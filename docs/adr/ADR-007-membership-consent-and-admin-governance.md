@@ -22,9 +22,14 @@ resolution under partition.
 ### Trust anchor: the genesis capability
 
 A channel begins with a **genesis record**: a self-signed root capability authored by the
-creator's identity key (ADR-002), fixing `channelID`, creation timestamp, the initial policy
-(history mode, deniability mode, TTL), and naming the creator as **root admin**. Its hash is the
-root of every certificate chain in the channel; every authority claim must verify back to it.
+creator's identity key (ADR-002), carrying a **128-bit random nonce**, creation timestamp, the initial
+policy (history mode, deniability mode, TTL), and naming the creator as **root admin**, serialized
+canonically (ADR-008). The **`channelID` is defined as `SHA-256(canonical genesis record)`** — so it is
+256-bit, high-entropy (the nonce guarantees it), self-certifying, and bound to exactly one genesis: a
+cold-joining node fetches the genesis from the rendezvous (ADR-012) and accepts it **only if its hash
+equals the `channelID`** it joined with. The genesis hash is thus simultaneously the channelID, the
+rendezvous seed (ADR-005), and the root of every certificate chain; every authority claim must verify
+back to it.
 
 ### Certificate and grant schema
 
@@ -42,13 +47,29 @@ mandatory suite of **golden test vectors** (valid chains, over-attenuation, expi
 concurrent-conflict cases). Two correct implementations MUST agree bit-for-bit on every vector; this is
 a release gate for the governance layer (not an open detail).
 
+**Capability vocabulary (closed set — the evaluator's entire domain).** The evaluator recognizes
+exactly these capabilities, ordered by the attenuation lattice (a delegation may grant only
+capabilities at or below its own; unknown capability types are a verification failure):
+- `admin` — full governance; implies every capability below. Held by the root admin from genesis.
+- `delegate` — may issue admin-delegation certs (attenuable; never exceeding the issuer's set).
+- `invite` — may issue identity-bound invites (ADR-005).
+- `policy` — may author policy-update entries (history / deniability / TTL).
+- `passphrase-rotate` — may author passphrase-rotation (epoch) entries.
+- **Tunnel capabilities, registered by ADR-013 into *this* lattice:** `bind:<service-tag>` (advertise/
+  host) and `dial:<service-tag>` (consume), plus attenuable **role-tag attributes** (e.g. `#ops`,
+  `#ssh-hosts`). ADR-013's ABAC policies (“`#ops` may Dial `#ssh-hosts`”) are evaluated by this same
+  evaluator over these grants — ADR-013 adds **no** parallel authorization engine.
+New capability types are added only here (versioned), preserving the single-evaluator guarantee.
+
 - **Admin delegation cert** — issued by an admin, names a delegate identity key and the granted
   capability set, optionally *attenuated* (e.g. `invite` but not `delegate`) and optionally with an
   expiry. Delegations chain to genesis, forming an SPKI/SDSI/UCAN-style capability tree the client
   verifies independently. No capability can exceed its issuer's (monotonic attenuation).
 - **Consent grant** — issued by an *individual member* `A`, names a target `N`, and is the act of
-  releasing `A`'s Sender Key to `N`: `A` encrypts `A`'s current SKDM (ADR-006) to `N` over their
-  pairwise channel (ADR-004) and records a consent-grant entry. This is the per-sender consent
+  releasing `A`'s Sender Key to `N`: `A` encrypts the appropriate SKDM (ADR-006) to `N` over their
+  pairwise channel (ADR-004) — the *current* iteration in forward-only channels, or the *origin*
+  iteration in full-history channels so `N` can read `A`'s retained history — and records a
+  consent-grant entry. This is the per-sender consent
   primitive — entirely `A`'s decision, authored only by `A`. **Membership is emergent, not an admin
   cert:** you are in the swarm by holding the passphrase (ADR-005), and you are *readable* by whoever
   has consent-granted to you. There is no admin-issued membership certificate and no admin-maintained
@@ -139,6 +160,12 @@ reconciles** (ADR-008). The model is chosen so most actions never truly conflict
 - **Admin authority is monotonic + revocable.** A key is an admin iff some valid delegation chain to
   genesis grants it and no causally-later authorized revocation supersedes it; ties resolve by the
   same removal-wins rule. Attenuation prevents privilege escalation regardless of ordering.
+- **Deterministic total tie-break (required for the bit-for-bit guarantee).** Causal order is partial,
+  so two concurrent, causally-unordered entries (e.g. two delegations of different attenuations to the
+  same key with no link between them) need a tie-break for all clients to converge identically. After
+  the removal-wins rule, the evaluator orders any remaining concurrent entries by **ascending entry
+  hash** (`SHA-256` of the canonical entry, ADR-008) and takes the last. This makes the evaluator a
+  total function of log state — the precondition for the golden-vector equality gate above.
 
 ### Enforcement honesty
 

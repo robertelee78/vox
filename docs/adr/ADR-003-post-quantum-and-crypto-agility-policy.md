@@ -42,6 +42,38 @@ policy, **rejects** (aborts, no fallback) any proposal below it, binds the negot
 transcript, and re-checks it after the handshake — so a network attacker cannot force a weaker suite.
 There is no "downgrade to classical" path: hybrid PQ is the floor.
 
+### Algorithm & ciphersuite registry (normative — the single source for every `algo_ids`)
+
+Every algorithm-identified field across the series (`algo_ids` in ADR-004/006/008 headers, suite IDs
+in ADR-005/011 handshakes, ADR-007 certs) draws from **this one registry**. An algorithm ID is a
+`u16` big-endian: the **high byte is the class** (this *is* the pairwise-disjoint encoding range +
+self-describing algorithm-prefix that ADR-002/§requirement-1 mandate) and the low byte is the member.
+
+| Class (hi) | Members (lo → algorithm) |
+|---|---|
+| `0x01` curve/KEX | `01` X25519 |
+| `0x02` KEM | `01` ML-KEM-768 |
+| `0x03` signature | `01` Ed25519 · `02` ML-DSA-65 · `03` SLH-DSA-SHA2-128s · `04` **composite** Ed25519+ML-DSA-65 |
+| `0x04` AEAD | `01` AES-256-GCM · `02` ChaCha20-Poly1305 |
+| `0x05` hash | `01` SHA-256 · `02` BLAKE3-256 |
+| `0x06` KDF | `01` HKDF-SHA-256 · `02` Argon2id |
+| `0x07` PAKE | `01` CPace-Ristretto255-SHA-512 |
+| `0x08` TLS group | `01` X25519MLKEM768 (`0x11EC` on the TLS wire) |
+
+A **ciphersuite** is a named, versioned tuple over these classes — itself a registry entry:
+
+| Suite | Composition |
+|---|---|
+| `vox-suite-1` (`0x0001`, rank 1) | X25519 · ML-KEM-768 · composite-Ed25519+ML-DSA-65 · AES-256-GCM · SHA-256 · HKDF-SHA-256 · CPace-Ristretto255-SHA-512 |
+
+**Hash is SHA-256 series-wide** (all `prev_hash`/`payload_hash`/CID/fingerprint uses) unless a future
+suite names otherwise. **Floor relation:** each suite carries an explicit total **strength rank** (the
+column above, *not* the numeric ID). A channel policy names a **minimum suite**; a peer advertises only
+suites whose every component rank ≥ the minimum's and **rejects** (aborts) any proposal below it. New
+suites are appended with an assigned rank, so the floor advances deliberately and never silently
+downgrades. The canonical byte serialization shared by every signed structure is specified once in
+**ADR-008** and referenced everywhere, so the same bytes are signed and verified across all ADRs.
+
 **Phasing.** Day-one: PQ *confidentiality* (hybrid PQXDH) and hybrid signatures. Later increment:
 post-quantum *post-compromise security* in the ratchet (ADR-004), whose dominant cost is
 bandwidth (~2.3 KB per PQ ratchet message vs ~32 B), mitigated by chunking.

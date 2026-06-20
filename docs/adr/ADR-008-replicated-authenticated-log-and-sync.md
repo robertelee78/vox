@@ -49,9 +49,30 @@ verification certificates for partial replication. This is the Bamboo design ada
 composite-PQ signatures and `(channelID, epoch)` binding — specified directly here, not pulled from
 an external library (Bamboo/Reed/Hypercore inform it but are not a runtime dependency).
 
-**Sync = anti-entropy.** Frontier have/want exchange for the simple case; range-based set
-reconciliation (Willow/Negentropy, logarithmic rounds) at scale (plain SSB degrades past ~100
-members).
+**Canonical serialization (normative, series-wide — the one encoding every ADR signs over).** Every
+signed/authenticated structure in Vox — log entries (here), SKDMs (ADR-006), certificates and consent
+grants (ADR-007), rendezvous records (ADR-012), the transport identity extension (ADR-011) — is encoded
+as **deterministic CBOR** (RFC 8949 §4.2.1: definite-length items, shortest-form integers, map keys
+sorted bytewise), prefixed with a **2-byte struct-type tag** + **1-byte format version**. Integer
+fields (`seq`, `iteration`, `epoch`, `payload_len`) are CBOR unsigned integers (no fixed width). The
+authenticator is computed over `domain_sep ‖ canonical_bytes`, where `domain_sep` is a per-struct ASCII
+label (e.g. `"vox/log-entry/v1"`). All hashes (`prev_hash`, `payload_hash`, CID = ADR-010) are
+**SHA-256** (ADR-003 registry) over those canonical bytes. Two correct implementations therefore
+produce **byte-identical** signed input — the precondition for signature verification, CID dedup, and
+the byte-equality fork-proof below. The **`lipmaa_backlink`** for entry `seq = n` targets the standard
+Bamboo `lipmaa(n)` (the largest certificate-pool predecessor of the form `(3^k − 1)/2`); every entry
+carries both `prev_hash` (the seq−1 link) and the `lipmaa_backlink` hash.
+
+**Sync = anti-entropy (concrete frames).** Mode is negotiated at session start (each peer sends a
+1-byte supported-mode bitmap; both use the strongest common mode):
+- **Frontier mode (default; required of every peer).** A peer sends a `HAVE` frame — the canonical-CBOR
+  list of `(author_id, max_seq, head_hash)` over the feeds it holds — and the receiver replies `WANT`
+  with the `(author_id, from_seq..to_seq)` ranges it lacks; the holder streams the missing entries
+  (skeleton + any retained payloads) over a reliable QUIC stream (ADR-011).
+- **Range-reconciliation mode (used when both peers advertise it; the default *above ~100 active
+  authors*, where `HAVE` size dominates).** Negentropy range-based set reconciliation over entry hashes
+  (logarithmic rounds; its published wire format). Frontier is mandatory; range-reconciliation is an
+  additional required capability for scale.
 
 **Per-entry-type authentication (binding — resolves the deniable/governance split).** Authentication
 is chosen by entry TYPE, not merely by channel mode:
@@ -70,6 +91,21 @@ content authenticator and how it preserves per-author single-writer ordering are
 **Consent + governance state lives here.** Admin/policy certificates, consent grants, and consent
 revocations are log entries, so they replicate and converge causally across the overlay (ADR-007).
 (Membership is emergent from join + consent — there is no membership-roster cert; ADR-007.)
+
+**Personal self-channel (multi-device state, including received consent).** A user's own shared-root
+devices (ADR-002) share state through a **single-author self-log**: a log authored by the user's
+identity, encrypted to itself under a key `K_self = HKDF-SHA-256(identity-root-derived secret,
+info="vox/self-channel/v1")`, and replicated **only among that identity's own devices** over an
+identity-keyed rendezvous (`rendezvous_self = HKDF-SHA-256(identity_pub, info="vox/self-rzv/v1")`,
+ADR-005 derivation; a device proves identity possession via the ADR-005 PoP to peer). It carries: local
+nicknames + verification state, and — load-bearing — **the SKDMs the identity has been consent-granted**
+(ADR-006) and per-channel join material. Because consent binds to an *identity* (ADR-006), syncing
+received SKDMs over the self-channel lets every shared-root device read what was consented to the
+identity, so **adding or restoring a shared-root device needs no re-consent**. First-device→second-device
+bootstrap: a new device is enrolled by presenting the identity key (out-of-band root sync, ADR-002),
+then discovers siblings at `rendezvous_self`. Per-device-key users have no shared root, so they hold no
+self-channel and their state is device-local (no special case). This is the sole spec of the
+self-channel; ADR-014 only surfaces its results.
 
 **Fork / equivocation handling.** A single-writer log must not fork; two distinct entries by the
 same author at the same `seq` are an equivocation. Handling differs by authentication type (above),
@@ -122,6 +158,9 @@ skeleton entry remains, so pruning can never silently rewrite history.
 - DAG convergence is proven for non-adversarial replicas; Sybil/withholding resistance must come
   from signatures + membership (ADR-002, ADR-007), not the DAG alone.
 - Ciphertext a node cannot read still consumes its storage/bandwidth (the cost of render-gating).
+- **Build coupling with ADR-009:** the deniable-content fork branch here checks the authenticator that
+  ADR-009 supplies, so 008's deniable path and ADR-009 are co-built (not 008-complete-then-009). The
+  dependency graph stays acyclic (009 → 008); only the *build order* is coupled.
 
 ### Neutral
 - Positions Vox alongside SSB / Hypercore / Berty / Matrix-event-DAG; differentiator remains the

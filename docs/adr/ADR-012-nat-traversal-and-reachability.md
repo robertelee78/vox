@@ -38,11 +38,13 @@ hidden service).
    timer). The relay carries only lightweight signaling, not traffic.
 4. **Relay of last resort** via the user's own node for the residual (both CGNAT/symmetric, no IPv6).
 
-**Rendezvous (authenticated, fresh, epoch-scoped).** Peers meet at a rendezvous key derived from
-`(channelID, epoch)` via a slow/memory-hard KDF (ADR-005) and publish current endpoints there as
-**signed, sequence-numbered mutable records**:
-`{ author_id, channelID, epoch, endpoints, seq (monotonic), timestamp }` signed by the publishing
-member's composite identity key (ADR-002). Readers **verify the signature, reject stale/replayed
+**Rendezvous (authenticated, fresh, epoch-scoped).** Peers meet at the rendezvous key
+`HKDF-SHA-256(channelID, info="vox/rendezvous/v1" ‖ epoch)` (the exact ADR-005 derivation; a fast KDF
+suffices because `channelID` is high-entropy, ADR-005/ADR-007) and publish current endpoints there as
+**signed, sequence-numbered mutable records** (canonical-CBOR, ADR-008):
+`{ author_id, channelID, epoch, endpoints, seq (monotonic), timestamp }`, where `endpoints` is a list
+of **multiaddr** values (IPv6 / IPv4 / relay-hint), signed by the publishing member's composite
+identity key (ADR-002). Readers **verify the signature, reject stale/replayed
 records** (older `seq`/timestamp), and accept records only from channel members — so a poisoner
 cannot inject or replay endpoints, and a stale record cannot be replayed after rotation. The
 rendezvous point can double as the hole-punch coordination channel for 3+-member channels.
@@ -55,6 +57,15 @@ faster, or extra records, are rejected by readers); records carry a short TTL (d
 endpoint-minimized (publish only the addresses needed for the reachability ladder). A revoked member's
 records are ignored once the revocation entry (ADR-007) is seen. This bounds rendezvous-record spam
 even from a joined member.
+
+**Pre-join rendezvous record class (the join-bootstrap path, ADR-004/ADR-005).** A peer that has not
+yet completed the authenticated join publishes prekeys + endpoints in a **separate, clearly-typed
+`pre-join` record class** at the same rendezvous key, self-signed by its asserted identity:
+`{ kind: "pre-join", asserted_id, channelID, prekey_bundle, endpoints, seq, timestamp }`. These records
+convey **no log authority** (ADR-008 accepts log entries only from joined identities) and readers treat
+them **only** as join-bootstrap material — a candidate prekey bundle + endpoints to attempt CPace
+against (ADR-005) — never as channel content. They carry the same caps/TTL/multiaddr encoding as member
+records. This is the executable schema for the "pre-join rendezvous record class" referenced by ADR-004.
 
 **Bootstrap (concrete, no third-party security dependency).** Cold-start onto the swarm uses a
 **configurable bootstrap set the user controls**: by default the user's own always-on node (the

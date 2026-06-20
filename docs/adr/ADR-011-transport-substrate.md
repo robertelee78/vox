@@ -13,8 +13,7 @@ reliability/latency contracts, without one degrading the other. It must compose 
 (ADR-002), the messaging crypto core (ADR-004), and NAT traversal (ADR-012). A prior review
 correctly flagged that "key the QUIC streams from PQXDH/Noise/QUIC-TLS, pending validation" was not
 a security spec but a false deferral. This ADR specifies the concrete transport security design.
-Grounded in the libp2p TLS spec, IETF `draft-ietf-tls-ecdhe-mlkem`, and RFC 7250. *(Verifier agents
-abstained under rate-limiting; sources are canonical.)*
+Grounded in the libp2p TLS spec, IETF `draft-ietf-tls-ecdhe-mlkem`, and RFC 7250.
 
 ## Decision
 
@@ -37,10 +36,13 @@ which lacks per-stream backpressure — but QUIC is primary.)
   certificate carrying its Vox identity public key in a custom X.509 extension**, and signs
   `"vox-tls-handshake:" ‖ cert_public_key` with its **identity private key** (the composite
   Ed25519+ML-DSA key, ADR-002) — a proof-of-possession that binds the ephemeral TLS certificate key
-  to the long-term Vox identity. The verifier derives the Vox identity from the extension and **MUST
+  to the long-term Vox identity. **Extension layout (concrete):** OID **`1.3.6.1.4.1.53594.1.1`** (under
+  the libp2p IANA PEN 53594, sub-arc reserved for Vox), `critical = false`, value = canonical-CBOR
+  (ADR-008) `{ composite_pubkey, pop_sig }` where `composite_pubkey` and `pop_sig` are the ADR-003
+  `0x03/0x04` composite encodings. The verifier derives the Vox identity from the extension and **MUST
   require it to match the expected peer, aborting on mismatch.** This authenticates Vox identities in
   the handshake without a CA and without RFC-7250 raw-public-key's out-of-band gap. (Production Rust
-  prior art: the `libp2p-tls` crate; OID-scoped extension.)
+  prior art: the `libp2p-tls` crate.)
 - **PQ authentication.** Because the identity-binding signature is the composite Ed25519+ML-DSA key,
   handshake authentication is post-quantum; the TLS certificate's own self-signature may be classical
   since authentication is carried by the PQ composite extension signature and confidentiality by the
@@ -62,8 +64,9 @@ Two distinct, separately-keyed layers, each binding the Vox identity:
 
 - **0-RTT is disabled.** QUIC/TLS 1.3 0-RTT early data is replayable; for a security overlay that
   risk is unacceptable, so Vox never offers or accepts 0-RTT.
-- **Datagram anti-replay.** RFC 9221 datagrams carry a Vox-framing sequence number + sliding replay
-  window; out-of-window or duplicate datagrams are dropped.
+- **Datagram anti-replay.** RFC 9221 datagrams carry a Vox-framing 64-bit sequence number + a sliding
+  replay window (**default 1024 packets**, DTLS-style bitmap); out-of-window or duplicate datagrams are
+  dropped.
 - **Downgrade prevention.** TLS 1.3's Finished MAC already binds the full transcript (including the
   negotiated group); offering only hybrid PQ groups removes any downgrade target; the negotiated
   suite is additionally recorded in the application session-establishment entry so downgrade is

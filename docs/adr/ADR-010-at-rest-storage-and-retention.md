@@ -30,16 +30,30 @@ These are kept separate and must not be conflated:
    *distribution* (ADR-007), never by per-recipient re-encryption — so dedup is never broken by
    consent.
 
-2. **Local at-rest encryption (the double-lock).** The entire local store — the log database, the
-   decrypted plaintext/index caches, and the private key material — is encrypted at rest under a
-   per-channel **Store Encryption Key (SEK)**, AEAD per segment. This is a strictly local layer; it
-   does not affect the wire/log format and therefore cannot break dedup or replication.
+2. **Local at-rest encryption (the double-lock).** The per-channel local store — the log database, the
+   decrypted plaintext/index caches, and **per-channel key material (sender keys, received SKDMs, and
+   the SEK wrap itself)** — is encrypted at rest under a per-channel **Store Encryption Key (SEK)**,
+   AEAD per segment. This is a strictly local layer; it does not affect the wire/log format and
+   therefore cannot break dedup or replication. **The root identity private key is NOT in any per-channel
+   SEK store** — it lives in a *separate* protection domain (below). This is deliberate and load-bearing:
+   the identity key is an *input* to deriving the SEK (§Double-lock), so it cannot itself sit behind the
+   SEK — otherwise unlocking would be circular.
 
 ### Double-lock key derivation
 
 The SEK is wrapped under **two independent factors, both required** to unlock (the "double-lock").
 The identity factor is derived **without ever reading raw private-key material** — so it works with
-non-exportable keys in `gpg-agent`, a smartcard, or the Secure Enclave:
+non-exportable keys in `gpg-agent`, a smartcard, or the Secure Enclave.
+
+**Where the identity key lives (resolves the would-be unlock circularity).** The identity root is held
+in a **separate identity domain**, unlocked once at app start, independent of any per-channel SEK:
+- **Imported keys** (GPG/smartcard/YubiKey): in `gpg-agent`/the card; signing is delegated, the private
+  key never leaves it.
+- **Generated keys**: in an **identity vault** — the root wrapped under an *identity* factor
+  (`Argon2id` over an identity passphrase, or a Secure-Enclave-gated random secret), **not** under any
+  channel SEK (ADR-014 generate path).
+Because the identity key is available once the identity domain is unlocked, deriving each channel's SEK
+via `id_proof` below is well-defined and non-circular.
 
 ```
 // identity factor — reproducible, never exposes the private key

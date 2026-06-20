@@ -29,8 +29,12 @@ it is what lets governance be attributable (ADR-007) while message content can b
    there is no membership certificate), and — in attributable channels — message
    metadata. The human-verifiable **identity fingerprint** is `SHA-256(Ed25519_pub ‖ ML-DSA_pub)`,
    rendered for manual verification (UX in ADR-014). Both components are always verified together;
-   a signature is valid only if *both* the Ed25519 and ML-DSA signatures verify (composite
-   signature `sig = Ed25519.sign ‖ ML-DSA.sign`).
+   a signature is valid only if *both* the Ed25519 and ML-DSA signatures verify. The composite
+   public key and signature are the registry's `0x03/0x04` type (ADR-003) and serialized canonically
+   (ADR-008) in **fixed component order**, lengths implied by the algorithm IDs:
+   `composite_pubkey = Ed25519_pub(32 B) ‖ ML-DSA-65_pub(1952 B)`,
+   `composite_sig = Ed25519_sig(64 B) ‖ ML-DSA-65_sig(3309 B)`, each carried inside the canonical
+   struct tag so no separate length prefix or domain tag is needed at the concat itself.
 
 2. **Key-agreement keys** (for ADR-004 PQXDH):
    - **X25519 identity DH key**, used in the DH legs of PQXDH.
@@ -46,9 +50,11 @@ it is what lets governance be attributable (ADR-007) while message content can b
    - **Attributable mode**: the Sender-Key signing key (per author, per channel) — an
      Ed25519+ML-DSA pair bound to `(channelID, epoch)` (ADR-006), cross-signed by the root so
      recipients tie it to the identity.
-   - **Deniable mode**: a **per-epoch ephemeral** signing key, bootstrapped through a deniable
-     exchange (ADR-009), *not* cross-signed by the root in a transferable way — so message content
-     carries no transferable proof of authorship to outsiders.
+   - **Deniable mode**: a **per-epoch ephemeral composite (Ed25519+ML-DSA-65) signing key**,
+     bootstrapped through a deniable exchange (ADR-009), *not* cross-signed by the root in a
+     transferable way — so live origin authentication is post-quantum, yet message content carries no
+     transferable proof of authorship to outsiders (deniability comes from publishing the ephemeral
+     private key at epoch end, ADR-009).
 
 All keys carry explicit, versioned algorithm identifiers with pairwise-disjoint encoding ranges
 and algorithm-prefix bytes (the ADR-003 type-confusion rule).
@@ -64,7 +70,10 @@ key material and fingerprint-verification culture (ADR-001 principle 3):
 - **Generate**: otherwise Vox generates a native Ed25519 root and exports it in OpenPGP format for
   backup and external verification.
 - The ML-DSA co-key is a Vox-managed companion key, committed to alongside the OpenPGP key via a
-  signed binding statement (the identity fingerprint covers both).
+  **signed binding statement** — a canonical-CBOR struct `{ openpgp_fpr, mldsa_pub, created }`
+  (ADR-008 encoding, domain `"vox/ml-dsa-binding/v1"`) signed by the OpenPGP Ed25519 primary. The
+  identity fingerprint `SHA-256(Ed25519_pub ‖ ML-DSA_pub)` covers both keys, so the binding cannot be
+  swapped without changing the fingerprint that peers verify.
 
 ### Lifecycle
 
@@ -88,7 +97,9 @@ device↔identity attestation**:
 
 - **Shared-root**: the same root identity on multiple devices (root key synced by the user out of
   band, e.g. via the OpenPGP export). Devices are indistinguishable; consent/membership operate on
-  the one identity.
+  the one identity. Because consent binds to the *identity* (ADR-006), the devices share **received
+  consent (SKDMs) and channel state over the identity-keyed self-channel** (ADR-008), so adding or
+  restoring a shared-root device requires no re-consent by peers.
 - **Per-device keys**: each device a distinct identity. Consent and membership then operate on
   device keys as identities. A member who wants their devices recognized as one persona MAY publish
   device sub-keys cross-signed by a shared root and present that linkage to peers — but this is

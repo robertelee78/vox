@@ -32,9 +32,29 @@ confusion; eprint 2023/1385). Every SKDM and message MUST bind `(channelID, epoc
 signed/AAD context. The epoch is the passphrase-rotation generation (ADR-007), giving a clean
 boundary that invalidates prior-epoch keys.
 
-**Post-quantum distribution.** SKDM transport uses the PQXDH pairwise channel (ADR-004); the
-distribution is KEM-encapsulation-based, accommodating ML-KEM's lack of static-static DH and
-larger keys (ADR-003).
+**Post-quantum distribution.** An SKDM is delivered **as an ordinary Double-Ratchet message inside the
+already-established pairwise session** (ADR-004); it inherits that session's hybrid AEAD and the ML-KEM
+secret already mixed in by PQXDH — there is **no separate per-SKDM KEM step** (implementers must not
+build a redundant KEM layer). This accommodates ML-KEM's lack of static-static DH and larger keys
+(ADR-003) because the KEM was already done once at session setup.
+
+**Consent binds to an identity, not a device.** An SKDM is addressed to a recipient *identity*. Under
+the shared-root multi-device model (ADR-002), the recipient's devices share received SKDMs over the
+identity-keyed self-channel (ADR-008), so every device of a consented-to identity can read — adding or
+restoring a shared-root device needs no re-consent. Per-device-key users are distinct identities,
+consented to separately.
+
+**History delivery (forward-only vs full-history — ADR-007 channel policy).** The SKDM names a starting
+`iteration`, and the chain is one-way (you cannot derive keys before your starting point), so what a
+newly-consented member can read is set by *which* SKDM the sender releases:
+- **Forward-only channels:** consent releases the SKDM at the sender's **current** `iteration` → the
+  newcomer reads only messages from now on.
+- **Full-history channels (the default, ADR-014):** consent releases the sender's **origin SKDM
+  (`iteration = 0`) for each epoch the retained history spans** → the newcomer derives the whole chain
+  and reads all of that sender's retained history. Senders keep their per-epoch origin chain keys for
+  this purpose, bounded by channel TTL (ADR-010).
+History is therefore **per-sender and consent-gated exactly like live messages**: a member who never
+consents reveals no history, and "full history" never bypasses per-sender consent.
 
 **PCS via explicit rotation.** Base Sender Keys has only weak post-compromise security and does
 not self-heal (Balbás et al., ASIACRYPT 2023). Recovery and revocation rely on *explicit* sender-

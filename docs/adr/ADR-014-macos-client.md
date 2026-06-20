@@ -59,10 +59,11 @@ ADRs) are referenced, not duplicated, and are not deferrals.
   role is strictly the ADR-010 *at-rest unlock factor* (a biometric-gated random secret), never the
   identity itself. Concretely:
   - **Generate path (default).** The core generates the Ed25519+ML-DSA root and holds it in locked,
-    zeroized memory while unlocked. At rest the root is wrapped under the **ADR-010 double-lock
-    factors** (channel/identity unlock), **not** a bare Keychain ACL — so a warm, screen-unlocked but
-    Vox-locked Mac never exposes the identity. A user-facing GnuPG install is **not required** for
-    this path.
+    zeroized memory while unlocked. At rest the root is wrapped in a **separate identity vault** — an
+    *identity* factor (Argon2id over an identity passphrase, or a Secure-Enclave-gated random secret),
+    **distinct from any per-channel SEK** (ADR-010), so the identity key is available to derive each
+    channel's SEK without circularity, and a warm, screen-unlocked but Vox-locked Mac never exposes the
+    identity. A user-facing GnuPG install is **not required** for this path.
   - **Import path (fully built, not stubbed).** A user may bind an existing GPG Ed25519 primary/subkey
     (or a YubiKey/smartcard) as the root; signing is delegated to `gpg-agent`/the card and the private
     key never leaves it (ADR-002). `gpg-agent` is engaged **only** on this explicit path.
@@ -74,13 +75,19 @@ ADRs) are referenced, not duplicated, and are not deferrals.
   create/join that **pre-selects the main/last-used identity** (the common case is one tap) and shows
   which key you are acting as; creating a **fresh per-channel pseudonymous identity** (ADR-002) is a
   prominent option on the same screen. Vox never silently reuses an identity across channels.
+- **Device add / device loss (stated honestly).** Adding or restoring a **shared-root** device backfills
+  channels *and received consent* from a surviving device via the self-channel (ADR-008) — **no
+  re-consent**. If **all** devices are lost (identity backup only, no sibling to sync from), recovery is
+  **rejoin each channel + be re-consented** by members: inbound consent grants were device-local and are
+  gone, while outbound consent you authored is on the log and recovers. The app surfaces this in
+  onboarding rather than implying seamless recovery.
 
 ### Channel create / join
 
 - **Create:** the creator (root admin) sets channel policy up front and can change it later (ADR-007).
   **Policy defaults** the create screen starts on (both options always supported):
-  - **Authorship: attributable** (per-message signatures → intra-group accountability, still deniable
-    to outsiders; ADR-009). Deniable mode is an explicit opt-in.
+  - **Authorship: attributable** (per-message signatures → **non-repudiable to insiders and outsiders**;
+    ADR-009). Deniable mode — outsider-repudiable content — is the explicit opt-in.
   - **History: full history** (new members *may* be given prior messages; per-sender consent still
     gates what decrypts; ADR-007). Forward-only is an explicit opt-in.
   - **Retention/TTL: never expire** (ADR-010), changeable anytime.
@@ -101,12 +108,12 @@ special 1:1 path** — a two-member channel *is* the only "direct message."
 - **Members are shown by a local nickname bound to their identity key.** The same key may recur across
   channels (shared-root identity) or a person may deliberately use different keys per channel
   (pseudonymity, ADR-002); a nickname is a private label over a *verified key*, never an account.
-- **Nickname + verification state sync across the user's own devices** (shared-root strategy) via a
-  **personal self-channel**: a single-author log authored by the user's identity, encrypted to itself
-  (key derived from the identity root by HKDF), replicated only among the user's shared-root devices
-  over an identity-keyed rendezvous (ADR-005/008 mechanics, no new transport). Users on the
-  **per-device-key** strategy have no shared root, so their nicknames/verification state stay
-  device-local — this composes cleanly with no special case.
+- **Nickname, verification state, and received consent sync across the user's own devices**
+  (shared-root strategy) via the **personal self-channel — specified in ADR-008** (identity-keyed
+  rendezvous in ADR-005). The client only surfaces the resulting synced state; it adds no protocol.
+  Because the self-channel also syncs received SKDMs, a newly added/restored shared-root device gains
+  access with **no re-consent**. Users on the **per-device-key** strategy have no shared root, so their
+  state stays device-local — composes cleanly, no special case.
 
 ### Member list & verification ceremony (evidence-driven)
 
@@ -167,7 +174,9 @@ reason to withhold the surface or ship it incomplete.
 ### Messaging
 
 - **Text and files.** Files are carried as ordinary log payloads (ADR-008): content-encrypted with a
-  fresh nonce, **chunked across entries above a size threshold**, render-gated and TTL-pruned like any
+  fresh nonce, **chunked above a size threshold (default 256 KiB/chunk)** with a **chunk-manifest entry**
+  `{ file_id, total_len, content_type, chunk_hashes[] }` (canonical-CBOR, ADR-008) that orders
+  reassembly and lets a receiver fetch/verify chunks independently; render-gated and TTL-pruned like any
   payload (ADR-010). No separate file-transfer path.
 - **Render-gating:** undecryptable entries are not shown (ADR-008); where a gap would be confusing,
   show an honest, non-leaking "messages you haven't been given access to" marker rather than silently

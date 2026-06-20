@@ -37,24 +37,32 @@ retaining deniability … we can never regain it in a higher layer":
 - **Message-content payloads** in a deniable channel are authenticated **only** by the per-author
   ephemeral key below — never the static key.
 
-### Concrete protocol — Van Gundy Deniable GKA + DSKE (per-epoch)
+### Concrete protocol — Deniable GKA + DSKE (per-epoch), buildable rounds
 
-At each epoch (the passphrase/epoch boundary, ADR-006), members run a **4-round deniable group key
-agreement + deniable signature-key exchange (DSKE)** that augments Bohli–Steinwandt deniable GKA:
-1. each member contributes to a deniable group key agreement (the GKA legs ride PQXDH material,
-   ADR-004, so the agreement itself is deniable — no static signature enters it);
-2. each member generates a **per-epoch ephemeral signing keypair** and shares its public part bound to
-   the session transcript;
-3. **signature-key confirmation:** each member signs the per-session Schnorr challenge `c_i` with its
-   ephemeral key to *prove knowledge of the ephemeral private key and bind it to the transcript* —
-   giving members non-repudiable origin authentication **to each other**, non-transferable to outsiders
-   (an outsider cannot bind the ephemeral key to any identity);
-4. key confirmation completes the session.
+At each epoch (the passphrase/epoch boundary, ADR-006) the consenting member set runs a **4-round**
+deniable group key agreement + deniable signature-key exchange (DSKE), augmenting Bohli–Steinwandt
+deniable GKA. All broadcasts are log entries (ADR-008) bound to `(channelID, epoch)`. Let each member
+`i` hold an ephemeral DH share `x_i` and generate a **per-epoch ephemeral composite (Ed25519+ML-DSA-65)
+signing keypair** `(esk_i, epk_i)`:
 
-Message content is then signed with the per-author per-epoch ephemeral key. **At epoch end each member
-publishes its ephemeral *private* key**, so anyone can retroactively forge that epoch's content
-signatures → content authorship is repudiable (the deniability property), while *live* recipients still
-got real origin authentication.
+1. **Commit.** `i` broadcasts `commit_i = SHA-256("vox/dgka-commit/v1" ‖ epk_i ‖ g^{x_i} ‖ n_i)` with a
+   fresh 128-bit nonce `n_i`. (Commitments prevent adaptive key-choice.)
+2. **Reveal.** `i` broadcasts `(epk_i, g^{x_i}, n_i)`; everyone checks each `commit_i`. The group key is
+   `K = HKDF-SHA-256(BD-combine({g^{x_i}}), info="vox/dgka/v1" ‖ channelID ‖ epoch)` via the
+   Burmester–Desmedt/Bohli–Steinwandt combiner — a **deniable** agreement: only ephemeral DH shares
+   enter it, **no static signature**, so participation is authenticated by membership (ADR-007), not by
+   a transferable signature.
+3. **DSKE bind.** Each `i` signs the transcript `T = SHA-256(sorted{epk_*} ‖ sorted{g^{x_*}} ‖ channelID
+   ‖ epoch)` with `esk_i` and broadcasts the signature. This proves knowledge of `esk_i` and binds
+   `epk_i` to *this session’s transcript* — giving members real, **post-quantum** origin authentication
+   to each other (composite signature), **non-transferable** to outsiders because `epk_i` is never
+   cross-signed by `i`'s root identity (an outsider cannot tie `epk_i` to any identity).
+4. **Confirm.** Each `i` broadcasts `MAC_K(T)`; the session opens when all confirmations verify.
+
+Message content in the epoch is then signed with the author's `esk_i`. **At epoch end each member
+publishes its ephemeral *private* key `esk_i`**, so anyone can retroactively forge that epoch's content
+signatures → content authorship is repudiable (the deniability property), while *live* recipients got
+genuine PQ origin authentication during the epoch.
 
 ### Per-sender consent is preserved (critical)
 
@@ -68,12 +76,13 @@ is rejected for that reason.)
 ### Mid-epoch membership change
 
 A member who joins (and is newly consented to, ADR-007) between passphrase-epochs does **not** reuse
-the prior epoch's (now-published, forgeable) keys. Instead an **incremental DSKE re-key** runs: the
-affected members generate fresh per-epoch ephemeral keypairs and re-confirm, so the newcomer obtains
-live per-member verifiers. Cost: one incremental key-agreement round per such join affecting a
-deniable channel (bounded; the FS window
-is one re-key interval). This is the concrete answer to "consent is continuous but the DAKE is
-per-epoch."
+the prior epoch's (now-published, forgeable) keys. The **incremental DSKE re-key** is triggered by the
+consent-grant log entry naming the newcomer: each member that consented generates a fresh `(esk', epk')`,
+re-runs steps 3–4 (DSKE bind + confirm) against an updated transcript `T'` that includes the newcomer's
+`epk_new`, and distributes the result to the newcomer. The group key `K` (a confidentiality key, not an
+authenticator) may be retained for the epoch, or re-derived if the join changes the DH set. Cost: one
+incremental bind+confirm round per such join (bounded; the FS window for the new verifiers is one re-key
+interval). This is the concrete answer to "consent is continuous but the DGKA is per-epoch."
 
 ### Fork / equivocation in deniable channels
 
@@ -89,16 +98,25 @@ GOTR-style deferred pairwise consistency checks. Governance forks remain attribu
 Content is signed with the root-cross-signed composite key — **non-repudiable to insiders and
 outsiders** (honest: it is *not* deniable). Used when intra-group accountability is wanted.
 
-### Post-quantum instantiation (hybrid, versioned)
+### Post-quantum instantiation — deniable mode is PQ today
 
-The ephemeral content authenticator is **hybrid**: classical Schnorr/Ed25519 ephemeral signatures
-today, plus a lattice multi-/designated-verifier signature as those mature — the chosen PQ target is
-**UDMVS** (lattice SIS/LWE universal designated-multi-verifier signature, ROM, peer-reviewed ISPEC 2024)
-or a post-quantum **MDVRS** built from generic primitives. Explicitly rejected as unfit: **LaSDVS**
-(single-verifier only, not group-applicable) and **PSDVRS** (efficient but discrete-log, *not*
-post-quantum). The scheme is versioned via ADR-003 crypto-agility so the PQ MDV component advances
-without changing the mode's semantics. Until a vetted PQ MDV ships, deniable mode runs classical-hybrid
-ephemeral signatures (deniable today; the governance/transport/key-agreement planes are already PQ).
+Deniable mode is **fully post-quantum now**, with no dependency on any unshipped primitive:
+- **Live origin authentication is PQ.** The per-epoch ephemeral signing key is the **composite
+  Ed25519+ML-DSA-65** key (ADR-002/ADR-003), so content signatures verify under a PQ signature during
+  the epoch.
+- **Confidentiality is PQ.** The deniable group key `K` rides ephemeral DH that mixes ML-KEM-768 material
+  via the PQXDH pairwise legs (ADR-004).
+- **Deniability is mechanism-based, not primitive-based.** Repudiation comes from **publishing the
+  ephemeral private key at epoch end** (anyone can then forge that epoch's content) — this needs no
+  special signature type, so there is no "classical-only until a PQ scheme ships" gap. Participation is
+  attributable by design (ADR-001/ADR-007), consistent with weak/content deniability.
+
+**Optional future strengthening (not required, via crypto-agility).** A post-quantum *designated-verifier*
+signature — **UDMVS** (lattice SIS/LWE universal designated-multi-verifier, ROM, ISPEC 2024) or a PQ
+**MDVRS** — would give **live non-transferability** so members need not wait for epoch-end key
+publication to obtain repudiation. It is an enhancement layered in through ADR-003 versioning without
+changing this mode's semantics; deniable mode ships complete without it. (Rejected as unfit for the
+group setting: **LaSDVS** single-verifier-only; **PSDVRS** discrete-log, not PQ.)
 
 ## Consequences
 
@@ -115,8 +133,9 @@ ephemeral signatures (deniable today; the governance/transport/key-agreement pla
   matters.
 - A multi-round deniable GKA + incremental re-key on each mid-epoch join is real protocol complexity and must be
   formally analyzed before shipping (Van Gundy/mpENC give the template, not a drop-in library).
-- The PQ MDV component (UDMVS/MDVRS) is young; until vetted, PQ deniability rests on the hybrid's
-  classical half (the rest of the stack is PQ).
+- Deniable mode is PQ today (composite ephemeral keys + epoch-end publication); the *optional*
+  live-non-transferability upgrade (PQ designated-verifier, UDMVS/MDVRS) is a young primitive, so until
+  one is vetted, repudiation is obtained by key publication rather than a designated-verifier signature.
 
 ### Neutral
 - Per-channel choice (admin-set, ADR-007), attributable default.

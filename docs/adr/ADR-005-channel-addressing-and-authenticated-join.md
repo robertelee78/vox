@@ -21,8 +21,12 @@ joining must grant *no* readable content by itself (per-sender consent, ADR-007)
 limits an attacker to one online guess per interaction — provably resisting offline dictionary
 attack on the low-entropy passphrase (UC proof, eprint 2021/114). **CPace alone only proves "this
 party holds the passphrase," not *which identity* it is.** Vox therefore composes two factors:
-1. **CPace** establishes a session keyed by the passphrase, with the `channelID`, `epoch`, and the
-   transcript bound into CPace's `CI`/`sid`/`AD`.
+1. **CPace, instantiated as Ristretto255 + SHA-512** (the CFRG primary instantiation: group =
+   Ristretto255, hash = SHA-512, generator via the CPace `calculate_generator`/`map_to_group`
+   procedure — registry `0x07/0x01`, ADR-003). Ristretto255 removes cofactor/point-validation
+   foot-guns and reuses the X25519 stack (`curve25519-dalek`). It establishes a session keyed by the
+   passphrase, with `CI = "vox/cpace/v1" ‖ channelID ‖ epoch`, `sid` = the fresh per-run nonce, and
+   `AD = suite_id` bound into CPace's inputs.
 2. **Identity proof-of-possession.** Inside that CPace-protected session, each party signs the CPace
    `sid` (and transcript hash) with its **composite Ed25519+ML-DSA identity key** (ADR-002) and sends
    its identity public keys; the peer verifies the signature and matches the derived identity
@@ -33,10 +37,16 @@ party holds the passphrase," not *which identity* it is.** Vox therefore compose
 Pairwise CPace-on-meet between members; no bespoke group PAKE (GPAKE is immature/unstandardized).
 
 **Separate rendezvous from authentication.**
-- **channelID → rendezvous address.** Derive the DHT/PubSub lookup key from the channel ID via a
-  one-way (and slow/memory-hard) KDF. Use a *distinct, high-entropy* channel ID for rendezvous;
-  do **not** derive the public lookup key directly from the human passphrase, or passive DHT
-  observers could offline-guess it (this derivation is outside CPace's proof).
+- **channelID is high-entropy and self-certifying.** The `channelID` is `SHA-256(canonical genesis
+  record)` (ADR-007 genesis, which carries a 128-bit random nonce) — 256-bit, high-entropy, and bound
+  to exactly one genesis (a cold-joiner fetches genesis from the rendezvous and accepts it only if its
+  hash equals the `channelID`, so there is one true genesis per channel).
+- **channelID → rendezvous address.** `rendezvous_key = HKDF-SHA-256(channelID, info = "vox/rendezvous/v1" ‖ epoch)`,
+  truncated to the DHT key width. A plain (fast) KDF is sufficient and correct **because the channelID
+  is already high-entropy** — a memory-hard KDF would add cost without benefit (knowing the channelID,
+  an observer computes the key once regardless; swarm-presence unlinkability is the later
+  metadata-privacy phase, ADR-001). The passphrase is **never** an input to rendezvous. ADR-012 uses
+  this exact derivation.
 - **passphrase → CPace secret only.**
 
 **Post-join.** A successful CPace run bootstraps a PQXDH/Double-Ratchet pairwise session (ADR-004).

@@ -16,10 +16,15 @@ are well-analyzed and the correct conventional base (ADR-001 principle 5).
 ## Decision
 
 **Key agreement = PQXDH** (Signal's design; formally verified, USENIX'24). Augment X3DH by mixing
-an ML-KEM shared secret into the KDF: `SK = KDF(DH1 || DH2 || DH3 || [DH4] || SS)`, where `SS` is
-the ML-KEM encapsulation against the peer's signed KEM prekey. Hybrid X25519 + ML-KEM-768 (ADR-003).
-The two ADR-003 defensive requirements (type-confusion prevention; KEM-secret binding into AEAD
-AD) are mandatory here.
+an ML-KEM shared secret into the KDF, instantiated concretely as
+`SK = HKDF-SHA-256(ikm = DH1 ‖ DH2 ‖ DH3 ‖ [DH4] ‖ SS, salt = 0x00…00 (32 B), info = "vox/pqxdh/v1" ‖ suite_id)`,
+where `SS` is the ML-KEM-768 encapsulation against the peer's signed KEM prekey (hybrid X25519 +
+ML-KEM-768, ADR-003). The two ADR-003 defensive requirements are mandatory and made concrete here:
+**(1) type-confusion prevention** — every key carries its ADR-003 class-prefixed algorithm ID, so a
+curve key can never be parsed as a KEM key; **(2) KEM-secret binding** — the KEM public key and
+ciphertext are bound into the first ratchet message's AEAD associated data,
+`AD = transcript_hash ‖ kem_pub ‖ kem_ct ‖ suite_id ‖ channelID ‖ epoch` (canonical encoding, ADR-008),
+defeating the re-encapsulation attack.
 
 **Message encryption = Double Ratchet** (X25519 DH-ratchet + symmetric KDF-chain ratchet, AEAD
 envelopes). Provides forward secrecy and classical post-compromise security for pairwise traffic.

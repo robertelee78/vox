@@ -36,9 +36,12 @@ established substrate and marked as such. This ADR specifies the complete tunnel
 - **Bind vs Dial are distinct rights** (OpenZiti model): *advertise/host* (Bind) and
   *consume/connect* (Dial) are separate capabilities granted independently per member per service.
   Hosting an ssh port requires Bind; connecting requires Dial; neither implies the other.
-- **ABAC over signed role attributes.** Authorization is attribute/role-based, not address/port
-  based: members and services carry role tags issued as signed capability certificates chaining to
-  the channel genesis (ADR-007). Policies read like "members tagged `#ops` may Dial `#ssh-hosts`."
+- **ABAC over signed role attributes, evaluated by the ADR-007 evaluator (no parallel engine).** Bind/
+  Dial and role tags are **capabilities registered in the ADR-007 lattice** (`bind:<service-tag>`,
+  `dial:<service-tag>`, attenuable role attributes like `#ops`/`#ssh-hosts`), issued as signed
+  capability certificates chaining to genesis (ADR-007). A policy like "members tagged `#ops` may Dial
+  `#ssh-hosts`" is decided by the **single deterministic ADR-007 evaluator** over those grants — ADR-013
+  introduces no second authorization engine, so the one golden-vector suite covers tunnel authz too.
 - **Authorization gates discovery — and advertisements never sit in cleartext on the shared log.**
   Because the replicated log (ADR-008) delivers every entry to every member, a service advertisement
   is **not** posted as cleartext channel content (doing so would make discovery-gating illusory).
@@ -51,17 +54,22 @@ established substrate and marked as such. This ADR specifies the complete tunnel
 - **Consent + revocation gate tunnels.** Tunnel rights are bound to channel membership and
   per-sender consent (ADR-007): revoking a member (or a passphrase-epoch rotation) revokes their
   tunnel access going forward, exactly like message access.
-- **SSH-CA conceptual template.** "ssh over Vox" uses the member's verified Vox identity (ADR-002)
-  as the host/authority — short-lived signed credentials carrying principals, capability
-  extensions, and validity windows, with **no separate SSH host-key TOFU** (the host's identity is
-  already the verified Vox identity). Vox issues these credentials from the channel's certificate
-  tree.
+- **SSH-CA mapping (concrete).** "ssh over Vox" uses the member's verified Vox identity (ADR-002) as
+  the authority. Vox issues a standard **OpenSSH certificate** with this field mapping: `key_id` = the
+  Vox identity fingerprint; `valid_principals` = the granted role/service tags (e.g. `#ops`);
+  `critical_options`/`extensions` carry the governing Vox capability (`dial:<service>`); `valid_after/
+  before` = a short window (**default 5 min**). It is signed by the **channel SSH-CA key**, which is an
+  `admin`-delegated capability cert in the ADR-007 tree. The SSH host trusts that CA pubkey via an
+  `@cert-authority` line (delivered as a channel entry), so there is **no host-key TOFU** — the host's
+  identity is the verified Vox identity.
 
 ### Addressing & name resolution
 
-- **Identity-derived addressing.** For the TUN model, each member has a stable address derived from
-  their identity key (CGA/Yggdrasil-style, in a dedicated ULA range), so addresses are unforgeable
-  and need no allocation. For the SOCKS/forward model, services are addressed logically by
+- **Identity-derived addressing (concrete derivation).** For the TUN model, each member's address is
+  `addr = 0xFD ‖ high-120-bits( SHA-256("vox/ula/v1" ‖ composite_identity_pubkey) )` — a self-certifying
+  /128 in the `fd00::/8` ULA range (CGA/Yggdrasil-style). It is unforgeable (bound to the key), needs no
+  allocation, and a peer **verifies** an address by recomputing it from the claimed identity; 128-bit
+  output makes collision negligible. For the SOCKS/forward model, services are addressed logically by
   `(member identity, service name)`.
 - **Channel-scoped resolution (single mechanism, consistent with discovery-gating above).** A service
   advertisement is an **audience-encrypted log entry**: an inner signed record `(member, service,
