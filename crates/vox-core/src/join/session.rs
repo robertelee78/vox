@@ -502,9 +502,12 @@ mod tests {
         let (ji_pending, ji_boot) = ji.complete_cpace(&resp_share)?;
         let (jr_pending, jr_boot) = jr.complete_cpace(&joiner_share)?;
 
-        // Exchange proofs and verify peer identity against the out-of-band fingerprint.
-        let verified_resp = ji_pending.verify_peer(jr_pending.own_proof(), &resp_fp)?;
-        let verified_joiner = jr_pending.verify_peer(ji_pending.own_proof(), &joiner_fp)?;
+        // Exchange the PoP SEALED under the CPace-derived K_pop (ADR-005 PoP
+        // confidentiality), then open+verify against the out-of-band fingerprint.
+        let ji_sealed = ji_pending.own_proof_sealed()?;
+        let jr_sealed = jr_pending.own_proof_sealed()?;
+        let verified_resp = ji_pending.verify_peer_sealed(&jr_sealed, &resp_fp)?;
+        let verified_joiner = jr_pending.verify_peer_sealed(&ji_sealed, &joiner_fp)?;
 
         // Phase 2: bootstrap the M2 PQXDH session.
         let (joiner_session, init_msg) = ji_boot.bootstrap(&b)?;
