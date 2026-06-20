@@ -37,7 +37,7 @@ use ml_dsa::{
     MlDsa65, Signature as DsaSignature, SigningKey as DsaSigningKey,
     VerifyingKey as DsaVerifyingKey, B32 as DsaB32,
 };
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::hash::{
@@ -173,6 +173,21 @@ impl CompositeSignature {
         out
     }
 
+    /// The Ed25519 component signature (64 raw bytes).
+    ///
+    /// Exposed for the ADR-010 at-rest **identity factor**: that factor is the
+    /// *deterministic* (RFC 8032) Ed25519 signature over a fixed challenge, and is
+    /// derived by signing composite and taking this half — so the at-rest KEK is
+    /// reproducible across unlocks without ever materializing the private key, and
+    /// works through a delegated (gpg-agent/Enclave) backend that only knows how to
+    /// produce a composite signature. The ML-DSA half is *not* used for the factor
+    /// (it is the reproducible-yet-deniable-of-the-PQ-co-key concern of ADR-010
+    /// §"Post-quantum strength of the at-rest factors").
+    #[must_use]
+    pub fn ed25519_bytes(&self) -> [u8; ED25519_SIG_LEN] {
+        self.ed.to_bytes()
+    }
+
     /// Parse a composite signature from the canonical fixed-order layout.
     ///
     /// The ML-DSA half is decoded structurally; the Ed25519 half is always a
@@ -293,6 +308,26 @@ pub trait RootSigner {
     /// [`crate::wire::signing_input`] output, i.e. `domain_sep ‖ body`); this
     /// method does not add domain separation of its own.
     fn sign(&self, msg: &[u8]) -> Result<CompositeSignature>;
+
+    /// The deterministic Ed25519 **id_proof** over `challenge` — the ADR-010
+    /// at-rest identity factor (`id_proof = Ed25519_sign(identity, challenge)`).
+    ///
+    /// The default extracts the Ed25519 half of a composite signature over the
+    /// challenge. Because Ed25519 signing is deterministic (RFC 8032), the same
+    /// challenge yields byte-identical bytes on every unlock, so the derived KEK is
+    /// reproducible — the property the double-lock depends on — and a delegated
+    /// backend (gpg-agent/Enclave) that only signs composite still satisfies it
+    /// without exporting the private key. A hardware-bound backend that cannot sign
+    /// deterministically uses the [`crate::atrest::IdentityFactor`]
+    /// release-a-stored-secret variant instead (ADR-010).
+    ///
+    /// The proof fully determines `factor_id` (one unlock factor), so it is secret
+    /// material: it is returned in a [`Zeroizing`] buffer (non-`Copy`, wiped on
+    /// drop) and the default extracts the Ed25519 half directly into it, never
+    /// binding a bare `[u8; 64]` that could linger on the stack past an app-lock.
+    fn ed25519_id_proof(&self, challenge: &[u8]) -> Result<Zeroizing<[u8; ED25519_SIG_LEN]>> {
+        Ok(Zeroizing::new(self.sign(challenge)?.ed25519_bytes()))
+    }
 }
 
 /// The complete in-software root-signing backend (ADR-002 §1).
@@ -336,17 +371,19 @@ impl SoftwareRootSigner {
 
     /// The Ed25519 component seed (for encrypted backup export, ADR-002 §Backup).
     ///
-    /// Returns secret material; callers must keep it zeroized. Used only by the
-    /// backup bundle builder.
+    /// Returns secret material in a [`Zeroizing`] buffer (non-`Copy`, wiped on
+    /// drop) so no bare `[u8; 32]` seed copy lingers at a call site. Used by the
+    /// backup bundle builder (M1) and the epoch-end ESK publication (M7).
     #[must_use]
-    pub(crate) fn ed25519_seed(&self) -> [u8; 32] {
-        self.secret.ed.to_bytes()
+    pub(crate) fn ed25519_seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.secret.ed.to_bytes())
     }
 
     /// The ML-DSA component seed (for encrypted backup export, ADR-002 §Backup).
+    /// Returned [`Zeroizing`] for the same reason as [`Self::ed25519_seed`].
     #[must_use]
-    pub(crate) fn ml_dsa_seed(&self) -> [u8; 32] {
-        self.secret.ml_dsa_seed.0
+    pub(crate) fn ml_dsa_seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.secret.ml_dsa_seed.0)
     }
 }
 

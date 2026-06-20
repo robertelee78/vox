@@ -20,6 +20,9 @@ getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 aes-gcm.workspace = true
+# At-rest storage & retention (ADR-010, M8).
+argon2.workspace = true
+region.workspace = true
 # Channel join (ADR-005, M3).
 curve25519-dalek.workspace = true
 subtle.workspace = true

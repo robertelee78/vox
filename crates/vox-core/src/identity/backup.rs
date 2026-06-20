@@ -25,7 +25,7 @@
 //! secret material and **must never be persisted unencrypted**; that contract is
 //! the reason the type zeroizes on drop and its `Debug` reveals nothing.
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -105,15 +105,19 @@ impl IdentityBackup {
     /// [`Error::MalformedBundle`] rather than stored.
     pub fn new(
         root: &SoftwareRootSigner,
-        x25519_identity_secret: [u8; 32],
+        x25519_identity_secret: Zeroizing<[u8; 32]>,
         self_seed: &SelfSeed,
         openpgp_fpr: &[u8],
     ) -> Result<Self> {
         validate_fpr_len(openpgp_fpr)?;
         Ok(Self {
-            ed25519_seed: root.ed25519_seed(),
-            ml_dsa_seed: root.ml_dsa_seed(),
-            x25519_identity_secret,
+            // The seed getters return `Zeroizing<[u8; 32]>` and the X25519 secret is
+            // taken as a non-`Copy` `Zeroizing` too; deref-copy into the bundle's own
+            // zeroize-on-drop fields. Every temporary `Zeroizing` wipes on drop, so no
+            // bare secret copy lingers at this call site or the caller's.
+            ed25519_seed: *root.ed25519_seed(),
+            ml_dsa_seed: *root.ml_dsa_seed(),
+            x25519_identity_secret: *x25519_identity_secret,
             self_seed: *self_seed.as_bytes(),
             openpgp_fpr: openpgp_fpr.to_vec(),
         })
@@ -125,9 +129,13 @@ impl IdentityBackup {
     }
 
     /// The recovered X25519 identity DH secret scalar.
+    ///
+    /// Returned in a [`Zeroizing`] buffer (non-`Copy`, wiped on drop) so a caller
+    /// cannot leave a bare `[u8; 32]` secret copy lingering — it fully determines
+    /// the identity DH secret (ADR-010 secret-hygiene audit).
     #[must_use]
-    pub fn x25519_identity_secret(&self) -> [u8; 32] {
-        self.x25519_identity_secret
+    pub fn x25519_identity_secret(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.x25519_identity_secret)
     }
 
     /// The recovered `self_seed`.
@@ -171,6 +179,8 @@ impl IdentityBackup {
         if version != BACKUP_BUNDLE_VERSION {
             return Err(Error::MalformedBundle("backup bundle version"));
         }
+        // Each seed is bound as a non-`Copy` `Zeroizing` local, so no un-zeroized
+        // Copy stack remnant survives the move into the (zeroize-on-drop) fields.
         let ed25519_seed = take32(&mut d, "ed25519_seed")?;
         let ml_dsa_seed = take32(&mut d, "ml_dsa_seed")?;
         let x25519_identity_secret = take32(&mut d, "x25519_secret")?;
@@ -180,10 +190,10 @@ impl IdentityBackup {
         let openpgp_fpr = fpr_slice.to_vec();
         d.finish()?;
         Ok(Self {
-            ed25519_seed,
-            ml_dsa_seed,
-            x25519_identity_secret,
-            self_seed,
+            ed25519_seed: *ed25519_seed,
+            ml_dsa_seed: *ml_dsa_seed,
+            x25519_identity_secret: *x25519_identity_secret,
+            self_seed: *self_seed,
             openpgp_fpr,
         })
     }
@@ -198,10 +208,15 @@ impl core::fmt::Debug for IdentityBackup {
     }
 }
 
-fn take32(d: &mut Decoder<'_>, field: &'static str) -> Result<[u8; 32]> {
-    d.bytes()?
-        .try_into()
-        .map_err(|_| Error::MalformedBundle(field))
+fn take32(d: &mut Decoder<'_>, field: &'static str) -> Result<Zeroizing<[u8; 32]>> {
+    let slice = d.bytes()?;
+    if slice.len() != 32 {
+        return Err(Error::MalformedBundle(field));
+    }
+    // Copy straight into the zeroizing buffer — no bare `[u8; 32]` Copy local.
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(slice);
+    Ok(out)
 }
 
 /// Validate the OpenPGP fingerprint reference is exactly a v4 (20-byte) or v6
@@ -250,13 +265,13 @@ mod tests {
         let ss = SelfSeed::from_bytes([9u8; SELF_SEED_LEN]);
         let fpr = vec![0xAA; 20];
 
-        let backup = IdentityBackup::new(&r, x, &ss, &fpr).unwrap();
+        let backup = IdentityBackup::new(&r, Zeroizing::new(x), &ss, &fpr).unwrap();
         let bytes = backup.to_canonical_vec();
         let restored = IdentityBackup::from_canonical_slice(&bytes).unwrap();
 
         // Root identity reconstructs to the same fingerprint.
         assert_eq!(restored.root_signer().unwrap().fingerprint(), fp_before);
-        assert_eq!(restored.x25519_identity_secret(), x);
+        assert_eq!(*restored.x25519_identity_secret(), x);
         assert_eq!(restored.self_seed().as_bytes(), ss.as_bytes());
         assert_eq!(restored.openpgp_fpr(), &fpr[..]);
     }
@@ -264,9 +279,13 @@ mod tests {
     #[test]
     fn restored_root_signs_verifiably() {
         let r = root();
-        let backup =
-            IdentityBackup::new(&r, [0u8; 32], &SelfSeed::from_bytes([0u8; 32]), &[0xBB; 32])
-                .unwrap();
+        let backup = IdentityBackup::new(
+            &r,
+            Zeroizing::new([0u8; 32]),
+            &SelfSeed::from_bytes([0u8; 32]),
+            &[0xBB; 32],
+        )
+        .unwrap();
         let bytes = backup.to_canonical_vec();
         let restored = IdentityBackup::from_canonical_slice(&bytes).unwrap();
         let signer = restored.root_signer().unwrap();
@@ -314,7 +333,7 @@ mod tests {
         let r = root();
         let backup = IdentityBackup::new(
             &r,
-            [0xCC; 32],
+            Zeroizing::new([0xCC; 32]),
             &SelfSeed::from_bytes([0xDD; 32]),
             &[0xEE; 20],
         )
@@ -329,7 +348,12 @@ mod tests {
         let r = root();
         // 19 bytes: neither v4 (20) nor v6 (32).
         assert!(matches!(
-            IdentityBackup::new(&r, [0u8; 32], &SelfSeed::from_bytes([0u8; 32]), &[0u8; 19]),
+            IdentityBackup::new(
+                &r,
+                Zeroizing::new([0u8; 32]),
+                &SelfSeed::from_bytes([0u8; 32]),
+                &[0u8; 19]
+            ),
             Err(Error::MalformedBundle(_))
         ));
     }

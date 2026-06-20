@@ -51,6 +51,20 @@ getrandom = "0.3"
 hkdf = { version = "0.12", default-features = false }
 hmac = { version = "0.12", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# At-rest double-lock passphrase factor (ADR-010, M8). Argon2id is the memory-hard
+# `factor_pass` KDF for the channel passphrase and the identity-vault passphrase;
+# pinned to the RustCrypto password-hashes island so it shares one `alloc`/`zeroize`
+# posture with the rest of the symmetric stack. `alloc` enables `hash_password_into`
+# (the crate allocates the memory blocks itself); Vox drives it through the low-level
+# `Params`/`Argon2::new` API with explicit `(m_cost, t_cost, p_cost)` profiles, never
+# the PHC-string convenience layer.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+# Best-effort `mlock` of in-memory secrets (ADR-010 §"App-lock and memory hygiene").
+# `region` exposes a *safe* `lock`/`LockGuard` RAII API over the platform mlock
+# syscall, so the `#![forbid(unsafe_code)]` crate root holds — Vox never writes raw
+# `unsafe`. mlock is best-effort: on failure the secret still lives in a zeroizing
+# buffer (the defined fallback), never unprotected.
+region = "3"
 # Equihash (n=200,k=9) join proof-of-work (ADR-005, M3). The librustzcash crate:
 # cheap runtime-(n,k) verification by default; the `solver` feature adds the real
 # (200,9) tromp solver (a C++ FFI backend, used only by the heavy #[ignore]d

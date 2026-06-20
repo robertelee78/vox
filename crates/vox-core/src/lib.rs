@@ -119,6 +119,29 @@
 //!   requires a formal analysis of the DGKA+DSKE construction before deniable mode
 //!   is enabled in a release (see [`deniable`]).
 //!
+//! Built on M0 + M1 + M5, milestone **M8** adds:
+//!
+//! - [`atrest`] — at-rest storage & retention (ADR-010), the local device-seizure
+//!   boundary. The two layers are kept strictly separate: content encryption is the
+//!   shared layer-1 already done by M4/M6 (M8 only adds the content-addressed,
+//!   dedup-by-identical-bytes object store), and the **double-lock** is M8's core —
+//!   a per-channel Store Encryption Key wrapped under **two both-required factors**:
+//!   the *identity factor* (`factor_id = HKDF(Ed25519_sign(identity,
+//!   "vox/sek-id-factor/v1" ‖ channelID))`, deterministic/RFC-8032 so it reproduces
+//!   without exporting the key and works through delegated gpg-agent/Enclave
+//!   signing) and the *passphrase factor* (`Argon2id`, **256 MiB / 3 passes** in the
+//!   default production profile; a reduced profile for tests). The root identity
+//!   lives in a separate **vault** (`Argon2id` over an identity passphrase → AEAD of
+//!   the M1 backup bundle, yielding a vault-backed `RootSigner`) — the
+//!   M1-deferred backend — so the SEK derivation is non-circular. App-lock zeroizes
+//!   the SEK on idle/sleep; secrets are best-effort `mlock`-ed via a *safe* crate
+//!   with a defined zeroize-only fallback. Passphrase rotation re-wraps only the
+//!   small wrap (the SEK and bulk store are untouched) and deletes the old wrap;
+//!   admin TTL prunes payload bytes via M5's authenticated pruning so the signed
+//!   skeleton stays verifiable, and "disappearing" also erases the plaintext cache.
+//!   gpg-agent/Enclave IPC and disappearing-message UX (ADR-014) are documented
+//!   seams, not stubs.
+//!
 //! ## Engineering mantra (binding — see ADR-001)
 //! No stubs, no `todo!()`, no shortcuts. What ships is complete and correct.
 //! Every module here carries its own tests and, where the ADRs name a release
@@ -130,6 +153,7 @@
 // freely, so the bans are relaxed there only.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod atrest;
 pub mod cbor;
 pub mod deniable;
 pub mod error;

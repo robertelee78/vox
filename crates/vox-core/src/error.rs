@@ -163,4 +163,34 @@ pub enum Error {
     /// totality over *any* input, not just well-formed input).
     #[error("governance causal graph contains a cycle")]
     GovernanceCycle,
+
+    /// An at-rest unlock failed: the AEAD over a SEK wrap, an identity-vault
+    /// bundle, or a store segment did not authenticate (ADR-010 double-lock).
+    /// Returned for a wrong channel passphrase, a wrong identity factor, a
+    /// wrong-channel wrap, a tampered ciphertext, or a wrong KDF-profile version —
+    /// they are deliberately one error so a probe cannot tell *which* factor was
+    /// wrong (the at-rest analogue of [`Error::JoinProofFailed`]).
+    #[error("at-rest unlock failed (wrong factor or tampered ciphertext)")]
+    AtRestUnlockFailed,
+
+    /// A SEK-backed operation (segment seal/open, re-wrap) was attempted after the
+    /// app was **locked** (ADR-010 §"App-lock and memory hygiene"): the SEK was
+    /// zeroized and invalidated, so it must be re-derived from both factors
+    /// (re-auth) before the store can be touched again. Distinct from
+    /// [`Error::AtRestUnlockFailed`] — it is not a wrong/forged factor, it is a
+    /// closed door requiring re-authentication.
+    #[error("at-rest store is locked; re-authenticate to obtain a fresh SEK")]
+    AtRestLocked,
+
+    /// An at-rest artifact (SEK wrap, vault bundle, store segment, content object)
+    /// was structurally malformed on parse, or a KDF profile carried out-of-range
+    /// Argon2id parameters. Carries a static reason (ADR-010).
+    #[error("malformed at-rest artifact: {0}")]
+    MalformedAtRest(&'static str),
+
+    /// The Argon2id passphrase factor (`factor_pass`) could not be computed
+    /// (ADR-010 §Double-lock). The only realistic cause is an invalid parameter
+    /// profile reaching the KDF; surfaced as an error rather than panicking.
+    #[error("argon2id key derivation failed")]
+    Argon2Failed,
 }
