@@ -138,4 +138,29 @@ pub enum Error {
     /// Carries a static label naming the limit that was exceeded.
     #[error("declared size exceeds hard limit: {0}")]
     SizeLimitExceeded(&'static str),
+
+    /// A governance capability token was not in the closed ADR-007 vocabulary.
+    /// The evaluator's domain is closed: an unknown capability is a hard
+    /// verification failure, never silently ignored (ADR-007 §"Capability
+    /// vocabulary").
+    #[error("unknown governance capability")]
+    UnknownCapability,
+
+    /// A governance struct (genesis record, admin-delegation cert, consent
+    /// grant/revocation, admin-delegation revocation, policy update) was
+    /// structurally malformed on parse — bad arity, an out-of-domain enum, a
+    /// wrong-length digest/key, or a field forbidden by its schema (e.g. a
+    /// policy-update carrying `deniability_mode`). Carries a static reason
+    /// (ADR-007).
+    #[error("malformed governance struct: {0}")]
+    MalformedGovernance(&'static str),
+
+    /// The caller-supplied governance causal edges contain a cycle (an entry is
+    /// reachable from its own `causal_predecessors`). A real hash-linked log is
+    /// acyclic by construction — a link can only name an already-existing entry —
+    /// so this is malformed/adversarial input. The deterministic evaluator rejects
+    /// it rather than recursing without bound (ADR-007 / ADR-008 anti-abuse:
+    /// totality over *any* input, not just well-formed input).
+    #[error("governance causal graph contains a cycle")]
+    GovernanceCycle,
 }

@@ -75,6 +75,27 @@
 //!   payload-TTL policy (M8), and admitted-set population (M3/M6) are documented
 //!   seams, not stubs.
 //!
+//! Built on M0 + M1 + M4 + M5, milestone **M6** adds:
+//!
+//! - [`governance`] — membership, per-sender consent & admin governance
+//!   (ADR-007), Vox's headline differentiator. The self-certifying genesis record
+//!   (tag `0x000D`, `channelID = SHA-256(canonical genesis)`, consistent with M3's
+//!   derivation); the closed capability vocabulary + SPKI/SDSI/UCAN attenuation
+//!   lattice (`admin` ⊇ `delegate`/`invite`/`policy`/`passphrase-rotate` + the
+//!   ADR-013 tunnel caps `bind:`/`dial:`/`#role`); the composite-signed,
+//!   `(channelID, epoch)`-bound governance entry bodies that ride the M5 log
+//!   (admin-delegation cert `0x0003` and revocation `0x000E`, consent grant
+//!   `0x0004` and revocation `0x0005`, policy-update + passphrase-rotation
+//!   `0x0006`); the
+//!   **deterministic evaluator** — a total function of log state with
+//!   chain-to-genesis, monotonic attenuation, expiry, revocation-wins, and the
+//!   ascending-entry-hash tie-break — gated by a mandatory golden-vector suite;
+//!   emergent membership ("who can read whom" with no roster), monotonic
+//!   per-sender visibility, the inbound visibility opt-out, and the invite modes.
+//!   Tunnel-capability *use* (M11/ADR-013), SKDM *delivery* (M4), the CPace
+//!   passphrase re-key on rotation (M3/M5), and TTL erasure (M8) are documented
+//!   seams, not stubs.
+//!
 //! ## Engineering mantra (binding — see ADR-001)
 //! No stubs, no `todo!()`, no shortcuts. What ships is complete and correct.
 //! Every module here carries its own tests and, where the ADRs name a release
@@ -88,6 +109,7 @@
 
 pub mod cbor;
 pub mod error;
+pub mod governance;
 pub mod group;
 pub mod hash;
 pub mod identity;
