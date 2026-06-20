@@ -33,6 +33,15 @@ identity, `(channelID, epoch)` binding (ADR-006), monotonic per-author sequence 
 hash-links, the issuer's certificate chain reference, and a composite Ed25519+ML-DSA signature
 (ADR-002/ADR-003).
 
+**Canonical encoding & evaluator (required for interop and safety).** Every certificate/grant has a
+**deterministic canonical serialization** (a single, versioned, canonical-CBOR layout with fixed field
+order and a type tag) signed under a **per-type domain-separation string** (e.g. `vox/cert/admin-deleg/v1`).
+Authorization is decided by a **single deterministic evaluator** — input: the requester's cert chain +
+the channel's current log state; output: granted/denied + the governing capability — specified with a
+mandatory suite of **golden test vectors** (valid chains, over-attenuation, expiry, revoked links,
+concurrent-conflict cases). Two correct implementations MUST agree bit-for-bit on every vector; this is
+a release gate for the governance layer (not an open detail).
+
 - **Admin delegation cert** — issued by an admin, names a delegate identity key and the granted
   capability set, optionally *attenuated* (e.g. `invite` but not `delegate`) and optionally with an
   expiry. Delegations chain to genesis, forming an SPKI/SDSI/UCAN-style capability tree the client
@@ -50,11 +59,27 @@ hash-links, the issuer's certificate chain reference, and a composite Ed25519+ML
 - **Policy update** — issued by an admin, changes channel policy (history/forward-only,
   deniable/attributable, TTL). Takes effect from its causal position forward.
 
+### Invite modes (who may join, and how `N`'s identity is known)
+
+A channel admin chooses, per channel, between two explicit invite modes:
+- **Identity-bound invite (default for high-trust channels).** The invite names the newcomer's
+  identity fingerprint in advance; an admin pre-signs a membership cert (or an invite cert) for that
+  identity, so the joiner is known before they arrive and admission is one-step. No "unknown person in
+  the lobby."
+- **Open passphrase lobby.** Anyone with `channelID + passphrase` may complete the join (ADR-005) and
+  appear in a **lobby** as an *unverified, not-yet-admitted* identity (their self-asserted identity
+  key, shown with an explicit "unverified" state, ADR-014). An admin must then explicitly admit them
+  (membership cert), and members consent individually. Until admitted, a lobby identity reads only
+  ciphertext and cannot post governance entries.
+
+This removes the previously-undefined "unknown joiner" state: every joiner is either pre-bound to an
+identity or sits in the lobby as explicitly-unverified until an admin acts.
+
 ### Admission and per-sender consent flow
 
 1. `N` completes the CPace join (ADR-005) and establishes pairwise PQXDH sessions (ADR-004) with
    whichever members it meets. Holding channel credentials yields **no** sender keys — `N` can read
-   nothing yet.
+   nothing yet (and, in open-lobby mode, `N` shows as an unverified lobby identity).
 2. An admin issues a **membership cert** for `N` (eligibility). This does not grant readability.
 3. `N` broadcasts its own SKDM to members (it has nothing to consent over; others reading `N`
    depends on each of them, symmetric to the rule below).
@@ -103,6 +128,14 @@ reconciles** (ADR-008). The model is chosen so most actions never truly conflict
 - **Admin authority is monotonic + revocable.** A key is an admin iff some valid delegation chain to
   genesis grants it and no causally-later authorized revocation supersedes it; ties resolve by the
   same removal-wins rule. Attenuation prevents privilege escalation regardless of ordering.
+- **Anti-griefing on revocation.** "Removal wins" combined with partition-time equivocation lets a
+  *delegated* admin grief a victim by repeated revoke/re-add flapping (the grief direction always wins
+  the race). Mitigations (binding): revocation of a **member's own consent** is always allowed (it is
+  `A`'s own decision), but **admin membership-revocation churn is rate-limited and surfaced** — more
+  than a small threshold of revoke/re-add cycles on one subject within a window is flagged as
+  admin-abuse in the UI (ADR-014), and a channel MAY require membership revocations to be **root-admin
+  or M-of-N admin** rather than any single attenuated delegate. Delegated `invite`-only admins cannot
+  revoke at all unless explicitly granted the `revoke` capability.
 
 ### Enforcement honesty
 

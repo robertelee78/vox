@@ -60,6 +60,16 @@ the identity key still cannot read a channel's store without that channel's pass
 passphrase alone is useless without the identity. SEK is per-channel, so one channel's passphrase
 never opens another's store.
 
+**Post-quantum strength of the at-rest factors (stated, not assumed).** The Ed25519 `id_proof` is
+*classical* — a future quantum adversary with the device could forge it — so the at-rest scheme's
+**post-quantum strength rests on the `factor_pass` (Argon2id over the channel passphrase)**, which is
+PQ-resistant. This is acceptable because device-seizure at rest requires the passphrase regardless;
+but it is stated explicitly so the at-rest boundary is not mis-sold as PQ-from-the-identity-key. Where
+a fully-PQ at-rest identity factor is wanted, use the hardware-stored-secret variant above (the secret,
+not a quantum-forgeable signature, gates unlock). `factor_pass` parameters: **Argon2id, ≥256 MB,
+≥3 passes, per-channel random 128-bit salt**; the wrap AEAD is per-segment with random nonces; the
+store records a KDF-profile version so parameters can be raised over time with transparent re-wrap.
+
 ### Passphrase rotation interaction
 
 The local SEK is **independent of the channel passphrase value**, so rotation never re-encrypts the

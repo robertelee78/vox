@@ -51,10 +51,10 @@ key rotation and passphrase-epoch rotation (ADR-007), not on ratchet self-healin
 - **Replay / window:** accept a message only if its `iteration` advances the receiver's last-seen
   value for `(author_id, chain_id)`; cache a **bounded** set of skipped per-iteration message keys
   for out-of-order delivery (same `MAX_SKIP` discipline as ADR-004); reject beyond the bound.
-- **Rotation cadence:** a sender rotates its sender key (new `chain_id`) on every membership change
-  affecting it (revocation, ADR-007) and additionally on a scheduled bound (max `N` messages or max
-  `T` time) to cap the post-compromise exposure window; passphrase-epoch rotation supersedes all
-  per-sender chains.
+- **Rotation cadence (concrete defaults, channel-policy-tunable):** a sender rotates its sender key
+  (new `chain_id`) on every membership change affecting it (revocation, ADR-007) and additionally on a
+  scheduled bound — **default max `N` = 1000 messages or max `T` = 7 days, whichever first** — to cap
+  the post-compromise exposure window; passphrase-epoch rotation supersedes all per-sender chains.
 - **Compromise recovery:** because there is no self-heal, recovery is an explicit `chain_id` rotation
   redistributed to current consenters (ADR-007); the schedule above bounds how long a leaked sender
   key remains useful.

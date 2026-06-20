@@ -50,13 +50,21 @@ concrete, non-bypassable layers rather than rate-limiting alone:
    membership — until an admin admits the joiner (membership cert) and members individually consent
    (ADR-007). Online passphrase-guessing therefore buys an attacker only the ability to sit in the
    swarm receiving ciphertext; it does not yield content or membership.
-2. **Channel/epoch-bound proof-of-work join tokens.** Each join attempt must carry a PoW token bound
-   to `(channelID, epoch, responder-nonce)`, so tokens cannot be precomputed or replayed across
-   channels/epochs — imposing a per-attempt cost that throttles online guessing at the swarm edge.
+2. **Channel/epoch-bound proof-of-work join tokens (concrete).** Each join attempt carries a PoW token
+   bound to `(channelID, epoch, responder-nonce)` so tokens cannot be precomputed or replayed across
+   channels/epochs. **Concrete function:** a *memory-hard* PoW (Argon2id over the bound tuple, ~64 MB)
+   to deny GPU/ASIC advantage; **default target solve ≈ 1–2 s on a mobile CPU**, with the responder
+   advertising a difficulty it adapts upward under load and downward when idle (difficulty is itself in
+   the signed responder-nonce so the prover cannot lie about it); **verifier cost is a single Argon2id
+   check (~ms)**, so verification never becomes the DoS. Accessibility note: difficulty caps keep
+   low-end devices usable; an invite-only channel may set difficulty to zero (admission is the gate).
 3. **Admission is admin-signed.** Final entry to the member set requires an admin-signed membership
    certificate (ADR-007); no amount of passphrase guessing produces one.
 
 Rate-limiting by peers remains a cheap first filter but is explicitly **not** the security boundary.
+**Bandwidth abuse beyond join** (an admitted member spamming the log or rendezvous, or forcing
+render-gating amplification) is bounded by the per-author log quotas (ADR-008) and rendezvous-record
+caps (ADR-012), not by join PoW.
 
 ## Consequences
 

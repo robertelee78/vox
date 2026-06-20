@@ -68,6 +68,13 @@ Two distinct, separately-keyed layers, each binding the Vox identity:
   negotiated group); offering only hybrid PQ groups removes any downgrade target; the negotiated
   suite is additionally recorded in the application session-establishment entry so downgrade is
   detectable end-to-end.
+- **Interop is a release criterion, and failure is hard (no silent fallback).** Because Vox offers
+  *no* classical-only group, a peer or library that cannot negotiate the required hybrid group simply
+  **fails to connect with a clear, surfaced error** — it never silently downgrades. The supported
+  provider set (quinn + rustls with the X25519MLKEM768 hybrid provider, version-pinned) and a
+  cross-version **interop test matrix** (each supported client/library pair must complete the handshake
+  + identity-PoP) are explicit release gates, not assumptions. The required-suite floor is versioned
+  (ADR-003) so the matrix advances deliberately.
 
 ### Two contracts on one connection
 

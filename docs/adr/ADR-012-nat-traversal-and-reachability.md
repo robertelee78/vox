@@ -49,6 +49,12 @@ rendezvous point can double as the hole-punch coordination channel for 3+-member
 **Privacy:** because the rendezvous key is `(channelID, epoch)`-derived, a leaked key expires at the
 next epoch (limiting swarm-presence tracking to that epoch); full unlinkability against a global
 observer is the later metadata-privacy phase (ADR-001), stated, not silently omitted.
+**Caps (anti-spam):** a member may publish **at most one current rendezvous record per
+`(author_id, channelID, epoch)`**, refreshed **no more often than every 60 s** (records refreshing
+faster, or extra records, are rejected by readers); records carry a short TTL (default 2 h) and are
+endpoint-minimized (publish only the addresses needed for the reachability ladder). A revoked member's
+records are ignored once the revocation entry (ADR-007) is seen. This bounds rendezvous-record spam
+even from an admitted member.
 
 **Bootstrap (concrete, no third-party security dependency).** Cold-start onto the swarm uses a
 **configurable bootstrap set the user controls**: by default the user's own always-on node (the

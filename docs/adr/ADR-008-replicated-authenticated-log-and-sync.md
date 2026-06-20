@@ -91,10 +91,16 @@ because automated punishment is only safe when the conflicting entries are *attr
   authority actions (admin grant/revoke) are treated as *provisional* until their causal neighborhood
   reconciles (ADR-007).
 
-**Abuse resistance.** Only entries from admitted members (ADR-007) are accepted into a channel's log,
-so unauthenticated floods cannot enter. Replication is bounded by per-author rate/size quotas (each
-peer caps what it stores/relays per author per epoch). Pruning is *authenticated*: a payload may be
-dropped per TTL, but its signed skeleton entry remains, so pruning can never silently rewrite history.
+**Abuse resistance (quantified).** Only entries from admitted members (ADR-007) are accepted into a
+channel's log, so unauthenticated floods cannot enter. Replication is bounded by **per-author quotas
+each peer enforces locally** — **defaults (channel-policy-tunable): ≤ 1000 entries/hour and
+≤ 50 MB/epoch per author**; over-quota entries from that author are dropped (not relayed) and the
+over-quota event is surfaced as an admin-abuse signal (like revocation churn). This directly bounds
+the **render-gating amplification** vector — because every ciphertext replicates to all members
+(§"Render-gating"), an admitted member could otherwise force O(members) storage; the per-author byte
+cap is what makes that cost finite, and a member may always decline to relay/store beyond a peer's
+own configured ceiling. Pruning is *authenticated*: a payload may be dropped per TTL, but its signed
+skeleton entry remains, so pruning can never silently rewrite history.
 
 ## Consequences
 
