@@ -1,9 +1,9 @@
 # ADR-012: NAT Traversal, Bootstrap, and Reachability
 
-- **Status**: proposed
-- **Date**: 2026-06-19
-- **Deciders**: Robert E. Lee <robert@agidreams.us>
-- **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
+**Status**: proposed
+**Date**: 2026-06-19
+**Deciders**: Robert E. Lee <robert@agidreams.us>
+**Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
 
 ## Context
 
@@ -67,5 +67,17 @@ the user's own node.
 - Reachability improves over time as IPv6 deployment grows (~41–50% single-endpoint and climbing).
 
 ## Links
-- Depends on: ADR-005, ADR-011.
+**Depends on**: ADR-005, ADR-011.
 - Depended on by: ADR-013, ADR-014.
+
+## Engineering Mantra
+
+These principles are binding on all work under this ADR:
+
+- **Do not be lazy.** Plenty of time to do it right.
+- **No shortcuts.** Every component is built to production quality from day one.
+- **Never make assumptions.** Dive deep before writing a single line of code.
+- **Measure three times, cut once.** Verify designs, implementations, and outputs.
+- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
+- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
+- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.

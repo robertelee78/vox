@@ -1,9 +1,9 @@
 # ADR-008: Replicated Authenticated Log and Sync
 
-- **Status**: proposed
-- **Date**: 2026-06-19
-- **Deciders**: Robert E. Lee <robert@agidreams.us>
-- **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
+**Status**: proposed
+**Date**: 2026-06-19
+**Deciders**: Robert E. Lee <robert@agidreams.us>
+**Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
 ## Context
 
@@ -66,5 +66,17 @@ revocations are log entries, so they replicate and converge causally across the 
   consent + crypto layered on top.
 
 ## Links
-- Depends on: ADR-002, ADR-006, ADR-007.
+**Depends on**: ADR-002, ADR-006, ADR-007.
 - Depended on by: ADR-009, ADR-010, ADR-011.
+
+## Engineering Mantra
+
+These principles are binding on all work under this ADR:
+
+- **Do not be lazy.** Plenty of time to do it right.
+- **No shortcuts.** Every component is built to production quality from day one.
+- **Never make assumptions.** Dive deep before writing a single line of code.
+- **Measure three times, cut once.** Verify designs, implementations, and outputs.
+- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
+- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
+- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.

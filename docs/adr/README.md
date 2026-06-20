@@ -34,3 +34,15 @@ All ADRs are **proposed**; they are grounded in a multi-pass research effort (Si
 Sender Keys/Megolm, MLS, SSB/Hypercore/Merkle-DAG, CPace/PAKE, QUIC/DCUtR, NAT/IPv6, deniable
 authentication). Later capabilities (voice/video, iOS, Linux client, metadata/traffic-analysis
 resistance) will be added as further ADRs.
+
+## Engineering Mantra
+
+These principles are binding on all work under this ADR:
+
+- **Do not be lazy.** Plenty of time to do it right.
+- **No shortcuts.** Every component is built to production quality from day one.
+- **Never make assumptions.** Dive deep before writing a single line of code.
+- **Measure three times, cut once.** Verify designs, implementations, and outputs.
+- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
+- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
+- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.
