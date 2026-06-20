@@ -1,4 +1,6 @@
-# Ruflo / Claude-Flow runtime artifacts (regenerable, not source)
+# Ruflo / Claude-Flow config + runtime artifacts (local, not source)
+.claude/
+CLAUDE.md
 .claude-flow/
 ruvector.db
 agentdb.rvf
