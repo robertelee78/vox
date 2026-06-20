@@ -68,14 +68,20 @@ canonical bytes are never cross-interpreted (the serialization analogue of ADR-0
 
 | Tag | Struct | Tag | Struct |
 |---|---|---|---|
-| `0x0001` | log-entry | `0x0007` | rendezvous-record (ADR-012) |
-| `0x0002` | SKDM (ADR-006) | `0x0008` | pre-join-record (ADR-012) |
-| `0x0003` | admin/governance cert (ADR-007) | `0x0009` | tls-identity-extension (ADR-011) |
-| `0x0004` | consent-grant (ADR-007) | `0x000A` | chunk-manifest (ADR-014) |
-| `0x0005` | consent-revocation (ADR-007) | `0x000B` | dgka-setup (ADR-009) |
-| `0x0006` | policy/passphrase-rotation (ADR-007) | `0x000C` | self-channel-entry |
+| `0x0001` | log-entry | `0x000A` | chunk-manifest (ADR-014) |
+| `0x0002` | SKDM (ADR-006) | `0x000B` | dgka-setup (ADR-009) |
+| `0x0003` | admin/governance cert (ADR-007) | `0x000C` | self-channel-entry |
+| `0x0004` | consent-grant (ADR-007) | `0x000D` | genesis-record (ADR-007) |
+| `0x0005` | consent-revocation (ADR-007) | `0x000E` | admin-delegation-revocation (ADR-007) |
+| `0x0006` | policy/passphrase-rotation (ADR-007) | `0x000F` | service-advertisement (ADR-013) |
+| `0x0007` | rendezvous-record (ADR-012) | `0x0010` | esk-publication (ADR-009) |
+| `0x0008` | pre-join-record (ADR-012) | `0x0011` | session-establishment (ADR-011) |
+| `0x0009` | tls-identity-extension (ADR-011) | | |
 
-New struct types are appended here (versioned), preserving the single canonical encoding.
+Each tag has a matching domain-separation label `vox/<struct>/v1`. New struct types are appended here
+(versioned), preserving the single canonical encoding. (Note: this struct-tag space is **disjoint from**
+the ADR-003 ciphersuite-ID space — `0x0001` here = `log-entry`, `0x0001` there = `vox-suite-1`; they
+never co-occur on the wire, so the numeric overlap is not a collision.)
 
 **Sync = anti-entropy (concrete frames).** All sync frames are canonical-CBOR (above), each prefixed by
 a **1-byte frame ID**. Mode is negotiated by the opening `HELLO` frame's **mode bitmap** (bit 0 =
@@ -88,9 +94,18 @@ frontier, bit 1 = range-reconciliation); both peers use the highest bit both set
   frames (skeleton + any retained payloads) over a reliable QUIC stream (ADR-011).
 - **Range-reconciliation mode (used when both peers set bit 1; the default *above ~100 active authors*,
   where `HAVE` size dominates).** `NEG` frames carry Negentropy range-based set reconciliation over entry
-  hashes (logarithmic rounds). The Negentropy message body follows its published format, wrapped in the
-  Vox `NEG` frame so the Vox wire contract is fully self-described here. Frontier is mandatory;
-  range-reconciliation is an additional required capability for scale.
+  hashes (logarithmic rounds). The `NEG` body is **Negentropy v1** keyed by the **full 32-byte SHA-256
+  entry hash** (no truncation), wrapped in the Vox `NEG` frame so the Vox wire contract is fully
+  self-described here. Frontier is mandatory; range-reconciliation is an additional required capability
+  for scale.
+
+**Abort / error signalling (normative).** Every hard-fail in the wire ADRs (floor-violation, ADR-003;
+unknown struct tag or algo ID; sync mode mismatch; signature/authenticator failure; quota breach) is
+surfaced — never silently downgraded — by **closing the QUIC stream (or connection) with a Vox
+application error code**: `0x01` protocol-version-unsupported, `0x02` suite-below-floor (ADR-003),
+`0x03` unknown-struct-tag, `0x04` unknown-algo-id, `0x05` authenticator-invalid, `0x06` quota-exceeded,
+`0x07` sync-mode-unsupported, `0x08` epoch-mismatch. The peer logs the coded reason and surfaces it
+(ADR-014). This is the single wire-error contract referenced by ADR-003/ADR-011.
 
 **Per-entry-type authentication (binding — resolves the deniable/governance split).** Authentication
 is chosen by entry TYPE, not merely by channel mode:
@@ -113,14 +128,15 @@ revocations are log entries, so they replicate and converge causally across the 
 
 **Personal self-channel (multi-device state, including received consent).** A user's own shared-root
 devices (ADR-002) share state through a **single-author self-log**: a log authored by the user's
-identity, encrypted to itself under a key derived **without reading raw private-key material** (so it
-works with non-exportable keys in gpg-agent/smartcard/Enclave, same trick as ADR-010's `id_proof`):
-`K_self = HKDF-SHA-256(Ed25519_sign(identity, "vox/self-channel/v1"), info="vox/self-channel/v1")`
-(the Ed25519 signature is deterministic, RFC 8032, so every device of the identity derives the same
-key). It is replicated **only among that identity's own devices** at the identity-keyed rendezvous
-`rendezvous_self = HKDF-SHA-256(identity_pub, info="vox/self-rzv/v1")` — the same HKDF rendezvous
-construction as ADR-005 (§Separate rendezvous), seeded by `identity_pub` instead of `channelID`; a
-device proves identity possession via the ADR-005 PoP to peer. It carries: local
+identity, keyed by a **dedicated random `self_seed`** (256-bit, generated at identity creation, stored
+in the identity vault and included in the encrypted identity backup, ADR-002; synced to a new device at
+enrollment alongside the root). Both the encryption key and the rendezvous derive from this **private**
+seed — never from a signature over a public constant (which a signing oracle could reproduce) and never
+from the *public* identity key (which would make the rendezvous locatable by anyone who knows it):
+`K_self = HKDF-SHA-256(self_seed, info="vox/self-channel/v1")` and
+`rendezvous_self = HKDF-SHA-256(self_seed, info="vox/self-rzv/v1")` (the ADR-005 rendezvous construction,
+seeded by the private `self_seed`). Replicated **only among that identity's own devices**; a device
+proves possession via the ADR-005 PoP to peer. It carries: local
 nicknames + verification state, and — load-bearing — **the SKDMs the identity has been consent-granted**
 (ADR-006) and per-channel join material. Because consent binds to an *identity* (ADR-006), syncing
 received SKDMs over the self-channel lets every shared-root device read what was consented to the

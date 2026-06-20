@@ -53,23 +53,35 @@ ephemeral composite (Ed25519+ML-DSA-65) signing keypair** `(esk_i, epk_i)`:
 1. **Commit.** `i` broadcasts `commit_i = SHA-256("vox/dgka-commit/v1" ‖ epk_i ‖ g^{x_i} ‖ n_i)` with a
    fresh 128-bit nonce `n_i`. (Commitments prevent adaptive key-choice.)
 2. **Reveal.** `i` broadcasts `(epk_i, g^{x_i}, n_i)`; everyone checks each `commit_i`. The group key is
-   `K = HKDF-SHA-256(ikm = BD-combine({g^{x_i}}) ‖ H(pairwise PQXDH root secrets, ADR-004),
-   info="vox/dgka/v1" ‖ channelID ‖ epoch)` — the Burmester–Desmedt/Bohli–Steinwandt combiner mixed with
-   each member's **pairwise PQXDH (ML-KEM-768) secrets**, so `K` is **hybrid-PQ** (secure if either the
-   DH or the ML-KEM leg holds). It is a **deniable** agreement: only ephemeral material enters it, **no
-   static signature**, so participation is authenticated by the signed envelope/membership (ADR-007), not
-   by a transferable signature on the key.
-3. **DSKE bind.** Each `i` signs the transcript `T = SHA-256(sorted{epk_*} ‖ sorted{g^{x_*}} ‖ channelID
-   ‖ epoch)` with `esk_i` and broadcasts the signature. This proves knowledge of `esk_i` and binds
-   `epk_i` to *this session’s transcript* — giving members real, **post-quantum** origin authentication
-   to each other (composite signature), **non-transferable** to outsiders because `epk_i` is never
-   cross-signed by `i`'s root identity (an outsider cannot tie `epk_i` to any identity).
+   `K = HKDF-SHA-256(ikm = BD-combine([g^{x_1}, …, g^{x_m}] sorted by author composite-pubkey),
+   info="vox/dgka/v1" ‖ channelID ‖ epoch)` — the Burmester–Desmedt/Bohli–Steinwandt combiner over the
+   ephemeral DH shares in **ascending-composite-pubkey order** (pinned so every member derives the *same*
+   `K`; the BD term order follows the standard published construction over that ordering). `K` is used
+   **only for epoch key-confirmation/binding (step 4), not as the content key**. It is a **deniable**
+   agreement: only ephemeral DH shares enter it, **no static signature on the key**. *(Note: `K` itself is
+   classical-DH; this is harmless because message **content** confidentiality is owned by the per-sender
+   Sender Keys (ADR-006), which are ML-KEM-768/PQXDH-distributed — see §Post-quantum instantiation. A
+   hybrid `K` is unnecessary since `K` only confirms the agreement.)*
+3. **DSKE bind.** Each `i` signs the transcript `T = SHA-256(epk_* ‖ g^{x_*} ‖ channelID ‖ epoch)`
+   — both lists in ascending author composite-pubkey order — with `esk_i` and broadcasts the signature,
+   proving knowledge of `esk_i` and binding `epk_i` to this session's transcript. This gives members
+   real **post-quantum origin authentication to each other** for the epoch's content.
+   **Honest deniability scope (important):** the `dgka-setup` envelope is root-signed (it must be an
+   accepted log entry, ADR-008), so it *is* transferable proof that identity `i` **participated** and
+   registered `epk_i` this epoch — consistent with mpENC **weak deniability** (participation is never
+   deniable). Consequently **live content authored under `esk_i` is attributable to `i` during the
+   epoch**; content-authorship repudiation is **retrospective**, taking effect at epoch end when `esk_i`
+   is published (step below), after which anyone could have forged it. This matches this ADR's scope —
+   *offline content repudiation against a later judge*, not live unlinkability. (The optional UDMVS
+   upgrade in §Post-quantum would add *live* non-transferability; not required for the threat model.)
 4. **Confirm.** Each `i` broadcasts `MAC_K(T)`; the session opens when all confirmations verify.
 
-Message content in the epoch is then signed with the author's `esk_i`. **At epoch end each member
-publishes its ephemeral *private* key `esk_i`**, so anyone can retroactively forge that epoch's content
-signatures → content authorship is repudiable (the deniability property), while *live* recipients got
-genuine PQ origin authentication during the epoch.
+Message content in the epoch is then signed with the author's `esk_i`. **At epoch end** — and only after
+the epoch has closed (a passphrase-rotation/epoch-increment is on the log; publishing earlier would void
+live authentication) — **each member publishes its ephemeral *private* key `esk_i`** as an
+`esk-publication` log entry (ADR-008 tag `0x0010`, root-signed envelope, body `{ epoch, esk_i }`). Anyone
+can then retroactively forge that epoch's content signatures → content authorship becomes repudiable (the
+deniability property), while *live* recipients got genuine PQ origin authentication during the epoch.
 
 ### Per-sender consent is preserved (critical)
 
@@ -86,7 +98,8 @@ A member who joins (and is newly consented to, ADR-007) between passphrase-epoch
 the prior epoch's (now-published, forgeable) keys. The **incremental DSKE re-key** is triggered by the
 consent-grant log entry naming the newcomer: each member that consented generates a fresh `(esk', epk')`,
 re-runs steps 3–4 (DSKE bind + confirm) against an updated transcript `T'` that includes the newcomer's
-`epk_new`, and distributes the result to the newcomer. The group key `K` (a confidentiality key, not an
+`epk_new` (members in `T'` ordered by ascending composite-pubkey, the same sort rule as `T`), and
+distributes the result to the newcomer. The group key `K` (a confidentiality key, not an
 authenticator) may be retained for the epoch, or re-derived if the join changes the DH set. Cost: one
 incremental bind+confirm round per such join (bounded; the FS window for the new verifiers is one re-key
 interval). This is the concrete answer to "consent is continuous but the DGKA is per-epoch."

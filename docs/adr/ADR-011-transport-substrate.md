@@ -36,13 +36,16 @@ which lacks per-stream backpressure — but QUIC is primary.)
   certificate carrying its Vox identity public key in a custom X.509 extension**, and signs
   `"vox-tls-handshake:" ‖ cert_public_key` with its **identity private key** (the composite
   Ed25519+ML-DSA key, ADR-002) — a proof-of-possession that binds the ephemeral TLS certificate key
-  to the long-term Vox identity. **Extension layout (concrete):** OID **`1.3.6.1.4.1.53594.1.1`** (under
-  the libp2p IANA PEN 53594, sub-arc reserved for Vox), `critical = false`, value = canonical-CBOR
-  (ADR-008) `{ composite_pubkey, pop_sig }` where `composite_pubkey` and `pop_sig` are the ADR-003
-  `0x03/0x04` composite encodings. The verifier derives the Vox identity from the extension and **MUST
-  require it to match the expected peer, aborting on mismatch.** This authenticates Vox identities in
-  the handshake without a CA and without RFC-7250 raw-public-key's out-of-band gap. (Production Rust
-  prior art: the `libp2p-tls` crate.)
+  to the long-term Vox identity. The PoP string `"vox-tls-handshake:" ‖ cert_public_key` is a
+  **TLS-layer signed string, deliberately outside** the ADR-008 CBOR struct-domain regime (it is not a
+  log struct). **Extension layout (concrete):** OID **`1.3.6.1.4.1.<VOX-PEN>.1.1`** where `<VOX-PEN>` is
+  a **Vox-owned IANA Private Enterprise Number** (registration pending; until assigned, builds use the
+  documented provisional arc and the interop matrix pins the exact OID — Vox does **not** squat on
+  libp2p's PEN 53594), `critical = false`, value = canonical-CBOR (ADR-008, tag `0x0009`)
+  `{ composite_pubkey, pop_sig }` (ADR-003 `0x03/0x04` composite encodings). The verifier derives the Vox
+  identity from the extension and **MUST require it to match the expected peer, aborting on mismatch**
+  (ADR-008 error `0x05`). This authenticates Vox identities without a CA and without RFC-7250's
+  out-of-band gap. (Production Rust prior art: the `libp2p-tls` crate's extension mechanism.)
 - **PQ authentication.** Because the identity-binding signature is the composite Ed25519+ML-DSA key,
   handshake authentication is post-quantum; the TLS certificate's own self-signature may be classical
   since authentication is carried by the PQ composite extension signature and confidentiality by the
@@ -69,8 +72,9 @@ Two distinct, separately-keyed layers, each binding the Vox identity:
   dropped.
 - **Downgrade prevention.** TLS 1.3's Finished MAC already binds the full transcript (including the
   negotiated group); offering only hybrid PQ groups removes any downgrade target; the negotiated
-  suite is additionally recorded in the application session-establishment entry so downgrade is
-  detectable end-to-end.
+  suite is additionally recorded in the application **session-establishment** entry (ADR-008 canonical
+  struct, tag `0x0011`, body `{ peer_id, suite_id, negotiated_group, ts }`) so downgrade is detectable
+  end-to-end.
 - **Interop is a release criterion, and failure is hard (no silent fallback).** Because Vox offers
   *no* classical-only group, a peer or library that cannot negotiate the required hybrid group simply
   **fails to connect with a clear, surfaced error** — it never silently downgrades. The supported

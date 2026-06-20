@@ -21,15 +21,17 @@ resolution under partition.
 
 ### Trust anchor: the genesis capability
 
-A channel begins with a **genesis record**: a self-signed root capability authored by the
-creator's identity key (ADR-002), carrying a **128-bit random nonce**, creation timestamp, the initial
-policy (history mode, deniability mode, TTL), and naming the creator as **root admin**, serialized
-canonically (ADR-008). The **`channelID` is defined as `SHA-256(canonical genesis record)`** — so it is
-256-bit, high-entropy (the nonce guarantees it), self-certifying, and bound to exactly one genesis: a
-cold-joining node fetches the genesis from the rendezvous (ADR-012) and accepts it **only if its hash
-equals the `channelID`** it joined with. The genesis hash is thus simultaneously the channelID, the
-rendezvous seed (ADR-005), and the root of every certificate chain; every authority claim must verify
-back to it.
+A channel begins with a **genesis record** — its own canonical struct (ADR-008 tag `0x000D`, domain
+`vox/genesis/v1`), **not** a generic governance cert — with this pinned, ordered field list:
+`{ nonce(16 B random), created(uint epoch-seconds), policy{ history_mode(enum), deniability_mode(enum),
+ttl(uint seconds, 0=never) }, creator_pubkey(composite, ADR-002), algo_ids }`, self-signed by the
+creator's composite identity key. The **`channelID` is defined as `SHA-256(canonical genesis record)`**
+— so it is 256-bit, high-entropy (the nonce guarantees it), self-certifying, and bound to exactly one
+genesis: a cold-joining node fetches the genesis from the rendezvous (ADR-012) and accepts it **only if
+its hash equals the `channelID`** it joined with. Because the field order/encoding is pinned, every
+implementation derives the *same* channelID from the same logical genesis. The genesis hash is thus
+simultaneously the channelID, the rendezvous seed (ADR-005), and the root of every certificate chain;
+every authority claim must verify back to it. The creator is **root admin** (holds `admin`, below).
 
 ### Certificate and grant schema
 
@@ -84,8 +86,24 @@ New capability types are added only here (versioned), preserving the single-eval
   entry** (it affects only `A`'s own view), and is reversible while `B` still consents to `A`. This is
   fully independent of outbound consent — the two functions answer two different questions ("who may
   read me" vs "whom do I read") and are set independently per member.
-- **Policy update** — issued by an admin, changes channel policy (history/forward-only,
-  deniable/attributable, TTL). Takes effect from its causal position forward.
+- **Policy update** — issued by a `policy`-capability holder, changes **history-mode and TTL** from its
+  causal position forward. **The deniability axis is genesis-immutable:** `deniability_mode` is set once
+  in the genesis record and a policy-update MUST NOT change it (an evaluator rejects a policy-update that
+  attempts to). Rationale: members join under a fixed authorship-accountability contract; flipping
+  attributable↔deniable mid-life would change the threat model under existing members and the
+  fork-handling split (ADR-008). History/TTL are retention conveniences with no such trust-contract
+  inversion, so they stay mutable.
+
+**Per-type body schemas (pinned, so the golden-vector gate is writable).** Beyond the common envelope
+above, each governance struct has this canonical body (ADR-008 tags in parentheses):
+- **admin-delegation cert** (`0x0003`): `{ delegate_pubkey(composite), capability_set[], expiry?(uint) }`.
+- **admin-delegation-revocation** (`0x000E`): `{ revoked_delegation_hash(32 B), reason?(enum) }` — the
+  first-class revocation the conflict rules below reference; removal-wins, ordered by the tie-break.
+- **consent-grant** (`0x0004`): `{ target_id(composite fpr), skdm_ref(32 B hash of the SKDM delivered
+  over ADR-004), history_mode_at_grant }` — the SKDM itself travels in the pairwise session, not inline;
+  the entry carries only its hash.
+- **consent-revocation** (`0x0005`): `{ target_id(composite fpr), new_chain_id }`.
+- **policy-update** (`0x0006`): `{ history_mode?, ttl? }` (never `deniability_mode`).
 
 ### Invite modes (how a joiner's identity is known — no admin "admit" step)
 

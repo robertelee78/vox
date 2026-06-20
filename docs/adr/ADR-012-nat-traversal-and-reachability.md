@@ -54,9 +54,13 @@ observer is the later metadata-privacy phase (ADR-001), stated, not silently omi
 **Caps (anti-spam):** a member may publish **at most one current rendezvous record per
 `(author_id, channelID, epoch)`**, refreshed **no more often than every 60 s** (records refreshing
 faster, or extra records, are rejected by readers); records carry a short TTL (default 2 h) and are
-endpoint-minimized (publish only the addresses needed for the reachability ladder). A revoked member's
-records are ignored once the revocation entry (ADR-007) is seen. This bounds rendezvous-record spam
-even from a joined member.
+endpoint-minimized (publish only the addresses needed for the reachability ladder). Rendezvous records are **epoch-scoped**: on passphrase rotation (new epoch, ADR-007) all prior-epoch
+records are invalid (wrong `(channelID, epoch)`) and anyone not given the new passphrase can no longer
+publish a valid record — that, not any per-member rendezvous revocation, is how the swarm sheds a
+party. (There is no "member revocation": swarm presence is not consent-gated — per-sender consent
+governs message *readability* only, ADR-007. A party whose message-consent was revoked is still present
+in the swarm at ciphertext level until the epoch rotates.) The per-`(author,channel,epoch)` cap bounds
+rendezvous-record spam even from a joined member.
 
 **Pre-join rendezvous record class (the join-bootstrap path, ADR-004/ADR-005).** A peer that has not
 yet completed the authenticated join publishes prekeys + endpoints in a **separate, clearly-typed

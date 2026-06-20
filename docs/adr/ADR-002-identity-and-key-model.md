@@ -88,7 +88,11 @@ key material and fingerprint-verification culture (ADR-001 principle 3):
   recovery against a compromised root is out-of-band re-verification of the new fingerprint. Root
   compromise remains unrecoverable by design — there is no central authority to appeal to.
 - **Backup** of the root (and its OpenPGP representation) is the user's responsibility; Vox
-  provides an explicit, encrypted export.
+  provides an explicit, encrypted export. The export also includes the **`self_seed`** — a 256-bit
+  random secret generated once at identity creation that keys the personal self-channel (ADR-008,
+  multi-device consent sync). It lives in the identity vault next to the root and is synced to a new
+  device at enrollment; it is a *private* secret (never derived from the public identity key), so the
+  self-channel rendezvous is not locatable by third parties.
 
 ### Multi-device
 

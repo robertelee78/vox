@@ -40,7 +40,10 @@ by its bandwidth cost (ADR-003).
 
 **Wire format & operational rules (so the ratchet is actually buildable):**
 - **Message header:** `{ ratchet_pubkey (DH), PN (previous-chain length), N (message number), algo_ids }`,
-  bound into the AEAD associated data along with the ciphersuite and `(channelID, epoch)`.
+  bound into the AEAD associated data along with the ciphersuite and `(channelID, epoch)`. **AD state
+  transition:** the *first* message of a session uses the KEM-binding AD from §Decision
+  (`transcript_hash ‖ kem_pub ‖ kem_ct ‖ suite_id ‖ channelID ‖ epoch`); *every subsequent* message uses
+  this header AD. The switch is exactly once, on the first post-handshake message.
 - **Out-of-order / skipped messages:** a receiver derives and **caches skipped message keys** up to a
   bounded `MAX_SKIP` per chain (with a total cap and expiry); messages beyond the bound are rejected
   rather than forcing unbounded computation (DoS guard). This is the standard Double Ratchet

@@ -74,9 +74,14 @@ suites are appended with an assigned rank, so the floor advances deliberately an
 downgrades. The canonical byte serialization shared by every signed structure is specified once in
 **ADR-008** and referenced everywhere, so the same bytes are signed and verified across all ADRs.
 
-**Phasing.** Day-one: PQ *confidentiality* (hybrid PQXDH) and hybrid signatures. Later increment:
-post-quantum *post-compromise security* in the ratchet (ADR-004), whose dominant cost is
-bandwidth (~2.3 KB per PQ ratchet message vs ~32 B), mitigated by chunking.
+**Scope of "post-quantum from the start" (precise, to avoid the false-deferral reading).** It means
+PQ **confidentiality** (hybrid PQXDH) and PQ **authentication** (composite Ed25519+ML-DSA) are present
+day one, everywhere. PQ **post-compromise security** in the ratchet (ADR-004) is a **distinct named
+capability with its own ADR**, not a deferred increment of confidentiality — it is separated because it
+is a different security property with a different cost profile (~2.3 KB per PQ ratchet message vs ~32 B,
+mitigated by chunking), exactly as voice/video, metadata/traffic-analysis resistance, and additional
+platforms are separate capabilities rather than "v1/v2" of one. Each is built complete when built; none
+is a stub or a half-promise inside another capability.
 
 ## Consequences
 

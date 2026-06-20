@@ -51,12 +51,27 @@ established substrate and marked as such. This ADR specifies the complete tunnel
   ADR-006). A member can thus enumerate only the services it is authorized to consume; an
   unauthorized member sees at most opaque ciphertext and cannot even learn a service exists. This
   resolves the otherwise-contradiction between discovery-gating and the replicate-all log.
-- **Consent + revocation gate tunnels.** Tunnel rights are bound to channel membership and
-  per-sender consent (ADR-007): revoking a member (or a passphrase-epoch rotation) revokes their
-  tunnel access going forward, exactly like message access.
+- **Chat membership grants NO tunnel reach — this is a hard invariant (but the two coexist freely in one
+  swarm).** Joining a channel, holding the passphrase, or being consented-to for *messages* conveys
+  **zero** tunnel reachability *by itself*. Tunnel capabilities are **never inherited from membership** —
+  they are **explicitly granted per member** (`bind:`/`dial:`). A **single swarm can absolutely carry
+  both comms and tunnels at once** (the compute-node case: the admin grants `dial:`/`bind:` to the
+  members that need them, in the same channel that also carries chat); what is forbidden is *automatic*
+  tunnel access falling out of chat membership. So the "here, join my chat" → "now I'm on your LAN" path
+  is structurally impossible: a chat invitee with no explicit `dial:` grant cannot enumerate or reach any
+  service (dark services, default-deny, above), even with full message consent and a valid ULA address —
+  while a teammate you *do* grant `dial:#ssh-hosts` reaches exactly that service and nothing more.
+- **Tunnel authorization is capability-gated and epoch-bound — orthogonal to message consent.** A tunnel
+  is reachable only by a member holding a valid, unrevoked `dial:<service>` capability (ADR-007 lattice)
+  for the current epoch. Revoking a tunnel = revoking that **capability** (admin-delegation-revocation,
+  ADR-007) or rotating the passphrase (epoch). **Revoking per-sender *message* consent / Block (ADR-007)
+  does NOT touch tunnel access, and vice-versa** — the two axes are independent (chat readability vs
+  service capability); a member can be blocked in chat yet retain a granted tunnel, or have a tunnel
+  revoked while remaining a full chat participant.
 - **SSH-CA mapping (concrete).** "ssh over Vox" uses the member's verified Vox identity (ADR-002) as
   the authority. Vox issues a standard **OpenSSH certificate** with this field mapping: `key_id` = the
-  Vox identity fingerprint; `valid_principals` = the granted role/service tags (e.g. `#ops`);
+  Vox identity fingerprint; `valid_principals` = the granted role/service tags used **verbatim** as principals (the `#`-prefixed
+  tag string, no transformation — e.g. `#ops` is the principal `#ops`, not `ops`);
   `critical_options`/`extensions` carry the governing Vox capability (`dial:<service>`); `valid_after/
   before` = a short window (**default 5 min**). It is signed by the **channel SSH-CA key**, which is an
   `admin`-delegated capability cert in the ADR-007 tree. The SSH host trusts that CA pubkey via an
@@ -67,14 +82,19 @@ established substrate and marked as such. This ADR specifies the complete tunnel
 
 - **Identity-derived addressing (concrete derivation).** For the TUN model, each member's address is
   `addr = 0xFD ‖ high-120-bits( SHA-256("vox/ula/v1" ‖ composite_identity_pubkey) )` — a self-certifying
-  /128 in the `fd00::/8` ULA range (CGA/Yggdrasil-style). It is unforgeable (bound to the key), needs no
+  /128 in the `fd00::/8` range (CGA/Yggdrasil-style). It is unforgeable (bound to the key), needs no
   allocation, and a peer **verifies** an address by recomputing it from the claimed identity; 128-bit
-  output makes collision negligible. For the SOCKS/forward model, services are addressed logically by
+  output makes collision negligible. **This is intentionally *not* RFC-4193-conformant ULA addressing**
+  (no 40-bit pseudo-random Global ID + 16-bit subnet structure) — it is Vox-CGA-style and must not be
+  expected to interoperate with other ULA users sharing a link. **An address grants no reachability** —
+  services are dark/default-deny and capability-gated (above); holding a ULA address ≠ being able to
+  reach anything. For the SOCKS/forward model, services are addressed logically by
   `(member identity, service name)`.
 - **Channel-scoped resolution (single mechanism, consistent with discovery-gating above).** A service
-  advertisement is an **audience-encrypted log entry**: an inner signed record `(member, service,
-  endpoint)` sealed to the current Dial-grant set (keyed per-recipient like an SKDM, ADR-006) and
-  carried as an opaque payload on the replicate-all log (ADR-008). A requester resolves a name purely
+  advertisement is an **audience-encrypted log entry**: an inner signed record — the **`service-advertisement`
+  struct (ADR-008 tag `0x000F`, domain `vox/service-ad/v1`, body `{ member_id, service_tag, endpoint }`)** —
+  sealed to the current Dial-grant set (keyed per-recipient like an SKDM, ADR-006) and carried as an opaque
+  payload on the replicate-all log (ADR-008). A requester resolves a name purely
   by **locally decrypting** the ads it is authorized for; it cannot read or even enumerate ads for
   Dial sets it is not in. There is **no responder-side "filter per requester"** (the log has no
   responder). On a Dial-set change (grant/revoke, ADR-007) the advertiser re-publishes a re-sealed ad.

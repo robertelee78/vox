@@ -197,6 +197,17 @@ reason to withhold the surface or ship it incomplete.
   reachable)" and current status; show sync progress and node/rendezvous status (patterns informed by
   Briar/SimpleX intermittent-connectivity UX; designed, evidence-gap noted).
 
+### Tunneling — OFF by default in the chat client
+
+- **The human chat client ships with tunneling disabled and out of sight.** A normal chat user never
+  encounters a tunnel surface: no service list, no `bind`/`dial`, no TUN interface. This matches the
+  protocol invariant that tunnel access is never inherited from chat membership (ADR-013) — the GUI
+  simply does not expose it by default.
+- **Tunneling is an explicit opt-in** (an Advanced/Power-User toggle, or the headless node's config for
+  compute-node swarms). Enabling it reveals the ADR-013 surfaces (`vox service add`, `vox forward`,
+  `vox up`) and the per-member `bind:`/`dial:` capability grants. A swarm can carry both chat and
+  tunnels at once (ADR-013), but in a chat-only deployment the feature stays dark.
+
 ### Notifications
 
 - **Serverless local notifications.** A background **LaunchAgent** keeps the node syncing; on a new

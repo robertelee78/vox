@@ -49,7 +49,8 @@ Pairwise CPace-on-meet between members; no bespoke group PAKE (GPAKE is immature
   this exact derivation.
 - **Same construction, other seeds.** The rendezvous KDF generalizes: any high-entropy seed `S` yields
   `rendezvous = HKDF-SHA-256(S, info=<label>)`. The personal self-channel (ADR-008) uses this with
-  `S = identity_pub` (label `"vox/self-rzv/v1"`) to let a user's own shared-root devices meet.
+  `S = self_seed` — the **private** per-identity self-channel secret (ADR-002), *not* the public
+  identity key — so a user's own shared-root devices meet at a rendezvous no third party can locate.
 - **passphrase → CPace secret only.**
 
 **Post-join.** A successful CPace run bootstraps a PQXDH/Double-Ratchet pairwise session (ADR-004).
@@ -66,13 +67,18 @@ concrete, non-bypassable layers rather than rate-limiting alone:
    only the ability to sit in the swarm receiving ciphertext; it never yields readable content.
 2. **Channel/epoch-bound proof-of-work join tokens (concrete).** Each join attempt carries a PoW token
    bound to `(channelID, epoch, responder-nonce)` so tokens cannot be precomputed or replayed across
-   channels/epochs. **Concrete function:** a *memory-hard* PoW (Argon2id over the bound tuple, ~64 MB)
-   to deny GPU/ASIC advantage; **default target solve ≈ 1–2 s on a mobile CPU**, with the responder
-   advertising a difficulty it adapts upward under load and downward when idle (difficulty is itself in
-   the signed responder-nonce so the prover cannot lie about it); **verifier cost is a single Argon2id
-   check (~ms)**, so verification never becomes the DoS. Accessibility note: difficulty caps keep
-   low-end devices usable; an invite-only (identity-bound) channel may set difficulty to zero
-   (per-sender consent is the gate).
+   channels/epochs. **Concrete function:** an *asymmetric memory-hard* PoW — **Equihash `(n=200, k=9)`**
+   (Zcash parameters) — chosen precisely because it is **memory-hard to *solve* (denies GPU/ASIC
+   advantage) yet cheap to *verify*** (a few hashes + XOR checks, sub-millisecond), so verification is
+   never itself the DoS (a plain Argon2id PoW does **not** have this property — verifying it costs the
+   same memory-hard work as solving it, which is why Equihash is used here). **Default target solve
+   ≈ 1–2 s on a mobile CPU**; the responder advertises a difficulty (Equihash effective-difficulty
+   filter on the solution hash) it adapts upward under load and downward when idle, carried in the
+   signed responder-nonce so the prover cannot lie about it. Accessibility note: difficulty caps keep
+   low-end devices usable. An **identity-bound (invite) channel defaults to a *low but non-zero* PoW
+   (≈200–500 ms)** — not zero — so a leaked channelID cannot cheaply flood the swarm; literal zero is
+   reserved for explicitly LAN/closed deployments. Per-sender consent remains the real read-gate
+   regardless.
 3. **Identity-bound log acceptance + per-author quotas.** Joining the swarm grants no authority to be
    *rendered*: the causal log accepts entries only from identities that completed the authenticated
    join and carry valid per-author composite signatures, each bounded by per-author entry/byte quotas
