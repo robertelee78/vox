@@ -46,67 +46,75 @@ a release gate for the governance layer (not an open detail).
   capability set, optionally *attenuated* (e.g. `invite` but not `delegate`) and optionally with an
   expiry. Delegations chain to genesis, forming an SPKI/SDSI/UCAN-style capability tree the client
   verifies independently. No capability can exceed its issuer's (monotonic attenuation).
-- **Membership cert** — issued by an admin holding the `invite` capability, names the newcomer's
-  identity key and admits them to the channel (eligibility to participate). Attributable and durable
-  (this is why membership is *not* deniable — ADR-009).
-- **Consent grant** — issued by an *individual member* `A`, names a target member `N`, and is the
-  act of releasing `A`'s Sender Key to `N`: `A` encrypts `A`'s current SKDM (ADR-006) to `N` over
-  their pairwise channel (ADR-004) and records a consent-grant entry. This is the per-sender consent
-  primitive — entirely `A`'s decision, authored only by `A`.
-- **Revocation** — a *consent revocation* (member `A` withdraws `N`'s access to `A`'s future
-  messages) or a *membership revocation* (an admin removes `N` from the channel). Triggers sender-key
-  rotation excluding the target (below).
+- **Consent grant** — issued by an *individual member* `A`, names a target `N`, and is the act of
+  releasing `A`'s Sender Key to `N`: `A` encrypts `A`'s current SKDM (ADR-006) to `N` over their
+  pairwise channel (ADR-004) and records a consent-grant entry. This is the per-sender consent
+  primitive — entirely `A`'s decision, authored only by `A`. **Membership is emergent, not an admin
+  cert:** you are in the swarm by holding the passphrase (ADR-005), and you are *readable* by whoever
+  has consent-granted to you. There is no admin-issued membership certificate and no admin-maintained
+  member roster.
+- **Consent revocation** *(outbound — "should a given member see messages from me?")* — member `A`
+  withdraws `N`'s access to `A`'s *future* messages; authored only by `A`, it rotates `A`'s own sender
+  key (`chain_id`) excluding `N` (below). There is **no admin per-member removal** — an admin removes
+  people only by rotating the channel passphrase (bulk; below).
+- **Visibility opt-out** *(inbound — "do I want to see messages from them?")* — a **separate,
+  purely receiver-side** control: `A` chooses to stop seeing `B`'s messages by discarding/ignoring
+  `B`'s sender key and not rendering `B`. It needs no cooperation from `B`, creates **no governance
+  entry** (it affects only `A`'s own view), and is reversible while `B` still consents to `A`. This is
+  fully independent of outbound consent — the two functions answer two different questions ("who may
+  read me" vs "whom do I read") and are set independently per member.
 - **Policy update** — issued by an admin, changes channel policy (history/forward-only,
   deniable/attributable, TTL). Takes effect from its causal position forward.
 
-### Invite modes (who may join, and how `N`'s identity is known)
+### Invite modes (how a joiner's identity is known — no admin "admit" step)
 
-A channel admin chooses, per channel, between two explicit invite modes:
-- **Identity-bound invite (default for high-trust channels).** The invite names the newcomer's
-  identity fingerprint in advance; an admin pre-signs a membership cert (or an invite cert) for that
-  identity, so the joiner is known before they arrive and admission is one-step. No "unknown person in
-  the lobby."
-- **Open passphrase lobby.** Anyone with `channelID + passphrase` may complete the join (ADR-005) and
-  appear in a **lobby** as an *unverified, not-yet-admitted* identity (their self-asserted identity
-  key, shown with an explicit "unverified" state, ADR-014). An admin must then explicitly admit them
-  (membership cert), and members consent individually. Until admitted, a lobby identity reads only
-  ciphertext and cannot post governance entries.
+How a newcomer's identity is established, chosen by whoever shares the channel. Neither mode involves
+an admin admitting anyone — membership is consent-based:
+- **Identity-bound invite (high-trust default).** The out-of-band invite names the newcomer's identity
+  fingerprint, so members know which identity to expect and verify before consent-granting. The joiner
+  is recognized on arrival.
+- **Open passphrase join.** Anyone with `channelID + passphrase` joins the swarm (ADR-005) and appears
+  to members as an *unverified* self-asserted identity (shown explicitly as unverified, ADR-014).
+  Members verify the fingerprint and consent at will; until a member consents, the joiner reads only
+  that member's ciphertext.
 
-This removes the previously-undefined "unknown joiner" state: every joiner is either pre-bound to an
-identity or sits in the lobby as explicitly-unverified until an admin acts.
+The passphrase gates the swarm; per-sender consent gates reading. There is no admin admission.
 
-### Admission and per-sender consent flow
+### Join and per-sender consent flow
 
-1. `N` completes the CPace join (ADR-005) and establishes pairwise PQXDH sessions (ADR-004) with
-   whichever members it meets. Holding channel credentials yields **no** sender keys — `N` can read
-   nothing yet (and, in open-lobby mode, `N` shows as an unverified lobby identity).
-2. An admin issues a **membership cert** for `N` (eligibility). This does not grant readability.
-3. `N` broadcasts its own SKDM to members (it has nothing to consent over; others reading `N`
-   depends on each of them, symmetric to the rule below).
-4. Each existing member `A` independently decides whether to consent. On consent, `A` issues a
-   **consent grant** (sends `A`'s SKDM to `N`). Until `A` does so, `A`'s messages remain
-   undecryptable to `N` — forever if `A` never consents. `N`'s readable view of the channel fills
-   in **monotonically, per sender**.
+1. `N` joins via CPace (ADR-005) and establishes pairwise PQXDH sessions (ADR-004) with members it
+   meets. Holding channel credentials yields **no** sender keys — `N` can read nothing yet (and shows
+   as an unverified identity until members verify it).
+2. `N` broadcasts its own SKDM to members (it has nothing to consent over; whether others can read
+   `N` is each member's own decision, symmetric to the rule below).
+3. Each existing member `A` independently decides whether to consent. On consent, `A` issues a
+   **consent grant** (sends `A`'s SKDM to `N`). Until `A` does so, `A`'s messages remain undecryptable
+   to `N` — forever if `A` never consents. `N`'s readable view fills in **monotonically, per sender**.
 
-Because possession of credentials releases no keys and every membership/consent act is a signed
-certificate verified to genesis, there is no server-controlled member list to forge — the
-Signalgate / Megolm membership-injection class is structurally absent.
+Because possession of credentials releases no keys, and readability is granted only by each member's
+own consent grant (no admin admission, no central roster), there is no server-controlled member list
+to forge — the Signalgate / Megolm membership-injection class is structurally absent.
 
 ### Revocation and epochs
 
-- **Per-member consent revocation:** `A` generates a fresh sender key, **advancing `A`'s own
-  `chain_id`** (the per-author generation counter, ADR-006) — *not* the channel `epoch`. `A`
+- **Outbound consent revocation ("who may read me"):** `A` generates a fresh sender key, **advancing
+  `A`'s own `chain_id`** (the per-author generation counter, ADR-006) — *not* the channel `epoch`. `A`
   distributes the new key to all members `A` still consents to *except* the revoked `N`, and records a
   revocation entry. `N` retains previously-held keys (uncallable) but cannot decrypt `A`'s future
   messages. (Terminology, normative: **`epoch` is a single channel-global counter** set only by the
   genesis record and admin policy/passphrase-rotation entries; per-author rotation is always
   `chain_id`. There is no per-author "epoch contribution.")
-- **Admin membership revocation:** an admin issues a membership-revocation cert; consenting members
-  rotate their sender keys excluding `N`.
-- **Passphrase-rotation epoch (bulk):** an admin rotates the channel passphrase (ADR-005), incrementing
-  the channel `epoch`. This evicts all members and forces rejoin (re-CPace, re-admission, re-consent),
-  and is the clean epoch boundary that re-binds all sender keys to the new `(channelID, epoch)`
-  (ADR-006) — the mass-revocation primitive.
+- **Inbound visibility opt-out ("whom I read"):** independently of the above, `A` may stop *seeing* any
+  sender `B` by dropping `B`'s sender key from `A`'s active set and not rendering `B`. This is local to
+  `A` — **no log entry, no key rotation, no effect on others** — and reversible while `B` still
+  consents to `A`. Outbound consent and inbound visibility are orthogonal and independently set.
+- **Passphrase rotation (the only admin-side removal — bulk).** An admin changes the channel
+  passphrase (ADR-005), incrementing the channel `epoch`. **All members must rejoin with the new
+  passphrase**; anyone not given it is thereby evicted. This is the clean epoch boundary that re-binds
+  all sender keys to the new `(channelID, epoch)` (ADR-006). It is deliberately **all-or-nothing**:
+  there is no admin facility to remove one member. Targeted removal is member-driven — each member who
+  no longer wants `N` reading them simply revokes consent (above); to force `N` out of the swarm
+  entirely, the admin rotates the passphrase.
 
 ### Conflict resolution under partition
 
@@ -118,24 +126,19 @@ reconciles** (ADR-008). The model is chosen so most actions never truly conflict
 - **Consent is single-writer.** Only `A` authors `A`'s consent grants and `A`'s sender-key rotations,
   so `A`'s consent timeline is totally ordered within `A`'s own log. There is no cross-writer race on
   "can `N` read `A`."
-- **Additive facts merge freely.** Membership certs, consent grants, and admin delegations are
-  add-only; concurrent ones all stand and are ordered causally.
-- **Removal beats addition (fail-safe).** When an authorized revocation/removal is concurrent with
-  (no causal ordering) or after a corresponding add/grant for the same subject, the subject is
-  treated as **not-admitted / not-consented** until a *causally-later* re-grant. This deterministic
-  "revocation wins" rule is applied per subject and resolves concurrent admin add-vs-remove
-  conservatively.
+- **Additive facts merge freely.** Consent grants and admin delegations are add-only; concurrent ones
+  all stand and are ordered causally.
+- **Removal beats addition (fail-safe), where removal exists.** The only removals are (a) a member's
+  own *consent revocation* and (b) an *admin-delegation revocation*. Consent has no race — it is
+  single-writer (`A` alone authors `A`'s grants and revocations), so `A`'s latest causal state wins.
+  For admin delegation, when a revocation is concurrent with or after a delegation of the same key,
+  that key is treated as **not-an-admin** until a causally-later re-delegation (revocation wins). There
+  is **no membership add/remove race**, because there is no admin membership operation — membership is
+  emergent (join + consent), and bulk removal is passphrase rotation, which is a clean epoch boundary,
+  not a per-member race.
 - **Admin authority is monotonic + revocable.** A key is an admin iff some valid delegation chain to
   genesis grants it and no causally-later authorized revocation supersedes it; ties resolve by the
   same removal-wins rule. Attenuation prevents privilege escalation regardless of ordering.
-- **Anti-griefing on revocation.** "Removal wins" combined with partition-time equivocation lets a
-  *delegated* admin grief a victim by repeated revoke/re-add flapping (the grief direction always wins
-  the race). Mitigations (binding): revocation of a **member's own consent** is always allowed (it is
-  `A`'s own decision), but **admin membership-revocation churn is rate-limited and surfaced** — more
-  than a small threshold of revoke/re-add cycles on one subject within a window is flagged as
-  admin-abuse in the UI (ADR-014), and a channel MAY require membership revocations to be **root-admin
-  or M-of-N admin** rather than any single attenuated delegate. Delegated `invite`-only admins cannot
-  revoke at all unless explicitly granted the `revoke` capability.
 
 ### Enforcement honesty
 

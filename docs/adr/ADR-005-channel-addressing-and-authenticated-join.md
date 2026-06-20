@@ -46,10 +46,10 @@ a joined node that no member has consented to sees only ciphertext.
 **Anti-abuse (layered, not just rate-limiting).** PAKE does not stop *online* guessing (one per run),
 and naive rate-limiting is Sybil-bypassable in a decentralized setting. Vox therefore relies on three
 concrete, non-bypassable layers rather than rate-limiting alone:
-1. **The real gate is consent.** A successful join grants *nothing readable* — no sender keys, no
-   membership — until an admin admits the joiner (membership cert) and members individually consent
-   (ADR-007). Online passphrase-guessing therefore buys an attacker only the ability to sit in the
-   swarm receiving ciphertext; it does not yield content or membership.
+1. **The real gate is consent.** A successful join grants *nothing readable* — no sender keys — until
+   members individually consent (ADR-007). There is no admin admission step; the passphrase gates the
+   swarm and per-sender consent gates reading. Online passphrase-guessing therefore buys an attacker
+   only the ability to sit in the swarm receiving ciphertext; it never yields readable content.
 2. **Channel/epoch-bound proof-of-work join tokens (concrete).** Each join attempt carries a PoW token
    bound to `(channelID, epoch, responder-nonce)` so tokens cannot be precomputed or replayed across
    channels/epochs. **Concrete function:** a *memory-hard* PoW (Argon2id over the bound tuple, ~64 MB)

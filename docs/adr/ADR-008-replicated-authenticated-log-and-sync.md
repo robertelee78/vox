@@ -54,8 +54,8 @@ members).
 **Per-entry-type authentication (binding — resolves the deniable/governance split).** Authentication
 is chosen by entry TYPE, not merely by channel mode:
 - **Governance/control entries are ALWAYS root-composite-signed (Ed25519+ML-DSA), even in deniable
-  channels:** genesis, membership certificates, admin delegations, consent grants, revocations, and
-  policy updates. They must stay attributable — membership is attributable by design (ADR-001/ADR-009),
+  channels:** genesis, admin delegations, consent grants, consent revocations, and
+  policy/passphrase-rotation updates. They must stay attributable — membership is attributable by design (ADR-001/ADR-009),
   and ADR-007's single-writer consent guarantee requires that a consent grant be unforgeably authored
   by its issuer. Non-negotiable in both modes.
 - **Message-content entries:** attributable channels → root-composite-signed; deniable channels →
@@ -65,8 +65,9 @@ governance entries are always signed, the governance plane — and its fork-attr
 even in deniable channels; only message-content authorship is deniable. The exact deniable
 content authenticator and how it preserves per-author single-writer ordering are specified in ADR-009.
 
-**Consent + certificate state lives here.** Membership certificates, consent grants, and
+**Consent + governance state lives here.** Admin/policy certificates, consent grants, and consent
 revocations are log entries, so they replicate and converge causally across the overlay (ADR-007).
+(Membership is emergent from join + consent — there is no membership-roster cert; ADR-007.)
 
 **Fork / equivocation handling.** A single-writer log must not fork; two distinct entries by the
 same author at the same `seq` are an equivocation. Handling differs by authentication type (above),

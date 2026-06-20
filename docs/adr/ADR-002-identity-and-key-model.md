@@ -9,7 +9,7 @@
 
 Vox has no accounts and no central key directory (ADR-001). Identity must be self-sovereign,
 verifiable peer-to-peer, and must root every other mechanism: key agreement (ADR-004), channel
-join (ADR-005), the signed admin/membership certificate tree (ADR-007), per-author log
+join (ADR-005), the signed admin/governance certificate tree (ADR-007), per-author log
 authentication (ADR-008), and deniable content authentication (ADR-009). It must satisfy the
 hybrid post-quantum policy (ADR-003), support per-channel pseudonymity, and accommodate a
 member-chosen multi-device strategy. This ADR specifies the complete key model: every key, its

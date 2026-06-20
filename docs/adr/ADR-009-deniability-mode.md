@@ -1,109 +1,124 @@
 # ADR-009: Deniability Mode (per-channel)
 
 **Status**: proposed
-**Date**: 2026-06-19
+**Date**: 2026-06-20
 **Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: deniability, mpotr, dake, mdvs, content-authorship, post-quantum
+**Tags**: deniability, mpenc, deniable-gka, content-authorship, post-quantum
 
 ## Context
 
-Deniability is a per-channel option (ADR-007), scoped to **content-authorship only** (membership
-stays attributable). A prior review found two real defects: (1) a contradiction — "attributable
-mode" message signing keys are root-cross-signed (ADR-002), which is *transferable, non-repudiable*
-proof, yet the design loosely claimed attributable mode was still "deniable to outsiders"; and
-(2) the deniable mode named "per-epoch ephemeral signing keys" without a concrete construction —
-and ephemeral *signatures* are still transferable unless the key→identity binding is itself
-deniable. This ADR fixes both: it states deniability precisely (relative to a judge) and picks ONE
-concrete construction. Grounded in the Berkeley *SoK: Secure Messaging*, the cypherpunks
-mpOTR/DAKE work (Goldberg et al.), and ETH Zürich's MDVS/MDRS-PKE results (CHMR23). *(Verifier
-agents abstained under rate-limiting; the sources are canonical primary literature.)*
+Deniability is a per-channel option, scoped to **content-authorship only** (governance/membership stay
+attributable, ADR-007/ADR-008). Earlier drafts named a *family* ("DAKE + MDVS") rather than a buildable
+protocol and left the deniable/governance collision unresolved. This ADR specifies ONE concrete,
+implementation-grade construction and how it composes with the log (ADR-008) and per-sender consent
+(ADR-007). It is grounded in the mpENC/mpOTR lineage (Van Gundy's *Deniable Key Exchange for Group
+Messaging*; mpENC "Multi-Party Encrypted Messaging Protocol", arXiv 1606.04598) and the deniable group
+key agreement of Bohli–Steinwandt. *(Verified 3-0 against these primary sources.)*
 
 ## Decision
 
-### Deniability model (precise)
+### Deniability scope = "weak" (content) deniability — the group analogue of OTR
 
-Deniability is defined **relative to a judge** who accepts only transferable cryptographic proof.
-Vox distinguishes (SoK):
-- **Message/content repudiation** — denying authorship of a specific message. **This is Vox's goal.**
-- **Participation repudiation** — denying having been in the channel at all. **Not a goal**:
-  membership is attributable (ADR-007); pseudonymity is handled by joining under a dedicated key
-  (ADR-002).
-- **Online vs offline** — Vox targets **offline** deniability (judge examines a past transcript,
-  even given long-term secrets). Online deniability (judge colludes live with an insider) is **not**
-  targeted; it is achieved by few protocols and is explicitly out of scope.
+We adopt exactly mpENC's **weak deniability**: *message contents are deniable, but session
+participation is not*. This matches ADR-001/ADR-007 (membership is attributable) and is the group
+analogue of how OTR achieves deniability — equivalent security. Full participation-deniability would
+require ring signatures "not yet in widespread usage" and is explicitly **out of scope** (it would also
+contradict the attributable governance plane). Deniability is defined against a judge and is **offline
+content repudiation**: no transferable proof of *who authored a message* survives, even given long-term
+secrets.
 
-### The two modes, characterized honestly
+### Per-entry-type signing (canonical; mirrors ADR-008)
 
-- **Attributable mode (default).** Message content is signed with the author's root-cross-signed
-  Sender-Key signing key (ADR-002). This is **transferable, non-repudiable proof of authorship to
-  anyone — insiders and outsiders alike. It is NOT deniable.** (This is the correction: no
-  outsider-deniability is claimed for attributable mode.) Use it when intra-group accountability is
-  wanted.
-- **Deniable mode.** Message content carries **no transferable proof of authorship**: any channel
-  member could have produced any member's authenticator, so a judge cannot attribute a message even
-  given long-term secrets.
+Confirmed by mpENC, which warns that signing content with static keys "destroys any chance … at
+retaining deniability … we can never regain it in a higher layer":
+- **Governance/structural entries are static-composite-signed (Ed25519+ML-DSA identity key) in ALL
+  modes:** genesis, admin delegations, consent grants, consent revocations, policy/passphrase-rotation
+  updates. (Attributable; preserves ADR-007 single-writer consent integrity.)
+- **Message-content payloads** in a deniable channel are authenticated **only** by the per-author
+  ephemeral key below — never the static key.
 
-### Concrete deniable construction (chosen)
+### Concrete protocol — Van Gundy Deniable GKA + DSKE (per-epoch)
 
-**Per-epoch deniable authenticated group key exchange (DAKE) + ephemeral authentication, with MDVS
-for receiver-coercion resistance** — the mpOTR/DGKE pattern, instantiated post-quantum:
+At each epoch (the passphrase/epoch boundary, ADR-006), members run a **4-round deniable group key
+agreement + deniable signature-key exchange (DSKE)** that augments Bohli–Steinwandt deniable GKA:
+1. each member contributes to a deniable group key agreement (the GKA legs ride PQXDH material,
+   ADR-004, so the agreement itself is deniable — no static signature enters it);
+2. each member generates a **per-epoch ephemeral signing keypair** and shares its public part bound to
+   the session transcript;
+3. **signature-key confirmation:** each member signs the per-session Schnorr challenge `c_i` with its
+   ephemeral key to *prove knowledge of the ephemeral private key and bind it to the transcript* —
+   giving members non-repudiable origin authentication **to each other**, non-transferable to outsiders
+   (an outsider cannot bind the ephemeral key to any identity);
+4. key confirmation completes the session.
 
-1. **Epoch DAKE.** At each epoch (ADR-006 passphrase/epoch boundary), members run a *deniable*
-   authenticated group key exchange that binds a fresh per-epoch ephemeral signing key to each
-   member's identity in a **non-transferable** way — the binding is forgeable from public keys
-   alone, so no outsider can prove "this ephemeral key is Alice's." The DAKE rides PQXDH (ADR-004),
-   whose KEM/DH shared secret is deniable-friendly (no long-term signature enters the secret).
-2. **In-epoch authentication.** Messages are authenticated under these ephemeral keys: insiders
-   verify origin (they witnessed the DAKE binding); outsiders cannot bind ephemeral→identity, so
-   they get no transferable proof — offline message repudiation holds against outsiders.
-3. **Receiver-coercion resistance (strong deniability).** Where a channel needs deniability even
-   against a *member who surrenders their own secret key to a judge*, the per-recipient authenticator
-   is a **Multi-Designated-Verifier Signature (MDVS)** / MDRS-PKE (ETH CHMR23): every designated
-   verifier could have forged it, so a colluding receiver still cannot convince a judge. MDVS is the
-   strong-deniability profile; DAKE-ephemeral authentication is the baseline profile.
+Message content is then signed with the per-author per-epoch ephemeral key. **At epoch end each member
+publishes its ephemeral *private* key**, so anyone can retroactively forge that epoch's content
+signatures → content authorship is repudiable (the deniability property), while *live* recipients still
+got real origin authentication.
 
-**Honest limit:** mpOTR-style per-epoch ephemeral keys lose *message unlinkability within an epoch*
-(a sender's messages in one epoch share an ephemeral key). This is acceptable: linkage *among
-members* is already attributable inside the channel; the property that matters — non-attribution to
-**outsiders/judges** — is preserved. Channels needing per-message unlinkability use the MDVS profile.
+### Per-sender consent is preserved (critical)
 
-### Log integrity in deniable mode
+The construction keeps **one ephemeral signing key per member** (public part shared), **not** a shared
+group signing secret. So the consent primitive survives unchanged in deniable mode: to consent, `A`
+releases `A`'s per-epoch ephemeral verifier (and the per-sender content key, ADR-006) to `N`; to
+withhold/revoke, `A` does not. `N` gains or loses **only `A`'s** content — exactly the per-sender,
+monotonic visibility of ADR-007. (A shared-group-secret design, e.g. a pure DGKE, would break this and
+is rejected for that reason.)
 
-The hash-linked log (ADR-008) provides tamper-evidence, causal ordering, and fork detection
-independent of *who* authenticates. In deniable mode the per-entry authenticator is the
-DAKE-ephemeral key (or MDVS), not the root-chained composite signature. Integrity against
-*outsiders* holds (only epoch members hold the ephemeral/MDVS keys); deniability holds because any
-*member* could have forged the authenticator — which is exactly the goal. Fork proofs still work:
-two conflicting entries at one `(author, seq)` are detectable even under deniable authentication,
-and equivocation is handled per ADR-008.
+### Mid-epoch membership change
 
-### Post-quantum instantiation
+A member admitted between passphrase-epochs does **not** reuse the prior epoch's (now-published,
+forgeable) keys. Instead an **incremental DSKE re-key** runs: the affected members generate fresh
+per-epoch ephemeral keypairs and re-confirm, so the newcomer obtains live per-member verifiers. Cost:
+one incremental key-agreement round per admission affecting a deniable channel (bounded; the FS window
+is one re-key interval). This is the concrete answer to "consent is continuous but the DAKE is
+per-epoch."
 
-Ordinary PQ signatures (ML-DSA) are transferable and **must not** be used to authenticate deniable
-content. The PQ deniable authenticator is a **lattice-based (multi-)designated-verifier signature**
-(e.g. an ideal-lattice/NTRU SDVS such as LaSDVS, or a ring-style multi-designated-verifier scheme);
-the DAKE uses PQXDH (ADR-004), already PQ-hybrid and deniable-friendly. Sizes/maturity of PQ MDVS
-are tracked in ADR-003's agility framework; the construction is versioned so the concrete PQ MDVS
-scheme can advance without changing the mode's semantics.
+### Fork / equivocation in deniable channels
+
+Because content authenticators are forgeable by any member, automated "freeze the equivocator" is
+**disabled** for deniable content (it would be a framing/DoS primitive — ADR-008). Vox uses mpENC's
+policy: a deniable-content fork raises a **non-attributable alarm** (causal-DAG inconsistency +
+TCP-style timeout warnings) surfaced for manual, out-of-band resolution, optionally hardened with
+GOTR-style deferred pairwise consistency checks. Governance forks remain attributable and auto-handled
+(they are static-signed, ADR-008).
+
+### Attributable mode (default)
+
+Content is signed with the root-cross-signed composite key — **non-repudiable to insiders and
+outsiders** (honest: it is *not* deniable). Used when intra-group accountability is wanted.
+
+### Post-quantum instantiation (hybrid, versioned)
+
+The ephemeral content authenticator is **hybrid**: classical Schnorr/Ed25519 ephemeral signatures
+today, plus a lattice multi-/designated-verifier signature as those mature — the chosen PQ target is
+**UDMVS** (lattice SIS/LWE universal designated-multi-verifier signature, ROM, peer-reviewed ISPEC 2024)
+or a post-quantum **MDVRS** built from generic primitives. Explicitly rejected as unfit: **LaSDVS**
+(single-verifier only, not group-applicable) and **PSDVRS** (efficient but discrete-log, *not*
+post-quantum). The scheme is versioned via ADR-003 crypto-agility so the PQ MDV component advances
+without changing the mode's semantics. Until a vetted PQ MDV ships, deniable mode runs classical-hybrid
+ephemeral signatures (deniable today; the governance/transport/key-agreement planes are already PQ).
 
 ## Consequences
 
 ### Positive
-- Resolves the contradiction: attributable mode is honestly non-repudiable; deniable mode has a
-  concrete, named construction with stated transferable/non-transferable guarantees.
-- Offline message repudiation against outsiders (baseline) and against colluding receivers (MDVS
-  profile), with PQ instantiation.
-- Log integrity, ordering, and fork detection are preserved in both modes.
+- One concrete, citable, buildable protocol (Van Gundy GKA+DSKE) — no families, no deferral.
+- Per-sender consent is provably preserved (per-author ephemeral keys), so the headline feature works
+  in deniable channels.
+- Clean split: governance attributable + auto-fork-handled; content deniable + alarm-only — the C1/C2
+  knot is resolved end-to-end with ADR-008.
 
 ### Negative
-- Per-epoch ephemeral authentication sacrifices in-epoch message unlinkability (baseline profile);
-  the MDVS profile recovers it at higher cost/complexity.
-- PQ MDVS/SDVS schemes are less mature and larger than ML-DSA; a real implementation and review-cost
-  risk that ADR-003 agility is meant to absorb.
-- A deniable group DAKE is non-trivial to implement and must be formally checked before shipping.
+- In-epoch message **unlinkability** is sacrificed (a member's content in one epoch shares an ephemeral
+  key) — acceptable, since intra-group linkage is already attributable; only outsider non-attribution
+  matters.
+- A multi-round deniable GKA + incremental re-key on admission is real protocol complexity and must be
+  formally analyzed before shipping (Van Gundy/mpENC give the template, not a drop-in library).
+- The PQ MDV component (UDMVS/MDVRS) is young; until vetted, PQ deniability rests on the hybrid's
+  classical half (the rest of the stack is PQ).
 
 ### Neutral
-- Per-channel choice (admin-set, ADR-007), like the history policy; attributable is the default.
+- Per-channel choice (admin-set, ADR-007), attributable default.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-006, ADR-007, ADR-008.
