@@ -151,15 +151,16 @@ impl core::fmt::Debug for Authenticator {
 /// owns the *shape* of the check (the trait + the non-attributable classification
 /// + the alarm fork path); 009/M7 owns the *crypto*.
 pub trait DeniableVerifier {
-    /// Verify a deniable authenticator's `auth_bytes` over `signing_input` for the
-    /// entry authored by `author_id`. Returns `Ok(())` iff the (forgeable, but
-    /// per-author-ordered) authenticator is valid per ADR-009.
-    fn verify_deniable(
-        &self,
-        author_id: &Digest32,
-        signing_input: &[u8],
-        auth_bytes: &[u8],
-    ) -> Result<()>;
+    /// Verify a deniable authenticator's `auth_bytes` for `skeleton`. The verifier
+    /// receives the **whole skeleton** (not just a flattened signing input) so it
+    /// can bind the check to the entry's exact `(channel_id, epoch, author_id)` —
+    /// the M7 verifier registers each member's per-epoch ephemeral verification key
+    /// under that triple, and an authenticator only verifies under the key for
+    /// *that* epoch (ADR-009: publishing an epoch's key makes only *that* epoch's
+    /// content forgeable, never a different/future epoch). The verifier derives the
+    /// signing input itself via [`EntrySkeleton::signing_input`]. Returns `Ok(())`
+    /// iff the (forgeable, but per-epoch-author-bound) authenticator is valid.
+    fn verify_deniable(&self, skeleton: &EntrySkeleton, auth_bytes: &[u8]) -> Result<()>;
 }
 
 /// A [`DeniableVerifier`] placeholder used only to name a concrete type for the
@@ -169,7 +170,7 @@ pub trait DeniableVerifier {
 enum NoDeniableVerifier {}
 
 impl DeniableVerifier for NoDeniableVerifier {
-    fn verify_deniable(&self, _: &Digest32, _: &[u8], _: &[u8]) -> Result<()> {
+    fn verify_deniable(&self, _: &EntrySkeleton, _: &[u8]) -> Result<()> {
         // Unconstructible (empty enum): this arm is unreachable. Returning the
         // boundary error keeps the function total without a panic.
         Err(Error::DeniableVerificationUnavailable)
@@ -474,11 +475,7 @@ impl Entry {
             }
             Authenticator::Deniable(bytes) => match deniable {
                 Some(v) => {
-                    v.verify_deniable(
-                        &self.skeleton.author_id,
-                        &self.skeleton.signing_input(),
-                        bytes,
-                    )?;
+                    v.verify_deniable(&self.skeleton, bytes)?;
                 }
                 None => return Err(Error::DeniableVerificationUnavailable),
             },
@@ -905,7 +902,7 @@ mod tests {
         // A stand-in M7 verifier that accepts iff the bytes start with 0xAA.
         struct StubM7;
         impl DeniableVerifier for StubM7 {
-            fn verify_deniable(&self, _: &Digest32, _: &[u8], auth: &[u8]) -> Result<()> {
+            fn verify_deniable(&self, _: &EntrySkeleton, auth: &[u8]) -> Result<()> {
                 if auth.first() == Some(&0xAA) {
                     Ok(())
                 } else {

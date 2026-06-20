@@ -63,7 +63,7 @@ use crate::log::quota::{QuotaReject, QuotaTracker};
 /// method is unreachable.
 enum NoDeniable {}
 impl DeniableVerifier for NoDeniable {
-    fn verify_deniable(&self, _: &Digest32, _: &[u8], _: &[u8]) -> Result<()> {
+    fn verify_deniable(&self, _: &crate::log::entry::EntrySkeleton, _: &[u8]) -> Result<()> {
         Err(Error::DeniableVerificationUnavailable)
     }
 }
@@ -611,7 +611,7 @@ mod tests {
     /// crypto.
     struct AcceptAnyDeniable;
     impl DeniableVerifier for AcceptAnyDeniable {
-        fn verify_deniable(&self, _: &Digest32, _: &[u8], auth: &[u8]) -> Result<()> {
+        fn verify_deniable(&self, _: &crate::log::entry::EntrySkeleton, auth: &[u8]) -> Result<()> {
             if auth.is_empty() {
                 Err(Error::SignatureInvalid)
             } else {

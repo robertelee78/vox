@@ -96,6 +96,29 @@
 //!   passphrase re-key on rotation (M3/M5), and TTL erasure (M8) are documented
 //!   seams, not stubs.
 //!
+//! Built on M1 + M4 + M5 + M6, milestone **M7** adds:
+//!
+//! - [`deniable`] — per-channel **deniability mode** (ADR-009), filling the
+//!   [`log::entry::DeniableVerifier`] seam M5 defined. Content authorship becomes
+//!   repudiable while governance/membership stay attributable (mpENC **weak**
+//!   deniability). The pieces: the per-epoch ephemeral composite (Ed25519+ML-DSA)
+//!   signing key `(esk_i, epk_i)` that signs content (never the static key); the
+//!   **4-round Deniable GKA + DSKE** (commit → reveal → DSKE-bind → confirm) whose
+//!   broadcasts ride the log as root-signed `dgka-setup` governance entries (tag
+//!   `0x000B`); the classical **Burmester–Desmedt** combiner over Ristretto255
+//!   ephemeral shares for the confirmation-only epoch key `K`; the
+//!   [`deniable::EpochVerifier`] that verifies deniable content against the
+//!   per-epoch `epk` *released* by per-sender consent (ADR-007); the incremental
+//!   DSKE re-key for a mid-epoch join; and the epoch-end **ESK publication** (tag
+//!   `0x0010`) that, by publishing `esk_i` after the epoch closes, makes that
+//!   epoch's content forgeable-by-anyone — the deniability mechanism. Confidentiality
+//!   (PQ Sender Keys, M4) and live origin auth (PQ composite ephemeral key) are PQ;
+//!   `K` is classical (confirmation-only) by design. The optional *live*
+//!   non-transferability upgrade (PQ designated-verifier, UDMVS/MDVRS) is out of
+//!   scope; the attributable-content path is M4/M6. **Ship prerequisite:** ADR-009
+//!   requires a formal analysis of the DGKA+DSKE construction before deniable mode
+//!   is enabled in a release (see [`deniable`]).
+//!
 //! ## Engineering mantra (binding — see ADR-001)
 //! No stubs, no `todo!()`, no shortcuts. What ships is complete and correct.
 //! Every module here carries its own tests and, where the ADRs name a release
@@ -108,6 +131,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod cbor;
+pub mod deniable;
 pub mod error;
 pub mod governance;
 pub mod group;

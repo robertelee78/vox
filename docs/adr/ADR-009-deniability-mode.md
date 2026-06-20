@@ -126,8 +126,13 @@ Deniable mode is **fully post-quantum now**, with no dependency on any unshipped
   the epoch.
 - **Confidentiality is PQ.** Message *content* confidentiality is owned by the per-sender Sender Keys
   (ADR-006), which are distributed over PQXDH (ML-KEM-768) — PQ independent of the DGKA. The DGKA's own
-  key `K` (used for epoch key-confirmation/binding, not as the content key) is additionally **hybrid-PQ**
-  because its derivation mixes the members' pairwise PQXDH secrets (§Concrete protocol, step 2).
+  key `K` (used for epoch key-confirmation/binding, **not** as the content key) is a **classical
+  Burmester–Desmedt** agreement over the ephemeral DH shares (§Concrete protocol, step 2). This is
+  harmless: `K` never protects content (content confidentiality is the PQ Sender Keys above), it only
+  confirms the agreement, so a classical `K` introduces no harvest-now-decrypt-later exposure. (A hybrid
+  `K` mixing the members' pairwise PQXDH secrets was considered and rejected: those pairwise secrets are
+  not a common group input, so the combiner would not be computable by all members — step 2 is the
+  authoritative, computable construction.)
 - **Deniability is mechanism-based, not primitive-based.** Repudiation comes from **publishing the
   ephemeral private key at epoch end** (anyone can then forge that epoch's content) — this needs no
   special signature type, so there is no "classical-only until a PQ scheme ships" gap. Participation is
