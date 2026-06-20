@@ -20,7 +20,8 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [011](ADR-011-transport-substrate.md) | Transport Substrate (QUIC) | 002, 004, 008 |
 | [012](ADR-012-nat-traversal-and-reachability.md) | NAT Traversal, Bootstrap & Reachability | 005, 011 |
 | [013](ADR-013-overlay-tunneling.md) | Overlay Tunneling (TCP-over-Vox) | 002, 007, 011, 012 |
-| [014](ADR-014-macos-client.md) | macOS Client (the wedge) | 002, 005–010, 012, 013 |
+| [014](ADR-014-macos-client.md) | macOS Client (native SwiftUI + Rust core) | 002, 005–010, 012, 013 |
+| [015](ADR-015-rust-tui-client.md) | Rust TUI Client (chat, swarm create/join, verification) | 002, 005–010, 012, 013 |
 
 ## Tiers
 

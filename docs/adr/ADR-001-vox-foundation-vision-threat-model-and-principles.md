@@ -52,6 +52,13 @@ the same overlay carries arbitrary byte streams (e.g. `ssh` over Vox), not just 
 8. **MIT licensed.** Maximally permissive; open source is a requirement, not a preference.
 9. **Capability-driven development.** Each capability is researched, specified, and defined
    before it is built; the ADR series is the spine.
+10. **Rust-maximal implementation.** Vox is built in Rust to the maximum practical extent: a single
+    shared Rust **core** (identity, crypto, log/sync, transport, governance, tunneling) and Rust
+    **clients** over it — including a first-class **Rust TUI client** (chat, swarm create/join,
+    verification, consent; ADR-015). Non-Rust code is the deliberate, scoped exception where an OS
+    demands it for native UX/integration — e.g. the SwiftUI layer of the macOS client (ADR-014),
+    which still runs the same Rust core via UniFFI. Multiple clients are peers over one core, not
+    forks of it.
 
 **Threat model (maximal — all four adversaries in scope):**
 
