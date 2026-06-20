@@ -203,8 +203,9 @@ A terminal has no camera, so the strong scan path is **relocated to the peer's d
   `gpg-agent`** over its socket (not gpgme-linked) so the static build stays clean. **Signed,
   reproducible** release artifacts (supply-chain integrity the threat model expects). Shell completions
   (`clap_complete`) + man pages (`clap_mangen`). Runs over SSH and over Vox's own tunnel (dogfoods
-  ADR-013). **Windows is out of scope for this ADR** — every at-rest/identity mechanism here is POSIX
-  (`mlock`, `gpg-agent`, XDG); a Windows client (DPAPI/`VirtualLock` mapping) is its own later peer ADR.
+  ADR-013). **Targets macOS and Linux only** — every at-rest/identity mechanism here is POSIX (`mlock`,
+  `gpg-agent`, XDG). Windows is **not a target**; supporting it would need its own ADR (DPAPI/`VirtualLock`/
+  `%APPDATA%` mappings) only if it is ever wanted — it is not planned.
 
 ## Consequences
 
@@ -224,7 +225,8 @@ A terminal has no camera, so the strong scan path is **relocated to the peer's d
   stated honestly. No rich media in the terminal.
 
 ### Neutral
-- Peer to ADR-014 over one core, not a fork; iOS / Linux-GUI / Windows clients are additional peer ADRs.
+- Peer to ADR-014 over one core, not a fork. Targets macOS + Linux; iOS / Linux-GUI are additional peer
+  ADRs if/when wanted (Windows is not a target).
 
 ## Links
 **Depends on**: ADR-002, ADR-004, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009, ADR-010, ADR-011, ADR-012, ADR-013.
