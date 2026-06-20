@@ -34,10 +34,13 @@ Bhargavan et al.; Cryspen):
 2. **KEM shared-secret binding** — bind the KEM public key (and ciphertext) into the AEAD
    associated data; IND-CCA alone is insufficient (re-encapsulation attack).
 
-**Crypto-agility.** All handshakes, certificates, and log entries carry explicit, versioned
-algorithm identifiers and negotiable ciphersuites, so primitives can be upgraded (e.g. PQ-PCS
-ratchet, new KEMs) without breaking the wire format. Bind the negotiated suite into the
-transcript to prevent downgrade.
+**Crypto-agility (with an explicit downgrade-rejection rule).** All handshakes, certificates, and log
+entries carry explicit, versioned algorithm identifiers and negotiable ciphersuites, so primitives
+can be upgraded (e.g. PQ-PCS ratchet, new KEMs) without breaking the wire format. Negotiation is
+**floor-gated, not best-effort**: each party advertises only suites at or above the channel's minimum
+policy, **rejects** (aborts, no fallback) any proposal below it, binds the negotiated suite into the
+transcript, and re-checks it after the handshake — so a network attacker cannot force a weaker suite.
+There is no "downgrade to classical" path: hybrid PQ is the floor.
 
 **Phasing.** Day-one: PQ *confidentiality* (hybrid PQXDH) and hybrid signatures. Later increment:
 post-quantum *post-compromise security* in the ratchet (ADR-004), whose dominant cost is

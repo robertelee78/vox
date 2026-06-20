@@ -16,12 +16,21 @@ joining must grant *no* readable content by itself (per-sender consent, ADR-007)
 
 ## Decision
 
-**Authenticated join = CPace** (the CFRG-recommended *balanced* PAKE). Symmetric (no server, no
-fixed roles), implicit mutual authentication, and a proof that an attacker gets at most one online
-guess per interaction — provably resisting offline dictionary attack on the low-entropy passphrase
-(UC proof, eprint 2021/114). Bind GPG/Ed25519 identity strings (ADR-002) into CPace's CI/sid/AD so
-the handshake authenticates party identities, not merely the passphrase. Pairwise CPace-on-meet
-between members; no bespoke group PAKE (GPAKE is immature/unstandardized).
+**Authenticated join = CPace + identity proof-of-possession.** CPace (the CFRG-recommended
+*balanced* PAKE) is symmetric (no server, no fixed roles), gives implicit mutual authentication, and
+limits an attacker to one online guess per interaction — provably resisting offline dictionary
+attack on the low-entropy passphrase (UC proof, eprint 2021/114). **CPace alone only proves "this
+party holds the passphrase," not *which identity* it is.** Vox therefore composes two factors:
+1. **CPace** establishes a session keyed by the passphrase, with the `channelID`, `epoch`, and the
+   transcript bound into CPace's `CI`/`sid`/`AD`.
+2. **Identity proof-of-possession.** Inside that CPace-protected session, each party signs the CPace
+   `sid` (and transcript hash) with its **composite Ed25519+ML-DSA identity key** (ADR-002) and sends
+   its identity public keys; the peer verifies the signature and matches the derived identity
+   fingerprint against the expected one (verified out-of-band per ADR-014). Merely *naming* an
+   identity string in CPace inputs is not sufficient — possession of the identity private key must be
+   proven, and it is, here.
+
+Pairwise CPace-on-meet between members; no bespoke group PAKE (GPAKE is immature/unstandardized).
 
 **Separate rendezvous from authentication.**
 - **channelID → rendezvous address.** Derive the DHT/PubSub lookup key from the channel ID via a
@@ -34,8 +43,20 @@ between members; no bespoke group PAKE (GPAKE is immature/unstandardized).
 Membership and any readable content still require the consent + certificate machinery of ADR-007;
 a joined node that no member has consented to sees only ciphertext.
 
-**Anti-abuse.** PAKE does not stop *online* guessing (one per run); add rate-limiting and/or
-proof-of-work join tokens on join attempts (ADR-012).
+**Anti-abuse (layered, not just rate-limiting).** PAKE does not stop *online* guessing (one per run),
+and naive rate-limiting is Sybil-bypassable in a decentralized setting. Vox therefore relies on three
+concrete, non-bypassable layers rather than rate-limiting alone:
+1. **The real gate is consent.** A successful join grants *nothing readable* — no sender keys, no
+   membership — until an admin admits the joiner (membership cert) and members individually consent
+   (ADR-007). Online passphrase-guessing therefore buys an attacker only the ability to sit in the
+   swarm receiving ciphertext; it does not yield content or membership.
+2. **Channel/epoch-bound proof-of-work join tokens.** Each join attempt must carry a PoW token bound
+   to `(channelID, epoch, responder-nonce)`, so tokens cannot be precomputed or replayed across
+   channels/epochs — imposing a per-attempt cost that throttles online guessing at the swarm edge.
+3. **Admission is admin-signed.** Final entry to the member set requires an admin-signed membership
+   certificate (ADR-007); no amount of passphrase guessing produces one.
+
+Rate-limiting by peers remains a cheap first filter but is explicitly **not** the security boundary.
 
 ## Consequences
 

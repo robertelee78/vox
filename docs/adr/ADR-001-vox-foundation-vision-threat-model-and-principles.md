@@ -66,6 +66,13 @@ the same overlay carries arbitrary byte streams (e.g. `ssh` over Vox), not just 
 - **Device seizure / local compromise** — addressed by at-rest "double-lock" encryption and
   forward secrecy (ADR-010).
 
+**Security-property taxonomy (named to keep later ADRs precise).** These are distinct guarantees and
+must never be conflated: **PQ confidentiality** (harvest-now-decrypt-later resistance, ADR-003/004,
+passive-quantum), **classical post-compromise security** (DH-ratchet healing, ADR-004), **PQ
+post-compromise security** (phased, not day-one, ADR-004), **content deniability** (per-channel,
+ADR-009), and **metadata privacy** against a network observer (phased; member-only first,
+traffic-analysis resistance later). Each ADR states which of these it does and does not provide.
+
 **Availability model.** Availability is emergent from who is online, with no always-on node
 required: a two-member channel requires both members online; a 3+-member channel needs any two
 online to propagate the log; a single online member is an outbox (can queue-to-send, cannot

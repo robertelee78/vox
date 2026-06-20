@@ -34,6 +34,28 @@ by its bandwidth cost (ADR-003).
 **Context binding.** Every handshake and ratchet message binds the negotiated ciphersuite
 (ADR-003) and, where applicable, the channel/epoch context (ADR-006) into its transcript/AD.
 
+**Wire format & operational rules (so the ratchet is actually buildable):**
+- **Message header:** `{ ratchet_pubkey (DH), PN (previous-chain length), N (message number), algo_ids }`,
+  bound into the AEAD associated data along with the ciphersuite and `(channelID, epoch)`.
+- **Out-of-order / skipped messages:** a receiver derives and **caches skipped message keys** up to a
+  bounded `MAX_SKIP` per chain (with a total cap and expiry); messages beyond the bound are rejected
+  rather than forcing unbounded computation (DoS guard). This is the standard Double Ratchet
+  skipped-key store, made explicitly bounded.
+- **Replay protection:** a `(ratchet_pubkey, N)` pair already consumed is rejected; message keys are
+  deleted after use so a replay cannot re-derive plaintext.
+- **Prekey publication (serverless).** There is no prekey *server*. A member publishes its signed
+  prekey bundle (ADR-002: X25519 + ML-KEM-768 signed prekey, one-time prekeys) as **signed records at
+  the channel rendezvous / on the log** (ADR-005/ADR-008); initiators fetch a bundle there and consume
+  a one-time prekey. One-time-prekey exhaustion falls back to the signed last-resort prekey — never to
+  no-prekey.
+
+**Security-property taxonomy (stated precisely to avoid conflation):**
+- **Forward secrecy** — from the symmetric KDF-chain ratchet (past keys unrecoverable from current).
+- **Classical post-compromise security** — from the DH ratchet (healing after compromise, classical).
+- **PQ confidentiality** — from PQXDH's ML-KEM leg (harvest-now-decrypt-later defeated), against a
+  **passive** quantum adversary only (active-quantum auth is out of scope per the PQXDH spec).
+- **PQ post-compromise security** — NOT day-one; the phased PQ-CKA layer above provides it later.
+
 ## Consequences
 
 ### Positive

@@ -39,9 +39,15 @@ established substrate and marked as such. This ADR specifies the complete tunnel
 - **ABAC over signed role attributes.** Authorization is attribute/role-based, not address/port
   based: members and services carry role tags issued as signed capability certificates chaining to
   the channel genesis (ADR-007). Policies read like "members tagged `#ops` may Dial `#ssh-hosts`."
-- **Authorization gates discovery.** A member can only enumerate the services they are authorized to
-  consume (a per-member filtered list). An unauthorized or malicious member cannot even learn which
-  services exist — directly shrinking blast radius.
+- **Authorization gates discovery — and advertisements never sit in cleartext on the shared log.**
+  Because the replicated log (ADR-008) delivers every entry to every member, a service advertisement
+  is **not** posted as cleartext channel content (doing so would make discovery-gating illusory).
+  Instead a Bind holder distributes its advertisement **only to members holding the matching Dial
+  capability** — either over their authenticated pairwise channels (ADR-004) or as a log entry
+  **encrypted to that authorized audience** (the Dial-grant set, keyed like a per-recipient SKDM,
+  ADR-006). A member can thus enumerate only the services it is authorized to consume; an
+  unauthorized member sees at most opaque ciphertext and cannot even learn a service exists. This
+  resolves the otherwise-contradiction between discovery-gating and the replicate-all log.
 - **Consent + revocation gate tunnels.** Tunnel rights are bound to channel membership and
   per-sender consent (ADR-007): revoking a member (or a passphrase-epoch rotation) revokes their
   tunnel access going forward, exactly like message access.

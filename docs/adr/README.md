@@ -1,8 +1,9 @@
 # Architecture Decision Records
 
-This directory records the architectural decisions for Vox. The series is **dependency-ordered**:
-the numbering is the intended build order — each ADR is buildable once its predecessors are done.
-Start with ADR-001.
+This directory records the architectural decisions for Vox. **Build order is the topological order
+of the `Depends on` column** (a partial order); each ADR is buildable once its dependencies are
+done. ADR numbering largely follows that order, with one deliberate exception: ADR-008 (the log
+primitive) precedes ADR-007 (consent, which is stored on the log) in build order. Start with ADR-001.
 
 | # | Title | Depends on |
 |---|-------|-----------|
@@ -12,11 +13,11 @@ Start with ADR-001.
 | [004](ADR-004-pairwise-secure-channel.md) | Pairwise Secure Channel (PQXDH + Double Ratchet) | 002, 003 |
 | [005](ADR-005-channel-addressing-and-authenticated-join.md) | Channel Addressing & Authenticated Join (CPace) | 002, 003, 004 |
 | [006](ADR-006-group-messaging-sender-keys.md) | Group Messaging — Sender Keys | 003, 004 |
-| [007](ADR-007-membership-consent-and-admin-governance.md) | Membership, Per-Sender Consent & Admin Governance | 002, 005, 006 |
-| [008](ADR-008-replicated-authenticated-log-and-sync.md) | Replicated Authenticated Log & Sync | 002, 006, 007 |
+| [008](ADR-008-replicated-authenticated-log-and-sync.md) | Replicated Authenticated Log & Sync | 002, 006 |
+| [007](ADR-007-membership-consent-and-admin-governance.md) | Membership, Per-Sender Consent & Admin Governance | 002, 005, 006, 008 |
 | [009](ADR-009-deniability-mode.md) | Deniability Mode (per-channel) | 002, 003, 006, 007, 008 |
 | [010](ADR-010-at-rest-storage-and-retention.md) | At-Rest Storage & Retention | 002, 007, 008 |
-| [011](ADR-011-transport-substrate.md) | Transport Substrate (QUIC) | 004, 008 |
+| [011](ADR-011-transport-substrate.md) | Transport Substrate (QUIC) | 002, 004, 008 |
 | [012](ADR-012-nat-traversal-and-reachability.md) | NAT Traversal, Bootstrap & Reachability | 005, 011 |
 | [013](ADR-013-overlay-tunneling.md) | Overlay Tunneling (TCP-over-Vox) | 007, 011, 012 |
 | [014](ADR-014-macos-client.md) | macOS Client (the wedge) | 002, 005–010, 012 |
@@ -26,7 +27,7 @@ Start with ADR-001.
 - **Tier 0 — Foundation:** 001
 - **Tier 1 — Cross-cutting policy:** 002, 003
 - **Tier 2 — Crypto core:** 004, 005, 006
-- **Tier 3 — Differentiator + data:** 007, 008, 009, 010
+- **Tier 3 — Differentiator + data:** 008, 007, 009, 010 (log before consent)
 - **Tier 4 — Network & overlay:** 011, 012, 013
 - **Tier 5 — App / platform:** 014
 

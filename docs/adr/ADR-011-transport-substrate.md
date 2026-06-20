@@ -3,55 +3,105 @@
 **Status**: proposed
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: transport, quic, multiplexing, datagrams, tunneling
+**Tags**: transport, quic, tls, post-quantum, multiplexing, datagrams
 
 ## Context
 
-Vox must carry two very different workloads over one overlay (ADR-001): low-latency *interactive*
-tunnels (e.g. `ssh` over Vox, ADR-013) and *store-and-forward* log replication (ADR-008), with
-different reliability/latency contracts, without one degrading the other. It must compose with the
-crypto core (ADR-004) and the NAT/connectivity layer (ADR-012).
+Vox must carry two workloads over one overlay (ADR-001): low-latency *interactive* tunnels (`ssh`
+over Vox, ADR-013) and *store-and-forward* log replication (ADR-008), with different
+reliability/latency contracts, without one degrading the other. It must compose with identity
+(ADR-002), the messaging crypto core (ADR-004), and NAT traversal (ADR-012). A prior review
+correctly flagged that "key the QUIC streams from PQXDH/Noise/QUIC-TLS, pending validation" was not
+a security spec but a false deferral. This ADR specifies the concrete transport security design.
+Grounded in the libp2p TLS spec, IETF `draft-ietf-tls-ecdhe-mlkem`, and RFC 7250. *(Verifier agents
+abstained under rate-limiting; sources are canonical.)*
 
 ## Decision
 
-**Connection substrate = QUIC.** A single QUIC connection provides built-in security plus
-transport-level multiplexing of independent, ordered, reliable streams with no head-of-line
-blocking between streams (RFC 9000/9308). With QUIC, no separate stream muxer is needed; each
-tunneled byte stream and the log-sync traffic get their own stream.
+### Substrate = QUIC
 
-**Two contracts on one connection.** Reliable/ordered QUIC streams for async/bulk (log
-replication, file transfer); the RFC 9221 unreliable-DATAGRAM extension for low-latency/loss-
-tolerant flows — all under one handshake. To prevent bulk traffic from degrading interactive
-flows: separate *streams* for isolation, and separate QUIC *connections* only where genuinely
-differential network treatment (DSCP/QoS) is required, since QUIC has one congestion controller per
-connection (minimize connection count otherwise).
+A single QUIC connection per peer provides built-in security plus transport-level multiplexing of
+independent, ordered, reliable streams with no head-of-line blocking between streams (RFC 9000/9308).
+Each tunneled byte stream (ADR-013) and the log-sync traffic (ADR-008) get their own stream; with
+QUIC no separate stream muxer is needed. (TCP fallback, if ever required, uses yamux — never mplex,
+which lacks per-stream backpressure — but QUIC is primary.)
 
-**Stream encryption keyed from the handshake.** Use the identity/PQXDH handshake (ADR-004) to
-bootstrap a single AEAD session key per connection (Noise / QUIC-TLS 1.3), then let the AEAD
-transport encrypt high-throughput streams — rather than per-packet ratcheting. This composes
-alongside the per-message Sender-Keys/log crypto (ADR-006/ADR-008). *(Marked as engineering
-inference pending validation at implementation time.)*
+### Transport security (concrete)
 
-**TCP fallback (if ever needed):** yamux for multiplexing (never mplex — mplex lacks stream-level
-backpressure).
+- **PQ-hybrid key exchange.** The QUIC TLS 1.3 handshake uses the hybrid named group
+  **X25519MLKEM768** (code point 0x11EC): the key-schedule secret is `concat(ML-KEM-768 secret,
+  X25519 secret)`, secure if *either* component holds — PQ confidentiality for the transport from day
+  one. Only hybrid PQ groups are offered or accepted (no classical-only group), so there is no
+  downgrade target.
+- **Identity authentication (libp2p-style, no CA/PKI).** Each peer presents a **self-signed
+  certificate carrying its Vox identity public key in a custom X.509 extension**, and signs
+  `"vox-tls-handshake:" ‖ cert_public_key` with its **identity private key** (the composite
+  Ed25519+ML-DSA key, ADR-002) — a proof-of-possession that binds the ephemeral TLS certificate key
+  to the long-term Vox identity. The verifier derives the Vox identity from the extension and **MUST
+  require it to match the expected peer, aborting on mismatch.** This authenticates Vox identities in
+  the handshake without a CA and without RFC-7250 raw-public-key's out-of-band gap. (Production Rust
+  prior art: the `libp2p-tls` crate; OID-scoped extension.)
+- **PQ authentication.** Because the identity-binding signature is the composite Ed25519+ML-DSA key,
+  handshake authentication is post-quantum; the TLS certificate's own self-signature may be classical
+  since authentication is carried by the PQ composite extension signature and confidentiality by the
+  hybrid group.
+
+### Layering vs PQXDH (resolves the prior ambiguity)
+
+Two distinct, separately-keyed layers, each binding the Vox identity:
+- **Transport layer (this ADR):** QUIC-TLS 1.3 with X25519MLKEM768 + the identity-extension PoP.
+  Authenticates the peer and secures the link.
+- **Messaging layer (ADR-004):** PQXDH + Double Ratchet provides the per-author/pairwise *message*
+  keys, run **over** the authenticated transport. Vox does **not** run PQXDH as the transport
+  handshake, and **application/message keys are NOT derived from the TLS exporter** — so a transport
+  compromise does not expose message forward-secrecy / post-compromise security, which remain owned
+  by the ratchet. Tunnel streams (ADR-013), which are not ratcheted messages, use the transport's
+  AEAD directly.
+
+### Replay, 0-RTT, downgrade
+
+- **0-RTT is disabled.** QUIC/TLS 1.3 0-RTT early data is replayable; for a security overlay that
+  risk is unacceptable, so Vox never offers or accepts 0-RTT.
+- **Datagram anti-replay.** RFC 9221 datagrams carry a Vox-framing sequence number + sliding replay
+  window; out-of-window or duplicate datagrams are dropped.
+- **Downgrade prevention.** TLS 1.3's Finished MAC already binds the full transcript (including the
+  negotiated group); offering only hybrid PQ groups removes any downgrade target; the negotiated
+  suite is additionally recorded in the application session-establishment entry so downgrade is
+  detectable end-to-end.
+
+### Two contracts on one connection
+
+Reliable/ordered QUIC streams carry async/bulk traffic (log replication, file transfer); the RFC
+9221 unreliable-DATAGRAM extension carries low-latency/loss-tolerant flows — all under one handshake.
+To stop bulk traffic degrading interactive flows: separate **streams** for isolation, and separate
+QUIC **connections** only where genuinely differential network treatment (DSCP/QoS) is required
+(QUIC has one congestion controller per connection); otherwise minimize connection count.
+
+### Rust building blocks
+
+`quinn` (QUIC) + `rustls` with the post-quantum/hybrid provider (X25519MLKEM768), and
+`libp2p-tls`-style self-signed-cert + identity-extension handling for the PoP binding. All
+production-ready as of 2026.
 
 ## Consequences
 
 ### Positive
-- One encrypted connection cleanly carries interactive tunnels + async sync without cross-stream HOL blocking.
-- Native QUIC security + multiplexing reduces moving parts.
-- Stream-keyed-from-handshake gives high throughput without per-packet ratchet overhead.
+- A concrete, PQ-hybrid, identity-authenticated transport — no deferral, modeled on deployed prior
+  art (libp2p, IETF hybrid TLS).
+- Clean layering: transport compromise cannot undermine message FS/PCS (owned by ADR-004).
+- One encrypted connection carries interactive tunnels + async sync without cross-stream HOL blocking.
 
 ### Negative
-- Shared per-connection congestion control means a bulk stream can still throttle an interactive
-  one on the same connection; true QoS separation needs multiple connections (overhead trade-off).
-- The handshake→stream-key composition needs explicit security validation (not yet from a verified source).
+- Disabling 0-RTT costs a round trip on resumption — accepted for the replay-safety it buys.
+- Per-connection congestion control means true QoS separation needs multiple connections (overhead).
+- The custom identity-extension + composite-PQ-signature cert path needs careful implementation and
+  review (a wrong binding would break peer authentication).
 
 ### Neutral
-- QUIC is also the natural substrate for the NAT-traversal techniques in ADR-012 (UDP-based).
+- QUIC is also the natural substrate for ADR-012's UDP-based NAT traversal.
 
 ## Links
-**Depends on**: ADR-004, ADR-008.
+**Depends on**: ADR-002, ADR-004, ADR-008.
 - Depended on by: ADR-012, ADR-013.
 
 ## Engineering Mantra

@@ -38,13 +38,28 @@ hidden service).
    timer). The relay carries only lightweight signaling, not traffic.
 4. **Relay of last resort** via the user's own node for the residual (both CGNAT/symmetric, no IPv6).
 
-**Rendezvous.** Peers meet at the KDF-derived rendezvous key (ADR-005), publishing current
-endpoints there (DHT mutable items / OpenDHT-style), which can double as the hole-punch
-coordination channel for 3+-member channels. Cold-start joins the DHT via a minimal, possibly
-piggybacked (e.g. existing public DHT) bootstrap set.
+**Rendezvous (authenticated, fresh, epoch-scoped).** Peers meet at a rendezvous key derived from
+`(channelID, epoch)` via a slow/memory-hard KDF (ADR-005) and publish current endpoints there as
+**signed, sequence-numbered mutable records**:
+`{ author_id, channelID, epoch, endpoints, seq (monotonic), timestamp }` signed by the publishing
+member's composite identity key (ADR-002). Readers **verify the signature, reject stale/replayed
+records** (older `seq`/timestamp), and accept records only from channel members — so a poisoner
+cannot inject or replay endpoints, and a stale record cannot be replayed after rotation. The
+rendezvous point can double as the hole-punch coordination channel for 3+-member channels.
+**Privacy:** because the rendezvous key is `(channelID, epoch)`-derived, a leaked key expires at the
+next epoch (limiting swarm-presence tracking to that epoch); full unlinkability against a global
+observer is the later metadata-privacy phase (ADR-001), stated, not silently omitted.
 
-**Anti-abuse.** Rate-limit join attempts and/or require proof-of-work join tokens (PAKE stops
-offline but not online guessing, ADR-005).
+**Bootstrap (concrete, no third-party security dependency).** Cold-start onto the swarm uses a
+**configurable bootstrap set the user controls**: by default the user's own always-on node (the
+ADR-012 decision below) is their primary bootstrap + rendezvous; a user may additionally opt into a
+community/volunteer set. Vox does **not** treat any external/public DHT as a security dependency —
+bootstrap nodes only *introduce* peers (they can neither read traffic nor forge membership), so a
+hostile or absent bootstrap degrades availability but never confidentiality or authenticity. (This
+replaces the earlier "possibly piggyback public DHT" wording, which was a false deferral.)
+
+**Anti-abuse.** Join-attempt abuse is bounded by the layered controls in ADR-005 (consent gate +
+`(channelID, epoch)`-bound PoW join tokens + admin-signed admission), not by rate-limiting alone.
 
 **Honest limit (documented).** Two peers both behind CGNAT/symmetric NAT with no IPv6 and no
 reachable coordinator cannot connect. Global joint-IPv6 probability for a random pair is only

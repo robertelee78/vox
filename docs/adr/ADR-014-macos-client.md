@@ -132,7 +132,8 @@ carefully from ADR-007 and will require user testing:
 - Native UI is macOS-specific: Linux/iOS reuse the core but need their own UIs (their own ADRs).
 - The UniFFI boundary must be carefully designed to avoid leaking secrets or blocking on the core.
 - The per-sender consent UX is genuinely novel with no verified precedent — it carries design risk
-  and must be validated with real users before it is considered done.
+  addressed by **pre-release usability validation as a release acceptance criterion** (not a deferred
+  protocol requirement; the underlying protocol guarantees of ADR-007 do not depend on it).
 
 ### Neutral
 - Choosing native-per-platform over a single cross-platform UI is a deliberate trade of code reuse

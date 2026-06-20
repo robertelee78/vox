@@ -118,8 +118,12 @@ across channels without the user choosing to.
 - Reuses OpenPGP key material and fingerprint culture instead of minting an app-specific identity.
 
 ## Links
-**Depends on**: ADR-001, ADR-003.
-- Depended on by: ADR-004, ADR-005, ADR-007, ADR-008, ADR-009, ADR-010, ADR-014.
+**Depends on**: ADR-001.
+- Depended on by: ADR-003, ADR-004, ADR-005, ADR-007, ADR-008, ADR-009, ADR-010, ADR-011, ADR-014.
+
+> Note: ADR-002 names the concrete PQ algorithms (ML-DSA, ML-KEM) as direct references; the hybrid
+> and crypto-agility *policy* that governs them is ADR-003, which builds on this key model. The
+> dependency is one-directional (003 → 002) to keep the ADR graph acyclic.
 
 ## Engineering Mantra
 

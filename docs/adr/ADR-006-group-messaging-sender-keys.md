@@ -40,6 +40,25 @@ larger keys (ADR-003).
 not self-heal (Balbás et al., ASIACRYPT 2023). Recovery and revocation rely on *explicit* sender-
 key rotation and passphrase-epoch rotation (ADR-007), not on ratchet self-healing.
 
+**Wire format & operational rules (so the group layer is buildable):**
+- **SKDM fields:** `{ channelID, epoch, author_id, chain_id, iteration, chain_key, signing_pubkey,
+  algo_ids, signature }`. The **`chain_id` is a per-sender generation identifier distinct from the
+  channel `epoch`** — it increments on every per-member sender-key rotation (revocation, scheduled
+  refresh) so multiple generations are unambiguous within one epoch.
+- **Message header:** `{ channelID, epoch, author_id, chain_id, iteration }`, all bound into the
+  AEAD associated data; receivers reject a message whose `(channelID, epoch)` does not match the
+  expected channel (the cross-group-confusion guard).
+- **Replay / window:** accept a message only if its `iteration` advances the receiver's last-seen
+  value for `(author_id, chain_id)`; cache a **bounded** set of skipped per-iteration message keys
+  for out-of-order delivery (same `MAX_SKIP` discipline as ADR-004); reject beyond the bound.
+- **Rotation cadence:** a sender rotates its sender key (new `chain_id`) on every membership change
+  affecting it (revocation, ADR-007) and additionally on a scheduled bound (max `N` messages or max
+  `T` time) to cap the post-compromise exposure window; passphrase-epoch rotation supersedes all
+  per-sender chains.
+- **Compromise recovery:** because there is no self-heal, recovery is an explicit `chain_id` rotation
+  redistributed to current consenters (ADR-007); the schedule above bounds how long a leaked sender
+  key remains useful.
+
 ## Consequences
 
 ### Positive

@@ -82,8 +82,10 @@ Signalgate / Megolm membership-injection class is structurally absent.
 
 ### Conflict resolution under partition
 
-Governance state lives on the causal Merkle-DAG (ADR-008), which converges without consensus. The
-model is chosen so most actions never truly conflict:
+Governance state lives on the causal Merkle-DAG (ADR-008), which converges without consensus, and
+relies on ADR-008's **fork/equivocation handling** (signed heads, durable fork proofs, equivocator
+freeze). Partition-time authority actions are therefore **provisional until their causal neighborhood
+reconciles** (ADR-008). The model is chosen so most actions never truly conflict:
 
 - **Consent is single-writer.** Only `A` authors `A`'s consent grants and `A`'s sender-key rotations,
   so `A`'s consent timeline is totally ordered within `A`'s own log. There is no cross-writer race on
