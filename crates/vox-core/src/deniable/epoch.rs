@@ -93,7 +93,11 @@ impl EphemeralSigningKey {
     /// secret material — only [`crate::deniable::esk_publication`] calls this, and
     /// only **after** the epoch has closed (publishing earlier voids live auth).
     pub(crate) fn publishable_seeds(&self) -> ([u8; 32], [u8; 32]) {
-        (self.signer.ed25519_seed(), self.signer.ml_dsa_seed())
+        // The seed getters now return `Zeroizing<[u8; 32]>`; deref-copy them out.
+        // Unlike the at-rest factors, these seeds are *deliberately* published here
+        // (the ESK-publication mechanism, ADR-009): once the epoch has closed they
+        // are no longer secret, so surfacing them by value is correct by design.
+        (*self.signer.ed25519_seed(), *self.signer.ml_dsa_seed())
     }
 }
 
