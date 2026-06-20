@@ -141,14 +141,23 @@ reason to withhold the surface or ship it incomplete.
 - Consent is an explicit, **per-member decision**: when a newcomer is admitted, each member is
   prompted "Allow [member] to read your messages?", tied to that member's verification state to
   encourage *verify-before-consent*.
-- **Two distinct axes, never conflated:** *verification* ("is this really them?") and *consent* ("can
-  they read me?" / "can I read them?") are shown as separate, clearly-labeled states per member —
-  avoiding the binary trusted/untrusted confusion.
+- **Three distinct, clearly-labeled states per member — never conflated:** *verification* ("is this
+  really them?"), *outbound consent* ("should they see my messages?"), and *inbound visibility* ("do I
+  want to see theirs?"). Independent toggles, not one trusted/untrusted switch.
 - **Honest partial-visibility display:** show, per member, whether you've consented to them and (where
   known) whether they've consented to you; show a newcomer a clear "you'll see each member's messages
   as they allow you" state rather than a confusing empty/partial timeline.
-- **Revocation** is a clear per-member "stop sharing my messages with them" action (triggers sender-key
-  rotation, ADR-007).
+- **Per-member controls (both directions, ADR-007):**
+  - *Outbound consent* — "share / stop sharing my messages with them" (rotates `A`'s sender key
+    excluding them).
+  - *Inbound visibility* — "see / stop seeing their messages" (local; drops their sender key from your
+    view; no rotation, no log entry).
+- **Block — the common combined action.** Realistic flow: member-2 joins, member-1 consents, then later
+  member-1 wants nothing to do with member-2. A single **"Block [member]"** action handles **both
+  directions at once** — revoke outbound consent *and* opt out inbound visibility — so the user isn't
+  forced to reason about two toggles in the moment. The per-member panel still exposes the two toggles
+  individually for the less-common asymmetric cases; **Unblock** restores them (re-consent re-shares
+  the key going forward, ADR-007).
 
 ### Messaging
 
