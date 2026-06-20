@@ -10,133 +10,221 @@
 Vox is Rust-maximal (ADR-001 principle 10): one shared Rust **core** with Rust **clients** over it.
 The macOS client (ADR-014) is the deliberate native-UI exception (SwiftUI over the core via UniFFI).
 This ADR specifies the **first-class Rust TUI client** — a terminal-native client for chat, swarm
-create/join, verification, and consent — which is the natural home client for Linux, servers,
-headless boxes, and power users, and the one that runs *over SSH* (and over Vox's own tunnel,
-dogfooding ADR-013). Unlike the macOS client it links the core **directly as a Rust crate (no FFI)**,
-so there is no binding layer to leak secrets across. It must make Vox's novel trust model usable in a
-terminal: per-sender consent (ADR-007), key verification (ADR-002), and the honest-limits discipline,
-under the same protocol guarantees as ADR-014 — only the presentation differs.
+create/join, verification, and consent — the natural home client for Linux, servers, headless boxes,
+and power users, and the one that runs *over SSH* (and over Vox's own tunnel, dogfooding ADR-013).
+It links the core **directly as a Rust crate (no FFI)**, so there is no binding layer to leak secrets
+across. It must make Vox's trust model usable in a terminal: per-sender consent (ADR-007), key
+verification (ADR-002), the honest-limits discipline — under the same protocol guarantees as ADR-014,
+held to the same "execute without re-deciding" bar; only presentation differs.
 
 ## Decision
 
 ### Architecture
 
-- **Single Rust binary linking the `vox-core` crate directly.** The core (identity ADR-002, crypto
-  ADR-004/006, log/sync ADR-008, governance ADR-007, transport ADR-011, NAT ADR-012, tunneling
-  ADR-013) is a library crate; the TUI is a binary crate that depends on it. **No UniFFI, no IPC** —
-  the same APIs the macOS Swift layer reaches through UniFFI are plain async Rust calls here.
-- **Async runtime = `tokio`** (the core's runtime); the UI render loop runs on the main thread and
-  receives core state over channels (`tokio::sync::mpsc`/`watch`), so the render never blocks on the
-  core and secrets never cross a process boundary.
-- **TUI stack (SOTA, production-ready as of 2026):** **`ratatui`** (immediate-mode TUI framework) +
-  **`crossterm`** backend (cross-platform: Linux/macOS/Windows terminals, raw mode, key/mouse
-  events). Text entry via `tui-textarea`; in-terminal QR rendering via the `qrcode` crate (Unicode
-  half-block / ANSI); argument parsing via `clap`. Secrets held in `zeroize`/`secrecy` types,
-  `mlock`'d (ADR-010), never written to scrollback or logs.
+- **Single Rust binary linking the `vox-core` crate directly — no UniFFI, no IPC control plane.** The
+  core (identity ADR-002, crypto ADR-004/006, log/sync ADR-008, governance ADR-007, transport ADR-011,
+  NAT ADR-012, tunneling ADR-013) is a library crate; the TUI is a binary crate depending on it.
+- **The headless node is a *sync peer*, not a control plane (resolves the no-IPC claim).** "Attach to a
+  user-run headless node" (ADR-012/014) means the TUI's **embedded** node syncs with that node **as just
+  another ciphertext-only relay/store peer** over the ADR-008 sync protocol on ADR-011 transport — the
+  node never holds this user's secrets or plaintext and is never remote-controlled. The TUI **always**
+  holds the secrets and does all decryption locally; so "secrets never cross a process boundary" holds.
+  A true remote-core / thin-client (secrets on a remote node) is **explicitly out of scope** here and
+  would be its own capability ADR.
+- **Async runtime = multi-threaded `tokio`** (the core's runtime). The **main task owns the terminal and
+  the render loop**; a **dedicated blocking task** polls `crossterm` events and forwards them; shutdown
+  is cooperative via a `CancellationToken`. The render never blocks on the core.
+- **Typed core↔UI boundary (no secrets in UI channels — binding contract).** core→UI uses
+  **`watch<ViewModel>` for latest-wins *state*** (sync status, per-member verification/consent/visibility
+  state, reachability) and **`mpsc<Event>` for ordered *events* that must never coalesce** (new log
+  entries, key-change alerts, errors). UI→core uses `mpsc<Command>`. These channels carry **only
+  rendered/redacted view models** — decrypted text destined for display, yes; **never** raw keys, SKDMs,
+  passphrases, the SEK, or `self_seed`, which stay inside core types (`zeroize`/`secrecy`, mlock'd). Bounded
+  channels; view-state updates use newest-wins, events are never dropped.
 
-### Navigation model (the channel is the unit, ADR-001)
+### TUI stack (SOTA, production-ready 2026)
+
+`ratatui` (immediate-mode TUI) + `crossterm` backend (Linux/macOS terminals, raw mode, key/mouse
+events) + `tui-textarea` (composer) + `qrcode` (matrix generation) + `clap`/`clap_complete`/`clap_mangen`
+(args, completions, man pages) + `zeroize`/`secrecy` (+ explicit `libc::mlock`/`region`, below).
+
+### Navigation & input state machine
 
 - **Home = channel (swarm) list**; create/join is the primary action; each channel has a local name.
-- **Channel view** = message timeline + composer; a **member pane** (toggle) shows each member's
-  local nickname, verification state, and consent state. **No contacts tier, no special 1:1** — a
-  two-member channel is the only "DM" (ADR-001 principle 2).
-- **Keyboard-first, discoverable.** Vim-style motion plus an always-available command palette
-  (`:`-prompt) and a visible keybinding hint bar; nothing essential is hidden behind unlabeled keys.
-  Mouse is supported where the terminal allows but never required.
+  **Channel view** = message timeline + composer + toggleable **member pane** (nickname, verification,
+  consent state). **No contacts tier, no special 1:1** — a two-member channel is the only "DM" (ADR-001).
+- **Focus model:** `Tab` cycles timeline → composer → member pane; the focused pane is visibly marked.
+- **Input modality:** the composer is **modeless insert** by default (`tui-textarea`), with an optional
+  vim mode (config). A **`:` command palette** is a modal overlay (`Esc` dismisses). A **visible keybind
+  hint bar** is always shown. **Every action is reachable by a typed `:`-command**, not only by chord
+  (discoverability + accessibility).
 
 ### Identity & onboarding
 
-- Generate or import a GPG/Ed25519 identity paired with its ML-DSA co-key (ADR-002); generate the
-  256-bit `self_seed` (ADR-002). Display the identity as a plain-language **safety code** (not
-  "fingerprint"), and a **terminal QR** of the identity material for a phone/other device to scan.
-- **Identity-key storage (no Secure Enclave here).** On generate, the root is held in `mlock`'d
-  zeroized memory while unlocked and wrapped at rest in the **identity vault** (Argon2id over an
-  identity passphrase), separate from any per-channel SEK (ADR-010) — no circularity. On import,
-  signing is delegated to `gpg-agent`/smartcard; the key never leaves it.
-- **Mandatory verified encrypted backup before first use** (OpenPGP export incl. `self_seed`,
-  ADR-002); root loss is unrecoverable and the client says so.
-- **Per-channel identity selection** is an explicit step at create/join, pre-selecting the
-  main/last-used identity, with "create a fresh pseudonymous identity" as a one-key option (ADR-002).
+- Generate or import a GPG/Ed25519 identity + ML-DSA co-key (ADR-002); generate the 256-bit `self_seed`
+  (ADR-002). Show the identity as a plain-language **safety code** and a **terminal QR** of the identity.
+- **Storage (no Secure Enclave here).** Generate path: root in `mlock`'d zeroized memory while unlocked,
+  at rest in the **identity vault** (Argon2id over an identity passphrase), separate from any per-channel
+  SEK (ADR-010) — no circularity. Import path: signing delegated to `gpg-agent`/smartcard; the key never
+  leaves it.
+- **Mandatory verified encrypted backup before first use** (OpenPGP export incl. `self_seed`, ADR-002),
+  with ADR-014's **honest caveat**: a hardware-bound/non-exportable import key **cannot** be exported —
+  Vox backs up `self_seed` + its Vox-managed companion material and says plainly it cannot export the
+  hardware-held private key (that is the card/agent's responsibility).
+- **Per-channel identity selection** is explicit at create/join, pre-selecting the main/last-used
+  identity; "create a fresh pseudonymous identity" (ADR-002) is a one-key option.
 
-### Swarm create / join
+### Swarm create / join (incl. ADR-007 invite modes)
 
-- **Create:** set policy up front — **authorship: attributable** (default; deniable is an explicit
-  opt-in and is **genesis-immutable**, ADR-007), **history: full** (default), **TTL: never** (default,
-  changeable). Creating mints the genesis record → `channelID = SHA-256(genesis)` (ADR-007).
-- **Join:** paste/scan the **channelID** (the invite artifact, ADR-005/014); enter the **passphrase
-  separately** (never one artifact). The client runs CPace + identity PoP (ADR-005). It states plainly
-  that **joining grants nothing readable until members consent** (ADR-007).
-- **Sharing an invite:** render the channelID as a **terminal QR + copyable string**; the passphrase
-  is shared out-of-band by the user. The client never puts both in one artifact.
+- **Create:** set policy up front — **authorship attributable** (default; deniable is opt-in and
+  **genesis-immutable**, ADR-007), **history full** (default), **TTL never** (default, mutable). Creating
+  mints the genesis record → `channelID = SHA-256(genesis)` (ADR-007).
+- **Invite modes (ADR-007), both supported:** **identity-bound invite (default, high-trust)** — the
+  invite artifact names the newcomer's expected identity fingerprint; the TUI shows "expecting `<safety
+  code>`" and flags any joiner who doesn't match. **Open passphrase join** — anyone with `channelID +
+  passphrase`; such a joiner is shown **unverified** until a member verifies them. The **passphrase is
+  always shared out-of-band, never in the invite artifact**.
+- **Terminal QR rendering contract:** the QR encodes the **channelID** (plus the expected fingerprint
+  for an identity-bound invite); ECC level **M**, mandatory **quiet zone**, **Unicode half-block** render
+  by default with an **ASCII fallback** (`--accessible`/no-Unicode terminals), a **minimum-terminal-size
+  check** (else show the copyable string), and a copyable string alongside. The client states plainly:
+  **joining grants nothing readable until members consent** (ADR-007).
 
-### Verification ceremony (terminal-adapted, evidence-aligned)
+### Verification ceremony (terminal-adapted, ADR-014 evidence ordering preserved)
 
-The terminal cannot operate a camera, so the scan-first default of ADR-014 inverts: **the TUI
-*displays* a QR for the peer's phone to scan**, and the **grouped numeric safety code** (derived from
-`SHA-256(Ed25519_pub ‖ ML-DSA_pub)` of both parties, ADR-002) is the **primary in-terminal compare**
-path. Optionally a QR **image file** can be read for scan-equivalent verification. Verification is
-**proactively prompted** at trust-relevant moments — new member, **before a consent decision**, on any
-key change — and is one screen, not buried. Key-change / TOFU state is surfaced per member (verified /
-unverified-TOFU / key-changed) over the log; no server-dependent key transparency (ADR-014 parity).
+A terminal has no camera, so the strong scan path is **relocated to the peer's device, not weakened**:
+
+- **Recommended ceremony: the TUI *displays* a QR; the peer scans it with their phone** — one-scan
+  verification with the strong properties ADR-014 requires. The grouped **numeric safety-code compare**
+  is the **in-terminal fallback** when no phone is present (ADR-014's evidence-weakest path, used only as
+  fallback — the strong path stays primary, just on the peer's camera). An optional **QR-image-file** read
+  gives scan-equivalent verification.
+- **Pinned derivation (so two clients agree):** safety code = grouped decimal of
+  `SHA-256("vox/safety/v1" ‖ pk_lo ‖ pk_hi)` where `pk_lo,pk_hi` are the two parties' composite identity
+  pubkeys (ADR-002) in **ascending byte order**. The verification QR payload is a canonical-CBOR record
+  of the displaying party's composite pubkey (ADR-008 encoding).
+- **Acceptance state machine:** `unverified-TOFU → verified` on a successful scan/compare; any key change
+  resets to **`key-changed` (must re-verify)**. State is **persisted per member** in the per-channel
+  store. Verification is **proactively prompted** at new-member, **before a consent decision**, and on key
+  change — one screen, never buried.
 
 ### Per-sender consent UX (the differentiator, in a terminal)
 
-- Three **distinct, labeled** per-member states, never conflated: *verification* ("is this them?"),
-  *outbound consent* ("should they see my messages?"), *inbound visibility* ("do I want to see
-  theirs?") — independent toggles in the member pane (ADR-007).
-- **Block** = the combined action (revoke outbound consent + opt out inbound visibility); **Block is
-  NOT removal** — the member stays in the list with a "Blocked" state; **Unblock** re-consents both
-  directions (ADR-007/014 parity).
-- **Honest partial-visibility:** show, per member, whether you've consented to them and (where known)
-  whether they've consented to you; show a newcomer the "you'll see each member's messages as they
-  allow you" state rather than a confusing empty timeline.
+- Three **distinct, labeled** per-member states, never conflated: *verification*, *outbound consent*,
+  *inbound visibility* — independent toggles in the member pane (ADR-007).
+- **Block** = combined (revoke outbound consent + opt out inbound visibility); **Block is NOT removal**
+  (member stays in the list with a "Blocked" state). **Unblock restores *your* outbound consent and
+  *your* local inbound-visibility preference** — it **cannot force the peer to consent to you** (ADR-007).
+- **Honest partial-visibility:** per member, show whether you've consented to them and (where known)
+  whether they've consented to you; show a newcomer "you'll see each member's messages as they allow you"
+  rather than a confusing empty timeline.
 
 ### Messaging
 
-- **Text and files.** Files are sent by path, carried as chunk-manifest log payloads (ADR-008/014:
-  256 KiB chunks). Render-gated, undecryptable entries shown as an honest non-leaking marker.
-- **Voice/video are out of scope** for the TUI (no terminal path); they remain a separate future
-  capability for GUI clients (ADR-014).
+- **Text and files.** Files are sent by path, carried as **chunk-manifest** payloads — manifest schema
+  `{ file_id, total_len, content_type, chunk_hashes[] }` is ADR-014's, its 256-KiB chunking and canonical
+  encoding (tag `0x000A`) are ADR-008's. Render-gated; undecryptable entries shown as an honest
+  non-leaking marker. **Voice/video are out of scope** (no terminal path).
 
-### Connectivity, node operation & tunneling
+### Connectivity, node operation, notifications & tunneling
 
-- The TUI **embeds the node** when running, or **attaches to a user-run headless node** (the same
-  Rust core, ADR-012/014) as rendezvous/relay/store anchor — configurable, none compulsory.
-- Surfaces emergent availability honestly (per-channel reachability/sync; for a two-member channel,
-  "both must be online or your node reachable").
-- **Tunneling (ADR-013) is a first-class capability, present but OFF by default** (parity with
-  ADR-014: nothing active until enabled). The terminal is its *natural* surface — `vox service add`,
-  `vox forward`, `vox up` and per-member `bind:`/`dial:` grants are exposed when enabled. Chat
-  membership still grants **zero** tunnel reach; access requires explicit capability grants (ADR-013).
+- The TUI **embeds the node** when running, or syncs with a **user-run headless node as a ciphertext-only
+  peer/anchor** (above; ADR-012/014) — configurable, none compulsory. Surfaces emergent availability
+  honestly (per-channel reachability/sync; for a two-member channel, "both must be online or your node
+  reachable").
+- **Notifications (while running; no extra daemon).** New-decryptable-entry events surface **in-app**
+  (unread markers in the channel list, a status line) and, on a desktop session, as OS notifications via
+  `notify-rust`; over SSH the fallback is **OSC 9 / terminal bell**. The TUI does **not** spawn a
+  background agent (that is the headless-node binary's role, ADR-012/014) — it notifies only while running.
+- **Tunneling (ADR-013): first-class, present but OFF (inactive, not hidden) by default.** The terminal
+  is its natural surface: the **full** ADR-013 surface ships — `vox service add`, `vox forward` / SOCKS,
+  and per-member `bind:`/`dial:` grants require **no privilege** and are the default tunneling path;
+  **`vox up` (TUN) is gated behind an explicit privilege step** (run as root / `CAP_NET_ADMIN` via
+  `setcap`) and refuses with a clear message if unprivileged. Chat membership still grants **zero** tunnel
+  reach; access requires explicit capability grants (ADR-013).
 
 ### At-rest, app-lock & screen security
 
-- Per-channel SEK + identity vault (ADR-010). **App-lock** zeroizes the SEK from memory and requires
-  re-auth (passphrase + identity factor); default 5-min idle timeout. On lock the TUI **clears the
-  alternate screen and disables scrollback retention** so plaintext is not left in terminal history;
-  it warns that terminal multiplexers/loggers (tmux/screen, `script`) can defeat this — honest limit.
+- Per-channel SEK + identity vault (ADR-010). **Plaintext is rendered ONLY to the alternate screen,
+  never to the primary buffer** — so it never enters terminal scrollback. (The earlier "disable
+  scrollback" framing was wrong: scrollback is the emulator's buffer, not ours.)
+- **App-lock** zeroizes the SEK(s) **and** the in-memory identity root (generate path) and decrypted view
+  models, then requires re-auth (identity-vault unlock + per-channel SEK re-derive). For `gpg-agent`
+  imports, Vox clears only its **own** derived material — the key's custody and TTL are the agent's
+  (honest limit). On lock the TUI **leaves the alternate screen with its buffer cleared** and issues a
+  **best-effort `ESC[3J`**; it **documents the honest limit** that non-cooperating emulators, `tmux`/
+  `screen`, or `script` may retain copies (not claimed-fixed). **Default 5-min idle-lock**; it **also
+  locks on terminal detach / `SIGHUP` / connection drop** (the SSH analogue of "lock on sleep"). Lock is
+  **user-configurable incl. disable** (with a direct warning, ADR-014 parity). On first run inside a
+  detected multiplexer it shows a **one-time honest warning** about capture being outside Vox's control.
+- **Memory protection (no false claim).** Secrets use `zeroize`/`secrecy` types **and are `mlock`'d**
+  (explicit `libc::mlock`/`region`). Where `mlock` is **unavailable** (e.g. `RLIMIT_MEMLOCK=0` in an
+  unprivileged container — exactly the headless target), the client does **not** silently pretend: it
+  surfaces a prominent warning and continues with **zeroize-only**, a defined, documented degradation
+  (per the no-fallback mantra this behavior is specified, not stubbed).
+
+### Configuration, state & logging
+
+- **XDG-conformant layout:** config `$XDG_CONFIG_HOME/vox/config.toml` (macOS `~/Library/Application
+  Support/vox`), data `$XDG_DATA_HOME/vox/` (identity vault, per-channel SEK stores, log DB). **Store
+  files `0600`, dirs `0700`.** Precedence: CLI flags > env > config file > defaults. Per-identity
+  **profile separation** (distinct data dirs). Keybindings overridable in config.
+- **Log redaction is mandatory:** logs and panic reports never contain plaintext, keys, passphrases, or
+  seeds; secret types render as redacted.
+
+### Error & offline UX
+
+- A persistent **status bar** plus a **dismissible alert log**. The **ADR-008 wire error codes
+  `0x01`–`0x08`** map to human strings; join failures (wrong passphrase, Equihash PoW delay, PoP
+  mismatch), unreachable-peer / "both must be online", epoch mismatch, quota, key-change, and
+  missing-consent ("you'll see them once they consent") each render as a visible state with a recovery
+  action — never a silent failure.
+
+### Accessibility (an executable mode, not a disclaimer)
+
+- **Never color-only signalling:** verification / consent / Block state is always color **+ glyph +
+  label**. Honor **`NO_COLOR`** and a high-contrast/no-color mode. **ASCII (non-Unicode) QR fallback.**
+  Every action reachable by typed `:`-command (no chord-only paths). **No mouse dependence** (mouse
+  optional). A linear, screen-reader-friendly view mode.
+
+### Testing strategy (release gate)
+
+- `ratatui` **`TestBackend` render-snapshot** tests; headless **input-injection** state-machine tests;
+  an explicit assertion that **plaintext never reaches the primary buffer** (directly validates the
+  at-rest screen claim); **QR encode/decode round-trip**; consent/verification **golden flows**;
+  **lock/zeroize** tests; **tokio shutdown/backpressure** tests; a **terminal-compatibility matrix**;
+  core integration tests (trivial via direct linking); **parity tests** against ADR-014 client
+  expectations (same core state → equivalent surfaced state).
 
 ### Distribution
 
-- **`cargo install vox-tui`**, plus prebuilt **static `musl` binaries** and per-distro packages; no
-  notarization needed (CLI). Runs over SSH and over Vox's own tunnel (dogfooding ADR-013).
+- Command suite is **`vox`**; the interactive TUI is `vox` (no args) or `vox tui`; crate/package name
+  `vox-tui`. Static **`musl`** binary for the generate path; the import path **shells to the system
+  `gpg-agent`** over its socket (not gpgme-linked) so the static build stays clean. **Signed,
+  reproducible** release artifacts (supply-chain integrity the threat model expects). Shell completions
+  (`clap_complete`) + man pages (`clap_mangen`). Runs over SSH and over Vox's own tunnel (dogfoods
+  ADR-013). **Windows is out of scope for this ADR** — every at-rest/identity mechanism here is POSIX
+  (`mlock`, `gpg-agent`, XDG); a Windows client (DPAPI/`VirtualLock` mapping) is its own later peer ADR.
 
 ## Consequences
 
 ### Positive
-- Pure Rust, **no FFI boundary** to secure — the smallest secret-handling attack surface of any client.
-- Runs everywhere a terminal does, including **headless servers and over SSH**, making it the natural
-  Linux/server client and the one that exercises tunneling end-to-end.
+- Pure Rust, **no FFI boundary** to secure — the smallest secret-handling surface of any client; the
+  headless node never holds this user's secrets, preserving the no-IPC-secret-crossing claim.
+- Runs everywhere a terminal does, incl. **headless servers and over SSH**, and exercises tunneling
+  end-to-end (dogfoods ADR-013); the natural Linux/server client.
 - Reuses the entire core and the ADR-014 trust-model UX requirements; only presentation is new.
 
 ### Negative
-- **No camera ⇒ verification inverts** to display-QR-for-phone + safety-code compare; slightly higher
-  friction than scan-first, mitigated by proactive prompting and the numeric code.
-- Terminal UX has real accessibility limits (screen readers vary on TUIs); documented, not hidden.
-- No rich media (voice/video/inline images) in the terminal.
+- **No camera ⇒ the strong scan path lives on the peer's phone**; numeric compare is the in-terminal
+  fallback (higher false-accept, ARES 2023), mitigated by keeping scan primary and prompting proactively.
+- `mlock` can be unavailable on the very headless/container targets this client favors — handled by a
+  surfaced, documented degradation rather than a silent one.
+- Terminal a11y has real limits (screen-reader/TUI variance); addressed by the executable a11y mode and
+  stated honestly. No rich media in the terminal.
 
 ### Neutral
-- Peer to ADR-014 over one core, not a fork; future iOS/Linux-GUI clients are additional peers.
+- Peer to ADR-014 over one core, not a fork; iOS / Linux-GUI / Windows clients are additional peer ADRs.
 
 ## Links
 **Depends on**: ADR-002, ADR-004, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009, ADR-010, ADR-011, ADR-012, ADR-013.
