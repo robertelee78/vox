@@ -91,6 +91,32 @@ Rate-limiting by peers remains a cheap first filter but is explicitly **not** th
 render-gating amplification) is bounded by the per-author log quotas (ADR-008) and rendezvous-record
 caps (ADR-012), not by join PoW.
 
+### Implementation notes (normative)
+
+- **PoW verification is pure-Rust and cheap.** Equihash solution validity is checked with the
+  `equihash` (librustzcash) crate's pure-Rust verifier plus the difficulty-filter hash; verification
+  is sub-millisecond and is always the path a responder runs. The signed responder-nonce carries the
+  difficulty so the prover cannot understate it, and a token is bound to `(channelID, epoch,
+  responder_nonce)` so it cannot be precomputed or replayed across channels/epochs.
+- **PoW solving — solver strategy + a scoped Rust-maximal exception.** The default solve path is a
+  **pure-Rust** generalized-Wagner solver (memory-bounded: parent-pointer nodes, per-round
+  collide-keep-discard, hard-capped list — it does *not* retain flattened index lists). It is the
+  solver used for reduced-parameter CI and is a correct — but, at the real `(200,9)` parameters,
+  ~1.7–2.5 GB and seconds-to-minutes — fallback. Because that does not meet the ~1–2 s mobile-join
+  target, an **optional, off-by-default `equihash-solver` build feature** enables the C++ `tromp`
+  solver (via librustzcash) for production `(200,9)` proving. This is a **deliberate, scoped exception
+  to ADR-001 principle 10 (Rust-maximal)**: *all* protocol logic and *all* verification remain pure
+  Rust; only the prover's optional speed path is non-Rust, it is never required for the default build
+  or CI, and the pure-Rust solver remains a complete (if slower) alternative. A future benchmarked
+  pure-Rust `(200,9)` solver would let the exception be retired. (Decision pending deciders'
+  confirmation; trivially reversible by dropping the feature.)
+- **Proof-of-possession confidentiality.** The identity PoP exchanged inside the CPace-protected
+  session is AEAD-sealed (AES-256-GCM) under a key derived from the CPace ISK,
+  `K_pop = HKDF-SHA-256(ISK, info="vox/cpace-pop/v1")`, so the identity public keys and signature are
+  not exposed on the wire before the pairwise session exists.
+- **PoW precedes CPace.** A responder verifies the join PoW token *before* performing any CPace work,
+  so unauthenticated peers cannot force PAKE computation.
+
 ## Consequences
 
 ### Positive

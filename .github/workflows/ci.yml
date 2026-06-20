@@ -24,7 +24,23 @@ jobs:
         run: rustc --version && cargo --version
       - name: Format check
         run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --all-features --workspace
+      # The default gate is PURE-RUST (no --all-features): the optional
+      # `equihash-solver` feature pulls a C++ tromp backend (ADR-005 PoW prover
+      # perf path) that must never be required for the core build/CI (ADR-001
+      # principle 10). It gets its own opt-in compile check below.
+      - name: Clippy (default, pure-Rust)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test (default, pure-Rust)
+        run: cargo test --workspace
+      - name: Docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+  # Compile-checks the optional C++ Equihash solver feature so it cannot rot,
+  # but it is a separate, non-default job — the core never depends on it.
+  solver-feature-build:
+    name: equihash-solver (C++ tromp) build check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with equihash-solver
+        run: cargo build -p vox-core --features equihash-solver

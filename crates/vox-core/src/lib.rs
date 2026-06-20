@@ -35,6 +35,29 @@
 //!   post-compromise security, PQ confidentiality, KEM-secret binding, bounded
 //!   out-of-order handling, and replay rejection.
 //!
+//! Built on M1 + M2, milestone **M3** adds:
+//!
+//! - [`join`] — channel addressing and authenticated join (ADR-005): the
+//!   high-entropy channelID and the fast rendezvous KDF (passphrase never an
+//!   input), CPace (Ristretto255 + SHA-512 balanced PAKE) keyed by the passphrase,
+//!   composite-identity proof-of-possession inside the CPace channel, an Equihash
+//!   `(200,9)` join proof-of-work bound to `(channelID, epoch, nonce)`, and the
+//!   orchestration that bootstraps an M2 [`pairwise::Session`] from a successful
+//!   join — yielding no readable content (per-sender consent is ADR-007/M6).
+//!
+//! Built on M1 + M2, milestone **M4** adds:
+//!
+//! - [`group`] — group messaging via Sender Keys (ADR-006): the per-author
+//!   one-way HMAC-SHA-256 chain ratchet (Signal Sender-Keys construction), a
+//!   composite Ed25519+ML-DSA Sender-Key signing key bound to `(channelID,
+//!   epoch)` and cross-signed by the identity root, the Sender-Key Distribution
+//!   Message (tag `0x0002`) delivered as an ordinary M2 Double-Ratchet message
+//!   (no redundant per-SKDM KEM), the mandatory `(channelID, epoch)` binding that
+//!   defeats cross-group confusion, AES-256-GCM broadcast messages signed by the
+//!   sender key, a bounded skip/replay window, the consent-gated history
+//!   release-at-iteration mechanism, and explicit sender-key rotation for
+//!   post-compromise recovery.
+//!
 //! ## Engineering mantra (binding — see ADR-001)
 //! No stubs, no `todo!()`, no shortcuts. What ships is complete and correct.
 //! Every module here carries its own tests and, where the ADRs name a release
@@ -48,8 +71,10 @@
 
 pub mod cbor;
 pub mod error;
+pub mod group;
 pub mod hash;
 pub mod identity;
+pub mod join;
 pub mod pairwise;
 pub mod suite;
 pub mod wire;

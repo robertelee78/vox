@@ -30,6 +30,14 @@ hex = "0.4"
 # no rand_core RNG object is threaded through key generation.
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
 x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+# Ristretto255 group ops for CPace (ADR-005, M3). Pinned to the same 4.1 the
+# dalek stack already resolves to, so there is one curve25519-dalek in the tree.
+# Default features include the ristretto `from_uniform_bytes` one-way map and
+# `Scalar::from_bytes_mod_order_wide` that CPace's generator and scalar sampling
+# need; `zeroize` lets scalar secrets be wiped.
+curve25519-dalek = { version = "4.1.3", default-features = false, features = ["alloc", "zeroize", "precomputed-tables"] }
+# Constant-time choice/equality used in CPace identity-element checks (ADR-005).
+subtle = { version = "2.6", default-features = false }
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "zeroize"] }
 ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "zeroize", "getrandom"] }
 getrandom = "0.3"
@@ -43,6 +51,15 @@ getrandom = "0.3"
 hkdf = { version = "0.12", default-features = false }
 hmac = { version = "0.12", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# Equihash (n=200,k=9) join proof-of-work (ADR-005, M3). The librustzcash crate:
+# cheap runtime-(n,k) verification by default; the `solver` feature adds the real
+# (200,9) tromp solver (a C++ FFI backend, used only by the heavy #[ignore]d
+# real-parameter test). Vox's always-on solve path is a pure-Rust Wagner solver
+# in `join::pow` parameterised for reduced CI params; the crate verifier is the
+# cross-check oracle for both.
+equihash = { version = "0.3", default-features = false, features = ["std"] }
+# BLAKE2b with personalization — the Equihash string generator (ADR-005 PoW).
+blake2b_simd = { version = "1.0", default-features = false, features = ["std"] }
 
 [profile.release]
 # Crypto + protocol code: keep overflow checks on in release too. A silent wrap

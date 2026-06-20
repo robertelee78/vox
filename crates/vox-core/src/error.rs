@@ -96,4 +96,30 @@ pub enum Error {
     /// on parse (ADR-002 §Backup, §GPG integration).
     #[error("malformed identity bundle: {0}")]
     MalformedBundle(&'static str),
+
+    /// A received CPace public share or the derived shared point `K` was the
+    /// group identity (ADR-005 CPace `scalar_mult_vfy` MUST-abort). The session
+    /// is aborted: the peer either sent a degenerate share or no agreement
+    /// exists.
+    #[error("cpace identity-element / invalid share")]
+    CpaceInvalidShare,
+
+    /// A join message was structurally malformed (bad arity, wrong length field,
+    /// missing component). Carries a static reason for diagnosis (ADR-005).
+    #[error("malformed join message: {0}")]
+    MalformedJoin(&'static str),
+
+    /// An identity proof-of-possession failed (ADR-005 factor 2): either the
+    /// composite signature over `sid ‖ transcript_hash` did not verify, or the
+    /// presented identity's fingerprint did not match the expected one. The two
+    /// are deliberately one error so a probe cannot distinguish "wrong key" from
+    /// "wrong identity".
+    #[error("join proof-of-possession failed")]
+    JoinProofFailed,
+
+    /// An Equihash join proof-of-work was invalid (ADR-005 anti-abuse layer 2):
+    /// the solution did not verify for `(channelID, epoch, responder_nonce)`, did
+    /// not meet the advertised difficulty, or its parameters were rejected.
+    #[error("join proof-of-work invalid")]
+    JoinPowInvalid,
 }

@@ -20,6 +20,18 @@ getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 aes-gcm.workspace = true
+# Channel join (ADR-005, M3).
+curve25519-dalek.workspace = true
+subtle.workspace = true
+equihash.workspace = true
+blake2b_simd.workspace = true
+
+[features]
+# The real (n=200,k=9) Equihash *solver* (ADR-005). Off by default because it
+# pulls the librustzcash `solver` feature, which builds a C++ tromp backend via
+# `cc`; only the heavy, `#[ignore]`d real-parameter solve test needs it. Verify
+# and the pure-Rust reduced-parameter solver are always available without it.
+equihash-solver = ["equihash/solver"]
 
 [dev-dependencies]
 hex.workspace = true
