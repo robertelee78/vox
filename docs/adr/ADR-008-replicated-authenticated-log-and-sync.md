@@ -51,27 +51,45 @@ an external library (Bamboo/Reed/Hypercore inform it but are not a runtime depen
 reconciliation (Willow/Negentropy, logarithmic rounds) at scale (plain SSB degrades past ~100
 members).
 
-**Dual authentication modes.** Attributable channels use per-author signatures on entries;
-deniable channels authenticate via the ADR-009 mechanism. The hash-chain itself is
-signature-agnostic, so ordering/tamper-evidence hold in both modes; deniable-mode integrity
-detail is specified in ADR-009.
+**Per-entry-type authentication (binding — resolves the deniable/governance split).** Authentication
+is chosen by entry TYPE, not merely by channel mode:
+- **Governance/control entries are ALWAYS root-composite-signed (Ed25519+ML-DSA), even in deniable
+  channels:** genesis, membership certificates, admin delegations, consent grants, revocations, and
+  policy updates. They must stay attributable — membership is attributable by design (ADR-001/ADR-009),
+  and ADR-007's single-writer consent guarantee requires that a consent grant be unforgeably authored
+  by its issuer. Non-negotiable in both modes.
+- **Message-content entries:** attributable channels → root-composite-signed; deniable channels →
+  authenticated by the ADR-009 deniable construction (content authorship forgeable by any member).
+The hash-chain provides ordering and tamper-evidence regardless of the authenticator. Because
+governance entries are always signed, the governance plane — and its fork-attribution — stays intact
+even in deniable channels; only message-content authorship is deniable. The exact deniable
+content authenticator and how it preserves per-author single-writer ordering are specified in ADR-009.
 
 **Consent + certificate state lives here.** Membership certificates, consent grants, and
 revocations are log entries, so they replicate and converge causally across the overlay (ADR-007).
 
 **Fork / equivocation handling.** A single-writer log must not fork; two distinct entries by the
-same author at the same `seq` are an equivocation. Vox makes this detectable and attributable:
-- Every entry binds `seq` + `prev_hash`, so any peer holding two validly-signed entries with the
-  same `(author_id, seq)` but different hashes possesses a **self-authenticating fork proof**.
-- Anti-entropy gossips **signed log heads** `(author_id, seq, hash)`; a head that rewrites or skips a
-  known `seq` surfaces the conflict immediately.
-- On a fork proof, clients **freeze that author** (stop accepting/rendering their further entries),
-  record the fork proof as a channel log entry, surface it in the UI (ADR-014), and members revoke
-  consent / rotate to exclude the equivocator (ADR-007).
+same author at the same `seq` are an equivocation. Handling differs by authentication type (above),
+because automated punishment is only safe when the conflicting entries are *attributable*:
+
+- **Attributable entries (all governance entries always; all entries in attributable channels)** are
+  root-composite-signed, so two validly-signed entries at the same `(author_id, seq)` with different
+  hashes are a **self-authenticating fork proof** that genuinely incriminates that author. Anti-entropy
+  gossips **signed log heads** `(author_id, seq, hash)`; on a fork proof clients **freeze that author**,
+  record the proof as a channel entry, surface it in the UI (ADR-014), and members revoke consent /
+  rotate to exclude the equivocator (ADR-007). Because governance is always attributable, the
+  membership/admin plane always gets this strong remedy.
+- **Deniable message-content entries** use a forgeable authenticator (ADR-009), so a "fork proof" does
+  **NOT** incriminate a specific author — any member could mint a second entry at a victim's
+  `(author_id, seq)`. Automated freeze/eviction is therefore **disabled** for deniable content forks
+  (it would be a framing/DoS primitive). Instead a deniable-content fork raises a **non-attributable
+  fork *alarm*** surfaced for manual, out-of-band resolution; the per-author ordering/anti-equivocation
+  guarantee that still holds in deniable mode (without enabling framing) is specified in ADR-009.
 - Honest partition limit: during a partition an equivocator can present different heads to disjoint
-  partitions; this cannot be *prevented* without consensus, but it is **permanently detectable and
-  attributable on heal** (the fork proof is durable). Accordingly, partition-time authority actions
-  (admin grant/revoke) are treated as *provisional* until their causal neighborhood reconciles.
+  partitions; this cannot be *prevented* without consensus, but for attributable entries it is
+  **permanently detectable and attributable on heal** (the fork proof is durable). Partition-time
+  authority actions (admin grant/revoke) are treated as *provisional* until their causal neighborhood
+  reconciles (ADR-007).
 
 **Abuse resistance.** Only entries from admitted members (ADR-007) are accepted into a channel's log,
 so unauthenticated floods cannot enter. Replication is bounded by per-author rate/size quotas (each

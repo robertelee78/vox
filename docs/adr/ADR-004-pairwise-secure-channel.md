@@ -23,8 +23,7 @@ AD) are mandatory here.
 
 **Message encryption = Double Ratchet** (X25519 DH-ratchet + symmetric KDF-chain ratchet, AEAD
 envelopes). Provides forward secrecy and classical post-compromise security for pairwise traffic.
-Use HMAC-based chain KDFs per the Signal spec (the old Go prototype's bare-SHA256 chain KDF is
-explicitly rejected).
+Use HMAC-based chain KDFs per the Signal spec (a bare-SHA256 chain KDF is explicitly rejected).
 
 **Post-quantum PCS (phased).** PQXDH gives PQ confidentiality but not PQ post-compromise security.
 A PQ continuous-key-agreement layer (Signal SPQR / "Triple Ratchet" with ML-KEM-768, or Apple

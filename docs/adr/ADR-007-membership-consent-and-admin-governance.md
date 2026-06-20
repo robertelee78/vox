@@ -69,10 +69,13 @@ Signalgate / Megolm membership-injection class is structurally absent.
 
 ### Revocation and epochs
 
-- **Per-member consent revocation:** `A` generates a fresh sender key (new per-author chain,
-  advancing `A`'s epoch contribution), distributes it to all members `A` still consents to *except*
-  the revoked `N`, and records a revocation entry. `N` retains previously-held keys (uncallable) but
-  cannot decrypt `A`'s future messages.
+- **Per-member consent revocation:** `A` generates a fresh sender key, **advancing `A`'s own
+  `chain_id`** (the per-author generation counter, ADR-006) — *not* the channel `epoch`. `A`
+  distributes the new key to all members `A` still consents to *except* the revoked `N`, and records a
+  revocation entry. `N` retains previously-held keys (uncallable) but cannot decrypt `A`'s future
+  messages. (Terminology, normative: **`epoch` is a single channel-global counter** set only by the
+  genesis record and admin policy/passphrase-rotation entries; per-author rotation is always
+  `chain_id`. There is no per-author "epoch contribution.")
 - **Admin membership revocation:** an admin issues a membership-revocation cert; consenting members
   rotate their sender keys excluding `N`.
 - **Passphrase-rotation epoch (bulk):** an admin rotates the channel passphrase (ADR-005), incrementing

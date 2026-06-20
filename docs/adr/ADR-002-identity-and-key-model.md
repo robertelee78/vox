@@ -68,12 +68,15 @@ key material and fingerprint-verification culture (ADR-001 principle 3):
 ### Lifecycle
 
 - **Prekey rotation** is automatic on cadence; **one-time prekeys** are replenished continuously.
-- **Root-key rotation is identity replacement.** Because the root is the human-verified anchor, a
-  new root is a new identity and requires out-of-band re-verification; Vox supports publishing a
-  root-signed *succession statement* (old root signs the new root's fingerprint) so peers who
-  already trust the old root can migrate without a fresh fingerprint check, while peers who do not
-  must verify anew. Compromise of the root is unrecoverable for that identity — by design, there
-  is no central authority to appeal to.
+- **Root-key rotation is identity replacement, migrated by TOFU-on-succession (never silently).**
+  A new root is a new identity. Vox supports a root-signed *succession statement* (old root signs the
+  new root's fingerprint), but peers MUST **surface it as a key-change event requiring explicit user
+  acknowledgement** (ADR-014) — never auto-migrate trust on the signature alone. This is critical
+  because the root can be *compromised*: a leaked old root can sign a succession to an
+  attacker-controlled key, so silent auto-migration would convert "lose this identity" into "attacker
+  silently inherits all your channel trust." Therefore a succession only *prompts* migration; genuine
+  recovery against a compromised root is out-of-band re-verification of the new fingerprint. Root
+  compromise remains unrecoverable by design — there is no central authority to appeal to.
 - **Backup** of the root (and its OpenPGP representation) is the user's responsibility; Vox
   provides an explicit, encrypted export.
 

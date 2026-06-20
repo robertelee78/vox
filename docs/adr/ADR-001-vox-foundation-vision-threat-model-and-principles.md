@@ -7,9 +7,8 @@
 
 ## Context
 
-Vox is a serverless, end-to-end-encrypted peer-to-peer overlay for private communication and
-arbitrary TCP/IP tunneling. It is a ground-up Rust redesign of an earlier Go prototype
-("Vox Lux") that implemented X3DH + Double Ratchet + Sender Keys over libp2p.
+Vox Lux ("Vox" for short) is a serverless, end-to-end-encrypted peer-to-peer overlay for private
+communication and arbitrary TCP/IP tunneling, built in Rust.
 
 The motivating problems with existing secure messengers:
 

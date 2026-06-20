@@ -63,8 +63,13 @@ established substrate and marked as such. This ADR specifies the complete tunnel
   their identity key (CGA/Yggdrasil-style, in a dedicated ULA range), so addresses are unforgeable
   and need no allocation. For the SOCKS/forward model, services are addressed logically by
   `(member identity, service name)`.
-- **Channel-scoped resolution.** Service names resolve to `(member, service, endpoint)` via signed
-  service-advertisement records on the log (ADR-008), authorization-filtered per requester.
+- **Channel-scoped resolution (single mechanism, consistent with discovery-gating above).** A service
+  advertisement is an **audience-encrypted log entry**: an inner signed record `(member, service,
+  endpoint)` sealed to the current Dial-grant set (keyed per-recipient like an SKDM, ADR-006) and
+  carried as an opaque payload on the replicate-all log (ADR-008). A requester resolves a name purely
+  by **locally decrypting** the ads it is authorized for; it cannot read or even enumerate ads for
+  Dial sets it is not in. There is **no responder-side "filter per requester"** (the log has no
+  responder). On a Dial-set change (grant/revoke, ADR-007) the advertiser re-publishes a re-sealed ad.
 
 ### Mapping onto QUIC (ADR-011)
 

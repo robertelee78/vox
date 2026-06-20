@@ -9,14 +9,17 @@
 
 The macOS client is the first surface over the Rust core and the primary real-world use (the
 author and his wife, across devices; macOS first, with an Apple developer account). Its job is to
-make Vox Lux's novel trust model usable: per-sender consent (ADR-007), member/key verification
+make Vox's novel trust model usable: per-sender consent (ADR-007), member/key verification
 (ADR-002), channel join (ADR-005), the replicated log (ADR-008), at-rest protection (ADR-010), and
 connectivity/node operation (ADR-012). Research is authoritative on the make-or-break part —
 **key-verification UX** — and that evidence drives the trust-ceremony design below; the remaining
-UX is designed from Vox Lux's established architecture and established secure-messenger patterns,
-marked as such. This ADR specifies the complete macOS client capability. Capabilities surfaced by
-their own ADRs (tunneling UI → ADR-013; voice/video → a future capability ADR; iOS/Linux clients →
-their own ADRs) are referenced, not duplicated, and are not deferrals.
+UX is designed from Vox's established architecture and established secure-messenger patterns,
+marked as such. This ADR specifies the complete macOS client capability with no open questions: it
+fixes distribution, the FFI contract, identity storage on macOS, the navigation model, channel
+policy defaults, the verification and consent ceremonies, node/availability operation, notifications,
+and the at-rest UX — every one a concrete, executable decision. Capabilities surfaced by their own
+ADRs (tunneling UI → ADR-013; voice/video → a future capability ADR; iOS/Linux clients → their own
+ADRs) are referenced, not duplicated, and are not deferrals.
 
 ## Decision
 
@@ -27,36 +30,83 @@ their own ADRs) are referenced, not duplicated, and are not deferrals.
   over a stable, typed API.
 - **Native SwiftUI over the Rust core via UniFFI.** The macOS app is native SwiftUI; the Rust core
   is compiled to a static library with **UniFFI**-generated Swift bindings. Rationale: native gives
-  first-class macOS integration the security model needs — Keychain/Secure Enclave for the
-  identity-factor unlock (ADR-010), `NetworkExtension`/`utun` for tunneling (ADR-013), notarization
-  and hardened runtime — while UniFFI gives a typed, memory-safe boundary and lets **the same core
-  be reused on iOS** (SwiftUI) and Linux (its own UI). **Rejected:** Tauri/Electron (webview =
-  weaker native integration, larger attack surface, no clean Secure Enclave / NetworkExtension
-  path).
-- **Secret handling across the FFI.** Private keys and the SEK never cross the FFI as long-lived
-  plaintext; signing/decryption happen in the core (or `gpg-agent`/Secure Enclave), which holds
-  secrets in locked, zeroized memory (ADR-002/ADR-010). The Swift layer receives only what it must
-  render.
-- **Packaging.** App Sandbox + Hardened Runtime + notarization; Keychain for the wrapped identity
-  factor; an XPC/privileged helper only where a TUN interface later requires it (ADR-013).
+  first-class macOS integration the security model needs — Keychain/Secure Enclave for the at-rest
+  unlock factor (ADR-010), `NetworkExtension`/`utun` for tunneling (ADR-013), notarization and
+  hardened runtime — while UniFFI gives a typed, memory-safe boundary and lets **the same core be
+  reused on iOS** (SwiftUI) and Linux (its own UI). **Rejected:** Tauri/Electron (webview = weaker
+  native integration, larger attack surface, no clean Secure Enclave / NetworkExtension path).
+- **FFI contract (binding).** The core exposes an **async, callback/stream API** — SwiftUI never
+  makes a blocking call into the core, and the node's sync/connectivity events are delivered to the
+  UI as streams. Private keys and the SEK **never cross the FFI as long-lived plaintext**;
+  signing/decryption happen inside the core (or `gpg-agent`/Secure Enclave), which holds secrets in
+  locked, zeroized memory (`mlock`/`zeroize`, ADR-002/ADR-010). The Swift layer receives only the
+  rendered state it must display (decrypted text for the view, verification/consent states, sync
+  status) — never raw secret material.
+- **Distribution: Developer ID, notarized.** Shipped as a **notarized, hardened-runtime app via
+  Developer ID** (direct download / DMG), **not** the Mac App Store. Rationale: the App Store sandbox
+  cannot accommodate the `NetworkExtension` + privileged helper that tunneling requires (ADR-013) or
+  a long-lived background node agent. App Sandbox entitlements are applied where compatible with those
+  components; the privileged helper / system extension is added only where a TUN interface later
+  requires it (ADR-013).
 
 ### Identity & onboarding
 
-- Generate or import a GPG/Ed25519 identity (ADR-002); display the identity as a plain-language
-  **safety code** (not "fingerprint" — evidence: the term confuses non-cryptographers).
-- Per-channel identity selection is an explicit step at create/join (pseudonymity, ADR-002).
-- Guided, encrypted identity **backup/export** during onboarding; loss is unrecoverable, so the app
-  insists on a backup before first use.
+- Generate or import a GPG/Ed25519 identity (paired with its ML-DSA co-key, ADR-002); display the
+  identity as a plain-language **safety code** (not "fingerprint" — evidence: the term confuses
+  non-cryptographers).
+- **Identity-key storage on macOS (binding).** The Secure Enclave **cannot** hold the Vox identity
+  key — the Enclave stores only NIST P-256 keys, while the identity is Ed25519 + ML-DSA. The Enclave's
+  role is strictly the ADR-010 *at-rest unlock factor* (a biometric-gated random secret), never the
+  identity itself. Concretely:
+  - **Generate path (default).** The core generates the Ed25519+ML-DSA root and holds it in locked,
+    zeroized memory while unlocked. At rest the root is wrapped under the **ADR-010 double-lock
+    factors** (channel/identity unlock), **not** a bare Keychain ACL — so a warm, screen-unlocked but
+    Vox-locked Mac never exposes the identity. A user-facing GnuPG install is **not required** for
+    this path.
+  - **Import path (fully built, not stubbed).** A user may bind an existing GPG Ed25519 primary/subkey
+    (or a YubiKey/smartcard) as the root; signing is delegated to `gpg-agent`/the card and the private
+    key never leaves it (ADR-002). `gpg-agent` is engaged **only** on this explicit path.
+- **Mandatory encrypted backup.** Guided encrypted identity **backup/export** (OpenPGP format,
+  ADR-002) during onboarding; root loss is unrecoverable, so the app **insists on a verified backup
+  before first use**. (Hardware-bound import keys are backed up by the user's existing card/agent
+  practice; the app states this honestly rather than implying it can export a non-exportable key.)
+- **Per-channel identity selection.** Identity choice is an explicit, always-visible step at
+  create/join that **pre-selects the main/last-used identity** (the common case is one tap) and shows
+  which key you are acting as; creating a **fresh per-channel pseudonymous identity** (ADR-002) is a
+  prominent option on the same screen. Vox never silently reuses an identity across channels.
 
 ### Channel create / join
 
-- **Create:** the creator (root admin) sets channel policy up front and can change it later —
-  history vs forward-only, deniable vs attributable, retention/TTL (ADR-007).
+- **Create:** the creator (root admin) sets channel policy up front and can change it later (ADR-007).
+  **Policy defaults** the create screen starts on (both options always supported):
+  - **Authorship: attributable** (per-message signatures → intra-group accountability, still deniable
+    to outsiders; ADR-009). Deniable mode is an explicit opt-in.
+  - **History: full history** (new members *may* be given prior messages; per-sender consent still
+    gates what decrypts; ADR-007). Forward-only is an explicit opt-in.
+  - **Retention/TTL: never expire** (ADR-010), changeable anytime.
 - **Join:** present an invite as a **single scannable QR + copyable code that carries only the
-  channelID (rendezvous)**, with the **passphrase shared over a separate out-of-band channel** by
-  default — never both in one artifact, so a leaked QR alone cannot join. The UI explains the split
-  in plain language. (Conservative design; this sub-area had no surviving verified evidence.)
+  channelID (rendezvous, ADR-005)**, with the **passphrase shared over a separate out-of-band
+  channel** by default — never both in one artifact, so a leaked QR alone cannot join. The UI
+  explains the split in plain language. (Conservative design; this sub-area had no surviving verified
+  evidence.)
 - Set expectations explicitly: joining grants nothing readable until members consent (ADR-007).
+
+### Navigation model
+
+The channel is the unit of communication (ADR-001 principle 2): there is **no contacts tier and no
+special 1:1 path** — a two-member channel *is* the only "direct message."
+
+- **Home = the list of channels (swarms)** the user has created or joined. Creating or joining a
+  channel is the primary action. The user can give each channel a **local name**.
+- **Members are shown by a local nickname bound to their identity key.** The same key may recur across
+  channels (shared-root identity) or a person may deliberately use different keys per channel
+  (pseudonymity, ADR-002); a nickname is a private label over a *verified key*, never an account.
+- **Nickname + verification state sync across the user's own devices** (shared-root strategy) via a
+  **personal self-channel**: a single-author log authored by the user's identity, encrypted to itself
+  (key derived from the identity root by HKDF), replicated only among the user's shared-root devices
+  over an identity-keyed rendezvous (ADR-005/008 mechanics, no new transport). Users on the
+  **per-device-key** strategy have no shared root, so their nicknames/verification state stay
+  device-local — this composes cleanly with no special case.
 
 ### Member list & verification ceremony (evidence-driven)
 
@@ -65,79 +115,114 @@ requirements, not preferences:
 
 - **QR / in-person scan is the DEFAULT trust ceremony.** Manual digit comparison is a *fallback
   only* — long numeric fingerprints suffer ~43% false-acceptance against near-collision (AitM)
-  fingerprints because users short-circuit comparisons (ARES 2023). Do not make manual comparison
-  the headline path.
-- **Plain-language, per-pair, numeric** "safety code" for the manual fallback (Signal's evolution:
-  rename, per-conversation 1:1 mapping, numeric to halve comparison load).
+  fingerprints because users short-circuit comparisons (ARES 2023). Do not make manual comparison the
+  headline path.
+- **Safety-code format.** Per-pair, **numeric, grouped** (Signal's evolution: rename, per-conversation
+  1:1 mapping, numeric to halve comparison load), derived from `SHA-256(Ed25519_pub ‖ ML-DSA_pub)` of
+  both parties (ADR-002). The QR encodes the same identity material for one-scan verification; the
+  grouped numeric code is the manual fallback.
 - **Proactively prompt** verification at trust-relevant moments — new member, *before a consent
   decision*, and on any key change — never bury it behind a menu. Evidence: unprompted ceremonies
   succeed ~14% vs ~78% when the UI names the task; so name the task and guide it.
 - **Fast, one step.** Single-scan, single-screen (evidence: ~11-minute ceremonies discourage use).
-- **Key-change alerts + TOFU indicators** surfaced automatically over the log; verification state
-  per member (verified / unverified-TOFU / key-changed). (Server-dependent key transparency like
-  CONIKS is not adopted — no central server; local key-change detection over the log is.)
+- **Key-change alerts + TOFU indicators** surfaced automatically over the log; verification state per
+  member (verified / unverified-TOFU / key-changed). (Server-dependent key transparency like CONIKS is
+  not adopted — no central server; local key-change detection over the log is.)
 
 ### Per-sender consent UX (the differentiator)
 
 No verified external precedent survived (the Cwtch claims were refuted), so this is designed
-carefully from ADR-007 and will require user testing:
+carefully from ADR-007. Per the engineering mantra it **ships complete and production-quality** —
+it is *not* a stub awaiting a future milestone, and usability validation is **not a release gate**.
+Structured user testing runs **continuously** and feeds iterative refinement; ADR-007's protocol
+guarantees stand regardless of it. The bar is "ship the best-designed version, complete" — never a
+reason to withhold the surface or ship it incomplete.
 
 - Consent is an explicit, **per-member decision**: when a newcomer is admitted, each member is
   prompted "Allow [member] to read your messages?", tied to that member's verification state to
   encourage *verify-before-consent*.
-- **Two distinct axes, never conflated:** *verification* ("is this really them?") and *consent*
-  ("can they read me?" / "can I read them?") are shown as separate, clearly-labeled states per
-  member — avoiding the binary trusted/untrusted confusion.
-- **Honest partial-visibility display:** show, per member, whether you've consented to them and
-  (where known) whether they've consented to you; show a newcomer a clear "you'll see each member's
-  messages as they allow you" state rather than a confusing empty/partial timeline.
-- **Revocation** is a clear per-member "stop sharing my messages with them" action (triggers
+- **Two distinct axes, never conflated:** *verification* ("is this really them?") and *consent* ("can
+  they read me?" / "can I read them?") are shown as separate, clearly-labeled states per member —
+  avoiding the binary trusted/untrusted confusion.
+- **Honest partial-visibility display:** show, per member, whether you've consented to them and (where
+  known) whether they've consented to you; show a newcomer a clear "you'll see each member's messages
+  as they allow you" state rather than a confusing empty/partial timeline.
+- **Revocation** is a clear per-member "stop sharing my messages with them" action (triggers sender-key
   rotation, ADR-007).
 
 ### Messaging
 
-- **Text and files.** Render-gated: undecryptable entries are not shown (ADR-008); where a gap would
-  be confusing, show an honest, non-leaking "messages you haven't been given access to" marker
-  rather than silently dropping context.
-- Voice/video are a separate future capability ADR (the transport datagram path, ADR-011, is built
-  to carry them) — out of this client capability's scope, not deferred work within it.
+- **Text and files.** Files are carried as ordinary log payloads (ADR-008): content-encrypted with a
+  fresh nonce, **chunked across entries above a size threshold**, render-gated and TTL-pruned like any
+  payload (ADR-010). No separate file-transfer path.
+- **Render-gating:** undecryptable entries are not shown (ADR-008); where a gap would be confusing,
+  show an honest, non-leaking "messages you haven't been given access to" marker rather than silently
+  dropping context.
+- Voice/video are a separate future capability ADR (the transport datagram path, ADR-011, is built to
+  carry them) — out of this client capability's scope, not deferred work within it.
 
 ### Connectivity, availability & node operation
 
-- Surface **emergent availability honestly** (ADR-001/ADR-012): per-channel reachability and sync
-  state; for a two-member channel, clearly communicate "both must be online" and current status;
-  show sync progress and node/rendezvous status (patterns informed by Briar/SimpleX intermittent-
-  connectivity UX; designed, evidence-gap noted).
-- **Run-your-own-node configuration:** point the client at the user's always-on node / LAN box with
-  port-forward as their rendezvous/relay (ADR-012).
+- **The macOS app embeds the node** (the core runs the local node, above) whenever it is running.
+- **Headless node build.** Vox also ships a **headless node binary** (same Rust core, no UI) for an
+  always-on box (LAN machine / mini PC) with a port-forward, for reachability while the Mac sleeps
+  (ADR-012). The client can **point at any user-run node** as its rendezvous/relay+store anchor. Vox
+  **mandates no topology** — how the household stays reachable is the users' to arrange (ADR-001/012);
+  the client makes every user-run option configurable and none compulsory.
+- **Surface emergent availability honestly** (ADR-001/ADR-012): per-channel reachability and sync
+  state; for a two-member channel, clearly communicate "both must be online (or your node must be
+  reachable)" and current status; show sync progress and node/rendezvous status (patterns informed by
+  Briar/SimpleX intermittent-connectivity UX; designed, evidence-gap noted).
+
+### Notifications
+
+- **Serverless local notifications.** A background **LaunchAgent** keeps the node syncing; on a new
+  *decryptable* entry it posts a native macOS local notification. No APNs, no third party (consistent
+  with ADR-001). The cost — a persistent background process and its battery/power use — is accepted
+  and stated honestly. Notification previews are hidden by default (screen-security, below).
 
 ### At-rest & device-seizure UX
 
-- **App-lock** on idle-timeout / manual / sleep, with re-auth = channel passphrase + identity
-  factor; on Secure-Enclave hardware, biometrics gate the *identity* factor only and never replace
-  the passphrase factor (ADR-010).
-- **Disappearing messages** tied to admin TTL; **screen-security** (hide previews; deter
-  screenshots where the OS permits).
+- **App-lock.** The SEK lives only in memory while unlocked; lock zeroizes it and forces re-auth =
+  channel passphrase + identity factor (ADR-010). **Default: 5-minute idle timeout + lock on sleep.**
+  The lock is **fully user-configurable, including disabling it entirely** — honoring user autonomy,
+  with the **honest, documented consequence** that a warm Mac with lock disabled exposes the local
+  vault (the one exposure ADR-010 otherwise bounds; the app states this plainly at the point of
+  change).
+- On Secure-Enclave hardware, biometrics gate the *identity factor* only and **never replace the
+  passphrase factor** (ADR-010).
+- **Disappearing messages** tied to admin TTL (default never-expire, so off by default; ADR-010).
+- **Screen-security:** hide message previews in notifications by default; deter screenshots where the
+  OS permits.
 
 ## Consequences
 
 ### Positive
-- Native SwiftUI+UniFFI gives the security integrations the model depends on and reuses the Rust
-  core on iOS/Linux.
+- Native SwiftUI+UniFFI gives the security integrations the model depends on and reuses the Rust core
+  on iOS/Linux.
 - Verification is designed against the known fatal flaw of E2EE UX (scan-first, prompted, one-step).
 - Per-sender consent and verification are presented as distinct, honest axes — the differentiator
   made tangible.
+- Every section is concretely specified (storage, FFI contract, defaults, node operation,
+  notifications, lock behavior), so an engineer can execute without re-deciding architecture.
 
 ### Negative
 - Native UI is macOS-specific: Linux/iOS reuse the core but need their own UIs (their own ADRs).
-- The UniFFI boundary must be carefully designed to avoid leaking secrets or blocking on the core.
+- The UniFFI boundary must be carefully designed to avoid leaking secrets or blocking on the core
+  (mitigated by the async/stream contract above).
 - The per-sender consent UX is genuinely novel with no verified precedent — it carries design risk
-  addressed by **pre-release usability validation as a release acceptance criterion** (not a deferred
-  protocol requirement; the underlying protocol guarantees of ADR-007 do not depend on it).
+  addressed by **continuous user-testing and iterative refinement** (not a release gate, not a
+  deferred protocol requirement; the underlying protocol guarantees of ADR-007 do not depend on it).
+- Developer-ID distribution forgoes Mac App Store discovery/auto-update in exchange for the system
+  extension / privileged-helper / background-agent freedom the capability set requires.
+- The personal self-channel for nickname/verification sync is a real mechanism to build and test (not
+  free), justified by cross-device usability for shared-root users.
 
 ### Neutral
-- Choosing native-per-platform over a single cross-platform UI is a deliberate trade of code reuse
-  for integration depth and security.
+- Choosing native-per-platform over a single cross-platform UI is a deliberate trade of code reuse for
+  integration depth and security.
+- App-lock-disable and topology are deliberately left to the user, consistent with Vox's
+  user-autonomy posture; the client states the consequences rather than enforcing a policy.
 
 ## Links
 **Depends on**: ADR-002, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009, ADR-010, ADR-012, ADR-013.
