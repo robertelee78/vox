@@ -58,6 +58,23 @@
 //!   release-at-iteration mechanism, and explicit sender-key rotation for
 //!   post-compromise recovery.
 //!
+//! Built on M0 + M1 + M4, milestone **M5** adds:
+//!
+//! - [`log`] — the replicated authenticated log & sync (ADR-008): per-author
+//!   hash-linked feeds (Bamboo `lipmaa` skip-links, log-entry tag `0x0001`)
+//!   merged into a causally-ordered Merkle-DAG (a CRDT, *not* a consensus
+//!   blockchain); the signed-skeleton-over-payload-hash entry that lets payloads
+//!   prune while the chain stays verifiable; render-gating (replicate-all,
+//!   decrypt-what-you-can); anti-entropy sync over an abstract transport in both
+//!   frontier and Negentropy-v1 range-reconciliation modes (keyed by the full
+//!   32-byte entry hash); attributable fork/equivocation proofs with author
+//!   freeze (and the deniable-alarm seam for ADR-009/M7); per-author abuse-quotas;
+//!   and the personal multi-device self-channel (tag `0x000C`, `K_self` /
+//!   `rendezvous_self` KDFs) that carries received SKDMs across an identity's own
+//!   devices. The real QUIC transport (M9), the deniable authenticator (M7),
+//!   payload-TTL policy (M8), and admitted-set population (M3/M6) are documented
+//!   seams, not stubs.
+//!
 //! ## Engineering mantra (binding — see ADR-001)
 //! No stubs, no `todo!()`, no shortcuts. What ships is complete and correct.
 //! Every module here carries its own tests and, where the ADRs name a release
@@ -75,6 +92,7 @@ pub mod group;
 pub mod hash;
 pub mod identity;
 pub mod join;
+pub mod log;
 pub mod pairwise;
 pub mod suite;
 pub mod wire;

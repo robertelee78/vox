@@ -297,7 +297,7 @@ pub enum SolverStrategy {
     /// reduced parameters; also the complete (slower) `(200,9)` fallback when the
     /// `equihash-solver` feature is **not** built.
     Wagner,
-    /// The librustzcash C++ tromp solver ([`solve_real_200_9`]) — only selectable at
+    /// The librustzcash C++ tromp solver (`solve_real_200_9`) — only selectable at
     /// the real `(200,9)` parameters and only when the `equihash-solver` feature is
     /// built. The fast production `(200,9)` prover.
     Tromp,
@@ -327,7 +327,7 @@ pub fn select_solver(params: PowParams) -> SolverStrategy {
 /// `params`, and returning a valid [`PowToken`].
 ///
 /// - [`SolverStrategy::Tromp`] (real `(200,9)`, `equihash-solver` feature on) →
-///   the fast C++ solver ([`solve_real_200_9`]).
+///   the fast C++ solver (`solve_real_200_9`).
 /// - [`SolverStrategy::Wagner`] (reduced params, or `(200,9)` without the feature)
 ///   → the pure-Rust solver ([`solve_token_bounded`]). Correct at every parameter
 ///   set; at `(200,9)` it is the complete-but-slow fallback (production `(200,9)`

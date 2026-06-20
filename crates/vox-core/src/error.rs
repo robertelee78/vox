@@ -122,4 +122,20 @@ pub enum Error {
     /// not meet the advertised difficulty, or its parameters were rejected.
     #[error("join proof-of-work invalid")]
     JoinPowInvalid,
+
+    /// A log entry carried the ADR-009 *deniable* content authenticator, whose
+    /// verification is provided by milestone M7 (ADR-009) — not implemented in M5.
+    /// This is an honest capability boundary, not a stub: M5 builds the wire seam
+    /// (the entry round-trips and is classified non-attributable) and the
+    /// composite path fully, and refuses to *claim* a deniable verification it
+    /// does not perform (ADR-008 §"build coupling with ADR-009").
+    #[error("deniable authenticator verification is provided by M7 (ADR-009)")]
+    DeniableVerificationUnavailable,
+
+    /// A framed structure exceeded a hard size limit before any allocation
+    /// proportional to attacker-declared counts/lengths was performed (ADR-008
+    /// anti-abuse: the per-author quota must not be the first line of defense).
+    /// Carries a static label naming the limit that was exceeded.
+    #[error("declared size exceeds hard limit: {0}")]
+    SizeLimitExceeded(&'static str),
 }
