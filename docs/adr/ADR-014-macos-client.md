@@ -156,8 +156,13 @@ reason to withhold the surface or ship it incomplete.
   member-1 wants nothing to do with member-2. A single **"Block [member]"** action handles **both
   directions at once** — revoke outbound consent *and* opt out inbound visibility — so the user isn't
   forced to reason about two toggles in the moment. The per-member panel still exposes the two toggles
-  individually for the less-common asymmetric cases; **Unblock** restores them (re-consent re-shares
-  the key going forward, ADR-007).
+  individually for the less-common asymmetric cases.
+  - **Block is NOT removal.** There is no removal (ADR-007); the blocked member **remains visible in
+    the channel/swarm member list**, shown with a clear **"Blocked"** state. You simply stop sharing
+    with and seeing them.
+  - **Unblock re-consents both directions** — restores outbound consent (re-shares your sender key
+    going forward, ADR-007) and inbound visibility (resumes rendering them). It is always available
+    from the member's entry in the list.
 
 ### Messaging
 
