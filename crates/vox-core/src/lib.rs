@@ -1,0 +1,39 @@
+//! # vox-core
+//!
+//! The single shared Rust core for Vox Lux (ADR-001 principle 10). Every Vox
+//! client — the Rust TUI (ADR-015), the macOS app (ADR-014) — is a peer over
+//! *this* library, never a fork of it.
+//!
+//! This crate is built up milestone by milestone in the dependency order fixed
+//! by `docs/adr/README.md`. The modules present today are the **foundation**
+//! (milestone M0) that every later milestone signs and verifies against:
+//!
+//! - [`cbor`] — the one canonical, deterministic CBOR codec the whole series
+//!   signs over (ADR-008). Strict on decode: non-canonical input is rejected,
+//!   not tolerated, because signature/MAC inputs must be unambiguous.
+//! - [`wire`] — the struct-type tag registry, struct framing, and the wire
+//!   error-code contract (ADR-008).
+//! - [`suite`] — the algorithm / ciphersuite registry and floor relation
+//!   (ADR-003): the single source for every `algo_id` on the wire.
+//! - [`hash`] — SHA-256 and the domain-separated hashing helpers, including the
+//!   identity fingerprint (ADR-002/003).
+//! - [`error`] — the crate-wide error type.
+//!
+//! ## Engineering mantra (binding — see ADR-001)
+//! No stubs, no `todo!()`, no shortcuts. What ships is complete and correct.
+//! Every module here carries its own tests and, where the ADRs name a release
+//! gate, golden test vectors.
+
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Production code must not panic on attacker-controlled input. Tests assert
+// freely, so the bans are relaxed there only.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+pub mod cbor;
+pub mod error;
+pub mod hash;
+pub mod suite;
+pub mod wire;
+
+pub use error::{Error, Result};

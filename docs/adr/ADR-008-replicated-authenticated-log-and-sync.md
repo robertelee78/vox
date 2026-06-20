@@ -53,7 +53,14 @@ an external library (Bamboo/Reed/Hypercore inform it but are not a runtime depen
 signed/authenticated structure in Vox — log entries (here), SKDMs (ADR-006), certificates and consent
 grants (ADR-007), rendezvous records (ADR-012), the transport identity extension (ADR-011) — is encoded
 as **deterministic CBOR** (RFC 8949 §4.2.1: definite-length items, shortest-form integers, map keys
-sorted bytewise), prefixed with a **2-byte struct-type tag** + **1-byte format version**. Integer
+sorted bytewise), prefixed with a **2-byte struct-type tag** + **1-byte format version**. Each signed
+struct is a **definite-length CBOR array** whose element order is exactly the field order listed for that
+struct (COSE-style, RFC 9052) — arrays are unambiguously deterministic with no key-ordering question and
+are smaller; the "map keys sorted bytewise" rule therefore applies only to a CBOR *map* nested inside a
+payload, not to the signed skeleton. Every struct's field order is **normative** and pinned by golden
+vectors. A conforming decoder is **strict**: it rejects any non-canonical encoding (non-shortest integer,
+indefinite length, reserved additional-info, unsorted/duplicate map keys, trailing bytes), since a
+malleable encoding would let two distinct byte strings verify under one signature. Integer
 fields (`seq`, `iteration`, `epoch`, `payload_len`) are CBOR unsigned integers (no fixed width). The
 authenticator is computed over `domain_sep ‖ canonical_bytes`, where `domain_sep` is a per-struct ASCII
 label (e.g. `"vox/log-entry/v1"`). All hashes (`prev_hash`, `payload_hash`, CID = ADR-010) are
@@ -78,8 +85,23 @@ canonical bytes are never cross-interpreted (the serialization analogue of ADR-0
 | `0x0008` | pre-join-record (ADR-012) | `0x0011` | session-establishment (ADR-011) |
 | `0x0009` | tls-identity-extension (ADR-011) | | |
 
-Each tag has a matching domain-separation label `vox/<struct>/v1`. New struct types are appended here
-(versioned), preserving the single canonical encoding. (Note: this struct-tag space is **disjoint from**
+Each tag has an **explicit, normative** domain-separation label (the prefix of its signing input,
+`domain_sep ‖ canonical_bytes`). The labels are pinned exactly — they are not mechanically derived from
+the struct name, so two implementations cannot disagree on the bytes that get signed:
+
+| Tag | Label | Tag | Label |
+|---|---|---|---|
+| `0x0001` | `vox/log-entry/v1` | `0x000A` | `vox/chunk-manifest/v1` |
+| `0x0002` | `vox/skdm/v1` | `0x000B` | `vox/dgka-setup/v1` |
+| `0x0003` | `vox/admin-cert/v1` | `0x000C` | `vox/self-channel-entry/v1` |
+| `0x0004` | `vox/consent-grant/v1` | `0x000D` | `vox/genesis/v1` |
+| `0x0005` | `vox/consent-revocation/v1` | `0x000E` | `vox/admin-delegation-revocation/v1` |
+| `0x0006` | `vox/policy-rotation/v1` | `0x000F` | `vox/service-advertisement/v1` |
+| `0x0007` | `vox/rendezvous-record/v1` | `0x0010` | `vox/esk-publication/v1` |
+| `0x0008` | `vox/pre-join-record/v1` | `0x0011` | `vox/session-establishment/v1` |
+| `0x0009` | `vox/tls-identity-extension/v1` | | |
+
+New struct types are appended here (versioned), preserving the single canonical encoding. (Note: this struct-tag space is **disjoint from**
 the ADR-003 ciphersuite-ID space — `0x0001` here = `log-entry`, `0x0001` there = `vox-suite-1`; they
 never co-occur on the wire, so the numeric overlap is not a collision.)
 

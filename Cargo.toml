@@ -1,0 +1,29 @@
+# Vox Lux — Cargo workspace.
+#
+# Per ADR-001 principle 10 (Rust-maximal): one shared `vox-core` library and
+# Rust clients over it. Crates are added to `members` as milestones land.
+[workspace]
+resolver = "2"
+members = ["crates/vox-core"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT"
+authors = ["Robert E. Lee <robert@agidreams.us>"]
+repository = "https://github.com/agidreams/vox"
+
+# Dependencies shared across crates are pinned here so every crate signs/verifies
+# with the exact same primitive versions (ADR-003: deterministic, agile crypto).
+[workspace.dependencies]
+sha2 = "0.10"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+hex = "0.4"
+
+[profile.release]
+# Crypto + protocol code: keep overflow checks on in release too. A silent wrap
+# in a length or sequence field is a correctness/security bug, not a perf knob.
+overflow-checks = true
+lto = "thin"
