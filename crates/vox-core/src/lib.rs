@@ -19,6 +19,14 @@
 //!   identity fingerprint (ADR-002/003).
 //! - [`error`] — the crate-wide error type.
 //!
+//! Built on that foundation, milestone **M1** adds:
+//!
+//! - [`identity`] — the self-sovereign identity and key model (ADR-002): the
+//!   composite Ed25519+ML-DSA-65 root of trust, the hybrid (X25519 + ML-KEM-768)
+//!   signed and one-time prekeys for PQXDH (ADR-004), the OpenPGP↔ML-DSA binding
+//!   statement, the `self_seed`, the serializable identity-backup bundle, and the
+//!   multi-device / pseudonymity model.
+//!
 //! ## Engineering mantra (binding — see ADR-001)
 //! No stubs, no `todo!()`, no shortcuts. What ships is complete and correct.
 //! Every module here carries its own tests and, where the ADRs name a release
@@ -33,6 +41,7 @@
 pub mod cbor;
 pub mod error;
 pub mod hash;
+pub mod identity;
 pub mod suite;
 pub mod wire;
 

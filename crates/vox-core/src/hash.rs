@@ -40,8 +40,18 @@ pub fn domain_hash(domain: &str, data: &[u8]) -> Digest32 {
 
 /// Length of an Ed25519 public key (ADR-002 composite layout).
 pub const ED25519_PUB_LEN: usize = 32;
+/// Length of an Ed25519 signature (ADR-002 composite layout).
+pub const ED25519_SIG_LEN: usize = 64;
 /// Length of an ML-DSA-65 public key (ADR-002 composite layout).
 pub const ML_DSA_65_PUB_LEN: usize = 1952;
+/// Length of an ML-DSA-65 signature (ADR-002 composite layout).
+pub const ML_DSA_65_SIG_LEN: usize = 3309;
+/// Length of the composite Ed25519+ML-DSA-65 public key (ADR-002):
+/// `Ed25519_pub(32) ‖ ML-DSA-65_pub(1952)`.
+pub const COMPOSITE_PUB_LEN: usize = ED25519_PUB_LEN + ML_DSA_65_PUB_LEN;
+/// Length of the composite Ed25519+ML-DSA-65 signature (ADR-002):
+/// `Ed25519_sig(64) ‖ ML-DSA-65_sig(3309)`.
+pub const COMPOSITE_SIG_LEN: usize = ED25519_SIG_LEN + ML_DSA_65_SIG_LEN;
 
 /// The human-verifiable identity fingerprint (ADR-002):
 /// `SHA-256(Ed25519_pub ‖ ML-DSA_pub)`. Both components are always covered, so
@@ -57,6 +67,20 @@ pub fn identity_fingerprint(
     ml_dsa_pub: &[u8; ML_DSA_65_PUB_LEN],
 ) -> Digest32 {
     sha256_concat(&[&ed25519_pub[..], &ml_dsa_pub[..]])
+}
+
+/// A lowercase-hex `Debug` wrapper for byte slices, used so key/fingerprint
+/// `Debug` output is a readable hex string instead of a byte-array dump (and so
+/// secret-bearing types can render only their public fingerprint).
+pub struct Hex<'a>(pub &'a [u8]);
+
+impl core::fmt::Debug for Hex<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

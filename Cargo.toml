@@ -21,6 +21,18 @@ sha2 = "0.10"
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }
 hex = "0.4"
+# Cryptographic primitives. Pinned once here so every crate signs/verifies with
+# identical primitive versions (ADR-003: deterministic, agile crypto). Crate
+# selection rationale lives in the module docs of `vox-core::identity`.
+#
+# Hybrid-PQ signatures + KEM (RustCrypto): actively maintained, rand_core 0.10,
+# broad ecosystem adoption. `getrandom` seeds deterministic-from-seed keygen, so
+# no rand_core RNG object is threaded through key generation.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "zeroize"] }
+ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "zeroize"] }
+getrandom = "0.3"
 
 [profile.release]
 # Crypto + protocol code: keep overflow checks on in release too. A silent wrap

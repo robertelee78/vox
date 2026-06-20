@@ -47,4 +47,53 @@ pub enum Error {
         /// The minimum suite the channel policy requires.
         floor: u16,
     },
+
+    /// The operating-system CSPRNG was unavailable (ADR-002 identity key
+    /// generation). A hard failure — Vox never falls back to a weaker source.
+    #[error("operating-system CSPRNG unavailable")]
+    Rng,
+
+    /// Public-key bytes did not decode as a valid key for the named algorithm
+    /// (ADR-002/003). The `algo` field is the ADR-003 algorithm ID.
+    #[error("invalid key encoding for algorithm {algo:#06x}")]
+    InvalidKeyEncoding {
+        /// The ADR-003 algorithm ID whose key encoding was rejected.
+        algo: u16,
+    },
+
+    /// Signature bytes did not decode as a structurally valid signature
+    /// (ADR-002 composite signature parsing).
+    #[error("invalid signature encoding")]
+    InvalidSignatureEncoding,
+
+    /// A signature failed verification (ADR-002). For composite signatures this
+    /// is returned whenever *either* component half fails, without revealing
+    /// which.
+    #[error("signature verification failed")]
+    SignatureInvalid,
+
+    /// A signing operation failed (ADR-002). Distinct from a verification
+    /// failure: this is an error producing a signature, not checking one.
+    #[error("signing operation failed")]
+    SigningFailed,
+
+    /// A field carried an algorithm ID that is valid in the registry but not the
+    /// one this structure requires (ADR-003 type-confusion guard at a boundary).
+    #[error("unexpected algorithm {got:#06x}, expected {expected:#06x}")]
+    UnexpectedAlgo {
+        /// The algorithm ID actually present.
+        got: u16,
+        /// The algorithm ID the structure requires.
+        expected: u16,
+    },
+
+    /// A consume-once one-time prekey was requested but the pool is empty
+    /// (ADR-002 §2). Callers fall back to the signed last-resort prekey.
+    #[error("one-time prekey pool is empty")]
+    PrekeyPoolEmpty,
+
+    /// A backup/binding bundle's declared field was inconsistent or out of range
+    /// on parse (ADR-002 §Backup, §GPG integration).
+    #[error("malformed identity bundle: {0}")]
+    MalformedBundle(&'static str),
 }

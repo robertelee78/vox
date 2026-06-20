@@ -73,7 +73,31 @@ key material and fingerprint-verification culture (ADR-001 principle 3):
   **signed binding statement** — a canonical-CBOR struct `{ openpgp_fpr, mldsa_pub, created }`
   (ADR-008 encoding, domain `"vox/ml-dsa-binding/v1"`) signed by the OpenPGP Ed25519 primary. The
   identity fingerprint `SHA-256(Ed25519_pub ‖ ML-DSA_pub)` covers both keys, so the binding cannot be
-  swapped without changing the fingerprint that peers verify.
+  swapped without changing the fingerprint that peers verify. A verifier MUST check **both** that the
+  statement's `openpgp_fpr` equals the fingerprint of the OpenPGP key it trusts **and** that the
+  Ed25519 signature verifies — checking the signature alone would let an attacker present key A's valid
+  statement while the verifier trusts fingerprint B (a confused-deputy gap).
+
+### Identity-layer domain labels (normative)
+
+The signed prekeys and the identity DH key are **identity-layer artifacts**, not log/wire structures,
+so they have no tag in the ADR-008 struct-tag registry (`0x0001..0x0011`). Like the GPG binding
+statement, each is signed under its own ASCII domain label prefixed directly onto the canonical-CBOR
+body — signing input `domain ‖ canonical_body` — so independent implementations sign and verify
+byte-identical inputs. The labels are fixed normatively here:
+
+| Artifact | Domain label | Canonical body (ADR-008 array, fixed order) | Signer |
+|---|---|---|---|
+| ML-DSA binding statement | `vox/ml-dsa-binding/v1` | `[openpgp_fpr, mldsa_pub, created]` | OpenPGP Ed25519 primary |
+| Identity DH key (IK_B) | `vox/identity-dh-key/v1` | `[algo_X25519, x25519_pub, created]` | composite root |
+| Signed prekey | `vox/signed-prekey/v1` | `[algo_X25519, algo_ML_KEM_768, prekey_id, created, x25519_pub, ml_kem_pub]` | composite root |
+| One-time prekey | `vox/one-time-prekey/v1` | `[algo_X25519, algo_ML_KEM_768, prekey_id, created, x25519_pub, ml_kem_pub]` | composite root |
+
+The long-term **X25519 identity DH key is root-signed** (the `vox/identity-dh-key/v1` record above):
+ADR-004's PQXDH consumes it as the authenticated `IK_B`, so it cannot be an unauthenticated bare key
+— an active attacker would otherwise substitute their own. Each prekey body carries its component
+algorithm IDs explicitly (ADR-003 requirement 1: a curve field can never be parsed as a KEM field),
+and the `created` timestamp is inside the signed body so a stale key cannot be silently re-dated.
 
 ### Lifecycle
 
