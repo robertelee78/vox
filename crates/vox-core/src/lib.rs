@@ -27,6 +27,14 @@
 //!   statement, the `self_seed`, the serializable identity-backup bundle, and the
 //!   multi-device / pseudonymity model.
 //!
+//! Built on M1, milestone **M2** adds:
+//!
+//! - [`pairwise`] — the pairwise secure channel (ADR-004): PQXDH key agreement
+//!   (post-quantum X3DH) and the Double Ratchet (X25519 DH ratchet +
+//!   HMAC-SHA-256 chain ratchet + AES-256-GCM), with forward secrecy, classical
+//!   post-compromise security, PQ confidentiality, KEM-secret binding, bounded
+//!   out-of-order handling, and replay rejection.
+//!
 //! ## Engineering mantra (binding — see ADR-001)
 //! No stubs, no `todo!()`, no shortcuts. What ships is complete and correct.
 //! Every module here carries its own tests and, where the ADRs name a release
@@ -42,6 +50,7 @@ pub mod cbor;
 pub mod error;
 pub mod hash;
 pub mod identity;
+pub mod pairwise;
 pub mod suite;
 pub mod wire;
 

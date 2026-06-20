@@ -31,8 +31,18 @@ hex = "0.4"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
 x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "zeroize"] }
-ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "zeroize"] }
+ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "zeroize", "getrandom"] }
 getrandom = "0.3"
+# PQXDH + Double Ratchet symmetric crypto (ADR-004, M2). RustCrypto, pinned to
+# the digest-0.10 / sha2-0.10 island the identity layer already uses so HKDF and
+# the HMAC chain KDF share one SHA-256 implementation:
+#   hkdf  — HKDF-SHA-256 (the PQXDH root-secret KDF and the Double Ratchet root KDF)
+#   hmac  — HMAC-SHA-256 (the Double Ratchet symmetric chain KDF; a bare-SHA256
+#           chain KDF is explicitly rejected by ADR-004 / the Signal spec)
+#   aes-gcm — AES-256-GCM, the vox-suite-1 default AEAD for ratchet envelopes
+hkdf = { version = "0.12", default-features = false }
+hmac = { version = "0.12", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 
 [profile.release]
 # Crypto + protocol code: keep overflow checks on in release too. A silent wrap
