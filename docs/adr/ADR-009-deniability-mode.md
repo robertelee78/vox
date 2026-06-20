@@ -33,7 +33,8 @@ Confirmed by mpENC, which warns that signing content with static keys "destroys 
 retaining deniability … we can never regain it in a higher layer":
 - **Governance/structural entries are static-composite-signed (Ed25519+ML-DSA identity key) in ALL
   modes:** genesis, admin delegations, consent grants, consent revocations, policy/passphrase-rotation
-  updates. (Attributable; preserves ADR-007 single-writer consent integrity.)
+  updates, **and the DGKA/DSKE setup entries** (§Concrete protocol; participation is attributable).
+  (Attributable; preserves ADR-007 single-writer consent integrity.)
 - **Message-content payloads** in a deniable channel are authenticated **only** by the per-author
   ephemeral key below — never the static key.
 
