@@ -40,8 +40,9 @@ Pairwise CPace-on-meet between members; no bespoke group PAKE (GPAKE is immature
 - **passphrase → CPace secret only.**
 
 **Post-join.** A successful CPace run bootstraps a PQXDH/Double-Ratchet pairwise session (ADR-004).
-Membership and any readable content still require the consent + certificate machinery of ADR-007;
-a joined node that no member has consented to sees only ciphertext.
+Joining yields **no readable content**: membership is emergent (join + per-sender consent, ADR-007)
+and a joined node sees only ciphertext until individual members consent to it. There is no admin
+admission step and no membership certificate.
 
 **Anti-abuse (layered, not just rate-limiting).** PAKE does not stop *online* guessing (one per run),
 and naive rate-limiting is Sybil-bypassable in a decentralized setting. Vox therefore relies on three
@@ -57,12 +58,17 @@ concrete, non-bypassable layers rather than rate-limiting alone:
    advertising a difficulty it adapts upward under load and downward when idle (difficulty is itself in
    the signed responder-nonce so the prover cannot lie about it); **verifier cost is a single Argon2id
    check (~ms)**, so verification never becomes the DoS. Accessibility note: difficulty caps keep
-   low-end devices usable; an invite-only channel may set difficulty to zero (admission is the gate).
-3. **Admission is admin-signed.** Final entry to the member set requires an admin-signed membership
-   certificate (ADR-007); no amount of passphrase guessing produces one.
+   low-end devices usable; an invite-only (identity-bound) channel may set difficulty to zero
+   (per-sender consent is the gate).
+3. **Identity-bound log acceptance + per-author quotas.** Joining the swarm grants no authority to be
+   *rendered*: the causal log accepts entries only from identities that completed the authenticated
+   join and carry valid per-author composite signatures, each bounded by per-author entry/byte quotas
+   (ADR-008). No amount of passphrase guessing yields readable content or unbounded write authority —
+   there is no admin-signed membership certificate to forge (ADR-007), because there is no membership
+   certificate at all.
 
 Rate-limiting by peers remains a cheap first filter but is explicitly **not** the security boundary.
-**Bandwidth abuse beyond join** (an admitted member spamming the log or rendezvous, or forcing
+**Bandwidth abuse beyond join** (a joined member spamming the log or rendezvous, or forcing
 render-gating amplification) is bounded by the per-author log quotas (ADR-008) and rendezvous-record
 caps (ADR-012), not by join PoW.
 

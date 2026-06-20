@@ -67,10 +67,11 @@ is rejected for that reason.)
 
 ### Mid-epoch membership change
 
-A member admitted between passphrase-epochs does **not** reuse the prior epoch's (now-published,
-forgeable) keys. Instead an **incremental DSKE re-key** runs: the affected members generate fresh
-per-epoch ephemeral keypairs and re-confirm, so the newcomer obtains live per-member verifiers. Cost:
-one incremental key-agreement round per admission affecting a deniable channel (bounded; the FS window
+A member who joins (and is newly consented to, ADR-007) between passphrase-epochs does **not** reuse
+the prior epoch's (now-published, forgeable) keys. Instead an **incremental DSKE re-key** runs: the
+affected members generate fresh per-epoch ephemeral keypairs and re-confirm, so the newcomer obtains
+live per-member verifiers. Cost: one incremental key-agreement round per such join affecting a
+deniable channel (bounded; the FS window
 is one re-key interval). This is the concrete answer to "consent is continuous but the DAKE is
 per-epoch."
 
@@ -112,7 +113,7 @@ ephemeral signatures (deniable today; the governance/transport/key-agreement pla
 - In-epoch message **unlinkability** is sacrificed (a member's content in one epoch shares an ephemeral
   key) — acceptable, since intra-group linkage is already attributable; only outsider non-attribution
   matters.
-- A multi-round deniable GKA + incremental re-key on admission is real protocol complexity and must be
+- A multi-round deniable GKA + incremental re-key on each mid-epoch join is real protocol complexity and must be
   formally analyzed before shipping (Van Gundy/mpENC give the template, not a drop-in library).
 - The PQ MDV component (UDMVS/MDVRS) is young; until vetted, PQ deniability rests on the hybrid's
   classical half (the rest of the stack is PQ).

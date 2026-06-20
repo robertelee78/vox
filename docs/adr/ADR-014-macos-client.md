@@ -138,7 +138,7 @@ Structured user testing runs **continuously** and feeds iterative refinement; AD
 guarantees stand regardless of it. The bar is "ship the best-designed version, complete" — never a
 reason to withhold the surface or ship it incomplete.
 
-- Consent is an explicit, **per-member decision**: when a newcomer is admitted, each member is
+- Consent is an explicit, **per-member decision**: when a newcomer joins the swarm, each member is
   prompted "Allow [member] to read your messages?", tied to that member's verification state to
   encourage *verify-before-consent*.
 - **Three distinct, clearly-labeled states per member — never conflated:** *verification* ("is this

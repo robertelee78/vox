@@ -54,8 +54,9 @@ by its bandwidth cost (ADR-003).
   concurrently. The recipient performs **reuse detection** (an OTP seen twice is logged and the second
   session treated as last-resort-grade), and a deliberate **drain attack** can only downgrade *new*
   sessions to last-resort-prekey FS (a documented, bounded residual), never break confidentiality.
-  Pre-admission joiners publish prekeys in a **separate pre-admission rendezvous record class** (ADR-012)
-  that conveys no log authority (ADR-008 accepts log entries only from admitted members).
+  Pre-join peers publish prekeys in a **separate pre-join rendezvous record class** (ADR-012)
+  that conveys no log authority (ADR-008 accepts log entries only from identities that completed the
+  authenticated join for the current `(channelID, epoch)`).
 
 **Security-property taxonomy (stated precisely to avoid conflation):**
 - **Forward secrecy** — from the symmetric KDF-chain ratchet (past keys unrecoverable from current).

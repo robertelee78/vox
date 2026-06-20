@@ -54,7 +54,7 @@ observer is the later metadata-privacy phase (ADR-001), stated, not silently omi
 faster, or extra records, are rejected by readers); records carry a short TTL (default 2 h) and are
 endpoint-minimized (publish only the addresses needed for the reachability ladder). A revoked member's
 records are ignored once the revocation entry (ADR-007) is seen. This bounds rendezvous-record spam
-even from an admitted member.
+even from a joined member.
 
 **Bootstrap (concrete, no third-party security dependency).** Cold-start onto the swarm uses a
 **configurable bootstrap set the user controls**: by default the user's own always-on node (the
@@ -64,8 +64,9 @@ bootstrap nodes only *introduce* peers (they can neither read traffic nor forge 
 hostile or absent bootstrap degrades availability but never confidentiality or authenticity. (This
 replaces the earlier "possibly piggyback public DHT" wording, which was a false deferral.)
 
-**Anti-abuse.** Join-attempt abuse is bounded by the layered controls in ADR-005 (consent gate +
-`(channelID, epoch)`-bound PoW join tokens + admin-signed admission), not by rate-limiting alone.
+**Anti-abuse.** Join-attempt abuse is bounded by the layered controls in ADR-005 (per-sender consent
+gate + `(channelID, epoch)`-bound PoW join tokens + identity-bound log acceptance with per-author
+quotas), not by rate-limiting alone. There is no admin admission step (ADR-007).
 
 **Honest limit (documented).** Two peers both behind CGNAT/symmetric NAT with no IPv6 and no
 reachable coordinator cannot connect. Global joint-IPv6 probability for a random pair is only

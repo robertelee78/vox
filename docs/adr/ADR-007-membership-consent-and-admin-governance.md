@@ -144,8 +144,8 @@ reconciles** (ADR-008). The model is chosen so most actions never truly conflict
 
 Only **forward** guarantees are cryptographic: rotating to keys a party never receives is enforceable;
 recalling keys a party already holds is not, and TTL/erasure (ADR-010) is client-honored. That
-previously-admitted members can still read traffic they already had keys for is an accepted,
-documented property of the threat model — not a defect to paper over.
+members who were previously consented-to can still read traffic they already hold keys for is an
+accepted, documented property of the threat model — not a defect to paper over.
 
 ## Consequences
 

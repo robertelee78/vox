@@ -38,9 +38,11 @@ you hold; the log replicates everything.
 **Concrete entry format (Bamboo-derived, no external log dependency).** A Vox log entry is a signed
 struct:
 `{ author_id, seq (per-author, strictly monotonic from 1), prev_hash, lipmaa_backlink, channelID,
-epoch, algo_ids, payload_hash, payload_len, end_of_feed_flag }`, authenticated by a composite
-Ed25519+ML-DSA signature (attributable channels) or the ADR-009 deniable authenticator (deniable
-channels), computed over all preceding fields. Because the signature commits to the *payload hash*,
+epoch, algo_ids, payload_hash, payload_len, end_of_feed_flag }`, authenticated **per entry type**
+(see "Per-entry-type authentication" below): governance/control entries are *always* composite
+Ed25519+ML-DSA root-signed (in every channel); message-content entries are composite-signed in
+attributable channels and authenticated by the ADR-009 deniable authenticator in deniable channels.
+The authenticator is computed over all preceding fields. Because the signature commits to the *payload hash*,
 not the bytes, a peer can delete old payload bodies (honoring admin TTL, ADR-010) while the signed,
 hash-linked skeleton stays fully verifiable; **lipmaa skip-links** give logarithmic-length
 verification certificates for partial replication. This is the Bamboo design adapted to Vox's
@@ -92,13 +94,18 @@ because automated punishment is only safe when the conflicting entries are *attr
   authority actions (admin grant/revoke) are treated as *provisional* until their causal neighborhood
   reconciles (ADR-007).
 
-**Abuse resistance (quantified).** Only entries from admitted members (ADR-007) are accepted into a
-channel's log, so unauthenticated floods cannot enter. Replication is bounded by **per-author quotas
-each peer enforces locally** — **defaults (channel-policy-tunable): ≤ 1000 entries/hour and
-≤ 50 MB/epoch per author**; over-quota entries from that author are dropped (not relayed) and the
-over-quota event is surfaced as an admin-abuse signal (like revocation churn). This directly bounds
-the **render-gating amplification** vector — because every ciphertext replicates to all members
-(§"Render-gating"), an admitted member could otherwise force O(members) storage; the per-author byte
+**Abuse resistance (quantified).** There is no membership roster or admission gate (ADR-007); the log
+acceptance predicate is instead **identity- and signature-bound**: an entry is accepted only if (a) it
+is authored by an identity that completed the authenticated channel join (CPace, ADR-005) for the
+current `(channelID, epoch)`, (b) it carries a valid per-author authenticator for its entry type
+(governance → root composite signature; content → composite or ADR-009 deniable), and (c) it is within
+that author's quota. Unauthenticated or wrong-epoch floods therefore cannot enter. Replication is
+bounded by **per-author quotas each peer enforces locally** — **defaults (channel-policy-tunable):
+≤ 1000 entries/hour and ≤ 50 MB/epoch per author**; over-quota entries from that author are dropped
+(not relayed) and the over-quota event is surfaced as an abuse signal (like revocation churn). This
+directly bounds the **render-gating amplification** vector — because every ciphertext replicates to
+all members (§"Render-gating"), a joined author could otherwise force O(members) storage; the
+per-author byte
 cap is what makes that cost finite, and a member may always decline to relay/store beyond a peer's
 own configured ceiling. Pruning is *authenticated*: a payload may be dropped per TTL, but its signed
 skeleton entry remains, so pruning can never silently rewrite history.

@@ -25,7 +25,8 @@ it is what lets governance be attributable (ADR-007) while message content can b
 
 1. **Identity / governance key (root).** A long-term **Ed25519** signing key, paired for hybrid
    PQ with an **ML-DSA-65** signing key (ADR-003). The pair is the root of trust: it signs
-   sub-keys, membership/admin certificates (ADR-007), and — in attributable channels — message
+   sub-keys, admin-delegation and governance certificates and per-sender consent grants (ADR-007;
+   there is no membership certificate), and — in attributable channels — message
    metadata. The human-verifiable **identity fingerprint** is `SHA-256(Ed25519_pub ‖ ML-DSA_pub)`,
    rendered for manual verification (UX in ADR-014). Both components are always verified together;
    a signature is valid only if *both* the Ed25519 and ML-DSA signatures verify (composite
