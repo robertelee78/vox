@@ -1,0 +1,94 @@
+# ADR-001: Vox Foundation — Vision, Threat Model, and Cross-Cutting Principles
+
+- **Status**: proposed
+- **Date**: 2026-06-19
+- **Deciders**: Robert E. Lee <robert@agidreams.us>
+- **Tags**: foundation, vision, threat-model, principles
+
+## Context
+
+Vox is a serverless, end-to-end-encrypted peer-to-peer overlay for private communication and
+arbitrary TCP/IP tunneling. It is a ground-up Rust redesign of an earlier Go prototype
+("Vox Lux") that implemented X3DH + Double Ratchet + Sender Keys over libp2p.
+
+The motivating problems with existing secure messengers:
+
+- **Central-server dependency.** Signal, Matrix, WhatsApp et al. depend on servers for prekey
+  distribution, identity, and message routing — a metadata chokepoint, censorship target, and
+  trust anchor the user does not control.
+- **Identity tied to phone numbers / accounts.** Binds a secure identity to a SIM and a
+  real-world identity.
+- **Room-level admission ("Signalgate," March 2025).** In Signal/Megolm/Sender-Keys, admission
+  is a room-level property: one wrong add instantly exposes *all new* traffic from *everyone*,
+  because group membership is not cryptographically authenticated (Albrecht et al., IEEE S&P
+  2023; eprint 2023/485, 2023/1300).
+
+The author distrusts implementations with central servers or closed source, and requires full
+control and customization. This ADR fixes the vision, threat model, and cross-cutting
+principles that govern all subsequent ADRs. It is the root of a dependency-ordered series; the
+order of ADRs is the intended build order.
+
+## Decision
+
+**Vision.** Signal-grade confidentiality without Signal's server, phone-number identity, or
+account requirement — joining a conversation is as frictionless as opening a magnet link, and
+the same overlay carries arbitrary byte streams (e.g. `ssh` over Vox), not just chat.
+
+**Cross-cutting principles (binding on all ADRs):**
+
+1. **Serverless = no *privileged* central server.** Some minimal bootstrap/rendezvous substrate
+   is provably unavoidable (see ADR-012); the requirement is that it be decentralized and
+   user-runnable — any node may serve, no Vox-operated infrastructure. "Serverless" means no
+   server anyone is *forced* to trust, not "no infrastructure."
+2. **The channel is the unit of communication.** All messages are broadcast to a channel; a 1:1
+   chat is just a two-member channel. There is no special pairwise messaging path.
+3. **Self-sovereign identity.** Identity is rooted in the user's own GPG/Ed25519 keys with manual
+   fingerprint verification. No accounts, no phone numbers, no central key directory. (ADR-002)
+4. **Per-sender consent admission is the headline trust model.** Possessing channel credentials
+   grants nothing readable; each member individually consents to a newcomer. (ADR-007)
+5. **Conventional, well-reviewed cryptography.** Novelty lives in the *trust model*, not the
+   primitives. Prefer standardized, analyzed constructions.
+6. **Post-quantum from the start.** Hybrid (classical + PQ) throughout. (ADR-003)
+7. **Chat and tunneling are both first-class.** (ADR-011, ADR-013)
+8. **MIT licensed.** Maximally permissive; open source is a requirement, not a preference.
+9. **Capability-driven development.** Each capability is researched, specified, and defined
+   before it is built; the ADR series is the spine.
+
+**Threat model (maximal — all four adversaries in scope):**
+
+- **Nation-state / network observer** — traffic analysis, censorship. Metadata confidentiality
+  to non-members is a *phased* goal (encryption + padding first; onion/mixnet-grade
+  traffic-analysis resistance is a later capability). "Hide in plain sight" traffic shaping is a
+  future interest.
+- **Platform operators** — addressed by the serverless, open-source core.
+- **Wrongly-added / passphrase-holder** — the Signalgate case; addressed by per-sender consent
+  (ADR-007).
+- **Device seizure / local compromise** — addressed by at-rest "double-lock" encryption and
+  forward secrecy (ADR-010).
+
+**Availability model.** Availability is emergent from who is online, with no always-on node
+required: a two-member channel requires both members online; a 3+-member channel needs any two
+online to propagate the log; a single online member is an outbox (can queue-to-send, cannot
+receive). This is accepted as an inherent property (see ADR-008, ADR-012).
+
+## Consequences
+
+### Positive
+- Maximal user autonomy: no server, account, or phone number to trust or be deplatformed from.
+- Structurally avoids the Signalgate room-level-admission failure (ADR-007).
+- One overlay serves both private messaging and arbitrary tunneling.
+
+### Negative
+- No "message someone while everyone is offline" without at least one reachable peer/own node.
+- A minimal, decentralized bootstrap/rendezvous layer is unavoidable (ADR-012); strict
+  zero-infrastructure is impossible.
+- Inherits known limitations of the Sender-Keys family (weak PCS, ADR-006/ADR-007).
+- Full nation-state traffic-analysis resistance is deferred, not solved in the first iteration.
+
+### Neutral
+- Positions Vox in the serverless/log-replicated family (Secure Scuttlebutt, Berty, Briar,
+  SimpleX, Matrix event-DAG) rather than against Signal directly; the differentiator is
+  per-sender consent + Signal-grade pairwise crypto.
+
+## Links
+- Governs: ADR-002 through ADR-014.

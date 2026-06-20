@@ -1,0 +1,9 @@
+# Ruflo / Claude-Flow runtime artifacts (regenerable, not source)
+.claude-flow/
+ruvector.db
+agentdb.rvf
+agentdb.rvf.lock
+
+# Rust build output (for when implementation begins)
+/target/
+**/*.rs.bk
