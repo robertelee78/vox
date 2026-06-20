@@ -3,62 +3,123 @@
 **Status**: proposed
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: identity, keys, gpg, ed25519, multi-device, pseudonymity
+**Tags**: identity, keys, gpg, ed25519, multi-device, pseudonymity, post-quantum
 
 ## Context
 
 Vox has no accounts and no central key directory (ADR-001). Identity must be self-sovereign,
-verifiable peer-to-peer, and able to root every other cryptographic mechanism: key agreement
-(ADR-004), channel join (ADR-005), the signed admin/membership certificate tree (ADR-007), and
-the per-author log (ADR-008). It must also support per-channel pseudonymity and a
-member-chosen multi-device strategy, and co-exist with the post-quantum policy (ADR-003).
+verifiable peer-to-peer, and must root every other mechanism: key agreement (ADR-004), channel
+join (ADR-005), the signed admin/membership certificate tree (ADR-007), per-author log
+authentication (ADR-008), and deniable content authentication (ADR-009). It must satisfy the
+hybrid post-quantum policy (ADR-003), support per-channel pseudonymity, and accommodate a
+member-chosen multi-device strategy. This ADR specifies the complete key model: every key, its
+purpose, its lifecycle, and its representation.
 
 ## Decision
 
-**Identity root = GPG/Ed25519.** A member's long-term identity is their Ed25519 key (GPG-
-compatible), verified out-of-band by manual fingerprint comparison. No accounts, no phone
-numbers, no central directory.
+### Key hierarchy
 
-**Role-separated keys (control plane vs data plane).** Distinct keys for distinct jobs, so that
-deniability (ADR-009) and governance (ADR-007) do not entangle:
-- **Identity/governance key** (signing) — roots the signed membership/admin certificate tree;
-  always attributable.
-- **Message-authentication key(s)** — per-channel/per-epoch keys for message content; in a
-  deniable channel these are deliberately *not* the identity key (ADR-009).
-- **Key-agreement keys** — X25519 + ML-KEM prekeys for PQXDH (ADR-003, ADR-004).
+A Vox identity is a set of keys with strictly separated roles. Role separation is load-bearing:
+it is what lets governance be attributable (ADR-007) while message content can be deniable
+(ADR-009), and it limits blast radius on compromise.
 
-**Pseudonymity is operational, by key choice.** Membership is attributable (ADR-009), so a
-member wanting unlinkability joins a channel with a *dedicated/pseudonymous* identity key rather
-than their main one. Vox must make per-channel identity-key selection easy and explicit.
+1. **Identity / governance key (root).** A long-term **Ed25519** signing key, paired for hybrid
+   PQ with an **ML-DSA-65** signing key (ADR-003). The pair is the root of trust: it signs
+   sub-keys, membership/admin certificates (ADR-007), and — in attributable channels — message
+   metadata. The human-verifiable **identity fingerprint** is `SHA-256(Ed25519_pub ‖ ML-DSA_pub)`,
+   rendered for manual verification (UX in ADR-014). Both components are always verified together;
+   a signature is valid only if *both* the Ed25519 and ML-DSA signatures verify (composite
+   signature `sig = Ed25519.sign ‖ ML-DSA.sign`).
 
-**Multi-device is the member's choice; Vox does not attest device↔identity links.** A member may
-share one identity key across devices or use a unique key per device. Vox provides no
-cryptographic device-linking attestation. Consequence: with per-device keys, consent and
-membership operate on device keys as identities unless the member links them out of band.
+2. **Key-agreement keys** (for ADR-004 PQXDH):
+   - **X25519 identity DH key**, used in the DH legs of PQXDH.
+   - **Signed prekey**: an X25519 key plus an **ML-KEM-768** KEM keypair, both signed by the root.
+     Rotated on a fixed cadence (default: every 7 days; previous signed prekey retained one cadence
+     period to decrypt in-flight sessions).
+   - **One-time prekeys**: a replenished pool of X25519 one-time keys and ML-KEM-768 one-time KEM
+     keys, each signed by the root, consumed once per inbound session and never reused. The pool is
+     refilled whenever it drops below a low-water mark; depletion falls back to the signed
+     (last-resort) prekey, never to no-prekey.
 
-**Post-quantum identity.** The Ed25519 root gains a hybrid PQ co-signature capability
-(Ed25519 + ML-DSA) per ADR-003; the GPG/Ed25519 root remains the human-verified anchor.
+3. **Message-authentication keys** (per channel, ADR-006/ADR-009):
+   - **Attributable mode**: the Sender-Key signing key (per author, per channel) — an
+     Ed25519+ML-DSA pair bound to `(channelID, epoch)` (ADR-006), cross-signed by the root so
+     recipients tie it to the identity.
+   - **Deniable mode**: a **per-epoch ephemeral** signing key, bootstrapped through a deniable
+     exchange (ADR-009), *not* cross-signed by the root in a transferable way — so message content
+     carries no transferable proof of authorship to outsiders.
+
+All keys carry explicit, versioned algorithm identifiers with pairwise-disjoint encoding ranges
+and algorithm-prefix bytes (the ADR-003 type-confusion rule).
+
+### GPG integration
+
+The root identity is an OpenPGP-representable Ed25519 key, so it interoperates with existing PGP
+key material and fingerprint-verification culture (ADR-001 principle 3):
+
+- **Import**: a user may bind an existing GPG Ed25519 primary (or signing subkey) as the Vox root;
+  signing operations are delegated to `gpg-agent`, so the private key need never leave the agent /
+  smartcard / Secure Enclave.
+- **Generate**: otherwise Vox generates a native Ed25519 root and exports it in OpenPGP format for
+  backup and external verification.
+- The ML-DSA co-key is a Vox-managed companion key, committed to alongside the OpenPGP key via a
+  signed binding statement (the identity fingerprint covers both).
+
+### Lifecycle
+
+- **Prekey rotation** is automatic on cadence; **one-time prekeys** are replenished continuously.
+- **Root-key rotation is identity replacement.** Because the root is the human-verified anchor, a
+  new root is a new identity and requires out-of-band re-verification; Vox supports publishing a
+  root-signed *succession statement* (old root signs the new root's fingerprint) so peers who
+  already trust the old root can migrate without a fresh fingerprint check, while peers who do not
+  must verify anew. Compromise of the root is unrecoverable for that identity — by design, there
+  is no central authority to appeal to.
+- **Backup** of the root (and its OpenPGP representation) is the user's responsibility; Vox
+  provides an explicit, encrypted export.
+
+### Multi-device
+
+Per the project decision, the multi-device strategy is the member's choice and Vox provides **no
+device↔identity attestation**:
+
+- **Shared-root**: the same root identity on multiple devices (root key synced by the user out of
+  band, e.g. via the OpenPGP export). Devices are indistinguishable; consent/membership operate on
+  the one identity.
+- **Per-device keys**: each device a distinct identity. Consent and membership then operate on
+  device keys as identities. A member who wants their devices recognized as one persona MAY publish
+  device sub-keys cross-signed by a shared root and present that linkage to peers — but this is
+  member-managed convention, not a Vox-enforced attestation. Clients MUST represent device-keys
+  clearly so consent is never granted to an unrecognized device by accident (ADR-014).
+
+### Pseudonymity
+
+Membership is attributable (ADR-009), so unlinkability is achieved operationally: a member joins a
+channel under a **dedicated identity key** rather than their main one. Per-channel identity-key
+selection is a first-class, explicit client operation (ADR-014); Vox never reuses an identity
+across channels without the user choosing to.
 
 ## Consequences
 
 ### Positive
-- No central trust anchor; identity is fully user-controlled and portable.
-- Role separation cleanly enables both attributable governance and deniable content.
-- Per-channel key selection gives strong, simple pseudonymity without a protocol-level anonymity system.
+- No central trust anchor; identity is fully user-controlled, portable, and interoperates with PGP.
+- Strict role separation enables attributable governance and deniable content simultaneously, and
+  contains compromise blast radius.
+- Operational pseudonymity needs no protocol-level anonymity system — just key choice.
+- Hybrid Ed25519+ML-DSA root and ML-KEM prekeys make identity post-quantum from day one.
 
 ### Negative
-- Manual fingerprint verification is a UX burden and a foot-gun if skipped.
-- No device-linking means per-device-key users must manage identity coherence themselves; consent
-  UX must represent device-keys clearly (ADR-014).
-- Key management (backup, rotation, loss) is the user's responsibility; losing the root key is unrecoverable.
+- Manual fingerprint verification is a real UX burden and a foot-gun if skipped (mitigated in ADR-014).
+- No device attestation means per-device-key users manage persona coherence themselves.
+- Root-key loss is unrecoverable; backup discipline is on the user.
+- Composite (Ed25519+ML-DSA) signatures and ML-KEM prekeys are larger and slower than classical
+  alone (sizing addressed in ADR-003/ADR-008).
 
 ### Neutral
-- Reuses existing PGP key material and fingerprint-verification culture rather than minting an
-  app-specific identity system.
+- Reuses OpenPGP key material and fingerprint culture instead of minting an app-specific identity.
 
 ## Links
-**Depends on**: ADR-001.
-- Depended on by: ADR-003, ADR-004, ADR-005, ADR-007, ADR-008, ADR-009.
+**Depends on**: ADR-001, ADR-003.
+- Depended on by: ADR-004, ADR-005, ADR-007, ADR-008, ADR-009, ADR-010, ADR-014.
 
 ## Engineering Mantra
 

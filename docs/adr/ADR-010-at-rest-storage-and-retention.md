@@ -3,53 +3,101 @@
 **Status**: proposed
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: storage, at-rest, encryption, retention, ttl, device-seizure
+**Tags**: storage, at-rest, encryption, retention, ttl, device-seizure, app-lock
 
 ## Context
 
 Device seizure / local compromise is in the threat model (ADR-001). The local store holds the
-replicated log (ADR-008) — including a full message history — which is a goldmine if a device is
-taken. Retention is also a channel-policy concern (admin-set TTL, ADR-007). At-rest protection must
-co-exist with the content-addressed, de-duplicated, sparsely-replicated log.
+replicated log (ADR-008) — including private keys (ADR-002), decrypted plaintext caches, and
+indexes — a goldmine if a device is taken. Retention is also channel policy (admin-set TTL,
+ADR-007). At-rest protection must co-exist with the content-addressed, de-duplicated, sparsely-
+replicated log and must not weaken it. This ADR specifies the key hierarchy, the double-lock,
+its interaction with passphrase rotation and dedup, app-lock, retention, and the honest limits.
 
 ## Decision
 
-**Double-lock at rest.** Encrypt the local message store such that a thief who has the device *and*
-the user's GPG key would *still* need the channel passphrase. Concretely, derive the local store
-key from *both* the GPG-held key material *and* the channel passphrase. Defense-in-depth: raises
-the bar against device seizure beyond single-key compromise.
+### Two distinct encryption layers
 
-**Acknowledged limits of double-lock.** The channel passphrase is shared among members (not a
-per-user secret), so it raises the bar against an outsider/thief, not against another member. And
-passphrase rotation (ADR-007) means old messages were encrypted under the prior passphrase —
-reading them after rotation requires retaining the old key or re-encrypting; this interaction must
-be specified.
+These are kept separate and must not be conflated:
 
-**Dedup/replication interaction.** Payloads encrypted under the shared channel key preserve
-cross-member de-duplication (same key → same ciphertext → same CID) and sparse replication
-(ADR-008). Per-recipient consent encryption differs per recipient and breaks dedup; the design
-keeps channel-shared payload encryption for the log and layers per-recipient gating via key
-*distribution* (ADR-006/ADR-007), not per-recipient payload re-encryption.
+1. **Log/transport content encryption (shared).** Message payloads in the log are encrypted under
+   channel-shared content keys derived from the Sender-Key material (ADR-006). This is what
+   replicates between members; encrypting under shared keys is what preserves cross-member
+   de-duplication (same key → same ciphertext → same CID) and sparse replication (ADR-008).
+   Per-recipient gating is achieved by gating key *distribution* (ADR-007), never by per-recipient
+   payload re-encryption — so dedup is never broken by consent.
 
-**Retention / TTL is admin-set and client-honored, not enforceable.** The admin sets TTL (default:
-never expire) and may change it anytime. Clients are expected to honor it by pruning payload bytes
-(ADR-008 payload-hash signing keeps the chain intact), but a malicious client can ignore TTL. This
-limit is documented, not papered over.
+2. **Local at-rest encryption (the double-lock).** The entire local store — the log database, the
+   decrypted plaintext/index caches, and the private key material — is encrypted at rest under a
+   per-channel **Store Encryption Key (SEK)**, AEAD per segment. This is a strictly local layer; it
+   does not affect the wire/log format and therefore cannot break dedup or replication.
+
+### Double-lock key derivation
+
+The SEK is wrapped under **two independent factors, both required** to unlock (the "double-lock"):
+
+```
+factor_id   = KDF_HKDF(identity-key-material)            // requires the GPG/Ed25519 root,
+                                                          // via gpg-agent / Secure Enclave where present
+factor_pass = Argon2id(channel_passphrase, salt, params) // memory-hard; per-channel salt
+KEK         = HKDF(factor_id || factor_pass, info="vox-sek-wrap/v1")
+stored:       wrap = AEAD_KEK(SEK)                        // only the small wrap is stored
+```
+
+A device thief who has the device **and** the GPG key still cannot read a channel's store without
+that channel's passphrase; conversely the passphrase alone is useless without the identity key.
+SEK is per-channel, so compromise of one channel's passphrase never opens another channel's store.
+
+### Passphrase rotation interaction
+
+When an admin rotates the channel passphrase (new epoch, ADR-007), `factor_pass` changes, so the
+SEK **wrap** is re-derived and re-stored under the new KEK at rotation time. Only the small wrap is
+re-encrypted — the bulk store is *not* re-encrypted, since the SEK itself is unchanged — so history
+encrypted under the existing SEK stays readable after rotation. A member offline during rotation
+rejoins under the new passphrase (ADR-005) and re-derives the wrap. The prior passphrase no longer
+unlocks the new wrap; history readability is preserved deliberately and explicitly, not by
+retaining the old passphrase.
+
+### App-lock and memory hygiene
+
+- The SEK lives **only in memory** while the app is unlocked. Lock (manual, idle-timeout, or on
+  sleep) zeroizes the SEK and derived material from memory, requiring re-authentication (identity
+  key + passphrase, or — on platforms with a Secure Enclave — a biometric-gated re-wrap of the
+  identity factor so biometrics never replace the passphrase factor, only the identity factor's
+  unlock).
+- Secrets use locked, zeroized memory (`mlock`/`zeroize`); plaintext caches are themselves inside
+  the SEK-encrypted store, never written unencrypted.
+- Screen-security and disappearing-message UX are specified in ADR-014.
+
+### Retention / TTL
+
+Admin-set TTL (ADR-007); default **never expire**; changeable anytime. Clients are expected to honor
+it by pruning payload bytes — the log's payload-hash signing keeps the hash-skeleton verifiable
+after pruning (ADR-008). "Disappearing" deletes both the plaintext cache and the payload bytes at
+TTL. This is **client-honored, not enforceable**: a malicious client can retain data; we state this
+plainly rather than implying a guarantee we cannot make.
 
 ## Consequences
 
 ### Positive
-- Device seizure requires device + GPG key + channel passphrase to read history — strong defense-in-depth.
-- TTL pruning works without breaking log integrity (ADR-008).
-- Channel-shared payload encryption keeps dedup and sparse replication intact.
+- Reading a channel's history at rest requires device **and** identity key **and** channel
+  passphrase — strong defense-in-depth against seizure.
+- The two-layer design keeps dedup/sparse-replication intact while still encrypting everything local.
+- Passphrase rotation preserves history without re-encrypting the bulk store and without retaining
+  old passphrases.
+- App-lock plus memory hygiene bounds exposure of a warm device.
 
 ### Negative
-- Double-lock complicates key management and the passphrase-rotation/history-readability interaction.
-- TTL/erasure is best-effort; "delete" cannot be guaranteed across honest-but-curious or malicious peers.
-- Shared channel passphrase as a second factor does not protect against a malicious *member*.
+- The double-lock adds key-management complexity (two factors, per-channel SEK, wrap re-derivation on
+  rotation).
+- The channel passphrase is shared among members, so as a second factor it raises the bar against an
+  outsider/thief, not against a malicious *member*.
+- A warm, unlocked device with SEK in memory is exposed — hence mandatory lock/timeout — and no
+  at-rest scheme defends a fully compromised OS/root.
 
 ### Neutral
-- Could be merged into ADR-008 implementation-wise, but kept separate as a distinct security decision.
+- Mechanically adjacent to ADR-008, but kept as a separate decision because it is a distinct security
+  boundary (local-at-rest vs replicated-log).
 
 ## Links
 **Depends on**: ADR-002, ADR-007, ADR-008.

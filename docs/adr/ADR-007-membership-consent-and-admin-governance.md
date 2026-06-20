@@ -3,73 +3,132 @@
 **Status**: proposed
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: consent, membership, admin, governance, revocation, differentiator
+**Tags**: consent, membership, admin, governance, revocation, capabilities, differentiator
 
 ## Context
 
-This is Vox's headline differentiator, designed against the Signalgate failure (ADR-001): in
+This is Vox's headline differentiator (ADR-001), designed against the Signalgate failure: in
 Signal/Matrix/WhatsApp, group membership is not cryptographically authenticated, so one wrong add
-exposes all future traffic to the intruder. Vox must instead make admission a *per-member,
-per-sender* cryptographic decision, with no central authority — while still providing workable
-admin and channel policy in a serverless setting. Built on Sender Keys (ADR-006), identity
-(ADR-002), and verified against the Megolm membership-control attacks (IEEE S&P 2023, eprint
-2023/1300).
+exposes all future traffic. Vox makes admission a *per-member, per-sender* cryptographic decision
+with no central authority, while providing workable, verifiable admin and policy in a serverless
+setting. It is built on identity (ADR-002), channel join (ADR-005), Sender Keys (ADR-006), and the
+causal log (ADR-008), and is validated against the Megolm membership-control attacks (Albrecht et
+al., IEEE S&P 2023; eprint 2023/1300). This ADR specifies the complete governance protocol: the
+trust anchor, the certificate/grant schema, the consent and revocation flows, and conflict
+resolution under partition.
 
 ## Decision
 
-**Per-sender consent admission.** A node that joins the swarm with correct credentials (ADR-005)
-can read *nothing* by default — it holds no member's sender key. Each existing member individually
-consents to a newcomer by releasing *their* SKDM (ADR-006) to it. Until member A consents, A's
-messages remain undecryptable to the newcomer — forever, if A never consents. Visibility fills in
-monotonically, per sender. Newcomers auto-broadcast their own SKDM to all (they have nothing to
-consent over). This structurally avoids the Signalgate cascade: there is no server-controlled
-member list to forge, and possessing credentials releases no keys.
+### Trust anchor: the genesis capability
 
-**Cryptographic admin without a server = a signed certificate tree.** Admin and membership are
-governed by Ed25519/ML-DSA-signed certificates forming a tree of signatures rooted at the
-channel-creation event (the trust anchor) — SPKI/SDSI/UCAN-style attenuated delegation, verified
-independently by every client. (This is precisely the fix the Matrix authors proposed but never
-shipped.) The creator is the root admin and may delegate admin by signing an admin certificate
-naming a delegate's key (ADR-002).
+A channel begins with a **genesis record**: a self-signed root capability authored by the
+creator's identity key (ADR-002), fixing `channelID`, creation timestamp, the initial policy
+(history mode, deniability mode, TTL), and naming the creator as **root admin**. Its hash is the
+root of every certificate chain in the channel; every authority claim must verify back to it.
 
-**Channel policy is admin-set and mutable.** The admin sets per-channel policy — notably
-history-vs-forward-only for newcomers, and the deniable-vs-attributable mode (ADR-009) — and may
-change it after creation. Prior-message *metadata* visibility to newcomers follows the channel's
-history policy.
+### Certificate and grant schema
 
-**Revocation = forward rotation.**
-- **Per-member revocation:** remaining members rotate their sender keys and redistribute to all
-  except the revoked node (excludes it from future traffic).
-- **Passphrase-rotation epoch:** the admin rotates the channel passphrase, evicting all members
-  and forcing rejoin — a bulk re-key / mass-revocation primitive and a clean epoch boundary
-  (ADR-006 binding).
+All of the following are signed entries on the causal log (ADR-008). Each carries: author
+identity, `(channelID, epoch)` binding (ADR-006), monotonic per-author sequence number, parent
+hash-links, the issuer's certificate chain reference, and a composite Ed25519+ML-DSA signature
+(ADR-002/ADR-003).
 
-**Enforcement honesty.** Only *forward* guarantees are cryptographic: no mechanism can recall keys
-a member already holds, and TTL/erasure is client-honored, not enforceable (ADR-010). Past traffic
-remaining readable by previously-admitted members is an accepted, documented property of the
-threat model.
+- **Admin delegation cert** — issued by an admin, names a delegate identity key and the granted
+  capability set, optionally *attenuated* (e.g. `invite` but not `delegate`) and optionally with an
+  expiry. Delegations chain to genesis, forming an SPKI/SDSI/UCAN-style capability tree the client
+  verifies independently. No capability can exceed its issuer's (monotonic attenuation).
+- **Membership cert** — issued by an admin holding the `invite` capability, names the newcomer's
+  identity key and admits them to the channel (eligibility to participate). Attributable and durable
+  (this is why membership is *not* deniable — ADR-009).
+- **Consent grant** — issued by an *individual member* `A`, names a target member `N`, and is the
+  act of releasing `A`'s Sender Key to `N`: `A` encrypts `A`'s current SKDM (ADR-006) to `N` over
+  their pairwise channel (ADR-004) and records a consent-grant entry. This is the per-sender consent
+  primitive — entirely `A`'s decision, authored only by `A`.
+- **Revocation** — a *consent revocation* (member `A` withdraws `N`'s access to `A`'s future
+  messages) or a *membership revocation* (an admin removes `N` from the channel). Triggers sender-key
+  rotation excluding the target (below).
+- **Policy update** — issued by an admin, changes channel policy (history/forward-only,
+  deniable/attributable, TTL). Takes effect from its causal position forward.
+
+### Admission and per-sender consent flow
+
+1. `N` completes the CPace join (ADR-005) and establishes pairwise PQXDH sessions (ADR-004) with
+   whichever members it meets. Holding channel credentials yields **no** sender keys — `N` can read
+   nothing yet.
+2. An admin issues a **membership cert** for `N` (eligibility). This does not grant readability.
+3. `N` broadcasts its own SKDM to members (it has nothing to consent over; others reading `N`
+   depends on each of them, symmetric to the rule below).
+4. Each existing member `A` independently decides whether to consent. On consent, `A` issues a
+   **consent grant** (sends `A`'s SKDM to `N`). Until `A` does so, `A`'s messages remain
+   undecryptable to `N` — forever if `A` never consents. `N`'s readable view of the channel fills
+   in **monotonically, per sender**.
+
+Because possession of credentials releases no keys and every membership/consent act is a signed
+certificate verified to genesis, there is no server-controlled member list to forge — the
+Signalgate / Megolm membership-injection class is structurally absent.
+
+### Revocation and epochs
+
+- **Per-member consent revocation:** `A` generates a fresh sender key (new per-author chain,
+  advancing `A`'s epoch contribution), distributes it to all members `A` still consents to *except*
+  the revoked `N`, and records a revocation entry. `N` retains previously-held keys (uncallable) but
+  cannot decrypt `A`'s future messages.
+- **Admin membership revocation:** an admin issues a membership-revocation cert; consenting members
+  rotate their sender keys excluding `N`.
+- **Passphrase-rotation epoch (bulk):** an admin rotates the channel passphrase (ADR-005), incrementing
+  the channel `epoch`. This evicts all members and forces rejoin (re-CPace, re-admission, re-consent),
+  and is the clean epoch boundary that re-binds all sender keys to the new `(channelID, epoch)`
+  (ADR-006) — the mass-revocation primitive.
+
+### Conflict resolution under partition
+
+Governance state lives on the causal Merkle-DAG (ADR-008), which converges without consensus. The
+model is chosen so most actions never truly conflict:
+
+- **Consent is single-writer.** Only `A` authors `A`'s consent grants and `A`'s sender-key rotations,
+  so `A`'s consent timeline is totally ordered within `A`'s own log. There is no cross-writer race on
+  "can `N` read `A`."
+- **Additive facts merge freely.** Membership certs, consent grants, and admin delegations are
+  add-only; concurrent ones all stand and are ordered causally.
+- **Removal beats addition (fail-safe).** When an authorized revocation/removal is concurrent with
+  (no causal ordering) or after a corresponding add/grant for the same subject, the subject is
+  treated as **not-admitted / not-consented** until a *causally-later* re-grant. This deterministic
+  "revocation wins" rule is applied per subject and resolves concurrent admin add-vs-remove
+  conservatively.
+- **Admin authority is monotonic + revocable.** A key is an admin iff some valid delegation chain to
+  genesis grants it and no causally-later authorized revocation supersedes it; ties resolve by the
+  same removal-wins rule. Attenuation prevents privilege escalation regardless of ordering.
+
+### Enforcement honesty
+
+Only **forward** guarantees are cryptographic: rotating to keys a party never receives is enforceable;
+recalling keys a party already holds is not, and TTL/erasure (ADR-010) is client-honored. That
+previously-admitted members can still read traffic they already had keys for is an accepted,
+documented property of the threat model — not a defect to paper over.
 
 ## Consequences
 
 ### Positive
 - Eliminates the Signalgate single-wrong-add exposure by construction — the core product promise.
-- Serverless, verifiable governance with no central membership authority.
-- Per-sender monotonic visibility is expressible because of the Sender-Keys per-author model (ADR-006).
+- Fully serverless, client-verifiable governance: every authority claim chains to genesis.
+- Per-sender, monotonic visibility is expressible precisely because consent is single-writer over
+  per-author Sender Keys (ADR-006), and converges cleanly on the causal log.
 
 ### Negative
-- Revocation is O(remaining members) of SKDM redistribution; a passphrase epoch is a full
-  re-admission/re-consent cycle (~O(N²) pairwise) — strong but expensive as N grows.
-- Consent state and the certificate tree must stay consistent across a serverless overlay under
-  partition / concurrent admin actions — handled on the causal log (ADR-008).
-- "Admin" reintroduces a (delegated, signed, non-server) authority concept that must be designed carefully.
+- Per-member revocation costs O(remaining consented members) of SKDM redistribution; a passphrase
+  epoch is a full re-admission/re-consent cycle — strong but expensive as membership grows.
+- "Removal wins" can transiently hide a legitimately re-added member until a causally-later re-grant
+  propagates; acceptable as the fail-safe direction.
+- Admin reintroduces a delegated (signed, non-server) authority that must be implemented with strict
+  attenuation and chain verification.
 
 ### Neutral
-- Consent/admin state lives in the replicated log (ADR-008); deniable channels alter the signing
-  story (ADR-009) but not the consent mechanics.
+- All governance state is ordinary signed log content (ADR-008); deniable channels (ADR-009) change
+  message-content signing but not the governance plane, which stays attributable.
 
 ## Links
-**Depends on**: ADR-002, ADR-005, ADR-006.
-- Depended on by: ADR-008, ADR-009, ADR-014.
+**Depends on**: ADR-002, ADR-005, ADR-006, ADR-008.
+- Depended on by: ADR-009, ADR-010, ADR-013, ADR-014.
 
 ## Engineering Mantra
 
