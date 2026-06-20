@@ -142,6 +142,30 @@
 //!   gpg-agent/Enclave IPC and disappearing-message UX (ADR-014) are documented
 //!   seams, not stubs.
 //!
+//! Built on M0 + M1 + M5, milestone **M9** adds:
+//!
+//! - [`transport`] — the QUIC transport substrate (ADR-011): one authenticated,
+//!   PQ-hybrid QUIC connection per peer, multiplexing independent reliable streams
+//!   (no cross-stream head-of-line blocking) for bulk/sync and RFC 9221 unreliable
+//!   datagrams for low-latency flows. The TLS 1.3 handshake offers **only** the
+//!   X25519MLKEM768 hybrid group (code point `0x11EC`) — no classical downgrade
+//!   target — and authenticates peers libp2p-style with **no CA**: a self-signed
+//!   leaf carries the Vox composite identity (ADR-002) in a custom X.509 extension
+//!   plus a composite proof-of-possession over `"vox-tls-handshake:" ‖
+//!   cert_public_key`, which the verifier recovers and matches against the expected
+//!   peer (mismatch → wire error `0x05`). 0-RTT is disabled; datagrams carry a
+//!   64-bit sequence + a DTLS-style sliding anti-replay window (default 1024); the
+//!   negotiated suite/group is recorded in a session-establishment entry (tag
+//!   `0x0011`) for end-to-end downgrade auditability. M5's [`log::sync::Transport`]
+//!   gets a real quinn-backed implementation so anti-entropy sync runs over QUIC.
+//!   Per ADR-011, transport keys are deliberately **separate** from the ADR-004
+//!   message keys (a transport compromise cannot expose message FS/PCS). The TLS
+//!   crypto **provider** (`aws-lc-rs`, for the hybrid group) is the one
+//!   ecosystem-forced Rust-maximal exception (ADR-001 #10), scoped to the handshake;
+//!   app/message/log crypto stays RustCrypto and `#![forbid(unsafe_code)]` holds.
+//!   NAT traversal (M10/ADR-012), tunnel streams (M11/ADR-013), and the IANA PEN
+//!   registration are documented seams, not stubs.
+//!
 //! ## Engineering mantra (binding — see ADR-001)
 //! No stubs, no `todo!()`, no shortcuts. What ships is complete and correct.
 //! Every module here carries its own tests and, where the ADRs name a release
@@ -165,6 +189,7 @@ pub mod join;
 pub mod log;
 pub mod pairwise;
 pub mod suite;
+pub mod transport;
 pub mod wire;
 
 pub use error::{Error, Result};

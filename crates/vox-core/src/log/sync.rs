@@ -71,6 +71,17 @@ pub trait Transport {
     /// Close the stream with a Vox application error code (ADR-008). After a
     /// close the peer must not send/receive further frames.
     fn close(&mut self, code: WireError);
+
+    /// Cleanly finish the **send** direction: no more frames will be sent, and the
+    /// peer's [`Transport::recv`] should observe end-of-stream (`Ok(None)`) once it
+    /// has drained the frames already sent. This is the *success* terminator,
+    /// distinct from the hard-fail [`Transport::close`].
+    ///
+    /// The default is a no-op: the in-memory [`DuplexTransport`] signals
+    /// end-of-stream implicitly (an empty inbox reads as `Ok(None)`), so it needs
+    /// nothing here. A real ordered byte transport (the QUIC mapping, M9) overrides
+    /// this to FIN its send stream so the peer's blocking read terminates.
+    fn finish(&mut self) {}
 }
 
 /// An in-memory duplex transport pairing two endpoints by shared queues, for
@@ -625,6 +636,90 @@ where
     let into_a = drain_entries(ta, a, resolver, admission, now_secs)?;
     let into_b = drain_entries(tb, b, resolver, admission, now_secs)?;
     Ok((into_a, into_b))
+}
+
+/// Drive **one peer's** half of a frontier-mode session over a single
+/// [`Transport`] endpoint, to completion. Unlike [`frontier_session`] (which pumps
+/// both in-process duplex sides in one thread), this runs a single side over a
+/// real bidirectional transport — the QUIC mapping (M9), where the network moves
+/// bytes, so no `pump` is needed. Both peers are protocol-symmetric, so the same
+/// function serves the initiator and the responder; run one on each peer
+/// concurrently and both converge.
+///
+/// The phases mirror [`frontier_session`]: `HELLO` → `HAVE` → `WANT` → serve the
+/// peer's `WANT` with `ENTRY` frames, then drain and apply the peer's `ENTRY`
+/// frames. After serving its entries the peer half-closes its send direction
+/// ([`Transport::close`] is **not** called on the success path — a clean
+/// end-of-stream is signalled by [`Transport::recv`] returning `Ok(None)`), so the
+/// drain loop terminates. A hard fail closes the transport with the mapped
+/// [`WireError`].
+///
+/// Returns the number of entries newly applied into `dag`.
+pub fn frontier_session_peer<T, R>(
+    t: &mut T,
+    dag: &mut Dag,
+    resolver: &R,
+    admission: &AdmissionPolicy,
+    now_secs: u64,
+) -> std::result::Result<usize, WireError>
+where
+    T: Transport,
+    R: AuthorResolver,
+{
+    match frontier_session_peer_inner(t, dag, resolver, admission, now_secs) {
+        Ok(applied) => Ok(applied),
+        Err(code) => {
+            t.close(code);
+            Err(code)
+        }
+    }
+}
+
+fn frontier_session_peer_inner<T, R>(
+    t: &mut T,
+    dag: &mut Dag,
+    resolver: &R,
+    admission: &AdmissionPolicy,
+    now_secs: u64,
+) -> std::result::Result<usize, WireError>
+where
+    T: Transport,
+    R: AuthorResolver,
+{
+    let send = |t: &mut T, f: Vec<u8>| {
+        t.send(&f)
+            .map_err(|_| WireError::ProtocolVersionUnsupported)
+    };
+
+    // 1. HELLO exchange + mode negotiation.
+    send(t, encode_hello(SYNC_MODE_FRONTIER))?;
+    let remote_hello = expect_hello(t.recv())?;
+    negotiate_mode(SYNC_MODE_FRONTIER, remote_hello)?;
+
+    // 2. HAVE exchange.
+    send(t, encode_have(&frontiers_of(dag)))?;
+    let remote_have = expect_have(t.recv())?;
+
+    // 3. WANT exchange (ask for what we lack, including equal-seq forks).
+    let my_wants = wants_for(dag, &remote_have);
+    send(t, encode_want(&my_wants))?;
+    let their_wants = expect_want(t.recv())?;
+
+    // 4. Serve their WANT with ENTRY frames, then signal end-of-stream by
+    //    half-closing the send side via a benign close. We must NOT use
+    //    `Transport::close` here (that is the hard-fail path); a clean FIN is the
+    //    success terminator. The QUIC mapping finishes the send stream; the
+    //    in-memory duplex relies on the drain loop observing an empty inbox.
+    for wire in entries_for_wants(dag, &their_wants) {
+        send(t, encode_entry(&wire))?;
+    }
+    // Signal a clean end-of-stream on our send side (success terminator, not a
+    // hard close), so the peer's drain loop terminates at FIN.
+    t.finish();
+
+    // 5. Drain and apply the entries the peer serves us, until the peer's clean
+    //    half-close (recv → Ok(None)).
+    drain_entries(t, dag, resolver, admission, now_secs)
 }
 
 /// Read and apply every queued `ENTRY` frame on `t` into `dag`. A hard fail

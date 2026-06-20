@@ -28,6 +28,15 @@ curve25519-dalek.workspace = true
 subtle.workspace = true
 equihash.workspace = true
 blake2b_simd.workspace = true
+# Transport substrate (ADR-011, M9).
+quinn.workspace = true
+rustls.workspace = true
+rustls-post-quantum.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
+x509-parser.workspace = true
+tokio.workspace = true
+bytes.workspace = true
 
 [features]
 # The real (n=200,k=9) Equihash *solver* (ADR-005). Off by default because it

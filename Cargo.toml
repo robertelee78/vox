@@ -75,6 +75,37 @@ equihash = { version = "0.3", default-features = false, features = ["std"] }
 # BLAKE2b with personalization — the Equihash string generator (ADR-005 PoW).
 blake2b_simd = { version = "1.0", default-features = false, features = ["std"] }
 
+# --- Transport substrate (ADR-011, M9) ---------------------------------------
+# The QUIC substrate. `quinn` 0.11 rides `rustls` 0.23 over `tokio` (its default
+# `runtime-tokio` feature). Streams give per-stream backpressure with no
+# cross-stream head-of-line blocking; RFC 9221 unreliable datagrams carry the
+# low-latency flows. One connection per peer.
+quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio", "log"] }
+# TLS 1.3 with the X25519MLKEM768 hybrid group. The `aws_lc_rs` provider supplies
+# the hybrid KEM (X25519 + ML-KEM-768) — the one ecosystem-forced C/asm crypto in
+# the transport (ADR-001 #10 Rust-maximal exception, documented in `transport`).
+# App crypto stays RustCrypto. We pin the provider explicitly and restrict
+# `kx_groups` to exactly the hybrid group, so there is NO classical downgrade
+# target on the TLS wire.
+rustls = { version = "0.23.22", default-features = false, features = ["aws_lc_rs", "std"] }
+# The `&'static dyn SupportedKxGroup` for X25519MLKEM768 (TLS code point 0x11EC),
+# used to pin `CryptoProvider::kx_groups` to the single hybrid group.
+rustls-post-quantum = "0.2"
+# Shared PKI value types (CertificateDer / PrivateKeyDer / ServerName) re-exported
+# by rustls; pinned so the verifier and config code share one version.
+rustls-pki-types = "1"
+# Self-signed cert + the custom X.509 identity extension (libp2p-tls-style). rcgen
+# 0.14 builds the leaf cert and embeds the extension at our provisional OID.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# DER parsing on the verify side: pull the identity extension out by OID and read
+# the cert's SubjectPublicKeyInfo to bind the proof-of-possession.
+x509-parser = "0.16"
+# Async runtime for quinn + the loopback transport tests.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
+# `Bytes` is quinn's datagram payload type (its own public API surface). Pinned at
+# the workspace level so we share the exact `bytes` quinn resolves.
+bytes = { version = "1", default-features = false }
+
 [profile.release]
 # Crypto + protocol code: keep overflow checks on in release too. A silent wrap
 # in a length or sequence field is a correctness/security bug, not a perf knob.
