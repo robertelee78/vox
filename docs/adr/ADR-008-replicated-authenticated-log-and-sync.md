@@ -63,22 +63,41 @@ the byte-equality fork-proof below. The **`lipmaa_backlink`** for entry `seq = n
 Bamboo `lipmaa(n)` (the largest certificate-pool predecessor of the form `(3^k − 1)/2`); every entry
 carries both `prev_hash` (the seq−1 link) and the `lipmaa_backlink` hash.
 
-**Sync = anti-entropy (concrete frames).** Mode is negotiated at session start (each peer sends a
-1-byte supported-mode bitmap; both use the strongest common mode):
-- **Frontier mode (default; required of every peer).** A peer sends a `HAVE` frame — the canonical-CBOR
-  list of `(author_id, max_seq, head_hash)` over the feeds it holds — and the receiver replies `WANT`
-  with the `(author_id, from_seq..to_seq)` ranges it lacks; the holder streams the missing entries
-  (skeleton + any retained payloads) over a reliable QUIC stream (ADR-011).
-- **Range-reconciliation mode (used when both peers advertise it; the default *above ~100 active
-  authors*, where `HAVE` size dominates).** Negentropy range-based set reconciliation over entry hashes
-  (logarithmic rounds; its published wire format). Frontier is mandatory; range-reconciliation is an
-  additional required capability for scale.
+**Struct-type tag registry (normative).** The 2-byte leading tag identifies the structure so the same
+canonical bytes are never cross-interpreted (the serialization analogue of ADR-003's algorithm prefixes):
+
+| Tag | Struct | Tag | Struct |
+|---|---|---|---|
+| `0x0001` | log-entry | `0x0007` | rendezvous-record (ADR-012) |
+| `0x0002` | SKDM (ADR-006) | `0x0008` | pre-join-record (ADR-012) |
+| `0x0003` | admin/governance cert (ADR-007) | `0x0009` | tls-identity-extension (ADR-011) |
+| `0x0004` | consent-grant (ADR-007) | `0x000A` | chunk-manifest (ADR-014) |
+| `0x0005` | consent-revocation (ADR-007) | `0x000B` | dgka-setup (ADR-009) |
+| `0x0006` | policy/passphrase-rotation (ADR-007) | `0x000C` | self-channel-entry |
+
+New struct types are appended here (versioned), preserving the single canonical encoding.
+
+**Sync = anti-entropy (concrete frames).** All sync frames are canonical-CBOR (above), each prefixed by
+a **1-byte frame ID**. Mode is negotiated by the opening `HELLO` frame's **mode bitmap** (bit 0 =
+frontier, bit 1 = range-reconciliation); both peers use the highest bit both set.
+- Frame IDs: `0x01 HELLO {mode_bitmap}`, `0x02 HAVE {feeds: [(author_id, max_seq, head_hash)]}`,
+  `0x03 WANT {ranges: [(author_id, from_seq, to_seq)]}`, `0x04 ENTRY {entry, payload?}`,
+  `0x05 NEG {negentropy_msg}` (range-reconciliation payload).
+- **Frontier mode (default; required of every peer).** `HAVE` lists the feeds a peer holds; the receiver
+  replies `WANT` with the missing `(author_id, from_seq..to_seq)` ranges; the holder streams `ENTRY`
+  frames (skeleton + any retained payloads) over a reliable QUIC stream (ADR-011).
+- **Range-reconciliation mode (used when both peers set bit 1; the default *above ~100 active authors*,
+  where `HAVE` size dominates).** `NEG` frames carry Negentropy range-based set reconciliation over entry
+  hashes (logarithmic rounds). The Negentropy message body follows its published format, wrapped in the
+  Vox `NEG` frame so the Vox wire contract is fully self-described here. Frontier is mandatory;
+  range-reconciliation is an additional required capability for scale.
 
 **Per-entry-type authentication (binding — resolves the deniable/governance split).** Authentication
 is chosen by entry TYPE, not merely by channel mode:
 - **Governance/control entries are ALWAYS root-composite-signed (Ed25519+ML-DSA), even in deniable
-  channels:** genesis, admin delegations, consent grants, consent revocations, and
-  policy/passphrase-rotation updates. They must stay attributable — membership is attributable by design (ADR-001/ADR-009),
+  channels:** genesis, admin delegations, consent grants, consent revocations,
+  policy/passphrase-rotation updates, and the deniable-mode **DGKA/DSKE setup** entries (ADR-009 —
+  participation is attributable; only message content is deniable). They must stay attributable — membership is attributable by design (ADR-001/ADR-009),
   and ADR-007's single-writer consent guarantee requires that a consent grant be unforgeably authored
   by its issuer. Non-negotiable in both modes.
 - **Message-content entries:** attributable channels → root-composite-signed; deniable channels →
@@ -94,10 +113,14 @@ revocations are log entries, so they replicate and converge causally across the 
 
 **Personal self-channel (multi-device state, including received consent).** A user's own shared-root
 devices (ADR-002) share state through a **single-author self-log**: a log authored by the user's
-identity, encrypted to itself under a key `K_self = HKDF-SHA-256(identity-root-derived secret,
-info="vox/self-channel/v1")`, and replicated **only among that identity's own devices** over an
-identity-keyed rendezvous (`rendezvous_self = HKDF-SHA-256(identity_pub, info="vox/self-rzv/v1")`,
-ADR-005 derivation; a device proves identity possession via the ADR-005 PoP to peer). It carries: local
+identity, encrypted to itself under a key derived **without reading raw private-key material** (so it
+works with non-exportable keys in gpg-agent/smartcard/Enclave, same trick as ADR-010's `id_proof`):
+`K_self = HKDF-SHA-256(Ed25519_sign(identity, "vox/self-channel/v1"), info="vox/self-channel/v1")`
+(the Ed25519 signature is deterministic, RFC 8032, so every device of the identity derives the same
+key). It is replicated **only among that identity's own devices** at the identity-keyed rendezvous
+`rendezvous_self = HKDF-SHA-256(identity_pub, info="vox/self-rzv/v1")` — the same HKDF rendezvous
+construction as ADR-005 (§Separate rendezvous), seeded by `identity_pub` instead of `channelID`; a
+device proves identity possession via the ADR-005 PoP to peer. It carries: local
 nicknames + verification state, and — load-bearing — **the SKDMs the identity has been consent-granted**
 (ADR-006) and per-channel join material. Because consent binds to an *identity* (ADR-006), syncing
 received SKDMs over the self-channel lets every shared-root device read what was consented to the

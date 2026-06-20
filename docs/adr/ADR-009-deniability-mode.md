@@ -41,17 +41,23 @@ retaining deniability … we can never regain it in a higher layer":
 
 At each epoch (the passphrase/epoch boundary, ADR-006) the consenting member set runs a **4-round**
 deniable group key agreement + deniable signature-key exchange (DSKE), augmenting Bohli–Steinwandt
-deniable GKA. All broadcasts are log entries (ADR-008) bound to `(channelID, epoch)`. Let each member
-`i` hold an ephemeral DH share `x_i` and generate a **per-epoch ephemeral composite (Ed25519+ML-DSA-65)
-signing keypair** `(esk_i, epk_i)`:
+deniable GKA. All four rounds' broadcasts are **governance/control-class log entries** (ADR-008,
+struct-type `dgka-setup`): they are **root-composite-signed**, so peers accept them under ADR-008's
+per-entry-type rule and *participation* in the epoch is attributable — which is exactly mpENC **weak
+deniability** (participation is never deniable; only message *content* is). The static signature is on
+the log envelope only; the key-agreement material *inside* carries no static signature, preserving
+content deniability. Let each member `i` hold an ephemeral DH share `x_i` and generate a **per-epoch
+ephemeral composite (Ed25519+ML-DSA-65) signing keypair** `(esk_i, epk_i)`:
 
 1. **Commit.** `i` broadcasts `commit_i = SHA-256("vox/dgka-commit/v1" ‖ epk_i ‖ g^{x_i} ‖ n_i)` with a
    fresh 128-bit nonce `n_i`. (Commitments prevent adaptive key-choice.)
 2. **Reveal.** `i` broadcasts `(epk_i, g^{x_i}, n_i)`; everyone checks each `commit_i`. The group key is
-   `K = HKDF-SHA-256(BD-combine({g^{x_i}}), info="vox/dgka/v1" ‖ channelID ‖ epoch)` via the
-   Burmester–Desmedt/Bohli–Steinwandt combiner — a **deniable** agreement: only ephemeral DH shares
-   enter it, **no static signature**, so participation is authenticated by membership (ADR-007), not by
-   a transferable signature.
+   `K = HKDF-SHA-256(ikm = BD-combine({g^{x_i}}) ‖ H(pairwise PQXDH root secrets, ADR-004),
+   info="vox/dgka/v1" ‖ channelID ‖ epoch)` — the Burmester–Desmedt/Bohli–Steinwandt combiner mixed with
+   each member's **pairwise PQXDH (ML-KEM-768) secrets**, so `K` is **hybrid-PQ** (secure if either the
+   DH or the ML-KEM leg holds). It is a **deniable** agreement: only ephemeral material enters it, **no
+   static signature**, so participation is authenticated by the signed envelope/membership (ADR-007), not
+   by a transferable signature on the key.
 3. **DSKE bind.** Each `i` signs the transcript `T = SHA-256(sorted{epk_*} ‖ sorted{g^{x_*}} ‖ channelID
    ‖ epoch)` with `esk_i` and broadcasts the signature. This proves knowledge of `esk_i` and binds
    `epk_i` to *this session’s transcript* — giving members real, **post-quantum** origin authentication
@@ -104,8 +110,10 @@ Deniable mode is **fully post-quantum now**, with no dependency on any unshipped
 - **Live origin authentication is PQ.** The per-epoch ephemeral signing key is the **composite
   Ed25519+ML-DSA-65** key (ADR-002/ADR-003), so content signatures verify under a PQ signature during
   the epoch.
-- **Confidentiality is PQ.** The deniable group key `K` rides ephemeral DH that mixes ML-KEM-768 material
-  via the PQXDH pairwise legs (ADR-004).
+- **Confidentiality is PQ.** Message *content* confidentiality is owned by the per-sender Sender Keys
+  (ADR-006), which are distributed over PQXDH (ML-KEM-768) — PQ independent of the DGKA. The DGKA's own
+  key `K` (used for epoch key-confirmation/binding, not as the content key) is additionally **hybrid-PQ**
+  because its derivation mixes the members' pairwise PQXDH secrets (§Concrete protocol, step 2).
 - **Deniability is mechanism-based, not primitive-based.** Repudiation comes from **publishing the
   ephemeral private key at epoch end** (anyone can then forge that epoch's content) — this needs no
   special signature type, so there is no "classical-only until a PQ scheme ships" gap. Participation is

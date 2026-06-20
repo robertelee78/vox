@@ -47,6 +47,9 @@ Pairwise CPace-on-meet between members; no bespoke group PAKE (GPAKE is immature
   an observer computes the key once regardless; swarm-presence unlinkability is the later
   metadata-privacy phase, ADR-001). The passphrase is **never** an input to rendezvous. ADR-012 uses
   this exact derivation.
+- **Same construction, other seeds.** The rendezvous KDF generalizes: any high-entropy seed `S` yields
+  `rendezvous = HKDF-SHA-256(S, info=<label>)`. The personal self-channel (ADR-008) uses this with
+  `S = identity_pub` (label `"vox/self-rzv/v1"`) to let a user's own shared-root devices meet.
 - **passphrase → CPace secret only.**
 
 **Post-join.** A successful CPace run bootstraps a PQXDH/Double-Ratchet pairwise session (ADR-004).
