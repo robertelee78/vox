@@ -187,6 +187,7 @@ pub mod hash;
 pub mod identity;
 pub mod join;
 pub mod log;
+pub mod nat;
 pub mod pairwise;
 pub mod suite;
 pub mod transport;

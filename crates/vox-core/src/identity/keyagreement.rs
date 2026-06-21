@@ -703,6 +703,93 @@ impl PrekeyBundlePublic {
         }
         Ok(())
     }
+
+    /// Canonical-CBOR encoding of the full public bundle, for embedding in other
+    /// authenticated structs (e.g. the ADR-012 pre-join rendezvous record).
+    ///
+    /// Layout — arity `6` (no one-time prekey) or `8` (with one):
+    /// `[ root_pub, identity_dh_key_body, identity_dh_key_sig,
+    ///    signed_prekey_body, signed_prekey_sig, has_otp,
+    ///    (one_time_prekey_body, one_time_prekey_sig)? ]`.
+    ///
+    /// Each component sub-record is embedded as the **byte string** of its own
+    /// `canonical_body()` so the existing per-component strict decoders
+    /// (`from_canonical_body`) recover it byte-for-byte. This is a plain
+    /// serialization helper — it carries no domain tag of its own; the enclosing
+    /// struct (the pre-join record) supplies the ADR-008 framing and signature.
+    #[must_use]
+    pub fn encode_canonical(&self) -> Vec<u8> {
+        let has_otp = self.one_time_prekey.is_some() && self.one_time_prekey_sig.is_some();
+        let mut e = Encoder::new();
+        e.array(if has_otp { 8 } else { 6 })
+            .bytes(&self.root_pub)
+            .bytes(&self.identity_dh_key.canonical_body())
+            .bytes(&self.identity_dh_key_sig)
+            .bytes(&self.signed_prekey.canonical_body())
+            .bytes(&self.signed_prekey_sig)
+            .uint(u64::from(has_otp));
+        if let (Some(otp), Some(sig)) = (&self.one_time_prekey, &self.one_time_prekey_sig) {
+            e.bytes(&otp.canonical_body()).bytes(sig);
+        }
+        e.finish()
+    }
+
+    /// Strictly decode a [`PrekeyBundlePublic::encode_canonical`] body.
+    ///
+    /// Rejects a wrong arity, an `has_otp`/arity mismatch, wrong-length key or
+    /// signature fields, or any trailing bytes. Does **not** verify the embedded
+    /// signatures — call [`PrekeyBundlePublic::verify`] after decoding.
+    pub fn decode_canonical(body: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(body);
+        let arity = d.array()?;
+        if arity != 6 && arity != 8 {
+            return Err(Error::MalformedBundle("prekey-bundle arity"));
+        }
+        let root_pub: [u8; crate::hash::COMPOSITE_PUB_LEN] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("prekey-bundle root_pub length"))?;
+        let identity_dh_key = X25519IdentityKeyPublic::from_canonical_body(d.bytes()?)?;
+        let identity_dh_key_sig: [u8; crate::hash::COMPOSITE_SIG_LEN] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("prekey-bundle identity_dh_key_sig length"))?;
+        let signed_prekey = SignedPrekeyPublic::from_canonical_body(d.bytes()?)?;
+        let signed_prekey_sig: [u8; crate::hash::COMPOSITE_SIG_LEN] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("prekey-bundle signed_prekey_sig length"))?;
+        let has_otp = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::MalformedBundle("prekey-bundle has_otp domain")),
+        };
+        if has_otp != (arity == 8) {
+            return Err(Error::MalformedBundle(
+                "prekey-bundle has_otp/arity mismatch",
+            ));
+        }
+        let (one_time_prekey, one_time_prekey_sig) = if has_otp {
+            let otp = OneTimePrekeyPublic::from_canonical_body(d.bytes()?)?;
+            let sig: [u8; crate::hash::COMPOSITE_SIG_LEN] = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedBundle("prekey-bundle one_time_prekey_sig length"))?;
+            (Some(otp), Some(sig))
+        } else {
+            (None, None)
+        };
+        d.finish()?;
+        Ok(Self {
+            root_pub,
+            identity_dh_key,
+            identity_dh_key_sig,
+            signed_prekey,
+            signed_prekey_sig,
+            one_time_prekey,
+            one_time_prekey_sig,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

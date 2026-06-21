@@ -193,4 +193,49 @@ pub enum Error {
     /// profile reaching the KDF; surfaced as an error rather than panicking.
     #[error("argon2id key derivation failed")]
     Argon2Failed,
+
+    /// A rendezvous record (member or pre-join), a multiaddr, or an endpoint list
+    /// was structurally malformed on parse — bad arity, an unknown multiaddr
+    /// discriminant, a wrong-length address/digest/key, a wrong struct tag, or a
+    /// value out of range (ADR-012). Carries a static reason.
+    #[error("malformed rendezvous artifact: {0}")]
+    MalformedRendezvous(&'static str),
+
+    /// A rendezvous record was well-formed and correctly signed but was **rejected
+    /// by the reader's authenticated-store policy** (ADR-012): a stale/replayed
+    /// `(seq, timestamp)` (older than the current record for that
+    /// `(author, channel, epoch)`), a refresh faster than the minimum interval, a
+    /// publisher that is not a channel member, an expired TTL, or a record whose
+    /// `(channelID, epoch)` does not match the rendezvous key it was published
+    /// under. Distinct from [`Error::MalformedRendezvous`] — the bytes are valid,
+    /// the *policy* refuses them, so a poisoner cannot inject or replay endpoints.
+    #[error("rendezvous record rejected by store policy: {0}")]
+    RendezvousRejected(&'static str),
+
+    /// A port-mapping exchange (PCP, RFC 6887, or NAT-PMP, RFC 6886) failed: the
+    /// gateway returned a non-success result code, the response was malformed or
+    /// for a different request (nonce/opcode/epoch mismatch), or the mapping the
+    /// gateway granted did not satisfy the request. Carries a static reason
+    /// (ADR-012 reachability ladder). A failure on one rung falls through to the
+    /// next rung; it never silently claims a mapping that does not exist.
+    #[error("port mapping failed: {0}")]
+    PortMappingFailed(&'static str),
+
+    /// A hole-punch coordination exchange (DCUtR-style Connect/Sync, ADR-012)
+    /// failed: a malformed or out-of-sequence coordination message, a missing peer
+    /// endpoint, or the half-RTT synchronization timer elapsed without a usable
+    /// simultaneous-open window. Carries a static reason. Hole-punching is
+    /// best-effort by nature (both-symmetric-NAT pairs cannot be punched, ADR-012);
+    /// a failure degrades to the relay rung, never to a false success.
+    #[error("hole-punch coordination failed: {0}")]
+    HolePunchFailed(&'static str),
+
+    /// Every rung of the reachability ladder was exhausted without establishing a
+    /// connection to the peer (ADR-012): no direct candidate connected, no
+    /// coordinator was reachable for a hole-punch, and no relay closed the residual.
+    /// This is the honest documented limit (both peers behind CGNAT/symmetric NAT
+    /// with no IPv6 and no reachable coordinator) — surfaced as an error, never a
+    /// false success.
+    #[error("peer unreachable: {0}")]
+    Unreachable(&'static str),
 }

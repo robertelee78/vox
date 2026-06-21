@@ -1,4 +1,4 @@
-//! The real M5 [`Transport`](crate::log::sync::Transport) over a reliable QUIC
+//! The real M5 [`Transport`] over a reliable QUIC
 //! bi-stream.
 //!
 //! M5 frames are opaque byte vectors; here they are length-delimited on the stream

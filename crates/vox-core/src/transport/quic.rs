@@ -22,7 +22,8 @@
 //! negotiate the hybrid group simply fails — there is no classical fallback.
 //!
 //! ## Sync over QUIC (the M5 `Transport` impl)
-//! [`QuicStreamTransport`] implements the synchronous M5 [`Transport`] trait over
+//! [`QuicStreamTransport`] implements the synchronous M5
+//! [`Transport`](crate::log::sync::Transport) trait over
 //! a reliable QUIC bi-stream by bridging to a tokio runtime
 //! ([`tokio::runtime::Handle::block_on`]). Each M5 frame (an opaque byte vector) is
 //! length-delimited on the stream with a 4-byte big-endian length prefix, so the
