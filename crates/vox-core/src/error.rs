@@ -238,4 +238,18 @@ pub enum Error {
     /// false success.
     #[error("peer unreachable: {0}")]
     Unreachable(&'static str),
+
+    /// A tunnel operation was refused by authorization (ADR-013): the requesting
+    /// member holds no valid `dial:<service>` capability (or the host no
+    /// `bind:<service>`), or the service is dark/unknown. Default-deny: the absence
+    /// of a grant is a denial, and a denial is indistinguishable from "no such
+    /// service" so an unauthorized member cannot even confirm a service exists.
+    #[error("tunnel denied: {0}")]
+    TunnelDenied(&'static str),
+
+    /// A tunnel control message (service request, stream-setup handshake) or an
+    /// SSH-CA certificate was structurally malformed on parse, exceeded a size
+    /// bound, or carried an out-of-domain value (ADR-013). Carries a static reason.
+    #[error("malformed tunnel artifact: {0}")]
+    MalformedTunnel(&'static str),
 }

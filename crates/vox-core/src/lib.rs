@@ -191,6 +191,7 @@ pub mod nat;
 pub mod pairwise;
 pub mod suite;
 pub mod transport;
+pub mod tunnel;
 pub mod wire;
 
 pub use error::{Error, Result};
