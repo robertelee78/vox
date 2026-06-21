@@ -4,7 +4,7 @@
 # Rust clients over it. Crates are added to `members` as milestones land.
 [workspace]
 resolver = "2"
-members = ["crates/vox-core"]
+members = ["crates/vox-core", "crates/vox-tui"]
 
 [workspace.package]
 version = "0.0.0"
@@ -105,6 +105,27 @@ tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-t
 # `Bytes` is quinn's datagram payload type (its own public API surface). Pinned at
 # the workspace level so we share the exact `bytes` quinn resolves.
 bytes = { version = "1", default-features = false }
+
+# --- Rust TUI client (ADR-015, M12) ------------------------------------------
+# Pure-Rust terminal stack; keeps the static-musl generate path clean (ADR-015).
+#   ratatui      — immediate-mode TUI widgets + layout, with a `TestBackend` that
+#                  makes render-snapshot tests possible (the ADR release gate).
+#   crossterm    — terminal backend (raw mode, alternate screen, key/mouse events)
+#                  on Linux + macOS terminals; ratatui's default backend.
+#   tui-textarea — the modeless/vim composer widget.
+#   qrcode       — QR matrix generation for identity / invite / verification codes
+#                  (rendered as Unicode half-blocks with an ASCII fallback).
+#   clap (+complete/mangen) — args, shell completions, man pages.
+#   secrecy      — `SecretBox`/`SecretString` redaction for the few secret-bearing
+#                  CLI/config inputs (passphrases), complementing `zeroize`.
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", default-features = false, features = ["events"] }
+tui-textarea = { version = "0.7", default-features = false, features = ["crossterm", "ratatui"] }
+qrcode = { version = "0.14", default-features = false }
+clap = { version = "4", features = ["derive", "cargo", "env", "wrap_help"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+secrecy = "0.10"
 
 [profile.release]
 # Crypto + protocol code: keep overflow checks on in release too. A silent wrap

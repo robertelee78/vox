@@ -1,0 +1,36 @@
+# Vox Lux — Rust TUI client (ADR-015, M12).
+#
+# A single binary linking `vox-core` directly as a Rust crate (no FFI, no IPC
+# control plane). The terminal-native home client for Linux/servers/SSH; peer to
+# the macOS client (ADR-014) over the same core.
+[package]
+name = "vox-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Vox Lux terminal client — serverless E2EE chat, consent, verification, and tunneling"
+
+[lib]
+name = "vox_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vox"
+path = "src/main.rs"
+
+[dependencies]
+vox-core = { path = "../vox-core" }
+ratatui.workspace = true
+crossterm.workspace = true
+tui-textarea.workspace = true
+qrcode.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+zeroize.workspace = true
+secrecy.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
