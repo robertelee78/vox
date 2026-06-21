@@ -7,9 +7,11 @@
 
 ## Context
 
-The threat model (ADR-001) includes a nation-state adversary and "harvest now, decrypt later":
-traffic recorded today could be decrypted by a future quantum computer. Post-quantum readiness
-is therefore required from the start, not retrofitted. This policy constrains every cryptographic
+The threat model (ADR-001) defends content confidentiality against an on-path network adversary,
+which includes "harvest now, decrypt later": ciphertext recorded today could be decrypted by a future
+quantum computer. Post-quantum content confidentiality is the one defended property that is
+*time-sensitive* in this way, so PQ readiness is required from the start, not retrofitted. (This does
+not extend to metadata or traffic analysis, which ADR-001 lists as non-goals.) This policy constrains every cryptographic
 ADR (004, 005, 006, 007, 008, 009). FIPS 203 (ML-KEM), 204 (ML-DSA), and 205 (SLH-DSA) are
 finalized, and mature Rust implementations exist (RustCrypto `ml-kem`, libsignal's PQXDH, liboqs/
 oqs-rs, composite KEM/signature crates).

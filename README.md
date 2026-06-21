@@ -74,12 +74,21 @@ Each layer is a decision record in `docs/adr/`, built in dependency order:
 
 ## Threat model
 
-In scope (maximal): a **nation-state / network observer** (traffic analysis, censorship — metadata
-confidentiality to non-members is pursued in phases), **platform operators** (answered by the
-serverless, open-source core), a **wrongly-added / passphrase holder** (answered by per-sender
-consent), and **device seizure / local compromise** (answered by double-lock at-rest encryption and
-forward secrecy). Full traffic-analysis resistance (onion/mixnet-grade) is its own future capability,
-not a silent omission. See ADR-001.
+Vox claims exactly what its controls deliver — **post-quantum content confidentiality, content
+authenticity, and unforgeable membership** — and is explicit about what it does not.
+
+**Defended:** an **on-path network adversary** (including a resourced ISP) — content is end-to-end,
+post-quantum-hybrid encrypted and authenticated, and channel membership cannot be forged;
+**platform / server operators** — there is none to trust or be deplatformed by; a **wrongly-added
+participant / passphrase holder** (the "Signalgate" case) — per-sender consent gates readability per
+author; and **device seizure at rest** (a powered-off or locked device) — double-lock at-rest
+encryption plus forward secrecy.
+
+**Explicit non-goals (absent until a future ADR builds them):** metadata privacy / traffic analysis
+against a global passive adversary (content is protected, communication *patterns* are not); a
+running, compromised endpoint (malware/keylogger); coercion of a participant; and availability
+against a determined blocker. Vox therefore does **not** claim resistance to a nation-state as a
+holistic adversary — that would require all of the above. See ADR-001 for the full model.
 
 ## Availability
 

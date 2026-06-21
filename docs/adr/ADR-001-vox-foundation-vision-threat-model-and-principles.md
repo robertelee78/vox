@@ -60,24 +60,56 @@ the same overlay carries arbitrary byte streams (e.g. `ssh` over Vox), not just 
     which still runs the same Rust core via UniFFI. Multiple clients are peers over one core, not
     forks of it.
 
-**Threat model (maximal — all four adversaries in scope):**
+**Threat model (scoped to what the controls actually enforce).** Vox defends a specific, bounded set
+of adversaries and is explicit about the ones it does *not* — so the model never implies a control
+that does not exist. What Vox provides is **post-quantum content confidentiality, content
+authenticity, and unforgeable membership**; that is a real, bounded property, not blanket protection.
 
-- **Nation-state / network observer** — traffic analysis, censorship. Metadata confidentiality
-  to non-members is a *phased* goal (encryption + padding first; onion/mixnet-grade
-  traffic-analysis resistance is a later capability). "Hide in plain sight" traffic shaping is a
-  future interest.
-- **Platform operators** — addressed by the serverless, open-source core.
-- **Wrongly-added / passphrase-holder** — the Signalgate case; addressed by per-sender consent
-  (ADR-007).
-- **Device seizure / local compromise** — addressed by at-rest "double-lock" encryption and
-  forward secrecy (ADR-010).
+Defended adversaries:
+
+- **On-path network adversary (passive or active), including a resourced ISP.** Message *content* is
+  end-to-end encrypted with post-quantum-hybrid confidentiality (harvest-now-decrypt-later resistant,
+  ADR-003/004) and authenticated, and channel *membership* cannot be forged (ADR-005/007). Such an
+  adversary cannot read or tamper with content, or inject itself into a channel. It *can* still
+  observe communication metadata (see non-goals).
+- **Platform / server operator.** Eliminated by construction: there is no Vox server, account, or
+  operator to trust, subpoena, or be deplatformed by (serverless, open-source core).
+- **Wrongly-added participant / passphrase holder (the "Signalgate" case).** Holding the channel
+  passphrase does not make your messages readable: per-sender consent (ADR-007) gates readability per
+  author, independent of admission.
+- **Device seizure / at-rest local access (a powered-off or locked device).** Addressed by the
+  at-rest "double-lock" encryption and forward secrecy (ADR-010). At-rest only — a *running,
+  compromised* device is a non-goal below.
+
+**Explicit non-goals (stated so the model is honest, not aspirational — these are simply absent until
+and unless a future ADR builds them):**
+
+- **Metadata privacy against a global passive adversary / traffic analysis.** Who-talks-to-whom,
+  when, and how much is *not* hidden from an observer who can watch enough of the network. Content is
+  protected; communication patterns are not. Onion/mixnet-grade traffic-analysis resistance and
+  traffic shaping are a possible future capability, not a current guarantee.
+- **A running, compromised endpoint.** Malware, a keylogger, or a screen-grabber on a live, unlocked
+  device defeats any messenger; the at-rest protections do not apply to a hot device with keys in
+  memory.
+- **Coercion of a participant.** Vox cannot stop a member compelled (legally or physically) to hand
+  over keys or content; content deniability (ADR-009) limits cryptographic *proof* to third parties,
+  not disclosure by a participant.
+- **Availability against a determined blocker.** An adversary able to drop or block traffic can deny
+  availability; Vox targets confidentiality/authenticity, not censorship circumvention, in this
+  iteration.
+- **"Nation-state" as a holistic adversary.** A state-level actor combines global traffic analysis,
+  endpoint implants, supply-chain access, and coercion — the items above. Vox defends none of those
+  as a bundle and therefore does **not** claim nation-state resistance. It gives a user facing a
+  powerful adversary post-quantum content confidentiality and unforgeable membership — bounded, real,
+  and not a substitute for the missing controls.
 
 **Security-property taxonomy (named to keep later ADRs precise).** These are distinct guarantees and
 must never be conflated: **PQ confidentiality** (harvest-now-decrypt-later resistance, ADR-003/004,
 passive-quantum), **classical post-compromise security** (DH-ratchet healing, ADR-004), **PQ
 post-compromise security** (phased, not day-one, ADR-004), **content deniability** (per-channel,
-ADR-009), and **metadata privacy** against a network observer (phased; member-only first,
-traffic-analysis resistance later). Each ADR states which of these it does and does not provide.
+ADR-009), and **metadata privacy** against a network observer (member-only confidentiality is
+provided; pattern/traffic-analysis privacy against a global passive adversary is an explicit non-goal
+today, not merely "later"). Each ADR states which of these it does and does not provide.
 
 **Availability model.** Availability is emergent from who is online, with no always-on node
 required: a two-member channel requires both members online; a 3+-member channel needs any two
@@ -96,7 +128,9 @@ receive). This is accepted as an inherent property (see ADR-008, ADR-012).
 - A minimal, decentralized bootstrap/rendezvous layer is unavoidable (ADR-012); strict
   zero-infrastructure is impossible.
 - Inherits known limitations of the Sender-Keys family (weak PCS, ADR-006/ADR-007).
-- Full nation-state traffic-analysis resistance is deferred, not solved in the first iteration.
+- Metadata privacy / traffic-analysis resistance is an explicit non-goal today: Vox protects content
+  and membership, not communication patterns. Nation-state resistance is not claimed (see the threat
+  model's non-goals).
 
 ### Neutral
 - Positions Vox in the serverless/log-replicated family (Secure Scuttlebutt, Berty, Briar,
