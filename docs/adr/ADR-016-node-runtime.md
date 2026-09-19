@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) next
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1 done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -311,6 +311,19 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   declared-but-unused dependencies are now used (`tokio`, `zeroize`) or removed (`tui-textarea`), and
   ADR-015's primary-buffer and lock/zeroize gates are met (ADR-015 Implementation notes). **M13 is
   complete; M14 begins.**
+
+## Implementation notes (M14)
+
+- **Member bundle record (M14.1).** `wire::StructTag::MemberBundleRecord = 0x0012`
+  (`vox/member-bundle-record/v1`) is registered — the registry table, `ALL` and the coverage test now
+  span `0x0001..=0x0012`, and ADR-008's normative tables carry the tag and label.
+  `nat::record::MemberBundleRecord` is the `0x0007` shape with `endpoints` replaced by the canonical
+  `PrekeyBundlePublic` bytes; `verify` binds `prekey_bundle.root_pub` to the resolved member key and
+  checks the bundle's internal signatures, and `build` refuses to sign a foreign bundle.
+  `RendezvousStore` gained `BUNDLE_MAX_TTL_SECS` (7 days), `accept_bundle`, `current_bundles`,
+  `bundle`, and a third bucket family pruned with the others (ADR-012 Implementation notes). The
+  ADR-008 golden-vector obligation is still **UNMET** and now extends to `0x0012`; a pinned vector
+  for this tag needs the fixed-seed X25519/ML-KEM prekey generation the rest of the suite also lacks.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

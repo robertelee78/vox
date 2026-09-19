@@ -74,7 +74,7 @@ increments of the ones here (ADR-003 §Scope).
 auditable list so none is missed. **Status (2026-09-19)** is recorded per gate so the list is
 honest, not aspirational:
 
-- **Canonical serialization (ADR-008):** golden vectors for every struct tag `0x0001–0x0011`; two
+- **Canonical serialization (ADR-008):** golden vectors for every struct tag `0x0001–0x0012`; two
   independent implementations must produce byte-identical canonical CBOR. — **UNMET**: only the
   log-entry skeleton is byte-pinned; CBOR primitives have RFC-8949 vectors; no per-tag fixtures.
 - **Identity (ADR-002):** test vectors for composite pubkey/sig byte layout and the ML-DSA binding statement.

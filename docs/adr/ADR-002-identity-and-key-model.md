@@ -82,7 +82,7 @@ key material and fingerprint-verification culture (ADR-001 principle 3):
 ### Identity-layer domain labels (normative)
 
 The signed prekeys and the identity DH key are **identity-layer artifacts**, not log/wire structures,
-so they have no tag in the ADR-008 struct-tag registry (`0x0001..0x0011`). Like the GPG binding
+so they have no tag in the ADR-008 struct-tag registry (`0x0001..0x0012`). Like the GPG binding
 statement, each is signed under its own ASCII domain label prefixed directly onto the canonical-CBOR
 body — signing input `domain ‖ canonical_body` — so independent implementations sign and verify
 byte-identical inputs. The labels are fixed normatively here:

@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
-use crate::nat::record::{PreJoinRecord, RendezvousRecord};
+use crate::nat::record::{MemberBundleRecord, PreJoinRecord, RendezvousRecord};
 
 /// Minimum seconds between successive accepted records for one
 /// `(author, channel, epoch)` — the ADR-012 refresh cap (≥ 60 s).
@@ -52,6 +52,12 @@ pub const DEFAULT_TTL_SECS: u64 = 2 * 60 * 60;
 /// is rejected (ADR-012 "short TTL"): a member cannot pin a long-lived stale
 /// advertisement.
 pub const MAX_TTL_SECS: u64 = 2 * 60 * 60;
+
+/// Hard ceiling on a member **bundle** record's requested `ttl_secs` (ADR-016
+/// M14): the ADR-002 signed-prekey rotation cadence, 7 days. A bundle is
+/// republished on rotation and when the one-time pool runs low, so a longer
+/// pin would only serve a stale bundle.
+pub const BUNDLE_MAX_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Maximum seconds a record's `timestamp` may lead `now` before it is rejected as
 /// implausibly future-dated (clock-skew tolerance).
@@ -77,6 +83,11 @@ fn member_expiry(rec: &RendezvousRecord) -> u64 {
 /// TTL, since pre-join records carry no TTL field (ADR-012).
 fn prejoin_expiry(rec: &PreJoinRecord) -> u64 {
     rec.timestamp.saturating_add(DEFAULT_TTL_SECS)
+}
+
+/// The expiry instant of a member bundle record (epoch-seconds).
+fn bundle_expiry(rec: &MemberBundleRecord) -> u64 {
+    rec.timestamp.saturating_add(rec.ttl_secs)
 }
 
 /// Shared freshness checks for a replacement against the current record's
@@ -112,15 +123,18 @@ fn check_time_validity(timestamp: u64, expiry: u64, now: u64) -> Result<()> {
 
 /// The authenticated rendezvous store.
 ///
-/// Holds the current member advertisements per `(channelID, epoch)` and the current
-/// pre-join advertisements per `channelID`. Construct with [`RendezvousStore::new`],
-/// feed records through [`RendezvousStore::accept_member`] /
-/// [`RendezvousStore::accept_prejoin`], and read current endpoints through the
-/// query methods.
+/// Holds the current member advertisements and member prekey bundles per
+/// `(channelID, epoch)` and the current pre-join advertisements per `channelID`.
+/// Construct with [`RendezvousStore::new`], feed records through
+/// [`RendezvousStore::accept_member`] / [`RendezvousStore::accept_bundle`] /
+/// [`RendezvousStore::accept_prejoin`], and read current endpoints and bundles
+/// through the query methods.
 #[derive(Debug, Default)]
 pub struct RendezvousStore {
     /// `(channelID, epoch)` → (`author_id` → current member record).
     members: HashMap<(Digest32, u64), HashMap<Digest32, RendezvousRecord>>,
+    /// `(channelID, epoch)` → (`author_id` → current member bundle record).
+    bundles: HashMap<(Digest32, u64), HashMap<Digest32, MemberBundleRecord>>,
     /// `channelID` → (`asserted_id` → current pre-join record).
     prejoins: HashMap<Digest32, HashMap<Digest32, PreJoinRecord>>,
 }
@@ -189,6 +203,58 @@ impl RendezvousStore {
         Ok(())
     }
 
+    /// Admit (or refresh) a **member bundle** record (ADR-016 M14), enforcing the
+    /// same member-only, anti-replay, time-sanity and capacity policy as
+    /// [`RendezvousStore::accept_member`], with the TTL capped at
+    /// [`BUNDLE_MAX_TTL_SECS`] instead of [`MAX_TTL_SECS`]. Bundles are keyed
+    /// per `(channelID, epoch)` like address records but live in their own
+    /// buckets: a member's address refresh never displaces its bundle and vice
+    /// versa.
+    ///
+    /// `resolve_member` is the membership oracle exactly as for
+    /// [`RendezvousStore::accept_member`]; the resolved key must be the bundle's
+    /// root (checked by [`MemberBundleRecord::verify`]), so a member cannot
+    /// publish another identity's prekeys under its own name.
+    pub fn accept_bundle(
+        &mut self,
+        record: MemberBundleRecord,
+        resolve_member: impl FnOnce(&Digest32) -> Option<CompositePublicKey>,
+        now: u64,
+    ) -> Result<()> {
+        // 1. Member-only.
+        let author_pubkey = resolve_member(&record.author_id)
+            .ok_or(Error::RendezvousRejected("author is not a channel member"))?;
+        // 2. Record signature, author binding, bundle root == author, bundle
+        //    self-signatures.
+        record.verify(&author_pubkey)?;
+
+        // 3. TTL bounds and time sanity.
+        if record.ttl_secs == 0 {
+            return Err(Error::RendezvousRejected("zero ttl"));
+        }
+        if record.ttl_secs > BUNDLE_MAX_TTL_SECS {
+            return Err(Error::RendezvousRejected("ttl exceeds maximum"));
+        }
+        check_time_validity(record.timestamp, bundle_expiry(&record), now)?;
+
+        let bucket_key = (record.channel_id, record.epoch);
+        let bucket = self.bundles.entry(bucket_key).or_default();
+
+        // 4. Freshness vs the current bundle for this author (if any).
+        if let Some(cur) = bucket.get(&record.author_id) {
+            check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
+        } else if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
+            bucket.retain(|_, r| now < bundle_expiry(r));
+            if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
+                return Err(Error::RendezvousRejected("bundle bucket at capacity"));
+            }
+        }
+
+        // 5. Admit: one current bundle per author.
+        bucket.insert(record.author_id, record);
+        Ok(())
+    }
+
     /// Admit (or refresh) a **pre-join** rendezvous record, enforcing the ADR-012
     /// reader policy. The record is self-verifying (the asserted identity and the
     /// embedded prekey bundle are checked); it conveys no channel authority.
@@ -251,6 +317,38 @@ impl RendezvousStore {
             .filter(|r| now < member_expiry(r))
     }
 
+    /// The current, non-expired member bundle records for `(channelID, epoch)`, in
+    /// unspecified order — the material a newcomer needs to seal its SKDM to each
+    /// consenting member (ADR-016 M14).
+    #[must_use]
+    pub fn current_bundles(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+        now: u64,
+    ) -> Vec<&MemberBundleRecord> {
+        self.bundles
+            .get(&(*channel_id, epoch))
+            .map(|b| b.values().filter(|r| now < bundle_expiry(r)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The current bundle record for one specific author in `(channelID, epoch)`,
+    /// if present and unexpired.
+    #[must_use]
+    pub fn bundle(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+        author_id: &Digest32,
+        now: u64,
+    ) -> Option<&MemberBundleRecord> {
+        self.bundles
+            .get(&(*channel_id, epoch))
+            .and_then(|b| b.get(author_id))
+            .filter(|r| now < bundle_expiry(r))
+    }
+
     /// The current, non-expired pre-join records for `channelID`, in unspecified
     /// order — candidate join-bootstrap material (ADR-004/ADR-005).
     #[must_use]
@@ -261,9 +359,9 @@ impl RendezvousStore {
             .unwrap_or_default()
     }
 
-    /// Drop every expired record (member and pre-join) and any bucket left empty.
-    /// Idempotent; call periodically to reclaim memory. Returns the number of
-    /// records removed.
+    /// Drop every expired record (member, bundle and pre-join) and any bucket left
+    /// empty. Idempotent; call periodically to reclaim memory. Returns the number
+    /// of records removed.
     pub fn prune_expired(&mut self, now: u64) -> usize {
         let mut removed = 0;
         for bucket in self.members.values_mut() {
@@ -272,6 +370,12 @@ impl RendezvousStore {
             removed += before - bucket.len();
         }
         self.members.retain(|_, b| !b.is_empty());
+        for bucket in self.bundles.values_mut() {
+            let before = bucket.len();
+            bucket.retain(|_, r| now < bundle_expiry(r));
+            removed += before - bucket.len();
+        }
+        self.bundles.retain(|_, b| !b.is_empty());
         for bucket in self.prejoins.values_mut() {
             let before = bucket.len();
             bucket.retain(|_, r| now < prejoin_expiry(r));
@@ -534,5 +638,77 @@ mod tests {
             store.accept_prejoin(rec, now),
             Err(Error::RendezvousRejected(_))
         ));
+    }
+    #[test]
+    fn bundle_record_member_only_ttl_capped_replay_and_prune() {
+        let a = signer(1, 2);
+        let b = signer(3, 4);
+        let outsider = signer(5, 6);
+        let cid = [9u8; 32];
+        let a_id = a.fingerprint();
+        let a_pub = a.public_key();
+        let resolve = |id: &Digest32| (*id == a_id).then(|| a_pub.clone());
+        let mut store = RendezvousStore::new();
+        let t0 = 1_700_000_000;
+
+        // Non-member: rejected before any signature work.
+        let stray =
+            MemberBundleRecord::build(&outsider, &cid, 1, bundle(&outsider), 1, t0, 60).unwrap();
+        assert!(matches!(
+            store.accept_bundle(stray, resolve, t0),
+            Err(Error::RendezvousRejected("author is not a channel member"))
+        ));
+
+        // TTL above the bundle cap (7 days) is rejected; the address cap (2 h) is
+        // NOT the bundle cap — a 6-day bundle is fine.
+        let too_long =
+            MemberBundleRecord::build(&a, &cid, 1, bundle(&a), 1, t0, BUNDLE_MAX_TTL_SECS + 1)
+                .unwrap();
+        assert!(matches!(
+            store.accept_bundle(too_long, resolve, t0),
+            Err(Error::RendezvousRejected("ttl exceeds maximum"))
+        ));
+        let six_days = 6 * 24 * 60 * 60;
+        let first = MemberBundleRecord::build(&a, &cid, 1, bundle(&a), 1, t0, six_days).unwrap();
+        store.accept_bundle(first.clone(), resolve, t0).unwrap();
+        assert_eq!(store.bundle(&cid, 1, &a_id, t0), Some(&first));
+        assert_eq!(store.current_bundles(&cid, 1, t0).len(), 1);
+        // Epoch-scoped: nothing in epoch 2.
+        assert!(store.current_bundles(&cid, 2, t0).is_empty());
+
+        // Replay (same seq) and too-fast refresh are refused.
+        assert!(store.accept_bundle(first.clone(), resolve, t0 + 1).is_err());
+        let fast = MemberBundleRecord::build(&a, &cid, 1, bundle(&a), 2, t0 + 1, six_days).unwrap();
+        assert!(matches!(
+            store.accept_bundle(fast, resolve, t0 + 1),
+            Err(Error::RendezvousRejected(_))
+        ));
+        // A proper refresh replaces it (one current bundle per author).
+        let t1 = t0 + MIN_REFRESH_SECS;
+        let second = MemberBundleRecord::build(&a, &cid, 1, bundle(&a), 2, t1, six_days).unwrap();
+        store.accept_bundle(second.clone(), resolve, t1).unwrap();
+        assert_eq!(store.bundle(&cid, 1, &a_id, t1), Some(&second));
+        assert_eq!(store.current_bundles(&cid, 1, t1).len(), 1);
+
+        // A member cannot publish another identity's bundle: forge the record by
+        // hand (build() refuses) and confirm the store refuses it too.
+        let mut forged =
+            MemberBundleRecord::build(&a, &cid, 1, bundle(&a), 3, t1 + 60, 60).unwrap();
+        forged.prekey_bundle = bundle(&b);
+        assert!(store.accept_bundle(forged, resolve, t1 + 60).is_err());
+
+        // Address records and bundles live in separate buckets: a member address
+        // refresh does not displace the bundle.
+        store
+            .accept_member(member(&a, &cid, 1, 1, t1 + 60), resolve, t1 + 60)
+            .unwrap();
+        assert_eq!(store.bundle(&cid, 1, &a_id, t1 + 60), Some(&second));
+
+        // Expiry and prune.
+        let late = t1 + six_days;
+        assert!(store.bundle(&cid, 1, &a_id, late).is_none());
+        assert!(store.current_bundles(&cid, 1, late).is_empty());
+        assert_eq!(store.prune_expired(late), 2);
+        assert!(store.bundles.is_empty());
     }
 }

@@ -2,7 +2,7 @@
 
 **Status**: implemented (M5, `crates/vox-core/src/log/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate.
+**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
@@ -84,7 +84,7 @@ canonical bytes are never cross-interpreted (the serialization analogue of ADR-0
 | `0x0006` | policy/passphrase-rotation (ADR-007) | `0x000F` | service-advertisement (ADR-013) |
 | `0x0007` | rendezvous-record (ADR-012) | `0x0010` | esk-publication (ADR-009) |
 | `0x0008` | pre-join-record (ADR-012) | `0x0011` | session-establishment (ADR-011) |
-| `0x0009` | tls-identity-extension (ADR-011) | | |
+| `0x0009` | tls-identity-extension (ADR-011) | `0x0012` | member-bundle-record (ADR-016) |
 
 Each tag has an **explicit, normative** domain-separation label (the prefix of its signing input,
 `domain_sep ‖ canonical_bytes`). The labels are pinned exactly — they are not mechanically derived from
@@ -100,7 +100,7 @@ the struct name, so two implementations cannot disagree on the bytes that get si
 | `0x0006` | `vox/policy-rotation/v1` | `0x000F` | `vox/service-advertisement/v1` |
 | `0x0007` | `vox/rendezvous-record/v1` | `0x0010` | `vox/esk-publication/v1` |
 | `0x0008` | `vox/pre-join-record/v1` | `0x0011` | `vox/session-establishment/v1` |
-| `0x0009` | `vox/tls-identity-extension/v1` | | |
+| `0x0009` | `vox/tls-identity-extension/v1` | `0x0012` | `vox/member-bundle-record/v1` |
 
 New struct types are appended here (versioned), preserving the single canonical encoding. (Note: this struct-tag space is **disjoint from**
 the ADR-003 ciphersuite-ID space — `0x0001` here = `log-entry`, `0x0001` there = `vox-suite-1`; they
@@ -262,7 +262,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   errors map to `0x01`, which the M0 table defines as "version". (7) The authenticator type sits outside
   the signed skeleton and `algo_ids[0]` is pinned to the composite id even for deniable entries.
   Test-vector obligation: only the log-entry skeleton is byte-pinned; there is no golden canonical-CBOR
-  suite for tags `0x0001–0x0011` and no frontier/Negentropy interop bytes against a reference.
+  suite for tags `0x0001–0x0012` and no frontier/Negentropy interop bytes against a reference.
 
 ## Links
 **Depends on**: ADR-002, ADR-006.
