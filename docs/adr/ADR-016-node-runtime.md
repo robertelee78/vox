@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.7a done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.7b done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -421,6 +421,11 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   input from a chat message: an unknown query key is refused rather than ignored (an older client must not
   silently drop a future field), as are a duplicate `r`, a missing `b`, more anchors than `MAX_ENDPOINTS`,
   a non-canonical base32 tail, or any malformed component.
+- **The genesis goes on the board (M14.7b).** The service's three record kinds could not answer the one
+  question a cold joiner asks first — *what is this channel?* — so `RecordKinds::GENESIS` was added
+  (ADR-012 Implementation notes explain why it needs neither a membership check nor a TTL). Without it the
+  §"Join over the network" flow could dial the anchors and read the board but never construct
+  `ChannelState`, since that needs the genesis whose hash is the channelID.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
