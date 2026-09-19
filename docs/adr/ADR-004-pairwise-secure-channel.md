@@ -2,7 +2,7 @@
 
 **Status**: implemented (M2, `crates/vox-core/src/pairwise/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M2) added; uncommitted DH-ratchet secrets are wiped when a decrypt plan is dropped; nonce KDF error propagates instead of an all-zero nonce. 2026-09-20 — serverless one-time-prekey consume semantics implemented (`node::prekeys`, ADR-016 M14.3).
+**Updated**: 2026-09-19 — Implementation notes (M2) added; uncommitted DH-ratchet secrets are wiped when a decrypt plan is dropped; nonce KDF error propagates instead of an all-zero nonce. 2026-09-20 — serverless one-time-prekey consume semantics implemented (`node::prekeys`, ADR-016 M14.3) and reconciled with the per-process reuse tracker at the point sessions are established (`node::joinstream`, M14.4).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: crypto-core, pqxdh, double-ratchet, forward-secrecy, pcs
 
@@ -120,13 +120,17 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   ADR's documented forward-secrecy residual by a week to serve an initiator that can simply refetch.
   Exhaustion is proven by a test: a drained pool still publishes a verifying bundle, without a one-time
   prekey.
-- **Reconciliation obligation on the session layer (M14.5), recorded so it cannot be missed.** The ring
-  is the *persistent* record of what was consumed; `OtpReuseTracker` is a *per-process* one. A node that
-  restarts and then accepts a duplicate would therefore see `PrekeyRing::use_one_time` → `Reused` but a
-  fresh tracker reporting first use, and would **not** flag the session last-resort-grade. When M14.5
-  establishes sessions it must derive the flag from the ring's verdict (or seed the tracker from the
-  ring's retained set), never from a fresh per-process tracker. No live path can be wrong today — the
-  node cannot yet establish a session — which is why this is sequenced here rather than guessed at now.
+- **The two records are reconciled where sessions are established (done, M14.4).** The ring is the
+  *persistent* record of what was consumed; `OtpReuseTracker` is a *per-process* one, so a node that
+  restarted and then accepted a duplicate could have seen `use_one_time` → `Reused` while a fresh
+  tracker reported first use, and would not have flagged the session last-resort-grade. The join
+  responder (`node::joinstream`) therefore **seeds the tracker from the ring's verdict**: on `Reused` it
+  calls `observe(id)` before `Session::accept`, so the downgrade survives a restart; on `Unknown` — a
+  prekey this identity never issued, or one whose retention has elapsed — it refuses the handshake
+  outright rather than completing a session it cannot key. It also **persists the ring the moment the
+  prekey is consumed**, before the handshake completes, so a crash cannot leave it re-offerable. Any
+  future session-establishment path (M14.5 onwards) must do the same; a `debug_assert` pins that the
+  session's own `is_last_resort_grade` equals the ring's verdict.
 - **Message nonce KDF has no fallback.** The per-message AEAD nonce is `HMAC-SHA-256(mk, 0x03)[..12]`;
   HMAC keying cannot fail for a 32-byte key, but the error is propagated (`Result`) rather than
   replaced by an all-zero nonce. *(2026-09-19 review.)*

@@ -265,6 +265,21 @@ pub enum Error {
         detail: String,
     },
 
+    /// The responder refused a join (ADR-016 §"Join over the network"): the coarse
+    /// reason it sent on the join stream. Deliberately not a fine-grained taxonomy —
+    /// a wrong passphrase already fails locally on the joiner, so the responder has
+    /// no reason to confirm a guess. Carries a static reason.
+    #[error("join refused: {0}")]
+    JoinRefused(&'static str),
+
+    /// A peer opened a stream kind its class is not authorized to open (ADR-016
+    /// §"Connections": an anchor has no channel authority, a pending joiner may
+    /// open only the join stream, an unknown peer only the rendezvous service).
+    /// The stream is reset with the same coded rejection an unauthenticated peer
+    /// gets, so probing stream kinds reveals nothing. Carries a static reason.
+    #[error("stream refused: {0}")]
+    StreamRefused(&'static str),
+
     /// A profile lifecycle state error (ADR-016 §Profile): no identity in the
     /// profile, an identity already present, or an operation that needs the
     /// unlocked identity while the profile is locked. Carries a static reason.

@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.3 done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.4 done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -355,6 +355,23 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   the concurrent-duplicate window and its expiry, the drain cap, rotation retaining the previous prekey
   for exactly one cadence, low-water refill at the real 64-prekey size) plus the M13 restart gate, which
   now also asserts the ring reloads and its bundle verifies at production Argon2id parameters.
+- **Connection manager and the join stream (M14.4).** `node::net::ConnectionManager` keeps one
+  `VoxConnection` per peer fingerprint whichever side dialled, dials through the ADR-012 ladder
+  (`connect_direct` over the record's candidates), reaps closed connections, and closes a simultaneous
+  second connection so the invariant holds. **One deviation from the Decision, recorded:** accepting with
+  `Admission::Callback` over the union of memberships would reject the unknown peers ADR-012 requires a
+  rendezvous server to serve, so admission stays open (ADR-011's default) and the membership rule moves
+  to the **stream kind** — `PeerPolicy` classifies member / anchor / pending joiner / unknown and
+  `accept_authorized` refuses a kind that class may not open, which is where "pending pre-join identity,
+  for the join stream only" is now enforced exactly (ADR-012 Implementation notes). `node::joinstream` is
+  the join exchange: seven ordered frames driving the ADR-005 state machine unchanged, with the
+  authenticated transport identity as the PoP's expected identity, one opaque refusal reason, and the
+  one-time prekey consumed *and persisted* before the handshake completes (ADR-004/ADR-005 Implementation
+  notes). The ADR-005 structs' borrowed signer became `Send + Sync` so the exchange can be driven on a
+  spawned task — a type-level tightening, no cryptographic change. Proven over loopback QUIC: a full join
+  yields two sessions that encrypt and decrypt both ways, a wrong passphrase is refused opaquely, an
+  unknown peer's `sync` stream is reset with the coded rejection, and the whole join runs at **production
+  (200,9)** PoW in 1.95 s (release, `#[ignore]`d in debug like the other real-parameter gates).
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
