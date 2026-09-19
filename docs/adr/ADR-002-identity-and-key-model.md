@@ -1,7 +1,8 @@
 # ADR-002: Identity and Key Model
 
-**Status**: proposed
+**Status**: implemented (M1, `crates/vox-core/src/identity/`)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — Implementation notes (M1) added; all private-key accessors now return non-`Copy` zeroizing buffers.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: identity, keys, gpg, ed25519, multi-device, pseudonymity, post-quantum
 
@@ -159,6 +160,20 @@ across channels without the user choosing to.
 
 ### Neutral
 - Reuses OpenPGP key material and fingerprint culture instead of minting an app-specific identity.
+
+## Implementation notes (M1)
+
+These record the concrete decisions made building this ADR (`crates/vox-core/src/identity/`), so the spec and code stay in lockstep:
+
+- **Secret-hygiene rule for accessors.** Every accessor that hands out private key material — the
+  composite root's Ed25519/ML-DSA seeds, the X25519 identity-DH scalar, signed-prekey and one-time-prekey
+  X25519 scalars and ML-KEM-768 seeds, the backup bundle's secrets — returns a non-`Copy`
+  `zeroize::Zeroizing` buffer that is wiped on drop, never a bare `[u8; N]`. Callers deref-copy into
+  their own zeroize-on-drop fields and the temporary wipes itself, so no bare secret copy lingers at
+  a call site. A type-level test (`identity::keyagreement::tests::secret_getters_return_zeroizing_buffers`)
+  fails to compile if any getter regresses. *(2026-09-19 review: the key-agreement getters predated the
+  ADR-010 secret-hygiene audit and returned bare `Copy` arrays; PQXDH re-wrapped them, the ratchet did
+  not.)*
 
 ## Links
 **Depends on**: ADR-001.

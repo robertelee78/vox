@@ -703,7 +703,9 @@ mod tests {
         // While unlocked, seal+open works.
         let sealed = seal_segment(&sek, SegmentKind::LogDb, 0, b"plaintext").unwrap();
         assert_eq!(
-            open_segment(&sek, SegmentKind::LogDb, 0, &sealed).unwrap(),
+            open_segment(&sek, SegmentKind::LogDb, 0, &sealed)
+                .unwrap()
+                .as_slice(),
             b"plaintext"
         );
         // App-lock invalidates the SEK.

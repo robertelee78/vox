@@ -166,6 +166,10 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   unwrap, rotation re-wrap and KDF upgrade) and `IdentityVault::unlock` applies the same collapse, so
   all of them surface `AtRestUnlockFailed`; only a structurally malformed wrap/vault encoding is
   `MalformedAtRest`.
+- **Opened segment plaintext is a secret.** `store::open_segment` returns the decrypted segment in a
+  `Zeroizing<Vec<u8>>` — it is exactly what the double-lock protects — so a caller that drops it does
+  not leave the cleartext in freed memory. `EpochKey` (ADR-009) likewise has no `Clone`, matching the
+  `Sek` posture: one owner, one wipe point. *(2026-09-19 secret-hygiene sweep.)*
 
 ## Links
 **Depends on**: ADR-002, ADR-007, ADR-008.

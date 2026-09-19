@@ -32,7 +32,7 @@
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::atrest::sek::{Sek, NONCE_LEN, TAG_LEN};
 use crate::error::{Error, Result};
@@ -142,12 +142,15 @@ pub fn seal_segment(
 /// must be supplied; a mismatch (or a wrong SEK, or tamper) fails with
 /// [`Error::AtRestUnlockFailed`] — so a segment cannot be opened as the wrong kind
 /// or in the wrong slot.
+///
+/// The plaintext is exactly what the at-rest double-lock protects, so it is
+/// returned in a [`Zeroizing`] buffer (wiped on drop) rather than a bare `Vec`.
 pub fn open_segment(
     sek: &Sek,
     kind: SegmentKind,
     segment_id: u64,
     sealed: &SealedSegment,
-) -> Result<Vec<u8>> {
+) -> Result<Zeroizing<Vec<u8>>> {
     if sealed.ciphertext.len() < TAG_LEN {
         return Err(Error::MalformedAtRest("segment ciphertext too short"));
     }
@@ -163,6 +166,7 @@ pub fn open_segment(
                 aad: &aad,
             },
         )
+        .map(Zeroizing::new)
         .map_err(|_| Error::AtRestUnlockFailed)
 }
 
@@ -276,7 +280,7 @@ mod tests {
         let pt = b"a decrypted plaintext cache page (must stay sealed at rest)";
         let sealed = seal_segment(&sek, SegmentKind::PlaintextCache, 7, pt).unwrap();
         let got = open_segment(&sek, SegmentKind::PlaintextCache, 7, &sealed).unwrap();
-        assert_eq!(got, pt);
+        assert_eq!(got.as_slice(), pt);
     }
 
     #[test]
@@ -331,7 +335,9 @@ mod tests {
         let back = sealed_segment_from_slice(&bytes).unwrap();
         assert_eq!(sealed, back);
         assert_eq!(
-            open_segment(&sek, SegmentKind::Index, 3, &back).unwrap(),
+            open_segment(&sek, SegmentKind::Index, 3, &back)
+                .unwrap()
+                .as_slice(),
             b"payload"
         );
     }
