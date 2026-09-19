@@ -56,8 +56,8 @@ QUIC/DCUtR, NAT/IPv6, deniable authentication).
 | 012 | implemented (primitives) | M10 `nat/` — not composed into the ladder |
 | 013 | implemented (library) | M11 `tunnel/` — no CLI surface |
 | 014 | proposed — not started | native macOS GUI |
-| 015 | implemented (offline shell) | M12 `vox-tui/` — live core is the ADR-016 seam |
-| 016 | accepted — M13 in progress | node runtime: M13 single-device → M14 two machines chat → M15 headless anchor + tunnel CLI |
+| 015 | implemented (live, single-device) | M12 + M13.5 `vox-tui/` — embedded node; network verbs arrive with M14 |
+| 016 | accepted — **M13 done**, M14 next | node runtime: M13 single-device ✓ → M14 two machines chat → M15 headless anchor + tunnel CLI |
 
 **What is missing is the node runtime** that composes the implemented layers (join → transport →
 NAT → sync → governance) and gives the TUI a live `CoreHandle`; that is ADR-016, accepted
