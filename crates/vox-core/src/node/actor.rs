@@ -44,18 +44,9 @@ const COMMAND_QUEUE: usize = 64;
 /// actor's event emission; the TUI drains continuously (ADR-015).
 const EVENT_QUEUE: usize = 256;
 
-/// A wall-clock source (seconds since the Unix epoch).
-pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
-
-/// The system clock.
-#[must_use]
-pub fn system_clock() -> Clock {
-    Arc::new(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
-    })
-}
+// The clock lives in `crate::time` (M14.2: the rendezvous service needs it too and
+// `nat` must not depend on `node`); re-exported so this path stays stable.
+pub use crate::time::{system_clock, Clock};
 
 /// A client's handle to a running node.
 #[derive(Debug, Clone)]

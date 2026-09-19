@@ -2,7 +2,7 @@
 
 **Status**: implemented (M9, `crates/vox-core/src/transport/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline).
+**Updated**: 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline). 2026-09-20 — stream framing lifted into `transport::framing`; typed streams (`transport::streams`, ADR-016 M14.2).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: transport, quic, tls, post-quantum, multiplexing, datagrams
 
@@ -130,6 +130,16 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   only by caller discipline — a byte-exact replay reached the application, proven over real loopback
   QUIC and now pinned by a test.)* The raw `quinn()` accessor still exists for advanced callers (M11)
   and bypasses this layer by construction; any such use must apply the same rule.
+- **Stream framing and typed streams (ADR-016 M14.2).** The u32-BE length prefix that
+  `QuicStreamTransport` applied to M5 frames is now the async pair `transport::framing::{write_frame,
+  read_frame}` (a clean FIN exactly at a frame boundary is the success half-close → `None`; a FIN
+  mid-frame, a reset, or a length above the caller's per-flow cap is an error), and every stream flow
+  — M5 sync, the rendezvous service, the join stream — uses it. Each bi-stream is **typed by its
+  first frame**, the one-element canonical-CBOR array `[kind]` (`transport::streams::StreamKind`:
+  `sync` 1, `join` 2, `pairwise` 3, `rendezvous` 4, `tunnel` 5, `coord` 6); `open_typed` writes it,
+  `accept_typed` reads it and refuses an unknown kind before any flow bytes are read. `close_code`
+  is public so any flow can reset its stream with the ADR-008 code. M5 sync still opens untyped
+  streams through `QuicStreamTransport::open/accept`; the M14.6 connection manager will type them.
 - **Known gaps (recorded 2026-09-19).** `confirm_hybrid_group` checks only ALPN `vox/1`, and
   `SessionEstablishment::new` **hardcodes** the group code point `0x11EC`, so the "downgrade
   auditability" record documents a constant rather than an observation — the real guarantee is

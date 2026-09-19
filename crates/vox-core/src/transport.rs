@@ -57,11 +57,13 @@
 //!   interop matrix pins as a release gate.
 
 pub mod datagram;
+pub mod framing;
 pub mod identity_cert;
 pub mod provider;
 pub mod quic;
 pub mod session;
 pub mod stream_transport;
+pub mod streams;
 pub mod verifier;
 
 #[cfg(test)]
