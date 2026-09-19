@@ -552,6 +552,13 @@ impl ChannelState {
         self.poisoned
     }
 
+    /// Whether this channel's SEK is `mlock`ed (ADR-010 best-effort; surfaced to
+    /// the UI as the memory-protection honesty flag).
+    #[must_use]
+    pub fn mlock_active(&self) -> bool {
+        self.sek.is_mlocked()
+    }
+
     /// App-lock this channel: wipe the SEK now. The state should be dropped
     /// afterwards; any further seal/open fails with [`Error::AtRestLocked`].
     pub fn lock_now(&mut self) {

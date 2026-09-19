@@ -297,6 +297,14 @@ impl Sek {
         self.locked
     }
 
+    /// Whether the key buffer is `mlock`ed (best-effort, ADR-010): `false` means
+    /// the documented zeroize-only degradation is in effect and the UI should say
+    /// so (ADR-015 memory-protection honesty).
+    #[must_use]
+    pub fn is_mlocked(&self) -> bool {
+        self.key.is_mlocked()
+    }
+
     /// **App-lock**: zeroize the key and invalidate this SEK (manual lock / idle /
     /// sleep, ADR-010). Idempotent. After this, [`Sek::key_bytes`] and every
     /// SEK-backed operation fail with [`Error::AtRestLocked`] until a fresh SEK is
