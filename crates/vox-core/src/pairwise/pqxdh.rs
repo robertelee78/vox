@@ -195,12 +195,12 @@ pub fn initiate(
     crate::suite::suite_by_id(suite_id)?;
 
     // Copied secret scalars are zeroized after the DH legs are computed.
-    let ik_a_secret = Zeroizing::new(ik_a.secret_bytes());
+    let ik_a_secret = ik_a.secret_bytes();
     let ik_a_pub = ik_a.public_bytes();
 
     // Fresh ephemeral EK_A.
     let ek_a = X25519IdentityKey::generate()?;
-    let ek_a_secret = Zeroizing::new(ek_a.secret_bytes());
+    let ek_a_secret = ek_a.secret_bytes();
     let ek_a_pub = ek_a.public_bytes();
 
     let ik_b = bundle.identity_dh_key.x25519_pub;
@@ -319,20 +319,17 @@ pub fn accept(
     }
 
     // Copied secret scalars/seeds are zeroized after the DH legs / decapsulation.
-    let ik_b_secret = Zeroizing::new(prekeys.identity_dh_key.secret_bytes());
+    let ik_b_secret = prekeys.identity_dh_key.secret_bytes();
     let ik_b_pub = prekeys.identity_dh_key.public_bytes();
-    let spk_b_secret = Zeroizing::new(prekeys.signed_prekey.x25519_secret_bytes());
+    let spk_b_secret = prekeys.signed_prekey.x25519_secret_bytes();
     let spk_b_pub = prekeys.signed_prekey.public().x25519_pub;
 
     // KEM secret: decapsulate with the one-time KEM seed if an OTP was used, else
     // the signed-prekey KEM seed (mirrors the initiator's selection).
     let (kem_seed, kem_pub) = match prekeys.one_time_prekey {
-        Some(otp) => (
-            Zeroizing::new(otp.ml_kem_seed_bytes()),
-            otp.public().ml_kem_pub,
-        ),
+        Some(otp) => (otp.ml_kem_seed_bytes(), otp.public().ml_kem_pub),
         None => (
-            Zeroizing::new(prekeys.signed_prekey.ml_kem_seed_bytes()),
+            prekeys.signed_prekey.ml_kem_seed_bytes(),
             prekeys.signed_prekey.public().ml_kem_pub,
         ),
     };
@@ -340,9 +337,7 @@ pub fn accept(
     let ss = decapsulate(&decaps, &message.kem_ct);
 
     let opk_b_pub = prekeys.one_time_prekey.map(|o| o.public().x25519_pub);
-    let opk_b_secret = prekeys
-        .one_time_prekey
-        .map(|o| Zeroizing::new(o.x25519_secret_bytes()));
+    let opk_b_secret = prekeys.one_time_prekey.map(|o| o.x25519_secret_bytes());
 
     // DH legs, responder side — the symmetric counterpart of each initiator leg.
     let dh1 = dh(&spk_b_secret, &message.ik_a); // DH(IK_A, SPK_B)
@@ -424,7 +419,7 @@ mod tests {
         let b = bundle(&r, otp.as_ref());
         let ik_a = X25519IdentityKey::generate().unwrap();
         let cid = [9u8; 32];
-        let bob_idk = X25519IdentityKey::from_secret_bytes(r.idk.x25519_secret_bytes());
+        let bob_idk = X25519IdentityKey::from_secret_bytes(*r.idk.x25519_secret_bytes());
 
         let init = initiate(&ik_a, &b, &cid, 7, 0x0001).unwrap();
         let prekeys = ResponderPrekeys {

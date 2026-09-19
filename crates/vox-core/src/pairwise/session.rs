@@ -308,7 +308,7 @@ mod tests {
         let cid = [9u8; 32];
 
         let (init_msg, alice) = Session::initiate(&alice_idk, &b, &cid, 7, 0x0001).unwrap();
-        let bob_idk = X25519IdentityKey::from_secret_bytes(bob.idk.x25519_secret_bytes());
+        let bob_idk = X25519IdentityKey::from_secret_bytes(*bob.idk.x25519_secret_bytes());
         let pk = prekeys(&bob, &bob_idk, Some(&otp));
         let mut reuse = OtpReuseTracker::new();
         let bob_session = Session::accept(&init_msg, &pk, &cid, 7, &mut reuse).unwrap();
@@ -467,7 +467,7 @@ mod tests {
         // (and hence the whole ratchet + KEM-binding AD) diverges; the first
         // message fails to open.
         init_msg.kem_ct[0] ^= 0x01;
-        let bob_idk = X25519IdentityKey::from_secret_bytes(bob.idk.x25519_secret_bytes());
+        let bob_idk = X25519IdentityKey::from_secret_bytes(*bob.idk.x25519_secret_bytes());
         let pk = prekeys(&bob, &bob_idk, Some(&otp));
         let mut reuse = OtpReuseTracker::new();
         let mut bob_session = Session::accept(&init_msg, &pk, &cid, 7, &mut reuse).unwrap();
@@ -483,7 +483,7 @@ mod tests {
         let b = bundle(&bob, None);
         let cid = [1u8; 32];
         let (init_msg, mut alice) = Session::initiate(&alice_idk, &b, &cid, 0, 0x0001).unwrap();
-        let bob_idk = X25519IdentityKey::from_secret_bytes(bob.idk.x25519_secret_bytes());
+        let bob_idk = X25519IdentityKey::from_secret_bytes(*bob.idk.x25519_secret_bytes());
         let pk = prekeys(&bob, &bob_idk, None);
         let mut reuse = OtpReuseTracker::new();
         let mut bob_session = Session::accept(&init_msg, &pk, &cid, 0, &mut reuse).unwrap();
@@ -500,7 +500,7 @@ mod tests {
         let otp = bob.pool.take().unwrap();
         let b = bundle(&bob, Some(&otp));
         let cid = [2u8; 32];
-        let bob_idk = X25519IdentityKey::from_secret_bytes(bob.idk.x25519_secret_bytes());
+        let bob_idk = X25519IdentityKey::from_secret_bytes(*bob.idk.x25519_secret_bytes());
         let mut reuse = OtpReuseTracker::new();
 
         let alice1 = X25519IdentityKey::generate().unwrap();

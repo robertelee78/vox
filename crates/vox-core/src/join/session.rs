@@ -472,7 +472,7 @@ mod tests {
         let mut responder = member(3, 4);
         let otp = responder.pool.take().unwrap();
         let b = bundle(&responder, &otp);
-        let resp_idk = X25519IdentityKey::from_secret_bytes(responder.idk.x25519_secret_bytes());
+        let resp_idk = X25519IdentityKey::from_secret_bytes(*responder.idk.x25519_secret_bytes());
         let joiner_fp = joiner.root.public_key().fingerprint();
         let resp_fp = responder.root.public_key().fingerprint();
 

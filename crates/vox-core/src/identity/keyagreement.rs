@@ -41,7 +41,7 @@
 //! [`crate::wire::signing_input`], but with an identity-layer label).
 
 use x25519_dalek::{PublicKey as XPublic, StaticSecret as XSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -74,7 +74,7 @@ mod mlkem {
     //! keypair and its public encapsulation key bytes.
 
     use ml_kem::{Kem, KeyExport, MlKem768, Seed as KemSeed};
-    use zeroize::{Zeroize, ZeroizeOnDrop};
+    use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
     use super::ML_KEM_768_ENCAPS_LEN;
     use crate::error::{Error, Result};
@@ -102,9 +102,10 @@ mod mlkem {
             })
         }
 
-        /// The 64-byte seed (secret; for backup export and PQXDH reconstruction).
-        pub(super) fn seed_bytes(&self) -> [u8; 64] {
-            self.seed.0
+        /// The 64-byte seed (secret; for backup export and PQXDH reconstruction),
+        /// in a non-`Copy` [`Zeroizing`] buffer.
+        pub(super) fn seed_bytes(&self) -> Zeroizing<[u8; 64]> {
+            Zeroizing::new(self.seed.0)
         }
 
         fn decap_key(&self) -> DecapKey {
@@ -165,9 +166,10 @@ impl X25519IdentityKey {
         }
     }
 
-    /// The 32-byte secret scalar (secret; for backup export only).
-    pub(crate) fn secret_bytes(&self) -> [u8; 32] {
-        self.secret.to_bytes()
+    /// The 32-byte secret scalar (secret; for backup export and PQXDH), in a
+    /// non-`Copy` [`Zeroizing`] buffer so no bare copy can linger at a call site.
+    pub(crate) fn secret_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.secret.to_bytes())
     }
 
     /// The X25519 public key bytes.
@@ -288,10 +290,10 @@ impl SignedIdentityDhKey {
         &self.signature
     }
 
-    /// The secret X25519 scalar (PQXDH responder input, ADR-004, M2). Returns
-    /// secret material; keep it zeroized.
+    /// The secret X25519 scalar (PQXDH responder input, ADR-004, M2), in a
+    /// non-`Copy` [`Zeroizing`] buffer (wiped on drop).
     #[must_use]
-    pub fn x25519_secret_bytes(&self) -> [u8; 32] {
+    pub fn x25519_secret_bytes(&self) -> Zeroizing<[u8; 32]> {
         self.key.secret_bytes()
     }
 }
@@ -418,16 +420,17 @@ impl SignedPrekey {
     /// The secret X25519 scalar of this prekey.
     ///
     /// This is the responder-side private input PQXDH (ADR-004, M2) consumes to
-    /// complete the handshake. Returns secret material; keep it zeroized.
+    /// complete the handshake. Returned in a non-`Copy` [`Zeroizing`] buffer
+    /// (wiped on drop).
     #[must_use]
-    pub fn x25519_secret_bytes(&self) -> [u8; 32] {
+    pub fn x25519_secret_bytes(&self) -> Zeroizing<[u8; 32]> {
         self.x25519.secret_bytes()
     }
 
     /// The secret ML-KEM-768 seed of this prekey (the responder-side KEM private
-    /// input for PQXDH, ADR-004, M2). Returns secret material; keep it zeroized.
+    /// input for PQXDH, ADR-004, M2), in a non-`Copy` [`Zeroizing`] buffer.
     #[must_use]
-    pub fn ml_kem_seed_bytes(&self) -> [u8; 64] {
+    pub fn ml_kem_seed_bytes(&self) -> Zeroizing<[u8; 64]> {
         self.ml_kem.seed_bytes()
     }
 }
@@ -527,16 +530,16 @@ impl OneTimePrekey {
     }
 
     /// The secret X25519 scalar of this one-time prekey (PQXDH responder input,
-    /// ADR-004, M2). Returns secret material; keep it zeroized.
+    /// ADR-004, M2), in a non-`Copy` [`Zeroizing`] buffer (wiped on drop).
     #[must_use]
-    pub fn x25519_secret_bytes(&self) -> [u8; 32] {
+    pub fn x25519_secret_bytes(&self) -> Zeroizing<[u8; 32]> {
         self.x25519.secret_bytes()
     }
 
     /// The secret ML-KEM-768 seed of this one-time prekey (PQXDH responder input,
-    /// ADR-004, M2). Returns secret material; keep it zeroized.
+    /// ADR-004, M2), in a non-`Copy` [`Zeroizing`] buffer.
     #[must_use]
-    pub fn ml_kem_seed_bytes(&self) -> [u8; 64] {
+    pub fn ml_kem_seed_bytes(&self) -> Zeroizing<[u8; 64]> {
         self.ml_kem.seed_bytes()
     }
 }
@@ -1031,7 +1034,7 @@ mod tests {
         );
         // Reconstructing the public key from the secret matches the signed record.
         assert_eq!(
-            X25519IdentityKey::from_secret_bytes(idk.x25519_secret_bytes()).public_bytes(),
+            X25519IdentityKey::from_secret_bytes(*idk.x25519_secret_bytes()).public_bytes(),
             idk.public().x25519_pub
         );
     }
@@ -1068,6 +1071,28 @@ mod tests {
         assert!(matches!(bundle.verify(), Err(Error::MalformedBundle(_))));
     }
 
+    #[test]
+    fn secret_getters_return_zeroizing_buffers() {
+        // Secret-hygiene rule (ADR-010 audit; applied to this module 2026-09-19):
+        // every accessor that hands out private key material returns a non-`Copy`
+        // `Zeroizing` buffer, so a caller cannot leave a bare `[u8; N]` copy
+        // lingering. This is a TYPE-LEVEL test: it fails to compile if any getter
+        // regresses to a bare array.
+        fn zeroizing<T: Zeroize>(_: Zeroizing<T>) {}
+        let r = root();
+        let idk = X25519IdentityKey::generate().unwrap();
+        zeroizing(idk.secret_bytes());
+        let sidk = SignedIdentityDhKey::generate(&r, 1).unwrap();
+        zeroizing(sidk.x25519_secret_bytes());
+        let spk = SignedPrekey::generate(&r, 1, 1).unwrap();
+        zeroizing(spk.x25519_secret_bytes());
+        zeroizing(spk.ml_kem_seed_bytes());
+        let mut pool = OneTimePrekeyPool::generate(&r, 1, 1, 1).unwrap();
+        let otp = pool.take().unwrap();
+        zeroizing(otp.x25519_secret_bytes());
+        zeroizing(otp.ml_kem_seed_bytes());
+    }
+
     // Reconstruct the ML-KEM-768 encaps-public bytes from a 64-byte seed using
     // the upstream library directly — the M2/PQXDH responder reconstruction path.
     fn kem_public_from_seed(seed: [u8; 64]) -> [u8; ML_KEM_768_ENCAPS_LEN] {
@@ -1090,20 +1115,20 @@ mod tests {
         let r = root();
         let spk = SignedPrekey::generate(&r, 1, 1).unwrap();
         let x_pub_from_secret =
-            X25519IdentityKey::from_secret_bytes(spk.x25519_secret_bytes()).public_bytes();
+            X25519IdentityKey::from_secret_bytes(*spk.x25519_secret_bytes()).public_bytes();
         assert_eq!(x_pub_from_secret, spk.public().x25519_pub);
         assert_eq!(
-            kem_public_from_seed(spk.ml_kem_seed_bytes()),
+            kem_public_from_seed(*spk.ml_kem_seed_bytes()),
             spk.public().ml_kem_pub
         );
 
         // Same for a one-time prekey.
         let mut pool = OneTimePrekeyPool::generate(&r, 1, 0, 1).unwrap();
         let otp = pool.take().unwrap();
-        let otp_x = X25519IdentityKey::from_secret_bytes(otp.x25519_secret_bytes()).public_bytes();
+        let otp_x = X25519IdentityKey::from_secret_bytes(*otp.x25519_secret_bytes()).public_bytes();
         assert_eq!(otp_x, otp.public().x25519_pub);
         assert_eq!(
-            kem_public_from_seed(otp.ml_kem_seed_bytes()),
+            kem_public_from_seed(*otp.ml_kem_seed_bytes()),
             otp.public().ml_kem_pub
         );
     }

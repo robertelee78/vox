@@ -29,7 +29,9 @@ pub const CONFIRM_LEN: usize = 32;
 /// The agreed epoch key `K` after a successful DGKA. Held as the HKDF-derived
 /// 32-byte secret (the Ristretto `K` point is the IKM); zeroized on drop. Used
 /// only to derive the confirmation sub-key — never to encrypt content.
-#[derive(Clone)]
+///
+/// Deliberately not `Clone` (like [`crate::atrest::sek::Sek`]): a secret with
+/// one owner has one wipe point.
 pub struct EpochKey {
     bytes: [u8; 32],
 }

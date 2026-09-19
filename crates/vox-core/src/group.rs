@@ -134,7 +134,7 @@ mod integration_tests {
         let b = bundle(&bob, &otp);
         let cid = [9u8; 32];
         let (init_msg, alice) = Session::initiate(&alice_idk, &b, &cid, 7, 0x0001).unwrap();
-        let bob_idk = X25519IdentityKey::from_secret_bytes(bob.idk.x25519_secret_bytes());
+        let bob_idk = X25519IdentityKey::from_secret_bytes(*bob.idk.x25519_secret_bytes());
         let pk = ResponderPrekeys {
             identity_dh_key: &bob_idk,
             signed_prekey: &bob.spk,

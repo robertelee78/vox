@@ -276,7 +276,7 @@ impl Ratchet {
         aead_algo: u16,
     ) -> Result<Self> {
         let dh_self = X25519IdentityKey::generate()?;
-        let dh_self_secret = dh_self.secret_bytes();
+        let dh_self_secret = dh_self.secret_bytes(); // Zeroizing; wiped after the copy below
         let dh_self_public = dh_self.public_bytes();
 
         let dh_out = Zeroizing::new(dh(&dh_self_secret, &remote_ratchet_pub));
@@ -284,7 +284,7 @@ impl Ratchet {
 
         Ok(Self {
             root,
-            dh_self_secret,
+            dh_self_secret: *dh_self_secret,
             dh_self_public,
             dh_remote: Some(remote_ratchet_pub),
             send_chain: Some(send_ck),
@@ -305,13 +305,15 @@ impl Ratchet {
     /// established when the first inbound message triggers a DH ratchet step.
     pub fn init_responder(
         sk: &[u8; 32],
-        signed_prekey_secret: [u8; 32],
+        signed_prekey_secret: Zeroizing<[u8; 32]>,
         signed_prekey_public: [u8; X25519_PUB_LEN],
         aead_algo: u16,
     ) -> Self {
+        // The caller's `Zeroizing` buffer wipes on drop after this deref-copy into
+        // the ratchet's own zeroize-on-drop field; no bare secret lingers.
         Self {
             root: Key32(*sk),
-            dh_self_secret: signed_prekey_secret,
+            dh_self_secret: *signed_prekey_secret,
             dh_self_public: signed_prekey_public,
             dh_remote: None,
             send_chain: None,
@@ -460,7 +462,7 @@ impl Ratchet {
             let dh_recv = Zeroizing::new(dh(&self.dh_self_secret, &header.ratchet_pubkey));
             let (root1, recv_ck) = kdf_rk(&self.root, &dh_recv)?;
             let new_self = X25519IdentityKey::generate()?;
-            let new_self_secret = Zeroizing::new(new_self.secret_bytes());
+            let new_self_secret = new_self.secret_bytes();
             let new_self_public = new_self.public_bytes();
             let dh_send = Zeroizing::new(dh(&new_self_secret, &header.ratchet_pubkey));
             let (root2, send_ck) = kdf_rk(&root1, &dh_send)?;
@@ -482,7 +484,7 @@ impl Ratchet {
                 root: Some(root2),
                 recv_chain: Some(recv_chain),
                 send: Some(SendCandidate {
-                    self_secret: *new_self_secret,
+                    self_secret: new_self_secret,
                     self_public: new_self_public,
                     send_chain: send_ck,
                     pn: self.n_send,
@@ -514,7 +516,7 @@ impl Ratchet {
         }
         if let Some(send) = plan.send {
             self.dh_self_secret.zeroize();
-            self.dh_self_secret = send.self_secret;
+            self.dh_self_secret = *send.self_secret;
             self.dh_self_public = send.self_public;
             self.send_chain = Some(send.send_chain);
             self.dh_remote = Some(send.remote);
@@ -529,12 +531,23 @@ impl Ratchet {
 /// The candidate `send`-side state produced by a DH ratchet step (committed only
 /// on AEAD success).
 struct SendCandidate {
-    self_secret: [u8; 32],
+    /// The new DH ratchet secret, zeroizing so an uncommitted plan (AEAD open
+    /// failed) wipes it on drop.
+    self_secret: Zeroizing<[u8; 32]>,
     self_public: [u8; X25519_PUB_LEN],
     send_chain: Key32,
     pn: u64,
     remote: [u8; X25519_PUB_LEN],
 }
+
+// Secret-hygiene check (2026-09-19 review): the candidate's new DH secret lives
+// in a zeroizing buffer, so a `DecryptPlan` dropped on a failed AEAD open wipes
+// it. Type-level — this fails to compile if the field regresses to a bare array.
+const _: () = {
+    fn _self_secret_is_zeroizing(c: &SendCandidate) -> &Zeroizing<[u8; 32]> {
+        &c.self_secret
+    }
+};
 
 /// A fully-computed inbound decrypt transition, held in temporaries until the
 /// AEAD open authenticates the packet (see [`Ratchet::decrypt`]).

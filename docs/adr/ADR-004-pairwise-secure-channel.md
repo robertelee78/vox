@@ -1,7 +1,8 @@
 # ADR-004: Pairwise Secure Channel (PQXDH + Double Ratchet)
 
-**Status**: proposed
+**Status**: implemented (M2, `crates/vox-core/src/pairwise/`)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — Implementation notes (M2) added; uncommitted DH-ratchet secrets are wiped when a decrypt plan is dropped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: crypto-core, pqxdh, double-ratchet, forward-secrecy, pcs
 
@@ -89,6 +90,19 @@ by its bandwidth cost (ADR-003).
 
 ### Neutral
 - The pairwise channel is an internal substrate; users only ever see "the channel" (ADR-001).
+
+## Implementation notes (M2)
+
+These record the concrete decisions made building this ADR (`crates/vox-core/src/pairwise/`), so the spec and code stay in lockstep:
+
+- **Transactional decrypt wipes what it does not commit.** `Ratchet::decrypt` computes the whole
+  inbound transition (skipped keys, new root/chain keys, and — on a DH step — the new local ratchet
+  secret) into a plan, opens the AEAD, and commits only on success. Every secret in that plan is a
+  zeroize-on-drop type, including the candidate DH ratchet secret, so a forged or corrupt packet that
+  fails the AEAD leaves no secret residue behind when the plan is dropped. Enforced at the type level
+  by a compile-time check in `pairwise::ratchet`. *(2026-09-19 review: the candidate secret was a bare
+  `[u8; 32]` and was not wiped on the failure path.)* `Ratchet::init_responder` takes the signed-prekey
+  secret as a `Zeroizing` buffer for the same reason.
 
 ## Links
 **Depends on**: ADR-002, ADR-003.
