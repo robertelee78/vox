@@ -32,8 +32,10 @@ jobs:
         run: cargo test --workspace
       - name: Docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-      # Production-parameter PoW gate (ADR-005): a real (200,9) Equihash solve
-      # cross-checked by the librustzcash verifier. Ignored in the debug suite
-      # (≈25 s unoptimized) and run here in release (≈1 s, 245 MB).
-      - name: Real-parameter PoW solve→verify (release)
-        run: cargo test --release -p vox-core --lib real_200_9_solve_then_verify -- --ignored
+      # Real-parameter gates that are too slow unoptimized and therefore
+      # `#[ignore]`d in the debug suite: the (200,9) Equihash solve→verify
+      # (ADR-005, ≈1 s / 245 MB in release) and the production-Argon2id node +
+      # live-client lifecycle tests (ADR-016 M13; ≈0.3 s per derivation in
+      # release). Run here in release.
+      - name: Real-parameter gates (release)
+        run: cargo test --release --workspace -- --ignored

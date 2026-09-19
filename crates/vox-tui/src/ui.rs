@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::state::{Focus, Mode, Screen, UiState};
+use crate::state::{Focus, Mode, Prompt, Screen, UiState};
 use crate::viewmodel::{
     InboundVisibility, MemberView, MessageView, OutboundConsent, Reachability, SyncStatus,
     Verification, ViewModel,
@@ -86,9 +86,27 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &UiState) {
     render_status_bar(frame, chunks[1], vm);
     render_hint_bar(frame, chunks[2], ui);
 
-    if let Mode::CommandPalette(ref buf) = ui.mode {
-        render_palette(frame, area, buf);
+    match ui.mode {
+        Mode::CommandPalette(ref buf) => render_palette(frame, area, buf),
+        Mode::Prompt(ref p) => render_prompt(frame, area, p),
+        Mode::Normal => {}
     }
+}
+
+/// The masked onboarding/unlock prompt: the current field's label and its
+/// **masked** value (one `•` per character for secret fields), never the text.
+fn render_prompt(frame: &mut Frame, area: Rect, p: &Prompt) {
+    let h = 5.min(area.height);
+    let y = area.height.saturating_sub(h);
+    let overlay = Rect::new(area.x, y, area.width, h);
+    let step = format!("{}/{}", p.step + 1, p.kind.fields().len());
+    let body = vec![
+        Line::from(format!("{} ({step}): {}", p.label(), p.display())),
+        Line::from("Enter: next/submit · Esc: cancel"),
+    ];
+    let widget =
+        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(p.kind.title()));
+    frame.render_widget(widget, overlay);
 }
 
 fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
@@ -107,8 +125,9 @@ fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiSta
             } else {
                 String::new()
             };
+            let lock = if c.open { "" } else { " 🔒" };
             ListItem::new(format!(
-                "{marker}{}{unread}  [{}]",
+                "{marker}{}{lock}{unread}  [{}]",
                 c.local_name,
                 reachability_label(c.reachability)
             ))
@@ -145,7 +164,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
         channel.timeline.as_slice(),
         focused(ui, Focus::Timeline),
     );
-    render_composer(frame, body[1], focused(ui, Focus::Composer));
+    render_composer(frame, body[1], &ui.composer, focused(ui, Focus::Composer));
     render_members(
         frame,
         cols[1],
@@ -182,9 +201,15 @@ fn render_timeline(frame: &mut Frame, area: Rect, timeline: &[MessageView], focu
     frame.render_widget(p, area);
 }
 
-fn render_composer(frame: &mut Frame, area: Rect, focus: bool) {
-    let p = Paragraph::new("type a message — Tab to switch panes, : for commands")
-        .block(pane_block("Composer", focus));
+fn render_composer(frame: &mut Frame, area: Rect, text: &str, focus: bool) {
+    let shown = if text.is_empty() && !focus {
+        "type a message — Tab to focus the composer, : for commands".to_owned()
+    } else if focus {
+        format!("{text}▏")
+    } else {
+        text.to_owned()
+    };
+    let p = Paragraph::new(shown).block(pane_block("Composer", focus));
     frame.render_widget(p, area);
 }
 
@@ -242,8 +267,12 @@ fn render_hint_bar(frame: &mut Frame, area: Rect, ui: &UiState) {
         return;
     }
     let hint = match ui.screen {
-        Screen::ChannelList => " ↑/↓ select · Enter open · : command · Ctrl-C quit",
-        Screen::Channel => " Tab switch pane · : command · Esc back · Ctrl-C quit",
+        Screen::ChannelList => {
+            " ↑/↓ select · Enter open · :new <name> · :unlock · :lock · Ctrl-C quit"
+        }
+        Screen::Channel => {
+            " Tab switch pane · Enter (composer) send · : command · Esc back · Ctrl-C quit"
+        }
     };
     frame.render_widget(Paragraph::new(hint), area);
 }
@@ -280,6 +309,7 @@ mod tests {
     fn channel_vm() -> ViewModel {
         ViewModel {
             channels: vec![ChannelSummary {
+                open: true,
                 channel_id: [7; 32],
                 local_name: "team-rocket".into(),
                 unread: 2,
@@ -316,6 +346,7 @@ mod tests {
             sync: SyncStatus::Synced,
             locked: false,
             mlock_active: true,
+            has_identity: true,
         }
     }
 
@@ -377,5 +408,32 @@ mod tests {
         vm.locked = true;
         let out = draw(&vm, &UiState::new());
         assert!(out.contains("LOCKED"));
+    }
+    #[test]
+    fn prompt_overlay_shows_mask_never_the_typed_secret() {
+        let mut ui = UiState::new();
+        ui.start_prompt(crate::state::PromptKind::Unlock, None);
+        if let Mode::Prompt(ref mut p) = ui.mode {
+            p.fields[0].push_str("hunter2");
+        }
+        let out = draw(&channel_vm(), &ui);
+        assert!(out.contains("Unlock"));
+        assert!(out.contains("identity passphrase"));
+        assert!(out.contains("•••••••"));
+        assert!(!out.contains("hunter2"));
+    }
+
+    #[test]
+    fn closed_channel_is_marked_and_composer_shows_pending_text() {
+        let mut vm = channel_vm();
+        vm.channels[0].open = false;
+        let mut ui = UiState::new();
+        let out = draw(&vm, &ui);
+        assert!(out.contains("🔒"));
+        ui.screen = Screen::Channel;
+        ui.focus = Focus::Composer;
+        ui.composer = "draft text".into();
+        let out = draw(&vm, &ui);
+        assert!(out.contains("draft text"));
     }
 }

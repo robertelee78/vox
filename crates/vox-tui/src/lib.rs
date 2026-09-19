@@ -21,6 +21,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod live;
 pub mod qr;
 pub mod state;
 pub mod ui;

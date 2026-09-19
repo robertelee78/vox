@@ -10,9 +10,115 @@
 //! invents trust state.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use secrecy::SecretString;
 use vox_core::hash::Digest32;
+use zeroize::Zeroizing;
 
 use crate::viewmodel::{Command, InboundVisibility, Verification, ViewModel};
+
+/// Idle time after which the app locks itself (ADR-015 §Screen security: 5 min).
+pub const IDLE_LOCK_SECS: u64 = 5 * 60;
+
+/// Whether the idle-lock timer has elapsed.
+#[must_use]
+pub fn idle_lock_due(last_input_secs: u64, now_secs: u64) -> bool {
+    now_secs.saturating_sub(last_input_secs) >= IDLE_LOCK_SECS
+}
+
+/// Which masked onboarding/unlock prompt is open (ADR-015: passphrases are entered
+/// through a masked prompt, never on the palette line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptKind {
+    /// Unlock the identity: `[passphrase]`.
+    Unlock,
+    /// Create the identity: `[passphrase, confirm]`.
+    CreateIdentity,
+    /// Create a channel: `[name, passphrase, confirm]`.
+    CreateChannel,
+    /// Open a closed channel: `[passphrase]` for `Prompt::target`.
+    OpenChannel,
+}
+
+impl PromptKind {
+    /// The field labels, in order.
+    #[must_use]
+    pub fn fields(self) -> &'static [&'static str] {
+        match self {
+            PromptKind::Unlock => &["identity passphrase"],
+            PromptKind::CreateIdentity => &["new identity passphrase", "confirm passphrase"],
+            PromptKind::CreateChannel => {
+                &["channel name", "channel passphrase", "confirm passphrase"]
+            }
+            PromptKind::OpenChannel => &["channel passphrase"],
+        }
+    }
+
+    /// Whether field `i` is secret (masked while typing, zeroized after).
+    #[must_use]
+    pub fn is_secret(self, i: usize) -> bool {
+        !(self == PromptKind::CreateChannel && i == 0)
+    }
+
+    /// The prompt's title.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            PromptKind::Unlock => "Unlock",
+            PromptKind::CreateIdentity => "Create identity",
+            PromptKind::CreateChannel => "Create channel",
+            PromptKind::OpenChannel => "Open channel",
+        }
+    }
+}
+
+/// A masked multi-field prompt. Every field buffer is [`Zeroizing`], so a
+/// cancelled or submitted prompt leaves no passphrase in memory; the values never
+/// appear in a status string or the palette line.
+#[derive(Clone, Debug)]
+pub struct Prompt {
+    /// What the prompt is for.
+    pub kind: PromptKind,
+    /// The field being edited.
+    pub step: usize,
+    /// The field buffers (zeroized on drop).
+    pub fields: Vec<Zeroizing<String>>,
+    /// The channel a per-channel prompt targets.
+    pub target: Option<Digest32>,
+}
+
+impl Prompt {
+    /// A fresh prompt of `kind` (optionally targeting a channel).
+    #[must_use]
+    pub fn new(kind: PromptKind, target: Option<Digest32>) -> Self {
+        Self {
+            kind,
+            step: 0,
+            fields: kind
+                .fields()
+                .iter()
+                .map(|_| Zeroizing::new(String::new()))
+                .collect(),
+            target,
+        }
+    }
+
+    /// The label of the current field.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        self.kind.fields().get(self.step).copied().unwrap_or("")
+    }
+
+    /// The current field rendered for display: masked (`•` per char) if secret.
+    #[must_use]
+    pub fn display(&self) -> String {
+        let v = self.fields.get(self.step).map_or("", |f| f.as_str());
+        if self.kind.is_secret(self.step) {
+            "•".repeat(v.chars().count())
+        } else {
+            v.to_owned()
+        }
+    }
+}
 
 /// Which screen is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,13 +152,24 @@ impl Focus {
     }
 }
 
-/// Input modality: normal navigation, or the modal `:` command-palette overlay.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Input modality: normal navigation, the modal `:` command-palette overlay, or a
+/// masked prompt.
+#[derive(Clone, Debug)]
 pub enum Mode {
     /// Normal mode: chords navigate; the composer (when focused) inserts text.
     Normal,
     /// The command palette is open; the buffer holds the typed command line.
     CommandPalette(String),
+    /// A masked onboarding/unlock prompt is open (modal).
+    Prompt(Prompt),
+}
+
+impl Mode {
+    /// Whether the mode is `Normal`.
+    #[must_use]
+    pub fn is_normal(&self) -> bool {
+        matches!(self, Mode::Normal)
+    }
 }
 
 /// The outcome of handling one key event. (`Command` carries a redacted
@@ -84,6 +201,8 @@ pub struct UiState {
     /// A transient status/alert line shown at the bottom (e.g. the result of the
     /// last command, an error, a recovery hint). `None` when clear.
     pub status_message: Option<String>,
+    /// The composer's pending text (single-line; Enter sends).
+    pub composer: String,
 }
 
 impl Default for UiState {
@@ -95,6 +214,7 @@ impl Default for UiState {
             selected_channel: 0,
             selected_member: 0,
             status_message: None,
+            composer: String::new(),
         }
     }
 }
@@ -111,13 +231,42 @@ impl UiState {
     /// `vm` is read-only context (the active channel/members) used to resolve
     /// selection-relative commands; this method never mutates trust state.
     pub fn on_key(&mut self, key: KeyEvent, vm: &ViewModel) -> Action {
-        // The command palette is modal and intercepts all keys while open.
-        if let Mode::CommandPalette(_) = self.mode {
-            return self.on_palette_key(key, vm);
-        }
-        // Ctrl-C always quits.
+        // Ctrl-C always quits — from any mode, including an open prompt or palette
+        // (the exit path restores the terminal and the node shuts down locked).
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.mode = Mode::Normal;
             return Action::Quit;
+        }
+        // Modal overlays intercept all other keys while open.
+        match self.mode {
+            Mode::CommandPalette(_) => return self.on_palette_key(key, vm),
+            Mode::Prompt(_) => return self.on_prompt_key(key),
+            Mode::Normal => {}
+        }
+        // The composer, when focused, owns printable keys, Backspace and Enter.
+        if self.screen == Screen::Channel && self.focus == Focus::Composer {
+            match key.code {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.composer.push(c);
+                    return Action::Redraw;
+                }
+                KeyCode::Backspace => {
+                    self.composer.pop();
+                    return Action::Redraw;
+                }
+                KeyCode::Enter => {
+                    let text = self.composer.trim().to_owned();
+                    if text.is_empty() {
+                        return Action::Redraw;
+                    }
+                    let Some(channel_id) = self.active_channel_id(vm) else {
+                        return Action::Redraw;
+                    };
+                    self.composer.clear();
+                    return Action::Dispatch(Command::SendText { channel_id, text });
+                }
+                _ => {}
+            }
         }
         match key.code {
             KeyCode::Char(':') => {
@@ -131,17 +280,11 @@ impl UiState {
             KeyCode::Esc => {
                 if self.screen == Screen::Channel {
                     self.screen = Screen::ChannelList;
+                    return Action::Dispatch(Command::SelectChannel { channel_id: None });
                 }
                 Action::Redraw
             }
-            KeyCode::Enter if self.screen == Screen::ChannelList => {
-                if self.selected_channel < vm.channels.len() {
-                    self.screen = Screen::Channel;
-                    self.focus = Focus::Timeline;
-                    self.selected_member = 0;
-                }
-                Action::Redraw
-            }
+            KeyCode::Enter if self.screen == Screen::ChannelList => self.open_selected(vm),
             KeyCode::Up => {
                 self.move_selection(vm, -1);
                 Action::Redraw
@@ -151,6 +294,124 @@ impl UiState {
                 Action::Redraw
             }
             _ => Action::Redraw,
+        }
+    }
+
+    /// Enter / `:open` on the channel list: an **open** channel goes on screen
+    /// (and the core is told which one is active); a **closed** channel needs its
+    /// passphrase first (double-lock), so the masked prompt opens instead.
+    fn open_selected(&mut self, vm: &ViewModel) -> Action {
+        let Some(summary) = vm.channels.get(self.selected_channel) else {
+            return Action::Redraw;
+        };
+        if summary.open {
+            self.screen = Screen::Channel;
+            self.focus = Focus::Timeline;
+            self.selected_member = 0;
+            Action::Dispatch(Command::SelectChannel {
+                channel_id: Some(summary.channel_id),
+            })
+        } else {
+            self.mode = Mode::Prompt(Prompt::new(
+                PromptKind::OpenChannel,
+                Some(summary.channel_id),
+            ));
+            Action::Redraw
+        }
+    }
+
+    /// Open a masked prompt (also used by the loop for onboarding: no identity ⇒
+    /// create; locked ⇒ unlock).
+    pub fn start_prompt(&mut self, kind: PromptKind, target: Option<Digest32>) {
+        self.mode = Mode::Prompt(Prompt::new(kind, target));
+    }
+
+    fn on_prompt_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::Prompt(ref mut p) = self.mode else {
+            return Action::Redraw;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                // Dropping the prompt zeroizes every field.
+                self.mode = Mode::Normal;
+                Action::Redraw
+            }
+            KeyCode::Char(c) => {
+                if let Some(f) = p.fields.get_mut(p.step) {
+                    f.push(c);
+                }
+                Action::Redraw
+            }
+            KeyCode::Backspace => {
+                if let Some(f) = p.fields.get_mut(p.step) {
+                    f.pop();
+                }
+                Action::Redraw
+            }
+            KeyCode::Enter => {
+                if p.step + 1 < p.fields.len() {
+                    p.step += 1;
+                    return Action::Redraw;
+                }
+                self.submit_prompt()
+            }
+            _ => Action::Redraw,
+        }
+    }
+
+    /// Validate and turn the finished prompt into a [`Command`]. A confirm
+    /// mismatch keeps the prompt open at the passphrase step with the secret
+    /// fields cleared; the mismatch is reported through the status line without
+    /// echoing anything typed.
+    fn submit_prompt(&mut self) -> Action {
+        let Mode::Prompt(p) = std::mem::replace(&mut self.mode, Mode::Normal) else {
+            return Action::Redraw;
+        };
+        let secret = |s: &Zeroizing<String>| SecretString::from(s.as_str().to_owned());
+        match p.kind {
+            PromptKind::Unlock => Action::Dispatch(Command::Unlock {
+                passphrase: secret(&p.fields[0]),
+            }),
+            PromptKind::OpenChannel => match p.target {
+                Some(channel_id) => Action::Dispatch(Command::OpenChannel {
+                    channel_id,
+                    passphrase: secret(&p.fields[0]),
+                }),
+                None => Action::Redraw,
+            },
+            PromptKind::CreateIdentity => {
+                if p.fields[0].as_str() != p.fields[1].as_str() || p.fields[0].is_empty() {
+                    self.status_message =
+                        Some("passphrases do not match (or empty) — try again".into());
+                    self.mode = Mode::Prompt(Prompt::new(PromptKind::CreateIdentity, None));
+                    return Action::Redraw;
+                }
+                Action::Dispatch(Command::CreateIdentity {
+                    passphrase: secret(&p.fields[0]),
+                })
+            }
+            PromptKind::CreateChannel => {
+                let name = p.fields[0].trim().to_owned();
+                if name.is_empty() {
+                    self.status_message = Some("channel name is required".into());
+                    self.mode = Mode::Prompt(Prompt::new(PromptKind::CreateChannel, None));
+                    return Action::Redraw;
+                }
+                if p.fields[1].as_str() != p.fields[2].as_str() || p.fields[1].is_empty() {
+                    self.status_message =
+                        Some("passphrases do not match (or empty) — try again".into());
+                    let mut again = Prompt::new(PromptKind::CreateChannel, None);
+                    again.fields[0] = Zeroizing::new(name);
+                    again.step = 1;
+                    self.mode = Mode::Prompt(again);
+                    return Action::Redraw;
+                }
+                Action::Dispatch(Command::CreateChannel {
+                    local_name: name,
+                    passphrase: secret(&p.fields[1]),
+                    deniable: false,
+                })
+            }
         }
     }
 
@@ -192,11 +453,20 @@ impl UiState {
                 match parse_command(&line, self, vm) {
                     Some(Parsed::Core(cmd)) => Action::Dispatch(cmd),
                     Some(Parsed::Quit) => Action::Quit,
-                    Some(Parsed::Nav(nav)) => {
-                        self.apply_nav(nav, vm);
+                    Some(Parsed::Nav(nav)) => self.apply_nav(nav, vm),
+                    Some(Parsed::Prompt(kind, name)) => {
+                        let mut p = Prompt::new(kind, None);
+                        if let Some(n) = name {
+                            p.fields[0] = Zeroizing::new(n);
+                            p.step = 1;
+                        }
+                        self.mode = Mode::Prompt(p);
                         Action::Redraw
                     }
-                    None => Action::Redraw,
+                    None => {
+                        self.status_message = Some("unknown command".into());
+                        Action::Redraw
+                    }
                 }
             }
             _ => Action::Redraw,
@@ -205,16 +475,19 @@ impl UiState {
 
     /// Apply a navigation action (the typed-command equivalents of the chord
     /// navigation, so every action is reachable by command — ADR-015 a11y).
-    fn apply_nav(&mut self, nav: Nav, vm: &ViewModel) {
+    fn apply_nav(&mut self, nav: Nav, vm: &ViewModel) -> Action {
         match nav {
             Nav::Open => {
-                if self.screen == Screen::ChannelList && self.selected_channel < vm.channels.len() {
-                    self.screen = Screen::Channel;
-                    self.focus = Focus::Timeline;
-                    self.selected_member = 0;
+                if self.screen == Screen::ChannelList {
+                    return self.open_selected(vm);
                 }
             }
-            Nav::Back => self.screen = Screen::ChannelList,
+            Nav::Back => {
+                if self.screen == Screen::Channel {
+                    self.screen = Screen::ChannelList;
+                    return Action::Dispatch(Command::SelectChannel { channel_id: None });
+                }
+            }
             Nav::FocusNext => {
                 if self.screen == Screen::Channel {
                     self.focus = self.focus.next();
@@ -223,6 +496,7 @@ impl UiState {
             Nav::Up => self.move_selection(vm, -1),
             Nav::Down => self.move_selection(vm, 1),
         }
+        Action::Redraw
     }
 
     /// The fingerprint of the currently-selected member, if any.
@@ -280,6 +554,8 @@ pub enum Parsed {
     Quit,
     /// A UI navigation action.
     Nav(Nav),
+    /// Open a masked prompt (with an optional prefilled non-secret first field).
+    Prompt(PromptKind, Option<String>),
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -295,13 +571,13 @@ pub enum Parsed {
 /// - `send <text…>`, `consent grant|revoke`, `show` / `hide`, `block` / `unblock`,
 ///   `verify` (acts on the selected member).
 ///
-/// **Create / join are intentionally not one-line palette commands.** They require
-/// a channel passphrase, which ADR-015 mandates be entered through a **masked**
-/// prompt and shared out-of-band — never echoed on the palette line or stored in a
-/// status string. They are therefore initiated through the dedicated create/join
-/// onboarding flow (with masked passphrase entry), which is wired with the live
-/// core; this is a security-driven exception to "one-line command", not a chord-only
-/// path. Every *non-secret* action is reachable here by a typed command.
+/// **Create / join / unlock / init are not one-line palette commands.** They require
+/// a passphrase, which ADR-015 mandates be entered through a **masked** prompt and
+/// shared out-of-band — never echoed on the palette line or stored in a status
+/// string. The verbs `init`, `unlock`, `new <name>` therefore *open the prompt*;
+/// the secret is typed there. This is a security-driven exception to "one-line
+/// command", not a chord-only path. Every *non-secret* action is reachable here by
+/// a typed command. `close` closes the active channel (wipes its SEK).
 pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed> {
     let line = line.trim();
     let (verb, rest) = match line.split_once(char::is_whitespace) {
@@ -312,6 +588,15 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     match verb {
         "quit" | "q" => return Some(Parsed::Quit),
         "lock" => return Some(Parsed::Core(Command::Lock)),
+        "unlock" => return Some(Parsed::Prompt(PromptKind::Unlock, None)),
+        "init" => return Some(Parsed::Prompt(PromptKind::CreateIdentity, None)),
+        "new" if !rest.is_empty() => {
+            return Some(Parsed::Prompt(
+                PromptKind::CreateChannel,
+                Some(rest.to_owned()),
+            ))
+        }
+        "new" => return Some(Parsed::Prompt(PromptKind::CreateChannel, None)),
         "open" => return Some(Parsed::Nav(Nav::Open)),
         "back" => return Some(Parsed::Nav(Nav::Back)),
         "focus" => return Some(Parsed::Nav(Nav::FocusNext)),
@@ -325,6 +610,9 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         "send" if !rest.is_empty() => Command::SendText {
             channel_id: channel,
             text: rest.to_owned(),
+        },
+        "close" => Command::CloseChannel {
+            channel_id: channel,
         },
         "consent" => match rest {
             "grant" => Command::GrantConsent {
@@ -368,6 +656,7 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
 mod tests {
     use super::*;
     use crate::viewmodel::{ChannelView, MemberView, OutboundConsent, Reachability};
+    use secrecy::ExposeSecret;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -388,6 +677,7 @@ mod tests {
     fn vm_with_channel() -> ViewModel {
         ViewModel {
             channels: vec![crate::viewmodel::ChannelSummary {
+                open: true,
                 channel_id: [7; 32],
                 local_name: "team".into(),
                 unread: 0,
@@ -466,7 +756,7 @@ mod tests {
             }
             other => panic!("expected SendText, got {other:?}"),
         }
-        assert_eq!(ui.mode, Mode::Normal, "palette closes after Enter");
+        assert!(ui.mode.is_normal(), "palette closes after Enter");
     }
 
     #[test]
@@ -546,7 +836,7 @@ mod tests {
         ui.on_key(key(KeyCode::Char('x')), &vm);
         let a = ui.on_key(key(KeyCode::Esc), &vm);
         assert!(matches!(a, Action::Redraw));
-        assert_eq!(ui.mode, Mode::Normal);
+        assert!(ui.mode.is_normal());
     }
 
     #[test]
@@ -571,6 +861,225 @@ mod tests {
         assert_eq!(
             on_key_change(Verification::Verified),
             Verification::KeyChanged
+        );
+    }
+    // ---- M13.5: prompts, composer, open/closed channels ----
+
+    fn vm_locked_with_closed_channel() -> ViewModel {
+        ViewModel {
+            channels: vec![crate::viewmodel::ChannelSummary {
+                open: false,
+                channel_id: [9; 32],
+                local_name: "(locked 09090909)".into(),
+                unread: 0,
+                reachability: Reachability::Offline,
+            }],
+            active: None,
+            sync: crate::viewmodel::SyncStatus::Idle,
+            locked: false,
+            mlock_active: true,
+            has_identity: true,
+        }
+    }
+
+    fn type_str(ui: &mut UiState, vm: &ViewModel, s: &str) -> Action {
+        let mut last = Action::Redraw;
+        for c in s.chars() {
+            last = ui.on_key(key(KeyCode::Char(c)), vm);
+        }
+        last
+    }
+
+    #[test]
+    fn enter_on_a_closed_channel_opens_the_passphrase_prompt_and_submits_open() {
+        let mut ui = UiState::new();
+        let vm = vm_locked_with_closed_channel();
+        assert!(matches!(
+            ui.on_key(key(KeyCode::Enter), &vm),
+            Action::Redraw
+        ));
+        assert!(
+            matches!(ui.mode, Mode::Prompt(ref p) if p.kind == PromptKind::OpenChannel && p.target == Some([9; 32]))
+        );
+        assert_eq!(
+            ui.screen,
+            Screen::ChannelList,
+            "no screen change until opened"
+        );
+        type_str(&mut ui, &vm, "s3cret");
+        // The prompt displays a mask, never the text.
+        if let Mode::Prompt(ref p) = ui.mode {
+            assert_eq!(p.display(), "••••••");
+            assert!(!p.display().contains("s3cret"));
+        }
+        match ui.on_key(key(KeyCode::Enter), &vm) {
+            Action::Dispatch(Command::OpenChannel {
+                channel_id,
+                passphrase,
+            }) => {
+                assert_eq!(channel_id, [9; 32]);
+                assert_eq!(passphrase.expose_secret(), "s3cret");
+            }
+            other => panic!("expected OpenChannel, got {other:?}"),
+        }
+        assert!(ui.mode.is_normal());
+    }
+
+    #[test]
+    fn enter_on_an_open_channel_selects_it_for_the_core() {
+        let mut ui = UiState::new();
+        let vm = vm_with_channel(); // open: true
+        match ui.on_key(key(KeyCode::Enter), &vm) {
+            Action::Dispatch(Command::SelectChannel { channel_id }) => {
+                assert_eq!(channel_id, Some([7; 32]))
+            }
+            other => panic!("expected SelectChannel, got {other:?}"),
+        }
+        assert_eq!(ui.screen, Screen::Channel);
+        // Esc back tells the core nothing is on screen.
+        match ui.on_key(key(KeyCode::Esc), &vm) {
+            Action::Dispatch(Command::SelectChannel { channel_id }) => assert_eq!(channel_id, None),
+            other => panic!("expected SelectChannel(None), got {other:?}"),
+        }
+        assert_eq!(ui.screen, Screen::ChannelList);
+    }
+
+    #[test]
+    fn escape_cancels_a_prompt_and_ctrl_c_quits_from_inside_one() {
+        let mut ui = UiState::new();
+        let vm = vm_locked_with_closed_channel();
+        ui.start_prompt(PromptKind::Unlock, None);
+        type_str(&mut ui, &vm, "half-typed");
+        assert!(matches!(ui.on_key(key(KeyCode::Esc), &vm), Action::Redraw));
+        assert!(ui.mode.is_normal(), "cancel drops the (zeroizing) fields");
+        ui.start_prompt(PromptKind::Unlock, None);
+        assert!(matches!(
+            ui.on_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &vm
+            ),
+            Action::Quit
+        ));
+    }
+
+    #[test]
+    fn create_identity_prompt_requires_matching_non_empty_confirmation() {
+        let mut ui = UiState::new();
+        let vm = ViewModel::default();
+        ui.start_prompt(PromptKind::CreateIdentity, None);
+        type_str(&mut ui, &vm, "abc");
+        ui.on_key(key(KeyCode::Enter), &vm); // to confirm step
+        type_str(&mut ui, &vm, "abd");
+        assert!(matches!(
+            ui.on_key(key(KeyCode::Enter), &vm),
+            Action::Redraw
+        ));
+        assert!(
+            matches!(ui.mode, Mode::Prompt(ref p) if p.kind == PromptKind::CreateIdentity && p.step == 0)
+        );
+        assert!(ui
+            .status_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("do not match"));
+        // Status never echoes what was typed.
+        assert!(!ui.status_message.as_deref().unwrap_or("").contains("abc"));
+        type_str(&mut ui, &vm, "abc");
+        ui.on_key(key(KeyCode::Enter), &vm);
+        type_str(&mut ui, &vm, "abc");
+        match ui.on_key(key(KeyCode::Enter), &vm) {
+            Action::Dispatch(Command::CreateIdentity { passphrase }) => {
+                assert_eq!(passphrase.expose_secret(), "abc")
+            }
+            other => panic!("expected CreateIdentity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_verb_prefills_the_channel_name_and_collects_a_masked_passphrase() {
+        let mut ui = UiState::new();
+        let vm = vm_locked_with_closed_channel();
+        ui.on_key(key(KeyCode::Char(':')), &vm);
+        type_str(&mut ui, &vm, "new family chat");
+        ui.on_key(key(KeyCode::Enter), &vm);
+        assert!(
+            matches!(ui.mode, Mode::Prompt(ref p) if p.kind == PromptKind::CreateChannel && p.step == 1 && p.fields[0].as_str() == "family chat")
+        );
+        type_str(&mut ui, &vm, "pw");
+        ui.on_key(key(KeyCode::Enter), &vm);
+        type_str(&mut ui, &vm, "pw");
+        match ui.on_key(key(KeyCode::Enter), &vm) {
+            Action::Dispatch(Command::CreateChannel {
+                local_name,
+                passphrase,
+                deniable,
+            }) => {
+                assert_eq!(local_name, "family chat");
+                assert_eq!(passphrase.expose_secret(), "pw");
+                assert!(!deniable);
+            }
+            other => panic!("expected CreateChannel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unlock_and_init_verbs_open_prompts_not_commands() {
+        let ui = UiState::new();
+        let vm = ViewModel::default();
+        assert!(matches!(
+            parse_command("unlock", &ui, &vm),
+            Some(Parsed::Prompt(PromptKind::Unlock, None))
+        ));
+        assert!(matches!(
+            parse_command("init", &ui, &vm),
+            Some(Parsed::Prompt(PromptKind::CreateIdentity, None))
+        ));
+        assert!(matches!(
+            parse_command("new", &ui, &vm),
+            Some(Parsed::Prompt(PromptKind::CreateChannel, None))
+        ));
+    }
+
+    #[test]
+    fn composer_collects_text_and_enter_sends_to_the_active_channel() {
+        let mut ui = UiState::new();
+        let vm = vm_with_channel();
+        ui.screen = Screen::Channel;
+        ui.focus = Focus::Composer;
+        type_str(&mut ui, &vm, "hello there");
+        assert_eq!(ui.composer, "hello there");
+        // A colon in the composer is text, not the palette.
+        ui.on_key(key(KeyCode::Char(':')), &vm);
+        assert_eq!(ui.composer, "hello there:");
+        assert!(ui.mode.is_normal());
+        ui.on_key(key(KeyCode::Backspace), &vm);
+        match ui.on_key(key(KeyCode::Enter), &vm) {
+            Action::Dispatch(Command::SendText { channel_id, text }) => {
+                assert_eq!(channel_id, [7; 32]);
+                assert_eq!(text, "hello there");
+            }
+            other => panic!("expected SendText, got {other:?}"),
+        }
+        assert!(ui.composer.is_empty(), "composer clears after send");
+        // Empty composer: Enter sends nothing.
+        assert!(matches!(
+            ui.on_key(key(KeyCode::Enter), &vm),
+            Action::Redraw
+        ));
+        // Tab leaves the composer; then ':' opens the palette again.
+        ui.on_key(key(KeyCode::Tab), &vm);
+        assert_eq!(ui.focus, Focus::Members);
+        ui.on_key(key(KeyCode::Char(':')), &vm);
+        assert!(matches!(ui.mode, Mode::CommandPalette(_)));
+    }
+
+    #[test]
+    fn idle_lock_threshold() {
+        assert!(!idle_lock_due(1_000, 1_000 + IDLE_LOCK_SECS - 1));
+        assert!(idle_lock_due(1_000, 1_000 + IDLE_LOCK_SECS));
+        assert!(
+            !idle_lock_due(2_000, 1_000),
+            "clock going backwards never locks"
         );
     }
 }
