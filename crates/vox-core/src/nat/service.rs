@@ -40,6 +40,7 @@ use quinn::{RecvStream, SendStream};
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
+use crate::governance::genesis::Genesis;
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::log::sync::wire_error_for;
@@ -58,8 +59,8 @@ use crate::wire::{parse_frame, StructTag};
 pub const MAX_RENDEZVOUS_FRAME: usize = MAX_PREKEY_BUNDLE_BYTES + 16 * 1024;
 
 /// The most `RECORD` frames a client accepts for one `GET`: the store can hold at
-/// most this many live records for one `(channelID, epoch)`.
-pub const MAX_GET_RECORDS: usize = 2 * MAX_AUTHORS_PER_BUCKET + MAX_PREJOIN_PER_CHANNEL;
+/// most this many live records for one `(channelID, epoch)`, plus the genesis.
+pub const MAX_GET_RECORDS: usize = 2 * MAX_AUTHORS_PER_BUCKET + MAX_PREJOIN_PER_CHANNEL + 1;
 
 /// Which record kinds a `GET` asks for (a bit set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,8 +73,11 @@ impl RecordKinds {
     pub const BUNDLES: Self = Self(0b010);
     /// Pre-join records (`0x0008`).
     pub const PREJOINS: Self = Self(0b100);
+    /// The channel genesis (`0x000D`) — what a cold joiner needs before it can
+    /// build channel state at all (ADR-007).
+    pub const GENESIS: Self = Self(0b1000);
     /// Every kind.
-    pub const ALL: Self = Self(0b111);
+    pub const ALL: Self = Self(0b1111);
 
     /// Combine two sets.
     #[must_use]
@@ -308,8 +312,9 @@ pub trait MembershipOracle: Send + Sync {
 }
 
 /// The live records a `GET` returned, parsed by kind (unverified — see the
-/// module docs).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// module docs; the genesis is the exception, verified and channel-bound on
+/// arrival because it is self-validating).
+#[derive(Debug, Clone, Default)]
 pub struct RecordSet {
     /// Member address records.
     pub members: Vec<RendezvousRecord>,
@@ -317,6 +322,8 @@ pub struct RecordSet {
     pub bundles: Vec<MemberBundleRecord>,
     /// Pre-join records.
     pub prejoins: Vec<PreJoinRecord>,
+    /// The channel genesis, if the board holds it.
+    pub genesis: Option<Genesis>,
 }
 
 /// The server side: a [`RendezvousStore`] behind a lock, the membership oracle
@@ -395,6 +402,11 @@ impl RendezvousService {
                             .map(|r| RendezvousResponse::Record(r.to_wire())),
                     );
                 }
+                if kinds.contains(RecordKinds::GENESIS) {
+                    if let Some(g) = store.genesis(channel_id) {
+                        out.push(RendezvousResponse::Record(g.to_wire()));
+                    }
+                }
                 drop(store);
                 out.push(RendezvousResponse::End);
                 out
@@ -432,6 +444,13 @@ impl RendezvousService {
                 let rec =
                     PreJoinRecord::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
                 lock(&self.store).accept_prejoin(rec, now)
+            }
+            // Self-validating: its hash is the channelID, so no author check is
+            // needed or possible (ADR-007; see `accept_genesis`).
+            StructTag::GenesisRecord => {
+                let genesis =
+                    Genesis::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
+                lock(&self.store).accept_genesis(genesis)
             }
             _ => return Err(RejectReason::UnknownKind),
         };
@@ -554,6 +573,18 @@ impl RendezvousClient {
                         }
                         StructTag::PreJoinRecord if kinds.contains(RecordKinds::PREJOINS) => {
                             set.prejoins.push(PreJoinRecord::from_wire(&wire)?);
+                        }
+                        StructTag::GenesisRecord if kinds.contains(RecordKinds::GENESIS) => {
+                            let g = Genesis::from_wire(&wire)?;
+                            // The board is only availability: verify the genesis and
+                            // bind it to the channelID we asked for.
+                            g.verify()?;
+                            if g.channel_id() != *channel_id {
+                                return Err(Error::MalformedRendezvous(
+                                    "rendezvous get: genesis is not this channel's",
+                                ));
+                            }
+                            set.genesis = Some(g);
                         }
                         _ => {
                             return Err(Error::MalformedRendezvous(
@@ -689,13 +720,16 @@ mod tests {
         let mut e = Encoder::new();
         e.array(3).uint(OP_GET).bytes(&cid).uint(1);
         assert!(RendezvousRequest::from_frame(&e.finish()).is_err());
+        // A bit outside the four kinds (members, bundles, pre-joins, genesis).
         let mut e = Encoder::new();
-        e.array(4).uint(OP_GET).bytes(&cid).uint(1).uint(8);
+        e.array(4).uint(OP_GET).bytes(&cid).uint(1).uint(16);
         assert!(matches!(
             RendezvousRequest::from_frame(&e.finish()),
             Err(Error::MalformedRendezvous("rendezvous get kinds"))
         ));
         assert!(RecordKinds::from_bits(0).is_err());
+        assert!(RecordKinds::from_bits(u64::from(RecordKinds::ALL.bits())).is_ok());
+        assert!(RecordKinds::ALL.contains(RecordKinds::GENESIS));
         let mut e = Encoder::new();
         e.array(2).uint(OP_REJECTED).uint(9);
         assert!(matches!(
@@ -760,6 +794,50 @@ mod tests {
             vec![RendezvousResponse::Rejected(RejectReason::Malformed)]
         );
 
+        // The genesis: self-validating, so anyone may publish it and no membership
+        // check applies (ADR-007 — a cold joiner needs it before it has any state).
+        let genesis = crate::governance::genesis::Genesis::create(
+            &stranger,
+            T0,
+            crate::governance::genesis::ChannelPolicy {
+                history_mode: crate::governance::genesis::HistoryMode::ForwardOnly,
+                deniability_mode: crate::governance::genesis::DeniabilityMode::Attributable,
+                ttl: 0,
+                min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
+            },
+        )
+        .unwrap();
+        let g_cid = genesis.channel_id();
+        assert_eq!(
+            put(genesis.to_wire()),
+            vec![RendezvousResponse::Accepted],
+            "a non-member may publish a genesis"
+        );
+        assert_eq!(
+            put(genesis.to_wire()),
+            vec![RendezvousResponse::Accepted],
+            "re-publishing the same genesis is a no-op"
+        );
+        // It is filed under its own hash, so it never answers another channel's GET.
+        let for_other = svc.handle(&RendezvousRequest::Get {
+            channel_id: cid,
+            epoch: 1,
+            kinds: RecordKinds::GENESIS,
+        });
+        assert_eq!(for_other, vec![RendezvousResponse::End]);
+        let for_its_own = svc.handle(&RendezvousRequest::Get {
+            channel_id: g_cid,
+            epoch: 0,
+            kinds: RecordKinds::GENESIS,
+        });
+        assert_eq!(
+            for_its_own,
+            vec![
+                RendezvousResponse::Record(genesis.to_wire()),
+                RendezvousResponse::End
+            ]
+        );
+
         // GET by kinds.
         let get = |kinds| {
             svc.handle(&RendezvousRequest::Get {
@@ -769,7 +847,11 @@ mod tests {
             })
         };
         let all = get(RecordKinds::ALL);
-        assert_eq!(all.len(), 4, "member + bundle + prejoin + End");
+        assert_eq!(
+            all.len(),
+            4,
+            "member + bundle + prejoin + End (no genesis here)"
+        );
         assert_eq!(all.last(), Some(&RendezvousResponse::End));
         let only_bundles = get(RecordKinds::BUNDLES);
         assert_eq!(

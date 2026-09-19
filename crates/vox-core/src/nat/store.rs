@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
+use crate::governance::genesis::Genesis;
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::nat::record::{MemberBundleRecord, PreJoinRecord, RendezvousRecord};
@@ -73,6 +74,12 @@ pub const MAX_PREJOIN_PER_CHANNEL: usize = 256;
 /// records are already membership-bounded; this is defense in depth against a
 /// permissive membership lookup.
 pub const MAX_AUTHORS_PER_BUCKET: usize = 1024;
+
+/// Maximum distinct channels whose **genesis** this store retains (M14.7b). A
+/// genesis is immutable and self-validating (its hash *is* the channelID), so it
+/// needs no TTL and no author check — only a bound, so an unknown peer cannot grow
+/// the board without limit by inventing channels.
+pub const MAX_GENESIS_CHANNELS: usize = 4096;
 
 /// The expiry instant of a member record (epoch-seconds).
 fn member_expiry(rec: &RendezvousRecord) -> u64 {
@@ -137,6 +144,10 @@ pub struct RendezvousStore {
     bundles: HashMap<(Digest32, u64), HashMap<Digest32, MemberBundleRecord>>,
     /// `channelID` → (`asserted_id` → current pre-join record).
     prejoins: HashMap<Digest32, HashMap<Digest32, PreJoinRecord>>,
+    /// `channelID` → that channel's genesis (ADR-007: a cold-joining node fetches
+    /// the genesis from the rendezvous and accepts it only if its hash equals the
+    /// channelID it joined with).
+    genesis: HashMap<Digest32, Genesis>,
 }
 
 impl RendezvousStore {
@@ -253,6 +264,40 @@ impl RendezvousStore {
         // 5. Admit: one current bundle per author.
         bucket.insert(record.author_id, record);
         Ok(())
+    }
+
+    /// Admit a channel's **genesis** (ADR-007 §Genesis; M14.7b).
+    ///
+    /// This kind needs neither a membership check nor a TTL, and that is not a gap:
+    /// the genesis is immutable and **self-validating** — its hash *is* the
+    /// channelID, so a wrong or forged genesis cannot be filed under a channelID
+    /// anyone asked for, and a reader re-checks the hash against the channelID it
+    /// joined with regardless. Anyone may therefore publish it (a joiner that has
+    /// one, an anchor restoring its store), which is exactly what makes a cold join
+    /// possible when no member is online. Re-publishing the same genesis is a no-op;
+    /// the only bound is [`MAX_GENESIS_CHANNELS`].
+    pub fn accept_genesis(&mut self, genesis: Genesis) -> Result<()> {
+        genesis.verify()?;
+        let channel_id = genesis.channel_id();
+        if let Some(existing) = self.genesis.get(&channel_id) {
+            // Two different genesis structures cannot share a channelID unless
+            // SHA-256 collided; keep the one already verified and filed.
+            if existing.to_wire() == genesis.to_wire() {
+                return Ok(());
+            }
+            return Err(Error::RendezvousRejected("genesis already present"));
+        }
+        if self.genesis.len() >= MAX_GENESIS_CHANNELS {
+            return Err(Error::RendezvousRejected("genesis board at capacity"));
+        }
+        self.genesis.insert(channel_id, genesis);
+        Ok(())
+    }
+
+    /// The stored genesis for `channel_id`, if any.
+    #[must_use]
+    pub fn genesis(&self, channel_id: &Digest32) -> Option<&Genesis> {
+        self.genesis.get(channel_id)
     }
 
     /// Admit (or refresh) a **pre-join** rendezvous record, enforcing the ADR-012
@@ -710,5 +755,54 @@ mod tests {
         assert!(store.current_bundles(&cid, 1, late).is_empty());
         assert_eq!(store.prune_expired(late), 2);
         assert!(store.bundles.is_empty());
+    }
+    #[test]
+    fn a_genesis_is_self_validating_needs_no_member_and_is_filed_by_its_hash() {
+        use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+        let creator = signer(7, 8);
+        let stranger = signer(9, 10);
+        let policy = ChannelPolicy {
+            history_mode: HistoryMode::ForwardOnly,
+            deniability_mode: DeniabilityMode::Attributable,
+            ttl: 0,
+            min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
+        };
+        let genesis = Genesis::create(&creator, 1_700_000_000, policy).unwrap();
+        let cid = genesis.channel_id();
+
+        let mut store = RendezvousStore::new();
+        assert!(store.genesis(&cid).is_none());
+        // No membership oracle is consulted: a stranger relaying someone's genesis
+        // is exactly how a cold join works (ADR-007).
+        store.accept_genesis(genesis.clone()).unwrap();
+        assert_eq!(
+            store.genesis(&cid).map(Genesis::to_wire),
+            Some(genesis.to_wire())
+        );
+        // Idempotent.
+        store.accept_genesis(genesis.clone()).unwrap();
+
+        // A different channel's genesis is filed under its own hash, never this one.
+        let other = Genesis::create(&stranger, 1_700_000_001, policy).unwrap();
+        let other_cid = other.channel_id();
+        assert_ne!(other_cid, cid);
+        store.accept_genesis(other).unwrap();
+        assert_eq!(
+            store.genesis(&cid).map(Genesis::to_wire),
+            Some(genesis.to_wire())
+        );
+
+        // A tampered genesis fails its own verification and is never filed.
+        let mut broken = genesis.clone();
+        broken.body.created = broken.body.created.wrapping_add(1);
+        assert!(store.accept_genesis(broken).is_err());
+        assert_eq!(
+            store.genesis(&cid).map(Genesis::to_wire),
+            Some(genesis.to_wire())
+        );
+        // It also has no TTL: it is immutable and still there far in the future.
+        assert!(store.genesis(&cid).is_some());
+        store.prune_expired(1_700_000_000 + 10 * 365 * 24 * 3600);
+        assert!(store.genesis(&cid).is_some(), "a genesis never expires");
     }
 }
