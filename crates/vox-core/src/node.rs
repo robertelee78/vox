@@ -28,6 +28,7 @@ pub mod api;
 pub mod channel;
 pub mod content;
 pub mod joinstream;
+pub mod link;
 pub mod net;
 pub mod pairwise_stream;
 pub mod paths;

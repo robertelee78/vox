@@ -165,6 +165,52 @@ impl From<SocketAddr> for Multiaddr {
     }
 }
 
+impl Multiaddr {
+    /// Parse the text form [`Display`](fmt::Display) produces: `/ip6/<addr>/udp/<port>`,
+    /// `/ip4/<addr>/udp/<port>` or `/relay/<64 hex chars>`.
+    ///
+    /// Strict: an unknown protocol, a missing or extra segment, a malformed address
+    /// or port, or a relay fingerprint that is not exactly 32 hex-encoded bytes is
+    /// [`Error::MalformedRendezvous`]. This is the form the ADR-016 invite link
+    /// carries, so it must round-trip exactly.
+    pub fn parse(text: &str) -> Result<Self> {
+        let parts: Vec<&str> = text.split('/').collect();
+        // A leading '/' yields an empty first element.
+        match parts.as_slice() {
+            ["", "ip6", addr, "udp", port] => {
+                let ip: Ipv6Addr = addr
+                    .parse()
+                    .map_err(|_| Error::MalformedRendezvous("multiaddr ip6 address"))?;
+                let port: u16 = port
+                    .parse()
+                    .map_err(|_| Error::MalformedRendezvous("multiaddr port"))?;
+                Ok(Multiaddr::Ip6(SocketAddrV6::new(ip, port, 0, 0)))
+            }
+            ["", "ip4", addr, "udp", port] => {
+                let ip: Ipv4Addr = addr
+                    .parse()
+                    .map_err(|_| Error::MalformedRendezvous("multiaddr ip4 address"))?;
+                let port: u16 = port
+                    .parse()
+                    .map_err(|_| Error::MalformedRendezvous("multiaddr port"))?;
+                Ok(Multiaddr::Ip4(SocketAddrV4::new(ip, port)))
+            }
+            ["", "relay", hex] => {
+                if hex.len() != 64 {
+                    return Err(Error::MalformedRendezvous("multiaddr relay length"));
+                }
+                let mut out = [0u8; 32];
+                for (i, byte) in out.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                        .map_err(|_| Error::MalformedRendezvous("multiaddr relay hex"))?;
+                }
+                Ok(Multiaddr::Relay(out))
+            }
+            _ => Err(Error::MalformedRendezvous("multiaddr form")),
+        }
+    }
+}
+
 impl fmt::Display for Multiaddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -410,5 +456,37 @@ mod tests {
         .unwrap();
         assert_eq!(list.direct_candidates().len(), 2);
         assert_eq!(list.relay_hints(), vec![[9u8; 32]]);
+    }
+    #[test]
+    fn multiaddr_text_round_trips_and_rejects_malformed() {
+        let cases = [
+            Multiaddr::Ip4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 9), 4433)),
+            Multiaddr::Ip6(SocketAddrV6::new(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                4433,
+                0,
+                0,
+            )),
+            Multiaddr::Relay([0xAB; 32]),
+        ];
+        for a in cases {
+            let text = a.to_string();
+            assert_eq!(Multiaddr::parse(&text).unwrap(), a, "{text}");
+        }
+        for bad in [
+            "",
+            "/",
+            "/ip4/10.0.0.9",
+            "/ip4/10.0.0.9/udp/",
+            "/ip4/10.0.0.9/udp/99999",
+            "/ip4/not-an-ip/udp/443",
+            "/ip6/10.0.0.9/udp/443",
+            "/quic/10.0.0.9/udp/443",
+            "/relay/abc",
+            "/relay/zz00000000000000000000000000000000000000000000000000000000000000",
+            "/ip4/10.0.0.9/udp/443/extra",
+        ] {
+            assert!(Multiaddr::parse(bad).is_err(), "accepted {bad:?}");
+        }
     }
 }
