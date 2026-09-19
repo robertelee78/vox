@@ -34,3 +34,4 @@ pub mod paths;
 pub mod prekeys;
 pub mod profile;
 pub mod store;
+pub mod syncstream;

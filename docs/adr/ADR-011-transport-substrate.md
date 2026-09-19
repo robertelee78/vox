@@ -138,8 +138,9 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   first frame**, the one-element canonical-CBOR array `[kind]` (`transport::streams::StreamKind`:
   `sync` 1, `join` 2, `pairwise` 3, `rendezvous` 4, `tunnel` 5, `coord` 6); `open_typed` writes it,
   `accept_typed` reads it and refuses an unknown kind before any flow bytes are read. `close_code`
-  is public so any flow can reset its stream with the ADR-008 code. M5 sync still opens untyped
-  streams through `QuicStreamTransport::open/accept`; the M14.6 connection manager will type them.
+  is public so any flow can reset its stream with the ADR-008 code. M5 sync opens a **typed** `sync`
+  stream via `node::syncstream::open_sync` (M14.6); `QuicStreamTransport::open/accept` remain for
+  callers that pair streams themselves.
 - **Known gaps (recorded 2026-09-19).** `confirm_hybrid_group` checks only ALPN `vox/1`, and
   `SessionEstablishment::new` **hardcodes** the group code point `0x11EC`, so the "downgrade
   auditability" record documents a constant rather than an observation — the real guarantee is

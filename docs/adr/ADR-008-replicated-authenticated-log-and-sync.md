@@ -2,7 +2,7 @@
 
 **Status**: implemented (M5, `crates/vox-core/src/log/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`.
+**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
@@ -260,8 +260,19 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   fork remedy — but the discriminator now exists: `node::channel::classify_payload` (2026-09-20, ADR-016
   M14.5) types an entry from its payload, which is self-describing and disjoint (a governance payload is a
   struct-tagged frame, a sender-key message is domain-prefixed `vox/group-msg/v1`, anything else is
-  refused), and every entry the node accepts or reloads is classified that way. Wiring it into the sync
-  resolver is M14.6. (5) `K_self` is derived but never applied (the self-log test stores plaintext);
+  refused), and every entry the node accepts or reloads is classified that way. **Closed for sync
+  (2026-09-20, M14.6):** `node::channel::ChannelAuthors` is the resolver a channel hands to a session, and
+  its `kind_for` uses that discriminator, so a governance entry received via sync is classified as
+  governance rather than given the content fork remedy. Only a *pruned* payload still falls back to
+  `Content`, and governance entries must retain their payload, so that case is not governance.
+- **Sync presupposes that every author has been admitted (recorded 2026-09-20, M14.6).** `apply_entry`
+  turns an author the resolver cannot resolve into `WireError::AuthenticatorInvalid`, which is a **hard**
+  failure that closes the session — correctly, since an unverifiable entry must not be stored. The
+  operational consequence is worth stating plainly: a member must admit the channel's current members
+  (whose full composite keys are on the ADR-012 board) *before* it can sync, or the first entry from an
+  unadmitted author kills the session. A test pins this exact behaviour rather than papering over it, and
+  `ChannelState::sync_over` persists everything that arrived **before** surfacing the coded failure, so a
+  partial session still makes durable progress instead of leaving entries only in the in-memory DAG. (5) `K_self` is derived but never applied (the self-log test stores plaintext);
   `self_channel_id` (`vox/self-channel-id/v1`) is an addition not in the Decision. (6) Transport I/O
   errors map to `0x01`, which the M0 table defines as "version". (7) The authenticator type sits outside
   the signed skeleton and `algo_ids[0]` is pinned to the composite id even for deniable entries.

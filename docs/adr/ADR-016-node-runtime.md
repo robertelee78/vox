@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.5 done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.6 done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -396,6 +396,21 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   re-derived. Proven by an in-process test (ciphertext before the key, backfill on arrival, forward-only
   history releasing nothing earlier, replay refused, survives a reopen) and a loopback QUIC test (the SKDM
   crosses a real pairwise stream sealed in a real PQXDH session and then decrypts the author's broadcast).
+- **Frontier sync over QUIC (M14.6).** `node::syncstream::open_sync` / `accept_sync` put the ADR-008
+  engine on a **typed** `sync` stream, and `ChannelState::sync_over` is the reconciliation the runtime owes
+  after a session: sync applies entries to the log itself, then the channel seals each new entry into a
+  `LogDb` segment, folds governance into the evaluator, and renders content subject to *both* gates (key
+  held **and** author consented). Whatever arrived is reconciled even when the session then fails, so a
+  partial session makes durable progress; the coded ADR-008 reason is preserved rather than collapsed.
+  `SyncSchedule` is the §"Sync scheduling" policy as a pure function — a session on connect, on a local
+  append, and every `SYNC_INTERVAL_SECS` (30) otherwise — and `should_use_range_mode` is the >100-author
+  rule; wiring them to the actor's timers is M14.7/M14.8. The session's resolver
+  (`ChannelState::resolver`) closes ADR-008's `kind_for` gap for sync. One constraint surfaced and is now
+  documented rather than discovered later: a member must admit the channel's current members before it can
+  sync, because an entry from an unadmitted author is an unverifiable entry and hard-fails the session —
+  the test asserts the failure, then admits and succeeds. Proven over loopback QUIC: two members converge
+  and each renders the other's post-consent message (and *not* what was written before consent, under
+  forward-only history), while a third member syncs the entire log and renders nothing.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
