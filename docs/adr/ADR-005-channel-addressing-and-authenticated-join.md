@@ -1,7 +1,8 @@
 # ADR-005: Channel Addressing and Authenticated Join
 
-**Status**: proposed
+**Status**: implemented (M3, `crates/vox-core/src/join/`)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — KDF error paths (`K_pop`, rendezvous) now surface as errors instead of an all-zero key; `K_pop` returned zeroizing.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: channel, addressing, pake, cpace, rendezvous, join
 
@@ -116,6 +117,10 @@ caps (ADR-012), not by join PoW.
   not exposed on the wire before the pairwise session exists.
 - **PoW precedes CPace.** A responder verifies the join PoW token *before* performing any CPace work,
   so unauthenticated peers cannot force PAKE computation.
+- **No zero-key fallback.** `derive_pop_key` and the rendezvous derivation return `Result` and
+  propagate the (unreachable for a 32-byte OKM) HKDF-Expand error as `MalformedJoin`; they never
+  substitute an all-zero key. `K_pop` is returned in a `Zeroizing` buffer. *(2026-09-19 review: both
+  previously zero-filled on the error path — a key no honest peer derives is still a key.)*
 
 ## Consequences
 

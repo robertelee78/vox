@@ -169,7 +169,9 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
 - **Opened segment plaintext is a secret.** `store::open_segment` returns the decrypted segment in a
   `Zeroizing<Vec<u8>>` — it is exactly what the double-lock protects — so a caller that drops it does
   not leave the cleartext in freed memory. `EpochKey` (ADR-009) likewise has no `Clone`, matching the
-  `Sek` posture: one owner, one wipe point. *(2026-09-19 secret-hygiene sweep.)*
+  `Sek` posture: one owner, one wipe point. *(2026-09-19 secret-hygiene sweep.)* Both are pinned as
+  non-`Clone` by an autoref-specialization check (`test_support::is_clone!`) with a positive control —
+  replacing a test that compiled for any type and proved nothing.
 
 ## Links
 **Depends on**: ADR-002, ADR-007, ADR-008.

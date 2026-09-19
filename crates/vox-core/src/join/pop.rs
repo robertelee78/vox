@@ -37,6 +37,7 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::hash::{sha256_concat, Digest32, COMPOSITE_PUB_LEN, COMPOSITE_SIG_LEN};
@@ -162,15 +163,17 @@ impl IdentityProof {
 
 /// Derive the PoP-sealing AEAD key from the CPace ISK:
 /// `K_pop = HKDF-SHA-256(ISK, info = "vox/cpace-pop/v1")` (ADR-005).
-#[must_use]
-pub fn derive_pop_key(isk: &[u8]) -> [u8; 32] {
+///
+/// Returned in a [`Zeroizing`] buffer (it is a symmetric key). HKDF-Expand with
+/// a 32-byte OKM never fails for SHA-256; the error path is still surfaced as
+/// [`Error::MalformedJoin`] — never as an all-zero key (no fallback; 2026-09-19
+/// review).
+pub fn derive_pop_key(isk: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let hk = Hkdf::<Sha256>::new(None, isk);
-    let mut key = [0u8; 32];
-    // HKDF-Expand with a 32-byte OKM never fails for SHA-256; map defensively.
-    if hk.expand(POP_SEAL_DOMAIN.as_bytes(), &mut key).is_err() {
-        key = [0u8; 32];
-    }
-    key
+    let mut key = Zeroizing::new([0u8; 32]);
+    hk.expand(POP_SEAL_DOMAIN.as_bytes(), key.as_mut())
+        .map_err(|_| Error::MalformedJoin("pop key hkdf expand"))?;
+    Ok(key)
 }
 
 /// Seal an [`IdentityProof`] under an already-derived `K_pop` (see
@@ -210,13 +213,15 @@ pub fn open_pop_with_key(key: &[u8; 32], sealed: &[u8]) -> Result<IdentityProof>
 /// `K_pop` from the CPace `isk` (ADR-005). Thin wrapper over [`derive_pop_key`] +
 /// [`seal_pop_with_key`].
 pub fn seal_pop(isk: &[u8], proof: &IdentityProof) -> Result<Vec<u8>> {
-    seal_pop_with_key(&derive_pop_key(isk), proof)
+    let key = derive_pop_key(isk)?;
+    seal_pop_with_key(&key, proof)
 }
 
 /// Open a PoP sealed by [`seal_pop`], deriving `K_pop` from the CPace `isk`. Thin
 /// wrapper over [`derive_pop_key`] + [`open_pop_with_key`].
 pub fn open_pop(isk: &[u8], sealed: &[u8]) -> Result<IdentityProof> {
-    open_pop_with_key(&derive_pop_key(isk), sealed)
+    let key = derive_pop_key(isk)?;
+    open_pop_with_key(&key, sealed)
 }
 
 /// The verified peer identity yielded by a successful PoP check: the composite

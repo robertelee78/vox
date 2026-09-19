@@ -2,7 +2,7 @@
 
 **Status**: implemented (M5, `crates/vox-core/src/log/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification.
+**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
@@ -244,6 +244,11 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   attention-DoS primitive.)* `sync::apply_entry` still reports a genuine fork as the non-fatal
   `ApplyOutcome::Fork`; the forged case now closes the stream with wire error `0x05` like any other
   authenticator failure.
+- **Self-channel KDFs have no zero-fill fallback.** `derive_k_self`, `derive_rendezvous_self` and
+  `self_channel_id` return `Result`; the shared HKDF-Expand helper propagates the ceiling error
+  (output > 255·32 bytes) and leaves the caller's buffer untouched instead of zero-filling it. The
+  three fixed 32-byte outputs can never hit it, but the helper's contract is general and a test pins
+  the oversize case. *(2026-09-19 review.)*
 
 ## Links
 **Depends on**: ADR-002, ADR-006.

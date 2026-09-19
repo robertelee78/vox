@@ -53,18 +53,17 @@ pub const SELF_RENDEZVOUS_LABEL: &str = "vox/self-rzv/v1";
 /// fully-assembled info string (use [`channel_info`] / [`self_info`] to build the
 /// canonical ones). HKDF is used with an empty salt: the seed is already uniform,
 /// and the info label provides domain separation between uses.
-#[must_use]
-pub fn rendezvous(seed: &Digest32, info: &[u8]) -> [u8; RENDEZVOUS_KEY_LEN] {
+///
+/// HKDF-Expand over a 32-byte output cannot exceed the 255·HashLen ceiling, so
+/// the only documented error path is unreachable; it is nevertheless surfaced as
+/// [`Error::MalformedJoin`] — never as an all-zero key (no fallback; 2026-09-19
+/// review).
+pub fn rendezvous(seed: &Digest32, info: &[u8]) -> Result<[u8; RENDEZVOUS_KEY_LEN]> {
     let hk = Hkdf::<Sha256>::new(None, seed);
     let mut okm = [0u8; RENDEZVOUS_KEY_LEN];
-    // HKDF-Expand over a 32-byte output cannot exceed the 255*HashLen ceiling, so
-    // the only documented error path is unreachable. If it ever did fire, `okm`
-    // stays all-zero (a key no honest peer derives) rather than panicking — but it
-    // cannot, since 32 <= 255*32.
-    if hk.expand(info, &mut okm).is_err() {
-        okm = [0u8; RENDEZVOUS_KEY_LEN];
-    }
-    okm
+    hk.expand(info, &mut okm)
+        .map_err(|_| Error::MalformedJoin("rendezvous hkdf expand"))?;
+    Ok(okm)
 }
 
 /// Build the channel-rendezvous info string `"vox/rendezvous/v1" ‖ epoch_be`
@@ -86,8 +85,7 @@ pub fn self_info() -> Vec<u8> {
 
 /// Derive the channel rendezvous key for `(channel_id, epoch)` — the convenience
 /// wrapper over [`rendezvous`] + [`channel_info`] that ADR-012 (M10) consumes.
-#[must_use]
-pub fn channel_rendezvous(channel_id: &Digest32, epoch: u64) -> [u8; RENDEZVOUS_KEY_LEN] {
+pub fn channel_rendezvous(channel_id: &Digest32, epoch: u64) -> Result<[u8; RENDEZVOUS_KEY_LEN]> {
     rendezvous(channel_id, &channel_info(epoch))
 }
 
@@ -95,8 +93,7 @@ pub fn channel_rendezvous(channel_id: &Digest32, epoch: u64) -> [u8; RENDEZVOUS_
 /// (ADR-005/ADR-008). The seed is the **private** per-identity self-channel
 /// secret — never the public identity key — so no third party can locate where a
 /// user's own shared-root devices meet.
-#[must_use]
-pub fn self_rendezvous(self_seed: &Digest32) -> [u8; RENDEZVOUS_KEY_LEN] {
+pub fn self_rendezvous(self_seed: &Digest32) -> Result<[u8; RENDEZVOUS_KEY_LEN]> {
     rendezvous(self_seed, &self_info())
 }
 
@@ -125,21 +122,27 @@ mod tests {
     #[test]
     fn rendezvous_is_deterministic() {
         let s = seed(7);
-        assert_eq!(channel_rendezvous(&s, 1), channel_rendezvous(&s, 1));
+        assert_eq!(
+            channel_rendezvous(&s, 1).unwrap(),
+            channel_rendezvous(&s, 1).unwrap()
+        );
     }
 
     #[test]
     fn rendezvous_is_epoch_sensitive() {
         // Epoch rotation (ADR-007) must move the channel to a fresh address.
         let s = seed(7);
-        assert_ne!(channel_rendezvous(&s, 1), channel_rendezvous(&s, 2));
+        assert_ne!(
+            channel_rendezvous(&s, 1).unwrap(),
+            channel_rendezvous(&s, 2).unwrap()
+        );
     }
 
     #[test]
     fn rendezvous_is_seed_sensitive() {
         assert_ne!(
-            channel_rendezvous(&seed(1), 5),
-            channel_rendezvous(&seed(2), 5)
+            channel_rendezvous(&seed(1), 5).unwrap(),
+            channel_rendezvous(&seed(2), 5).unwrap()
         );
     }
 
@@ -149,7 +152,10 @@ mod tests {
         // on the same rendezvous address — the labels separate the two uses.
         let s = seed(9);
         // Channel at epoch 0 vs self-channel (no epoch).
-        assert_ne!(channel_rendezvous(&s, 0), self_rendezvous(&s));
+        assert_ne!(
+            channel_rendezvous(&s, 0).unwrap(),
+            self_rendezvous(&s).unwrap()
+        );
         // And the raw info strings are different.
         assert_ne!(channel_info(0), self_info());
     }
@@ -164,7 +170,7 @@ mod tests {
 
     #[test]
     fn truncate_narrows_and_rejects_overlong() {
-        let key = channel_rendezvous(&seed(3), 0);
+        let key = channel_rendezvous(&seed(3), 0).unwrap();
         // A narrower width is a prefix of the full key.
         let narrow = truncate(&key, 20).unwrap();
         assert_eq!(narrow.len(), 20);
@@ -182,6 +188,6 @@ mod tests {
         let hk = Hkdf::<Sha256>::new(None, &s);
         let mut expected = [0u8; 32];
         hk.expand(&channel_info(42), &mut expected).unwrap();
-        assert_eq!(channel_rendezvous(&s, 42), expected);
+        assert_eq!(channel_rendezvous(&s, 42).unwrap(), expected);
     }
 }

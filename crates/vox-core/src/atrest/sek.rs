@@ -743,10 +743,11 @@ mod tests {
 
     #[test]
     fn sek_is_not_clone() {
-        // Compile-time guard documented as a runtime note: `Sek` must not be Clone
-        // (a stray clone could outlive a lock). This is enforced by the type not
-        // deriving Clone; this test exists so the intent is visible in the suite.
-        fn assert_not_clone<T>() {}
-        assert_not_clone::<Sek>();
+        // `Sek` must not be Clone (a stray clone could outlive a lock). Checked
+        // with autoref specialization, which genuinely discriminates Clone from
+        // non-Clone types on stable Rust; the positive control proves the checker
+        // is not vacuous (the previous version compiled for any `T`).
+        assert!(!crate::test_support::is_clone!(Sek));
+        assert!(crate::test_support::is_clone!(Vec<u8>)); // positive control
     }
 }
