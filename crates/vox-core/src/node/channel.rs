@@ -58,6 +58,7 @@ use crate::identity::composite::{CompositePublicKey, RootSigner};
 use crate::log::dag::{AdmissionPolicy, Dag};
 use crate::log::entry::{Entry, EntryKind, EntrySkeleton, ZERO_HASH};
 use crate::log::feed::lipmaa;
+use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
 use crate::node::content::Content;
 use crate::node::profile::Profile;
 use crate::suite::{algo, SuiteFloor};
@@ -91,6 +92,59 @@ pub const MAX_RECEIVER_CHAINS: usize = 4096;
 pub const MAX_AUTHORS: usize = 1024;
 /// Cap on a local channel name.
 pub const MAX_LOCAL_NAME_LEN: usize = 128;
+
+/// Map an ADR-008 coded sync failure onto the error taxonomy, keeping the reason
+/// (the ADR's rule is that a failure is never silently downgraded).
+fn sync_failure(code: crate::wire::WireError) -> Error {
+    Error::MalformedGovernance(match code {
+        crate::wire::WireError::ProtocolVersionUnsupported => "sync failed: protocol version",
+        crate::wire::WireError::SuiteBelowFloor => "sync failed: suite below floor",
+        crate::wire::WireError::UnknownStructTag => "sync failed: unknown struct tag",
+        crate::wire::WireError::UnknownAlgoId => "sync failed: unknown algo id",
+        crate::wire::WireError::AuthenticatorInvalid => "sync failed: authenticator invalid",
+        crate::wire::WireError::QuotaExceeded => "sync failed: quota exceeded",
+        crate::wire::WireError::SyncModeUnsupported => "sync failed: sync mode unsupported",
+        crate::wire::WireError::EpochMismatch => "sync failed: epoch mismatch",
+    })
+}
+
+/// The channel's [`AuthorResolver`] for ADR-008 sync: the admitted authors' keys,
+/// plus the entry classification the trait's `kind_for` previously had no
+/// discriminator for (it defaulted everything to `Content`, so a governance entry
+/// received via sync got the content fork remedy).
+pub struct ChannelAuthors {
+    authors: BTreeMap<Digest32, CompositePublicKey>,
+}
+
+impl AuthorResolver for ChannelAuthors {
+    fn key_for(&self, author: &Digest32) -> Option<CompositePublicKey> {
+        self.authors.get(author).cloned()
+    }
+
+    fn kind_for(&self, entry: &Entry) -> EntryKind {
+        // A governance payload is a struct-tagged frame, a sender-key message is
+        // domain-prefixed. A payload that is neither, or a pruned one (which cannot
+        // be classified at all), falls back to `Content` — the conservative choice,
+        // since governance entries must retain their payload (ADR-008) and so are
+        // never the pruned case.
+        entry
+            .payload
+            .as_deref()
+            .and_then(|p| classify_payload(p).ok())
+            .unwrap_or(EntryKind::Content)
+    }
+}
+
+/// What one [`ChannelState::sync_over`] session did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SyncOutcome {
+    /// Entries the ADR-008 session applied to the log.
+    pub applied: usize,
+    /// How many of those were governance entries folded into the evaluator.
+    pub governance: usize,
+    /// How many of those were decrypted and rendered into the timeline.
+    pub rendered: usize,
+}
 
 /// What [`ChannelState::accept_entry`] did with a peer's entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,6 +826,19 @@ impl ChannelState {
         self.authors.values().cloned().collect()
     }
 
+    /// Mint an SKDM releasing this identity's sender key at its **current
+    /// position** — the forward-only release consent normally uses (ADR-006: the
+    /// recipient reads from here on, never the history before it).
+    ///
+    /// Deliver it over a `pairwise` stream ([`crate::node::pairwise_stream`]) and
+    /// record the consent with [`ChannelState::issue_consent`], passing the same
+    /// SKDM so the grant carries its `skdm_ref`.
+    pub fn skdm_for_consent(&self, profile: &Profile) -> Result<Skdm> {
+        let signer = profile.signer()?;
+        let (iteration, key) = self.sender.current_position();
+        self.sender.skdm_for(signer, iteration, key)
+    }
+
     /// Issue a **consent grant** to `target`: the ADR-007 log fact that this
     /// identity released its sender key to `target`, carrying the `skdm_ref` of the
     /// SKDM actually delivered over the pairwise session and the history mode in
@@ -856,6 +923,147 @@ impl ChannelState {
     /// never trusted for authority).
     fn gov_heads(&self) -> std::collections::BTreeSet<Digest32> {
         self.gov_entries.iter().map(|g| g.entry_hash).collect()
+    }
+
+    /// The resolver ADR-008 sync needs: this channel's admitted authors and the
+    /// entry classification for `kind_for`.
+    #[must_use]
+    pub fn resolver(&self) -> ChannelAuthors {
+        ChannelAuthors {
+            authors: self.authors.clone(),
+        }
+    }
+
+    /// Run one ADR-008 **frontier sync** session over `transport` against a peer,
+    /// then durably record and render whatever arrived (ADR-016 §"Sync
+    /// scheduling").
+    ///
+    /// Sync is ADR-008's business and applies entries to the log itself; this method
+    /// is the reconciliation the runtime owes afterwards. It snapshots each author's
+    /// head, runs the session, and for every entry that appeared: seals it into a
+    /// `LogDb` segment, folds a governance entry into the evaluator, and renders a
+    /// content entry if this node holds the author's sender key **and** the author
+    /// consented to it (ADR-007). An entry that arrives but cannot be persisted
+    /// poisons the channel rather than living only in memory.
+    ///
+    /// **Whatever arrived is reconciled even when the session then fails**, so a
+    /// session that dies part-way still makes durable progress instead of leaving
+    /// entries in the in-memory DAG that the next open would silently drop.
+    ///
+    /// A session hard-fails on the first entry from an author this node has **not
+    /// admitted** (it cannot verify it), so a member must admit the channel's current
+    /// members — whose full composite keys are on the rendezvous board — before
+    /// syncing. That is what makes ADR-016's "`AuthorResolver` built from the genesis,
+    /// admin certificates and the stored records" load-bearing rather than incidental.
+    ///
+    /// The session is synchronous (ADR-008's engine is), so the caller runs it on a
+    /// thread that may block — `tokio::task::spawn_blocking` in the node.
+    pub fn sync_over<T: Transport>(
+        &mut self,
+        profile: &Profile,
+        transport: &mut T,
+        now_secs: u64,
+    ) -> Result<SyncOutcome> {
+        if self.poisoned {
+            return Err(Error::Profile(
+                "channel is poisoned after a failed persist; reopen it",
+            ));
+        }
+        // Per-author heads before the session, so the new entries can be found after.
+        let before: BTreeMap<Digest32, u64> = self
+            .authors
+            .keys()
+            .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
+            .collect();
+        let resolver = self.resolver();
+        let session = frontier_session_peer(
+            transport,
+            &mut self.dag,
+            &resolver,
+            &self.admission,
+            now_secs,
+        );
+
+        // Collect what arrived, in per-author sequence order, before touching the
+        // store (the borrow of `self.dag` ends here).
+        let mut arrived: Vec<(Digest32, Digest32, Vec<u8>)> = Vec::new();
+        for (author, head) in &before {
+            let Some(feed) = self.dag.feed(author) else {
+                continue;
+            };
+            for seq in (head + 1)..=feed.max_seq() {
+                if let Some(entry) = feed.get(seq) {
+                    let Some(payload) = entry.payload.clone() else {
+                        continue;
+                    };
+                    arrived.push((*author, entry.entry_hash(), payload));
+                }
+            }
+        }
+
+        let mut out = SyncOutcome {
+            applied: session.unwrap_or(arrived.len()),
+            ..SyncOutcome::default()
+        };
+        for (author, entry_hash, payload) in arrived {
+            let key = self
+                .authors
+                .get(&author)
+                .ok_or(Error::MalformedGovernance(
+                    "synced entry from an unadmitted author",
+                ))?
+                .clone();
+            let wire = self
+                .dag
+                .get_by_hash(&entry_hash)
+                .ok_or(Error::MalformedGovernance("synced entry vanished"))?
+                .to_wire();
+            let id = self.next_log_id;
+            let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
+            if let Err(e) =
+                profile
+                    .store()
+                    .put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)
+            {
+                self.poisoned = true;
+                return Err(e);
+            }
+            self.next_log_id = id.saturating_add(1);
+            match classify_payload(&payload)? {
+                EntryKind::Governance => {
+                    let entry = self
+                        .dag
+                        .get_by_hash(&entry_hash)
+                        .ok_or(Error::MalformedGovernance("synced entry vanished"))?
+                        .clone();
+                    let gov = GovEntry::from_verified_log_entry(
+                        &entry,
+                        &key,
+                        &self.channel_id,
+                        self.gov_heads(),
+                    )?;
+                    self.gov_entries.push(gov);
+                    self.evaluator = Self::build_evaluator(
+                        &self.genesis,
+                        &self.authors,
+                        &self.gov_entries,
+                        now_secs,
+                    )?;
+                    out.governance += 1;
+                }
+                EntryKind::Content => {
+                    if self.render_content(profile, author, entry_hash, &payload, now_secs)? {
+                        out.rendered += 1;
+                    }
+                }
+            }
+        }
+        // Reconciliation done; only now surface a session failure, with its coded
+        // reason preserved (ADR-008 never downgrades a failure silently).
+        match session {
+            Ok(_) => Ok(out),
+            Err(code) => Err(sync_failure(code)),
+        }
     }
 
     /// Accept a **sender-key distribution message** from `author` (ADR-006/ADR-007
