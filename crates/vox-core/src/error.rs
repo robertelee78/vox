@@ -265,6 +265,13 @@ pub enum Error {
         detail: String,
     },
 
+    /// A `vox://` invite link was malformed (ADR-016 §"Invite link"): wrong scheme,
+    /// a bad base32 digest, a malformed or over-long anchor list, a duplicate or
+    /// unknown query field. A link is untrusted input from a chat message, so
+    /// nothing about it is guessed. Carries a static reason.
+    #[error("malformed invite link: {0}")]
+    MalformedLink(&'static str),
+
     /// The responder refused a join (ADR-016 §"Join over the network"): the coarse
     /// reason it sent on the join stream. Deliberately not a fine-grained taxonomy —
     /// a wrong passphrase already fails locally on the joiner, so the responder has

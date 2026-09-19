@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.6 done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.7a done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -411,6 +411,16 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   the test asserts the failure, then admits and succeeds. Proven over loopback QUIC: two members converge
   and each renders the other's post-consent message (and *not* what was written before consent, under
   forward-only history), while a third member syncs the entire log and renders nothing.
+- **The `vox://` invite link (M14.7a).** `node::link::InviteLink` is the format above, parsed and rendered.
+  The 32-byte digests are lowercase unpadded RFC 4648 base32 (52 chars, case-insensitive on input, so a
+  link survives being re-typed or lower-cased by a chat client, and needs no percent-encoding); anchors use
+  the exact ADR-012 multiaddr text form, for which `Multiaddr::parse` now round-trips `Display`. The
+  structure enforces the decision that matters: **there is no field for a secret**, so the passphrase
+  cannot be in the link even by accident, and a leaked link is a leaked rendezvous — which ADR-012 already
+  opens to any authenticated peer that knows the channelID. Parsing is strict because a link is untrusted
+  input from a chat message: an unknown query key is refused rather than ignored (an older client must not
+  silently drop a future field), as are a duplicate `r`, a missing `b`, more anchors than `MAX_ENDPOINTS`,
+  a non-canonical base32 tail, or any malformed component.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
