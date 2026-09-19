@@ -36,7 +36,7 @@ use crate::error::{Error, Result};
 use crate::hash::{sha256, Digest32, COMPOSITE_PUB_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
 use crate::identity::rng::fill_random;
-use crate::suite::{algo, validate_algo};
+use crate::suite::{algo, suite_by_id, validate_algo, SuiteFloor};
 use crate::wire::{frame, parse_frame, signing_input, StructTag};
 
 /// Length of the genesis nonce in bytes (128-bit, ADR-007).
@@ -131,6 +131,17 @@ pub struct ChannelPolicy {
     /// Payload time-to-live in seconds; `0` means never expire (mutable). The
     /// actual erasure is M8 (ADR-010); this is the policy value.
     pub ttl: u64,
+    /// The channel's **minimum ciphersuite** id (ADR-003 §"Floor relation";
+    /// raise-only via policy update). Every handshake on the channel rejects a
+    /// proposal ranked below it. Must name a registered suite.
+    pub min_suite: u16,
+}
+
+impl ChannelPolicy {
+    /// The channel's ciphersuite floor as a typed value for handshakes.
+    pub fn suite_floor(&self) -> Result<SuiteFloor> {
+        SuiteFloor::new(self.min_suite)
+    }
 }
 
 /// The unsigned genesis body — every field except the self-signature.
@@ -152,19 +163,21 @@ pub struct GenesisBody {
 
 impl GenesisBody {
     /// Canonical-CBOR body in the ADR-007 field order:
-    /// `[nonce, created, [history_mode, deniability_mode, ttl], creator_pubkey,
-    ///   [sign_algo]]`. `sign_algo` is the composite signature class (the only
-    /// algorithm a genesis record commits to).
+    /// `[nonce, created, [history_mode, deniability_mode, ttl, min_suite],
+    ///   creator_pubkey, [sign_algo]]`. `sign_algo` is the composite signature
+    /// class (the only algorithm a genesis record commits to); `min_suite` is the
+    /// ADR-003 ciphersuite floor the channel is created at.
     #[must_use]
     pub fn canonical_body(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(5)
             .bytes(&self.nonce)
             .uint(self.created)
-            .array(3)
+            .array(4)
             .uint(self.policy.history_mode.as_u64())
             .uint(self.policy.deniability_mode.as_u64())
-            .uint(self.policy.ttl);
+            .uint(self.policy.ttl)
+            .uint(u64::from(self.policy.min_suite));
         e.bytes(&self.creator_pubkey.to_bytes())
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
@@ -198,12 +211,13 @@ impl GenesisBody {
             .try_into()
             .map_err(|_| Error::MalformedGovernance("genesis nonce length"))?;
         let created = d.uint()?;
-        if d.array()? != 3 {
+        if d.array()? != 4 {
             return Err(Error::MalformedGovernance("genesis policy arity"));
         }
         let history_mode = HistoryMode::from_u64(d.uint()?)?;
         let deniability_mode = DeniabilityMode::from_u64(d.uint()?)?;
         let ttl = d.uint()?;
+        let min_suite = u16_from(d.uint()?)?;
         let pk_bytes: [u8; COMPOSITE_PUB_LEN] = d
             .bytes()?
             .try_into()
@@ -221,6 +235,9 @@ impl GenesisBody {
                 expected: algo::COMPOSITE_ED25519_ML_DSA_65,
             });
         }
+        // The floor must name a registered suite (an unknown id could never be
+        // honored by any peer, so it is malformed, not "very strong").
+        suite_by_id(min_suite)?;
         let creator_pubkey = CompositePublicKey::from_bytes(&pk_bytes)?;
         Ok(Self {
             nonce,
@@ -229,6 +246,7 @@ impl GenesisBody {
                 history_mode,
                 deniability_mode,
                 ttl,
+                min_suite,
             },
             creator_pubkey,
         })
@@ -268,6 +286,8 @@ impl Genesis {
         policy: ChannelPolicy,
         nonce: [u8; GENESIS_NONCE_LEN],
     ) -> Result<Self> {
+        // A genesis can only be created at a registered floor (ADR-003).
+        suite_by_id(policy.min_suite)?;
         let body = GenesisBody {
             nonce,
             created,
@@ -300,10 +320,11 @@ impl Genesis {
         e.array(6)
             .bytes(&b.nonce)
             .uint(b.created)
-            .array(3)
+            .array(4)
             .uint(b.policy.history_mode.as_u64())
             .uint(b.policy.deniability_mode.as_u64())
-            .uint(b.policy.ttl);
+            .uint(b.policy.ttl)
+            .uint(u64::from(b.policy.min_suite));
         e.bytes(&b.creator_pubkey.to_bytes())
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
@@ -337,12 +358,13 @@ impl Genesis {
         // signing input is byte-identical to the creator's.
         let nonce = d.bytes()?.to_vec();
         let created = d.uint()?;
-        if d.array()? != 3 {
+        if d.array()? != 4 {
             return Err(Error::MalformedGovernance("genesis policy arity"));
         }
         let history_mode = d.uint()?;
         let deniability_mode = d.uint()?;
         let ttl = d.uint()?;
+        let min_suite = d.uint()?;
         let creator_pubkey = d.bytes()?.to_vec();
         if d.array()? != 1 {
             return Err(Error::MalformedGovernance("genesis algo_ids arity"));
@@ -355,10 +377,11 @@ impl Genesis {
         be.array(5)
             .bytes(&nonce)
             .uint(created)
-            .array(3)
+            .array(4)
             .uint(history_mode)
             .uint(deniability_mode)
-            .uint(ttl);
+            .uint(ttl)
+            .uint(min_suite);
         be.bytes(&creator_pubkey).array(1).uint(sign_algo);
         let body = GenesisBody::from_canonical_body(&be.finish())?;
 
@@ -422,7 +445,35 @@ mod tests {
             history_mode: HistoryMode::ForwardOnly,
             deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
+            min_suite: SuiteFloor::DAY_ONE.id(),
         }
+    }
+
+    #[test]
+    fn genesis_floor_must_name_a_registered_suite() {
+        // ADR-003: an unknown suite id could never be honored by any peer, so a
+        // genesis naming one is rejected at creation and on decode.
+        let r = root(1, 2);
+        let mut bad = sample_policy();
+        bad.min_suite = 0x1234;
+        assert!(matches!(
+            Genesis::create_with_nonce(&r, 1_700_000_000, bad, [0xAB; 16]),
+            Err(Error::UnknownSuite(0x1234))
+        ));
+        // On the wire: take a good record and rewrite the policy's min_suite.
+        let g = Genesis::create_with_nonce(&r, 1_700_000_000, sample_policy(), [0xAB; 16]).unwrap();
+        let mut body = g.body.clone();
+        body.policy.min_suite = 0x1234;
+        let forged = Genesis {
+            body,
+            signature: g.signature.clone(),
+        };
+        assert!(matches!(
+            Genesis::from_wire(&forged.to_wire()),
+            Err(Error::UnknownSuite(0x1234))
+        ));
+        // The floor is part of the signed body: changing it changes the channelID.
+        assert_ne!(forged.body.channel_id(), g.body.channel_id());
     }
 
     #[test]
@@ -514,6 +565,7 @@ mod tests {
             history_mode: HistoryMode::FullHistory,
             deniability_mode: DeniabilityMode::Deniable,
             ttl: 3600,
+            min_suite: SuiteFloor::DAY_ONE.id(),
         };
         let g = Genesis::create_with_nonce(&r, 100, policy, [3; 16]).unwrap();
         let decoded = Genesis::from_wire(&g.to_wire()).unwrap();

@@ -49,6 +49,7 @@ fn policy() -> ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
         deniability_mode: DeniabilityMode::Attributable,
         ttl: 0,
+        min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     }
 }
 

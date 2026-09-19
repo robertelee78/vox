@@ -170,6 +170,7 @@ mod tests {
             history_mode: HistoryMode::ForwardOnly,
             deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
+            min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
         };
         let genesis = Genesis::create_with_nonce(&creator, 100, policy, [9; 16]).unwrap();
         let cid = genesis.channel_id();

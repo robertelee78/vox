@@ -30,6 +30,7 @@ use crate::error::{Error, Result};
 use crate::governance::genesis::HistoryMode;
 use crate::hash::{Digest32, COMPOSITE_SIG_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
+use crate::suite::suite_by_id;
 use crate::wire::{frame, parse_frame, signing_input, StructTag};
 
 /// Body kind discriminant distinguishing a policy-update from a
@@ -56,21 +57,33 @@ pub struct PolicyUpdateBody {
     pub history_mode: Option<HistoryMode>,
     /// New payload TTL in seconds (`0` = never), or `None` to leave unchanged.
     pub ttl: Option<u64>,
+    /// New minimum ciphersuite (ADR-003 floor), or `None` to leave unchanged.
+    /// The evaluator applies it **raise-only**: an update naming a suite ranked
+    /// below the current floor is ignored, so the floor never silently downgrades.
+    pub min_suite: Option<u16>,
 }
 
 impl PolicyUpdateBody {
     /// Canonical-CBOR body
     /// `[kind, channelID, epoch, issuer_id, history_present, history_mode?,
-    ///   ttl_present, ttl?]` where `kind == KIND_POLICY_UPDATE`. An absent optional
-    /// field omits its value element (presence flag only), so two implementations
-    /// encode the identical bytes for the identical logical update.
+    ///   ttl_present, ttl?, suite_present, min_suite?]` where
+    /// `kind == KIND_POLICY_UPDATE`. An absent optional field omits its value
+    /// element (presence flag only), so two implementations encode the identical
+    /// bytes for the identical logical update.
     #[must_use]
     pub fn canonical_body(&self) -> Vec<u8> {
         let hist_present = self.history_mode.is_some();
         let ttl_present = self.ttl.is_some();
+        let suite_present = self.min_suite.is_some();
         // Fixed leading fields: kind, channel, epoch, issuer, hist_present.
-        // Then optional history value, ttl_present, optional ttl value.
-        let arity = 5 + usize::from(hist_present) + 1 + usize::from(ttl_present);
+        // Then optional history value, ttl_present, optional ttl value,
+        // suite_present, optional min_suite value.
+        let arity = 5
+            + usize::from(hist_present)
+            + 1
+            + usize::from(ttl_present)
+            + 1
+            + usize::from(suite_present);
         let mut e = Encoder::new();
         e.array(arity)
             .uint(KIND_POLICY_UPDATE)
@@ -84,6 +97,10 @@ impl PolicyUpdateBody {
         e.uint(u64::from(ttl_present));
         if let Some(ttl) = self.ttl {
             e.uint(ttl);
+        }
+        e.uint(u64::from(suite_present));
+        if let Some(id) = self.min_suite {
+            e.uint(u64::from(id));
         }
         e.finish()
     }
@@ -101,13 +118,17 @@ impl PolicyUpdateBody {
     fn from_canonical_body(body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
         let arity = d.array()?;
-        // Min arity: kind, channel, epoch, issuer, hist_present, ttl_present = 6.
-        if !(6..=8).contains(&arity) {
-            return Err(Error::MalformedGovernance("policy-update arity"));
-        }
+        // The kind discriminant is checked first so a passphrase-rotation body
+        // (which shares tag 0x0006) is reported as the wrong kind, not as a
+        // wrong arity.
         let kind = d.uint()?;
         if kind != KIND_POLICY_UPDATE {
             return Err(Error::MalformedGovernance("policy-update wrong body kind"));
+        }
+        // Min arity: kind, channel, epoch, issuer, hist_present, ttl_present,
+        // suite_present = 7; max 10 with all three values present.
+        if !(7..=10).contains(&arity) {
+            return Err(Error::MalformedGovernance("policy-update arity"));
         }
         let channel_id = take_digest(&mut d)?;
         let epoch = d.uint()?;
@@ -128,10 +149,29 @@ impl PolicyUpdateBody {
             _ => return Err(Error::MalformedGovernance("policy-update ttl_present")),
         };
         let ttl = if ttl_present { Some(d.uint()?) } else { None };
+        let suite_present = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::MalformedGovernance("policy-update suite_present")),
+        };
+        let min_suite = if suite_present {
+            let id = u16::try_from(d.uint()?)
+                .map_err(|_| Error::MalformedGovernance("policy-update min_suite range"))?;
+            // Must name a registered suite; an unknown id is malformed, not strong.
+            suite_by_id(id)?;
+            Some(id)
+        } else {
+            None
+        };
         d.finish()?;
 
         // Arity must exactly match the presence flags (no extra/missing elements).
-        let expected = 5 + usize::from(hist_present) + 1 + usize::from(ttl_present);
+        let expected = 5
+            + usize::from(hist_present)
+            + 1
+            + usize::from(ttl_present)
+            + 1
+            + usize::from(suite_present);
         if arity != expected {
             return Err(Error::MalformedGovernance(
                 "policy-update presence/arity mismatch",
@@ -143,6 +183,7 @@ impl PolicyUpdateBody {
             issuer_id,
             history_mode,
             ttl,
+            min_suite,
         })
     }
 }
@@ -157,22 +198,28 @@ pub struct PolicyUpdate {
 }
 
 impl PolicyUpdate {
-    /// Build and root-sign a policy-update. At least one of `history_mode`/`ttl`
-    /// is normally set; both `None` is permitted but inert. (`deniability_mode`
-    /// cannot be expressed — the struct has no such field, ADR-007.)
+    /// Build and root-sign a policy-update. At least one of
+    /// `history_mode`/`ttl`/`min_suite` is normally set; all `None` is permitted
+    /// but inert. (`deniability_mode` cannot be expressed — the struct has no such
+    /// field, ADR-007.) A `min_suite` must name a registered suite.
     pub fn build(
         issuer_root: &dyn RootSigner,
         channel_id: &Digest32,
         epoch: u64,
         history_mode: Option<HistoryMode>,
         ttl: Option<u64>,
+        min_suite: Option<u16>,
     ) -> Result<Self> {
+        if let Some(id) = min_suite {
+            suite_by_id(id)?;
+        }
         let body = PolicyUpdateBody {
             channel_id: *channel_id,
             epoch,
             issuer_id: issuer_root.fingerprint(),
             history_mode,
             ttl,
+            min_suite,
         };
         let signature = issuer_root.sign(&body.signing_input())?;
         Ok(Self { body, signature })
@@ -185,7 +232,13 @@ impl PolicyUpdate {
         let b = &self.body;
         let hist_present = b.history_mode.is_some();
         let ttl_present = b.ttl.is_some();
-        let signed_arity = 5 + usize::from(hist_present) + 1 + usize::from(ttl_present);
+        let suite_present = b.min_suite.is_some();
+        let signed_arity = 5
+            + usize::from(hist_present)
+            + 1
+            + usize::from(ttl_present)
+            + 1
+            + usize::from(suite_present);
         let mut e = Encoder::new();
         e.array(signed_arity + 1)
             .uint(KIND_POLICY_UPDATE)
@@ -199,6 +252,10 @@ impl PolicyUpdate {
         e.uint(u64::from(ttl_present));
         if let Some(ttl) = b.ttl {
             e.uint(ttl);
+        }
+        e.uint(u64::from(suite_present));
+        if let Some(id) = b.min_suite {
+            e.uint(u64::from(id));
         }
         e.bytes(&self.signature.to_bytes());
         frame(StructTag::PolicyRotation, &e.finish())
@@ -215,7 +272,7 @@ impl PolicyUpdate {
         }
         let mut d = Decoder::new(parsed.body);
         let wire_arity = d.array()?;
-        if !(7..=9).contains(&wire_arity) {
+        if !(8..=11).contains(&wire_arity) {
             return Err(Error::MalformedGovernance("policy-update wire arity"));
         }
         // Read the leading kind to fail fast on a passphrase-rotation body.
@@ -238,12 +295,23 @@ impl PolicyUpdate {
         } else {
             None
         };
+        let suite_present = d.uint()?;
+        let min_suite = if suite_present == 1 {
+            Some(d.uint()?)
+        } else {
+            None
+        };
         let sig_bytes = d.bytes()?.to_vec();
         d.finish()?;
 
         // Rebuild the signed body bytes and decode strictly.
         let mut be = Encoder::new();
-        let signed_arity = 5 + usize::from(hist_present == 1) + 1 + usize::from(ttl_present == 1);
+        let signed_arity = 5
+            + usize::from(hist_present == 1)
+            + 1
+            + usize::from(ttl_present == 1)
+            + 1
+            + usize::from(suite_present == 1);
         be.array(signed_arity)
             .uint(KIND_POLICY_UPDATE)
             .bytes(&channel_id)
@@ -256,6 +324,10 @@ impl PolicyUpdate {
         be.uint(ttl_present);
         if let Some(t) = ttl {
             be.uint(t);
+        }
+        be.uint(suite_present);
+        if let Some(id) = min_suite {
+            be.uint(id);
         }
         let body = PolicyUpdateBody::from_canonical_body(&be.finish())?;
         let signature = parse_sig(&sig_bytes)?;
@@ -301,8 +373,15 @@ mod tests {
     #[test]
     fn both_fields_round_trip() {
         let r = root(1, 2);
-        let pu =
-            PolicyUpdate::build(&r, &CID, 1, Some(HistoryMode::FullHistory), Some(3600)).unwrap();
+        let pu = PolicyUpdate::build(
+            &r,
+            &CID,
+            1,
+            Some(HistoryMode::FullHistory),
+            Some(3600),
+            None,
+        )
+        .unwrap();
         assert!(pu.verify(&r.public_key()).is_ok());
         let decoded = PolicyUpdate::from_wire(&pu.to_wire()).unwrap();
         assert_eq!(decoded.body, pu.body);
@@ -314,7 +393,8 @@ mod tests {
     #[test]
     fn only_history_round_trips() {
         let r = root(3, 4);
-        let pu = PolicyUpdate::build(&r, &CID, 1, Some(HistoryMode::ForwardOnly), None).unwrap();
+        let pu =
+            PolicyUpdate::build(&r, &CID, 1, Some(HistoryMode::ForwardOnly), None, None).unwrap();
         let decoded = PolicyUpdate::from_wire(&pu.to_wire()).unwrap();
         assert_eq!(decoded.body.history_mode, Some(HistoryMode::ForwardOnly));
         assert_eq!(decoded.body.ttl, None);
@@ -324,7 +404,7 @@ mod tests {
     #[test]
     fn only_ttl_round_trips() {
         let r = root(5, 6);
-        let pu = PolicyUpdate::build(&r, &CID, 1, None, Some(0)).unwrap();
+        let pu = PolicyUpdate::build(&r, &CID, 1, None, Some(0), None).unwrap();
         let decoded = PolicyUpdate::from_wire(&pu.to_wire()).unwrap();
         assert_eq!(decoded.body.history_mode, None);
         assert_eq!(decoded.body.ttl, Some(0));
@@ -333,7 +413,7 @@ mod tests {
     #[test]
     fn empty_update_round_trips() {
         let r = root(7, 8);
-        let pu = PolicyUpdate::build(&r, &CID, 1, None, None).unwrap();
+        let pu = PolicyUpdate::build(&r, &CID, 1, None, None, None).unwrap();
         let decoded = PolicyUpdate::from_wire(&pu.to_wire()).unwrap();
         assert_eq!(decoded.body.history_mode, None);
         assert_eq!(decoded.body.ttl, None);
@@ -343,10 +423,38 @@ mod tests {
     #[test]
     fn tamper_rejected() {
         let r = root(9, 10);
-        let pu = PolicyUpdate::build(&r, &CID, 1, Some(HistoryMode::ForwardOnly), None).unwrap();
+        let pu =
+            PolicyUpdate::build(&r, &CID, 1, Some(HistoryMode::ForwardOnly), None, None).unwrap();
         let mut decoded = PolicyUpdate::from_wire(&pu.to_wire()).unwrap();
         decoded.body.history_mode = Some(HistoryMode::FullHistory);
         assert!(decoded.verify(&r.public_key()).is_err());
+    }
+
+    #[test]
+    fn min_suite_round_trips_and_must_be_registered() {
+        use crate::suite::VOX_SUITE_1;
+        let r = root(1, 2);
+        let pu = PolicyUpdate::build(&r, &CID, 1, None, None, Some(VOX_SUITE_1.id)).unwrap();
+        let decoded = PolicyUpdate::from_wire(&pu.to_wire()).unwrap();
+        assert_eq!(decoded.body, pu.body);
+        assert_eq!(decoded.body.min_suite, Some(VOX_SUITE_1.id));
+        assert!(decoded.verify(&r.public_key()).is_ok());
+        // Unregistered at build …
+        assert!(matches!(
+            PolicyUpdate::build(&r, &CID, 1, None, None, Some(0x1234)),
+            Err(Error::UnknownSuite(0x1234))
+        ));
+        // … and on decode (rewrite the field, re-sign is irrelevant: parse fails).
+        let mut body = pu.body.clone();
+        body.min_suite = Some(0x1234);
+        let forged = PolicyUpdate {
+            body,
+            signature: pu.signature.clone(),
+        };
+        assert!(matches!(
+            PolicyUpdate::from_wire(&forged.to_wire()),
+            Err(Error::UnknownSuite(0x1234))
+        ));
     }
 
     #[test]
@@ -373,7 +481,8 @@ mod tests {
         // has no such field. This test documents the schema-level enforcement: the
         // builder signature simply has no deniability parameter.
         let r = root(1, 1);
-        let pu = PolicyUpdate::build(&r, &CID, 1, Some(HistoryMode::FullHistory), Some(1)).unwrap();
+        let pu = PolicyUpdate::build(&r, &CID, 1, Some(HistoryMode::FullHistory), Some(1), None)
+            .unwrap();
         // The canonical body has the fixed layout with no deniability element; a
         // round-trip preserves exactly history+ttl and nothing else.
         let decoded = PolicyUpdate::from_wire(&pu.to_wire()).unwrap();
