@@ -50,8 +50,9 @@
 //!
 //! ## Engineering mantra (binding — see ADR-001)
 //! No stubs, no `todo!()`, no shortcuts. The CPace construction is validated
-//! against the CFRG draft's Ristretto255+SHA-512 test vectors and the Equihash
-//! verifier against librustzcash vectors; both are the correctness gates.
+//! against the CFRG draft's Ristretto255+SHA-512 test vectors, and every Equihash
+//! solution the pure-Rust solver emits is cross-checked by the librustzcash
+//! verifier (solve → verify round-trip); both are the correctness gates.
 
 pub mod channelid;
 pub mod cpace;

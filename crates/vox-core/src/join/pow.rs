@@ -23,24 +23,44 @@
 //!    `(n,k)`, and an attacker cannot separate the layers (a solution that fails the
 //!    filter forces restarting the memory-hard search).
 //!
-//! ## Difficulty policy (ADR-005)
-//! - **Identity-bound / invite channels** default to a *low but non-zero* PoW
-//!   (`≈200–500 ms`) — a leaked channelID cannot cheaply flood the swarm.
-//! - **Literal zero** is reserved for explicit LAN/closed mode
-//!   ([`Difficulty::ZERO`]).
-//! - Difficulty is modelled as a parameter the responder sets and signs; it is not
-//!   the security boundary (per-sender consent, ADR-007, is the real read-gate).
+//! ## Difficulty policy (ADR-005) — calibrated, not prose
+//! The cost model: an Equihash `(200,9)` solve yields ≈ 2 solutions per nonce by
+//! design, and a solution passes a `d`-bit filter with probability `2^-d`, so a
+//! join costs about `max(1, 2^d / 2)` **base solves** ([`Difficulty::expected_solves`]).
+//! The base solve is the memory-hard unit of cost; the filter tunes it *upward*.
+//! Measured on 2026-09-19 (release build, Apple-silicon laptop core, the
+//! `spike_pow` example): a `(200,9)` base solve with this crate's Wagner solver is
+//! **≈ 7.5 s and 1.65 GB peak RSS**, 2.0 solutions/nonce. That is already above
+//! ADR-005's *target* of ≈ 1–2 s on a mobile CPU — the gap is the solver's memory
+//! layout (a tromp-class bucket-sorted design runs the same algorithm in ≈ 144 MB
+//! and well under a second per nonce), not the language; closing it is the next
+//! PoW milestone (ADR-005 Implementation notes). The defaults below are therefore
+//! expressed in base-solve multiples:
+//! - [`Difficulty::DEFAULT_INVITE`] (1 bit, ≈ 1 solve): identity-bound / invite
+//!   channels — the smallest *non-zero* filter, so a leaked channelID still costs a
+//!   full memory-hard solve per attempt.
+//! - [`Difficulty::DEFAULT_OPEN`] (2 bits, ≈ 2 solves): open passphrase channels.
+//! - [`Difficulty::MAX`] (8 bits, ≈ 128 solves): the **accessibility cap**. A joiner
+//!   refuses a challenge above it ([`crate::join::join_initiate`]), which also
+//!   bounds the grind any attacker-signed challenge can extract.
+//! - [`Difficulty::adapted_for_load`]: the responder-side adaptation rule (one extra
+//!   bit per doubling of pending joins above a small threshold, capped at `MAX`; it
+//!   falls back as load falls). It is a pure function the node runtime calls with
+//!   its live queue depth.
+//! - **Literal zero** ([`Difficulty::ZERO`]) is reserved for explicit LAN/closed
+//!   mode — Equihash validity still applies; only the tunable filter is disabled.
+//! - Difficulty is a parameter the responder sets and signs; it is not the security
+//!   boundary (per-sender consent, ADR-007, is the real read-gate).
 //!
-//! ## Solve paths
-//! - **Always-on (CI):** a pure-Rust generalized-Wagner solver ([`wagner`])
-//!   parameterised for *reduced* `(n,k)` (the tests use `n=48,k=5`), used by the
-//!   always-on solve→verify round-trip test. It produces solutions the
-//!   librustzcash verifier accepts — that cross-check is the correctness gate.
-//! - **Real `(200,9)`:** the same Wagner solver runs at `(200,9)` correctly but is
-//!   slow, so the real-parameter solve test is `#[ignore]`d. The librustzcash
-//!   tromp C++ solver is also available under the `equihash-solver` crate feature
-//!   (the `solve_real_200_9` function) for a fast real-parameter path. The
-//!   `(200,9)` code path is real, not stubbed.
+//! ## Solve path — pure Rust, one backend
+//! A pure-Rust generalized-Wagner solver ([`wagner`]) is the *only* prover, at
+//! every parameter set. CI runs it at reduced `(n,k)` (the tests use `n=48,k=5`)
+//! through the solve→verify round-trip; the real `(200,9)` solve is exercised by an
+//! `#[ignore]`d test (seconds and GBs) and timed by the `spike_pow` example. Every
+//! solution is cross-checked by the librustzcash verifier — that is the correctness
+//! gate. The optional C++ `tromp` backend ADR-005 once carved out was **rejected by
+//! the decider on 2026-09-19** ("Vox is Rust only"); it no longer exists in the
+//! build, the manifest, or CI.
 
 pub mod wagner;
 
@@ -120,7 +140,8 @@ impl PowParams {
 }
 
 /// The PoW difficulty: a minimum number of leading zero bits on the difficulty
-/// hash. `0` means no filter (LAN/closed mode only — ADR-005).
+/// hash. `0` means no filter (LAN/closed mode only — ADR-005). See the module
+/// docs for the cost model and the measured calibration behind the defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Difficulty {
     /// Required leading zero bits on `BLAKE2b(diff_domain ‖ seed ‖ nonce ‖ soln)`.
@@ -130,16 +151,68 @@ pub struct Difficulty {
 impl Difficulty {
     /// No difficulty filter — explicit LAN/closed mode only (ADR-005). Equihash
     /// validity still applies; only the tunable filter is disabled.
-    pub const ZERO: Self = Self {
-        leading_zero_bits: 0,
-    };
+    pub const ZERO: Self = Self::bits(0);
+
+    /// Default for identity-bound / invite channels: the smallest **non-zero**
+    /// filter (≈ 1 expected base solve). ADR-005: "low but non-zero — a leaked
+    /// channelID cannot cheaply flood the swarm".
+    pub const DEFAULT_INVITE: Self = Self::bits(1);
+
+    /// Default for open passphrase channels (≈ 2 expected base solves).
+    pub const DEFAULT_OPEN: Self = Self::bits(2);
+
+    /// The accessibility cap (≈ 128 expected base solves). A responder never
+    /// advertises above it ([`Difficulty::adapted_for_load`] saturates here) and a
+    /// joiner refuses a challenge above it, which also bounds the grind an
+    /// attacker-signed challenge can extract.
+    pub const MAX: Self = Self::bits(8);
+
+    /// Expected Equihash solutions per nonce at `(200,9)` (≈ 2 by construction of
+    /// the generalized-birthday parameters; measured 2.0 on 2026-09-19).
+    pub const SOLUTIONS_PER_NONCE: f64 = 2.0;
+
+    /// Pending-join queue depth at which load adaptation starts adding bits.
+    pub const ADAPT_THRESHOLD: u32 = 4;
 
     /// Build a difficulty of `bits` leading zero bits.
     #[must_use]
-    pub fn bits(bits: u8) -> Self {
+    pub const fn bits(bits: u8) -> Self {
         Self {
             leading_zero_bits: bits,
         }
+    }
+
+    /// Expected number of memory-hard base solves a joiner performs to satisfy
+    /// this difficulty: `max(1, 2^bits / SOLUTIONS_PER_NONCE)`. This is the cost
+    /// model the defaults are calibrated in (see module docs).
+    #[must_use]
+    pub fn expected_solves(self) -> f64 {
+        let candidates = 2f64.powi(i32::from(self.leading_zero_bits));
+        (candidates / Self::SOLUTIONS_PER_NONCE).max(1.0)
+    }
+
+    /// Whether this difficulty exceeds the accessibility cap ([`Difficulty::MAX`]).
+    #[must_use]
+    pub fn exceeds_cap(self) -> bool {
+        self > Self::MAX
+    }
+
+    /// The responder's load-adaptation rule (ADR-005: "adapts upward under load and
+    /// downward when idle"): from a base difficulty, add one bit per doubling of
+    /// `pending_joins` at or above [`Difficulty::ADAPT_THRESHOLD`], saturating at
+    /// [`Difficulty::MAX`]. Pure and monotone in `pending_joins`, so a node calls
+    /// it with its live queue depth each time it mints a challenge; as the queue
+    /// drains the result falls back to `self`.
+    #[must_use]
+    pub fn adapted_for_load(self, pending_joins: u32) -> Self {
+        let extra = if pending_joins >= Self::ADAPT_THRESHOLD {
+            (pending_joins / Self::ADAPT_THRESHOLD).ilog2()
+        } else {
+            0
+        };
+        let extra = u8::try_from(extra).unwrap_or(u8::MAX);
+        let bits = self.leading_zero_bits.saturating_add(extra);
+        Self::bits(bits.min(Self::MAX.leading_zero_bits))
     }
 
     /// Whether `hash` satisfies this difficulty (has at least `leading_zero_bits`
@@ -286,63 +359,12 @@ pub fn verify_token(params: PowParams, challenge: &ResponderNonce, token: &PowTo
     Ok(())
 }
 
-/// Which solver backend [`solve_token`] will use for a given parameter set.
-///
-/// This is the *decision*, separated from the *execution* so the selection logic is
-/// unit-testable without running a (slow) real solve (ADR-005 §Implementation
-/// notes, the Codex-review HIGH item).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SolverStrategy {
-    /// The pure-Rust generalized-Wagner solver ([`wagner::solve`]). Always used for
-    /// reduced parameters; also the complete (slower) `(200,9)` fallback when the
-    /// `equihash-solver` feature is **not** built.
-    Wagner,
-    /// The librustzcash C++ tromp solver (`solve_real_200_9`) — only selectable at
-    /// the real `(200,9)` parameters and only when the `equihash-solver` feature is
-    /// built. The fast production `(200,9)` prover.
-    Tromp,
-}
-
-/// Choose the solver backend for `params` (ADR-005).
-///
-/// At the real `(200,9)` parameters the C++ tromp solver is preferred **iff** the
-/// optional `equihash-solver` feature is compiled in (it meets the ~1–2 s mobile
-/// join target; the pure-Rust solver is correct but takes seconds per nonce there).
-/// Every other case — reduced parameters, or `(200,9)` without the feature — uses
-/// the pure-Rust Wagner solver. Production `(200,9)` builds SHOULD enable
-/// `equihash-solver`; without it the join still works, just slower.
-#[must_use]
-pub fn select_solver(params: PowParams) -> SolverStrategy {
-    #[cfg(feature = "equihash-solver")]
-    {
-        if params == PowParams::DEFAULT {
-            return SolverStrategy::Tromp;
-        }
-    }
-    let _ = params;
-    SolverStrategy::Wagner
-}
-
-/// Solve a PoW challenge, dispatching to the backend [`select_solver`] picks for
-/// `params`, and returning a valid [`PowToken`].
-///
-/// - [`SolverStrategy::Tromp`] (real `(200,9)`, `equihash-solver` feature on) →
-///   the fast C++ solver (`solve_real_200_9`).
-/// - [`SolverStrategy::Wagner`] (reduced params, or `(200,9)` without the feature)
-///   → the pure-Rust solver ([`solve_token_bounded`]). Correct at every parameter
-///   set; at `(200,9)` it is the complete-but-slow fallback (production `(200,9)`
-///   builds SHOULD enable `equihash-solver`).
+/// Solve a PoW challenge with the pure-Rust Wagner solver ([`wagner::solve`]),
+/// returning a valid [`PowToken`]. One backend at every parameter set; the
+/// nonce search is bounded at `2^24` nonces (a difficulty at [`Difficulty::MAX`]
+/// needs ≈ 128 in expectation).
 pub fn solve_token(params: PowParams, challenge: &ResponderNonce) -> Result<PowToken> {
-    match select_solver(params) {
-        #[cfg(feature = "equihash-solver")]
-        SolverStrategy::Tromp => solve_real_200_9(challenge),
-        SolverStrategy::Wagner => solve_token_bounded(params, challenge, 1 << 24),
-        // Without the feature, `Tromp` is never returned by `select_solver`, so this
-        // arm is unreachable; it exists only to make the match exhaustive in both
-        // cfg states without a feature-gated arm being the sole `Tromp` handler.
-        #[cfg(not(feature = "equihash-solver"))]
-        SolverStrategy::Tromp => solve_token_bounded(params, challenge, 1 << 24),
-    }
+    solve_token_bounded(params, challenge, 1 << 24)
 }
 
 /// [`solve_token`] with an explicit nonce-search bound (for tests).
@@ -378,51 +400,6 @@ pub fn solve_token_bounded(
     Err(Error::JoinPowInvalid)
 }
 
-/// Solve a real `(200, 9)` challenge with the librustzcash tromp C++ solver.
-///
-/// Available only with the `equihash-solver` crate feature (which builds the C++
-/// backend). This is the fast real-parameter path; the always-on Wagner solver also
-/// handles `(200,9)` correctly but slowly. Returns the first solution meeting the
-/// difficulty.
-///
-/// Nonces are tried **one at a time** so the produced token's `equihash_nonce` is
-/// exactly the nonce that generated the returned solution: the tromp helper's
-/// `next_nonce` closure yields a single nonce, all its solutions for that nonce
-/// come back, and each is re-checked through the canonical [`verify_token`] path
-/// before being returned. There is therefore no nonce-binding ambiguity.
-#[cfg(feature = "equihash-solver")]
-pub fn solve_real_200_9(challenge: &ResponderNonce) -> Result<PowToken> {
-    let params = PowParams::DEFAULT;
-    let seed = challenge.pow_seed();
-    for counter in 0u32..(1 << 20) {
-        let mut equihash_nonce = [0u8; 32];
-        equihash_nonce[..4].copy_from_slice(&counter.to_le_bytes());
-        // Yield exactly this one nonce, then stop — so every returned solution is
-        // for `equihash_nonce`.
-        let mut yielded = false;
-        let solutions = equihash::tromp::solve_200_9::<32>(&seed, || {
-            if yielded {
-                None
-            } else {
-                yielded = true;
-                Some(equihash_nonce)
-            }
-        });
-        for solution in solutions {
-            let token = PowToken {
-                equihash_nonce: equihash_nonce.to_vec(),
-                solution,
-            };
-            // Canonical verify (Equihash validity + difficulty) — the single source
-            // of truth, identical to what a remote verifier runs.
-            if verify_token(params, challenge, &token).is_ok() {
-                return Ok(token);
-            }
-        }
-    }
-    Err(Error::JoinPowInvalid)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,24 +428,47 @@ mod tests {
     }
 
     #[test]
-    fn solver_strategy_selects_correctly() {
-        // Reduced parameters always use the pure-Rust Wagner solver, in either cfg.
-        assert_eq!(
-            select_solver(PowParams::new(48, 5).unwrap()),
-            SolverStrategy::Wagner
-        );
-        assert_eq!(
-            select_solver(PowParams::new(96, 5).unwrap()),
-            SolverStrategy::Wagner
-        );
-        // The real (200,9) parameters pick the C++ tromp solver IFF the optional
-        // feature is built; without it they fall back to the pure-Rust solver.
-        // This tests the selection logic without running an actual (200,9) solve.
-        let chosen = select_solver(PowParams::DEFAULT);
-        #[cfg(feature = "equihash-solver")]
-        assert_eq!(chosen, SolverStrategy::Tromp);
-        #[cfg(not(feature = "equihash-solver"))]
-        assert_eq!(chosen, SolverStrategy::Wagner);
+    fn difficulty_defaults_cap_and_cost_model() {
+        // Ordering: ZERO < invite < open <= MAX; both defaults are non-zero.
+        assert!(Difficulty::ZERO < Difficulty::DEFAULT_INVITE);
+        assert!(Difficulty::DEFAULT_INVITE < Difficulty::DEFAULT_OPEN);
+        assert!(Difficulty::DEFAULT_OPEN <= Difficulty::MAX);
+        assert_ne!(Difficulty::DEFAULT_INVITE, Difficulty::ZERO);
+        // Cost model in base solves: max(1, 2^d / 2).
+        assert_eq!(Difficulty::ZERO.expected_solves(), 1.0);
+        assert_eq!(Difficulty::DEFAULT_INVITE.expected_solves(), 1.0);
+        assert_eq!(Difficulty::DEFAULT_OPEN.expected_solves(), 2.0);
+        assert_eq!(Difficulty::bits(3).expected_solves(), 4.0);
+        assert_eq!(Difficulty::MAX.expected_solves(), 128.0);
+        // Cap.
+        assert!(!Difficulty::MAX.exceeds_cap());
+        assert!(Difficulty::bits(Difficulty::MAX.leading_zero_bits + 1).exceeds_cap());
+    }
+
+    #[test]
+    fn difficulty_adapts_monotonically_and_saturates() {
+        let base = Difficulty::DEFAULT_OPEN;
+        // Below the threshold nothing changes (idle = base).
+        for pending in 0..Difficulty::ADAPT_THRESHOLD {
+            assert_eq!(base.adapted_for_load(pending), base);
+        }
+        // One extra bit per doubling at/above the threshold …
+        assert_eq!(base.adapted_for_load(4), Difficulty::bits(2));
+        assert_eq!(base.adapted_for_load(8), Difficulty::bits(3));
+        assert_eq!(base.adapted_for_load(16), Difficulty::bits(4));
+        assert_eq!(base.adapted_for_load(64), Difficulty::bits(6));
+        // … monotone in load …
+        let mut last = base;
+        for pending in 0..2048u32 {
+            let d = base.adapted_for_load(pending);
+            assert!(d >= last, "difficulty must not fall as load rises");
+            last = d;
+        }
+        // … and never above the cap, even under absurd load.
+        assert_eq!(base.adapted_for_load(u32::MAX), Difficulty::MAX);
+        assert_eq!(Difficulty::MAX.adapted_for_load(u32::MAX), Difficulty::MAX);
+        // Falls back as load drains.
+        assert_eq!(base.adapted_for_load(0), base);
     }
 
     #[test]

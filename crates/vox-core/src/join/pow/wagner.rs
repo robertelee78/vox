@@ -7,10 +7,10 @@
 //!
 //! ## Why a hand-written solver
 //! The librustzcash crate verifies any `(n,k)` but only *solves* `(200,9)`, and
-//! only via a C++ tromp backend behind a feature flag. ADR-005 requires a real,
-//! non-stubbed solve path that also works at *reduced* parameters for fast CI.
-//! This generic Wagner solver fills that gap; the C++ tromp solver remains
-//! available as the fast real-parameter path (`super::solve_real_200_9`).
+//! only via a C++ backend. Vox is Rust-only (ADR-001 #10; the C++ carve-out was
+//! rejected by the decider 2026-09-19), and ADR-005 requires a real, non-stubbed
+//! solve path that also works at *reduced* parameters for fast CI. This generic
+//! Wagner solver is therefore the **only** prover, at every parameter set.
 //!
 //! ## Exact construction (Zcash protocol spec §7.6, librustzcash)
 //! - **String generator.** `BLAKE2b` personalized with `"ZcashPoW" ‖ LE32(n) ‖
@@ -244,13 +244,17 @@ fn ordered(a: &Node, b: &Node) -> bool {
 /// - The per-round list is **hard-capped** at `init_count` nodes (a safety valve);
 ///   nodes are stored as parent-pointer tuples (no flattened index lists), so peak
 ///   memory is `O(k · init_count · collision_byte_length)`. For the real `(200,9)`
-///   parameters that is **~1.2 GB measured** (`/usr/bin/time -l`, single-nonce
-///   solve) — well under 2 GB, and a world away from the ~30 GB the earlier
-///   flattened-index design hit. It is NOT sub-gigabyte, and a `(200,9)` solve
-///   still takes **several seconds per nonce** — slower than the ~1–2 s join
-///   target, which is exactly why the optional C++ `tromp` solver
-///   (`equihash-solver` feature) is the production `(200,9)` prover (ADR-005).
-///   Reduced CI parameters are cheap (hundreds of rows, ~ms).
+///   parameters that is **1.65 GB peak RSS and ≈ 7.5 s per nonce, measured**
+///   (release build, Apple-silicon laptop core, `/usr/bin/time -l`, the
+///   `spike_pow` example, 2026-09-19; 2.0 solutions/nonce) — a world away from the
+///   ~30 GB the earlier flattened-index design hit, but still above the ADR-005
+///   ≈ 1–2 s join target. The gap is this layout, not the algorithm: a
+///   tromp-class design (bucket-sorted collision layers keyed by the round's
+///   collision prefix, fixed-capacity buckets of compact 32-bit slots that pack
+///   the surviving hash bits with the two parent slot indices, layers reused
+///   round to round) runs the same Wagner algorithm in ≈ 144 MB and well under a
+///   second per nonce. Porting that layout to pure Rust is the next PoW milestone
+///   (ADR-005 Implementation notes). Reduced CI parameters are cheap (~ms).
 /// - Only final solutions are flattened to their `2^k` indices and emitted; every
 ///   emitted solution is re-checked by the librustzcash verifier in the caller.
 pub fn solve(params: PowParams, seed: &[u8], nonce: &[u8]) -> Result<Vec<Vec<u8>>> {

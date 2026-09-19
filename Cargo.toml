@@ -65,12 +65,12 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc", "zero
 # `unsafe`. mlock is best-effort: on failure the secret still lives in a zeroizing
 # buffer (the defined fallback), never unprotected.
 region = "3"
-# Equihash (n=200,k=9) join proof-of-work (ADR-005, M3). The librustzcash crate:
-# cheap runtime-(n,k) verification by default; the `solver` feature adds the real
-# (200,9) tromp solver (a C++ FFI backend, used only by the heavy #[ignore]d
-# real-parameter test). Vox's always-on solve path is a pure-Rust Wagner solver
-# in `join::pow` parameterised for reduced CI params; the crate verifier is the
-# cross-check oracle for both.
+# Equihash (n=200,k=9) join proof-of-work (ADR-005, M3). The librustzcash crate
+# is used ONLY as the runtime-(n,k) verifier (pure Rust); its `solver` feature (a
+# C++ tromp backend) is deliberately not enabled anywhere — Vox is Rust-only
+# (ADR-001 #10; carve-out rejected by the decider 2026-09-19). The solve path is
+# Vox's own pure-Rust Wagner solver in `join::pow`; the crate verifier is its
+# cross-check oracle.
 equihash = { version = "0.3", default-features = false, features = ["std"] }
 # BLAKE2b with personalization — the Equihash string generator (ADR-005 PoW).
 blake2b_simd = { version = "1.0", default-features = false, features = ["std"] }
