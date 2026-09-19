@@ -428,7 +428,6 @@ fn m5_sync_reconciles_divergent_logs_over_real_quic() {
 
 #[test]
 fn datagram_round_trips_over_real_quic_with_replay_window() {
-    use crate::transport::datagram::{DatagramSender, ReplayWindow};
     let rt = runtime();
     let server = signer(20, 21);
     let client = signer(22, 23);
@@ -447,23 +446,100 @@ fn datagram_round_trips_over_real_quic_with_replay_window() {
                 .unwrap();
         let server_conn = accept.await.unwrap();
 
-        // Client frames three datagrams with sequence numbers; server applies the
-        // anti-replay window. (Datagrams may be reordered/dropped by QUIC, but on
-        // loopback they arrive; we assert the window accepts each new seq once.)
-        let mut sender = DatagramSender::new();
-        let mut window = ReplayWindow::default();
+        // The connection sequences three payloads on send and applies the
+        // anti-replay window on receive; the application sees only payloads.
+        // (Datagrams may be reordered/dropped by QUIC, but on loopback they
+        // arrive in order.)
         for i in 0..3u8 {
-            let frame = sender.frame(&[i]);
-            client_conn.send_datagram(frame).unwrap();
+            client_conn.send_datagram(&[i]).unwrap();
         }
-        for _ in 0..3 {
+        for i in 0..3u8 {
             let got = tokio::time::timeout(TIMEOUT, server_conn.recv_datagram())
                 .await
                 .unwrap()
                 .unwrap();
-            let (seq, _payload) = crate::transport::datagram::parse_datagram(&got).unwrap();
-            assert!(window.accept(seq), "new datagram seq {seq} accepted once");
-            assert!(!window.accept(seq), "duplicate seq {seq} dropped");
+            assert_eq!(got, vec![i]);
         }
+        assert_eq!(server_conn.datagrams_dropped(), 0);
+        // The payload budget is the peer's datagram size minus the 8-byte prefix.
+        let max = server_conn.max_datagram_payload().unwrap();
+        assert!(max > 0 && max + 8 <= server_conn.quinn().max_datagram_size().unwrap());
+    });
+}
+
+#[test]
+fn replayed_and_unframed_datagrams_are_dropped_by_the_connection() {
+    // ADR-011 §"Datagram anti-replay": out-of-window or duplicate datagrams are
+    // dropped. That must be a property of the connection, not caller discipline
+    // (2026-09-19 review): a byte-exact replay injected below the Vox framing
+    // layer must never reach the application.
+    use crate::transport::datagram::frame_datagram;
+    let rt = runtime();
+    let server = signer(24, 25);
+    let client = signer(26, 27);
+    let server_fp = server.fingerprint();
+
+    rt.block_on(async move {
+        let server_ep = VoxEndpoint::bind(&server, loopback()).unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+        let client_ep = VoxEndpoint::bind(&client, loopback()).unwrap();
+        let accept: tokio::task::JoinHandle<VoxConnection> =
+            tokio::spawn(async move { server_ep.accept(0).await.unwrap().unwrap() });
+        let client_conn =
+            tokio::time::timeout(TIMEOUT, client_ep.connect(server_addr, server_fp, 0))
+                .await
+                .unwrap()
+                .unwrap();
+        let server_conn = accept.await.unwrap();
+
+        // Genuine datagram; the connection assigns it sequence 0.
+        client_conn.send_datagram(b"first").unwrap();
+        let got = tokio::time::timeout(TIMEOUT, server_conn.recv_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, b"first");
+
+        // An on-path replay of the exact wire bytes of that datagram, injected
+        // beneath the Vox framing layer, then a genuine send (sequence 1).
+        client_conn
+            .quinn()
+            .send_datagram(bytes::Bytes::from(frame_datagram(0, b"first")))
+            .unwrap();
+        client_conn.send_datagram(b"second").unwrap();
+        let got = tokio::time::timeout(TIMEOUT, server_conn.recv_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, b"second", "replay must be skipped, genuine delivered");
+        assert_eq!(server_conn.datagrams_dropped(), 1);
+
+        // An unframed datagram (shorter than the sequence prefix) and a stale
+        // sequence far below the window are dropped the same way.
+        client_conn
+            .quinn()
+            .send_datagram(bytes::Bytes::from_static(b"xyz"))
+            .unwrap();
+        for _ in 0..2000u32 {
+            client_conn.send_datagram(b"fill").unwrap();
+        }
+        for _ in 0..2000u32 {
+            let got = tokio::time::timeout(TIMEOUT, server_conn.recv_datagram())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got, b"fill");
+        }
+        client_conn
+            .quinn()
+            .send_datagram(bytes::Bytes::from(frame_datagram(1, b"stale")))
+            .unwrap();
+        client_conn.send_datagram(b"last").unwrap();
+        let got = tokio::time::timeout(TIMEOUT, server_conn.recv_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, b"last");
+        assert_eq!(server_conn.datagrams_dropped(), 3);
     });
 }

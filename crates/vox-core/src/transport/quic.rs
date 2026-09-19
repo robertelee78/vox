@@ -9,8 +9,12 @@
 //! cross-stream head-of-line blocking, so bulk log replication on one stream never
 //! stalls an interactive flow on another (ADR-011 §"Two contracts on one
 //! connection"). Low-latency, loss-tolerant flows use RFC 9221 datagrams
-//! ([`VoxConnection::send_datagram`] / [`VoxConnection::recv_datagram`]) with the
-//! [`crate::transport::datagram`] anti-replay window layered on top.
+//! ([`VoxConnection::send_datagram`] / [`VoxConnection::recv_datagram`]); the
+//! connection itself applies the [`crate::transport::datagram`] 64-bit sequence
+//! framing and the DTLS-style anti-replay window (ADR-011 §"Datagram
+//! anti-replay"), so a replayed, duplicate, out-of-window or unframed datagram is
+//! dropped before it can reach the application — that is a property of the
+//! connection, never caller discipline (2026-09-19 review).
 //!
 //! ## Authentication + the recorded session
 //! Connecting and accepting both authenticate the peer via the
@@ -32,13 +36,15 @@
 //! divergent logs over this transport in the tests.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
+use crate::transport::datagram::{parse_datagram, DatagramSender, ReplayWindow, SEQ_PREFIX_LEN};
 use crate::transport::identity_cert::build_leaf_certificate;
 use crate::transport::provider::{client_config, server_config, X25519MLKEM768_CODE_POINT};
 use crate::transport::session::SessionEstablishment;
@@ -370,7 +376,19 @@ fn finish_connection(
         connection,
         peer_id,
         session,
+        datagram_tx: Mutex::new(DatagramSender::new()),
+        datagram_rx: Mutex::new(ReplayWindow::default()),
+        datagrams_dropped: AtomicU64::new(0),
     })
+}
+
+/// Lock a piece of per-connection datagram state. The critical sections are a
+/// single counter/bitmap update with no `.await` inside, so the state is always
+/// consistent between operations; a poisoned lock (another thread panicked while
+/// holding it — impossible in this `deny(clippy::panic)` crate outside tests) is
+/// therefore safe to recover rather than propagate.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Confirm the connection negotiated X25519MLKEM768; abort otherwise. Because the
@@ -397,10 +415,25 @@ fn confirm_hybrid_group(connection: &Connection) -> Result<()> {
 }
 
 /// An authenticated QUIC connection to one Vox peer.
+///
+/// Owns the per-connection datagram anti-replay state (ADR-011): an outbound
+/// [`DatagramSender`] sequence counter and an inbound [`ReplayWindow`] of
+/// [`crate::transport::datagram::DEFAULT_WINDOW`] packets. Both are private, so
+/// every datagram sent through [`VoxConnection::send_datagram`] is sequenced and
+/// every datagram returned by [`VoxConnection::recv_datagram`] has passed the
+/// window.
 pub struct VoxConnection {
     connection: Connection,
     peer_id: Digest32,
     session: SessionEstablishment,
+    /// Outbound datagram sequence numbers (monotonic, saturating).
+    datagram_tx: Mutex<DatagramSender>,
+    /// Inbound sliding anti-replay window.
+    datagram_rx: Mutex<ReplayWindow>,
+    /// Inbound datagrams dropped as replay / out-of-window / unframed. Exposed
+    /// for observability ([`VoxConnection::datagrams_dropped`]); a rising count
+    /// on a live connection is a replay signal worth surfacing.
+    datagrams_dropped: AtomicU64,
 }
 
 impl VoxConnection {
@@ -441,29 +474,57 @@ impl VoxConnection {
             .map_err(|_| Error::MalformedBundle("quic accept_bi"))
     }
 
-    /// Send one RFC 9221 unreliable datagram (the caller frames it with a
-    /// [`crate::transport::datagram`] sequence number). Fails if the datagram
-    /// exceeds the peer's advertised limit.
-    pub fn send_datagram(&self, frame: Vec<u8>) -> Result<()> {
+    /// Send one RFC 9221 unreliable datagram carrying `payload`. The connection
+    /// prepends the next 64-bit sequence number (ADR-011 datagram framing); the
+    /// caller never sees or chooses sequences. Fails if the framed datagram
+    /// exceeds the peer's advertised limit ([`VoxConnection::max_datagram_payload`]).
+    pub fn send_datagram(&self, payload: &[u8]) -> Result<()> {
+        let frame = lock(&self.datagram_tx).frame(payload);
         self.connection
             .send_datagram(bytes::Bytes::from(frame))
             .map_err(|_| Error::MalformedBundle("quic send_datagram"))
     }
 
-    /// Receive the next inbound datagram's bytes.
+    /// Receive the next inbound datagram's **payload** that passes the
+    /// anti-replay window. Datagrams that are unframed (shorter than the sequence
+    /// prefix), duplicates, or below the window are dropped here — counted in
+    /// [`VoxConnection::datagrams_dropped`] — and never returned, exactly as
+    /// ADR-011 §"Datagram anti-replay" specifies. Only a transport-level read
+    /// failure (connection closed) is an error.
     pub async fn recv_datagram(&self) -> Result<Vec<u8>> {
-        self.connection
-            .read_datagram()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|_| Error::MalformedBundle("quic read_datagram"))
+        loop {
+            let raw = self
+                .connection
+                .read_datagram()
+                .await
+                .map_err(|_| Error::MalformedBundle("quic read_datagram"))?;
+            let Some((seq, payload)) = parse_datagram(&raw) else {
+                self.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            if !lock(&self.datagram_rx).accept(seq) {
+                self.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            return Ok(payload.to_vec());
+        }
     }
 
-    /// The maximum datagram payload the peer will accept right now, if datagrams
-    /// are enabled on the connection.
+    /// Number of inbound datagrams this connection has dropped as replayed,
+    /// duplicate, out-of-window, or unframed.
     #[must_use]
-    pub fn max_datagram_size(&self) -> Option<usize> {
-        self.connection.max_datagram_size()
+    pub fn datagrams_dropped(&self) -> u64 {
+        self.datagrams_dropped.load(Ordering::Relaxed)
+    }
+
+    /// The maximum datagram **payload** the peer will accept right now (its
+    /// advertised datagram size minus the sequence prefix), if datagrams are
+    /// enabled on the connection.
+    #[must_use]
+    pub fn max_datagram_payload(&self) -> Option<usize> {
+        self.connection
+            .max_datagram_size()
+            .map(|n| n.saturating_sub(SEQ_PREFIX_LEN))
     }
 
     /// Close the connection with an application code + reason.

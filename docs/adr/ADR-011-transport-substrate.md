@@ -1,7 +1,8 @@
 # ADR-011: Transport Substrate
 
-**Status**: proposed
+**Status**: implemented (M9, `crates/vox-core/src/transport/`)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: transport, quic, tls, post-quantum, multiplexing, datagrams
 
@@ -113,6 +114,22 @@ production-ready as of 2026.
 
 ### Neutral
 - QUIC is also the natural substrate for ADR-012's UDP-based NAT traversal.
+
+## Implementation notes (M9)
+
+These record the concrete decisions made building this ADR (`crates/vox-core/src/transport/`), so the spec and code stay in lockstep:
+
+- **Datagram anti-replay is a property of the connection.** `VoxConnection` owns the outbound 64-bit
+  sequence counter and the inbound DTLS-style sliding window (default 1024 packets, per the rule above).
+  `send_datagram(payload)` prepends the next sequence; `recv_datagram()` parses the prefix, runs the
+  window, and **drops** — never returns — a datagram that is unframed (shorter than the 8-byte prefix),
+  a duplicate, or below the window, counting each in `datagrams_dropped()` so a live replay shows up
+  as a rising counter. The application only ever sees payloads and cannot choose or observe sequence
+  numbers. The framing/window primitives remain in `transport::datagram` for tests and vectors.
+  *(2026-09-19 review: previously the connection exposed raw datagram bytes and the window was applied
+  only by caller discipline — a byte-exact replay reached the application, proven over real loopback
+  QUIC and now pinned by a test.)* The raw `quinn()` accessor still exists for advanced callers (M11)
+  and bypasses this layer by construction; any such use must apply the same rule.
 
 ## Links
 **Depends on**: ADR-002, ADR-004, ADR-008.
