@@ -22,6 +22,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [013](ADR-013-overlay-tunneling.md) | Overlay Tunneling (TCP-over-Vox) | 002, 007, 011, 012 |
 | [014](ADR-014-macos-client.md) | macOS Client (native SwiftUI + Rust core) | 002, 005–010, 012, 013 |
 | [015](ADR-015-rust-tui-client.md) | Rust TUI Client (chat, swarm create/join, verification) | 002, 005–010, 012, 013 |
+| [016](ADR-016-node-runtime.md) | Node Runtime — composing the core (persistence, rendezvous service, join over the network, sync, headless anchor) | 002, 003, 005–008, 010–013, 015 |
 
 ## Tiers
 
@@ -31,6 +32,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 - **Tier 3 — Differentiator + data:** 008, 007, 009, 010 (log before consent)
 - **Tier 4 — Network & overlay:** 011, 012, 013
 - **Tier 5 — App / platform:** 014, 015
+- **Tier 6 — Integration:** 016 (the runtime that composes Tiers 1–5 into a running node)
 
 ## Status (2026-09-19)
 
@@ -55,10 +57,13 @@ QUIC/DCUtR, NAT/IPv6, deniable authentication).
 | 013 | implemented (library) | M11 `tunnel/` — no CLI surface |
 | 014 | proposed — not started | native macOS GUI |
 | 015 | implemented (offline shell) | M12 `vox-tui/` — live core is the ADR-016 seam |
+| 016 | proposed | node runtime: M13 single-device → M14 two machines chat → M15 headless anchor + tunnel CLI |
 
 **What is missing is the node runtime** that composes the implemented layers (join → transport →
-NAT → sync → governance) and gives the TUI a live `CoreHandle`; that is the next capability
-(ADR-016). Each ADR's "Known gaps" bullet records its residual drift as of 2026-09-19. Later
+NAT → sync → governance) and gives the TUI a live `CoreHandle`; that is ADR-016, proposed
+2026-09-19 with its decisions taken (redb; member bundle records on the rendezvous board; passphrase
+never in the invite link; single-device M13 before network M14). Each ADR's "Known gaps" bullet
+records its residual drift as of 2026-09-19. Later
 capabilities (voice/video, iOS, Linux client, metadata/traffic-analysis resistance, PQ
 post-compromise security) are **distinct named capabilities** with their own ADRs — not deferred
 increments of the ones here (ADR-003 §Scope).
