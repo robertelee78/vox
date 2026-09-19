@@ -180,6 +180,13 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `VaultRootSigner` — the gpg-agent/hardware backends are the documented seam. Test-vector
   obligation: composite pubkey/sig layout is asserted structurally with a fixed-seed signer, but no
   pinned known-answer bytes exist yet for the pubkey, signature, fingerprint, or binding statement.
+- **OpenPGP representation of the native root (M13.2, 2026-09-19).** `identity::openpgp` builds the
+  v4 public-key packet for the Ed25519 half (algo 22 EdDSALegacy, Ed25519 OID, 263-bit MPI with the
+  `0x40` prefix) and its v4 fingerprint; the construction is pinned by the draft-bre "Alice" sample
+  key and by a GnuPG-generated key whose fingerprint was reproduced from `(pubkey, created)` alone.
+  A generated identity's backup therefore carries its real OpenPGP fingerprint. Armored export with
+  a user ID and self-signature (the "exports it in OpenPGP format" half) is the ADR-015 identity
+  export surface, still a known gap.
 
 ## Links
 **Depends on**: ADR-001.
