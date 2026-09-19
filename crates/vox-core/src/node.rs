@@ -11,11 +11,20 @@
 //! - [`content`] — the plaintext envelope a message carries (kind, time, text).
 //! - [`channel`] — per-channel state: create, open (double-lock), append, render,
 //!   all persisted as sealed segments and re-verified on open.
+//! - [`api`] — the node's client-agnostic typed boundary: [`api::NodeView`],
+//!   [`api::NodeCommand`], [`api::NodeEvent`], [`api::Outcome`]. Every client (the
+//!   Rust TUI, the macOS app over UniFFI) projects its own UI model from these;
+//!   the node never depends on a UI.
+//! - [`actor`] — the [`actor::Node`] actor and its [`actor::NodeHandle`]: one
+//!   task owns every secret and is the single writer; commands go in over an
+//!   `mpsc` with a per-command reply, the latest view comes out over a `watch`,
+//!   and ordered events over an `mpsc` (ADR-016 §"The `Node`").
 //!
-//! Later M13 pieces (the `Node` actor and its `CoreHandle` binding) are added
-//! here as they ship. Nothing in this module is a stub: each submodule is a
-//! finished, independently useful unit.
+//! Nothing in this module is a stub: each submodule is a finished, independently
+//! useful unit.
 
+pub mod actor;
+pub mod api;
 pub mod channel;
 pub mod content;
 pub mod paths;

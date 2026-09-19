@@ -268,6 +268,28 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   iteration for a different plaintext would be key/nonce reuse. M13 membership is `{creator}` and the
   evaluator is built over the genesis alone; M14 layers other authors, SKDMs, consent and sync onto
   the same layout. `lock_now` wipes the SEK; the state is then dropped.
+- **The node's own typed boundary (`node::api`, M13.4) — a refinement of the Decision.** The
+  Decision says the UI talks to the node through ADR-015's `ViewModel`/`Command`/`Event`. Those
+  types live in `vox-tui`, and `vox-core` must not depend on a UI, so the node exposes its **own**
+  client-agnostic types — `NodeView` (identity, locked, `mlock_active`, channel summaries, open
+  channels' detail), `NodeCommand` (create/unlock/lock identity; create/open/close channel; send
+  text; shutdown), `NodeEvent` (new entry, locked/unlocked, channel opened/closed, shutdown) and a
+  closed, `Copy` `Outcome`/`Fault` (no free text) — and each client projects its own UI model from
+  them: the TUI maps `NodeView` → `ViewModel` and `Command` → `NodeCommand` in its live `CoreHandle`
+  (M13.5); the macOS client (ADR-014) consumes the same API over UniFFI. Passphrases enter as a
+  zeroizing `Secret`; nothing else that crosses is secret-bearing (asserted by type: `Outcome` is
+  `Copy`). A channel's *local name* is under the channel lock (it lives in the sealed manifest), so
+  a closed channel is listed by id only.
+- **The actor (`node::actor`, M13.4).** `Node::spawn` (system clock, production Argon2id) /
+  `spawn_with` (injected clock + profile, for tests) opens an existing profile **locked** and runs one
+  tokio task that owns the `Profile` and every open `ChannelState`, processing commands strictly in
+  order with a per-command `oneshot` reply, publishing the latest `NodeView` on a `watch` after every
+  command, and emitting ordered `NodeEvent`s on an `mpsc`. KDF-heavy commands run inline in the
+  actor (later commands queue for the ~1 s an Argon2id unlock takes) — serialization is the design.
+  `Lock` and `Shutdown`, and the close of the last `NodeHandle`, wipe every open channel's SEK and
+  drop the signer before the task exits. Tests drive the whole single-device lifecycle through the
+  handle, including a simulated process restart (identity present and locked, channels listed
+  closed, timeline restored after unlock + open) and last-handle-drop locking.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
