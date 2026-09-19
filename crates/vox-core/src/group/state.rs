@@ -25,6 +25,9 @@
 
 use std::collections::HashMap;
 
+use zeroize::Zeroizing;
+
+use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::group::message::{GroupMessage, MessageHeader};
 use crate::group::senderkey::{ChainKey, MessageKey, SenderKeySigningKey};
@@ -115,6 +118,79 @@ impl SenderChain {
             signing_key,
             created_at,
         }
+    }
+
+    /// Serialize the chain's **secret** state for the sealed at-rest key-material
+    /// segment (ADR-010 §"per-channel key material"; ADR-016 M13). Canonical CBOR
+    /// `[1, channel_id, epoch, author_id, chain_id, chain_key, next_iteration,
+    /// ed25519_seed, ml_dsa_seed, created_at]`. Returned zeroizing; it must only
+    /// ever be handed to [`crate::atrest::store::seal_segment`].
+    #[must_use]
+    pub fn to_state(&self) -> Zeroizing<Vec<u8>> {
+        let (ed, ml) = self.signing_key.component_seeds();
+        let mut e = Encoder::new();
+        e.array(10)
+            .uint(SENDER_STATE_VERSION)
+            .bytes(&self.channel_id)
+            .uint(self.epoch)
+            .bytes(&self.author_id)
+            .uint(self.chain_id)
+            .bytes(self.chain_key.bytes())
+            .uint(self.next_iteration)
+            .bytes(ed.as_ref())
+            .bytes(ml.as_ref())
+            .uint(self.created_at);
+        Zeroizing::new(e.finish())
+    }
+
+    /// Restore a chain from [`SenderChain::to_state`] bytes (opened from a sealed
+    /// segment). Strict: arity, version, lengths, trailing bytes.
+    pub fn from_state(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 10 {
+            return Err(Error::MalformedBundle("sender chain state arity"));
+        }
+        if d.uint()? != SENDER_STATE_VERSION {
+            return Err(Error::MalformedBundle("sender chain state version"));
+        }
+        let channel_id: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("sender chain state channel_id"))?;
+        let epoch = d.uint()?;
+        let author_id: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("sender chain state author_id"))?;
+        let chain_id = d.uint()?;
+        let ck: [u8; 32] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("sender chain state chain_key"))?;
+        let next_iteration = d.uint()?;
+        let ed: [u8; 32] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("sender chain state ed25519 seed"))?;
+        let ml: [u8; 32] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("sender chain state ml-dsa seed"))?;
+        let created_at = d.uint()?;
+        d.finish()?;
+        let ed = Zeroizing::new(ed);
+        let ml = Zeroizing::new(ml);
+        let signing_key = SenderKeySigningKey::from_component_seeds(&ed, &ml)?;
+        Ok(Self {
+            channel_id,
+            epoch,
+            author_id,
+            chain_id,
+            chain_key: ChainKey::from_bytes(ck),
+            next_iteration,
+            signing_key,
+            created_at,
+        })
     }
 
     /// The channel id this chain is bound to.
@@ -228,6 +304,9 @@ impl SenderChain {
         )
     }
 }
+
+/// Version of the sealed sender-chain state encoding.
+const SENDER_STATE_VERSION: u64 = 1;
 
 /// The receive side of one `(author_id, chain_id)` generation: derives message
 /// keys forward from a starting iteration, with a bounded skip/replay window.
@@ -381,6 +460,33 @@ impl ReceiverChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_chain_state_round_trips_and_continues_the_ratchet() {
+        // Persist mid-chain, restore, and the restored chain produces exactly the
+        // messages the original would have (same keys, same iterations, same
+        // signing key) — the M13 at-rest continuity property.
+        let cid = [0xC1u8; 32];
+        let author = [0xA1u8; 32];
+        let mut live = SenderChain::new(&cid, 3, &author, 0, 1_000).unwrap();
+        let _m0 = live.encrypt(b"zero").unwrap();
+        let _m1 = live.encrypt(b"one").unwrap();
+        let state = live.to_state();
+        let mut restored = SenderChain::from_state(&state).unwrap();
+        assert_eq!(restored.next_iteration(), 2);
+        assert_eq!(restored.chain_id(), 0);
+        assert_eq!(restored.epoch(), 3);
+        assert_eq!(restored.signing_pubkey(), live.signing_pubkey());
+        let a = live.encrypt(b"two").unwrap();
+        let b = restored.encrypt(b"two").unwrap();
+        // Same header + ciphertext (same key, same nonce derivation) and both verify.
+        assert_eq!(a.to_wire(), b.to_wire());
+        // Strictness: tampered arity/version rejected.
+        assert!(SenderChain::from_state(&state[..state.len() - 1]).is_err());
+        let mut bad = state.clone();
+        bad[1] = 2; // version
+        assert!(SenderChain::from_state(&bad).is_err());
+    }
     use crate::identity::composite::SoftwareRootSigner;
 
     fn root(a: u8, b: u8) -> SoftwareRootSigner {

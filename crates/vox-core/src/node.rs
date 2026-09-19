@@ -8,11 +8,16 @@
 //!   sees plaintext or a raw key.
 //! - [`profile`] — the identity lifecycle: create a native root and seal it in the
 //!   ADR-010 identity vault, open, unlock, lock.
+//! - [`content`] — the plaintext envelope a message carries (kind, time, text).
+//! - [`channel`] — per-channel state: create, open (double-lock), append, render,
+//!   all persisted as sealed segments and re-verified on open.
 //!
-//! Later M13 pieces (channel state, the `Node` actor and its `CoreHandle`
-//! binding) are added here as they ship. Nothing in this module is a stub: each
-//! submodule is a finished, independently useful unit.
+//! Later M13 pieces (the `Node` actor and its `CoreHandle` binding) are added
+//! here as they ship. Nothing in this module is a stub: each submodule is a
+//! finished, independently useful unit.
 
+pub mod channel;
+pub mod content;
 pub mod paths;
 pub mod profile;
 pub mod store;
