@@ -105,6 +105,13 @@ impl MessageKey {
     pub(crate) fn bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Wrap explicit key bytes, for restoring a receiver chain's skipped-key cache
+    /// from its sealed at-rest state ([`crate::group::state::ReceiverChain`]).
+    #[must_use]
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl ChainKey {

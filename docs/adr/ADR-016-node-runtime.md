@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.5a done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.5 done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -383,6 +383,19 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   discriminator it lacked (governance = struct-tagged frame, content = `vox/group-msg/v1` prefix,
   anything else refused); wiring it into the sync resolver is M14.6. SKDM delivery — the half that makes
   an admitted, consented author actually *readable* — is M14.5b.
+- **SKDM delivery (M14.5b).** `node::pairwise_stream` is the `pairwise` stream kind's first content: one
+  frame carrying an SKDM sealed into the peer's ADR-004 session, delivered without a round trip
+  (`deliver_skdm` / `recv_skdm`). `ChannelState::accept_skdm` verifies it against the author's admitted
+  key, keeps it as a `ReceiverChain` in a sealed `SEG_RECEIVERS` segment, and **backfills**: every content
+  entry already stored from that author is retried, so the common ordering (entries arrive before the key)
+  renders correctly. Rendering applies both gates — the sender key must be held *and* the author must have
+  consented on the log — so a decryptable message from a non-consenting author still does not render.
+  `ReceiverChain` gained `to_state`/`from_state` so the head and skipped-key cache survive a restart
+  (ADR-006/ADR-010 Implementation notes); a decrypt's chain advance and its plaintext row are persisted in
+  one batch, and a failed persist poisons the channel rather than allowing a consumed iteration to be
+  re-derived. Proven by an in-process test (ciphertext before the key, backfill on arrival, forward-only
+  history releasing nothing earlier, replay refused, survives a reopen) and a loopback QUIC test (the SKDM
+  crosses a real pairwise stream sealed in a real PQXDH session and then decrypts the author's broadcast).
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

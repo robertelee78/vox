@@ -2,7 +2,7 @@
 
 **Status**: implemented (M4, `crates/vox-core/src/group/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — status reconciled; Implementation notes (M4) added.
+**Updated**: 2026-09-20 — SKDMs are delivered over a `pairwise` stream and receiver chains persist their live state (`node::pairwise_stream`, `node::channel`, ADR-016 M14.5b). 2026-09-19 — status reconciled; Implementation notes (M4) added.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: group-messaging, sender-keys, channel, pq-kem
 
@@ -114,6 +114,22 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   with ADR-004.
 - **Rotation bounds** `ROTATE_AFTER_MESSAGES = 1000`, `ROTATE_AFTER_SECS = 7 d` are exposed as
   `SenderChain::should_rotate` for the governing layer to poll.
+- **Sender keys are delivered and retained (ADR-016 M14.5b).** An SKDM now travels as one frame on a
+  bi-stream typed `pairwise`, sealed into the recipient's ADR-004 session (`Skdm::seal_into`), so the
+  ratchet — not the stream — provides confidentiality and authenticity; the recipient verifies it against
+  the author's *admitted* key and this channel/epoch before it becomes a `ReceiverChain`
+  (`ChannelState::accept_skdm`). Two things this forced, both recorded here:
+  (1) **A receiver chain persists its live state, not the SKDM that created it.** `ReceiverChain` gained
+  `to_state`/`from_state` (sealed as a `KeyMaterial` segment, ADR-010), because `next_iteration` and the
+  skipped-key cache *are* the replay defence: rebuilding from the SKDM after a restart would reset the
+  head and let an already-consumed iteration decrypt again. A restored chain refuses a replay exactly as
+  the live one does, and a cached key at or above the head is refused on decode.
+  (2) **Key arrival and message arrival are independent, so acceptance backfills.** A message often
+  arrives before the key that opens it, so accepting an SKDM retries every content entry already stored
+  from that author and renders those that open — the monotone per-sender fill-in ADR-007 describes. Under
+  this channel's default `ForwardOnly` history mode an SKDM released at the author's current position
+  renders *nothing* earlier, which a test asserts as intended behaviour rather than a plumbing failure.
+  A second SKDM for a generation already held is ignored rather than rewinding the chain head.
 - **Known gaps (recorded 2026-09-19).** (1) The ADR-002 §3 cross-signature requirement is met by the
   root signature over the whole SKDM body; the separate `SenderKeyCrossSig` / `sender_key_binding_input`
   mechanism exists but is not wired anywhere — two mechanisms for one requirement, one dead (candidate

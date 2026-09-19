@@ -49,8 +49,9 @@ use crate::governance::entry::GovEntry;
 use crate::governance::evaluator::Evaluator;
 use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
 use crate::governance::membership::{issue_consent_grant, MembershipView};
+use crate::group::message::GroupMessage;
 use crate::group::skdm::Skdm;
-use crate::group::state::SenderChain;
+use crate::group::state::{ReceiverChain, SenderChain};
 use crate::group::wire::GROUP_MSG_SIGN_DOMAIN;
 use crate::hash::{sha256, Digest32};
 use crate::identity::composite::{CompositePublicKey, RootSigner};
@@ -66,6 +67,9 @@ const SEG_MANIFEST: u64 = 0;
 /// The admitted-authors segment id within [`SegmentKind::KeyMaterial`] (M14.5): the
 /// composite keys of every identity whose entries this node accepts into the log.
 const SEG_AUTHORS: u64 = 2;
+/// The receiver-chains segment id within [`SegmentKind::KeyMaterial`] (M14.5b): the
+/// sender keys other members have released to this identity.
+const SEG_RECEIVERS: u64 = 3;
 /// Segment id of this identity's sender chain in `KeyMaterial`.
 const SEG_SENDER: u64 = 1;
 /// Manifest encoding version.
@@ -75,6 +79,12 @@ const CACHE_VERSION: u64 = 1;
 
 /// At-rest version of the admitted-authors segment.
 const AUTHORS_VERSION: u64 = 1;
+
+/// At-rest version of the receiver-chains segment.
+const RECEIVERS_VERSION: u64 = 1;
+
+/// Hard cap on retained receiver chains per channel (one per author generation).
+pub const MAX_RECEIVER_CHAINS: usize = 4096;
 
 /// Hard cap on admitted authors per channel, so a hostile or corrupt segment cannot
 /// force an unbounded allocation on open.
@@ -88,9 +98,11 @@ pub enum Accepted {
     /// A governance entry: verified, stored, and folded into the evaluator.
     Governance,
     /// A content entry: verified and stored, but not readable — this node holds no
-    /// sender key for that author yet (ADR-007: consent, not credentials, grants
-    /// reading).
+    /// sender key for that author yet, or that author has not consented to this
+    /// identity (ADR-007: consent, not credentials, grants reading).
     ContentNotReadable,
+    /// A content entry that was decrypted and rendered into the timeline.
+    Rendered,
 }
 
 /// A rendered (decrypted, render-gated) message in the timeline.
@@ -126,6 +138,10 @@ pub struct ChannelState {
     /// Accepted governance entries (consent grants and the rest) in acceptance
     /// order — the evaluator's input, rebuilt from the log on open (M14.5).
     gov_entries: Vec<GovEntry>,
+    /// Sender keys released to this identity, keyed by `(author, chain_id)`
+    /// (M14.5b). Present only for authors that consented; its presence is what
+    /// makes their content readable.
+    receivers: BTreeMap<(Digest32, u64), ReceiverChain>,
     poisoned: bool,
 }
 
@@ -138,6 +154,7 @@ impl std::fmt::Debug for ChannelState {
             .field("entries", &self.dag.len())
             .field("authors", &self.authors.len())
             .field("governance", &self.gov_entries.len())
+            .field("receiver_chains", &self.receivers.len())
             .field("poisoned", &self.poisoned)
             .finish_non_exhaustive()
     }
@@ -217,6 +234,39 @@ fn parse_authors(bytes: &[u8]) -> Result<BTreeMap<Digest32, CompositePublicKey>>
             return Err(Error::MalformedAtRest("channel author key/fingerprint"));
         }
         out.insert(fp, key);
+    }
+    d.finish()?;
+    Ok(out)
+}
+
+/// The receiver-chains segment: `[version, [chain_state, …]]`, each element a
+/// [`ReceiverChain::to_state`] blob (which carries its own author/chain binding).
+/// Secret-bearing, so the assembled buffer zeroizes on drop.
+fn receivers_bytes(receivers: &BTreeMap<(Digest32, u64), ReceiverChain>) -> Zeroizing<Vec<u8>> {
+    let mut e = Encoder::new();
+    e.array(2).uint(RECEIVERS_VERSION).array(receivers.len());
+    for chain in receivers.values() {
+        e.bytes(&chain.to_state());
+    }
+    Zeroizing::new(e.finish())
+}
+
+fn parse_receivers(bytes: &[u8]) -> Result<BTreeMap<(Digest32, u64), ReceiverChain>> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 {
+        return Err(Error::MalformedAtRest("channel receivers arity"));
+    }
+    if d.uint()? != RECEIVERS_VERSION {
+        return Err(Error::MalformedAtRest("channel receivers version"));
+    }
+    let n = d.array()?;
+    if n > MAX_RECEIVER_CHAINS {
+        return Err(Error::SizeLimitExceeded("channel receiver chains"));
+    }
+    let mut out = BTreeMap::new();
+    for _ in 0..n {
+        let chain = ReceiverChain::from_state(d.bytes()?)?;
+        out.insert((chain.author_id(), chain.chain_id()), chain);
     }
     d.finish()?;
     Ok(out)
@@ -385,6 +435,7 @@ impl ChannelState {
             next_log_id: 1,
             timeline: Vec::new(),
             gov_entries: Vec::new(),
+            receivers: BTreeMap::new(),
             poisoned: false,
         })
     }
@@ -486,6 +537,16 @@ impl ChannelState {
         let sender = SenderChain::from_state(&sender_state)?;
         drop(sender_state);
 
+        // Sender keys other members released to us (M14.5b).
+        let receivers =
+            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_RECEIVERS)? {
+                Some(seg) => {
+                    let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_RECEIVERS, &seg)?;
+                    parse_receivers(&bytes)?
+                }
+                None => BTreeMap::new(),
+            };
+
         let evaluator = Self::build_evaluator(&genesis, &authors, &gov_entries, now_secs)?;
         Ok(Self {
             channel_id: *channel_id,
@@ -502,6 +563,7 @@ impl ChannelState {
             next_log_id,
             timeline,
             gov_entries,
+            receivers,
             poisoned: false,
         })
     }
@@ -641,6 +703,7 @@ impl ChannelState {
             next_log_id: 1,
             timeline: Vec::new(),
             gov_entries: Vec::new(),
+            receivers: BTreeMap::new(),
             poisoned: false,
         })
     }
@@ -795,6 +858,179 @@ impl ChannelState {
         self.gov_entries.iter().map(|g| g.entry_hash).collect()
     }
 
+    /// Accept a **sender-key distribution message** from `author` (ADR-006/ADR-007
+    /// step 2/3): the sender key that member released to this identity, delivered
+    /// over the ADR-004 pairwise session (M14.5b `node::pairwise`).
+    ///
+    /// The SKDM is verified against the author's admitted key and bound to this
+    /// channel and epoch. On acceptance the chain is persisted **and every content
+    /// entry already stored from that author is retried**, so a message that arrived
+    /// as ciphertext before consent renders as soon as the key arrives — the
+    /// monotone per-sender fill-in ADR-007 describes. Returns how many entries that
+    /// backfill rendered.
+    pub fn accept_skdm(&mut self, profile: &Profile, skdm: &Skdm, now_secs: u64) -> Result<usize> {
+        if self.poisoned {
+            return Err(Error::Profile(
+                "channel is poisoned after a failed persist; reopen it",
+            ));
+        }
+        let author = skdm.body.author_id;
+        let key = self
+            .authors
+            .get(&author)
+            .ok_or(Error::MalformedGovernance("SKDM from an unadmitted author"))?
+            .clone();
+        let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, self.epoch)?;
+        let slot = (author, chain.chain_id());
+        // A second SKDM for a generation we already hold would rewind the chain
+        // head and re-enable consumed iterations; keep the live one.
+        if self.receivers.contains_key(&slot) {
+            return Ok(0);
+        }
+        if self.receivers.len() >= MAX_RECEIVER_CHAINS {
+            return Err(Error::SizeLimitExceeded("channel receiver chains"));
+        }
+        self.receivers.insert(slot, chain);
+        self.persist_receivers(profile)?;
+        self.backfill(profile, &author, now_secs)
+    }
+
+    /// Whether this node holds a sender key for `author`.
+    #[must_use]
+    pub fn has_sender_key(&self, author: &Digest32) -> bool {
+        self.receivers.keys().any(|(a, _)| a == author)
+    }
+
+    /// Persist the receiver chains, poisoning the channel if the write fails.
+    fn persist_receivers(&mut self, profile: &Profile) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_RECEIVERS,
+            &receivers_bytes(&self.receivers),
+        )?;
+        if let Err(e) = profile.store().put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_RECEIVERS,
+            &seg,
+        ) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Retry every stored content entry from `author` against the sender keys now
+    /// held, rendering those that open. Called when a key arrives.
+    fn backfill(&mut self, profile: &Profile, author: &Digest32, now_secs: u64) -> Result<usize> {
+        let already: std::collections::BTreeSet<Digest32> =
+            self.timeline.iter().map(|r| r.entry_hash).collect();
+        let pending: Vec<(Digest32, Vec<u8>, u64)> = match self.dag.feed(author) {
+            None => Vec::new(),
+            Some(feed) => (1..=feed.max_seq())
+                .filter_map(|seq| feed.get(seq))
+                .filter(|e| !already.contains(&e.entry_hash()))
+                .filter_map(|e| {
+                    e.payload
+                        .as_ref()
+                        .map(|p| (e.entry_hash(), p.clone(), e.skeleton.seq))
+                })
+                .collect(),
+        };
+        let mut rendered = 0usize;
+        for (entry_hash, payload, _seq) in pending {
+            if !matches!(classify_payload(&payload), Ok(EntryKind::Content)) {
+                continue;
+            }
+            if self.render_content(profile, *author, entry_hash, &payload, now_secs)? {
+                rendered += 1;
+            }
+        }
+        Ok(rendered)
+    }
+
+    /// Try to decrypt one stored content payload and, on success, render it into the
+    /// timeline and persist the sealed plaintext cache row.
+    ///
+    /// Both gates apply: this node must hold the author's sender key for the
+    /// message's generation **and** the author must have consented to this identity
+    /// on the log (ADR-007). A message whose key is absent, whose consent is absent,
+    /// or that fails to open is left stored as ciphertext.
+    fn render_content(
+        &mut self,
+        profile: &Profile,
+        author: Digest32,
+        entry_hash: Digest32,
+        payload: &[u8],
+        now_secs: u64,
+    ) -> Result<bool> {
+        let me = RootSigner::public_key(profile.signer()?).fingerprint();
+        if author != me && !self.may_read(&author, &me) {
+            return Ok(false);
+        }
+        let msg = match GroupMessage::from_wire(payload) {
+            Ok(m) => m,
+            Err(_) => return Ok(false),
+        };
+        let slot = (author, msg.header.chain_id);
+        let Some(chain) = self.receivers.get_mut(&slot) else {
+            return Ok(false);
+        };
+        let plaintext = match chain.decrypt(&msg) {
+            Ok(p) => Zeroizing::new(p),
+            Err(_) => return Ok(false),
+        };
+        let content = Content::from_canonical_slice(&plaintext)?;
+        let rendered = Rendered {
+            entry_hash,
+            author,
+            created_secs: content.created_secs,
+            text: content.text,
+        };
+        // The cache row shares the entry's log id space; use a fresh id so it never
+        // collides with an authored row.
+        let id = self.next_log_id;
+        let cache_seg = seal_segment(
+            &self.sek,
+            SegmentKind::PlaintextCache,
+            id,
+            &cache_bytes(&rendered),
+        )?;
+        let receivers_seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_RECEIVERS,
+            &receivers_bytes(&self.receivers),
+        )?;
+        let persisted = (|| -> Result<()> {
+            let mut batch = profile.store().batch()?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::PlaintextCache,
+                id,
+                &cache_seg,
+            )?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_RECEIVERS,
+                &receivers_seg,
+            )?;
+            batch.commit()
+        })();
+        if let Err(e) = persisted {
+            // The chain advanced in memory but the advance was not persisted: a
+            // reopen would re-derive a consumed key. Poison instead.
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.next_log_id = id.saturating_add(1);
+        self.timeline.push(rendered);
+        let _ = now_secs;
+        Ok(true)
+    }
+
     /// Accept an entry authored by **another** member (M14.5; the bytes arrive from
     /// the join stream now and from ADR-008 sync in M14.6).
     ///
@@ -844,6 +1080,7 @@ impl ChannelState {
         } else {
             None
         };
+        let entry_hash = entry.entry_hash();
         let wire = entry.to_wire();
         let id = self.next_log_id;
         let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
@@ -870,9 +1107,21 @@ impl ChannelState {
                 )?;
                 Ok(Accepted::Governance)
             }
-            // Stored as ciphertext: no sender key for this author yet, so there is
-            // nothing to render (ADR-007 step 3).
-            None => Ok(Accepted::ContentNotReadable),
+            // Content: render it if we hold the author's sender key and the author
+            // has consented to us; otherwise it stays stored as ciphertext
+            // (ADR-007 step 3) until an SKDM arrives and backfills it.
+            None => {
+                let payload = self
+                    .dag
+                    .get_by_hash(&entry_hash)
+                    .and_then(|e| e.payload.clone())
+                    .ok_or(Error::MalformedGovernance("accepted entry payload missing"))?;
+                if self.render_content(profile, author, entry_hash, &payload, now_secs)? {
+                    Ok(Accepted::Rendered)
+                } else {
+                    Ok(Accepted::ContentNotReadable)
+                }
+            }
         }
     }
 
@@ -1420,5 +1669,187 @@ mod tests {
         assert!(b.may_read(&a_fp, &b_fp), "consent survived the reopen");
         assert_eq!(a.author_keys().len(), 2);
         assert_eq!(alice_key.fingerprint(), a_fp);
+    }
+    /// M14.5b: the sender key is what makes a consented author readable, and a
+    /// message that arrived before the key renders as soon as the key lands.
+    #[test]
+    fn an_skdm_makes_a_stored_ciphertext_entry_render_and_survives_a_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = profile(&tmp, "alice");
+        let bob = profile(&tmp, "bob");
+        let t = 1_700_000_000;
+
+        let mut a = ChannelState::create_with_profile(
+            &alice,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        let cid = a.channel_id();
+        let a_fp = RootSigner::public_key(alice.signer().unwrap()).fingerprint();
+        let b_fp = RootSigner::public_key(bob.signer().unwrap()).fingerprint();
+        let mut b = ChannelState::join_channel_with_profile(
+            &bob,
+            a.genesis(),
+            &cid,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        a.admit_author(&alice, &RootSigner::public_key(bob.signer().unwrap()), t)
+            .unwrap();
+
+        // Alice writes two messages before Bob has anything; both cross as
+        // ciphertext.
+        let first = a.append_text(&alice, "before consent", t).unwrap().clone();
+        let second = a.append_text(&alice, "also before", t + 1).unwrap().clone();
+        for r in [&first, &second] {
+            let wire = a.dag.get_by_hash(&r.entry_hash).unwrap().to_wire();
+            assert_eq!(
+                b.accept_entry(&bob, Entry::from_wire(&wire).unwrap(), t)
+                    .unwrap(),
+                Accepted::ContentNotReadable
+            );
+        }
+        assert!(b.timeline().is_empty());
+        assert!(!b.has_sender_key(&a_fp));
+
+        // Alice consents: the grant goes on the log and her SKDM goes to Bob.
+        let (iteration, key) = a.sender.current_position();
+        let skdm = a
+            .sender
+            .skdm_for(alice.signer().unwrap(), iteration, key)
+            .unwrap();
+        let grant_hash = {
+            let grant = a.issue_consent(&alice, b_fp, &skdm, t + 2).unwrap();
+            assert_eq!(grant.body.target_id, b_fp);
+            a.gov_entries.last().unwrap().entry_hash
+        };
+        let grant_wire = a.dag.get_by_hash(&grant_hash).unwrap().to_wire();
+        b.accept_entry(&bob, Entry::from_wire(&grant_wire).unwrap(), t + 2)
+            .unwrap();
+
+        // An SKDM released at Alice's *current* position (forward-only history, the
+        // channel's default) does not unlock messages she sent earlier: the backfill
+        // renders nothing, which is the ADR-006 history mode working, not a bug.
+        assert_eq!(b.accept_skdm(&bob, &skdm, t + 2).unwrap(), 0);
+        assert!(b.has_sender_key(&a_fp));
+        assert!(b.timeline().is_empty(), "forward-only: no history");
+
+        // From here on Alice's messages render for Bob as they arrive.
+        let third = a
+            .append_text(&alice, "after consent", t + 3)
+            .unwrap()
+            .clone();
+        let wire = a.dag.get_by_hash(&third.entry_hash).unwrap().to_wire();
+        assert_eq!(
+            b.accept_entry(&bob, Entry::from_wire(&wire).unwrap(), t + 3)
+                .unwrap(),
+            Accepted::Rendered
+        );
+        assert_eq!(
+            b.timeline()
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["after consent"]
+        );
+        assert_eq!(b.timeline()[0].author, a_fp);
+
+        // A replayed entry is refused by the DAG, so a message cannot render twice.
+        assert!(b
+            .accept_entry(&bob, Entry::from_wire(&wire).unwrap(), t + 3)
+            .is_err());
+
+        // A second SKDM for the same generation is ignored rather than rewinding the
+        // chain head (which would re-enable a consumed iteration).
+        assert_eq!(b.accept_skdm(&bob, &skdm, t + 4).unwrap(), 0);
+
+        // Backfill — the realistic ordering: log entries often arrive *before* the
+        // key. Carol joins, Alice consents (minting an SKDM at her current
+        // position), Alice writes two more messages, Carol receives those entries
+        // first (unreadable), and only then the SKDM — which must render them.
+        let carol = profile(&tmp, "carol");
+        let c_fp = RootSigner::public_key(carol.signer().unwrap()).fingerprint();
+        let mut c = ChannelState::join_channel_with_profile(
+            &carol,
+            a.genesis(),
+            &cid,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        a.admit_author(&alice, &RootSigner::public_key(carol.signer().unwrap()), t)
+            .unwrap();
+        let (iter_c, key_c) = a.sender.current_position();
+        let skdm_c = a
+            .sender
+            .skdm_for(alice.signer().unwrap(), iter_c, key_c)
+            .unwrap();
+        let grant2 = a.issue_consent(&alice, c_fp, &skdm_c, t + 5).unwrap();
+        assert_eq!(grant2.body.target_id, c_fp);
+        a.append_text(&alice, "carol one", t + 6).unwrap();
+        a.append_text(&alice, "carol two", t + 7).unwrap();
+
+        // Carol receives Alice's whole feed, in sequence order — a feed cannot be
+        // accepted with gaps (ADR-008 `prev_hash`/lipmaa backlinks), which is what
+        // M14.6 sync will guarantee. Everything arrives before the key.
+        let feed_wires: Vec<Vec<u8>> = {
+            let feed = a.dag.feed(&a_fp).expect("Alice has a feed");
+            (1..=feed.max_seq())
+                .filter_map(|seq| feed.get(seq))
+                .map(Entry::to_wire)
+                .collect()
+        };
+        assert!(
+            feed_wires.len() >= 7,
+            "grants and messages are all on the feed"
+        );
+        for w in &feed_wires {
+            c.accept_entry(&carol, Entry::from_wire(w).unwrap(), t + 7)
+                .unwrap();
+        }
+        assert_eq!(c.entry_count(), feed_wires.len());
+        assert!(
+            c.timeline().is_empty(),
+            "no key yet: every content entry is stored ciphertext"
+        );
+        assert!(c.may_read(&a_fp, &c_fp), "the grant is on Carol's log");
+        // The key lands: both stored entries render, oldest first.
+        assert_eq!(
+            c.accept_skdm(&carol, &skdm_c, t + 8).unwrap(),
+            2,
+            "the SKDM backfills the entries that arrived before it"
+        );
+        assert_eq!(
+            c.timeline()
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["carol one", "carol two"]
+        );
+
+        // Everything survives a reopen, and the restored receiver chain still
+        // refuses a replay.
+        drop(b);
+        let b = ChannelState::open(&bob, &cid, b"channel-pp", t + 6).unwrap();
+        assert!(b.has_sender_key(&a_fp));
+        assert_eq!(
+            b.timeline()
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["after consent"]
+        );
+        drop(c);
+        let c = ChannelState::open(&carol, &cid, b"channel-pp", t + 9).unwrap();
+        assert_eq!(c.timeline().len(), 2);
+        assert!(c.has_sender_key(&a_fp));
     }
 }

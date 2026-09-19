@@ -29,6 +29,7 @@ pub mod channel;
 pub mod content;
 pub mod joinstream;
 pub mod net;
+pub mod pairwise_stream;
 pub mod paths;
 pub mod prekeys;
 pub mod profile;
