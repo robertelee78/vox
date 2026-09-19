@@ -2,7 +2,7 @@
 
 **Status**: implemented (M6, `crates/vox-core/src/governance/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin"; genesis policy and policy-update carry the ADR-003 `min_suite` floor.
+**Updated**: 2026-09-20 — the join/consent flow now has a runtime: joiner-side channel state, author admission as a log fact, and consent grants appended and evaluated (`node::channel`, ADR-016 M14.5). 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin"; genesis policy and policy-update carry the ADR-003 `min_suite` floor.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: consent, membership, admin, governance, revocation, capabilities, differentiator
 
@@ -248,6 +248,22 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   deterministic, and the canonical order is **normative** (an independent implementation must
   reproduce `Causality::build`'s order to agree bit-for-bit). *(Recorded 2026-09-19 to reconcile the
   Decision text above with the code; the golden vectors pin the code's rule.)*
+- **The join/consent flow runs (ADR-016 M14.5).** §"Join and per-sender consent flow" is now executable
+  in `node::channel`, and the separation it rests on is explicit in the code: **log authorship and read
+  authority are different things.** `ChannelState::join_channel` builds a joiner's local state from a
+  genesis fetched off the board, accepting it **only if its hash equals the channelID joined with** —
+  that check, not any roster, is what makes a cold-fetched genesis safe — and gives the joiner its own
+  local SEK and its own sender chain at `chain_id` 0. `admit_author` then records a verified composite key
+  as a log author (persisted in a new sealed `SEG_AUTHORS` segment, ADR-010), which lets that identity's
+  entries pass the ADR-008 predicate and **nothing more**: a content entry from an admitted author is
+  stored as ciphertext and never rendered, because rendering needs that author's sender key. Keys come
+  from the verified genesis, admin certificates, or the board's records (ADR-016), never from a
+  server-supplied list — the membership-injection class stays structurally absent. `issue_consent` builds
+  the grant with the `skdm_ref` of the SKDM actually delivered plus the history mode in force, appends it
+  as a **governance** entry, and folds it into the evaluator, so consent is a log fact both sides
+  evaluate independently; `may_read` is the resulting per-sender verdict. A test walks it: Bob joins, each
+  side admits the other, Alice's message crosses and is unreadable, her grant crosses and flips only
+  `Alice → Bob` (consent is per-sender, not mutual), and all of it survives a reopen.
 - **Known gaps (recorded 2026-09-19).** Role-tag ABAC (`#ops` may `dial:` `#ssh-hosts`) is not
   evaluated anywhere — `Capability::Role` exists, `is_at_or_below` is exact-match, and `tunnel/authz`
   checks only `bind:`/`dial:` tags; `Invite` has no wire encoding or signature yet; any `delegate`-holder

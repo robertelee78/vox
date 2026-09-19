@@ -256,8 +256,12 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   surfaces as a `prev_hash` failure (wire error `0x05`), so "permanently detectable on heal" holds only
   for equal-length forks. (3) Fork proofs live in the in-memory `frozen` map; the ADR's "record the
   proof as a channel entry" has no entry type yet. (4) `AuthorResolver::kind_for` defaults to
-  `Content` and nothing overrides it, so governance entries received via sync get the content fork
-  remedy. (5) `K_self` is derived but never applied (the self-log test stores plaintext);
+  `Content` and nothing overrides it, so governance entries received via **sync** still get the content
+  fork remedy — but the discriminator now exists: `node::channel::classify_payload` (2026-09-20, ADR-016
+  M14.5) types an entry from its payload, which is self-describing and disjoint (a governance payload is a
+  struct-tagged frame, a sender-key message is domain-prefixed `vox/group-msg/v1`, anything else is
+  refused), and every entry the node accepts or reloads is classified that way. Wiring it into the sync
+  resolver is M14.6. (5) `K_self` is derived but never applied (the self-log test stores plaintext);
   `self_channel_id` (`vox/self-channel-id/v1`) is an addition not in the Decision. (6) Transport I/O
   errors map to `0x01`, which the M0 table defines as "version". (7) The authenticator type sits outside
   the signed skeleton and `algo_ids[0]` is pinned to the composite id even for deniable entries.
