@@ -75,6 +75,7 @@ use crate::governance::entry::{GovBody, GovEntry};
 use crate::governance::genesis::{ChannelPolicy, Genesis};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
+use crate::suite::SuiteFloor;
 
 /// The verdict for an authority query: granted (with the governing capability and
 /// the effective set) or denied (with a reason).
@@ -639,6 +640,21 @@ impl<'a> Resolver<'a> {
             if let Some(ttl) = p.body.ttl {
                 policy.ttl = ttl;
             }
+            // The ciphersuite floor is raise-only (ADR-003: "the floor advances
+            // deliberately and never silently downgrades"). An authorized update
+            // naming a suite ranked below the floor in force is ignored — its
+            // other fields still apply. Both ids are registered (validated on
+            // decode / at genesis), so the lookups cannot fail; a miss would be
+            // an internal invariant breach and is treated as "not a raise".
+            if let Some(id) = p.body.min_suite {
+                let raise = SuiteFloor::new(id)
+                    .ok()
+                    .zip(SuiteFloor::new(policy.min_suite).ok())
+                    .is_some_and(|(new, cur)| cur.permits_raise_to(new));
+                if raise {
+                    policy.min_suite = id;
+                }
+            }
         }
         Ok(policy)
     }
@@ -806,6 +822,7 @@ mod causality_tests {
             history_mode: HistoryMode::ForwardOnly,
             deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
+            min_suite: SuiteFloor::DAY_ONE.id(),
         };
         GovBody::Genesis(Box::new(
             Genesis::create_with_nonce(&r, 0, policy, [0; 16]).unwrap(),

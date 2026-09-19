@@ -1,7 +1,8 @@
 # ADR-003: Post-Quantum and Crypto-Agility Policy
 
-**Status**: proposed
+**Status**: implemented (M0/M2/M3/M6; registry in `crates/vox-core/src/suite.rs`)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — Implementation notes added; the channel minimum suite now lives in the signed genesis policy and every PQXDH/join handshake is floor-gated (previously `check_floor` had no callers).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: post-quantum, ml-kem, ml-dsa, crypto-agility, hybrid
 
@@ -84,6 +85,36 @@ is a different security property with a different cost profile (~2.3 KB per PQ r
 mitigated by chunking), exactly as voice/video, metadata/traffic-analysis resistance, and additional
 platforms are separate capabilities rather than "v1/v2" of one. Each is built complete when built; none
 is a stub or a half-promise inside another capability.
+
+## Implementation notes
+
+These record the concrete decisions made building this ADR, so the spec and code stay in lockstep:
+
+- **Where the floor lives.** The channel's minimum suite is a field of the signed genesis policy
+  (`ChannelPolicy::min_suite`, ADR-007 tag `0x000D`; must name a registered suite) and can only be
+  **raised** by a `policy`-holder via a policy-update carrying `min_suite`: the evaluator ignores an
+  update naming a suite ranked below the floor in force (its other fields still apply), so the floor
+  advances deliberately and never silently downgrades. New channels default to `vox-suite-1`
+  (`SuiteFloor::DAY_ONE`).
+- **Where the floor is enforced.** `suite::SuiteFloor` is a distinct type from a proposed suite id (the
+  two `u16`s cannot be swapped at a call site) and is threaded through the handshakes that carry a
+  suite: `pairwise::pqxdh::{initiate, accept}` (and therefore `Session::{initiate, accept}`) refuse
+  to propose or accept a suite ranked below it, and the ADR-005 join binds its `JoinContext` to the
+  floor — `JoinContext::new`, `join_initiate` and `join_accept` all check before any PoW/CPace work.
+  A proposal below the floor is `Error::SuiteBelowFloor`: an abort, no fallback negotiation.
+  *(2026-09-19 review: `check_floor` existed but had no callers; any registered suite was accepted.)*
+- **The floor relation is on the suite rank.** The registry's rank column is assigned when a suite is
+  appended, so the total rank *is* the deliberate strength order; the "every component rank" phrasing
+  above has no separate per-component rank registry to compare against and is satisfied by the
+  suite rank. If a future suite is stronger in one class and weaker in another, that is decided at
+  registration time by the rank it is given, not by a per-component comparison at handshake time.
+- **The TLS group is outside the suite.** The `vox-suite-1` tuple does not include the TLS group
+  class; the transport (ADR-011) pins the provider to exactly X25519MLKEM768 both sides, which is a
+  compile-time floor rather than a policy value.
+- **Test-only weaker suite.** With a single production suite the relation cannot be exercised, so the
+  unit build registers a `cfg(test)`-only rank-0 suite (`vox-suite-test-weak`, id `0x7FFF`, identical
+  components). It does not exist in a non-test build: no production peer can propose, accept, or set
+  a floor at it.
 
 ## Consequences
 

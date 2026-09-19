@@ -45,6 +45,7 @@ use crate::pairwise::pqxdh::{
     accept as pqxdh_accept, initiate as pqxdh_initiate, ResponderPrekeys,
 };
 use crate::pairwise::ratchet::Ratchet;
+use crate::suite::SuiteFloor;
 
 /// The KEM commitment bound into the first message's AD, recomputed identically
 /// by both sides from the handshake.
@@ -107,8 +108,9 @@ impl Session {
         channel_id: &[u8; 32],
         epoch: u64,
         suite_id: u16,
+        floor: SuiteFloor,
     ) -> Result<(InitialMessage, Self)> {
-        let hs = pqxdh_initiate(ik_a, bundle, channel_id, epoch, suite_id)?;
+        let hs = pqxdh_initiate(ik_a, bundle, channel_id, epoch, suite_id, floor)?;
         let remote_ratchet = bundle.signed_prekey.x25519_pub;
         let aead_algo = crate::suite::suite_by_id(suite_id)?.aead;
         let sk = Zeroizing::new(*hs.sk.as_bytes());
@@ -145,8 +147,9 @@ impl Session {
         channel_id: &[u8; 32],
         epoch: u64,
         reuse: &mut OtpReuseTracker,
+        floor: SuiteFloor,
     ) -> Result<Self> {
-        let hs = pqxdh_accept(message, prekeys, channel_id, epoch)?;
+        let hs = pqxdh_accept(message, prekeys, channel_id, epoch, floor)?;
         let aead_algo = crate::suite::suite_by_id(message.suite_id)?.aead;
 
         // The responder's initial ratchet keypair is the targeted signed prekey
@@ -307,12 +310,47 @@ mod tests {
         let b = bundle(&bob, Some(&otp));
         let cid = [9u8; 32];
 
-        let (init_msg, alice) = Session::initiate(&alice_idk, &b, &cid, 7, 0x0001).unwrap();
+        let (init_msg, alice) =
+            Session::initiate(&alice_idk, &b, &cid, 7, 0x0001, SuiteFloor::DAY_ONE).unwrap();
         let bob_idk = X25519IdentityKey::from_secret_bytes(*bob.idk.x25519_secret_bytes());
         let pk = prekeys(&bob, &bob_idk, Some(&otp));
         let mut reuse = OtpReuseTracker::new();
-        let bob_session = Session::accept(&init_msg, &pk, &cid, 7, &mut reuse).unwrap();
+        let bob_session =
+            Session::accept(&init_msg, &pk, &cid, 7, &mut reuse, SuiteFloor::DAY_ONE).unwrap();
         (alice, bob_session, otp)
+    }
+
+    #[test]
+    fn responder_rejects_proposal_below_the_channel_floor() {
+        // ADR-003: negotiation is floor-gated — a peer REJECTS (aborts, no
+        // fallback) any proposal below the channel's minimum suite. The
+        // registry's test-only rank-0 suite plays the weaker proposal.
+        // (2026-09-19 review: `check_floor` had no callers; any registered suite
+        // was accepted.)
+        let mut bob = peer(5, 6);
+        let alice_idk = X25519IdentityKey::generate().unwrap();
+        let otp = bob.pool.take().unwrap();
+        let b = bundle(&bob, Some(&otp));
+        let cid = [9u8; 32];
+        let weak = crate::suite::VOX_SUITE_TEST_WEAK.id;
+
+        let weak_floor = SuiteFloor::new(weak).unwrap();
+        let (init_msg, _alice) =
+            Session::initiate(&alice_idk, &b, &cid, 7, weak, weak_floor).unwrap();
+        let bob_idk = X25519IdentityKey::from_secret_bytes(*bob.idk.x25519_secret_bytes());
+        let pk = prekeys(&bob, &bob_idk, Some(&otp));
+        let mut reuse = OtpReuseTracker::new();
+        // Bob's channel floor is vox-suite-1: the weak proposal must be refused.
+        assert!(matches!(
+            Session::accept(&init_msg, &pk, &cid, 7, &mut reuse, SuiteFloor::DAY_ONE),
+            Err(Error::SuiteBelowFloor { .. })
+        ));
+        // And an initiator holding that floor refuses to *propose* below it.
+        assert!(Session::initiate(&alice_idk, &b, &cid, 7, weak, weak_floor).is_ok());
+        assert!(matches!(
+            Session::initiate(&alice_idk, &b, &cid, 7, weak, SuiteFloor::DAY_ONE),
+            Err(Error::SuiteBelowFloor { .. })
+        ));
     }
 
     #[test]
@@ -461,7 +499,8 @@ mod tests {
         let otp = bob.pool.take().unwrap();
         let b = bundle(&bob, Some(&otp));
         let cid = [9u8; 32];
-        let (mut init_msg, mut alice) = Session::initiate(&alice_idk, &b, &cid, 7, 0x0001).unwrap();
+        let (mut init_msg, mut alice) =
+            Session::initiate(&alice_idk, &b, &cid, 7, 0x0001, SuiteFloor::DAY_ONE).unwrap();
 
         // Tamper the KEM ciphertext in the delivered initial message. Bob's SK
         // (and hence the whole ratchet + KEM-binding AD) diverges; the first
@@ -470,7 +509,8 @@ mod tests {
         let bob_idk = X25519IdentityKey::from_secret_bytes(*bob.idk.x25519_secret_bytes());
         let pk = prekeys(&bob, &bob_idk, Some(&otp));
         let mut reuse = OtpReuseTracker::new();
-        let mut bob_session = Session::accept(&init_msg, &pk, &cid, 7, &mut reuse).unwrap();
+        let mut bob_session =
+            Session::accept(&init_msg, &pk, &cid, 7, &mut reuse, SuiteFloor::DAY_ONE).unwrap();
 
         let m = alice.encrypt(b"secret").unwrap();
         assert!(bob_session.decrypt(&m, 1).is_err());
@@ -482,11 +522,13 @@ mod tests {
         let alice_idk = X25519IdentityKey::generate().unwrap();
         let b = bundle(&bob, None);
         let cid = [1u8; 32];
-        let (init_msg, mut alice) = Session::initiate(&alice_idk, &b, &cid, 0, 0x0001).unwrap();
+        let (init_msg, mut alice) =
+            Session::initiate(&alice_idk, &b, &cid, 0, 0x0001, SuiteFloor::DAY_ONE).unwrap();
         let bob_idk = X25519IdentityKey::from_secret_bytes(*bob.idk.x25519_secret_bytes());
         let pk = prekeys(&bob, &bob_idk, None);
         let mut reuse = OtpReuseTracker::new();
-        let mut bob_session = Session::accept(&init_msg, &pk, &cid, 0, &mut reuse).unwrap();
+        let mut bob_session =
+            Session::accept(&init_msg, &pk, &cid, 0, &mut reuse, SuiteFloor::DAY_ONE).unwrap();
         let m = alice.encrypt(b"no otp").unwrap();
         assert_eq!(bob_session.decrypt(&m, 1).unwrap(), b"no otp");
         assert!(!bob_session.is_last_resort_grade());
@@ -504,16 +546,20 @@ mod tests {
         let mut reuse = OtpReuseTracker::new();
 
         let alice1 = X25519IdentityKey::generate().unwrap();
-        let (im1, mut a1) = Session::initiate(&alice1, &b, &cid, 0, 0x0001).unwrap();
+        let (im1, mut a1) =
+            Session::initiate(&alice1, &b, &cid, 0, 0x0001, SuiteFloor::DAY_ONE).unwrap();
         let pk1 = prekeys(&bob, &bob_idk, Some(&otp));
-        let mut bob1 = Session::accept(&im1, &pk1, &cid, 0, &mut reuse).unwrap();
+        let mut bob1 =
+            Session::accept(&im1, &pk1, &cid, 0, &mut reuse, SuiteFloor::DAY_ONE).unwrap();
         assert!(!bob1.is_last_resort_grade());
         assert_eq!(bob1.decrypt(&a1.encrypt(b"x").unwrap(), 1).unwrap(), b"x");
 
         let alice2 = X25519IdentityKey::generate().unwrap();
-        let (im2, mut a2) = Session::initiate(&alice2, &b, &cid, 0, 0x0001).unwrap();
+        let (im2, mut a2) =
+            Session::initiate(&alice2, &b, &cid, 0, 0x0001, SuiteFloor::DAY_ONE).unwrap();
         let pk2 = prekeys(&bob, &bob_idk, Some(&otp));
-        let mut bob2 = Session::accept(&im2, &pk2, &cid, 0, &mut reuse).unwrap();
+        let mut bob2 =
+            Session::accept(&im2, &pk2, &cid, 0, &mut reuse, SuiteFloor::DAY_ONE).unwrap();
         assert!(bob2.is_last_resort_grade()); // downgraded
         assert_eq!(bob2.decrypt(&a2.encrypt(b"y").unwrap(), 1).unwrap(), b"y"); // not broken
     }

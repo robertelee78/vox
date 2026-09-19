@@ -91,6 +91,7 @@ mod integration_tests {
         X25519IdentityKey,
     };
     use crate::pairwise::{OtpReuseTracker, ResponderPrekeys, Session};
+    use crate::suite::SuiteFloor;
 
     // ---- Pairwise (M2) session harness, mirroring pairwise::session tests. ----
 
@@ -133,7 +134,8 @@ mod integration_tests {
         let otp = bob.pool.take().unwrap();
         let b = bundle(&bob, &otp);
         let cid = [9u8; 32];
-        let (init_msg, alice) = Session::initiate(&alice_idk, &b, &cid, 7, 0x0001).unwrap();
+        let (init_msg, alice) =
+            Session::initiate(&alice_idk, &b, &cid, 7, 0x0001, SuiteFloor::DAY_ONE).unwrap();
         let bob_idk = X25519IdentityKey::from_secret_bytes(*bob.idk.x25519_secret_bytes());
         let pk = ResponderPrekeys {
             identity_dh_key: &bob_idk,
@@ -141,7 +143,8 @@ mod integration_tests {
             one_time_prekey: Some(&otp),
         };
         let mut reuse = OtpReuseTracker::new();
-        let bob_session = Session::accept(&init_msg, &pk, &cid, 7, &mut reuse).unwrap();
+        let bob_session =
+            Session::accept(&init_msg, &pk, &cid, 7, &mut reuse, SuiteFloor::DAY_ONE).unwrap();
         (alice, bob_session)
     }
 

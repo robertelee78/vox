@@ -2,7 +2,7 @@
 
 **Status**: implemented (M6, `crates/vox-core/src/governance/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin".
+**Updated**: 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin"; genesis policy and policy-update carry the ADR-003 `min_suite` floor.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: consent, membership, admin, governance, revocation, capabilities, differentiator
 
@@ -230,6 +230,14 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   *(2026-09-19 review: `Expired`/`Revoked`/`OverAttenuated` were declared but never emitted —
   everything collapsed to `NotAdmin`, contradicting the "golden vectors can pin the exact reason"
   intent.)*
+- **Genesis policy carries the ciphersuite floor (ADR-003).** The genesis canonical body is
+  `[nonce, created, [history_mode, deniability_mode, ttl, min_suite], creator_pubkey, [sign_algo]]`;
+  `min_suite` must name a registered suite (validated at creation and on decode) and, being part of
+  the signed body, is bound into the channelID. The policy-update body (`0x0006`, kind 1) is
+  `[kind, channelID, epoch, issuer_id, history_present, history_mode?, ttl_present, ttl?,
+  suite_present, min_suite?]`; the evaluator applies `min_suite` **raise-only** (see ADR-003
+  Implementation notes). `ChannelPolicy::suite_floor()` yields the typed `SuiteFloor` handshakes take.
+  *(2026-09-19; wire-format change, no channels shipped.)*
 
 ## Links
 **Depends on**: ADR-002, ADR-005, ADR-006, ADR-008.

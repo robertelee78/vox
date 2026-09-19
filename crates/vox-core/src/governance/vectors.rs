@@ -273,7 +273,25 @@ pub mod harness {
             history_mode: Option<HistoryMode>,
             ttl: Option<u64>,
         ) -> Digest32 {
-            let pu = PolicyUpdate::build(issuer, channel_id, epoch, history_mode, ttl).unwrap();
+            let pu =
+                PolicyUpdate::build(issuer, channel_id, epoch, history_mode, ttl, None).unwrap();
+            let framed = pu.to_wire();
+            let preds = self.default_preds(issuer.fingerprint());
+            self.push_entry(issuer, framed, GovBody::PolicyUpdate(Box::new(pu)), preds)
+        }
+
+        /// Append a policy-update that sets the ciphersuite floor (and optionally
+        /// the ttl, to show the other fields of a floor-lowering update still apply).
+        pub fn policy_update_min_suite(
+            &mut self,
+            issuer: &SoftwareRootSigner,
+            channel_id: &Digest32,
+            epoch: u64,
+            ttl: Option<u64>,
+            min_suite: u16,
+        ) -> Digest32 {
+            let pu =
+                PolicyUpdate::build(issuer, channel_id, epoch, None, ttl, Some(min_suite)).unwrap();
             let framed = pu.to_wire();
             let preds = self.default_preds(issuer.fingerprint());
             self.push_entry(issuer, framed, GovBody::PolicyUpdate(Box::new(pu)), preds)
@@ -289,7 +307,8 @@ pub mod harness {
             ttl: Option<u64>,
             preds: BTreeSet<Digest32>,
         ) -> Digest32 {
-            let pu = PolicyUpdate::build(issuer, channel_id, epoch, history_mode, ttl).unwrap();
+            let pu =
+                PolicyUpdate::build(issuer, channel_id, epoch, history_mode, ttl, None).unwrap();
             let framed = pu.to_wire();
             self.push_entry(issuer, framed, GovBody::PolicyUpdate(Box::new(pu)), preds)
         }
@@ -389,6 +408,7 @@ mod golden {
             history_mode: HistoryMode::ForwardOnly,
             deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
+            min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
         };
         Genesis::create_with_nonce(creator, 1_000, policy, [0x5A; 16]).unwrap()
     }
@@ -911,6 +931,51 @@ mod golden {
         assert_eq!(p.ttl, 3600);
         // Deniability is genesis-immutable, unchanged.
         assert_eq!(p.deniability_mode, DeniabilityMode::Attributable);
+    }
+
+    #[test]
+    fn vector_suite_floor_raise_applies_lower_ignored() {
+        // ADR-003: "the floor advances deliberately and never silently
+        // downgrades" — a policy-holder can RAISE min_suite; an update naming a
+        // suite ranked below the floor in force is ignored (its other fields
+        // still apply). The registry's test-only rank-0 suite is the weaker one.
+        use crate::suite::{SuiteFloor, VOX_SUITE_1, VOX_SUITE_TEST_WEAK};
+        let creator = root(1, 1);
+
+        // Channel created at the weak floor; the creator raises it to suite-1.
+        let policy = ChannelPolicy {
+            history_mode: HistoryMode::ForwardOnly,
+            deniability_mode: DeniabilityMode::Attributable,
+            ttl: 0,
+            min_suite: VOX_SUITE_TEST_WEAK.id,
+        };
+        let genesis = Genesis::create_with_nonce(&creator, 1_000, policy, [0x5B; 16]).unwrap();
+        let cid = genesis.channel_id();
+        let mut h = LogBuilder::new(&genesis);
+        h.policy_update_min_suite(&creator, &cid, 0, None, VOX_SUITE_1.id);
+        let eval =
+            Evaluator::build(&genesis, &h.entries(), 2_000, key_resolver(vec![&creator])).unwrap();
+        assert_eq!(eval.policy().min_suite, VOX_SUITE_1.id);
+        assert_eq!(eval.policy().suite_floor().unwrap(), SuiteFloor::DAY_ONE);
+
+        // Channel created at suite-1; an authorized update naming the weak suite
+        // is ignored for the floor (but its ttl still applies).
+        let genesis = genesis_for(&creator);
+        let cid = genesis.channel_id();
+        let mut h = LogBuilder::new(&genesis);
+        h.policy_update_min_suite(&creator, &cid, 0, Some(77), VOX_SUITE_TEST_WEAK.id);
+        let eval =
+            Evaluator::build(&genesis, &h.entries(), 2_000, key_resolver(vec![&creator])).unwrap();
+        assert_eq!(
+            eval.policy().min_suite,
+            VOX_SUITE_1.id,
+            "floor must not lower"
+        );
+        assert_eq!(
+            eval.policy().ttl,
+            77,
+            "other fields of the same update apply"
+        );
     }
 
     #[test]

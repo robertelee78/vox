@@ -273,6 +273,7 @@ mod tests {
             history_mode: HistoryMode::ForwardOnly,
             deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
+            min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
         }
     }
 

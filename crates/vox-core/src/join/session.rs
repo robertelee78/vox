@@ -50,6 +50,7 @@ use crate::join::pop::{self, IdentityProof, JoinPeerIdentity};
 use crate::join::pow::{self, PowParams, PowToken, ResponderNonce};
 use crate::pairwise::session::Session;
 use crate::pairwise::{InitialMessage, OtpReuseTracker, ResponderPrekeys};
+use crate::suite::SuiteFloor;
 
 /// The parameters that bind a join to a specific channel and suite. Both ends MUST
 /// use identical values; a mismatch makes CPace fail to agree (the binding is into
@@ -60,22 +61,30 @@ pub struct JoinContext {
     pub channel_id: [u8; 32],
     /// The channel epoch (ADR-007 rotation).
     pub epoch: u64,
-    /// The negotiated ciphersuite id (ADR-003), bound as CPace `AD`.
+    /// The negotiated ciphersuite id (ADR-003), bound as CPace `AD`. Must rank
+    /// at or above [`JoinContext::floor`] (enforced by [`JoinContext::new`] and
+    /// re-checked by [`join_initiate`] / [`join_accept`]).
     pub suite_id: u16,
+    /// The channel's minimum ciphersuite (ADR-003 floor, from the genesis
+    /// policy). Gates the CPace suite binding and the PQXDH bootstrap.
+    pub floor: SuiteFloor,
     /// The Equihash PoW parameters in force for this channel.
     pub pow_params: PowParams,
 }
 
 impl JoinContext {
     /// Build a context with the production-default `(200,9)` PoW parameters.
-    #[must_use]
-    pub fn new(channel_id: [u8; 32], epoch: u64, suite_id: u16) -> Self {
-        Self {
+    /// Fails with [`Error::SuiteBelowFloor`] if `suite_id` ranks below `floor`
+    /// (a join can never negotiate under the channel's floor).
+    pub fn new(channel_id: [u8; 32], epoch: u64, suite_id: u16, floor: SuiteFloor) -> Result<Self> {
+        floor.check(suite_id)?;
+        Ok(Self {
             channel_id,
             epoch,
             suite_id,
+            floor,
             pow_params: PowParams::DEFAULT,
-        }
+        })
     }
 }
 
@@ -124,7 +133,10 @@ pub fn join_initiate<'a>(
     root: &'a dyn RootSigner,
     ik: &'a X25519IdentityKey,
 ) -> Result<(JoinInitiator<'a>, PowToken, [u8; CPACE_SHARE_LEN])> {
-    // 0. Verify the responder's signature over the challenge, and that the
+    // 0. The suite this join binds must sit at/above the channel floor
+    //    (ADR-003) — a context built by hand cannot bypass the constructor check.
+    ctx.floor.check(ctx.suite_id)?;
+    //    Verify the responder's signature over the challenge, and that the
     //    challenge is bound to THIS channel/epoch, before grinding any PoW.
     challenge.verify(responder_pub, challenge_sig)?;
     if challenge.channel_id != ctx.channel_id || challenge.epoch != ctx.epoch {
@@ -163,7 +175,10 @@ pub fn join_accept<'a>(
     token: &PowToken,
     root: &'a dyn RootSigner,
 ) -> Result<(JoinResponder<'a>, [u8; CPACE_SHARE_LEN])> {
-    // Gate: the joiner's PoW must verify against our signed challenge BEFORE CPace.
+    // Gate: the suite this join binds must sit at/above the channel floor
+    // (ADR-003), and the joiner's PoW must verify against our signed challenge —
+    // both BEFORE any CPace work.
+    ctx.floor.check(ctx.suite_id)?;
     pow::verify_token(ctx.pow_params, challenge, token)?;
     let (cpace, own_share) =
         CpaceState::start(passphrase, &ctx.channel_id, ctx.epoch, ctx.suite_id, sid)?;
@@ -330,6 +345,7 @@ impl JoinInitiatorBootstrap<'_> {
             &self.ctx.channel_id,
             self.ctx.epoch,
             self.ctx.suite_id,
+            self.ctx.floor,
         )?;
         Ok((session, init_msg))
     }
@@ -387,6 +403,7 @@ impl JoinResponderBootstrap {
             &self.ctx.channel_id,
             self.ctx.epoch,
             reuse,
+            self.ctx.floor,
         )
     }
 }
@@ -453,6 +470,7 @@ mod tests {
             channel_id,
             epoch,
             suite_id: 0x0001,
+            floor: SuiteFloor::DAY_ONE,
             pow_params: PowParams::new(48, 5).unwrap(),
         }
     }
@@ -523,6 +541,47 @@ mod tests {
             verified_resp,
             verified_joiner,
         ))
+    }
+
+    #[test]
+    fn join_context_and_accept_reject_suite_below_floor() {
+        // ADR-003: a join can never negotiate under the channel's floor. The
+        // constructor refuses, and a hand-built context is re-checked by
+        // join_accept before any CPace work (and by join_initiate before PoW).
+        use crate::suite::{SuiteFloor, VOX_SUITE_TEST_WEAK};
+        let weak = VOX_SUITE_TEST_WEAK.id;
+        assert!(matches!(
+            JoinContext::new([1u8; 32], 0, weak, SuiteFloor::DAY_ONE),
+            Err(Error::SuiteBelowFloor { .. })
+        ));
+        assert!(JoinContext::new([1u8; 32], 0, weak, SuiteFloor::new(weak).unwrap()).is_ok());
+
+        let responder = member(1, 2);
+        let mut bad = ctx([1u8; 32], 0);
+        bad.suite_id = weak; // floor stays DAY_ONE
+        let challenge = ResponderNonce::generate(&[1u8; 32], 0, Difficulty::ZERO).unwrap();
+        let sig = challenge.sign(&responder.root).unwrap();
+        let token = pow::solve_token(bad.pow_params, &challenge).unwrap();
+        assert!(matches!(
+            join_accept(bad, b"pp", b"sid", &challenge, &token, &responder.root),
+            Err(Error::SuiteBelowFloor { .. })
+        ));
+        let mut bad = ctx([1u8; 32], 0);
+        bad.suite_id = weak;
+        let ik = X25519IdentityKey::generate().unwrap();
+        assert!(matches!(
+            join_initiate(
+                bad,
+                b"pp",
+                b"sid",
+                &challenge,
+                &responder.root.public_key(),
+                &sig,
+                &responder.root,
+                &ik
+            ),
+            Err(Error::SuiteBelowFloor { .. })
+        ));
     }
 
     #[test]

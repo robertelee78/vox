@@ -144,9 +144,25 @@ pub const VOX_SUITE_1: Ciphersuite = Ciphersuite {
     pake: algo::CPACE_RISTRETTO255_SHA512,
 };
 
+/// A **test-only** suite ranked *below* `vox-suite-1` (rank 0) with identical
+/// components, so the floor relation can be exercised while the production
+/// registry has a single suite. It does not exist in a non-test build: no
+/// production peer can propose or accept it.
+#[cfg(test)]
+pub const VOX_SUITE_TEST_WEAK: Ciphersuite = Ciphersuite {
+    id: 0x7FFF,
+    rank: 0,
+    name: "vox-suite-test-weak",
+    ..VOX_SUITE_1
+};
+
 /// The ciphersuite registry. New suites are appended with an assigned rank, so
 /// the floor advances deliberately and never silently downgrades.
+#[cfg(not(test))]
 pub const SUITES: &[Ciphersuite] = &[VOX_SUITE_1];
+/// The ciphersuite registry (test build: plus the rank-0 test suite).
+#[cfg(test)]
+pub const SUITES: &[Ciphersuite] = &[VOX_SUITE_1, VOX_SUITE_TEST_WEAK];
 
 /// Resolve a suite by ID, else [`Error::UnknownSuite`].
 pub fn suite_by_id(id: u16) -> Result<&'static Ciphersuite> {
@@ -159,11 +175,11 @@ pub fn suite_by_id(id: u16) -> Result<&'static Ciphersuite> {
 /// Floor-gated downgrade rejection (ADR-003): accept `observed` only if its rank
 /// is ≥ the `floor` suite's rank, else [`Error::SuiteBelowFloor`].
 ///
-/// With the current single-suite registry the suite-level rank check is the whole
-/// relation; when suites diverge in individual components, per-component ranks are
-/// added to [`Ciphersuite`] and compared here too. The extension point is
-/// deliberate, not a stub: the relation is complete and correct for every suite
-/// the registry actually defines.
+/// The relation is on the registry's **suite rank** (the rank column of the
+/// ADR-003 table). Ranks are assigned deliberately when a suite is appended —
+/// "the floor advances deliberately and never silently downgrades" — so the
+/// total rank *is* the strength order; there is no separate per-component rank
+/// registry to compare against. Both ids must be registered.
 pub fn check_floor(observed: u16, floor: u16) -> Result<()> {
     let obs = suite_by_id(observed)?;
     let flr = suite_by_id(floor)?;
@@ -171,6 +187,58 @@ pub fn check_floor(observed: u16, floor: u16) -> Result<()> {
         Ok(())
     } else {
         Err(Error::SuiteBelowFloor { observed, floor })
+    }
+}
+
+/// A channel's **minimum ciphersuite** (ADR-003 §"Floor relation"), the value
+/// every handshake on that channel is gated by: a proposal whose suite ranks
+/// below the floor is rejected (aborted, no fallback).
+///
+/// The floor comes from the signed genesis policy (`ChannelPolicy::min_suite`,
+/// ADR-007) and can only be raised by a `policy`-holder. It is a distinct type
+/// from a proposed suite id so the two `u16`s cannot be swapped at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuiteFloor {
+    id: u16,
+}
+
+impl SuiteFloor {
+    /// The day-one floor: `vox-suite-1`. New channels are created at this floor
+    /// unless the creator names a stronger registered suite.
+    pub const DAY_ONE: SuiteFloor = SuiteFloor { id: VOX_SUITE_1.id };
+
+    /// A floor at the registered suite `id`, else [`Error::UnknownSuite`].
+    pub fn new(id: u16) -> Result<Self> {
+        suite_by_id(id)?;
+        Ok(Self { id })
+    }
+
+    /// The floor suite's id.
+    #[must_use]
+    pub const fn id(self) -> u16 {
+        self.id
+    }
+
+    /// The floor suite's rank.
+    #[must_use]
+    pub fn rank(self) -> u32 {
+        // The id was validated at construction; an unregistered id cannot exist
+        // here, so a lookup miss is an internal invariant breach — rank 0 keeps
+        // the relation conservative (everything registered is ≥ 0).
+        suite_by_id(self.id).map_or(0, |s| s.rank)
+    }
+
+    /// Gate a proposed suite: `Ok` iff `observed` is registered and ranks at or
+    /// above this floor, else [`Error::SuiteBelowFloor`] / [`Error::UnknownSuite`].
+    pub fn check(self, observed: u16) -> Result<()> {
+        check_floor(observed, self.id)
+    }
+
+    /// Whether `other` is at or above this floor (used by the policy fold: a
+    /// floor is only ever *raised*).
+    #[must_use]
+    pub fn permits_raise_to(self, other: SuiteFloor) -> bool {
+        other.rank() >= self.rank()
     }
 }
 
@@ -221,6 +289,42 @@ mod tests {
         for a in [s.curve, s.kem, s.signature, s.aead, s.hash, s.kdf, s.pake] {
             assert!(validate_algo(a).is_ok(), "{a:#06x}");
         }
+    }
+
+    #[test]
+    fn suite_floor_type_gates_and_raises_only() {
+        // A floor names a registered suite …
+        assert!(matches!(
+            SuiteFloor::new(0x1234),
+            Err(Error::UnknownSuite(0x1234))
+        ));
+        let day_one = SuiteFloor::DAY_ONE;
+        assert_eq!(day_one.id(), VOX_SUITE_1.id);
+        assert_eq!(day_one.rank(), VOX_SUITE_1.rank);
+        // … gates proposals by rank (the test-only rank-0 suite is "below") …
+        assert!(day_one.check(VOX_SUITE_1.id).is_ok());
+        assert!(matches!(
+            day_one.check(VOX_SUITE_TEST_WEAK.id),
+            Err(Error::SuiteBelowFloor { observed, floor })
+                if observed == VOX_SUITE_TEST_WEAK.id && floor == VOX_SUITE_1.id
+        ));
+        assert!(matches!(
+            day_one.check(0x1234),
+            Err(Error::UnknownSuite(0x1234))
+        ));
+        let weak = SuiteFloor::new(VOX_SUITE_TEST_WEAK.id).unwrap();
+        assert!(
+            weak.check(VOX_SUITE_1.id).is_ok(),
+            "stronger than a weak floor passes"
+        );
+        // … and only ever moves up.
+        assert!(weak.permits_raise_to(day_one));
+        assert!(day_one.permits_raise_to(day_one), "equal is a no-op raise");
+        assert!(!day_one.permits_raise_to(weak));
+        // The test-only suite is not in a production registry: the registry
+        // constant here is the cfg(test) one, so pin its shape explicitly.
+        assert_eq!(SUITES.len(), 2);
+        assert_eq!(VOX_SUITE_TEST_WEAK.rank, 0);
     }
 
     #[test]

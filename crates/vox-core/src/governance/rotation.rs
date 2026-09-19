@@ -269,7 +269,7 @@ mod tests {
         let rot = PassphraseRotation::build(&r, &CID, 1, 2).unwrap();
         assert!(PolicyUpdate::from_wire(&rot.to_wire()).is_err());
 
-        let pu = PolicyUpdate::build(&r, &CID, 1, None, Some(60)).unwrap();
+        let pu = PolicyUpdate::build(&r, &CID, 1, None, Some(60), None).unwrap();
         assert!(PassphraseRotation::from_wire(&pu.to_wire()).is_err());
     }
 }
