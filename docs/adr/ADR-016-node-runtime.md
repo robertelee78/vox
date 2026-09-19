@@ -249,6 +249,25 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   identity-needing operation goes through `Profile::signer()`, which is `Error::Profile("locked")`
   while locked. One identity per profile; a second `create` is refused. The passphrase is a `&[u8]`
   the caller owns and wipes.
+- **Channel state (`node::channel`, M13.3).** A channel at rest is: the SEK wrap (`sek_wraps`),
+  `KeyMaterial 0` = manifest `[1, genesis_wire, local_name, created, epoch]`, `KeyMaterial 1` = this
+  identity's sealed sender-chain state (`SenderChain::to_state`, a new ADR-006 codec:
+  `[1, cid, epoch, author, chain_id, chain_key, next_iteration, ed_seed, mldsa_seed, created]`),
+  `LogDb n` = one ADR-008 entry's wire bytes in arrival order, `PlaintextCache n` = the rendered row
+  `[1, entry_hash, author, created_secs, text]`. Message plaintext is the `node::content` envelope
+  `[1, kind=text, created_secs, text]` (≤ 64 KiB) inside the ADR-006 sender-key message, which is the
+  entry payload. `create` mints the genesis at the day-one floor (forward-only, attributable, no TTL),
+  a fresh SEK double-locked under (identity factor, channel passphrase), and the first sender chain,
+  persisting wrap + manifest + chain in one batch. `open` needs the unlocked identity **and** the
+  channel passphrase (tested: wrong passphrase, locked identity, and a stolen wrap under another
+  identity all fail), then **rebuilds the DAG from the log segments through `Dag::accept`** — the
+  store is a cache of verified entries, never trusted as such — and accepts a cache row only if its
+  entry is in the DAG. `append_text` validates against the DAG first, then commits entry + cache +
+  advanced chain state in **one batch**; a failed commit **poisons** the channel (further appends
+  refused until reopened) because the in-memory chain has already advanced and reusing a sender-key
+  iteration for a different plaintext would be key/nonce reuse. M13 membership is `{creator}` and the
+  evaluator is built over the genesis alone; M14 layers other authors, SKDMs, consent and sync onto
+  the same layout. `lock_now` wipes the SEK; the state is then dropped.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

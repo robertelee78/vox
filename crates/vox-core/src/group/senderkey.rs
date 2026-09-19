@@ -38,7 +38,7 @@
 //! into another (the cross-group-confusion guard, eprint 2023/1385, applied at the
 //! key-authorization layer as well as at message AD).
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::group::wire::{
@@ -191,6 +191,12 @@ impl SenderKeySigningKey {
     #[must_use]
     pub fn public_key(&self) -> CompositePublicKey {
         self.signer.public_key()
+    }
+
+    /// The two component seeds (Ed25519, ML-DSA), for the sealed at-rest chain
+    /// state only ([`crate::group::state::SenderChain::to_state`]). Zeroizing.
+    pub(crate) fn component_seeds(&self) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+        (self.signer.ed25519_seed(), self.signer.ml_dsa_seed())
     }
 
     /// The serialized signing public key bytes (fixed composite layout).
