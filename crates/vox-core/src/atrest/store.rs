@@ -69,6 +69,10 @@ pub enum SegmentKind {
     /// Per-channel key material at rest: sender keys, received SKDMs, and the SEK
     /// *wrap* itself (ADR-010 §"per-channel key material ... the SEK wrap itself").
     KeyMaterial,
+    /// The identity's prekey ring (signed prekeys + one-time pool, ADR-002 §2),
+    /// sealed under a key derived from the identity factor alone
+    /// ([`crate::node::prekeys`], ADR-016 M14.3).
+    PrekeyRing,
 }
 
 impl SegmentKind {
@@ -79,6 +83,7 @@ impl SegmentKind {
             SegmentKind::PlaintextCache => b"vox/seg/plaintext-cache/v1",
             SegmentKind::Index => b"vox/seg/index/v1",
             SegmentKind::KeyMaterial => b"vox/seg/key-material/v1",
+            SegmentKind::PrekeyRing => b"vox/seg/prekey-ring/v1",
         }
     }
 }

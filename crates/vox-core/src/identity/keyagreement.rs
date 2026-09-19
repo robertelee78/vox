@@ -102,6 +102,13 @@ mod mlkem {
             })
         }
 
+        /// Rebuild a keypair from its stored 64-byte seed (at-rest restore).
+        pub(super) fn from_seed(seed: &[u8; 64]) -> Self {
+            Self {
+                seed: KemSeed64(*seed),
+            }
+        }
+
         /// The 64-byte seed (secret; for backup export and PQXDH reconstruction),
         /// in a non-`Copy` [`Zeroizing`] buffer.
         pub(super) fn seed_bytes(&self) -> Zeroizing<[u8; 64]> {
@@ -278,10 +285,38 @@ impl SignedIdentityDhKey {
         })
     }
 
+    /// Rebuild a stored signed identity DH key from its public record, the root
+    /// signature over it and the secret key, checking that the secret derives
+    /// exactly the recorded public key and that `root` signed the record.
+    pub fn from_parts(
+        root: &CompositePublicKey,
+        public: X25519IdentityKeyPublic,
+        signature: CompositeSignature,
+        key: X25519IdentityKey,
+    ) -> Result<Self> {
+        if key.public_bytes() != public.x25519_pub {
+            return Err(Error::MalformedBundle(
+                "identity dh key secret/public mismatch",
+            ));
+        }
+        public.verify(root, &signature)?;
+        Ok(Self {
+            public,
+            signature,
+            key,
+        })
+    }
+
     /// The public, signable record.
     #[must_use]
     pub fn public(&self) -> &X25519IdentityKeyPublic {
         &self.public
+    }
+
+    /// The secret-holding X25519 key (the PQXDH responder's `IK_B`).
+    #[must_use]
+    pub fn key(&self) -> &X25519IdentityKey {
+        &self.key
     }
 
     /// The composite root signature over the public record.
@@ -405,6 +440,34 @@ impl SignedPrekey {
         })
     }
 
+    /// Rebuild a stored signed prekey from its public record, the root signature
+    /// and its secrets, checking that the secrets derive exactly the recorded
+    /// public keys and that `root` signed the record (at-rest restore).
+    pub fn from_parts(
+        root: &CompositePublicKey,
+        public: SignedPrekeyPublic,
+        signature: CompositeSignature,
+        x25519_secret: &Zeroizing<[u8; 32]>,
+        ml_kem_seed: &Zeroizing<[u8; 64]>,
+    ) -> Result<Self> {
+        let x25519 = X25519IdentityKey::from_secret_bytes(**x25519_secret);
+        let ml_kem = mlkem::MlKemKeypair::from_seed(ml_kem_seed);
+        if x25519.public_bytes() != public.x25519_pub
+            || ml_kem.encaps_public_bytes() != public.ml_kem_pub
+        {
+            return Err(Error::MalformedBundle(
+                "signed prekey secret/public mismatch",
+            ));
+        }
+        public.verify(root, &signature)?;
+        Ok(Self {
+            public,
+            signature,
+            x25519,
+            ml_kem,
+        })
+    }
+
     /// The public, signable record.
     #[must_use]
     pub fn public(&self) -> &SignedPrekeyPublic {
@@ -517,6 +580,34 @@ pub struct OneTimePrekey {
 }
 
 impl OneTimePrekey {
+    /// Rebuild a stored one-time prekey from its public record, the root
+    /// signature and its secrets, with the same checks as
+    /// [`SignedPrekey::from_parts`].
+    pub fn from_parts(
+        root: &CompositePublicKey,
+        public: OneTimePrekeyPublic,
+        signature: CompositeSignature,
+        x25519_secret: &Zeroizing<[u8; 32]>,
+        ml_kem_seed: &Zeroizing<[u8; 64]>,
+    ) -> Result<Self> {
+        let x25519 = X25519IdentityKey::from_secret_bytes(**x25519_secret);
+        let ml_kem = mlkem::MlKemKeypair::from_seed(ml_kem_seed);
+        if x25519.public_bytes() != public.x25519_pub
+            || ml_kem.encaps_public_bytes() != public.ml_kem_pub
+        {
+            return Err(Error::MalformedBundle(
+                "one-time prekey secret/public mismatch",
+            ));
+        }
+        public.verify(root, &signature)?;
+        Ok(Self {
+            public,
+            signature,
+            x25519,
+            ml_kem,
+        })
+    }
+
     /// The public, signable record.
     #[must_use]
     pub fn public(&self) -> &OneTimePrekeyPublic {
@@ -642,6 +733,42 @@ impl OneTimePrekeyPool {
     /// last-resort prekey — never to no-prekey, ADR-002/ADR-004).
     pub fn take(&mut self) -> Result<OneTimePrekey> {
         self.prekeys.pop().ok_or(Error::PrekeyPoolEmpty)
+    }
+
+    /// Rebuild a pool from stored prekeys and the next id to assign (at-rest
+    /// restore). Every stored id must be below `next_id` and unique, or the pool
+    /// could re-issue an id that was already published.
+    pub fn from_parts(next_id: u64, prekeys: Vec<OneTimePrekey>) -> Result<Self> {
+        let mut seen = std::collections::HashSet::with_capacity(prekeys.len());
+        for p in &prekeys {
+            let id = p.public().prekey_id;
+            if id >= next_id || !seen.insert(id) {
+                return Err(Error::MalformedBundle("one-time prekey pool ids"));
+            }
+        }
+        Ok(Self { prekeys, next_id })
+    }
+
+    /// The pooled prekeys, in pool order.
+    pub fn iter(&self) -> impl Iterator<Item = &OneTimePrekey> {
+        self.prekeys.iter()
+    }
+
+    /// The prekey with the lowest id — the one a bundle advertises next.
+    #[must_use]
+    pub fn first(&self) -> Option<&OneTimePrekey> {
+        self.prekeys.iter().min_by_key(|p| p.public().prekey_id)
+    }
+
+    /// Consume the prekey with `prekey_id` (an inbound session used it; ADR-002
+    /// "consumed once per inbound session and never reused"). `None` if it was
+    /// never in the pool or was already consumed.
+    pub fn take_by_id(&mut self, prekey_id: u64) -> Option<OneTimePrekey> {
+        let i = self
+            .prekeys
+            .iter()
+            .position(|p| p.public().prekey_id == prekey_id)?;
+        Some(self.prekeys.swap_remove(i))
     }
 
     /// The next prekey id the pool will assign (for bookkeeping/tests).

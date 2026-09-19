@@ -2,7 +2,7 @@
 
 **Status**: implemented (M1, `crates/vox-core/src/identity/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M1) added; all private-key accessors now return non-`Copy` zeroizing buffers.
+**Updated**: 2026-09-19 — Implementation notes (M1) added; all private-key accessors now return non-`Copy` zeroizing buffers. 2026-09-20 — §2 rotation cadence and retain-previous logic implemented (`node::prekeys`, ADR-016 M14.3); at-rest restore constructors added; that known gap is closed.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: identity, keys, gpg, ed25519, multi-device, pseudonymity, post-quantum
 
@@ -174,9 +174,20 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   fails to compile if any getter regresses. *(2026-09-19 review: the key-agreement getters predated the
   ADR-010 secret-hygiene audit and returned bare `Copy` arrays; PQXDH re-wrapped them, the ratchet did
   not.)*
-- **Known gaps (recorded 2026-09-19).** No succession statement (§Lifecycle) exists in code; there is no
-  prekey-rotation cadence or retain-previous logic (`keyagreement` defers it to a higher layer, and no
-  higher layer does it yet); the only `RootSigner` backends are `SoftwareRootSigner` and the at-rest
+- **Prekey persistence and rotation live one layer up (`node::prekeys`, M14.3).** `keyagreement` owns
+  the primitives; the *policy* — the 7-day signed-prekey cadence, retaining the previous prekey exactly
+  one cadence, refilling the one-time pool at its low-water mark, and consuming a one-time prekey once —
+  is the [`crate::node::prekeys::PrekeyRing`], which persists the whole ring at rest (ADR-010
+  Implementation notes). To make that possible the key-agreement types gained **restore constructors**
+  (`SignedIdentityDhKey::from_parts`, `SignedPrekey::from_parts`, `OneTimePrekey::from_parts`,
+  `OneTimePrekeyPool::from_parts`): each re-derives the public key from the stored secret and refuses a
+  mismatch, and re-verifies the root signature over the ADR-002 canonical body, so a tampered or
+  swapped-in at-rest ring is refused rather than adopted. `OneTimePrekeyPool::from_parts` additionally
+  rejects an id at or above `next_id`, or a duplicate, so a restored pool can never re-issue a prekey id
+  that was already published. The pool also gained `iter`/`first`/`take_by_id` so a caller can advertise
+  the lowest-id prekey and consume exactly the one an initial message targeted.
+- **Known gaps (recorded 2026-09-19; prekey rotation closed 2026-09-20).** No succession statement
+  (§Lifecycle) exists in code; the only `RootSigner` backends are `SoftwareRootSigner` and the at-rest
   `VaultRootSigner` — the gpg-agent/hardware backends are the documented seam. Test-vector
   obligation: composite pubkey/sig layout is asserted structurally with a fixed-seed signer, but no
   pinned known-answer bytes exist yet for the pubkey, signature, fingerprint, or binding statement.

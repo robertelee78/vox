@@ -2,7 +2,7 @@
 
 **Status**: implemented (M2, `crates/vox-core/src/pairwise/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M2) added; uncommitted DH-ratchet secrets are wiped when a decrypt plan is dropped; nonce KDF error propagates instead of an all-zero nonce.
+**Updated**: 2026-09-19 — Implementation notes (M2) added; uncommitted DH-ratchet secrets are wiped when a decrypt plan is dropped; nonce KDF error propagates instead of an all-zero nonce. 2026-09-20 — serverless one-time-prekey consume semantics implemented (`node::prekeys`, ADR-016 M14.3).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: crypto-core, pqxdh, double-ratchet, forward-secrecy, pcs
 
@@ -104,6 +104,21 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   by a compile-time check in `pairwise::ratchet`. *(2026-09-19 review: the candidate secret was a bare
   `[u8; 32]` and was not wiped on the failure path.)* `Ratchet::init_responder` takes the signed-prekey
   secret as a `Zeroizing` buffer for the same reason.
+- **Serverless one-time-prekey consume semantics are realized in the prekey ring (M14.3).** The
+  Decision's §"Prekey publication" rules — one-shot consumption, concurrent duplicate use tolerated and
+  **treated as last-resort-grade**, exhaustion falling back to the signed prekey and never to
+  no-prekey — are enforced by [`crate::node::prekeys::PrekeyRing::use_one_time`], which returns
+  `Fresh` / `Reused` / `Unknown`. Serving a *concurrent* duplicate requires the responder to still hold
+  the consumed secret, so a consumed prekey is moved into a bounded **retained set**
+  (`ONE_TIME_CONSUMED_RETAIN_SECS` = 1 h, `ONE_TIME_CONSUMED_MAX` = 256, oldest dropped first, pruned by
+  `maintain` and persisted across restarts) rather than destroyed on first use; the ring supplies the
+  **reuse-detection signal** and the session layer (M14.5) applies the last-resort-grade label. Once
+  retention elapses the secret is dropped — restoring forward secrecy — and a late duplicate gets
+  `Unknown`, so it cannot establish and must refetch a bundle. The Decision specifies only the
+  *concurrent* case; bounding retention to genuine concurrency is a deliberate refinement recorded here,
+  because retaining for the full ADR-016 bundle TTL (7 days) would extend this ADR's documented
+  forward-secrecy residual by a week to serve an initiator that can simply refetch. Exhaustion is
+  proven by a test: a drained pool still publishes a verifying bundle, without a one-time prekey.
 - **Message nonce KDF has no fallback.** The per-message AEAD nonce is `HMAC-SHA-256(mk, 0x03)[..12]`;
   HMAC keying cannot fail for a 32-byte key, but the error is propagated (`Result`) rather than
   replaced by an all-zero nonce. *(2026-09-19 review.)*

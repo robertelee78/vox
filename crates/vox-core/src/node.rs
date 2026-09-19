@@ -28,5 +28,6 @@ pub mod api;
 pub mod channel;
 pub mod content;
 pub mod paths;
+pub mod prekeys;
 pub mod profile;
 pub mod store;

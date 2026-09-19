@@ -14,9 +14,12 @@
 
 use std::sync::Arc;
 
+use vox_core::identity::composite::RootSigner;
 use vox_core::node::actor::{Clock, Node, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome, Secret};
 use vox_core::node::paths::Paths;
+use vox_core::node::prekeys;
+use vox_core::node::profile::Profile;
 
 fn secret(s: &str) -> Secret {
     Secret::new(s.as_bytes().to_vec())
@@ -223,5 +226,33 @@ fn m13_single_device_node_survives_a_restart() {
             assert_eq!(h.view().open_channels[0].timeline.len(), 4);
             assert!(h.apply(NodeCommand::Shutdown).await.is_done());
         });
+
+        // Drop the runtime so the node task — and with it the redb store — is
+        // released before this process reopens the same profile directory.
+        drop(rt);
+
+        // The prekey ring (ADR-016 M14.3) survived the same restart, through the
+        // whole composed path at production parameters: Argon2id vault unlock →
+        // deterministic identity factor → HKDF ring key → sealed segment. The
+        // reloaded ring is the one the node created, so bundles already published
+        // are still answerable.
+        let mut profile = Profile::open(paths.clone()).unwrap();
+        profile.unlock(b"identity passphrase").unwrap();
+        let signer = profile.signer().unwrap();
+        let ring = prekeys::load(profile.store(), signer)
+            .unwrap()
+            .expect("the node persisted a prekey ring");
+        let bundle = ring.bundle(&RootSigner::public_key(signer)).unwrap();
+        bundle.verify().unwrap();
+        assert_eq!(bundle.root_pub, RootSigner::public_key(signer).to_bytes());
+        assert_eq!(bundle.signed_prekey.prekey_id, ring.signed_prekey_id());
+        assert!(bundle.one_time_prekey.is_some(), "pool was generated");
+        assert_eq!(ring.one_time_len(), prekeys::ONE_TIME_PREKEY_TARGET);
+        // A different identity cannot open it.
+        let stranger = vox_core::identity::composite::SoftwareRootSigner::from_component_seeds(
+            &[9; 32], &[8; 32],
+        )
+        .unwrap();
+        assert!(prekeys::load(profile.store(), &stranger).is_err());
     }
 }
