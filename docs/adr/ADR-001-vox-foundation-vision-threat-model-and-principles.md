@@ -1,7 +1,8 @@
 # ADR-001: Vox Foundation — Vision, Threat Model, and Cross-Cutting Principles
 
-**Status**: proposed
+**Status**: accepted (governs ADR-002..015; the M0 foundation — canonical CBOR, wire registry, suite registry — is implemented in `crates/vox-core/src/{cbor,wire,suite,hash}.rs`)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — status reconciled; governs list extended to ADR-015.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: foundation, vision, threat-model, principles
 
@@ -138,7 +139,7 @@ receive). This is accepted as an inherent property (see ADR-008, ADR-012).
   per-sender consent + Signal-grade pairwise crypto.
 
 ## Links
-- Governs: ADR-002 through ADR-014.
+- Governs: ADR-002 through ADR-015.
 
 ## Engineering Mantra
 

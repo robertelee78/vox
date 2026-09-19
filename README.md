@@ -70,7 +70,9 @@ Each layer is a decision record in `docs/adr/`, built in dependency order:
     DCUtR hole-punching, with a user-runnable rendezvous; honest about the limits.
 12. **Overlay tunneling** *(ADR-013)* — arbitrary TCP/IP between members (`ssh` over Vox), authorized
     by channel membership and consent.
-13. **macOS client** *(ADR-014)* — the first client surface over the Rust core.
+13. **Rust TUI client** *(ADR-015)* — the first client surface over the Rust core: a terminal-native
+    home client for Linux/servers/SSH (chat, consent, verification, tunneling).
+14. **macOS client** *(ADR-014)* — the native SwiftUI client over the same core (not started).
 
 ## Threat model
 
@@ -107,18 +109,35 @@ build order. Every ADR is grounded in a multi-pass, citation-backed research eff
 ## Repository layout
 
 ```
-docs/adr/      Architecture Decision Records (the design spine)
-README.md      This file
-LICENSE        MIT
+crates/vox-core/   The shared Rust core: identity, crypto, join, group, log/sync, governance,
+                   deniability, at-rest, transport, NAT, tunneling (milestones M0–M11)
+crates/vox-tui/    The Rust TUI client, binary `vox` (M12, ADR-015)
+docs/adr/          Architecture Decision Records (the design spine; each records its
+                   implementation status and Implementation notes)
+.github/           CI: fmt · clippy -D warnings · test · rustdoc -D warnings · real-parameter PoW gate
+Cargo.toml         Workspace manifest (Rust 1.94, pinned in rust-toolchain.toml)
+README.md          This file
+LICENSE            MIT
 ```
-
-Rust crates (core library, daemon, clients) will be added as their capabilities are implemented.
 
 ## Building
 
-There is no build yet — implementation begins once the ADR series is complete. Vox will be written in
-Rust (a headless core library plus platform clients). The first client targets macOS; Linux and iOS
-follow as their own capabilities.
+Vox is a Cargo workspace, pure Rust (no C/C++ dependencies of its own; the one ecosystem-forced
+native crypto is `aws-lc-rs` inside the TLS stack, documented in ADR-011).
+
+```
+cargo build --workspace                 # core library + the `vox` binary
+cargo test --workspace                  # the unit + integration suite (~20 s)
+cargo run --release -p vox-tui -- --help
+```
+
+**What works today.** Every layer in `vox-core` is implemented to its ADR and tested (including
+real loopback QUIC, a real TCP-over-Vox tunnel, and a real `(200,9)` Equihash solve cross-checked by
+the librustzcash verifier). What does **not** exist yet is the node runtime that composes those
+layers — join → transport → NAT → sync → governance — so `vox` currently runs as an *offline* client
+shell over an empty core and says so at startup; you cannot create, join, or chat in a channel over
+the network yet. That runtime is the next capability (a forthcoming ADR-016); the macOS client
+(ADR-014) follows it. Linux (as a TUI host) is supported now; iOS is a separate future capability.
 
 ## Contributing
 

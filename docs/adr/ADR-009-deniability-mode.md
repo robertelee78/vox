@@ -1,7 +1,8 @@
 # ADR-009: Deniability Mode (per-channel)
 
-**Status**: proposed
+**Status**: implemented (M7 core, `crates/vox-core/src/deniable/`) — **not enabled for shipping**: formal analysis and the `dgka-setup` wire codec are outstanding (see Implementation notes)
 **Date**: 2026-06-20
+**Updated**: 2026-09-19 — status reconciled; Implementation notes (M7) added recording formula drift (code normative) and the shipping blockers.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: deniability, mpenc, deniable-gka, content-authorship, post-quantum
 
@@ -166,6 +167,42 @@ group setting: **LaSDVS** single-verifier-only; **PSDVRS** discrete-log, not PQ.
 
 ### Neutral
 - Per-channel choice (admin-set, ADR-007), attributable default.
+
+## Implementation notes (M7)
+
+These record the concrete decisions made building this ADR (`crates/vox-core/src/deniable/`), so the spec and code stay in lockstep. **The code is the normative source for the formulas below**; an independent implementation must match these bytes, not the prose above:
+
+- **Commitment** `= SHA-256("vox/dgka-commit/v1" ‖ author_pubkey ‖ epk ‖ z ‖ n16)` — the author's
+  static public key is included (the Decision's formula omits it; including it is the stronger binding).
+- **Transcript** `T = SHA-256("vox/dgka-transcript/v1" ‖ cid ‖ epoch_le64 ‖ epk_1..m ‖ z_1..m)` with
+  members sorted by ascending `author_pubkey` bytes (not fingerprint); the DSKE binding signature is
+  over `T_bind = SHA-256(T ‖ X_1..m)` (the round-2 values are bound too), and the confirmation is
+  `HMAC-SHA-256(K_confirm, T_bind)` with `K_confirm = HKDF(K, "vox/dgka-confirm/v1" ‖ cid ‖ epoch_le)`
+  — a derived sub-key, not `K` itself. `K = HKDF(compressed BD point, info = "vox/dgka/v1" ‖ cid ‖
+  epoch_le)`.
+- **The reveal is static-signed.** Each member's `(epk_i, z_i)` is signed by its identity root under
+  `vox/dgka-setup/v1 ‖ CBOR[cid, epoch, author_id, epk, z]`. This contradicts the Decision's "the
+  key-agreement material inside carries no static signature" sentence but is security-consistent
+  with its own "participation is attributable anyway" paragraph: without it a `(victim_id,
+  attacker_epk)` substitution is possible. The signature binds identity to the ephemeral key; content
+  authorship remains deniable because content is signed only by the per-epoch ephemeral key.
+- **Two-party case.** Burmester–Desmedt with `n = 2` degenerates to plain ECDH on the two shares; the
+  code takes that path explicitly.
+- **Verifier.** `EpochVerifier` implements the ADR-008 `DeniableVerifier` seam and keys on the exact
+  `(channel_id, epoch, author_id)` triple — it never scans other epochs. Epoch-end `esk` publication
+  (tag `0x0010`) is refused unless `publishing_epoch < current_epoch`, on build and on receive.
+- **Known gaps / shipping blockers (recorded 2026-09-19).** (1) **The formal analysis of the DGKA+DSKE
+  construction the Decision requires before shipping is not on file** — deniable mode must not be
+  enabled in a shipped build until it is (the module docs say the same). (2) `Reveal`, `Confirm` and
+  `ReKey` have **no wire codec** and nothing frames them into `dgka-setup` (`0x000B`) log entries — the
+  round-3 `X_i` broadcast has no message type at all; the setup rounds can be driven in-process only,
+  so deniable mode cannot yet run over the log. (3) Re-key regenerates all shares and always
+  re-derives `K'`, skips the commitment round (its shares are not protected against adaptive
+  choice), carries no static reveal signature on the wire, and uses the unverified context
+  constructor — identity binding on re-key rests on the caller sourcing descriptors from root-signed
+  entries. (4) Epoch-closed gating relies on a caller-supplied `current_epoch`, not log state. (5) The
+  optional GOTR-style deferred consistency checks are not present. Test-vector obligation: no pinned
+  K / T / T_bind / commit / MAC vectors exist yet.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-006, ADR-007, ADR-008.

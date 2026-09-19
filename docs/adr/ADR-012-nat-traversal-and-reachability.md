@@ -1,7 +1,8 @@
 # ADR-012: NAT Traversal, Bootstrap, and Reachability
 
-**Status**: proposed
+**Status**: implemented (M10 primitives, `crates/vox-core/src/nat/`) — not yet composed into the reachability ladder (see Known gaps)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — status reconciled; Known gaps recorded.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
 
@@ -114,6 +115,18 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
 - **Reachability ladder (`nat::reachability`).** `connect_direct` races a peer's direct candidates Happy-Eyeballs-style (RFC 8305, 250 ms staggered start) over the M9 QUIC endpoint via a tokio `JoinSet`, returning the first attempt that authenticates as the expected composite identity; ladder exhaustion is `Error::Unreachable` (the honest ADR-012 limit), never a false success.
 - **Hole-punch (`nat::holepunch`).** The DCUtR Connect/Sync coordination is a pure, deterministic state machine + message codec; the initiator fires RTT/2 after `Sync`, the responder fires on receiving `Sync`, so the simultaneous opens coincide. The synchronized dial reuses `reachability::connect_direct` on the shared endpoint (same local port the peer observed).
 - **Relay data-plane boundary.** M10 expresses relay *hints* (`Multiaddr::Relay`) and the bootstrap/relay node set (`nat::bootstrap`), and can reach a relay node over M9. The actual **byte-forwarding** a relay performs is the tunnel mechanism of ADR-013/M11 (a relay is a special tunnel); this is a layering decision, not a deferral of the rendezvous/signaling work, which is complete here.
+
+- **Known gaps (recorded 2026-09-19).** The rungs exist as independent, tested primitives and nothing
+  composes them: `connect_direct`, `map_port` and the DCUtR `Coordinator` have no orchestrator.
+  Hole-punch is a state machine only — no observed-address discovery, no relay channel carrying
+  `CoordMessage`, nothing executes a `PunchPlan`. Relay-of-last-resort is a `Multiaddr::Relay` hint
+  with no consumer and no data plane (the M11 tunnel does not implement one either). There is **no
+  DHT** anywhere and the join layer's `channel_rendezvous`/`truncate` derivation has no caller — the
+  DHT key width remains unchosen. The "rendezvous server" is `RendezvousStore`, an in-memory policy gate
+  with no wire protocol to publish or fetch records and no consumer outside its own tests;
+  `BootstrapSet` is pure configuration. PCP is IPv4-only (no IPv6 pinhole) and default-gateway
+  discovery is Linux-only. All of this is the node-runtime capability (ADR-016), which this ADR's
+  primitives were built to be composed by.
 
 ## Links
 **Depends on**: ADR-005, ADR-011.

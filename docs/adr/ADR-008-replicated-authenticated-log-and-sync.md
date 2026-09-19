@@ -199,7 +199,7 @@ current `(channelID, epoch)`, (b) it carries a valid per-author authenticator fo
 (governance → root composite signature; content → composite or ADR-009 deniable), and (c) it is within
 that author's quota. Unauthenticated or wrong-epoch floods therefore cannot enter. Replication is
 bounded by **per-author quotas each peer enforces locally** — **defaults (channel-policy-tunable):
-≤ 1000 entries/hour and ≤ 50 MB/epoch per author**; over-quota entries from that author are dropped
+≤ 1000 entries/hour and ≤ 50 MiB/epoch per author**; over-quota entries from that author are dropped
 (not relayed) and the over-quota event is surfaced as an abuse signal (like revocation churn). This
 directly bounds the **render-gating amplification** vector — because every ciphertext replicates to
 all members (§"Render-gating"), a joined author could otherwise force O(members) storage; the
@@ -249,6 +249,20 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   (output > 255·32 bytes) and leaves the caller's buffer untouched instead of zero-filling it. The
   three fixed 32-byte outputs can never hit it, but the helper's contract is general and a test pins
   the oversize case. *(2026-09-19 review.)*
+- **Known gaps (recorded 2026-09-19).** (1) Negentropy range reconciliation is implemented and tested
+  in memory (`range_reconcile_exchange`) but never runs over a `Transport`: `frontier_session*` offer
+  frontier mode only — the ~100-author range mode this ADR calls required at scale is unwired. (2) Only
+  an equal-`max_seq` divergent head is pulled and proven as a fork; a fork below the remote's head
+  surfaces as a `prev_hash` failure (wire error `0x05`), so "permanently detectable on heal" holds only
+  for equal-length forks. (3) Fork proofs live in the in-memory `frozen` map; the ADR's "record the
+  proof as a channel entry" has no entry type yet. (4) `AuthorResolver::kind_for` defaults to
+  `Content` and nothing overrides it, so governance entries received via sync get the content fork
+  remedy. (5) `K_self` is derived but never applied (the self-log test stores plaintext);
+  `self_channel_id` (`vox/self-channel-id/v1`) is an addition not in the Decision. (6) Transport I/O
+  errors map to `0x01`, which the M0 table defines as "version". (7) The authenticator type sits outside
+  the signed skeleton and `algo_ids[0]` is pinned to the composite id even for deniable entries.
+  Test-vector obligation: only the log-entry skeleton is byte-pinned; there is no golden canonical-CBOR
+  suite for tags `0x0001–0x0011` and no frontier/Negentropy interop bytes against a reference.
 
 ## Links
 **Depends on**: ADR-002, ADR-006.
