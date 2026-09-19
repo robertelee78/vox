@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1 done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.2 done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -324,6 +324,22 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `bundle`, and a third bucket family pruned with the others (ADR-012 Implementation notes). The
   ADR-008 golden-vector obligation is still **UNMET** and now extends to `0x0012`; a pinned vector
   for this tag needs the fixed-seed X25519/ML-KEM prekey generation the rest of the suite also lacks.
+- **Rendezvous service (M14.2).** `nat::service::{RendezvousService, RendezvousClient,
+  MembershipOracle, RendezvousRequest, RendezvousResponse, RejectReason, RecordKinds, RecordSet}`
+  over a bi-stream typed `StreamKind::Rendezvous` — the protocol exactly as the Decision states it
+  (`PUT`/`GET`, u32-BE length-prefixed canonical-CBOR frames, every PUT through the existing store
+  policy). Two things the Decision left implicit are now stated (ADR-012 Implementation notes):
+  reading is open to any authenticated peer that knows the channelID, and a PUT's author need not
+  be the connection's peer because the record is self-authenticating. The transport grew the shared
+  async framing and the typed-stream kind frame (ADR-011 Implementation notes), and the clock moved
+  to `crate::time` (re-exported from `node::actor`) because `nat` must not depend on `node`. Proven
+  by a loopback QUIC test: a member publishes all three kinds and reads them back, a replay is
+  refused with the coded reason on the same stream, a stranger reads the board but cannot publish a
+  member record, a garbage frame is reset with ADR-008 code `0x05` as observed by the peer, and
+  clean half-closes end the server task with `Ok`. Sizes measured (spike, then deleted): bundle
+  record 18 084 B, pre-join record 20 211 B, address record 3 634 B → `MAX_RENDEZVOUS_FRAME` 48 KiB.
+  The `MembershipOracle` for a node comes from its open channels' state (M14.5 wires it); the
+  anchor's oracle from stored genesis/admin/bundle material is M15.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

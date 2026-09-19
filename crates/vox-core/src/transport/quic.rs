@@ -60,7 +60,7 @@ pub const MAX_STREAM_FRAME: usize = crate::log::sync::MAX_ENTRY_WIRE + 4096;
 /// The QUIC application close code carried when a sync stream hard-fails. quinn
 /// requires a `VarInt`; the M5 [`WireError`] byte is widened into it so the peer
 /// observes the exact coded reason (ADR-008 — never a silent downgrade).
-pub(super) fn close_code(err: WireError) -> quinn::VarInt {
+pub fn close_code(err: WireError) -> quinn::VarInt {
     quinn::VarInt::from_u32(u32::from(err.code()))
 }
 

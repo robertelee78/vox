@@ -39,4 +39,5 @@ pub mod multiaddr;
 pub mod portmap;
 pub mod reachability;
 pub mod record;
+pub mod service;
 pub mod store;

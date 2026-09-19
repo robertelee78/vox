@@ -191,6 +191,7 @@ pub mod nat;
 pub mod node;
 pub mod pairwise;
 pub mod suite;
+pub mod time;
 pub mod transport;
 pub mod tunnel;
 pub mod wire;

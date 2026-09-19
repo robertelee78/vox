@@ -2,15 +2,16 @@
 //! bi-stream.
 //!
 //! M5 frames are opaque byte vectors; here they are length-delimited on the stream
-//! with a 4-byte big-endian length prefix so the byte stream is re-segmented into
-//! exactly the frames M5 sent. The synchronous M5 sync engine is bridged onto
-//! async quinn via a tokio runtime [`Handle`].
+//! with the [`crate::transport::framing`] 4-byte big-endian length prefix so the
+//! byte stream is re-segmented into exactly the frames M5 sent. The synchronous M5
+//! sync engine is bridged onto async quinn via a tokio runtime [`Handle`].
 
 use quinn::{RecvStream, SendStream};
 use tokio::runtime::Handle;
 
 use crate::error::{Error, Result};
 use crate::log::sync::Transport;
+use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::{close_code, VoxConnection, MAX_STREAM_FRAME};
 use crate::wire::WireError;
 
@@ -61,45 +62,15 @@ impl Transport for QuicStreamTransport {
         if self.closed.is_some() {
             return Err(Error::MalformedBundle("quic transport: send after close"));
         }
-        let len = u32::try_from(frame.len())
-            .map_err(|_| Error::SizeLimitExceeded("quic stream frame length"))?;
         let send = &mut self.send;
-        self.handle.block_on(async move {
-            send.write_all(&len.to_be_bytes())
-                .await
-                .map_err(|_| Error::MalformedBundle("quic stream write len"))?;
-            send.write_all(frame)
-                .await
-                .map_err(|_| Error::MalformedBundle("quic stream write body"))?;
-            Ok::<(), Error>(())
-        })
+        self.handle.block_on(write_frame(send, frame))
     }
 
     fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        // A clean FIN exactly at a frame boundary is the peer's success
+        // half-close → `Ok(None)`; anything else is a real transport failure.
         let recv = &mut self.recv;
-        self.handle.block_on(async move {
-            // Read the 4-byte length prefix. A clean FIN *exactly at* the frame
-            // boundary is the peer's success half-close → `Ok(None)`. Any other
-            // read error (including a FIN partway through the prefix) is a real
-            // transport failure.
-            let mut len_buf = [0u8; 4];
-            match recv.read_exact(&mut len_buf).await {
-                Ok(()) => {}
-                Err(quinn::ReadExactError::FinishedEarly(0)) => {
-                    return Ok(None);
-                }
-                Err(_) => return Err(Error::MalformedBundle("quic stream read len")),
-            }
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len > MAX_STREAM_FRAME {
-                return Err(Error::SizeLimitExceeded("quic stream frame length"));
-            }
-            let mut body = vec![0u8; len];
-            recv.read_exact(&mut body)
-                .await
-                .map_err(|_| Error::MalformedBundle("quic stream read body"))?;
-            Ok(Some(body))
-        })
+        self.handle.block_on(read_frame(recv, MAX_STREAM_FRAME))
     }
 
     fn close(&mut self, code: WireError) {
