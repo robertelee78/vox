@@ -127,7 +127,7 @@ impl IdentityVault {
             .map_err(|_| Error::AtRestUnlockFailed)?;
         plaintext.zeroize();
         Ok(Self {
-            profile_id: profile.id,
+            profile_id: profile.id(),
             salt: *salt,
             nonce,
             ciphertext: ct,
@@ -136,10 +136,12 @@ impl IdentityVault {
 
     /// **Unlock** the vault: re-derive the vault key from `identity_passphrase`,
     /// AEAD-open, and parse the [`IdentityBackup`]. Any failure collapses to
-    /// [`Error::AtRestUnlockFailed`] (wrong passphrase / tamper) — the plaintext
-    /// is never partially exposed.
+    /// [`Error::AtRestUnlockFailed`] (wrong passphrase / tamper / a stored profile
+    /// id this build cannot resolve) — the plaintext is never partially exposed
+    /// and no persisted field is a distinguishable oracle.
     pub fn unlock(&self, identity_passphrase: &[u8]) -> Result<IdentityBackup> {
-        let profile = Argon2Profile::from_id(self.profile_id)?;
+        let profile =
+            Argon2Profile::from_id(self.profile_id).map_err(|_| Error::AtRestUnlockFailed)?;
         let key = derive_vault_key(identity_passphrase, &self.salt, profile)?;
         let cipher =
             Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| Error::AtRestUnlockFailed)?;
@@ -290,6 +292,20 @@ mod tests {
         assert_eq!(recovered.root_signer().unwrap().fingerprint(), fp);
         assert_eq!(*recovered.x25519_identity_secret(), [9u8; 32]);
         assert_eq!(recovered.self_seed().as_bytes(), &[5u8; 32]);
+    }
+
+    #[test]
+    fn unknown_stored_profile_id_collapses_to_unlock_failure() {
+        // `profile_id` is a persisted vault field. Distinguishing "unknown
+        // profile" from "wrong passphrase / tamper" would hand whoever holds the
+        // file an oracle, so it collapses to AtRestUnlockFailed exactly as the
+        // SEK wrap does (ADR-010; 2026-09-19 review).
+        let mut vault = IdentityVault::seal(&backup(), b"identity-pp", P).unwrap();
+        vault.profile_id = 200;
+        assert!(matches!(
+            vault.unlock(b"identity-pp"),
+            Err(Error::AtRestUnlockFailed)
+        ));
     }
 
     #[test]

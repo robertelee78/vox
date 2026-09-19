@@ -22,13 +22,20 @@
 //!
 //! ## Argon2id profiles — production const vs reduced test (the M3-Equihash lesson)
 //! Production `factor_pass` is **memory-hard on purpose**: ADR-010 mandates
-//! Argon2id ≥256 MiB, ≥3 passes. Running that in a unit test would burn seconds
-//! and a quarter-gig of RSS per call. So [`Argon2Profile::PRODUCTION`] carries the
-//! real parameters and **is the default** ([`Argon2Profile::default`]); tests use
-//! [`Argon2Profile::REDUCED`] (tiny memory, one pass). The production profile's
-//! values are asserted by a test (cheap — it reads the const, it does not run the
-//! KDF), exactly as M3 asserts the real Equihash `(200,9)` parameters without
-//! solving them.
+//! Argon2id ≥256 MiB, ≥3 passes ([`ADR_MIN_M_COST_KIB`], [`ADR_MIN_T_COST`]).
+//! Running that in a unit test would burn seconds and a quarter-gig of RSS per
+//! call. So [`Argon2Profile::PRODUCTION`] carries the real parameters and **is
+//! the default** ([`Argon2Profile::default`]); this crate's own unit tests use a
+//! `#[cfg(test)]`-only reduced profile (tiny memory, one pass). The production
+//! profile is checked against the floor at **compile time** (a `const` assertion,
+//! so it can never silently regress), exactly as M3 asserts the real Equihash
+//! `(200,9)` parameters without solving them.
+//!
+//! The floor is **structural**, not a runtime check: [`Argon2Profile`]'s fields
+//! are private, so the only profiles a production build can construct or resolve
+//! (`from_id`) are the floor-meeting constants. The reduced profile does not exist
+//! outside `cfg(test)` — a wrap naming its id is simply un-openable in production
+//! (2026-09-19 review: it used to resolve, letting an 8 KiB/1-pass wrap unlock).
 //!
 //! ## KDF-profile version → transparent re-wrap
 //! The wrap records its profile *id*, so a future build can raise the Argon2id
@@ -71,26 +78,38 @@ const WRAP_AAD: &[u8] = b"vox/sek-wrap-aead/v1";
 /// Format version of the [`SekWrap`] serialization.
 const SEK_WRAP_VERSION: u64 = 1;
 
+/// ADR-010 floor for the passphrase factor: Argon2id memory cost, in KiB
+/// (**256 MiB**). Every profile a production build can resolve meets it.
+pub const ADR_MIN_M_COST_KIB: u32 = 256 * 1024;
+/// ADR-010 floor for the passphrase factor: Argon2id passes (**3**).
+pub const ADR_MIN_T_COST: u32 = 3;
+
 /// An Argon2id parameter profile for the passphrase factor (ADR-010). Carries a
 /// stable `id` so a wrap records which profile derived it and a later build can
 /// upgrade transparently.
+///
+/// The fields are private on purpose: a profile can only be one of the named
+/// constants (or resolved from a stored id via [`Argon2Profile::from_id`]), so no
+/// caller can seal under ad-hoc parameters below the ADR floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Argon2Profile {
     /// Stable profile id, stored in the wrap (so the right parameters re-derive
     /// the KEK, and so an upgrade is detectable).
-    pub id: u8,
+    id: u8,
     /// Memory cost in **KiB** (`m_cost`).
-    pub m_cost_kib: u32,
+    m_cost_kib: u32,
     /// Iterations / passes (`t_cost`).
-    pub t_cost: u32,
+    t_cost: u32,
     /// Degree of parallelism (`p_cost`).
-    pub p_cost: u32,
+    p_cost: u32,
 }
 
 impl Argon2Profile {
     /// Profile id of [`Argon2Profile::PRODUCTION`].
     pub const PRODUCTION_ID: u8 = 1;
-    /// Profile id of [`Argon2Profile::REDUCED`].
+    /// Profile id of the `#[cfg(test)]`-only reduced profile. Kept as a public
+    /// constant so the id stays reserved and documented; a production build does
+    /// not resolve it.
     pub const REDUCED_ID: u8 = 2;
 
     /// The **production** passphrase-factor profile (ADR-010 §"Post-quantum
@@ -104,9 +123,11 @@ impl Argon2Profile {
         p_cost: 1,
     };
 
-    /// A **reduced** profile for tests only: 8 KiB, 1 pass. Fast and tiny so the
-    /// double-lock crypto can be exercised without minutes of CPU or hundreds of
-    /// MiB of RSS. **Never** the default; selected explicitly in tests.
+    /// A **reduced** profile for this crate's unit tests only: 8 KiB, 1 pass. Fast
+    /// and tiny so the double-lock crypto can be exercised without minutes of CPU
+    /// or hundreds of MiB of RSS. It does not exist in a non-test build, so it can
+    /// be neither sealed under nor resolved from a stored id there.
+    #[cfg(test)]
     pub const REDUCED: Argon2Profile = Argon2Profile {
         id: Self::REDUCED_ID,
         m_cost_kib: 8,
@@ -115,13 +136,40 @@ impl Argon2Profile {
     };
 
     /// Resolve a profile from its stored id. Unknown ids are rejected so a wrap
-    /// cannot name a profile this build does not understand.
+    /// cannot name a profile this build does not understand — and every id a
+    /// production build *does* understand meets the ADR-010 floor by
+    /// construction (the reduced test profile resolves only under `cfg(test)`).
     pub fn from_id(id: u8) -> Result<Self> {
         match id {
             Self::PRODUCTION_ID => Ok(Self::PRODUCTION),
+            #[cfg(test)]
             Self::REDUCED_ID => Ok(Self::REDUCED),
             _ => Err(Error::MalformedAtRest("unknown argon2 profile id")),
         }
+    }
+
+    /// The stable profile id recorded in a wrap.
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        self.id
+    }
+
+    /// Memory cost in KiB (`m_cost`).
+    #[must_use]
+    pub const fn m_cost_kib(self) -> u32 {
+        self.m_cost_kib
+    }
+
+    /// Passes (`t_cost`).
+    #[must_use]
+    pub const fn t_cost(self) -> u32 {
+        self.t_cost
+    }
+
+    /// Degree of parallelism (`p_cost`).
+    #[must_use]
+    pub const fn p_cost(self) -> u32 {
+        self.p_cost
     }
 
     /// Build the `argon2` parameter object for this profile.
@@ -138,11 +186,19 @@ impl Argon2Profile {
 
 impl Default for Argon2Profile {
     /// The production profile is the default — the hardened parameters ship by
-    /// default; only tests opt down to [`Argon2Profile::REDUCED`].
+    /// default; only this crate's unit tests opt down to the reduced profile.
     fn default() -> Self {
         Self::PRODUCTION
     }
 }
+
+// ADR-010 floor, enforced at compile time: the production profile can never be
+// edited below "≥256 MiB, ≥3 passes" without this crate failing to build.
+const _: () = assert!(
+    Argon2Profile::PRODUCTION.m_cost_kib >= ADR_MIN_M_COST_KIB
+        && Argon2Profile::PRODUCTION.t_cost >= ADR_MIN_T_COST,
+    "Argon2Profile::PRODUCTION is below the ADR-010 floor"
+);
 
 /// Compute the passphrase factor `factor_pass = Argon2id(passphrase, salt, profile)`.
 ///
@@ -292,7 +348,7 @@ impl Sek {
             )
             .map_err(|_| Error::AtRestUnlockFailed)?;
         Ok(SekWrap {
-            profile_id: profile.id,
+            profile_id: profile.id(),
             salt: *salt,
             nonce,
             ciphertext: ct,
@@ -343,6 +399,18 @@ pub struct SekWrap {
 }
 
 impl SekWrap {
+    /// Resolve the Argon2id profile this wrap was sealed under.
+    ///
+    /// An unknown stored profile id is an **unlock failure**, not a
+    /// distinguishable [`Error::MalformedAtRest`]: `profile_id` is a persisted
+    /// wrap field, so distinguishing it from a wrong factor would hand whoever
+    /// holds the file an oracle. Every path that resolves a stored id goes
+    /// through here (unwrap, rotation re-wrap, KDF upgrade) so the collapse
+    /// cannot be forgotten.
+    pub fn profile(&self) -> Result<Argon2Profile> {
+        Argon2Profile::from_id(self.profile_id).map_err(|_| Error::AtRestUnlockFailed)
+    }
+
     /// Double-lock **unwrap**: recover the SEK from this wrap under
     /// `(identity factor, passphrase)` for `channel_id` (ADR-010).
     ///
@@ -358,11 +426,7 @@ impl SekWrap {
         channel_id: &[u8; CHANNEL_ID_LEN],
         passphrase: &[u8],
     ) -> Result<Sek> {
-        // An unknown stored profile id is treated as an unlock failure, not a
-        // distinguishable `MalformedAtRest`: `profile_id` is a persisted wrap field,
-        // so distinguishing it from a wrong factor would hand an attacker an oracle.
-        let profile =
-            Argon2Profile::from_id(self.profile_id).map_err(|_| Error::AtRestUnlockFailed)?;
+        let profile = self.profile()?;
         let kek = derive_two_factor_kek(id_factor, channel_id, passphrase, &self.salt, profile)?;
         let cipher =
             Aes256Gcm::new_from_slice(kek.as_ref()).map_err(|_| Error::AtRestUnlockFailed)?;
