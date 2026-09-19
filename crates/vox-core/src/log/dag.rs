@@ -259,17 +259,28 @@ impl Dag {
     /// Accept an entry into the DAG, enforcing the full ADR-008 predicate.
     ///
     /// Steps, in order (any failure leaves the DAG unchanged):
+    /// 0. Governance entries must carry an attributable (composite)
+    ///    authenticator → otherwise [`Rejected::GovernanceNotAttributable`].
     /// 1. If the author is frozen, refuse ([`Rejected::Fork`] with the recorded
     ///    proof is *not* re-raised; later entries from a frozen author are simply
-    ///    refused via [`Rejected::NotAdmitted`]-style guard — see below).
+    ///    refused via [`Rejected::NotAdmitted`]).
     /// 2. Duplicate (same hash already stored) → [`Rejected::Duplicate`]
     ///    (idempotent replication).
-    /// 3. Equivocation: a different entry already occupies `(author, seq)` →
+    /// 3. Admission: author ∈ admitted set for `(channel, epoch)`.
+    /// 4. Authenticator + structure verify under `author_root`.
+    /// 5. Equivocation: a different entry already occupies `(author, seq)` →
     ///    [`Rejected::Fork`]; for an attributable entry the author is frozen.
-    /// 4. Admission: author ∈ admitted set for `(channel, epoch)`.
-    /// 5. Authenticator + structure verify under `author_root`.
-    /// 6. Quota: within the author's rate/byte budget.
-    /// 7. Feed link: `seq`/`prev_hash`/`lipmaa_backlink`/end-of-feed.
+    /// 6. Feed link: `seq`/`prev_hash`/`lipmaa_backlink`/end-of-feed.
+    /// 7. Quota: within the author's rate/byte budget.
+    ///
+    /// Equivocation is classified **only after** admission and verification
+    /// (steps 3–4 precede 5). An ADR-008 fork proof must be *self-authenticating*
+    /// and a deniable-content alarm must come from an entry the epoch verifier
+    /// accepts; classifying first would let a peer holding *no* valid key surface
+    /// fork proofs and alarms — a framing / attention-DoS primitive
+    /// (2026-09-19 review, HIGH). A conflicting entry that is unadmitted or fails
+    /// verification is therefore rejected as [`Rejected::NotAdmitted`] /
+    /// [`Rejected::Verification`], never as a fork.
     ///
     /// `kind` selects the governance/content rule; fork attributability is then
     /// determined by the entry's authenticator type (governance is forced
@@ -278,9 +289,8 @@ impl Dag {
     /// Equivalent to [`Dag::accept_with_deniable`] with no deniable verifier, so a
     /// **deniable** content entry fails verification with
     /// [`Error::DeniableVerificationUnavailable`] (the M7 verifier is supplied via
-    /// [`Dag::accept_with_deniable`]). The equivocation check runs *before*
-    /// verification, so a deniable fork is still classified (as an alarm) without
-    /// a verifier.
+    /// [`Dag::accept_with_deniable`]) — including a conflicting one, which is
+    /// consequently never classified as an alarm without a verifier.
     pub fn accept(
         &mut self,
         entry: Entry,
@@ -330,34 +340,35 @@ impl Dag {
             return Err(Rejected::Duplicate);
         }
 
-        // Equivocation: a *different* entry already occupies (author, seq)?
-        if let Some(feed) = self.feeds.get(&author) {
-            if let Some(existing) = feed.get(seq) {
-                // Same seq, different hash (duplicate handled above) ⇒ a fork.
-                let outcome = self.classify_fork(existing.clone(), entry.clone());
-                if let ForkOutcome::Attributable(ref proof) = outcome {
-                    // Verify BOTH conflicting entries are validly signed before
-                    // freezing — an attributable fork proof must be
-                    // self-authenticating (both composite signatures verify).
-                    if entry.verify_with_deniable(author_root, deniable).is_ok()
-                        && existing.verify_with_deniable(author_root, deniable).is_ok()
-                    {
-                        self.frozen.insert(author, (**proof).clone());
-                    }
-                }
-                return Err(Rejected::Fork(outcome));
-            }
-        }
-
         // Admission.
         if !admission.is_admitted(&channel, epoch, &author) {
             return Err(Rejected::NotAdmitted);
         }
 
         // Authenticator + structure (deniable verified via the M7 seam if given).
+        // This precedes equivocation classification on purpose: only an entry
+        // that is admitted AND authenticates may surface a fork proof / alarm.
         entry
             .verify_with_deniable(author_root, deniable)
             .map_err(Rejected::Verification)?;
+
+        // Equivocation: a *different* entry already occupies (author, seq)?
+        if let Some(feed) = self.feeds.get(&author) {
+            if let Some(existing) = feed.get(seq) {
+                // Same seq, different hash (duplicate handled above) ⇒ a fork.
+                let outcome = self.classify_fork(existing.clone(), entry);
+                if let ForkOutcome::Attributable(ref proof) = outcome {
+                    // `conflicting` verified just above. `existing` was verified
+                    // when it was accepted (only this path stores entries); the
+                    // re-check is an invariant guard so the recorded proof is
+                    // self-authenticating regardless of how `existing` arrived.
+                    if existing.verify(author_root).is_ok() {
+                        self.frozen.insert(author, (**proof).clone());
+                    }
+                }
+                return Err(Rejected::Fork(outcome));
+            }
+        }
 
         // Feed link: validate (without mutating) BEFORE committing quota, so a
         // structural rejection never consumes the author's quota budget. The feed
@@ -463,8 +474,8 @@ impl Dag {
 mod tests {
     use super::*;
     use crate::hash::sha256;
-    use crate::identity::composite::{RootSigner, SoftwareRootSigner};
-    use crate::log::entry::{EntrySkeleton, ZERO_HASH};
+    use crate::identity::composite::{CompositeSignature, RootSigner, SoftwareRootSigner};
+    use crate::log::entry::{Authenticator, EntrySkeleton, ZERO_HASH};
     use crate::log::feed::lipmaa;
     use crate::suite::algo;
 
@@ -711,6 +722,151 @@ mod tests {
                 Error::DeniableVerificationUnavailable
             ))
         ));
+    }
+
+    /// A stand-in verifier for "the authenticator is not under this epoch's
+    /// key": rejects everything, the way the real M7 verifier does for bytes
+    /// that fail the epoch-key signature.
+    struct RejectAllDeniable;
+    impl DeniableVerifier for RejectAllDeniable {
+        fn verify_deniable(&self, _: &crate::log::entry::EntrySkeleton, _: &[u8]) -> Result<()> {
+            Err(Error::SignatureInvalid)
+        }
+    }
+
+    // --- Equivocation is classified only for admitted, authenticated entries ---
+    //
+    // Review finding (2026-09-19 swarm, HIGH): fork classification ran before
+    // admission and authenticator verification, so a peer needing *no* valid
+    // key could surface `Rejected::Fork` outcomes — attributable "proofs" that
+    // do not self-authenticate and deniable alarms nobody in the epoch signed.
+    // `sync::apply_entry` reports every fork as a non-fatal `ApplyOutcome::Fork`,
+    // turning that into a framing / attention-DoS primitive. The four tests
+    // below pin the ADR-008 rule that a fork proof is *self-authenticating* and
+    // a deniable alarm is raised only by an entry the epoch verifier accepts.
+
+    #[test]
+    fn unadmitted_conflicting_entry_is_not_a_fork() {
+        // A conflicting entry at an occupied (author, seq) from an author the
+        // policy no longer admits (epoch rotation / revocation) is refused as
+        // NotAdmitted — never surfaced as a fork, never freezes.
+        let r = root(30, 31);
+        let adm = admission_for(&[&r]);
+        let mut dag = Dag::new();
+        let e1 = next_entry(&dag, &r, b"first");
+        dag.accept(e1, EntryKind::Content, &r.public_key(), &adm, 0)
+            .unwrap();
+        let withdrawn = AdmissionPolicy::new();
+        let scratch = Dag::new();
+        let e2 = next_entry(&scratch, &r, b"second-equivocation");
+        assert!(matches!(
+            dag.accept(e2, EntryKind::Content, &r.public_key(), &withdrawn, 0),
+            Err(Rejected::NotAdmitted)
+        ));
+        assert!(!dag.is_frozen(&r.fingerprint()));
+        assert_eq!(dag.len(), 1);
+    }
+
+    #[test]
+    fn forged_conflicting_entry_is_not_a_fork() {
+        // An attacker (who cannot sign as `r`: `build_signed` refuses a
+        // skeleton whose author_id is not the signer's) ships a seq-1 entry
+        // naming `r` with a composite-typed authenticator that does not verify
+        // under r's root. This is a Verification rejection, NOT an attributable
+        // fork proof (the "proof" would not self-authenticate), and must not
+        // freeze r.
+        let r = root(32, 33);
+        let adm = admission_for(&[&r]);
+        let mut dag = Dag::new();
+        let e1 = next_entry(&dag, &r, b"first");
+        dag.accept(e1, EntryKind::Content, &r.public_key(), &adm, 0)
+            .unwrap();
+        let scratch = Dag::new();
+        let genuine = next_entry(&scratch, &r, b"framed");
+        let mut sig = match &genuine.authenticator {
+            Authenticator::Composite(s) => s.to_bytes(),
+            other => panic!("expected composite, got {other:?}"),
+        };
+        sig[0] ^= 0x01;
+        let forged = Entry {
+            skeleton: genuine.skeleton.clone(),
+            authenticator: Authenticator::Composite(Box::new(
+                CompositeSignature::from_bytes(&sig).unwrap(),
+            )),
+            payload: genuine.payload.clone(),
+        };
+        assert_eq!(forged.skeleton.author_id, r.fingerprint());
+        assert!(
+            forged.verify(&r.public_key()).is_err(),
+            "forgery must not verify"
+        );
+        assert!(matches!(
+            dag.accept(forged, EntryKind::Content, &r.public_key(), &adm, 0),
+            Err(Rejected::Verification(_))
+        ));
+        assert!(!dag.is_frozen(&r.fingerprint()));
+        assert!(dag.fork_proof(&r.fingerprint()).is_none());
+        assert_eq!(dag.len(), 1);
+    }
+
+    #[test]
+    fn deniable_conflict_without_verifier_is_not_an_alarm() {
+        // Without an M7 verifier a conflicting deniable entry cannot be
+        // authenticated at all, so it is a Verification rejection — not an alarm.
+        let r = root(36, 37);
+        let adm = admission_for(&[&r]);
+        let mut dag = Dag::new();
+        let v = AcceptAnyDeniable;
+        let e1 = next_deniable_entry(&dag, &r, b"first");
+        dag.accept_with_deniable(e1, EntryKind::Content, &r.public_key(), &adm, 0, Some(&v))
+            .unwrap();
+        let scratch = Dag::new();
+        let e2 = next_deniable_entry(&scratch, &r, b"second-equivocation");
+        assert!(matches!(
+            dag.accept(e2, EntryKind::Content, &r.public_key(), &adm, 0),
+            Err(Rejected::Verification(
+                Error::DeniableVerificationUnavailable
+            ))
+        ));
+        assert!(!dag.is_frozen(&r.fingerprint()));
+        assert_eq!(dag.len(), 1);
+    }
+
+    #[test]
+    fn deniable_conflict_failing_verifier_is_not_an_alarm() {
+        // A conflicting deniable entry whose authenticator the epoch verifier
+        // rejects is a Verification rejection — only an entry the epoch key
+        // actually authenticates may raise the (non-attributable) alarm.
+        let r = root(38, 39);
+        let adm = admission_for(&[&r]);
+        let mut dag = Dag::new();
+        let accept = AcceptAnyDeniable;
+        let e1 = next_deniable_entry(&dag, &r, b"first");
+        dag.accept_with_deniable(
+            e1,
+            EntryKind::Content,
+            &r.public_key(),
+            &adm,
+            0,
+            Some(&accept),
+        )
+        .unwrap();
+        let scratch = Dag::new();
+        let e2 = next_deniable_entry(&scratch, &r, b"second-equivocation");
+        let reject = RejectAllDeniable;
+        assert!(matches!(
+            dag.accept_with_deniable(
+                e2,
+                EntryKind::Content,
+                &r.public_key(),
+                &adm,
+                0,
+                Some(&reject)
+            ),
+            Err(Rejected::Verification(Error::SignatureInvalid))
+        ));
+        assert!(!dag.is_frozen(&r.fingerprint()));
+        assert_eq!(dag.len(), 1);
     }
 
     #[test]

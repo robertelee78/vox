@@ -1,7 +1,8 @@
 # ADR-008: Replicated Authenticated Log and Sync
 
-**Status**: proposed
+**Status**: implemented (M5, `crates/vox-core/src/log/`)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
@@ -226,6 +227,23 @@ skeleton entry remains, so pruning can never silently rewrite history.
 ### Neutral
 - Positions Vox alongside SSB / Hypercore / Berty / Matrix-event-DAG; differentiator remains the
   consent + crypto layered on top.
+
+## Implementation notes (M5)
+
+These record the concrete decisions made building this ADR (`crates/vox-core/src/log/`), so the spec and code stay in lockstep:
+
+- **Acceptance order (`Dag::accept_with_deniable`).** governance-must-be-attributable → frozen-author
+  refusal → duplicate → **admission → authenticator/structure verification → equivocation** → feed link
+  → quota. Equivocation is classified only for an entry that is admitted *and* authenticates, so an
+  attributable fork proof is self-authenticating by construction (both entries verified under the
+  author's root) and a deniable-content alarm is raised only by an entry the ADR-009 epoch verifier
+  accepts. A conflicting entry from an unadmitted author, one whose composite signature does not verify,
+  or a deniable one the verifier rejects (or with no verifier available) is rejected as
+  `NotAdmitted` / `Verification` and never surfaces as a fork. *(2026-09-19 review, HIGH: classifying
+  before verification let a peer holding no valid key raise fork proofs and alarms — a framing /
+  attention-DoS primitive.)* `sync::apply_entry` still reports a genuine fork as the non-fatal
+  `ApplyOutcome::Fork`; the forged case now closes the stream with wire error `0x05` like any other
+  authenticator failure.
 
 ## Links
 **Depends on**: ADR-002, ADR-006.
