@@ -2,7 +2,7 @@
 
 **Status**: implemented (M3, `crates/vox-core/src/join/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — KDF error paths (`K_pop`, rendezvous) now surface as errors instead of an all-zero key; `K_pop` returned zeroizing.
+**Updated**: 2026-09-19 — KDF error paths (`K_pop`, rendezvous) now surface as errors instead of an all-zero key; `K_pop` returned zeroizing. C++ solver carve-out rejected (Rust only); PoW cost measured; difficulty defaults, cap and load-adaptation policy added; tromp-class pure-Rust solver is the next PoW milestone.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: channel, addressing, pake, cpace, rendezvous, join
 
@@ -99,18 +99,45 @@ caps (ADR-012), not by join PoW.
   is sub-millisecond and is always the path a responder runs. The signed responder-nonce carries the
   difficulty so the prover cannot understate it, and a token is bound to `(channelID, epoch,
   responder_nonce)` so it cannot be precomputed or replayed across channels/epochs.
-- **PoW solving — solver strategy + a scoped Rust-maximal exception.** The default solve path is a
-  **pure-Rust** generalized-Wagner solver (memory-bounded: parent-pointer nodes, per-round
-  collide-keep-discard, hard-capped list — it does *not* retain flattened index lists). It is the
-  solver used for reduced-parameter CI and is a correct — but, at the real `(200,9)` parameters,
-  ~1.7–2.5 GB and seconds-to-minutes — fallback. Because that does not meet the ~1–2 s mobile-join
-  target, an **optional, off-by-default `equihash-solver` build feature** enables the C++ `tromp`
-  solver (via librustzcash) for production `(200,9)` proving. This is a **deliberate, scoped exception
-  to ADR-001 principle 10 (Rust-maximal)**: *all* protocol logic and *all* verification remain pure
-  Rust; only the prover's optional speed path is non-Rust, it is never required for the default build
-  or CI, and the pure-Rust solver remains a complete (if slower) alternative. A future benchmarked
-  pure-Rust `(200,9)` solver would let the exception be retired. (Decision pending deciders'
-  confirmation; trivially reversible by dropping the feature.)
+- **PoW solving — pure Rust only; the C++ carve-out is rejected.** The solve path is Vox's own
+  pure-Rust generalized-Wagner solver (`join::pow::wagner`), the *only* prover at every parameter set;
+  the librustzcash crate is used solely as the verifier. The optional C++ `tromp` solver this note once
+  carved out as "pending deciders' confirmation" was **rejected by the decider on 2026-09-19** ("Vox is
+  Rust only", ADR-001 principle 10): the `equihash-solver` feature and its CI job were removed. A
+  performance gap is an algorithm/implementation problem to be solved in Rust, never grounds for a
+  non-Rust exception.
+- **Measured cost (2026-09-19, `examples/spike_pow.rs`, release build, Apple-silicon laptop core).**
+  Pure-Rust Wagner at the real `(200,9)`: **≈ 7.5 s per nonce, 1.65 GB peak RSS, 2.0 solutions per
+  nonce**. Reduced CI parameters `(48,5)`: sub-millisecond; `(96,5)`: 0.09 s. (`(144,5)` was also
+  measured — 115 s and 10 GB — and is not a candidate.) The ≈ 1–2 s mobile-join target above is therefore
+  **not met today**: the base solve alone is 4–8× over it on a desktop-class core before any
+  difficulty filter. The target stands; the gap is closed by the solver milestone below, not by
+  weakening `(n,k)`.
+- **Difficulty is calibrated in base-solve multiples, not seconds.** A `(200,9)` solve yields ≈ 2
+  solutions per nonce and a `d`-bit filter passes each with probability `2^-d`, so a join costs
+  `max(1, 2^d / 2)` base solves (`Difficulty::expected_solves`). Defaults (`join::pow::Difficulty`):
+  `DEFAULT_INVITE` = 1 bit (≈ 1 solve; the smallest *non-zero* filter, so a leaked channelID still
+  costs a full memory-hard solve per attempt), `DEFAULT_OPEN` = 2 bits (≈ 2 solves), and the
+  accessibility cap `MAX` = 8 bits (≈ 128 solves) — a joiner **refuses** a challenge above the cap
+  before grinding (`join_initiate`), which also bounds the work an attacker-signed challenge can
+  extract. `ZERO` remains explicit LAN/closed mode. Once the solver milestone lands, the same bit
+  values map onto the wall-clock targets (1 solve ≈ 0.5–1 s ⇒ invite ≈ 0.5–1 s, open ≈ 1–2 s).
+- **Load adaptation is a pure function.** `Difficulty::adapted_for_load(pending_joins)` adds one bit
+  per doubling of the pending-join queue at or above a small threshold (4) and saturates at `MAX`;
+  it is monotone in load and falls back as the queue drains, so a responder node calls it with its
+  live queue depth each time it mints a signed challenge. The node runtime that supplies the queue
+  depth is the integration milestone (no such runtime exists yet); the policy itself is complete.
+- **Next PoW milestone — a tromp-class pure-Rust `(200,9)` solver.** The present solver stores
+  parent-pointer nodes and hard-caps each round's list, which is why it needs 1.65 GB and ≈ 7.5 s.
+  The reference design (tromp's `equi_miner`) runs the *same* Wagner algorithm in ≈ 144 MB and well
+  under a second per nonce on a modern core by (i) bucket-sorting each round's list by the round's
+  collision prefix into fixed-capacity buckets, (ii) storing each entry as a compact 32-bit slot that
+  packs the surviving hash bits with the two parent slot indices (no 64-bit pointers), (iii) reusing
+  two layer buffers round to round, and (iv) recovering the `2^k` leaf indices by walking slot pairs
+  only for the final collisions. Acceptance gates for the port: every emitted solution accepted by
+  the librustzcash verifier for the same `(seed, nonce)`; on this machine ≤ 2 s per nonce and
+  ≤ 256 MB peak RSS at `(200,9)` (measured by `spike_pow`); reduced-parameter CI round-trip unchanged.
+
 - **Proof-of-possession confidentiality.** The identity PoP exchanged inside the CPace-protected
   session is AEAD-sealed (AES-256-GCM) under a key derived from the CPace ISK,
   `K_pop = HKDF-SHA-256(ISK, info="vox/cpace-pop/v1")`, so the identity public keys and signature are

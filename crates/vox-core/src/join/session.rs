@@ -142,6 +142,12 @@ pub fn join_initiate<'a>(
     if challenge.channel_id != ctx.channel_id || challenge.epoch != ctx.epoch {
         return Err(Error::JoinPowInvalid);
     }
+    //    Accessibility cap (ADR-005): a challenge above `Difficulty::MAX` is
+    //    refused outright — an honest responder never mints one, and it bounds the
+    //    grind any attacker-signed challenge can extract from a joiner.
+    if challenge.difficulty.exceeds_cap() {
+        return Err(Error::JoinPowInvalid);
+    }
     // 1. PoW — memory-hard work bound to (channelID, epoch, responder_nonce).
     let token = pow::solve_token(ctx.pow_params, challenge)?;
     // 2. CPace — keyed by the passphrase.
@@ -541,6 +547,34 @@ mod tests {
             verified_resp,
             verified_joiner,
         ))
+    }
+
+    #[test]
+    fn joiner_refuses_challenge_above_the_difficulty_cap() {
+        // ADR-005 accessibility cap: a signed, correctly-bound challenge whose
+        // difficulty exceeds `Difficulty::MAX` is refused before any PoW grind.
+        let responder = member(1, 2);
+        let c = ctx([1u8; 32], 0);
+        let over = Difficulty::bits(Difficulty::MAX.leading_zero_bits + 1);
+        let challenge = ResponderNonce::generate(&[1u8; 32], 0, over).unwrap();
+        let sig = challenge.sign(&responder.root).unwrap();
+        let ik = X25519IdentityKey::generate().unwrap();
+        assert!(matches!(
+            join_initiate(
+                c,
+                b"pp",
+                b"sid",
+                &challenge,
+                &responder.root.public_key(),
+                &sig,
+                &responder.root,
+                &ik
+            ),
+            Err(Error::JoinPowInvalid)
+        ));
+        // Exactly at the cap is still acceptable (the cap is inclusive).
+        let at_cap = ResponderNonce::generate(&[1u8; 32], 0, Difficulty::MAX).unwrap();
+        assert!(!at_cap.difficulty.exceeds_cap());
     }
 
     #[test]
