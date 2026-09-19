@@ -1,8 +1,8 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — implementation in progress: M13 single-device node
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) next
 **Date**: 2026-09-19
-**Updated**: 2026-09-19 — accepted by the decider; M13 started.
+**Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: runtime, node, integration, persistence, rendezvous, sync, headless
 
@@ -299,6 +299,18 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   passphrase; M13's network verbs (join, consent, visibility, block) report "not available yet"
   rather than pretending. The production-Argon2id live-core lifecycle test is `#[ignore]`d in the
   debug suite and run in release by CI, alongside the real-parameter PoW gate.
+- **The M13 gate (M13.6).** `crates/vox-core/tests/node_m13_gate.rs` — linked without `cfg(test)`,
+  so it runs the **production** Argon2id profile — creates a profile, creates a channel, appends and
+  renders three messages (observing the ordered `NewEntry` events), locks (channel closed, name
+  hidden), rejects a wrong passphrase, unlocks and reopens, shuts down, then starts a **fresh runtime
+  and a fresh node over the same directory**: the identity is the same, the profile starts locked, the
+  channel is listed closed, a send is refused, unlock + open restores the local name, members and all
+  three messages, and a fourth message appends (the sender chain continued from disk). File modes are
+  asserted (`0600` vault/store, `0700` profile dir). ≈ 2.4 s in release; `#[ignore]`d in the debug
+  suite and run by CI's release step with the other real-parameter gates. The TUI's
+  declared-but-unused dependencies are now used (`tokio`, `zeroize`) or removed (`tui-textarea`), and
+  ADR-015's primary-buffer and lock/zeroize gates are met (ADR-015 Implementation notes). **M13 is
+  complete; M14 begins.**
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
