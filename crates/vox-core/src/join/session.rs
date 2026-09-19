@@ -90,6 +90,10 @@ impl JoinContext {
 
 /// The joiner (PQXDH initiator) side of a join, after CPace start.
 ///
+/// The borrowed signer is `Send + Sync` because this state is held across `await`
+/// points when the exchange is driven over the network (ADR-016 §"Join over the
+/// network"); the cryptography is unaffected.
+///
 /// Holds the in-progress CPace state and the joiner's X25519 identity key for the
 /// subsequent PQXDH bootstrap. Produced by [`join_initiate`]; advanced by
 /// [`JoinInitiator::complete_cpace`].
@@ -98,7 +102,7 @@ pub struct JoinInitiator<'a> {
     sid: Vec<u8>,
     cpace: CpaceState,
     own_share: [u8; CPACE_SHARE_LEN],
-    root: &'a dyn RootSigner,
+    root: &'a (dyn RootSigner + Send + Sync),
     ik: &'a X25519IdentityKey,
 }
 
@@ -108,7 +112,7 @@ pub struct JoinResponder<'a> {
     sid: Vec<u8>,
     cpace: CpaceState,
     own_share: [u8; CPACE_SHARE_LEN],
-    root: &'a dyn RootSigner,
+    root: &'a (dyn RootSigner + Send + Sync),
 }
 
 /// Begin the joiner side: solve the PoW, start CPace, and produce the values to
@@ -130,7 +134,7 @@ pub fn join_initiate<'a>(
     challenge: &ResponderNonce,
     responder_pub: &CompositePublicKey,
     challenge_sig: &CompositeSignature,
-    root: &'a dyn RootSigner,
+    root: &'a (dyn RootSigner + Send + Sync),
     ik: &'a X25519IdentityKey,
 ) -> Result<(JoinInitiator<'a>, PowToken, [u8; CPACE_SHARE_LEN])> {
     // 0. The suite this join binds must sit at/above the channel floor
@@ -179,7 +183,7 @@ pub fn join_accept<'a>(
     sid: &[u8],
     challenge: &ResponderNonce,
     token: &PowToken,
-    root: &'a dyn RootSigner,
+    root: &'a (dyn RootSigner + Send + Sync),
 ) -> Result<(JoinResponder<'a>, [u8; CPACE_SHARE_LEN])> {
     // Gate: the suite this join binds must sit at/above the channel floor
     // (ADR-003), and the joiner's PoW must verify against our signed challenge —

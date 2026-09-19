@@ -2,7 +2,7 @@
 
 **Status**: implemented (M3, `crates/vox-core/src/join/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — KDF error paths (`K_pop`, rendezvous) now surface as errors instead of an all-zero key; `K_pop` returned zeroizing. C++ solver carve-out rejected (Rust only); difficulty defaults, cap and load-adaptation policy added; solver rewritten with a bucket-sorted flat layout — (200,9) measured 1.1 s / 245 MB (was 7.5 s / 1.65 GB), target met.
+**Updated**: 2026-09-19 — KDF error paths (`K_pop`, rendezvous) now surface as errors instead of an all-zero key; `K_pop` returned zeroizing. C++ solver carve-out rejected (Rust only); difficulty defaults, cap and load-adaptation policy added; solver rewritten with a bucket-sorted flat layout — (200,9) measured 1.1 s / 245 MB (was 7.5 s / 1.65 GB), target met. 2026-09-20 — the join exchange now has a transport (`node::joinstream`, ADR-016 M14.4); the state machine's borrowed signer is `Send + Sync` so it can be driven across `await`s.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: channel, addressing, pake, cpace, rendezvous, join
 
@@ -147,6 +147,22 @@ caps (ADR-012), not by join PoW.
   machine (`spike_pow`). Parameter sets whose parent references exceed 32 bits (e.g. `(144,5)`)
   transparently use 64-bit references.
 
+- **The join over the wire (`node::joinstream`, ADR-016 M14.4).** This ADR's Decision defines the
+  cryptography and leaves "the *exchange* of shares / PoP / PoW ... the transport's job"; that transport
+  now exists as seven ordered frames on a bi-stream typed `join` (CHALLENGE → SOLVE → SHARE → PROOF →
+  PROOF → INIT → ACCEPTED/REJECTED), driving `join_initiate` / `join_accept` / `complete_cpace` /
+  `verify_peer_sealed` / `bootstrap` **unchanged**. Three properties are worth pinning here:
+  (1) **The transport identity *is* the expected PoP identity.** The responder verifies the joiner's PoP
+  against `VoxConnection::peer_id` and the joiner requires the challenge's composite key to hash to the
+  peer it dialled, so the ADR-005 proof and the ADR-011 handshake cannot disagree and a third party
+  cannot relay someone else's join. (2) **The joiner proves first**, so the party seeking entry commits
+  before the member reveals its proof; the consequence is that a wrong passphrase is detected by the
+  *responder*, which answers with one opaque `Refused` — `PowInvalid` and `Malformed` stay
+  distinguishable because they are structural, but nothing distinguishes a wrong passphrase from an
+  identity mismatch or a policy refusal. (3) The responder's challenge difficulty is
+  `base.adapted_for_load(pending_joins)`, so the load-adaptation policy above is applied where the load
+  is actually known. A full join runs over loopback QUIC in a test, at reduced and at **production
+  (200,9)** parameters (1.95 s in release, including the solve).
 - **Proof-of-possession confidentiality.** The identity PoP exchanged inside the CPace-protected
   session is AEAD-sealed (AES-256-GCM) under a key derived from the CPace ISK,
   `K_pop = HKDF-SHA-256(ISK, info="vox/cpace-pop/v1")`, so the identity public keys and signature are
