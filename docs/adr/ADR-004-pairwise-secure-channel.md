@@ -2,7 +2,7 @@
 
 **Status**: implemented (M2, `crates/vox-core/src/pairwise/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M2) added; uncommitted DH-ratchet secrets are wiped when a decrypt plan is dropped.
+**Updated**: 2026-09-19 — Implementation notes (M2) added; uncommitted DH-ratchet secrets are wiped when a decrypt plan is dropped; nonce KDF error propagates instead of an all-zero nonce.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: crypto-core, pqxdh, double-ratchet, forward-secrecy, pcs
 
@@ -103,6 +103,9 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   by a compile-time check in `pairwise::ratchet`. *(2026-09-19 review: the candidate secret was a bare
   `[u8; 32]` and was not wiped on the failure path.)* `Ratchet::init_responder` takes the signed-prekey
   secret as a `Zeroizing` buffer for the same reason.
+- **Message nonce KDF has no fallback.** The per-message AEAD nonce is `HMAC-SHA-256(mk, 0x03)[..12]`;
+  HMAC keying cannot fail for a 32-byte key, but the error is propagated (`Result`) rather than
+  replaced by an all-zero nonce. *(2026-09-19 review.)*
 
 ## Links
 **Depends on**: ADR-002, ADR-003.

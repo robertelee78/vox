@@ -296,7 +296,7 @@ impl<'a> JoinInitiator<'a> {
         let isk = self.cpace.finish(peer_share)?;
         let (transcript_hash, own_proof) =
             build_proof(self.root, &self.sid, &isk[..], &self.own_share, peer_share)?;
-        let pop_key = Zeroizing::new(pop::derive_pop_key(&isk[..]));
+        let pop_key = pop::derive_pop_key(&isk[..])?;
         let pending = JoinProofPending {
             sid: self.sid,
             transcript_hash,
@@ -351,7 +351,7 @@ impl JoinResponder<'_> {
         let isk = self.cpace.finish(peer_share)?;
         let (transcript_hash, own_proof) =
             build_proof(self.root, &self.sid, &isk[..], &self.own_share, peer_share)?;
-        let pop_key = Zeroizing::new(pop::derive_pop_key(&isk[..]));
+        let pop_key = pop::derive_pop_key(&isk[..])?;
         let pending = JoinProofPending {
             sid: self.sid,
             transcript_hash,

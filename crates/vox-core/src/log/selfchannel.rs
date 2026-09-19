@@ -67,13 +67,12 @@ impl core::fmt::Debug for KSelf {
 /// public key, not a signature over a constant) is the ADR-008 security property:
 /// only a holder of the seed — i.e. one of the identity's own devices — can
 /// derive it.
-#[must_use]
-pub fn derive_k_self(self_seed: &SelfSeed) -> KSelf {
+pub fn derive_k_self(self_seed: &SelfSeed) -> Result<KSelf> {
     let mut okm = [0u8; K_SELF_LEN];
-    hkdf_expand(self_seed.as_bytes(), INFO_K_SELF, &mut okm);
+    hkdf_expand(self_seed.as_bytes(), INFO_K_SELF, &mut okm)?;
     let k = KSelf(okm);
     okm.zeroize();
-    k
+    Ok(k)
 }
 
 /// Derive the self-channel rendezvous `rendezvous_self` from the private
@@ -81,27 +80,27 @@ pub fn derive_k_self(self_seed: &SelfSeed) -> KSelf {
 /// private seed). This is a *public* locator value used to find sibling devices,
 /// but because it derives from the private seed it is unlinkable to the identity
 /// by anyone who does not hold the seed.
-#[must_use]
-pub fn derive_rendezvous_self(self_seed: &SelfSeed) -> [u8; RENDEZVOUS_SELF_LEN] {
+pub fn derive_rendezvous_self(self_seed: &SelfSeed) -> Result<[u8; RENDEZVOUS_SELF_LEN]> {
     let mut out = [0u8; RENDEZVOUS_SELF_LEN];
-    hkdf_expand(self_seed.as_bytes(), INFO_RENDEZVOUS_SELF, &mut out);
-    out
+    hkdf_expand(self_seed.as_bytes(), INFO_RENDEZVOUS_SELF, &mut out)?;
+    Ok(out)
 }
 
 /// HKDF-SHA-256 expand with an empty salt over `ikm`, writing `okm.len()` bytes.
-/// Used for both self-channel derivations so they share one KDF (and differ only
+/// Used for all self-channel derivations so they share one KDF (and differ only
 /// by `info`).
-fn hkdf_expand(ikm: &[u8; SELF_SEED_LEN], info: &[u8], okm: &mut [u8]) {
+///
+/// `expand` fails only if `okm.len()` exceeds 255·HashLen (8160 B for SHA-256);
+/// the fixed 32-byte outputs below never do. It is still surfaced as an error —
+/// never a zero-filled buffer — because a silent all-zero key is a worse failure
+/// than an honest one (no fallback; 2026-09-19 review). On error `okm` is untouched.
+fn hkdf_expand(ikm: &[u8; SELF_SEED_LEN], info: &[u8], okm: &mut [u8]) -> Result<()> {
     use hkdf::Hkdf;
     use sha2::Sha256;
     // Extract with no salt: the seed is already a high-entropy uniform secret.
     let hk = Hkdf::<Sha256>::new(None, ikm);
-    // `expand` only errors if the output length exceeds 255*HashLen (8160 B for
-    // SHA-256); our outputs are 32 B, so this is unreachable, but we still avoid
-    // a panic by zero-filling on the impossible error rather than unwrapping.
-    if hk.expand(info, okm).is_err() {
-        okm.fill(0);
-    }
+    hk.expand(info, okm)
+        .map_err(|_| Error::MalformedBundle("self-channel hkdf expand"))
 }
 
 /// The kind of self-channel entry payload (ADR-008). The self-channel multiplexes
@@ -282,11 +281,10 @@ impl SignedSelfChannelEntry {
 /// self-log, derived deterministically from the `self_seed` so every one of the
 /// identity's devices computes the same id. Distinct `info` from `K_self` and
 /// `rendezvous_self` so it is independent of both.
-#[must_use]
-pub fn self_channel_id(self_seed: &SelfSeed) -> Digest32 {
+pub fn self_channel_id(self_seed: &SelfSeed) -> Result<Digest32> {
     let mut out = [0u8; DIGEST_LEN];
-    hkdf_expand(self_seed.as_bytes(), b"vox/self-channel-id/v1", &mut out);
-    out
+    hkdf_expand(self_seed.as_bytes(), b"vox/self-channel-id/v1", &mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -298,13 +296,28 @@ mod tests {
     }
 
     #[test]
+    fn oversize_expand_is_an_error_not_a_zero_key() {
+        // The HKDF-Expand ceiling for SHA-256 is 255 * 32 = 8160 bytes. Asking
+        // for more MUST be an error; it must never hand back an all-zero "key"
+        // (no fallback — 2026-09-19 review). The buffer is left untouched.
+        let s = seed(7);
+        let mut big = vec![0xA5u8; 8161];
+        let r = hkdf_expand(s.as_bytes(), b"vox/test/v1", &mut big);
+        assert!(r.is_err(), "oversize expand must fail");
+        assert!(
+            big.iter().all(|&b| b == 0xA5),
+            "buffer must be untouched on error"
+        );
+    }
+
+    #[test]
     fn kdfs_are_deterministic_from_seed() {
         let s = seed(0x42);
-        let k1 = derive_k_self(&s);
-        let k2 = derive_k_self(&s);
+        let k1 = derive_k_self(&s).unwrap();
+        let k2 = derive_k_self(&s).unwrap();
         assert_eq!(k1.as_bytes(), k2.as_bytes());
-        let r1 = derive_rendezvous_self(&s);
-        let r2 = derive_rendezvous_self(&s);
+        let r1 = derive_rendezvous_self(&s).unwrap();
+        let r2 = derive_rendezvous_self(&s).unwrap();
         assert_eq!(r1, r2);
     }
 
@@ -313,29 +326,29 @@ mod tests {
         // K_self and rendezvous_self derive from the same seed but different info,
         // so they must not collide (ADR-008 domain separation).
         let s = seed(0x07);
-        let k = derive_k_self(&s);
-        let r = derive_rendezvous_self(&s);
+        let k = derive_k_self(&s).unwrap();
+        let r = derive_rendezvous_self(&s).unwrap();
         assert_ne!(&k.as_bytes()[..], &r[..]);
         // And the channel id is independent of both.
-        let cid = self_channel_id(&s);
+        let cid = self_channel_id(&s).unwrap();
         assert_ne!(&cid[..], &k.as_bytes()[..]);
         assert_ne!(cid, r);
     }
 
     #[test]
     fn different_seeds_yield_different_keys() {
-        let a = derive_k_self(&seed(1));
-        let b = derive_k_self(&seed(2));
+        let a = derive_k_self(&seed(1)).unwrap();
+        let b = derive_k_self(&seed(2)).unwrap();
         assert_ne!(a.as_bytes(), b.as_bytes());
         assert_ne!(
-            derive_rendezvous_self(&seed(1)),
-            derive_rendezvous_self(&seed(2))
+            derive_rendezvous_self(&seed(1)).unwrap(),
+            derive_rendezvous_self(&seed(2)).unwrap()
         );
     }
 
     #[test]
     fn k_self_debug_is_redacted() {
-        let k = derive_k_self(&seed(0xAB));
+        let k = derive_k_self(&seed(0xAB)).unwrap();
         let dbg = format!("{k:?}");
         assert!(dbg.contains("redacted"));
         assert!(!dbg.contains("ab"));
@@ -372,7 +385,7 @@ mod tests {
 
         let r = SoftwareRootSigner::from_component_seeds(&[3; 32], &[4; 32]).unwrap();
         let s = seed(0x55);
-        let cid = self_channel_id(&s);
+        let cid = self_channel_id(&s).unwrap();
 
         // A fake received SKDM payload (opaque bytes that begin with the SKDM tag).
         let skdm_wire = vec![0x00, 0x02, 0x01, 0xAB, 0xCD, 0xEF];

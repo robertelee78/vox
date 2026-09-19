@@ -95,7 +95,7 @@ fn hmac_one(ck: &[u8; 32], tag: u8) -> Result<[u8; 32]> {
 fn aead_seal(mk: &Key32, ad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher =
         Aes256Gcm::new_from_slice(&mk.0).map_err(|_| Error::MalformedBundle("aead key"))?;
-    let nonce = message_nonce(mk);
+    let nonce = message_nonce(mk)?;
     cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -113,7 +113,7 @@ fn aead_seal(mk: &Key32, ad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
 fn aead_open(mk: &Key32, ad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     let cipher =
         Aes256Gcm::new_from_slice(&mk.0).map_err(|_| Error::MalformedBundle("aead key"))?;
-    let nonce = message_nonce(mk);
+    let nonce = message_nonce(mk)?;
     cipher
         .decrypt(
             Nonce::from_slice(&nonce),
@@ -128,11 +128,15 @@ fn aead_open(mk: &Key32, ad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
 /// Derive a deterministic 96-bit AEAD nonce from the (single-use) message key.
 /// Because each message key is derived once and deleted after use, a fixed
 /// nonce-per-key is safe (the GCM (key, nonce) pair never repeats).
-fn message_nonce(mk: &Key32) -> [u8; 12] {
-    let tag = hmac_one(&mk.0, 0x03).unwrap_or([0u8; 32]);
+///
+/// HMAC-SHA-256 keying never fails for a 32-byte key; the error path is still
+/// propagated — never replaced by an all-zero nonce (no fallback; 2026-09-19
+/// review).
+fn message_nonce(mk: &Key32) -> Result<[u8; 12]> {
+    let tag = hmac_one(&mk.0, 0x03)?;
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&tag[..12]);
-    nonce
+    Ok(nonce)
 }
 
 /// A cached skipped message key, keyed by `(ratchet_pubkey, N)`, with an
