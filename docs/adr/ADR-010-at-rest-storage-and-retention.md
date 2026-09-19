@@ -2,7 +2,7 @@
 
 **Status**: implemented (M8, `crates/vox-core/src/atrest/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-20 — identity-level key material (the prekey ring) given its at-rest home and derivation (ADR-016 M14.3). 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
+**Updated**: 2026-09-20 — identity-level key material (the prekey ring) given its at-rest home and derivation (ADR-016 M14.3); admitted channel authors sealed as key material (M14.5). 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: storage, at-rest, encryption, retention, ttl, device-seizure, app-lock
 
@@ -148,6 +148,13 @@ plainly rather than implying a guarantee we cannot make.
 
 These record the concrete decisions made building this ADR (`crates/vox-core/src/atrest/`), so the spec and code stay in lockstep:
 
+- **Admitted authors are per-channel key material (M14.5).** The composite keys of the identities whose
+  entries a channel accepts are sealed under that channel's SEK as a `KeyMaterial` segment
+  (`SEG_AUTHORS`), alongside the sender chain and the manifest — they are public keys, but *which*
+  identities a device admits is exactly the kind of metadata §"Two distinct encryption layers" puts
+  behind the double-lock. On open, each stored pair is re-checked (the fingerprint must be the key's own)
+  and the genesis creator is re-inserted unconditionally, so a tampered segment can neither admit an
+  identity under another's name nor exclude the creator whose signature the channelID commits to.
 - **Identity-level key material: a third home, single-factor by design (M14.3).** §"Two distinct
   encryption layers" names two homes — the per-channel SEK store for *per-channel* material, and the
   separate identity domain (the passphrase-sealed vault) for the root. The ADR-002 §2 key-agreement keys

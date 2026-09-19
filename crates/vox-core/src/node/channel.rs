@@ -44,9 +44,14 @@ use crate::atrest::sek::{Argon2Profile, Sek};
 use crate::atrest::store::{open_segment, seal_segment, SegmentKind};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
+use crate::governance::consent::ConsentGrant;
+use crate::governance::entry::GovEntry;
 use crate::governance::evaluator::Evaluator;
 use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+use crate::governance::membership::{issue_consent_grant, MembershipView};
+use crate::group::skdm::Skdm;
 use crate::group::state::SenderChain;
+use crate::group::wire::GROUP_MSG_SIGN_DOMAIN;
 use crate::hash::{sha256, Digest32};
 use crate::identity::composite::{CompositePublicKey, RootSigner};
 use crate::log::dag::{AdmissionPolicy, Dag};
@@ -58,14 +63,35 @@ use crate::suite::{algo, SuiteFloor};
 
 /// Segment id of the manifest in `KeyMaterial`.
 const SEG_MANIFEST: u64 = 0;
+/// The admitted-authors segment id within [`SegmentKind::KeyMaterial`] (M14.5): the
+/// composite keys of every identity whose entries this node accepts into the log.
+const SEG_AUTHORS: u64 = 2;
 /// Segment id of this identity's sender chain in `KeyMaterial`.
 const SEG_SENDER: u64 = 1;
 /// Manifest encoding version.
 const MANIFEST_VERSION: u64 = 1;
 /// Plaintext-cache row encoding version.
 const CACHE_VERSION: u64 = 1;
+
+/// At-rest version of the admitted-authors segment.
+const AUTHORS_VERSION: u64 = 1;
+
+/// Hard cap on admitted authors per channel, so a hostile or corrupt segment cannot
+/// force an unbounded allocation on open.
+pub const MAX_AUTHORS: usize = 1024;
 /// Cap on a local channel name.
 pub const MAX_LOCAL_NAME_LEN: usize = 128;
+
+/// What [`ChannelState::accept_entry`] did with a peer's entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accepted {
+    /// A governance entry: verified, stored, and folded into the evaluator.
+    Governance,
+    /// A content entry: verified and stored, but not readable — this node holds no
+    /// sender key for that author yet (ADR-007: consent, not credentials, grants
+    /// reading).
+    ContentNotReadable,
+}
 
 /// A rendered (decrypted, render-gated) message in the timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +123,9 @@ pub struct ChannelState {
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
     timeline: Vec<Rendered>,
+    /// Accepted governance entries (consent grants and the rest) in acceptance
+    /// order — the evaluator's input, rebuilt from the log on open (M14.5).
+    gov_entries: Vec<GovEntry>,
     poisoned: bool,
 }
 
@@ -107,6 +136,8 @@ impl std::fmt::Debug for ChannelState {
             .field("local_name", &self.local_name)
             .field("epoch", &self.epoch)
             .field("entries", &self.dag.len())
+            .field("authors", &self.authors.len())
+            .field("governance", &self.gov_entries.len())
             .field("poisoned", &self.poisoned)
             .finish_non_exhaustive()
     }
@@ -141,6 +172,73 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
     let epoch = d.uint()?;
     d.finish()?;
     Ok((genesis, name, created, epoch))
+}
+
+/// The admitted-authors segment: `[version, [[fingerprint, composite_pubkey], …]]`
+/// in fingerprint order (a `BTreeMap`, so the bytes are canonical).
+fn authors_bytes(authors: &BTreeMap<Digest32, CompositePublicKey>) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(AUTHORS_VERSION).array(authors.len());
+    for (fp, key) in authors {
+        e.array(2).bytes(fp).bytes(&key.to_bytes());
+    }
+    e.finish()
+}
+
+fn parse_authors(bytes: &[u8]) -> Result<BTreeMap<Digest32, CompositePublicKey>> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 {
+        return Err(Error::MalformedAtRest("channel authors arity"));
+    }
+    if d.uint()? != AUTHORS_VERSION {
+        return Err(Error::MalformedAtRest("channel authors version"));
+    }
+    let n = d.array()?;
+    if n > MAX_AUTHORS {
+        return Err(Error::SizeLimitExceeded("channel authors"));
+    }
+    let mut out = BTreeMap::new();
+    for _ in 0..n {
+        if d.array()? != 2 {
+            return Err(Error::MalformedAtRest("channel author tuple arity"));
+        }
+        let fp: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("channel author fingerprint"))?;
+        let key_bytes: [u8; crate::hash::COMPOSITE_PUB_LEN] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("channel author key length"))?;
+        let key = CompositePublicKey::from_bytes(&key_bytes)?;
+        // The stored fingerprint must be the key's own: a swapped pair would admit
+        // an identity under another's name.
+        if key.fingerprint() != fp {
+            return Err(Error::MalformedAtRest("channel author key/fingerprint"));
+        }
+        out.insert(fp, key);
+    }
+    d.finish()?;
+    Ok(out)
+}
+
+/// Classify a log entry by its payload — the discriminator ADR-008's `kind_for`
+/// lacked (it defaulted every entry to `Content`).
+///
+/// The two payload families are self-describing and disjoint: a governance payload
+/// is a struct-tagged ADR-008 frame, while a sender-key message is domain-prefixed
+/// with `vox/group-msg/v1`. Anything else is neither, and is refused rather than
+/// optimistically treated as content.
+fn classify_payload(payload: &[u8]) -> Result<EntryKind> {
+    if payload.starts_with(GROUP_MSG_SIGN_DOMAIN.as_bytes()) {
+        return Ok(EntryKind::Content);
+    }
+    if crate::wire::parse_frame(payload).is_ok() {
+        return Ok(EntryKind::Governance);
+    }
+    Err(Error::MalformedAtRest(
+        "entry payload is neither a group message nor a governance struct",
+    ))
 }
 
 fn cache_bytes(r: &Rendered) -> Vec<u8> {
@@ -238,8 +336,23 @@ impl ChannelState {
             SEG_SENDER,
             &sender.to_state(),
         )?;
+        let mut authors = BTreeMap::new();
+        authors.insert(me, signer.public_key());
+        let authors_seg = seal_segment(
+            &sek,
+            SegmentKind::KeyMaterial,
+            SEG_AUTHORS,
+            &authors_bytes(&authors),
+        )?;
+
         let mut batch = profile.store().batch()?;
         batch.put_sek_wrap(&channel_id, &wrap)?;
+        batch.put_segment(
+            &channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_AUTHORS,
+            &authors_seg,
+        )?;
         batch.put_segment(
             &channel_id,
             SegmentKind::KeyMaterial,
@@ -254,11 +367,9 @@ impl ChannelState {
         )?;
         batch.commit()?;
 
-        let mut authors = BTreeMap::new();
-        authors.insert(me, signer.public_key());
         let mut admission = AdmissionPolicy::new();
         admission.admit(channel_id, epoch, me);
-        let evaluator = Self::build_evaluator(&genesis, &authors, now_secs)?;
+        let evaluator = Self::build_evaluator(&genesis, &authors, &[], now_secs)?;
         Ok(Self {
             channel_id,
             genesis,
@@ -273,6 +384,7 @@ impl ChannelState {
             sender,
             next_log_id: 1,
             timeline: Vec::new(),
+            gov_entries: Vec::new(),
             poisoned: false,
         })
     }
@@ -305,7 +417,18 @@ impl ChannelState {
             return Err(Error::MalformedAtRest("channel manifest genesis mismatch"));
         }
 
-        let mut authors = BTreeMap::new();
+        // The admitted authors (M14.5). A channel created before this segment
+        // existed has only its creator, which is exactly what it had.
+        let mut authors =
+            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_AUTHORS)? {
+                Some(seg) => {
+                    let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_AUTHORS, &seg)?;
+                    parse_authors(&bytes)?
+                }
+                None => BTreeMap::new(),
+            };
+        // The creator is always an author: it signed the genesis whose hash is the
+        // channelID, so it cannot be excluded by a tampered segment.
         authors.insert(
             genesis.body.creator_pubkey.fingerprint(),
             genesis.body.creator_pubkey.clone(),
@@ -315,16 +438,33 @@ impl ChannelState {
             admission.admit(*channel_id, epoch, *author);
         }
 
-        // Rebuild the DAG: every stored entry re-passes the acceptance predicate.
+        // Rebuild the DAG: every stored entry re-passes the acceptance predicate,
+        // classified by its payload so governance entries are not re-admitted as
+        // content.
         let mut dag = Dag::new();
         let mut next_log_id = 1u64;
+        let mut gov_entries = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::LogDb)? {
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
             let entry = Entry::from_wire(&wire)?;
             let key = authors
                 .get(&entry.skeleton.author_id)
-                .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?;
-            dag.accept(entry, EntryKind::Content, key, &admission, now_secs)
+                .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?
+                .clone();
+            let payload = entry
+                .payload
+                .as_deref()
+                .ok_or(Error::MalformedAtRest("stored entry payload pruned"))?;
+            let kind = classify_payload(payload)?;
+            if kind == EntryKind::Governance {
+                gov_entries.push(GovEntry::from_verified_log_entry(
+                    &entry,
+                    &key,
+                    channel_id,
+                    Default::default(),
+                )?);
+            }
+            dag.accept(entry, kind, &key, &admission, now_secs)
                 .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
             next_log_id = id.saturating_add(1);
         }
@@ -346,7 +486,7 @@ impl ChannelState {
         let sender = SenderChain::from_state(&sender_state)?;
         drop(sender_state);
 
-        let evaluator = Self::build_evaluator(&genesis, &authors, now_secs)?;
+        let evaluator = Self::build_evaluator(&genesis, &authors, &gov_entries, now_secs)?;
         Ok(Self {
             channel_id: *channel_id,
             genesis,
@@ -361,6 +501,7 @@ impl ChannelState {
             sender,
             next_log_id,
             timeline,
+            gov_entries,
             poisoned: false,
         })
     }
@@ -368,9 +509,379 @@ impl ChannelState {
     fn build_evaluator(
         genesis: &Genesis,
         authors: &BTreeMap<Digest32, CompositePublicKey>,
+        gov_entries: &[GovEntry],
         now_secs: u64,
     ) -> Result<Evaluator> {
-        Evaluator::build(genesis, &[], now_secs, |id| authors.get(id).cloned())
+        Evaluator::build(genesis, gov_entries, now_secs, |id| {
+            authors.get(id).cloned()
+        })
+    }
+
+    /// Create the local state for a channel this identity **joined** (ADR-007
+    /// §"Join and per-sender consent flow", step 1) rather than created.
+    ///
+    /// `genesis` comes from the rendezvous board and is accepted **only if its hash
+    /// equals `channel_id`** (ADR-007: that check, not any roster, is what makes a
+    /// cold-fetched genesis trustworthy). The joiner gets its own local SEK (the
+    /// at-rest double-lock is per device, ADR-010) and its own sender chain at
+    /// `chain_id` 0 — holding channel credentials releases **no** sender keys, so it
+    /// can read nothing until members consent (step 3); its own messages are
+    /// readable by others only once it distributes its SKDM (step 2).
+    ///
+    /// The creator is admitted as an author immediately (its key is in the verified
+    /// genesis); every other member is admitted as its verified key arrives.
+    pub fn join_channel(
+        profile: &Profile,
+        genesis: &Genesis,
+        channel_id: &Digest32,
+        local_name: &str,
+        channel_passphrase: &[u8],
+        now_secs: u64,
+    ) -> Result<Self> {
+        Self::join_channel_with_profile(
+            profile,
+            genesis,
+            channel_id,
+            local_name,
+            channel_passphrase,
+            now_secs,
+            Argon2Profile::default(),
+        )
+    }
+
+    /// [`ChannelState::join_channel`] with an explicit Argon2id profile (tests use
+    /// the reduced one).
+    pub fn join_channel_with_profile(
+        profile: &Profile,
+        genesis: &Genesis,
+        channel_id: &Digest32,
+        local_name: &str,
+        channel_passphrase: &[u8],
+        now_secs: u64,
+        argon2: Argon2Profile,
+    ) -> Result<Self> {
+        if local_name.len() > MAX_LOCAL_NAME_LEN {
+            return Err(Error::SizeLimitExceeded("channel local name"));
+        }
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        genesis.verify()?;
+        if genesis.channel_id() != *channel_id {
+            return Err(Error::MalformedGovernance(
+                "genesis hash is not the channelID joined with",
+            ));
+        }
+        if profile.store().get_sek_wrap(channel_id)?.is_some() {
+            return Err(Error::Profile("this channel is already in the profile"));
+        }
+        let epoch = 0u64;
+        let sek = Sek::generate()?;
+        let factor = SignatureIdentityFactor::new(signer);
+        let wrap = sek.seal(&factor, channel_id, channel_passphrase, argon2)?;
+        let sender = SenderChain::new(channel_id, epoch, &me, 0, now_secs)?;
+
+        let creator = genesis.body.creator_pubkey.fingerprint();
+        let mut authors = BTreeMap::new();
+        authors.insert(creator, genesis.body.creator_pubkey.clone());
+        authors.insert(me, signer.public_key());
+
+        let manifest = manifest_bytes(genesis, local_name, now_secs, epoch);
+        let manifest_seg = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest)?;
+        let sender_seg = seal_segment(
+            &sek,
+            SegmentKind::KeyMaterial,
+            SEG_SENDER,
+            &sender.to_state(),
+        )?;
+        let authors_seg = seal_segment(
+            &sek,
+            SegmentKind::KeyMaterial,
+            SEG_AUTHORS,
+            &authors_bytes(&authors),
+        )?;
+        let mut batch = profile.store().batch()?;
+        batch.put_sek_wrap(channel_id, &wrap)?;
+        batch.put_segment(
+            channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_MANIFEST,
+            &manifest_seg,
+        )?;
+        batch.put_segment(
+            channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_SENDER,
+            &sender_seg,
+        )?;
+        batch.put_segment(
+            channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_AUTHORS,
+            &authors_seg,
+        )?;
+        batch.commit()?;
+
+        let mut admission = AdmissionPolicy::new();
+        for author in authors.keys() {
+            admission.admit(*channel_id, epoch, *author);
+        }
+        let evaluator = Self::build_evaluator(genesis, &authors, &[], now_secs)?;
+        Ok(Self {
+            channel_id: *channel_id,
+            genesis: genesis.clone(),
+            local_name: local_name.to_owned(),
+            created: now_secs,
+            epoch,
+            sek,
+            authors,
+            admission,
+            dag: Dag::new(),
+            evaluator,
+            sender,
+            next_log_id: 1,
+            timeline: Vec::new(),
+            gov_entries: Vec::new(),
+            poisoned: false,
+        })
+    }
+
+    /// Admit `key` as a log author for this channel: its entries are accepted into
+    /// the DAG and its governance entries are evaluated (ADR-007 — admission is a
+    /// *log* fact, not a read grant; reading still requires that author's SKDM and
+    /// this node's consent view).
+    ///
+    /// The key must hash to `fingerprint` (ADR-016: author keys come from the
+    /// verified genesis, admin certificates, or the board's records, each of which
+    /// carries the full composite key). Idempotent: re-admitting the same key is a
+    /// no-op that still succeeds.
+    pub fn admit_author(
+        &mut self,
+        profile: &Profile,
+        key: &CompositePublicKey,
+        now_secs: u64,
+    ) -> Result<bool> {
+        let fingerprint = key.fingerprint();
+        if let Some(existing) = self.authors.get(&fingerprint) {
+            if existing.to_bytes() == key.to_bytes() {
+                return Ok(false);
+            }
+            // Two different keys claiming one fingerprint is a SHA-256 collision or
+            // a bug; either way, never silently replace an admitted author.
+            return Err(Error::MalformedGovernance(
+                "another key is already admitted for this fingerprint",
+            ));
+        }
+        if self.authors.len() >= MAX_AUTHORS {
+            return Err(Error::SizeLimitExceeded("channel authors"));
+        }
+        self.authors.insert(fingerprint, key.clone());
+        self.admission
+            .admit(self.channel_id, self.epoch, fingerprint);
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_AUTHORS,
+            &authors_bytes(&self.authors),
+        )?;
+        if let Err(e) = profile.store().put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_AUTHORS,
+            &seg,
+        ) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.evaluator =
+            Self::build_evaluator(&self.genesis, &self.authors, &self.gov_entries, now_secs)?;
+        Ok(true)
+    }
+
+    /// Whether `fingerprint` is an admitted log author.
+    #[must_use]
+    pub fn is_author(&self, fingerprint: &Digest32) -> bool {
+        self.authors.contains_key(fingerprint)
+    }
+
+    /// The admitted authors' keys, in fingerprint order.
+    #[must_use]
+    pub fn author_keys(&self) -> Vec<CompositePublicKey> {
+        self.authors.values().cloned().collect()
+    }
+
+    /// Issue a **consent grant** to `target`: the ADR-007 log fact that this
+    /// identity released its sender key to `target`, carrying the `skdm_ref` of the
+    /// SKDM actually delivered over the pairwise session and the history mode in
+    /// force. Appends it as a governance entry and folds it into the evaluator, so
+    /// `target` immediately reads as consented in this node's view.
+    ///
+    /// The SKDM delivery itself is the caller's (M14.5b); this records the consent.
+    pub fn issue_consent(
+        &mut self,
+        profile: &Profile,
+        target: Digest32,
+        delivered_skdm: &Skdm,
+        now_secs: u64,
+    ) -> Result<ConsentGrant> {
+        let signer = profile.signer()?;
+        let grant = issue_consent_grant(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            target,
+            delivered_skdm,
+            self.genesis.body.policy.history_mode,
+        )?;
+        self.append_governance(profile, &grant.to_wire(), now_secs)?;
+        Ok(grant)
+    }
+
+    /// Append an already-built governance struct as a signed log entry.
+    fn append_governance(
+        &mut self,
+        profile: &Profile,
+        payload: &[u8],
+        now_secs: u64,
+    ) -> Result<Digest32> {
+        if self.poisoned {
+            return Err(Error::Profile(
+                "channel is poisoned after a failed persist; reopen it",
+            ));
+        }
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        if !self.authors.contains_key(&me) {
+            return Err(Error::Profile(
+                "this identity is not an author of the channel",
+            ));
+        }
+        let skeleton = self.next_skeleton(&me, payload);
+        let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
+        let hash = entry.entry_hash();
+        let wire = entry.to_wire();
+        let id = self.next_log_id;
+        let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
+        let key = signer.public_key();
+        let gov =
+            GovEntry::from_verified_log_entry(&entry, &key, &self.channel_id, self.gov_heads())?;
+        self.dag
+            .accept(
+                entry,
+                EntryKind::Governance,
+                &key,
+                &self.admission,
+                now_secs,
+            )
+            .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
+        if let Err(e) =
+            profile
+                .store()
+                .put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)
+        {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.next_log_id = id.saturating_add(1);
+        self.gov_entries.push(gov);
+        self.evaluator =
+            Self::build_evaluator(&self.genesis, &self.authors, &self.gov_entries, now_secs)?;
+        Ok(hash)
+    }
+
+    /// The governance entries a newly authored governance entry happens-after: the
+    /// hashes accepted so far (ADR-007's causal relation is only ever *followed*,
+    /// never trusted for authority).
+    fn gov_heads(&self) -> std::collections::BTreeSet<Digest32> {
+        self.gov_entries.iter().map(|g| g.entry_hash).collect()
+    }
+
+    /// Accept an entry authored by **another** member (M14.5; the bytes arrive from
+    /// the join stream now and from ADR-008 sync in M14.6).
+    ///
+    /// The author must already be admitted ([`ChannelState::admit_author`]), the
+    /// entry must pass the ADR-008 acceptance predicate under that author's key, and
+    /// its payload decides its kind. A content entry is stored but **not rendered**:
+    /// rendering needs that author's sender key, which only arrives with its SKDM,
+    /// and this node's consent view (ADR-007 — the newcomer sees ciphertext until a
+    /// member consents).
+    pub fn accept_entry(
+        &mut self,
+        profile: &Profile,
+        entry: Entry,
+        now_secs: u64,
+    ) -> Result<Accepted> {
+        if self.poisoned {
+            return Err(Error::Profile(
+                "channel is poisoned after a failed persist; reopen it",
+            ));
+        }
+        if entry.skeleton.channel_id != self.channel_id {
+            return Err(Error::MalformedGovernance("entry binds another channel"));
+        }
+        if entry.skeleton.epoch != self.epoch {
+            return Err(Error::MalformedGovernance("entry binds another epoch"));
+        }
+        let author = entry.skeleton.author_id;
+        let key = self
+            .authors
+            .get(&author)
+            .ok_or(Error::MalformedGovernance(
+                "entry from an unadmitted author",
+            ))?
+            .clone();
+        let payload = entry
+            .payload
+            .as_deref()
+            .ok_or(Error::MalformedGovernance("entry payload pruned"))?;
+        let kind = classify_payload(payload)?;
+        let gov = if kind == EntryKind::Governance {
+            Some(GovEntry::from_verified_log_entry(
+                &entry,
+                &key,
+                &self.channel_id,
+                self.gov_heads(),
+            )?)
+        } else {
+            None
+        };
+        let wire = entry.to_wire();
+        let id = self.next_log_id;
+        let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
+        self.dag
+            .accept(entry, kind, &key, &self.admission, now_secs)
+            .map_err(|_| Error::MalformedGovernance("entry failed the acceptance predicate"))?;
+        if let Err(e) =
+            profile
+                .store()
+                .put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)
+        {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.next_log_id = id.saturating_add(1);
+        match gov {
+            Some(g) => {
+                self.gov_entries.push(g);
+                self.evaluator = Self::build_evaluator(
+                    &self.genesis,
+                    &self.authors,
+                    &self.gov_entries,
+                    now_secs,
+                )?;
+                Ok(Accepted::Governance)
+            }
+            // Stored as ciphertext: no sender key for this author yet, so there is
+            // nothing to render (ADR-007 step 3).
+            None => Ok(Accepted::ContentNotReadable),
+        }
+    }
+
+    /// Whether this node may read `author`'s messages: `author` has consented to
+    /// this identity on the log (ADR-007 per-sender consent). Reading also needs the
+    /// sender key itself (the SKDM).
+    #[must_use]
+    pub fn may_read(&self, author: &Digest32, me: &Digest32) -> bool {
+        MembershipView::new(&self.evaluator).can_read(me, author)
     }
 
     /// Author a text message: encrypt under this identity's sender chain, wrap in
@@ -763,5 +1274,151 @@ mod tests {
             ch.append_text(&prof, "after lock", 2),
             Err(Error::AtRestLocked)
         ));
+    }
+    /// Both halves of ADR-007's join flow that do not need SKDM delivery (M14.5a):
+    /// a joiner builds local state from the board's genesis, each side admits the
+    /// other as a log author, a message crosses and is **stored but unreadable**,
+    /// and a consent grant becomes a governance fact both sides evaluate.
+    #[test]
+    fn a_joiner_admits_authors_stores_unreadable_content_and_records_consent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = profile(&tmp, "alice");
+        let bob = profile(&tmp, "bob");
+        let t = 1_700_000_000;
+
+        let mut a = ChannelState::create_with_profile(
+            &alice,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        let cid = a.channel_id();
+        let a_fp = RootSigner::public_key(alice.signer().unwrap()).fingerprint();
+        let b_fp = RootSigner::public_key(bob.signer().unwrap()).fingerprint();
+
+        // Bob joins with the genesis he fetched from the board. A genesis whose hash
+        // is not the channelID he joined with is refused (ADR-007).
+        assert!(matches!(
+            ChannelState::join_channel_with_profile(
+                &bob,
+                a.genesis(),
+                &[0xAB; 32],
+                "team",
+                b"channel-pp",
+                t,
+                Argon2Profile::REDUCED,
+            ),
+            Err(Error::MalformedGovernance(
+                "genesis hash is not the channelID joined with"
+            ))
+        ));
+        let mut b = ChannelState::join_channel_with_profile(
+            &bob,
+            a.genesis(),
+            &cid,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        // Joining admits the creator (from the verified genesis) and himself — and
+        // releases no sender keys.
+        assert!(b.is_author(&a_fp) && b.is_author(&b_fp));
+        assert_eq!(b.timeline().len(), 0);
+        // The same channel cannot be joined twice into one profile.
+        assert!(ChannelState::join_channel_with_profile(
+            &bob,
+            a.genesis(),
+            &cid,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .is_err());
+
+        // Alice has not yet admitted Bob: his entries are refused.
+        let bob_key = RootSigner::public_key(bob.signer().unwrap());
+        let alice_key = RootSigner::public_key(alice.signer().unwrap());
+        assert!(!a.is_author(&b_fp));
+        assert!(a.admit_author(&alice, &bob_key, t).unwrap());
+        assert!(
+            !a.admit_author(&alice, &bob_key, t).unwrap(),
+            "admission is idempotent"
+        );
+        assert!(a.is_author(&b_fp));
+
+        // Alice authors a message; the entry bytes reach Bob (sync is M14.6).
+        let rendered = a.append_text(&alice, "hello team", t).unwrap().clone();
+        let wire = {
+            let entry = a.dag.get_by_hash(&rendered.entry_hash).unwrap();
+            entry.to_wire()
+        };
+        let entry = Entry::from_wire(&wire).unwrap();
+        // Bob stores it, cannot read it, and it does not appear in his timeline —
+        // credentials released no keys (ADR-007 step 1).
+        assert_eq!(
+            b.accept_entry(&bob, entry, t).unwrap(),
+            Accepted::ContentNotReadable
+        );
+        assert_eq!(b.entry_count(), 1);
+        assert!(b.timeline().is_empty());
+        assert!(!b.may_read(&a_fp, &b_fp), "no consent yet");
+
+        // Alice consents to Bob: a real SKDM for her current position, then the
+        // grant on the log.
+        let (iteration, key) = a.sender.current_position();
+        let skdm = a
+            .sender
+            .skdm_for(alice.signer().unwrap(), iteration, key)
+            .unwrap();
+        let grant = a.issue_consent(&alice, b_fp, &skdm, t).unwrap();
+        assert_eq!(grant.body.target_id, b_fp);
+        assert!(
+            a.may_read(&a_fp, &b_fp),
+            "Alice's own view now has the grant"
+        );
+
+        // The grant crosses as a governance entry; Bob evaluates it and now knows
+        // Alice consented to him (he still needs the SKDM to actually read).
+        let grant_entry = {
+            let hash = a
+                .gov_entries
+                .last()
+                .expect("the grant was appended")
+                .entry_hash;
+            Entry::from_wire(&a.dag.get_by_hash(&hash).unwrap().to_wire()).unwrap()
+        };
+        assert_eq!(
+            b.accept_entry(&bob, grant_entry, t).unwrap(),
+            Accepted::Governance
+        );
+        assert!(b.may_read(&a_fp, &b_fp), "consent is on Bob's log too");
+        assert!(
+            !b.may_read(&b_fp, &a_fp),
+            "consent is per-sender, not mutual"
+        );
+
+        // A payload that is neither a group message nor a governance struct is
+        // refused rather than optimistically accepted as content.
+        assert!(classify_payload(b"not a vox payload").is_err());
+        assert_eq!(
+            classify_payload(&grant.to_wire()).unwrap(),
+            EntryKind::Governance
+        );
+
+        // Everything survives a reopen: admitted authors, the stored ciphertext
+        // entry, and the consent grant's effect.
+        drop(b);
+        let b = ChannelState::open(&bob, &cid, b"channel-pp", t).unwrap();
+        assert!(b.is_author(&a_fp) && b.is_author(&b_fp));
+        assert_eq!(b.entry_count(), 2);
+        assert!(b.timeline().is_empty());
+        assert!(b.may_read(&a_fp, &b_fp), "consent survived the reopen");
+        assert_eq!(a.author_keys().len(), 2);
+        assert_eq!(alice_key.fingerprint(), a_fp);
     }
 }

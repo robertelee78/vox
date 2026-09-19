@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.4 done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.5a done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -372,6 +372,17 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   yields two sessions that encrypt and decrypt both ways, a wrong passphrase is refused opaquely, an
   unknown peer's `sync` stream is reset with the coded rejection, and the whole join runs at **production
   (200,9)** PoW in 1.95 s (release, `#[ignore]`d in debug like the other real-parameter gates).
+- **Multi-author channel state and consent on the log (M14.5a).** `ChannelState` stops being
+  single-author: `join_channel` builds a joiner's state from the board's genesis (hash-checked against the
+  channelID), `admit_author` records a verified key as a log author in a sealed `SEG_AUTHORS` segment,
+  `accept_entry` takes a peer's entry through the ADR-008 predicate and classifies it by payload, and
+  `issue_consent` appends the ADR-007 consent grant as a governance entry that the evaluator folds in.
+  The load-bearing distinction is that admission grants *log authorship only*: an admitted author's
+  content entry is stored as ciphertext and never rendered, which is ADR-007's "credentials release no
+  keys" made structural rather than promised. `classify_payload` also gives ADR-008's `kind_for` the
+  discriminator it lacked (governance = struct-tagged frame, content = `vox/group-msg/v1` prefix,
+  anything else refused); wiring it into the sync resolver is M14.6. SKDM delivery — the half that makes
+  an admitted, consented author actually *readable* — is M14.5b.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
