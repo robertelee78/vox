@@ -136,8 +136,8 @@ real loopback QUIC, a real TCP-over-Vox tunnel, and a real `(200,9)` Equihash so
 the librustzcash verifier). What does **not** exist yet is the node runtime that composes those
 layers — join → transport → NAT → sync → governance — so `vox` currently runs as an *offline* client
 shell over an empty core and says so at startup; you cannot create, join, or chat in a channel over
-the network yet. That runtime is the next capability (a forthcoming ADR-016); the macOS client
-(ADR-014) follows it. Linux (as a TUI host) is supported now; iOS is a separate future capability.
+the network yet. That runtime is specified in [ADR-016](docs/adr/ADR-016-node-runtime.md) (proposed;
+milestones M13–M15); the macOS client (ADR-014) follows it. Linux (as a TUI host) is supported now; iOS is a separate future capability.
 
 ## Contributing
 
