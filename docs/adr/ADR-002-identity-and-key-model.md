@@ -174,6 +174,12 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   fails to compile if any getter regresses. *(2026-09-19 review: the key-agreement getters predated the
   ADR-010 secret-hygiene audit and returned bare `Copy` arrays; PQXDH re-wrapped them, the ratchet did
   not.)*
+- **Known gaps (recorded 2026-09-19).** No succession statement (§Lifecycle) exists in code; there is no
+  prekey-rotation cadence or retain-previous logic (`keyagreement` defers it to a higher layer, and no
+  higher layer does it yet); the only `RootSigner` backends are `SoftwareRootSigner` and the at-rest
+  `VaultRootSigner` — the gpg-agent/hardware backends are the documented seam. Test-vector
+  obligation: composite pubkey/sig layout is asserted structurally with a fixed-seed signer, but no
+  pinned known-answer bytes exist yet for the pubkey, signature, fingerprint, or binding statement.
 
 ## Links
 **Depends on**: ADR-001.

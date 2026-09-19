@@ -172,6 +172,14 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `Sek` posture: one owner, one wipe point. *(2026-09-19 secret-hygiene sweep.)* Both are pinned as
   non-`Clone` by an autoref-specialization check (`test_support::is_clone!`) with a positive control —
   replacing a test that compiled for any type and proved nothing.
+- **Known gaps (recorded 2026-09-19).** There is no persistence layer: no file I/O, segment map, or
+  database — `SekWrap`, `IdentityVault`, `SealedSegment` are codecs and mechanisms the node runtime
+  will drive. Only the SEK is `mlock`ed; derived factors, the KEK, the vault key and opened plaintext
+  are zeroizing but not pinned. The SEK never rotates and segment re-seals use random 96-bit nonces
+  with no nonce-count accounting (the 2^32 random-nonce GCM bound is not enforced). The
+  hardware-stored-secret identity factor, gpg-agent/smartcard signers and biometric-gated re-wrap are
+  trait seams only. TTL evaluation lives in governance policy; `retention` provides the prune
+  mechanism.
 
 ## Links
 **Depends on**: ADR-002, ADR-007, ADR-008.

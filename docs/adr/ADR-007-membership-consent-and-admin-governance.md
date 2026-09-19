@@ -182,8 +182,10 @@ reconciles** (ADR-008). The model is chosen so most actions never truly conflict
 - **Deterministic total tie-break (required for the bit-for-bit guarantee).** Causal order is partial,
   so two concurrent, causally-unordered entries (e.g. two delegations of different attenuations to the
   same key with no link between them) need a tie-break for all clients to converge identically. After
-  the removal-wins rule, the evaluator orders any remaining concurrent entries by **ascending entry
-  hash** (`SHA-256` of the canonical entry, ADR-008) and takes the last. This makes the evaluator a
+  the removal-wins rule, the evaluator orders any remaining concurrent entries by the **canonical
+  total order** (Kahn's algorithm over the causal relation, smallest ready entry hash first — in the
+  common case simply ascending entry hash, `SHA-256` of the canonical entry, ADR-008; see
+  Implementation notes) and takes the last. This makes the evaluator a
   total function of log state — the precondition for the golden-vector equality gate above.
 
 ### Enforcement honesty
@@ -238,6 +240,21 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   suite_present, min_suite?]`; the evaluator applies `min_suite` **raise-only** (see ADR-003
   Implementation notes). `ChannelPolicy::suite_floor()` yields the typed `SuiteFloor` handshakes take.
   *(2026-09-19; wire-format change, no channels shipped.)*
+- **Concurrent-conflict tie-break is the canonical order, not a literal hash sort.** Among the
+  causally-maximal concurrent delegations of a delegate, the governing one is the **last in the
+  canonical total order** — Kahn's algorithm over the causal relation, always emitting the
+  smallest-hash ready entry (`Causality::build`). That equals "ascending entry hash" when the
+  candidates become ready together and can differ when their predecessors differ; both rules are
+  deterministic, and the canonical order is **normative** (an independent implementation must
+  reproduce `Causality::build`'s order to agree bit-for-bit). *(Recorded 2026-09-19 to reconcile the
+  Decision text above with the code; the golden vectors pin the code's rule.)*
+- **Known gaps (recorded 2026-09-19).** Role-tag ABAC (`#ops` may `dial:` `#ssh-hosts`) is not
+  evaluated anywhere — `Capability::Role` exists, `is_at_or_below` is exact-match, and `tunnel/authz`
+  checks only `bind:`/`dial:` tags; `Invite` has no wire encoding or signature yet; any `delegate`-holder
+  may revoke any delegation (not lineage-restricted — the Decision does not say which capability
+  authorizes revocation); `history_mode_at_grant` and `new_chain_id` are recorded but never validated by
+  the evaluator; the golden-vector suite is in-process Rust assertions, not language-neutral fixtures
+  with pinned bytes (the "two independent implementations" gate needs the latter).
 
 ## Links
 **Depends on**: ADR-002, ADR-005, ADR-006, ADR-008.

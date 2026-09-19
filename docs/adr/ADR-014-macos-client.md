@@ -1,13 +1,15 @@
 # ADR-014: macOS Client
 
-**Status**: proposed
+**Status**: proposed — not started (the Rust TUI client, ADR-015, landed first as the initial client surface)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — wording reconciled: the TUI is the first client; this ADR is the first *native GUI* surface.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: client, macos, ux, verification, consent-ui, architecture
 
 ## Context
 
-The macOS client is the first surface over the Rust core and the primary real-world use (the
+The macOS client is the first *native GUI* surface over the Rust core (the Rust TUI client, ADR-015,
+is the first client surface overall) and the primary real-world use (the
 author and his wife, across devices; macOS first, with an Apple developer account). Its job is to
 make Vox's novel trust model usable: per-sender consent (ADR-007), member/key verification
 (ADR-002), channel join (ADR-005), the replicated log (ADR-008), at-rest protection (ADR-010), and

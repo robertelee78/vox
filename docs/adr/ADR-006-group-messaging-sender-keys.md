@@ -1,7 +1,8 @@
 # ADR-006: Group Messaging — Sender Keys
 
-**Status**: proposed
+**Status**: implemented (M4, `crates/vox-core/src/group/`)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — status reconciled; Implementation notes (M4) added.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: group-messaging, sender-keys, channel, pq-kem
 
@@ -94,6 +95,33 @@ key rotation and passphrase-epoch rotation (ADR-007), not on ratchet self-healin
 ### Neutral
 - MLS/TreeKEM remains a possible future option for channels that prioritize group-PCS over
   per-sender partial visibility, but is not adopted now.
+
+## Implementation notes (M4)
+
+These record the concrete decisions made building this ADR (`crates/vox-core/src/group/`), so the spec and code stay in lockstep:
+
+- **SKDM (tag `0x0002`, `vox/skdm/v1`)** is the canonical body `[cid, epoch, author_id, chain_id,
+  iteration, chain_key, signing_pubkey, [0x0304, 0x0401]]`, root-signed, and delivered **inside the
+  ADR-004 pairwise session** (`Skdm::seal_into` / `open_from`) — no per-SKDM KEM, exactly the
+  §"Post-quantum distribution" rule. `ReceiverChain::from_skdm` re-verifies the `(channelID, epoch)`
+  binding and `author_id == root.fingerprint()` before deriving any state.
+- **Chain KDF and message AEAD.** `mk = HMAC(CK, 0x01)`, `CK' = HMAC(CK, 0x02)`; the message header is
+  bound as AEAD associated data (`vox/group-msg-ad/v1 ‖ cbor[cid, epoch, author_id, chain_id,
+  iteration]`) and the ciphertext is Sender-Key-signed under `vox/group-msg/v1`; the AEAD nonce is
+  `HMAC(mk, 0x03 ‖ header)[..12]` (defence in depth against key reuse under a different header). The
+  receiver plans its ratchet advance in temporaries and commits only after the AEAD + signature pass;
+  a consumed key is deleted (replay fails). Out-of-order window `MAX_SKIP = 1000` / cache 2000, shared
+  with ADR-004.
+- **Rotation bounds** `ROTATE_AFTER_MESSAGES = 1000`, `ROTATE_AFTER_SECS = 7 d` are exposed as
+  `SenderChain::should_rotate` for the governing layer to poll.
+- **Known gaps (recorded 2026-09-19).** (1) The ADR-002 §3 cross-signature requirement is met by the
+  root signature over the whole SKDM body; the separate `SenderKeyCrossSig` / `sender_key_binding_input`
+  mechanism exists but is not wired anywhere — two mechanisms for one requirement, one dead (candidate
+  for removal). (2) Rotation is advisory: `SenderChain::encrypt` never refuses past the bound, and
+  because `OriginKeyStore::derive_at` caps history release at `iteration ≤ MAX_SKIP = ROTATE_AFTER_MESSAGES`,
+  an un-rotated chain past 1000 messages cannot release history at its head — the node runtime must
+  enforce rotation. (3) `GroupMessage::to_wire` reuses the *signing* label as its wire prefix rather
+  than a struct-tag frame (safe — different arity — but inconsistent with the SKDM rule).
 
 ## Links
 **Depends on**: ADR-003, ADR-004.

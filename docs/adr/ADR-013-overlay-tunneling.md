@@ -1,7 +1,8 @@
 # ADR-013: Overlay Tunneling (TCP-over-Vox)
 
-**Status**: proposed
+**Status**: implemented (M11, `crates/vox-core/src/tunnel/`) — library only; no CLI surface yet (see Known gaps)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — status reconciled; Known gaps recorded.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: tunneling, tcp, ssh, tun, socks, authorization, zero-trust
 
@@ -161,6 +162,16 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
 - **Identity-derived addressing** (`tunnel::addr`): `0xFD ‖ high-120-bits(SHA-256("vox/ula/v1" ‖ composite_pubkey))`, self-certifying and `verify_addr`-able; an address grants no reachability.
 
 **Scope decision — the TUN/VPN datapath is deferred to the client (ADR-014), not built in `vox-core`.** ADR-013 marks the TUN model *optional*; its datapath needs a privileged helper / `NetworkExtension` and a userspace TCP stack (`smoltcp`), which are platform-client concerns (the ADR ties TUN to ADR-014). `vox-core` therefore ships the **primary** per-stream SOCKS/port-forward model complete (the `ssh`-over-Vox path) plus the identity-derived addressing the TUN model will consume. This is a layering decision, not a false deferral: the per-service authorization, advertisement, addressing, and data-path are all complete and tested; only the OS interface binding (a client surface) is out of `vox-core` scope. `tun`/`utun` + `smoltcp` land with ADR-014.
+
+- **Known gaps (recorded 2026-09-19).** No `vox service add` / `vox forward` / `vox up` CLI exists (no
+  CLI crate; the TUI's only "up" is navigation). Tunnel session establishment is not recorded as signed
+  events (the "accountability" line above has no entry type). The SSH CA is a bare Ed25519 seed with
+  no binding to the ADR-007 capability tree, `verify_user_cert` ignores extensions/critical options,
+  and the capability rides in an extension rather than a critical option. SOCKS is a codec only — no
+  listener composes negotiate → CONNECT → service map → `session::dial` → reply, and `Reply::NotAllowed`
+  is never emitted. Only the pairwise service-advertisement delivery exists (the SKDM-style
+  audience-encrypted entry does not). The TUN/VPN datapath is deferred to ADR-014 as the Decision
+  says. Consumers of this module are the in-crate tests and `examples/spike_tunnel.rs` only.
 
 ## Links
 **Depends on**: ADR-002, ADR-007, ADR-011, ADR-012.

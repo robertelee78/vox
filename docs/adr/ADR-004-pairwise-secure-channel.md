@@ -51,7 +51,8 @@ by its bandwidth cost (ADR-003).
   rather than forcing unbounded computation (DoS guard). This is the standard Double Ratchet
   skipped-key store, made explicitly bounded. **Normative defaults** (channel-policy-tunable within
   required bounds): `MAX_SKIP` = 1000 keys per chain; total skipped-key cache = 2000 keys per session;
-  skipped-key expiry = 7 days. A gap larger than `MAX_SKIP` forces a new ratchet step, not unbounded
+  skipped-key expiry = 7 days. A message whose counter gap exceeds `MAX_SKIP` is **rejected** (the
+  sender must ratchet before the receiver will accept it), never unbounded
   derivation.
 - **Replay protection:** a `(ratchet_pubkey, N)` pair already consumed is rejected; message keys are
   deleted after use so a replay cannot re-derive plaintext.

@@ -1,7 +1,8 @@
 # ADR-015: Rust TUI Client
 
-**Status**: proposed
+**Status**: implemented (M12, `crates/vox-tui/`) — offline client shell; the live core is the ADR-016 seam
 **Date**: 2026-06-20
+**Updated**: 2026-09-19 — status reconciled; test count corrected; Known gaps recorded.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: client, tui, rust, terminal, ratatui, verification, consent-ui
 
@@ -241,7 +242,23 @@ Built as `crates/vox-tui` — a `vox_tui` library (all testable logic) + the `vo
 
 **Honest scope — the live-core runtime is the documented integration seam, exercised by the post-M12 manual-spike phase.** M12 ships the complete, tested client *structure*: the security-critical verification, the typed boundary, the navigation/consent state machine, QR, the ratatui view, and a terminal-correct event loop — all behind a `CoreHandle` trait. Binding that to a **running** embedded `vox-core` node (identity-vault unlock, channel create/join, log append + render-gate, sync producing `ViewModel`s and consuming `Command`s) is the `CoreHandle` contract; the shipped `OfflineCore` binding renders honestly and records commands **without fabricating** channels, messages, or trust state (it explicitly says "not connected" rather than faking delivery). This is a layering boundary, not a stub: nothing here pretends to work that doesn't. Wiring a live `CoreHandle` and proving it end-to-end against real peers is precisely the manual end-to-end verification the project runs after M12 (green unit tests ≠ verified-working). The TUN datapath (ADR-013/ADR-014, privileged helper + smoltcp) and desktop OS notifications (`notify-rust`; the dep-free OSC 9 / bell path is the SSH fallback) are likewise client-surface items folded into that phase.
 
-657 workspace tests pass (621 core + 36 tui); fmt/clippy(`-D warnings`)/doc all clean; the `vox` binary builds.
+686 workspace tests pass (642 core + 3 integration + 41 tui, 1 `#[ignore]`d real-parameter PoW test that CI runs in release); fmt/clippy(`-D warnings`)/doc all clean; the `vox` binary builds.
+
+- **Known gaps (recorded 2026-09-19).** The runtime the Decision specifies — a multi-threaded tokio
+  runtime, a blocking crossterm task, `CancellationToken`, `watch<ViewModel>` / `mpsc<Event>` /
+  `mpsc<Command>` — does not exist: `app::event_loop` is a single-threaded blocking `event::poll` loop,
+  `viewmodel::Event` is defined but never produced or consumed, and `tokio`, `tui-textarea` and
+  `zeroize` are declared-but-unused dependencies. `cli::run` always binds `OfflineCore` (the only
+  `CoreHandle`); the TUI calls into `vox_core` only for `cbor`, `error`, `hash` and
+  `identity::composite` — nothing from join/group/log/transport/nat/tunnel/atrest/governance. The
+  composer is a static placeholder (typed characters are dropped; `:send <text>` is the only send
+  path); `Command::CreateChannel`/`Join` are never constructed by any UI path; `verify::` and `qr::`
+  are never called from app code and the safety code is never rendered. Release gates unmet: the
+  primary-buffer non-leak assertion, lock/zeroize tests, tokio shutdown/backpressure tests, the
+  terminal-compatibility matrix, and the ADR-014 parity tests; the QR "round-trip" test compares
+  dimensions only. Unimplemented surface: identity generation/import/vault, backup, create/join
+  onboarding with masked passphrase, invite QR, XDG dirs, keybinding config, idle/SIGHUP lock,
+  multiplexer warning, `NO_COLOR`, notifications, tunneling subcommands, file send, `--accessible`.
 
 ## Links
 **Depends on**: ADR-002, ADR-004, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009, ADR-010, ADR-011, ADR-012, ADR-013.

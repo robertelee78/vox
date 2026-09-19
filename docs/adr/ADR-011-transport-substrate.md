@@ -130,6 +130,16 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   only by caller discipline — a byte-exact replay reached the application, proven over real loopback
   QUIC and now pinned by a test.)* The raw `quinn()` accessor still exists for advanced callers (M11)
   and bypasses this layer by construction; any such use must apply the same rule.
+- **Known gaps (recorded 2026-09-19).** `confirm_hybrid_group` checks only ALPN `vox/1`, and
+  `SessionEstablishment::new` **hardcodes** the group code point `0x11EC`, so the "downgrade
+  auditability" record documents a constant rather than an observation — the real guarantee is
+  `assert_pq_only` on both providers plus TLS transcript binding, which is sound but should be what
+  the record reports. All connect/accept failures collapse to `SignatureInvalid` (unreachable vs
+  handshake vs identity are indistinguishable to callers). The identity-extension OID uses the
+  placeholder PEN `1234567`. `VoxEndpoint::accept*` returns `Err` on a single failed handshake, so a
+  server loop must catch-and-continue. Gate obligation: the cross-version interop matrix
+  (handshake + identity-PoP) does not exist — no second implementation, no version-pinned matrix, no
+  CI job; the PoP is over the raw subject-public-key bits (not SPKI DER), which such a matrix must pin.
 
 ## Links
 **Depends on**: ADR-002, ADR-004, ADR-008.
