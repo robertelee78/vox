@@ -219,6 +219,25 @@ cross-process checks.
 - The relay data plane, a DHT, iOS, and the macOS GUI (ADR-014) remain distinct capabilities; M15's
   anchor is the "always-on box" ADR-014 assumes.
 
+## Implementation notes (M13)
+
+These record the concrete decisions made building this ADR (`crates/vox-core/src/node/`), so the spec and code stay in lockstep:
+
+- **Paths (`node::paths`, M13.1).** `Paths::resolve(profile, data_override, config_override)` applies
+  the ADR-015 precedence (explicit > `VOX_DATA_DIR`/`VOX_CONFIG_DIR` > `XDG_*` > platform default,
+  macOS `~/Library/Application Support/vox`, Linux `~/.local/share/vox` + `~/.config/vox`), creates
+  `<data>/vox/<profile>/` and the config dir `0700`, and rejects a profile name that is not a single
+  path component. `write_private_file` is temp-file + rename with `0600`; the store file the engine
+  creates is set `0600` after creation. Modes are enforced on Unix (the ADR-015 client scope); on other
+  platforms the calls are no-ops, stated in the docs.
+- **Store (`node::store`, M13.1).** `redb` tables `segments (channel_id, kind_code, id) → SealedSegment
+  bytes`, `sek_wraps channel_id → SekWrap bytes`, `meta` (schema version, checked on open; a newer or
+  garbage file is `Error::Storage`, never a panic). The write API accepts only `&SealedSegment` and
+  `&SekWrap` — the store cannot be handed plaintext or a raw key. `Batch` wraps one write
+  transaction so a log append and its chain-state advance commit together; a dropped batch writes
+  nothing (tested). Kind codes `LogDb=1, PlaintextCache=2, Index=3, KeyMaterial=4` are part of the
+  on-disk key and never reordered. `compact()` is the explicit space-reclamation call.
+
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
 ADR-013, ADR-015.

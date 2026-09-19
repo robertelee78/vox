@@ -252,4 +252,28 @@ pub enum Error {
     /// bound, or carried an out-of-domain value (ADR-013). Carries a static reason.
     #[error("malformed tunnel artifact: {0}")]
     MalformedTunnel(&'static str),
+
+    /// The node's persistent store (ADR-016) failed an operation: opening or
+    /// creating the file, a transaction, or a table access. `op` is a static
+    /// description of what was attempted; `detail` carries the engine's message
+    /// (never key material — the store only ever holds sealed artifacts).
+    #[error("store {op}: {detail}")]
+    Storage {
+        /// What was being attempted.
+        op: &'static str,
+        /// The underlying engine/OS message.
+        detail: String,
+    },
+
+    /// A profile/store path could not be resolved or prepared (ADR-016 §Layout):
+    /// no home directory, a directory that could not be created with the required
+    /// mode, or an I/O failure on the vault file. Carries a static reason plus the
+    /// OS message.
+    #[error("profile path {op}: {detail}")]
+    Path {
+        /// What was being attempted.
+        op: &'static str,
+        /// The underlying OS message.
+        detail: String,
+    },
 }
