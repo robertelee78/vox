@@ -1,7 +1,8 @@
 # ADR-007: Membership, Per-Sender Consent, and Admin Governance
 
-**Status**: proposed
+**Status**: implemented (M6, `crates/vox-core/src/governance/`)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin".
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: consent, membership, admin, governance, revocation, capabilities, differentiator
 
@@ -211,6 +212,24 @@ accepted, documented property of the threat model — not a defect to paper over
 ### Neutral
 - All governance state is ordinary signed log content (ADR-008); deniable channels (ADR-009) change
   message-content signing but not the governance plane, which stays attributable.
+
+## Implementation notes (M6)
+
+These record the concrete decisions made building this ADR (`crates/vox-core/src/governance/`), so the spec and code stay in lockstep:
+
+- **Denied verdicts name the reason.** `Evaluator::grants` returns `Verdict::Denied(DenyReason)` where
+  the reason is classified by the resolver, not inferred after the fact: for a key with no effective
+  authority, every in-scope delegation naming it is classified — killed by an authorized revocation
+  (removal-wins) → `Revoked`; past `expiry` at `now_secs` → `Expired`; issuer holds a chain but the
+  granted set is not within it → `OverAttenuated`; issuer holds no chain, or the cert is bound to an
+  epoch not in force → `NotAdmin` — and the highest-priority reason wins
+  (`Revoked` > `Expired` > `OverAttenuated` > `NotAdmin`; a deliberate removal outranks a passive lapse,
+  which outranks a void cert). A key never named as a delegate is plain `NotAdmin`; a key with a
+  chain that lacks the queried capability is `CapabilityNotHeld`. The golden-vector suite pins the
+  exact reason for the over-attenuation, expiry and revoked-link vectors and for the priority rule.
+  *(2026-09-19 review: `Expired`/`Revoked`/`OverAttenuated` were declared but never emitted —
+  everything collapsed to `NotAdmin`, contradicting the "golden vectors can pin the exact reason"
+  intent.)*
 
 ## Links
 **Depends on**: ADR-002, ADR-005, ADR-006, ADR-008.

@@ -103,7 +103,15 @@ impl Verdict {
 
 /// Why an authority query was denied — a closed, machine-stable set so golden
 /// vectors can pin the exact reason, not just "denied".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// For a key with no effective authority, the resolver classifies **every**
+/// in-scope delegation to that key (revoked / expired / over-attenuated /
+/// chain-less or out-of-epoch) and reports the highest-priority reason:
+/// `Revoked` > `Expired` > `OverAttenuated` > `NotAdmin` — a deliberate removal
+/// outranks a passive lapse, which outranks a void cert, which outranks having
+/// no chain at all. Deterministic, so vectors can pin it. *(2026-09-19 review:
+/// every such case previously collapsed to `NotAdmin`.)*
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum DenyReason {
     /// The key holds no valid authority chain to genesis at all.
@@ -135,6 +143,10 @@ pub struct Evaluator {
     /// non-admins are absent). Computed with attenuation + expiry + revocation +
     /// tie-break already applied.
     authority: BTreeMap<Digest32, CapabilitySet>,
+    /// For each identity that was named as a delegate but holds no effective
+    /// authority, the classified reason (see [`DenyReason`]). Identities never
+    /// named are simply absent (plain `NotAdmin`).
+    denied: BTreeMap<Digest32, DenyReason>,
     /// The effective channel policy after applying policy-updates over genesis.
     policy: ChannelPolicy,
     /// The current channel-global epoch after applying authorized passphrase
@@ -203,6 +215,7 @@ impl Evaluator {
         let mut resolver = Resolver::new(root_admin, &causality, now_secs);
         let head = resolver.head()?;
         let authority = head.authority;
+        let denied = head.denied;
         let current_epoch = head.epoch;
         let policy = resolver.resolve_policy(genesis)?;
         let consent = resolver.resolve_consent()?;
@@ -211,6 +224,7 @@ impl Evaluator {
             channel_id,
             root_admin,
             authority,
+            denied,
             policy,
             current_epoch,
             consent,
@@ -277,7 +291,12 @@ impl Evaluator {
     #[must_use]
     pub fn grants(&self, key: &Digest32, cap: &Capability) -> Verdict {
         match self.authority.get(key) {
-            None => Verdict::Denied(DenyReason::NotAdmin),
+            None => Verdict::Denied(
+                self.denied
+                    .get(key)
+                    .copied()
+                    .unwrap_or(DenyReason::NotAdmin),
+            ),
             Some(set) => {
                 if set.grants(cap) {
                     // The governing capability is `admin` if held (it implies all),
@@ -322,10 +341,12 @@ impl Evaluator {
     }
 }
 
-/// Resolved authority + established epoch over some causal scope.
+/// Resolved authority + established epoch over some causal scope, plus the
+/// classified reason for every named delegate that ended up with no authority.
 #[derive(Clone)]
 struct Resolved {
     authority: BTreeMap<Digest32, CapabilitySet>,
+    denied: BTreeMap<Digest32, DenyReason>,
     epoch: u64,
 }
 
@@ -484,7 +505,12 @@ impl<'a> Resolver<'a> {
         // Pre-compute, per in-effect delegation in scope, whether its issuer holds
         // a superset in the delegation's strict past (chain-to-genesis is already
         // baked into that recursive authority).
+        // Alongside, classify why a delegation does NOT confer authority, so a
+        // denied query can name the reason. Per delegation the checks are ranked
+        // Revoked > Expired > OverAttenuated > NotAdmin (an out-of-epoch cert or
+        // one whose issuer holds no chain at all is "no valid chain").
         let mut issuer_ok: BTreeMap<Digest32, bool> = BTreeMap::new();
+        let mut reason_for: BTreeMap<Digest32, DenyReason> = BTreeMap::new();
         for e in &self.causality.order {
             if !scope.contains(&e.entry_hash) {
                 continue;
@@ -498,11 +524,30 @@ impl<'a> Resolver<'a> {
             // The issuer must hold a superset of the granted set in this
             // delegation's strict past (chain-to-genesis + monotonic attenuation),
             // and the cert must be unexpired and bound to the in-force epoch.
-            let issuer_superset = before
-                .authority
-                .get(&c.body.issuer_id)
-                .is_some_and(|ic| c.body.capability_set.is_within(ic));
+            let issuer_authority = before.authority.get(&c.body.issuer_id);
+            let issuer_superset =
+                issuer_authority.is_some_and(|ic| c.body.capability_set.is_within(ic));
             issuer_ok.insert(e.entry_hash, unexpired && in_effect && issuer_superset);
+
+            // Removal-wins: killed iff some authorized revocation of this delegate's
+            // lineage is NOT causally-before this delegation (concurrent or after).
+            // Evaluated for every delegation (not only structurally valid ones) so
+            // a revoked-and-expired cert still classifies as Revoked.
+            let delegate = c.body.delegate_id();
+            let killed = authorized_revs.iter().any(|(r, target)| {
+                *target == delegate && !self.causality.happens_after(&e.entry_hash, &r.entry_hash)
+            });
+            let reason = if killed {
+                DenyReason::Revoked
+            } else if !unexpired {
+                DenyReason::Expired
+            } else if in_effect && issuer_authority.is_some() && !issuer_superset {
+                DenyReason::OverAttenuated
+            } else {
+                DenyReason::NotAdmin
+            };
+            let slot = reason_for.entry(delegate).or_insert(reason);
+            *slot = (*slot).max(reason);
         }
 
         let mut authority: BTreeMap<Digest32, CapabilitySet> = BTreeMap::new();
@@ -519,8 +564,6 @@ impl<'a> Resolver<'a> {
             if !issuer_ok.get(&e.entry_hash).copied().unwrap_or(false) {
                 continue;
             }
-            // Removal-wins: killed iff some authorized revocation of this delegate's
-            // lineage is NOT causally-before this delegation (concurrent or after).
             let delegate = c.body.delegate_id();
             let killed = authorized_revs.iter().any(|(r, target)| {
                 *target == delegate && !self.causality.happens_after(&e.entry_hash, &r.entry_hash)
@@ -555,7 +598,18 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        Ok(Resolved { authority, epoch })
+        // A named delegate with no effective authority keeps its classified
+        // reason; one that ended up authorized (or is the genesis root) needs none.
+        let denied: BTreeMap<Digest32, DenyReason> = reason_for
+            .into_iter()
+            .filter(|(d, _)| !authority.contains_key(d))
+            .collect();
+
+        Ok(Resolved {
+            authority,
+            denied,
+            epoch,
+        })
     }
 
     /// Resolve the effective channel policy: fold in-effect policy-updates whose

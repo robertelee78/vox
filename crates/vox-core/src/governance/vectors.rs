@@ -485,11 +485,13 @@ mod golden {
         )
         .unwrap();
         assert!(eval.is_admin(&a.fingerprint()));
-        // B's chain is void → not an admin.
+        // B's chain is void → not an admin, and the verdict names WHY: the only
+        // delegation to B over-attenuated (ADR-007 golden-vector suite pins the
+        // exact reason; 2026-09-19 review — this used to collapse to NotAdmin).
         assert!(!eval.is_admin(&b.fingerprint()));
         assert_eq!(
             eval.grants(&b.fingerprint(), &Capability::Policy),
-            Verdict::Denied(DenyReason::NotAdmin)
+            Verdict::Denied(DenyReason::OverAttenuated)
         );
     }
 
@@ -534,7 +536,7 @@ mod golden {
         assert!(!after.is_admin(&a.fingerprint()));
         assert_eq!(
             after.grants(&a.fingerprint(), &Capability::Invite),
-            Verdict::Denied(DenyReason::NotAdmin)
+            Verdict::Denied(DenyReason::Expired)
         );
     }
 
@@ -569,6 +571,61 @@ mod golden {
         )
         .unwrap();
         assert!(!eval.is_admin(&a.fingerprint()));
+        assert_eq!(
+            eval.grants(&a.fingerprint(), &Capability::Invite),
+            Verdict::Denied(DenyReason::Revoked)
+        );
+    }
+
+    #[test]
+    fn vector_deny_reason_priority_revoked_over_expired() {
+        // A held two delegations: one that expired, one that was revoked. Both
+        // are gone; the verdict names the deliberate removal (Revoked) over the
+        // passive lapse (Expired): Revoked > Expired > OverAttenuated > NotAdmin.
+        let creator = root(1, 1);
+        let a = root(2, 2);
+        let genesis = genesis_for(&creator);
+        let cid = genesis.channel_id();
+
+        let mut h = LogBuilder::new(&genesis);
+        h.admin_cert(
+            &creator,
+            &cid,
+            0,
+            &a,
+            CapabilitySet::from_iter_caps([Capability::Invite]),
+            1_500,
+        );
+        let deleg = h.admin_cert(
+            &creator,
+            &cid,
+            0,
+            &a,
+            CapabilitySet::from_iter_caps([Capability::Invite]),
+            0,
+        );
+        let mut preds = BTreeSet::new();
+        preds.insert(deleg);
+        h.admin_revocation(&creator, &cid, 0, deleg, preds);
+
+        let eval = Evaluator::build(
+            &genesis,
+            &h.entries(),
+            2_000,
+            key_resolver(vec![&creator, &a]),
+        )
+        .unwrap();
+        assert!(!eval.is_admin(&a.fingerprint()));
+        assert_eq!(
+            eval.grants(&a.fingerprint(), &Capability::Invite),
+            Verdict::Denied(DenyReason::Revoked)
+        );
+        // A stranger with no delegation at all is still plain NotAdmin.
+        let stranger = root(7, 7);
+        assert_eq!(
+            eval.grants(&stranger.fingerprint(), &Capability::Invite),
+            Verdict::Denied(DenyReason::NotAdmin)
+        );
     }
 
     #[test]
