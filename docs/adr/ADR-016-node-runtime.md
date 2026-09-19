@@ -1,7 +1,8 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: proposed
+**Status**: accepted (2026-09-19) — implementation in progress: M13 single-device node
 **Date**: 2026-09-19
+**Updated**: 2026-09-19 — accepted by the decider; M13 started.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: runtime, node, integration, persistence, rendezvous, sync, headless
 
