@@ -29,13 +29,12 @@
 //! join costs about `max(1, 2^d / 2)` **base solves** ([`Difficulty::expected_solves`]).
 //! The base solve is the memory-hard unit of cost; the filter tunes it *upward*.
 //! Measured on 2026-09-19 (release build, Apple-silicon laptop core, the
-//! `spike_pow` example): a `(200,9)` base solve with this crate's Wagner solver is
-//! **≈ 7.5 s and 1.65 GB peak RSS**, 2.0 solutions/nonce. That is already above
-//! ADR-005's *target* of ≈ 1–2 s on a mobile CPU — the gap is the solver's memory
-//! layout (a tromp-class bucket-sorted design runs the same algorithm in ≈ 144 MB
-//! and well under a second per nonce), not the language; closing it is the next
-//! PoW milestone (ADR-005 Implementation notes). The defaults below are therefore
-//! expressed in base-solve multiples:
+//! `spike_pow` example): a `(200,9)` base solve with this crate's bucket-sorted
+//! Wagner solver ([`wagner`]) is **≈ 1.1 s and 245 MB peak RSS**, ≈ 2.5
+//! solutions/nonce — inside ADR-005's ≈ 1–2 s target on a desktop-class core
+//! (the earlier parent-pointer layout took 7.5 s and 1.65 GB; the fix was the
+//! memory layout, not the language). The mobile figure is measured when a mobile
+//! client exists. The defaults below are expressed in base-solve multiples:
 //! - [`Difficulty::DEFAULT_INVITE`] (1 bit, ≈ 1 solve): identity-bound / invite
 //!   channels — the smallest *non-zero* filter, so a leaked channelID still costs a
 //!   full memory-hard solve per attempt.
@@ -588,11 +587,12 @@ mod tests {
         assert!(start.elapsed().as_millis() < 500, "verify too slow");
     }
 
-    /// The real (200,9) solve path EXISTS and is correct, but is slow with the
-    /// pure-Rust Wagner solver, so it is ignored by default. Run with
-    /// `cargo test -- --ignored` (allow several minutes / GBs of RAM).
+    /// The real (200,9) solve → librustzcash verify round-trip. Ignored in the
+    /// default (debug) suite because an unoptimized solve takes ≈ 25 s; CI runs
+    /// it in release (≈ 1 s, 245 MB) as the production-parameter gate:
+    /// `cargo test --release -p vox-core --lib real_200_9 -- --ignored`.
     #[test]
-    #[ignore = "real (200,9) Wagner solve is memory-hard and slow; on-demand only"]
+    #[ignore = "real (200,9) solve: ≈1 s in release but ≈25 s in debug and 245 MB; CI runs it in release, see ci.yml"]
     fn real_200_9_solve_then_verify() {
         let params = PowParams::DEFAULT;
         let rn = ResponderNonce::generate(&[1; 32], 1, Difficulty::ZERO).unwrap();

@@ -32,3 +32,8 @@ jobs:
         run: cargo test --workspace
       - name: Docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+      # Production-parameter PoW gate (ADR-005): a real (200,9) Equihash solve
+      # cross-checked by the librustzcash verifier. Ignored in the debug suite
+      # (≈25 s unoptimized) and run here in release (≈1 s, 245 MB).
+      - name: Real-parameter PoW solve→verify (release)
+        run: cargo test --release -p vox-core --lib real_200_9_solve_then_verify -- --ignored

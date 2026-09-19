@@ -2,7 +2,7 @@
 
 **Status**: implemented (M3, `crates/vox-core/src/join/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — KDF error paths (`K_pop`, rendezvous) now surface as errors instead of an all-zero key; `K_pop` returned zeroizing. C++ solver carve-out rejected (Rust only); PoW cost measured; difficulty defaults, cap and load-adaptation policy added; tromp-class pure-Rust solver is the next PoW milestone.
+**Updated**: 2026-09-19 — KDF error paths (`K_pop`, rendezvous) now surface as errors instead of an all-zero key; `K_pop` returned zeroizing. C++ solver carve-out rejected (Rust only); difficulty defaults, cap and load-adaptation policy added; solver rewritten with a bucket-sorted flat layout — (200,9) measured 1.1 s / 245 MB (was 7.5 s / 1.65 GB), target met.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: channel, addressing, pake, cpace, rendezvous, join
 
@@ -107,12 +107,16 @@ caps (ADR-012), not by join PoW.
   performance gap is an algorithm/implementation problem to be solved in Rust, never grounds for a
   non-Rust exception.
 - **Measured cost (2026-09-19, `examples/spike_pow.rs`, release build, Apple-silicon laptop core).**
-  Pure-Rust Wagner at the real `(200,9)`: **≈ 7.5 s per nonce, 1.65 GB peak RSS, 2.0 solutions per
-  nonce**. Reduced CI parameters `(48,5)`: sub-millisecond; `(96,5)`: 0.09 s. (`(144,5)` was also
-  measured — 115 s and 10 GB — and is not a candidate.) The ≈ 1–2 s mobile-join target above is therefore
-  **not met today**: the base solve alone is 4–8× over it on a desktop-class core before any
-  difficulty filter. The target stands; the gap is closed by the solver milestone below, not by
-  weakening `(n,k)`.
+  The bucket-sorted pure-Rust Wagner solver at the real `(200,9)`: **≈ 1.1 s per nonce, 245 MB peak
+  RSS, ≈ 2.5 solutions per nonce** — inside the ≈ 1–2 s target on a desktop-class core. The previous
+  parent-pointer layout measured 7.5 s / 1.65 GB / 2.0 on the same machine the same day; the 6.6×
+  speed-up and 6.7× memory reduction came entirely from the layout (below), confirming the gap was
+  never the language. Reduced CI parameters `(48,5)`: sub-millisecond; `(96,5)`: ≈ 0.1 s.
+  (`(144,5)` was also measured with the old layout — 115 s and 10 GB — and is not a candidate.)
+  The **mobile** figure the target names is measured when a mobile client exists (ADR-014 is macOS;
+  iOS is a separate capability); on current phone cores a 1.1 s laptop solve is expected to land
+  in the 2–4 s range, which the difficulty policy below can absorb by keeping invite channels at
+  1 bit.
 - **Difficulty is calibrated in base-solve multiples, not seconds.** A `(200,9)` solve yields ≈ 2
   solutions per nonce and a `d`-bit filter passes each with probability `2^-d`, so a join costs
   `max(1, 2^d / 2)` base solves (`Difficulty::expected_solves`). Defaults (`join::pow::Difficulty`):
@@ -120,23 +124,28 @@ caps (ADR-012), not by join PoW.
   costs a full memory-hard solve per attempt), `DEFAULT_OPEN` = 2 bits (≈ 2 solves), and the
   accessibility cap `MAX` = 8 bits (≈ 128 solves) — a joiner **refuses** a challenge above the cap
   before grinding (`join_initiate`), which also bounds the work an attacker-signed challenge can
-  extract. `ZERO` remains explicit LAN/closed mode. Once the solver milestone lands, the same bit
-  values map onto the wall-clock targets (1 solve ≈ 0.5–1 s ⇒ invite ≈ 0.5–1 s, open ≈ 1–2 s).
+  extract. `ZERO` remains explicit LAN/closed mode. With the measured ≈ 1.1 s base solve the bit
+  values map onto wall-clock cost as invite ≈ 1 s and open ≈ 2 s on a desktop-class core.
 - **Load adaptation is a pure function.** `Difficulty::adapted_for_load(pending_joins)` adds one bit
   per doubling of the pending-join queue at or above a small threshold (4) and saturates at `MAX`;
   it is monotone in load and falls back as the queue drains, so a responder node calls it with its
   live queue depth each time it mints a signed challenge. The node runtime that supplies the queue
   depth is the integration milestone (no such runtime exists yet); the policy itself is complete.
-- **Next PoW milestone — a tromp-class pure-Rust `(200,9)` solver.** The present solver stores
-  parent-pointer nodes and hard-caps each round's list, which is why it needs 1.65 GB and ≈ 7.5 s.
-  The reference design (tromp's `equi_miner`) runs the *same* Wagner algorithm in ≈ 144 MB and well
-  under a second per nonce on a modern core by (i) bucket-sorting each round's list by the round's
-  collision prefix into fixed-capacity buckets, (ii) storing each entry as a compact 32-bit slot that
-  packs the surviving hash bits with the two parent slot indices (no 64-bit pointers), (iii) reusing
-  two layer buffers round to round, and (iv) recovering the `2^k` leaf indices by walking slot pairs
-  only for the final collisions. Acceptance gates for the port: every emitted solution accepted by
-  the librustzcash verifier for the same `(seed, nonce)`; on this machine ≤ 2 s per nonce and
-  ≤ 256 MB peak RSS at `(200,9)` (measured by `spike_pow`); reduced-parameter CI round-trip unchanged.
+- **Solver layout (`join::pow::wagner`, 2026-09-19).** The same Wagner algorithm, re-derived with a
+  bucket-sorted flat-memory layout rather than ported from any C code: (i) each round's entries live in
+  a flat buffer of `2^12` fixed-capacity buckets keyed by the top 12 bits of the round's 20-bit digit,
+  each slot a compact byte record `[rest byte ‖ remaining digits]`; (ii) in-bucket collisions are found
+  in one pass with a 256-entry chained table on the rest byte (no sorting, no per-entry allocation);
+  (iii) two hash layers alternate between rounds, and one `u32` array per round records each slot's
+  parent pair `(bucket, slot_a, slot_b)`; (iv) the final round collides on the last two digits at once;
+  (v) the `2^k` leaves are expanded — and canonically ordered, distinctness-checked and minimal-encoded
+  — only for the final hits. A full bucket drops further entries (bounded, rare), so peak memory is a
+  function of the parameters alone. Acceptance gates, all met: every emitted solution accepted by the
+  librustzcash verifier for the same `(seed, nonce)` (reduced-parameter tests at `(48,5)` and `(96,5)`,
+  and the real-parameter round-trip `real_200_9_solve_then_verify`, which CI now runs in release as
+  the production-parameter gate); ≤ 2 s per nonce and ≤ 256 MB peak RSS at `(200,9)` on this
+  machine (`spike_pow`). Parameter sets whose parent references exceed 32 bits (e.g. `(144,5)`)
+  transparently use 64-bit references.
 
 - **Proof-of-possession confidentiality.** The identity PoP exchanged inside the CPace-protected
   session is AEAD-sealed (AES-256-GCM) under a key derived from the CPace ISK,
