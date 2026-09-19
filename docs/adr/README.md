@@ -57,10 +57,10 @@ QUIC/DCUtR, NAT/IPv6, deniable authentication).
 | 013 | implemented (library) | M11 `tunnel/` — no CLI surface |
 | 014 | proposed — not started | native macOS GUI |
 | 015 | implemented (offline shell) | M12 `vox-tui/` — live core is the ADR-016 seam |
-| 016 | proposed | node runtime: M13 single-device → M14 two machines chat → M15 headless anchor + tunnel CLI |
+| 016 | accepted — M13 in progress | node runtime: M13 single-device → M14 two machines chat → M15 headless anchor + tunnel CLI |
 
 **What is missing is the node runtime** that composes the implemented layers (join → transport →
-NAT → sync → governance) and gives the TUI a live `CoreHandle`; that is ADR-016, proposed
+NAT → sync → governance) and gives the TUI a live `CoreHandle`; that is ADR-016, accepted
 2026-09-19 with its decisions taken (redb; member bundle records on the rendezvous board; passphrase
 never in the invite link; single-device M13 before network M14). Each ADR's "Known gaps" bullet
 records its residual drift as of 2026-09-19. Later
