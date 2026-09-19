@@ -1,56 +1,67 @@
-//! The interactive terminal event loop (ADR-015 §"Async runtime", §"At-rest …
-//! screen security").
+//! The interactive terminal event loop and runtime (ADR-015 §"Async runtime",
+//! §"At-rest … screen security"; ADR-016 M13.5).
 //!
-//! Owns the terminal lifecycle and the render/input loop, delegating *all* logic
-//! to the tested [`UiState`] state machine and the pure [`crate::ui::render`]. The
-//! loop:
-//! - enters the **alternate screen** before any draw and leaves it (clearing its
-//!   buffer + a best-effort `ESC[3J`) on exit, so decrypted text never lands in the
-//!   primary buffer / scrollback (ADR-015 screen-security claim);
-//! - restores the terminal on **every** exit path (normal quit, error, and panic
-//!   unwind) via a RAII guard whose `Drop` runs best-effort restore;
-//! - routes input through [`UiState::on_key`]; navigation is fully live, and a
-//!   [`crate::viewmodel::Command`] is handed to the bound [`CoreHandle`].
+//! ## Runtime shape (ADR-015)
+//! [`run_live`] builds a **multi-threaded tokio runtime**, spawns the embedded
+//! `vox-core` node on it, and runs the UI loop on the calling thread as the
+//! **blocking crossterm task**: crossterm's event polling is synchronous, so the
+//! loop owns the terminal while the node's actor and the signal handler run on
+//! the runtime. A `CancellationToken` stops the auxiliary tasks and the node is
+//! shut down (locking everything) on every exit path. The loop reads the node's
+//! latest [`ViewModel`] projection each frame and hands it a [`Command`] per user
+//! action through the [`CoreHandle`] boundary.
 //!
-//! ## Live-core integration seam (honest scope, ADR-015)
-//! Producing the [`ViewModel`] from a running embedded node and applying
-//! [`Command`]s against the core (identity vault unlock, channel create/join, log
-//! append + render-gate, sync) is the [`CoreHandle`] contract. This module ships the
-//! complete, terminal-correct shell and the boundary; binding it to a live node is
-//! the integration the manual end-to-end verification phase exercises. The shell is
-//! runnable today against any [`CoreHandle`] — including [`OfflineCore`], which holds
-//! the view and records commands without inventing trust or message state.
+//! ## Screen security (ADR-015)
+//! Terminal I/O is behind [`TerminalIo`] so the sequence is **testable**: the
+//! alternate screen is entered before any draw and left — with the buffer cleared
+//! and a best-effort `ESC[3J` purge — on exit, so decrypted text never lands in the
+//! primary buffer / scrollback; the real backend restores the terminal on every
+//! exit path (normal return, error, panic unwind) via a RAII guard.
+//!
+//! ## Locking (ADR-015)
+//! `:lock`, the idle timer ([`crate::state::IDLE_LOCK_SECS`]) and `SIGHUP` all
+//! lock the node (every SEK and the signer are wiped). When the view reports
+//! `locked`, the masked unlock prompt opens; a profile without an identity opens
+//! the create-identity prompt at startup.
 
 use std::io::{self, Stdout, Write};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::{Frame, Terminal};
+use tokio_util::sync::CancellationToken;
+use vox_core::node::actor::Node;
+use vox_core::node::api::NodeCommand;
+use vox_core::node::paths::Paths;
 
-use crate::state::{Action, UiState};
+use crate::live::LiveCore;
+use crate::state::{idle_lock_due, Action, PromptKind, UiState};
 use crate::ui::render;
 use crate::viewmodel::{Command, CommandStatus, ViewModel};
 
-/// Errors from the terminal loop.
+/// Errors from the terminal loop / runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     /// A terminal I/O error (raw mode, alternate screen, draw, or event read).
     #[error("terminal I/O error: {0}")]
     Io(#[from] io::Error),
+    /// The embedded node could not be started (profile/store error).
+    #[error("node: {0}")]
+    Core(#[from] vox_core::error::Error),
 }
 
 /// The contract the loop uses to talk to the running core: it provides the current
-/// [`ViewModel`] to render and consumes [`Command`]s the user issues. A live
-/// implementation drives an embedded `vox-core` node; [`OfflineCore`] is the
-/// no-network shell binding.
+/// [`ViewModel`] to render and consumes [`Command`]s the user issues. The live
+/// implementation is [`LiveCore`] (an embedded `vox-core` node); [`OfflineCore`]
+/// is the no-node shell used by tests.
 pub trait CoreHandle {
-    /// The latest view model to render.
-    fn view(&self) -> ViewModel;
+    /// The latest view model to render (may fold in pending core events).
+    fn view(&mut self) -> ViewModel;
     /// Apply a user command; returns a **typed** status to surface (no free text,
     /// so the status channel cannot leak plaintext/secret detail).
     fn apply(&mut self, command: Command) -> CommandStatus;
@@ -62,9 +73,9 @@ pub trait CoreHandle {
     }
 }
 
-/// A no-network core binding: renders an empty/seeded view and records commands as
-/// status messages without fabricating channels, messages, or trust state. Honest
-/// default until a live node is attached (ADR-015 integration seam).
+/// A no-node core binding: renders an empty/seeded view and records commands as
+/// status messages without fabricating channels, messages, or trust state. Used
+/// by tests; the binary always runs [`LiveCore`].
 #[derive(Default)]
 pub struct OfflineCore {
     view: ViewModel,
@@ -79,7 +90,7 @@ impl OfflineCore {
 }
 
 impl CoreHandle for OfflineCore {
-    fn view(&self) -> ViewModel {
+    fn view(&mut self) -> ViewModel {
         self.view.clone()
     }
 
@@ -101,68 +112,210 @@ impl CoreHandle for OfflineCore {
     }
 }
 
-/// A RAII guard that restores the terminal on **every** exit path — normal return,
-/// an error `?`, or a panic unwind (its `Drop` runs during unwinding). Every step
-/// is best-effort (a failure in one does not skip the others), so the terminal is
-/// never left in raw mode or on the alternate screen with decrypted text visible.
-struct TerminalGuard;
+/// Terminal I/O as the loop sees it, so the screen-security sequence is testable.
+pub trait TerminalIo {
+    /// Enter raw mode and the alternate screen. Must precede any [`TerminalIo::draw`].
+    fn enter(&mut self) -> io::Result<()>;
+    /// Draw one frame.
+    fn draw(&mut self, render: &mut dyn FnMut(&mut Frame)) -> io::Result<()>;
+    /// Wait up to `timeout` for a key press (release events are filtered).
+    fn poll_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>>;
+    /// Leave the alternate screen (clearing it), purge scrollback, restore the
+    /// terminal. Idempotent; also performed on drop by real backends.
+    fn leave(&mut self) -> io::Result<()>;
+}
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        // Best-effort, in order: leave raw mode, leave the alternate screen, purge
-        // scrollback (ESC[3J — best-effort; tmux/screen/script may retain copies,
-        // the documented honest limit, ADR-015), restore the cursor.
-        let _ = disable_raw_mode();
-        let mut out = io::stdout();
-        let _ = execute!(out, LeaveAlternateScreen);
-        let _ = execute!(
-            out,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge)
-        );
-        let _ = execute!(out, crossterm::cursor::Show);
-        let _ = out.flush();
+/// The real crossterm/ratatui backend with a RAII restore on every exit path.
+pub struct CrosstermIo {
+    terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
+    entered: bool,
+}
+
+impl CrosstermIo {
+    /// A backend over stdout (nothing touches the terminal until `enter`).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            terminal: None,
+            entered: false,
+        }
     }
 }
 
-/// Run the interactive TUI against `core`. An internal RAII guard restores the
-/// terminal on every exit path (including panic).
-pub fn run_tui(mut core: impl CoreHandle) -> Result<(), AppError> {
-    enable_raw_mode()?;
-    // From here on, any return/panic restores the terminal via the guard's Drop.
-    let _guard = TerminalGuard;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    event_loop(&mut terminal, &mut core)
+impl Default for CrosstermIo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn restore_terminal() {
+    // Best-effort, in order: leave raw mode, leave the alternate screen, purge
+    // scrollback (ESC[3J — best-effort; tmux/screen/script may retain copies, the
+    // documented honest limit, ADR-015), restore the cursor.
+    let _ = disable_raw_mode();
+    let mut out = io::stdout();
+    let _ = execute!(out, LeaveAlternateScreen);
+    let _ = execute!(
+        out,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge)
+    );
+    let _ = execute!(out, crossterm::cursor::Show);
+    let _ = out.flush();
+}
+
+impl TerminalIo for CrosstermIo {
+    fn enter(&mut self) -> io::Result<()> {
+        enable_raw_mode()?;
+        self.entered = true;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        self.terminal = Some(Terminal::new(CrosstermBackend::new(stdout))?);
+        Ok(())
+    }
+
+    fn draw(&mut self, render: &mut dyn FnMut(&mut Frame)) -> io::Result<()> {
+        let Some(t) = self.terminal.as_mut() else {
+            return Err(io::Error::other("draw before enter"));
+        };
+        t.draw(|f| render(f))?;
+        Ok(())
+    }
+
+    fn poll_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
+        if !event::poll(timeout)? {
+            return Ok(None);
+        }
+        match event::read()? {
+            // Ignore key-release events (crossterm reports both on some platforms).
+            Event::Key(key) if key.kind != KeyEventKind::Release => Ok(Some(key)),
+            _ => Ok(None),
+        }
+    }
+
+    fn leave(&mut self) -> io::Result<()> {
+        if self.entered {
+            self.entered = false;
+            self.terminal = None;
+            restore_terminal();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CrosstermIo {
+    fn drop(&mut self) {
+        // Runs on every exit path, including panic unwind.
+        let _ = self.leave();
+    }
+}
+
+/// A wall-clock source for the idle-lock timer (seconds).
+pub type Clock = Box<dyn Fn() -> u64>;
+
+fn system_clock() -> Clock {
+    Box::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    })
+}
+
+/// Run the interactive TUI against `core` on the real terminal.
+pub fn run_tui(core: impl CoreHandle) -> Result<(), AppError> {
+    run_loop(CrosstermIo::new(), core, system_clock())
+}
+
+/// Run the full client: runtime + embedded node + terminal loop, for `paths`.
+pub fn run_live(paths: Paths) -> Result<(), AppError> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let node = rt.block_on(async { Node::spawn(paths) })?;
+    let cancel = CancellationToken::new();
+    #[cfg(unix)]
+    {
+        // SIGHUP (terminal went away) locks the node (ADR-015).
+        let n = node.clone();
+        let c = cancel.clone();
+        rt.spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let Ok(mut hup) = signal(SignalKind::hangup()) else {
+                return;
+            };
+            loop {
+                tokio::select! {
+                    _ = hup.recv() => { let _ = n.apply(NodeCommand::Lock).await; }
+                    () = c.cancelled() => break,
+                }
+            }
+        });
+    }
+    let core = LiveCore::new(node.clone(), rt.handle().clone());
+    let result = run_loop(CrosstermIo::new(), core, system_clock());
+    cancel.cancel();
+    // Shutdown locks (wipes every SEK and the signer) before the process exits.
+    let _ = rt.block_on(node.apply(NodeCommand::Shutdown));
+    result
+}
+
+/// The loop over an abstract terminal (the testable core of [`run_tui`]).
+pub fn run_loop(
+    mut io: impl TerminalIo,
+    mut core: impl CoreHandle,
+    clock: Clock,
+) -> Result<(), AppError> {
+    io.enter()?;
+    let result = event_loop(&mut io, &mut core, &clock);
+    io.leave()?;
+    result
 }
 
 fn event_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    io: &mut impl TerminalIo,
     core: &mut impl CoreHandle,
+    clock: &Clock,
 ) -> Result<(), AppError> {
     let mut ui = UiState::new();
     // Surface any startup notice (e.g. the offline-shell banner) until the user acts.
     ui.status_message = core.startup_notice();
+    let mut last_input = clock();
+    let mut was_locked: Option<bool> = None;
     loop {
         let vm = core.view();
-        terminal.draw(|f| render(f, &vm, &ui))?;
 
-        // Poll so the render loop never blocks indefinitely (idle-lock timers and
-        // core-pushed updates can be folded in here by the live integration).
-        if !event::poll(Duration::from_millis(250))? {
+        // Onboarding / re-auth prompts: open once per transition, never on top of
+        // another modal.
+        if ui.mode.is_normal() {
+            if !vm.has_identity && was_locked.is_none() {
+                ui.start_prompt(PromptKind::CreateIdentity, None);
+            } else if vm.locked && vm.has_identity && was_locked != Some(true) {
+                ui.start_prompt(PromptKind::Unlock, None);
+            }
+        }
+        was_locked = Some(vm.locked);
+
+        io.draw(&mut |f| render(f, &vm, &ui))?;
+
+        // Idle lock (ADR-015): lock the node after IDLE_LOCK_SECS without input.
+        let now = clock();
+        if !vm.locked && vm.has_identity && idle_lock_due(last_input, now) {
+            ui.status_message = Some(core.apply(Command::Lock).message());
+            last_input = now;
             continue;
         }
-        if let Event::Key(key) = event::read()? {
-            // Ignore key-release events (crossterm reports both on some platforms).
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
-            match ui.on_key(key, &vm) {
-                Action::Quit => return Ok(()),
-                Action::Redraw => {}
-                Action::Dispatch(cmd) => {
-                    ui.status_message = Some(core.apply(cmd).message());
-                }
+
+        // Poll so the render loop never blocks indefinitely (core-pushed updates
+        // and the idle timer are folded in each tick).
+        let Some(key) = io.poll_key(Duration::from_millis(250))? else {
+            continue;
+        };
+        last_input = clock();
+        match ui.on_key(key, &vm) {
+            Action::Quit => return Ok(()),
+            Action::Redraw => {}
+            Action::Dispatch(cmd) => {
+                ui.status_message = Some(core.apply(cmd).message());
             }
         }
     }
@@ -171,6 +324,9 @@ fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use std::collections::VecDeque;
 
     #[test]
     fn offline_core_records_commands_without_fabrication() {
@@ -198,8 +354,224 @@ mod tests {
     fn offline_core_announces_itself_at_startup() {
         // The offline shell must state plainly that no node is attached, so it is
         // never mistaken for a connected client.
-        let notice = OfflineCore::default().startup_notice().unwrap();
+        let core = OfflineCore::default();
+        let notice = core.startup_notice().unwrap();
         assert!(notice.contains("offline"));
-        assert!(notice.contains("node"));
+        assert!(notice.contains("no node attached"));
+    }
+
+    /// What a recording backend observed, in order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Op {
+        Enter,
+        Draw,
+        Leave,
+    }
+
+    /// A terminal that records the screen-security sequence and feeds scripted
+    /// keys; draws go to a real ratatui `TestBackend` so the render runs.
+    struct RecordingIo {
+        ops: Vec<Op>,
+        keys: VecDeque<KeyEvent>,
+        term: Terminal<TestBackend>,
+        entered: bool,
+    }
+
+    impl RecordingIo {
+        fn new(keys: Vec<KeyEvent>) -> Self {
+            Self {
+                ops: Vec::new(),
+                keys: keys.into(),
+                term: Terminal::new(TestBackend::new(80, 24)).unwrap(),
+                entered: false,
+            }
+        }
+    }
+
+    impl TerminalIo for RecordingIo {
+        fn enter(&mut self) -> io::Result<()> {
+            self.entered = true;
+            self.ops.push(Op::Enter);
+            Ok(())
+        }
+        fn draw(&mut self, render: &mut dyn FnMut(&mut Frame)) -> io::Result<()> {
+            assert!(self.entered, "draw before entering the alternate screen");
+            self.ops.push(Op::Draw);
+            self.term.draw(|f| render(f)).unwrap();
+            Ok(())
+        }
+        fn poll_key(&mut self, _timeout: Duration) -> io::Result<Option<KeyEvent>> {
+            Ok(self.keys.pop_front())
+        }
+        fn leave(&mut self) -> io::Result<()> {
+            if self.entered {
+                self.entered = false;
+                self.ops.push(Op::Leave);
+            }
+            Ok(())
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn alternate_screen_brackets_every_draw_and_is_left_on_exit() {
+        // ADR-015 primary-buffer gate: no draw before Enter, Leave after the last
+        // draw, exactly once each — on a normal quit.
+        let mut io = RecordingIo::new(vec![key(KeyCode::Down), key(KeyCode::Up), ctrl_c()]);
+        let core = OfflineCore::default();
+        // Borrow-safe: run the loop on a `&mut` wrapper that forwards.
+        struct Fwd<'a>(&'a mut RecordingIo);
+        impl TerminalIo for Fwd<'_> {
+            fn enter(&mut self) -> io::Result<()> {
+                self.0.enter()
+            }
+            fn draw(&mut self, r: &mut dyn FnMut(&mut Frame)) -> io::Result<()> {
+                self.0.draw(r)
+            }
+            fn poll_key(&mut self, t: Duration) -> io::Result<Option<KeyEvent>> {
+                self.0.poll_key(t)
+            }
+            fn leave(&mut self) -> io::Result<()> {
+                self.0.leave()
+            }
+        }
+        run_loop(Fwd(&mut io), core, Box::new(|| 0)).unwrap();
+        assert_eq!(io.ops.first(), Some(&Op::Enter));
+        assert_eq!(io.ops.last(), Some(&Op::Leave));
+        assert_eq!(io.ops.iter().filter(|o| **o == Op::Enter).count(), 1);
+        assert_eq!(io.ops.iter().filter(|o| **o == Op::Leave).count(), 1);
+        assert!(io.ops.iter().filter(|o| **o == Op::Draw).count() >= 3);
+        assert!(io
+            .ops
+            .windows(2)
+            .all(|w| !(w[0] == Op::Leave && w[1] == Op::Draw)));
+    }
+
+    #[test]
+    fn alternate_screen_is_left_when_the_loop_errors() {
+        // A draw error mid-loop must still leave the alternate screen.
+        struct FailingIo {
+            inner: RecordingIo,
+            fail_on_draw: usize,
+        }
+        impl TerminalIo for FailingIo {
+            fn enter(&mut self) -> io::Result<()> {
+                self.inner.enter()
+            }
+            fn draw(&mut self, r: &mut dyn FnMut(&mut Frame)) -> io::Result<()> {
+                if self.inner.ops.iter().filter(|o| **o == Op::Draw).count() >= self.fail_on_draw {
+                    return Err(io::Error::other("simulated draw failure"));
+                }
+                self.inner.draw(r)
+            }
+            fn poll_key(&mut self, t: Duration) -> io::Result<Option<KeyEvent>> {
+                self.inner.poll_key(t)
+            }
+            fn leave(&mut self) -> io::Result<()> {
+                self.inner.leave()
+            }
+        }
+        let mut io = FailingIo {
+            inner: RecordingIo::new(vec![key(KeyCode::Down); 10]),
+            fail_on_draw: 2,
+        };
+        struct Fwd<'a>(&'a mut FailingIo);
+        impl TerminalIo for Fwd<'_> {
+            fn enter(&mut self) -> io::Result<()> {
+                self.0.enter()
+            }
+            fn draw(&mut self, r: &mut dyn FnMut(&mut Frame)) -> io::Result<()> {
+                self.0.draw(r)
+            }
+            fn poll_key(&mut self, t: Duration) -> io::Result<Option<KeyEvent>> {
+                self.0.poll_key(t)
+            }
+            fn leave(&mut self) -> io::Result<()> {
+                self.0.leave()
+            }
+        }
+        let res = run_loop(Fwd(&mut io), OfflineCore::default(), Box::new(|| 0));
+        assert!(matches!(res, Err(AppError::Io(_))));
+        assert_eq!(io.inner.ops.last(), Some(&Op::Leave));
+    }
+
+    #[test]
+    fn idle_timer_locks_the_core() {
+        // A clock that jumps past IDLE_LOCK_SECS after the first frame.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let t = Rc::new(Cell::new(1_000u64));
+        let t2 = t.clone();
+        let clock: Clock = Box::new(move || t2.get());
+        struct Counting {
+            locks: usize,
+            view: ViewModel,
+        }
+        impl CoreHandle for Counting {
+            fn view(&mut self) -> ViewModel {
+                self.view.clone()
+            }
+            fn apply(&mut self, c: Command) -> CommandStatus {
+                if matches!(c, Command::Lock) {
+                    self.locks += 1;
+                    self.view.locked = true;
+                }
+                CommandStatus::Done
+            }
+        }
+        let mut io = RecordingIo::new(vec![key(KeyCode::Down), ctrl_c()]);
+        // Polls: (1) the Down key; (2) an idle tick — no key, but the clock has
+        // jumped past the threshold; (3) Ctrl-C to quit.
+        struct Fwd<'a>(&'a mut RecordingIo, Rc<Cell<u64>>, usize);
+        impl TerminalIo for Fwd<'_> {
+            fn enter(&mut self) -> io::Result<()> {
+                self.0.enter()
+            }
+            fn draw(&mut self, r: &mut dyn FnMut(&mut Frame)) -> io::Result<()> {
+                self.0.draw(r)
+            }
+            fn poll_key(&mut self, t: Duration) -> io::Result<Option<KeyEvent>> {
+                self.2 += 1;
+                if self.2 == 2 {
+                    self.1.set(self.1.get() + crate::state::IDLE_LOCK_SECS + 1);
+                    return Ok(None);
+                }
+                self.0.poll_key(t)
+            }
+            fn leave(&mut self) -> io::Result<()> {
+                self.0.leave()
+            }
+        }
+        let core = Counting {
+            locks: 0,
+            view: ViewModel {
+                has_identity: true,
+                locked: false,
+                ..ViewModel::default()
+            },
+        };
+        // We need the lock count after the loop; move the core in and read it via
+        // a shared cell.
+        struct Shared(Rc<Cell<usize>>, Counting);
+        impl CoreHandle for Shared {
+            fn view(&mut self) -> ViewModel {
+                self.1.view()
+            }
+            fn apply(&mut self, c: Command) -> CommandStatus {
+                let s = self.1.apply(c);
+                self.0.set(self.1.locks);
+                s
+            }
+        }
+        let locks = Rc::new(Cell::new(0));
+        run_loop(Fwd(&mut io, t, 0), Shared(locks.clone(), core), clock).unwrap();
+        assert!(locks.get() >= 1, "idle timer must lock");
     }
 }

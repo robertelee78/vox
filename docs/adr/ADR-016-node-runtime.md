@@ -290,6 +290,15 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   drop the signer before the task exits. Tests drive the whole single-device lifecycle through the
   handle, including a simulated process restart (identity present and locked, channels listed
   closed, timeline restored after unlock + open) and last-handle-drop locking.
+- **The live client (M13.5).** `vox-tui::live::LiveCore` is the TUI's `CoreHandle` over a
+  `NodeHandle`: `NodeView` → `ViewModel` projection, `Command` → `NodeCommand` mapping with the UI
+  thread blocking on the node's typed reply, and UI-local state (channel on screen, unread counts
+  from `NodeEvent`s, verification marks). `app::run_live` owns the runtime: multi-threaded tokio,
+  node spawned on it, the UI loop as the blocking crossterm task, `CancellationToken` for auxiliary
+  tasks, `SIGHUP` → `Lock`, and `Shutdown` on every exit path. Masked prompts collect every
+  passphrase; M13's network verbs (join, consent, visibility, block) report "not available yet"
+  rather than pretending. The production-Argon2id live-core lifecycle test is `#[ignore]`d in the
+  debug suite and run in release by CI, alongside the real-parameter PoW gate.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

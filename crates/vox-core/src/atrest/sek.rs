@@ -759,3 +759,16 @@ mod tests {
         assert!(crate::test_support::is_clone!(Vec<u8>)); // positive control
     }
 }
+
+#[cfg(test)]
+mod production_timing_spike {
+    //! Not a regular test: run with `cargo test --release -- --ignored production_kdf_timing`.
+    use super::*;
+    #[test]
+    #[ignore = "timing spike for the production Argon2id profile"]
+    fn production_kdf_timing() {
+        let t = std::time::Instant::now();
+        let _ = factor_pass(b"pp", &[7u8; SALT_LEN], Argon2Profile::PRODUCTION).unwrap();
+        eprintln!("production argon2id: {:?}", t.elapsed());
+    }
+}

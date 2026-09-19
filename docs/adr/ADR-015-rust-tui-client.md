@@ -1,8 +1,8 @@
 # ADR-015: Rust TUI Client
 
-**Status**: implemented (M12, `crates/vox-tui/`) — offline client shell; the live core is the ADR-016 seam
+**Status**: implemented (M12 + M13.5, `crates/vox-tui/`) — live single-device client over the embedded node; network features arrive with M14
 **Date**: 2026-06-20
-**Updated**: 2026-09-19 — status reconciled; test count corrected; Known gaps recorded.
+**Updated**: 2026-09-19 — status reconciled; test count corrected; Known gaps recorded. 2026-09-19 (M13.5): live `CoreHandle`, tokio runtime, masked onboarding prompts, composer, idle/SIGHUP lock, primary-buffer + lock gates met; `tui-textarea` dropped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: client, tui, rust, terminal, ratatui, verification, consent-ui
 
@@ -231,7 +231,7 @@ A terminal has no camera, so the strong scan path is **relocated to the peer's d
 
 ## Implementation notes (M12)
 
-Built as `crates/vox-tui` — a `vox_tui` library (all testable logic) + the `vox` binary, linking `vox-core` directly (no FFI). Stack as specified: ratatui + crossterm + tui-textarea + qrcode + clap(+complete+mangen) + secrecy/zeroize.
+Built as `crates/vox-tui` — a `vox_tui` library (all testable logic) + the `vox` binary, linking `vox-core` directly (no FFI). Stack: ratatui + crossterm + qrcode + clap(+complete+mangen) + secrecy/zeroize + tokio/tokio-util (`tui-textarea` was dropped in M13.5, see below).
 
 - **Verification core** (`verify`): the pinned safety code — `SHA-256("vox/safety/v1" ‖ pk_lo ‖ pk_hi)` over the two composite pubkeys in ascending byte order — rendered as 8 groups of 5 decimal digits (~133 bits), symmetric so this TUI and the ADR-014 client agree. The verification-QR payload is canonical-CBOR `[label, composite_pubkey]`, strictly decoded. Exhaustively unit-tested (symmetry, pinned re-derivation, tamper/label rejection).
 - **Typed core↔UI boundary** (`viewmodel`): `ViewModel` (latest-wins, `watch`-shaped) + `Event` (ordered, `mpsc`) + `Command` (UI→core). The binding contract holds *by construction* — these types carry only fingerprints, nicknames, already-decrypted display text, and enum state; **no** keys/SKDMs/SEK/`self_seed`. The one secret-bearing input (a create/join passphrase) is a transient `secrecy::SecretString`, never retained in a `ViewModel`. Both core→UI text paths are **typed, not free strings** — errors are a bounded `UiError` and command results a bounded `CommandStatus`, each mapping to fixed redaction-safe messages — so a (future live) core cannot leak plaintext through the error or status channel. Tests assert the types are `Send + 'static` and `Clone` (channel-safe).
@@ -242,23 +242,45 @@ Built as `crates/vox-tui` — a `vox_tui` library (all testable logic) + the `vo
 
 **Honest scope — the live-core runtime is the documented integration seam, exercised by the post-M12 manual-spike phase.** M12 ships the complete, tested client *structure*: the security-critical verification, the typed boundary, the navigation/consent state machine, QR, the ratatui view, and a terminal-correct event loop — all behind a `CoreHandle` trait. Binding that to a **running** embedded `vox-core` node (identity-vault unlock, channel create/join, log append + render-gate, sync producing `ViewModel`s and consuming `Command`s) is the `CoreHandle` contract; the shipped `OfflineCore` binding renders honestly and records commands **without fabricating** channels, messages, or trust state (it explicitly says "not connected" rather than faking delivery). This is a layering boundary, not a stub: nothing here pretends to work that doesn't. Wiring a live `CoreHandle` and proving it end-to-end against real peers is precisely the manual end-to-end verification the project runs after M12 (green unit tests ≠ verified-working). The TUN datapath (ADR-013/ADR-014, privileged helper + smoltcp) and desktop OS notifications (`notify-rust`; the dep-free OSC 9 / bell path is the SSH fallback) are likewise client-surface items folded into that phase.
 
-686 workspace tests pass (642 core + 3 integration + 41 tui, 1 `#[ignore]`d real-parameter PoW test that CI runs in release); fmt/clippy(`-D warnings`)/doc all clean; the `vox` binary builds.
+The workspace test counts are recorded in the ADR index status table, not here (they change with every milestone); fmt/clippy(`-D warnings`)/doc are CI gates and the `vox` binary builds.
 
-- **Known gaps (recorded 2026-09-19).** The runtime the Decision specifies — a multi-threaded tokio
-  runtime, a blocking crossterm task, `CancellationToken`, `watch<ViewModel>` / `mpsc<Event>` /
-  `mpsc<Command>` — does not exist: `app::event_loop` is a single-threaded blocking `event::poll` loop,
-  `viewmodel::Event` is defined but never produced or consumed, and `tokio`, `tui-textarea` and
-  `zeroize` are declared-but-unused dependencies. `cli::run` always binds `OfflineCore` (the only
-  `CoreHandle`); the TUI calls into `vox_core` only for `cbor`, `error`, `hash` and
-  `identity::composite` — nothing from join/group/log/transport/nat/tunnel/atrest/governance. The
-  composer is a static placeholder (typed characters are dropped; `:send <text>` is the only send
-  path); `Command::CreateChannel`/`Join` are never constructed by any UI path; `verify::` and `qr::`
-  are never called from app code and the safety code is never rendered. Release gates unmet: the
-  primary-buffer non-leak assertion, lock/zeroize tests, tokio shutdown/backpressure tests, the
-  terminal-compatibility matrix, and the ADR-014 parity tests; the QR "round-trip" test compares
-  dimensions only. Unimplemented surface: identity generation/import/vault, backup, create/join
-  onboarding with masked passphrase, invite QR, XDG dirs, keybinding config, idle/SIGHUP lock,
-  multiplexer warning, `NO_COLOR`, notifications, tunneling subcommands, file send, `--accessible`.
+- **Live client (M13.5, 2026-09-19).** `app::run_live` builds the multi-threaded tokio runtime,
+  spawns the embedded `vox-core` node (ADR-016) on it, runs the UI loop on the calling thread as the
+  blocking crossterm task, cancels auxiliary tasks with a `CancellationToken` and shuts the node down
+  (locking everything) on every exit path — the runtime shape this ADR specifies, now real.
+  `live::LiveCore` is the live `CoreHandle`: it projects the node's client-agnostic `NodeView` into
+  the `ViewModel` and maps each `Command` onto `NodeCommand`s, blocking the UI thread on the node's
+  typed reply; UI-local state (channel on screen, unread counts from the node's ordered events,
+  verification marks) lives there. `cli` always runs live over a profile (`--profile`, `--data-dir`,
+  `--config-dir`; env `VOX_PROFILE`/`VOX_DATA_DIR`/`VOX_CONFIG_DIR`; then XDG — the precedence above).
+- **Onboarding and passphrases (M13.5).** A modal, **masked** multi-field prompt (`state::Prompt`)
+  collects every passphrase: create-identity (opens automatically on a fresh profile), unlock (opens
+  whenever the view reports `locked`), create-channel (`:new <name>`, name prefilled), open-channel
+  (Enter on a closed channel — its local name is under the channel lock, so it is listed by a short
+  id). Field buffers are `Zeroizing<String>`; the prompt renders one `•` per character and a
+  mismatch is reported through the status line without echoing anything typed. Ctrl-C quits from any
+  mode. `:lock`, the 5-minute idle timer and `SIGHUP` lock the node.
+- **Composer (M13.5).** A single-line composer owns printable keys/Backspace/Enter when focused;
+  Enter sends `:send`-equivalent text to the channel on screen. **`tui-textarea` is dropped from the
+  stack** listed above: a chat composer with Enter-to-send is single-line by nature, and the widget
+  was an unused dependency; a multi-line/vim composer would be its own decision.
+- **Release gates now met (M13.5).** The primary-buffer assertion: terminal I/O is behind
+  `app::TerminalIo`, and tests with a recording backend prove the alternate screen is entered before
+  any draw and left (with purge) after the last, on a normal quit *and* on a mid-loop error.
+  Lock/zeroize: the live-core test locks and proves the view is locked, the channel closed and its
+  name hidden; prompt fields are zeroizing by type and a cancelled prompt drops them. Idle lock is
+  tested with an injected clock. Verification acceptance and consent flows remain unit-level until
+  M14 gives them a second party.
+- **Known gaps (re-cut 2026-09-19 after M13.5).** Still not implemented: identity import/export
+  (armored OpenPGP export with user ID + self-signature), backup, join onboarding and invite QR
+  (M14), the in-app verification screen and safety-code display (needs the peer's key: M14 member
+  bundles), keybinding config, the multiplexer warning, `NO_COLOR` handling, OS/OSC-9 notifications,
+  the tunneling subcommands (`vox service add` / `vox forward` / `vox up`, M15), file send, and the
+  `--accessible` flag (the ASCII QR style is unreachable from the CLI). The QR "round-trip" test
+  still compares dimensions only. The `tokio` and `zeroize` dependencies are now used; the runtime's
+  shutdown/backpressure and the terminal-compatibility matrix are exercised manually, not by tests.
+  The live-core lifecycle test runs the production Argon2id profile and is therefore `#[ignore]`d in
+  the debug suite and run in release by CI.
 
 ## Links
 **Depends on**: ADR-002, ADR-004, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009, ADR-010, ADR-011, ADR-012, ADR-013.

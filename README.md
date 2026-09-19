@@ -133,11 +133,15 @@ cargo run --release -p vox-tui -- --help
 
 **What works today.** Every layer in `vox-core` is implemented to its ADR and tested (including
 real loopback QUIC, a real TCP-over-Vox tunnel, and a real `(200,9)` Equihash solve cross-checked by
-the librustzcash verifier). What does **not** exist yet is the node runtime that composes those
-layers — join → transport → NAT → sync → governance — so `vox` currently runs as an *offline* client
-shell over an empty core and says so at startup; you cannot create, join, or chat in a channel over
-the network yet. That runtime is specified in [ADR-016](docs/adr/ADR-016-node-runtime.md) (proposed;
-milestones M13–M15); the macOS client (ADR-014) follows it. Linux (as a TUI host) is supported now; iOS is a separate future capability.
+the librustzcash verifier). The node runtime ([ADR-016](docs/adr/ADR-016-node-runtime.md), accepted)
+is landing in milestones: **M13 (single device) is in** — `vox` creates an identity behind a masked
+passphrase, creates channels double-locked under a channel passphrase, appends and renders messages,
+locks (`:lock`, idle, `SIGHUP`) and unlocks, and everything survives a restart as sealed segments in a
+redb store under `~/.local/share/vox/<profile>/` (macOS: `~/Library/Application Support/vox/`).
+What does **not** exist yet is the network: join, consent, sync and the rendezvous service are
+**M14**, the headless anchor and tunnel CLI **M15** — so today a channel has exactly one member (you)
+and the network verbs say "not available yet". The macOS client (ADR-014) follows; Linux (as a TUI
+host) is supported now; iOS is a separate future capability.
 
 ## Contributing
 

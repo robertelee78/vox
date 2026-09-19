@@ -3,14 +3,44 @@
 //! The interactive TUI is the default (`vox` or `vox tui`); `vox completions
 //! <shell>` and `vox man` emit shell completions and a man page (built from the
 //! same clap model, so they never drift from the real flags). [`run`] is the
-//! single entry the binary calls.
+//! single entry the binary calls. The TUI always runs an embedded node over a
+//! profile (ADR-016 M13): `--profile`, `--data-dir`, `--config-dir` select it
+//! (ADR-015 precedence: flags > env > defaults; env `VOX_DATA_DIR` /
+//! `VOX_CONFIG_DIR`, then XDG).
 
 use std::io;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use vox_core::node::paths::{Paths, DEFAULT_PROFILE};
 
-use crate::app::{run_tui, OfflineCore};
+use crate::app::run_live;
+
+/// Profile selection shared by the interactive commands.
+#[derive(Args, Debug, Clone)]
+pub struct ProfileArgs {
+    /// Profile name (one identity per profile).
+    #[arg(long, env = "VOX_PROFILE", default_value = DEFAULT_PROFILE)]
+    pub profile: String,
+    /// Data directory root (holds `<profile>/vault.cbor` and `store.redb`).
+    #[arg(long, env = "VOX_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+    /// Config directory.
+    #[arg(long, env = "VOX_CONFIG_DIR")]
+    pub config_dir: Option<PathBuf>,
+}
+
+impl ProfileArgs {
+    /// Resolve (and create) the profile paths.
+    pub fn paths(&self) -> vox_core::error::Result<Paths> {
+        Paths::resolve(
+            &self.profile,
+            self.data_dir.as_deref(),
+            self.config_dir.as_deref(),
+        )
+    }
+}
 
 /// Vox Lux — serverless, end-to-end-encrypted terminal client.
 #[derive(Parser)]
@@ -25,7 +55,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the interactive terminal client (the default).
-    Tui,
+    Tui(ProfileArgs),
     /// Print shell completions for SHELL to stdout.
     Completions {
         /// The shell to generate completions for (bash, zsh, fish, …).
@@ -39,14 +69,28 @@ enum Cmd {
 #[must_use]
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Cmd::Tui) {
-        Cmd::Tui => match run_tui(OfflineCore::default()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("vox: {e}");
-                ExitCode::FAILURE
+    let default_tui = Cmd::Tui(ProfileArgs {
+        profile: DEFAULT_PROFILE.to_owned(),
+        data_dir: std::env::var_os("VOX_DATA_DIR").map(PathBuf::from),
+        config_dir: std::env::var_os("VOX_CONFIG_DIR").map(PathBuf::from),
+    });
+    match cli.command.unwrap_or(default_tui) {
+        Cmd::Tui(args) => {
+            let paths = match args.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match run_live(paths) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "vox", &mut io::stdout());

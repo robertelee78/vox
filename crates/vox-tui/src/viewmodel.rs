@@ -106,6 +106,10 @@ pub enum Reachability {
 /// A channel summary for the home list (ADR-015 home = channel list).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelSummary {
+    /// Whether the channel is **open** (its SEK unlocked) in this session. A closed
+    /// channel's local name is under the channel lock (ADR-010 double-lock), so it
+    /// is listed by a short id until opened.
+    pub open: bool,
     /// The channelID (`SHA-256(genesis)`).
     pub channel_id: Digest32,
     /// The local, user-assigned channel name.
@@ -158,6 +162,8 @@ pub struct ViewModel {
     /// Whether `mlock` is in effect; `false` surfaces the documented zeroize-only
     /// degradation warning (ADR-015 memory-protection honesty).
     pub mlock_active: bool,
+    /// Whether the profile has an identity at all (`false` ⇒ onboarding: create one).
+    pub has_identity: bool,
 }
 
 /// An ordered core→UI event that must never coalesce (`mpsc`).
@@ -208,6 +214,20 @@ pub enum UiError {
     Malformed,
     /// A transport/connection error.
     Transport,
+    /// The profile has no identity yet (create one with `:init`).
+    NoIdentity,
+    /// The profile already has an identity.
+    IdentityExists,
+    /// The app is locked (`:unlock`).
+    Locked,
+    /// The channel is not open (select it and enter its passphrase).
+    ChannelNotOpen,
+    /// An input exceeded its bound (name or message length).
+    TooLong,
+    /// Persisting to the store failed; reopen the channel.
+    Storage,
+    /// This action needs the network milestone (M14) — not available yet.
+    NotAvailableYet,
     /// An unexpected internal error (never carries detail).
     Internal,
 }
@@ -239,6 +259,13 @@ impl UiError {
             UiError::MissingConsent => "you'll see this member once they consent to you",
             UiError::Malformed => "received a malformed entry (ignored)",
             UiError::Transport => "connection error",
+            UiError::NoIdentity => "no identity yet — :init to create one",
+            UiError::IdentityExists => "an identity already exists in this profile",
+            UiError::Locked => "locked — :unlock",
+            UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
+            UiError::TooLong => "too long",
+            UiError::Storage => "could not save — reopen the channel",
+            UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Internal => "internal error",
         }
     }
@@ -290,6 +317,34 @@ impl CommandStatus {
 /// [`ViewModel`]).
 #[derive(Debug)]
 pub enum Command {
+    /// Create this profile's identity (onboarding; masked prompt).
+    CreateIdentity {
+        /// The identity passphrase (redacted/zeroized).
+        passphrase: SecretString,
+    },
+    /// Unlock the identity (masked prompt).
+    Unlock {
+        /// The identity passphrase (redacted/zeroized).
+        passphrase: SecretString,
+    },
+    /// Open a closed channel: its passphrase is the second lock factor.
+    OpenChannel {
+        /// The channelID.
+        channel_id: Digest32,
+        /// The channel passphrase (redacted/zeroized).
+        passphrase: SecretString,
+    },
+    /// Close an open channel (wipes its SEK from memory).
+    CloseChannel {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// The UI's active channel changed (`None` = back at the channel list); the
+    /// core projects `ViewModel::active` and unread counts from it.
+    SelectChannel {
+        /// The channel now on screen, if any.
+        channel_id: Option<Digest32>,
+    },
     /// Create a channel with a local name and an out-of-band passphrase.
     CreateChannel {
         /// The local name for the new channel.
