@@ -106,6 +106,16 @@ tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-t
 # the workspace level so we share the exact `bytes` quinn resolves.
 bytes = { version = "1", default-features = false }
 
+# --- Node runtime (ADR-016, M13) ---------------------------------------------
+# Persistence engine (ADR-016 §Persistence): pure Rust, copy-on-write B-tree,
+# ACID, single writer / MVCC readers, single file, stable on-disk format, two-crate
+# footprint. Chosen over an LSM (fjall) because Vox's write rate is bounded by
+# design (ADR-008 quotas), every stored value is an already-sealed blob (ADR-010),
+# and the single-writer transaction matches the Node actor's single-writer rule.
+redb = "4.3"
+# Temp directories for store/vault tests only (pure Rust).
+tempfile = "3.27"
+
 # --- Rust TUI client (ADR-015, M12) ------------------------------------------
 # Pure-Rust terminal stack; keeps the static-musl generate path clean (ADR-015).
 #   ratatui      — immediate-mode TUI widgets + layout, with a `TestBackend` that

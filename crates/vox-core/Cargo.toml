@@ -37,9 +37,12 @@ rcgen.workspace = true
 x509-parser.workspace = true
 tokio.workspace = true
 bytes.workspace = true
+# Node runtime (ADR-016, M13).
+redb.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+tempfile.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
