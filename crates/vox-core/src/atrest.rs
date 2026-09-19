@@ -31,10 +31,12 @@
 //!   PQ-strong alternative for keys that cannot sign deterministically).
 //! - **passphrase factor** — `factor_pass = Argon2id(channel_passphrase, salt,
 //!   profile)`, memory-hard. The **production** profile is **256 MiB / 3 passes**
-//!   ([`sek::Argon2Profile::PRODUCTION`], the default); tests use a tiny reduced
-//!   profile so the suite stays fast (the same production-vs-test discipline M3
-//!   uses for Equihash). The post-quantum strength of the at-rest scheme rests on
-//!   this Argon2id factor, stated plainly in ADR-010.
+//!   ([`sek::Argon2Profile::PRODUCTION`], the default, checked against the ADR
+//!   floor at compile time); this crate's unit tests use a `#[cfg(test)]`-only
+//!   reduced profile so the suite stays fast (the same production-vs-test
+//!   discipline M3 uses for Equihash) — a production build cannot construct or
+//!   resolve any profile below the floor. The post-quantum strength of the
+//!   at-rest scheme rests on this Argon2id factor, stated plainly in ADR-010.
 //!
 //! `KEK = HKDF(factor_id ‖ factor_pass)`, `wrap = AEAD_KEK(SEK)`. Only the small
 //! wrap (+ salt + profile id) is stored. Either factor alone is useless, and the

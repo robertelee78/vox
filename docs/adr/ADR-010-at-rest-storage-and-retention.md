@@ -1,7 +1,8 @@
 # ADR-010: At-Rest Storage and Retention
 
-**Status**: proposed
+**Status**: implemented (M8, `crates/vox-core/src/atrest/`)
 **Date**: 2026-06-19
+**Updated**: 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: storage, at-rest, encryption, retention, ttl, device-seizure, app-lock
 
@@ -142,6 +143,29 @@ plainly rather than implying a guarantee we cannot make.
 ### Neutral
 - Mechanically adjacent to ADR-008, but kept as a separate decision because it is a distinct security
   boundary (local-at-rest vs replicated-log).
+
+## Implementation notes (M8)
+
+These record the concrete decisions made building this ADR (`crates/vox-core/src/atrest/`), so the spec and code stay in lockstep:
+
+- **Argon2id profile floor is structural (`atrest::sek::Argon2Profile`).** The "≥256 MB, ≥3 passes"
+  floor above is encoded as `ADR_MIN_M_COST_KIB` / `ADR_MIN_T_COST` and enforced at **compile time**
+  against the production profile (256 MiB / 3 passes / p=1, id 1, the default) by a `const` assertion.
+  The profile's fields are private, so the only profiles a production build can construct or resolve
+  from a stored id are the floor-meeting constants; there is no runtime "is this profile strong enough"
+  check to forget. The fast reduced profile (8 KiB / 1 pass, id 2) that keeps the unit suite cheap
+  exists only under `cfg(test)` — a wrap or vault naming id 2 is un-openable in a production build. An
+  integration test (`crates/vox-core/tests/atrest_profile_floor.rs`), which links the crate without
+  `cfg(test)`, proves that every id a production build resolves meets the floor. *(2026-09-19 review:
+  previously id 2 resolved in production, so an 8 KiB/1-pass wrap unlocked.)* Should a non-test
+  consumer ever need a cheaper profile (e.g. a client integration test), that is a deliberate,
+  feature-gated decision recorded here — never a change to `from_id`.
+- **Unknown stored profile id is an unlock failure everywhere.** `profile_id` is a persisted field of
+  the SEK wrap and the identity vault; distinguishing "unknown profile" from "wrong factor / tamper"
+  would hand whoever holds the file an oracle. `SekWrap::profile()` is the single resolver (used by
+  unwrap, rotation re-wrap and KDF upgrade) and `IdentityVault::unlock` applies the same collapse, so
+  all of them surface `AtRestUnlockFailed`; only a structurally malformed wrap/vault encoding is
+  `MalformedAtRest`.
 
 ## Links
 **Depends on**: ADR-002, ADR-007, ADR-008.

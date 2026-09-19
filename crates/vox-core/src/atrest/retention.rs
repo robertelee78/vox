@@ -67,7 +67,9 @@ pub fn rewrap_for_new_passphrase(
     old_passphrase: &[u8],
     new_passphrase: &[u8],
 ) -> Result<Rewrap> {
-    let profile = Argon2Profile::from_id(old_wrap.profile_id)?;
+    // Resolve via the wrap's own accessor so an unknown stored id collapses to an
+    // unlock failure (never a distinguishable oracle on a persisted field).
+    let profile = old_wrap.profile()?;
     // Recover the SEK under the old factors, then re-seal under the new passphrase.
     let sek = old_wrap.unwrap_sek(id_factor, channel_id, old_passphrase)?;
     let new_wrap = sek.seal(id_factor, channel_id, new_passphrase, profile)?;
@@ -163,6 +165,23 @@ mod tests {
     }
 
     #[test]
+    fn rewrap_with_unknown_stored_profile_id_collapses_to_unlock_failure() {
+        // Same oracle rule as `SekWrap::unwrap_sek`: a persisted profile id this
+        // build cannot resolve is an unlock failure, not a distinguishable
+        // MalformedAtRest (2026-09-19 review).
+        let s = signer(7, 9);
+        let f = SignatureIdentityFactor::new(&s);
+        let cid = [1u8; CHANNEL_ID_LEN];
+        let sek = Sek::generate().unwrap();
+        let mut old = sek.seal(&f, &cid, b"old-pp", P).unwrap();
+        old.profile_id = 200;
+        assert!(matches!(
+            rewrap_for_new_passphrase(&old, &f, &cid, b"old-pp", b"new-pp"),
+            Err(Error::AtRestUnlockFailed)
+        ));
+    }
+
+    #[test]
     fn offline_device_keeps_old_wrap_until_it_knows_new_passphrase() {
         // An offline device that does not know the new passphrase simply cannot
         // call rewrap (it lacks `new_passphrase`); meanwhile its existing OLD wrap
@@ -206,7 +225,7 @@ mod tests {
         let sek = Sek::generate().unwrap();
         let old = sek.seal(&f, &cid, b"pp", P).unwrap();
         let re = upgrade_kdf_profile(&old, &f, &cid, b"pp", P).unwrap();
-        assert_eq!(re.new_wrap.profile_id, P.id);
+        assert_eq!(re.new_wrap.profile_id, P.id());
         assert_eq!(
             re.new_wrap
                 .unwrap_sek(&f, &cid, b"pp")
