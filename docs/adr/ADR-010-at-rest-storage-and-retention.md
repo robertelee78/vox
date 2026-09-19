@@ -2,7 +2,7 @@
 
 **Status**: implemented (M8, `crates/vox-core/src/atrest/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-20 — identity-level key material (the prekey ring) given its at-rest home and derivation (ADR-016 M14.3); admitted channel authors sealed as key material (M14.5). 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
+**Updated**: 2026-09-20 — identity-level key material (the prekey ring) given its at-rest home and derivation (ADR-016 M14.3); admitted channel authors and received sender keys sealed as key material (M14.5). 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: storage, at-rest, encryption, retention, ttl, device-seizure, app-lock
 
@@ -148,6 +148,14 @@ plainly rather than implying a guarantee we cannot make.
 
 These record the concrete decisions made building this ADR (`crates/vox-core/src/atrest/`), so the spec and code stay in lockstep:
 
+- **Received sender keys are per-channel key material (M14.5b).** The `ReceiverChain`s built from other
+  members' SKDMs are sealed under the channel SEK as a `KeyMaterial` segment (`SEG_RECEIVERS`) — this is
+  §"Two distinct encryption layers"'s "received SKDMs" clause, made concrete. The **live** chain state is
+  what is stored (chain key, next iteration, skipped-key cache), not the originating SKDM, because the
+  head and the cache are the replay defence (ADR-006 Implementation notes). A decrypt that advances a
+  chain persists the advance in the same batch as the rendered plaintext row, and a failed persist
+  **poisons** the channel rather than leaving an in-memory advance the next open would undo — an
+  unpersisted advance would let a consumed iteration decrypt again.
 - **Admitted authors are per-channel key material (M14.5).** The composite keys of the identities whose
   entries a channel accepts are sealed under that channel's SEK as a `KeyMaterial` segment
   (`SEG_AUTHORS`), alongside the sender chain and the manifest — they are public keys, but *which*

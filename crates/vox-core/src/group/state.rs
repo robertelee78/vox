@@ -308,6 +308,9 @@ impl SenderChain {
 /// Version of the sealed sender-chain state encoding.
 const SENDER_STATE_VERSION: u64 = 1;
 
+/// At-rest version of a [`ReceiverChain`] state blob.
+const RECEIVER_STATE_VERSION: u64 = 1;
+
 /// The receive side of one `(author_id, chain_id)` generation: derives message
 /// keys forward from a starting iteration, with a bounded skip/replay window.
 pub struct ReceiverChain {
@@ -362,6 +365,104 @@ impl ReceiverChain {
             next_iteration: skdm.body.iteration,
             skipped: HashMap::new(),
         })
+    }
+
+    /// Serialize the **live** receiver state for sealing at rest (ADR-010; used by
+    /// [`crate::node::channel`]).
+    ///
+    /// The whole live state is captured, not just the SKDM that created the chain:
+    /// `next_iteration` and the skipped-key cache are what make replay rejection and
+    /// out-of-order delivery work, so rebuilding from the SKDM instead would reset
+    /// the head and let an already-consumed iteration decrypt again after a restart.
+    /// Contains key material, so the buffer zeroizes on drop.
+    #[must_use]
+    pub fn to_state(&self) -> Zeroizing<Vec<u8>> {
+        let mut e = Encoder::new();
+        e.array(9)
+            .uint(RECEIVER_STATE_VERSION)
+            .bytes(&self.channel_id)
+            .uint(self.epoch)
+            .bytes(&self.author_id)
+            .uint(self.chain_id)
+            .bytes(&self.signing_pubkey.to_bytes())
+            .bytes(self.chain_key.bytes())
+            .uint(self.next_iteration);
+        // Skipped keys in iteration order, so the bytes are canonical.
+        let mut skipped: Vec<(&u64, &MessageKey)> = self.skipped.iter().collect();
+        skipped.sort_by_key(|(i, _)| **i);
+        e.array(skipped.len());
+        for (iter, mk) in skipped {
+            e.array(2).uint(*iter).bytes(mk.bytes());
+        }
+        Zeroizing::new(e.finish())
+    }
+
+    /// Restore a receiver chain from [`ReceiverChain::to_state`].
+    pub fn from_state(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 9 {
+            return Err(Error::MalformedBundle("receiver chain state arity"));
+        }
+        if d.uint()? != RECEIVER_STATE_VERSION {
+            return Err(Error::MalformedBundle("receiver chain state version"));
+        }
+        let channel_id: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("receiver chain state channel_id"))?;
+        let epoch = d.uint()?;
+        let author_id: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("receiver chain state author_id"))?;
+        let chain_id = d.uint()?;
+        let pk: [u8; crate::hash::COMPOSITE_PUB_LEN] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("receiver chain state signing key"))?;
+        let signing_pubkey = CompositePublicKey::from_bytes(&pk)?;
+        let ck: [u8; 32] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedBundle("receiver chain state chain_key"))?;
+        let next_iteration = d.uint()?;
+        let n = d.array()?;
+        if n > MAX_CACHE {
+            return Err(Error::SizeLimitExceeded("receiver chain skipped cache"));
+        }
+        let mut skipped = HashMap::with_capacity(n);
+        for _ in 0..n {
+            if d.array()? != 2 {
+                return Err(Error::MalformedBundle("receiver chain skipped arity"));
+            }
+            let iter = d.uint()?;
+            let mk: [u8; 32] = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedBundle("receiver chain skipped key"))?;
+            // A cached key at or above the live head would be derivable twice.
+            if iter >= next_iteration {
+                return Err(Error::MalformedBundle("receiver chain skipped iteration"));
+            }
+            skipped.insert(iter, MessageKey::from_bytes(mk));
+        }
+        d.finish()?;
+        Ok(Self {
+            channel_id,
+            epoch,
+            author_id,
+            chain_id,
+            signing_pubkey,
+            chain_key: ChainKey::from_bytes(ck),
+            next_iteration,
+            skipped,
+        })
+    }
+
+    /// The author whose chain this is.
+    #[must_use]
+    pub fn author_id(&self) -> Digest32 {
+        self.author_id
     }
 
     /// The generation id this receiver reads.
@@ -600,5 +701,67 @@ mod tests {
         let s2 = s.rotated(2_000).unwrap();
         assert_eq!(s2.chain_id(), 1);
         assert_eq!(s2.next_iteration(), 0);
+    }
+    #[test]
+    fn receiver_chain_state_round_trips_and_preserves_replay_rejection() {
+        // A receiver chain restored from its sealed state must reject an iteration
+        // it already consumed — the reason the live state is persisted rather than
+        // rebuilt from the SKDM.
+        let author = root(5, 6);
+        let mut sender =
+            SenderChain::new(&[0xC7u8; 32], 3, &author.fingerprint(), 0, 1_000).unwrap();
+        let (iteration, key) = sender.current_position();
+        let skdm = sender.skdm_for(&author, iteration, key).unwrap();
+        let mut receiver =
+            ReceiverChain::from_skdm(&skdm, &author.public_key(), &[0xC7u8; 32], 3).unwrap();
+
+        let m0 = sender.encrypt(b"first").unwrap();
+        let m1 = sender.encrypt(b"second").unwrap();
+        let m2 = sender.encrypt(b"third").unwrap();
+        // Consume out of order so the skipped cache is populated.
+        assert_eq!(receiver.decrypt(&m2).unwrap(), b"third");
+        assert_eq!(receiver.next_iteration(), 3);
+
+        let state = receiver.to_state();
+        let mut restored = ReceiverChain::from_state(&state).unwrap();
+        assert_eq!(restored.chain_id(), receiver.chain_id());
+        assert_eq!(restored.next_iteration(), receiver.next_iteration());
+        assert_eq!(restored.author_id(), author.fingerprint());
+        // The cached skipped keys came back: the earlier messages still open.
+        assert_eq!(restored.decrypt(&m0).unwrap(), b"first");
+        assert_eq!(restored.decrypt(&m1).unwrap(), b"second");
+        // And a replay of an already-consumed iteration is refused after the
+        // restore, exactly as on the live chain.
+        assert!(restored.decrypt(&m0).is_err());
+        assert!(restored.decrypt(&m2).is_err());
+
+        // A cached key at or above the live head would be derivable twice: refused.
+        let mut e = Encoder::new();
+        e.array(9)
+            .uint(RECEIVER_STATE_VERSION)
+            .bytes(&[0xC7u8; 32])
+            .uint(3)
+            .bytes(&author.fingerprint())
+            .uint(0)
+            .bytes(&author.public_key().to_bytes())
+            .bytes(&[7u8; 32])
+            .uint(2)
+            .array(1);
+        e.array(2).uint(2).bytes(&[1u8; 32]);
+        assert!(matches!(
+            ReceiverChain::from_state(&e.finish()),
+            Err(Error::MalformedBundle("receiver chain skipped iteration"))
+        ));
+        // Wrong version and wrong arity are refused.
+        let mut e = Encoder::new();
+        e.array(9).uint(RECEIVER_STATE_VERSION + 1);
+        for _ in 0..7 {
+            e.uint(0);
+        }
+        e.array(0);
+        assert!(matches!(
+            ReceiverChain::from_state(&e.finish()),
+            Err(Error::MalformedBundle("receiver chain state version"))
+        ));
     }
 }
