@@ -63,11 +63,14 @@ pub enum StructTag {
     EskPublication = 0x0010,
     /// `0x0011` — transport session-establishment record (ADR-011).
     SessionEstablishment = 0x0011,
+    /// `0x0012` — member prekey-bundle rendezvous record (ADR-016 M14): a
+    /// member's root-signed prekey bundle on the rendezvous board.
+    MemberBundleRecord = 0x0012,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 17] = [
+    pub const ALL: [StructTag; 18] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -85,6 +88,7 @@ impl StructTag {
         StructTag::ServiceAdvertisement,
         StructTag::EskPublication,
         StructTag::SessionEstablishment,
+        StructTag::MemberBundleRecord,
     ];
 
     /// The 2-byte tag value.
@@ -95,7 +99,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 17-element table: trivial and avoids an
+        // Linear scan over an 18-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -126,6 +130,7 @@ impl StructTag {
             StructTag::ServiceAdvertisement => "vox/service-advertisement/v1",
             StructTag::EskPublication => "vox/esk-publication/v1",
             StructTag::SessionEstablishment => "vox/session-establishment/v1",
+            StructTag::MemberBundleRecord => "vox/member-bundle-record/v1",
         }
     }
 }
@@ -301,10 +306,10 @@ mod tests {
             assert!(d.starts_with("vox/"), "{d}");
             assert!(d.ends_with("/v1"), "{d}");
         }
-        // Registry covers exactly 0x0001..=0x0011.
+        // Registry covers exactly 0x0001..=0x0012.
         assert_eq!(seen.iter().min(), Some(&0x0001));
-        assert_eq!(seen.iter().max(), Some(&0x0011));
-        assert_eq!(seen.len(), 17);
+        assert_eq!(seen.iter().max(), Some(&0x0012));
+        assert_eq!(seen.len(), 18);
     }
 
     #[test]

@@ -435,6 +435,213 @@ impl PreJoinRecord {
     }
 }
 
+// ===========================================================================
+// Member prekey-bundle record (0x0012) — ADR-016 M14
+// ===========================================================================
+
+/// A channel member's root-signed **prekey bundle** on the rendezvous board
+/// (ADR-016 §"The rendezvous service and the member bundle record").
+///
+/// After a join, every consenting member seals its SKDM to the newcomer using
+/// the newcomer's pre-join bundle; the newcomer seals *its* SKDM to each member
+/// using that member's bundle record — this one. Like the member address record
+/// it is member-only (the store resolves the author's key from the authenticated
+/// membership), `(channelID, epoch)`-scoped, `seq`/`timestamp` anti-replayed and
+/// TTL'd — but its TTL is the ADR-002 signed-prekey cadence (7 days) rather than
+/// the address record's 2 hours, and it is refreshed on rotation and when the
+/// one-time pool crosses its low-water mark. It is a separate kind because the
+/// address record is tiny and refreshed on a minutes scale while a bundle is
+/// ~10–20 KB and changes weekly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberBundleRecord {
+    /// The publishing member's composite-identity fingerprint.
+    pub author_id: Digest32,
+    /// The channel (ADR-005 channelID).
+    pub channel_id: Digest32,
+    /// The membership epoch (ADR-007).
+    pub epoch: u64,
+    /// The member's current prekey bundle; its `root_pub` MUST be the member's
+    /// own composite root (checked in [`MemberBundleRecord::verify`]).
+    pub prekey_bundle: PrekeyBundlePublic,
+    /// Monotonic per-`(author, channel, epoch)` sequence (anti-replay).
+    pub seq: u64,
+    /// Wall-clock publication time (epoch-seconds).
+    pub timestamp: u64,
+    /// Requested time-to-live in seconds; the store caps it at
+    /// [`crate::nat::store::BUNDLE_MAX_TTL_SECS`].
+    pub ttl_secs: u64,
+    /// The author's composite signature over [`MemberBundleRecord::signing_input`].
+    pub signature: CompositeSignature,
+}
+
+impl MemberBundleRecord {
+    /// The canonical signed body (arity 8): `[author_id, channelID, epoch,
+    /// prekey_bundle, seq, timestamp, ttl_secs, [sign_algo]]`.
+    fn canonical_body(
+        author_id: &Digest32,
+        channel_id: &Digest32,
+        epoch: u64,
+        prekey_bundle_bytes: &[u8],
+        seq: u64,
+        timestamp: u64,
+        ttl_secs: u64,
+    ) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(8)
+            .bytes(author_id)
+            .bytes(channel_id)
+            .uint(epoch)
+            .bytes(prekey_bundle_bytes)
+            .uint(seq)
+            .uint(timestamp)
+            .uint(ttl_secs)
+            .array(1)
+            .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
+        e.finish()
+    }
+
+    /// The signing input: `vox/member-bundle-record/v1 ‖ canonical_body`.
+    #[must_use]
+    pub fn signing_input(&self) -> Vec<u8> {
+        signing_input(
+            StructTag::MemberBundleRecord,
+            &Self::canonical_body(
+                &self.author_id,
+                &self.channel_id,
+                self.epoch,
+                &self.prekey_bundle.encode_canonical(),
+                self.seq,
+                self.timestamp,
+                self.ttl_secs,
+            ),
+        )
+    }
+
+    /// Build and sign a member bundle record. `author_id` is the signer's
+    /// fingerprint, and the bundle's root MUST be the signer's key (else
+    /// [`Error::MalformedRendezvous`] — a member cannot publish someone else's
+    /// bundle under its own name).
+    pub fn build(
+        signer: &dyn RootSigner,
+        channel_id: &Digest32,
+        epoch: u64,
+        prekey_bundle: PrekeyBundlePublic,
+        seq: u64,
+        timestamp: u64,
+        ttl_secs: u64,
+    ) -> Result<Self> {
+        if prekey_bundle.root_pub != signer.public_key().to_bytes() {
+            return Err(Error::MalformedRendezvous(
+                "member-bundle prekey bundle root != signer",
+            ));
+        }
+        let author_id = signer.fingerprint();
+        let bundle_bytes = prekey_bundle.encode_canonical();
+        if bundle_bytes.len() > MAX_PREKEY_BUNDLE_BYTES {
+            return Err(Error::SizeLimitExceeded("member-bundle prekey bundle"));
+        }
+        let body = Self::canonical_body(
+            &author_id,
+            channel_id,
+            epoch,
+            &bundle_bytes,
+            seq,
+            timestamp,
+            ttl_secs,
+        );
+        let signature = signer.sign(&signing_input(StructTag::MemberBundleRecord, &body))?;
+        Ok(Self {
+            author_id,
+            channel_id: *channel_id,
+            epoch,
+            prekey_bundle,
+            seq,
+            timestamp,
+            ttl_secs,
+            signature,
+        })
+    }
+
+    /// Frame for the wire (tag `0x0012`): the 7 signed fields, the algo array,
+    /// then the composite signature (arity 9).
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(9)
+            .bytes(&self.author_id)
+            .bytes(&self.channel_id)
+            .uint(self.epoch)
+            .bytes(&self.prekey_bundle.encode_canonical())
+            .uint(self.seq)
+            .uint(self.timestamp)
+            .uint(self.ttl_secs)
+            .array(1)
+            .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65))
+            .bytes(&self.signature.to_bytes());
+        frame(StructTag::MemberBundleRecord, &e.finish())
+    }
+
+    /// Parse a framed member bundle record (does **not** verify — call
+    /// [`MemberBundleRecord::verify`]).
+    pub fn from_wire(bytes: &[u8]) -> Result<Self> {
+        let parsed = parse_frame(bytes)?;
+        if parsed.tag != StructTag::MemberBundleRecord {
+            return Err(Error::MalformedRendezvous("member-bundle wrong struct tag"));
+        }
+        let mut d = Decoder::new(parsed.body);
+        if d.array()? != 9 {
+            return Err(Error::MalformedRendezvous("member-bundle wire arity"));
+        }
+        let author_id = take_digest(&mut d, "member-bundle author_id length")?;
+        let channel_id = take_digest(&mut d, "member-bundle channel_id length")?;
+        let epoch = d.uint()?;
+        let bundle_bytes = d.bytes()?;
+        if bundle_bytes.len() > MAX_PREKEY_BUNDLE_BYTES {
+            return Err(Error::SizeLimitExceeded("member-bundle prekey bundle"));
+        }
+        let prekey_bundle = PrekeyBundlePublic::decode_canonical(bundle_bytes)?;
+        let seq = d.uint()?;
+        let timestamp = d.uint()?;
+        let ttl_secs = d.uint()?;
+        take_and_check_algo(&mut d, "member-bundle algo arity")?;
+        let sig_bytes: [u8; COMPOSITE_SIG_LEN] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedRendezvous("member-bundle signature length"))?;
+        d.finish()?;
+        let signature = CompositeSignature::from_bytes(&sig_bytes)?;
+        Ok(Self {
+            author_id,
+            channel_id,
+            epoch,
+            prekey_bundle,
+            seq,
+            timestamp,
+            ttl_secs,
+            signature,
+        })
+    }
+
+    /// Verify against the member's composite public key (supplied by the caller
+    /// from the authenticated membership, as for [`RendezvousRecord::verify`]):
+    /// fingerprint == `author_id`, the record signature verifies, the bundle's
+    /// root **is** this member, and every signature inside the bundle verifies.
+    pub fn verify(&self, author_pubkey: &CompositePublicKey) -> Result<()> {
+        if author_pubkey.fingerprint() != self.author_id {
+            return Err(Error::MalformedRendezvous(
+                "member-bundle author_id != signer fingerprint",
+            ));
+        }
+        author_pubkey.verify(&self.signing_input(), &self.signature)?;
+        if self.prekey_bundle.root_pub != author_pubkey.to_bytes() {
+            return Err(Error::MalformedRendezvous(
+                "member-bundle prekey bundle root != author",
+            ));
+        }
+        self.prekey_bundle.verify()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +771,45 @@ mod tests {
         bad.root_pub = other.public_key().to_bytes();
         let rec2 = PreJoinRecord::build(&s, &[8u8; 32], bad, endpoints(), 1, 100).unwrap();
         assert!(rec2.verify().is_err());
+    }
+    #[test]
+    fn member_bundle_record_round_trips_verifies_and_rejects_tamper_and_confusion() {
+        let s = signer(9, 10);
+        let other = signer(11, 12);
+        let cid = [3u8; 32];
+        let rec = MemberBundleRecord::build(&s, &cid, 4, bundle(&s), 7, 1_000, 86_400).unwrap();
+        rec.verify(&s.public_key()).unwrap();
+        let wire = rec.to_wire();
+        let back = MemberBundleRecord::from_wire(&wire).unwrap();
+        assert_eq!(back, rec);
+        back.verify(&s.public_key()).unwrap();
+        // Wrong member key: fingerprint mismatch.
+        assert!(matches!(
+            back.verify(&other.public_key()),
+            Err(Error::MalformedRendezvous(
+                "member-bundle author_id != signer fingerprint"
+            ))
+        ));
+        // Tamper the last channel_id byte (still parses; the signature fails).
+        let mut t = wire.clone();
+        let cid_end = t.windows(32).position(|w| w == cid).unwrap() + 32;
+        t[cid_end - 1] ^= 1;
+        let tampered = MemberBundleRecord::from_wire(&t).unwrap();
+        assert_ne!(tampered.channel_id, cid);
+        assert!(tampered.verify(&s.public_key()).is_err());
+        // Tag confusion: an address record is not a bundle record and vice versa.
+        let addr = RendezvousRecord::build(&s, &cid, 4, endpoints(), 1, 1_000, 60).unwrap();
+        assert!(matches!(
+            MemberBundleRecord::from_wire(&addr.to_wire()),
+            Err(Error::MalformedRendezvous("member-bundle wrong struct tag"))
+        ));
+        assert!(RendezvousRecord::from_wire(&wire).is_err());
+        // A member cannot publish another identity's bundle.
+        assert!(matches!(
+            MemberBundleRecord::build(&s, &cid, 4, bundle(&other), 8, 1_000, 60),
+            Err(Error::MalformedRendezvous(
+                "member-bundle prekey bundle root != signer"
+            ))
+        ));
     }
 }
