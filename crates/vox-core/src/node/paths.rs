@@ -4,10 +4,11 @@
 //! - config: `$XDG_CONFIG_HOME/vox/` (macOS: `~/Library/Application Support/vox/`)
 //! - data:   `$XDG_DATA_HOME/vox/<profile>/` holding `vault.cbor` and `store.redb`
 //!
-//! Precedence (ADR-015): explicit override > `VOX_CONFIG_DIR` / `VOX_DATA_DIR` env
-//! > XDG env > platform default. Directories are created `0700` and files are
-//! created `0600` on Unix; ADR-015 scopes clients to macOS + Linux, and on other
-//! platforms the mode calls are no-ops (documented, not hidden).
+//! Precedence (ADR-015), highest first: explicit override, then the
+//! `VOX_CONFIG_DIR` / `VOX_DATA_DIR` env vars, then the XDG env vars, then the
+//! platform default. Directories are created `0700` and files are created `0600`
+//! on Unix; ADR-015 scopes clients to macOS + Linux, and on other platforms the
+//! mode calls are no-ops (documented, not hidden).
 
 use std::path::{Path, PathBuf};
 
