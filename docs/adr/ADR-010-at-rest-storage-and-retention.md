@@ -2,7 +2,7 @@
 
 **Status**: implemented (M8, `crates/vox-core/src/atrest/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
+**Updated**: 2026-09-20 — identity-level key material (the prekey ring) given its at-rest home and derivation (ADR-016 M14.3). 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: storage, at-rest, encryption, retention, ttl, device-seizure, app-lock
 
@@ -148,6 +148,28 @@ plainly rather than implying a guarantee we cannot make.
 
 These record the concrete decisions made building this ADR (`crates/vox-core/src/atrest/`), so the spec and code stay in lockstep:
 
+- **Identity-level key material: a third home, single-factor by design (M14.3).** §"Two distinct
+  encryption layers" names two homes — the per-channel SEK store for *per-channel* material, and the
+  separate identity domain (the passphrase-sealed vault) for the root. The ADR-002 §2 key-agreement keys
+  are neither: they are **identity-level** (shared by every channel) and they rotate automatically while
+  the app runs. Both existing homes are wrong for them: re-sealing the vault needs the identity
+  passphrase, which is deliberately never retained (ADR-015), so automatic rotation would have to
+  re-prompt; and a per-channel SEK would make prekeys unavailable exactly when that channel is closed.
+  So the ring is a `SegmentKind::PrekeyRing` segment (new kind, AAD tag `vox/seg/prekey-ring/v1`, stable
+  code 5) in the profile store, sealed under a key derived from the **identity factor alone**:
+  `ring_channel = SHA-256("vox/prekey-ring-pseudo-channel/v1")` (a reserved pseudo-channel, not a real
+  channelID), then `factor_id` exactly as §"Double-lock key derivation" defines it, then
+  `ring_key = HKDF-SHA-256(factor_id, info = "vox/prekey-ring-sek/v1")` — the extra step keeping the ring
+  key domain-separated from every other `factor_id` consumer. This is single-factor **and not a
+  weakening**: the identity factor requires the unlocked identity domain, which requires the identity
+  passphrase, so the ring is gated by the same secret as the root it belongs to; it is derived without
+  reading raw private-key bytes (so a delegated `gpg-agent`/Enclave signer works); and it is non-circular
+  for the same reason per-channel SEKs are — the identity domain unlocks first. The node holds the ring
+  only while unlocked and drops it on app-lock, so no key-agreement secret sits behind a lock. A ring
+  sealed to another identity, or tampered with, fails as `AtRestUnlockFailed` and is **never** silently
+  regenerated (that would invalidate every published bundle); on decode every stored secret must re-derive
+  its recorded public key and every root signature must verify (ADR-002 Implementation notes). The
+  ADR-016 M13 restart gate proves the whole composed path at production Argon2id parameters.
 - **Argon2id profile floor is structural (`atrest::sek::Argon2Profile`).** The "≥256 MB, ≥3 passes"
   floor above is encoded as `ADR_MIN_M_COST_KIB` / `ADR_MIN_T_COST` and enforced at **compile time**
   against the production profile (256 MiB / 3 passes / p=1, id 1, the default) by a `const` assertion.

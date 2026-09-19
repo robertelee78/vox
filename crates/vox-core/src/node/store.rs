@@ -53,6 +53,7 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::PlaintextCache => 2,
         SegmentKind::Index => 3,
         SegmentKind::KeyMaterial => 4,
+        SegmentKind::PrekeyRing => 5,
     }
 }
 

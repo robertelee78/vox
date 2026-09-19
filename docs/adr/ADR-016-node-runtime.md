@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.2 done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.3 done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -340,6 +340,21 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   record 18 084 B, pre-join record 20 211 B, address record 3 634 B → `MAX_RENDEZVOUS_FRAME` 48 KiB.
   The `MembershipOracle` for a node comes from its open channels' state (M14.5 wires it); the
   anchor's oracle from stored genesis/admin/bundle material is M15.
+- **Prekey ring (M14.3).** M13's node could sign, seal and append but held **no key-agreement keys**:
+  nothing to put in a bundle record and nothing to answer PQXDH with. `node::prekeys::PrekeyRing` is
+  that state — identity DH key, current and retained-previous signed prekey, one-time pool, and the
+  bounded consumed set ADR-004's serverless semantics require — persisted in a new
+  `SegmentKind::PrekeyRing` segment sealed under an identity-factor-derived key (ADR-010 Implementation
+  notes explain why identity-level material needed a third at-rest home). Policy lands where it belongs:
+  the ADR-002 §2 rotation cadence, retain-previous window, pool low-water refill and one-shot consumption
+  are all here, closing that ADR's "no rotation cadence" gap (ADR-002/ADR-004 Implementation notes).
+  `load_or_create` is the single entry point: the node calls it after `CreateIdentity` and after every
+  `Unlock`, so the cadence is applied on unlock, and it drops the ring on lock (no prekey secret behind a
+  lock — an actor test pins it). Proven by nine module tests (bundle verification, depleted-pool
+  fallback, restart survival, wrong-identity and tamper refusal, one-shot consumption across a restart,
+  the concurrent-duplicate window and its expiry, the drain cap, rotation retaining the previous prekey
+  for exactly one cadence, low-water refill at the real 64-prekey size) plus the M13 restart gate, which
+  now also asserts the ring reloads and its bundle verifies at production Argon2id parameters.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

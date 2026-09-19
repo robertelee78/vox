@@ -36,6 +36,7 @@ use crate::node::api::{
 };
 use crate::node::channel::{ChannelState, Rendered};
 use crate::node::paths::Paths;
+use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
 
 /// Command queue depth (commands beyond it apply backpressure to the client).
@@ -94,6 +95,11 @@ impl NodeHandle {
 pub struct Node {
     paths: Paths,
     profile: Option<Profile>,
+    /// The identity's key-agreement keys (ADR-002 §2), held only while unlocked:
+    /// loaded (or generated on first use) by [`crate::node::prekeys::load_or_create`]
+    /// after the identity unlocks and dropped on lock, so no prekey secret is in
+    /// memory behind a lock (ADR-010/015). M14.4+ publishes its bundle.
+    prekeys: Option<PrekeyRing>,
     channels: BTreeMap<Digest32, ChannelState>,
     clock: Clock,
     argon2: Argon2Profile,
@@ -127,6 +133,7 @@ impl Node {
         let node = Self {
             paths,
             profile,
+            prekeys: None,
             channels: BTreeMap::new(),
             clock,
             argon2,
@@ -194,6 +201,11 @@ impl Node {
         match Profile::create_with_profile(self.paths.clone(), passphrase, now, self.argon2) {
             Ok(p) => {
                 self.profile = Some(p);
+                // A fresh identity gets its prekey ring immediately: without it the
+                // node has nothing to publish and cannot answer PQXDH.
+                if let Err(e) = self.load_prekeys(now) {
+                    return Outcome::Failed(fault_of(&e));
+                }
                 Outcome::Done
             }
             Err(e) => Outcome::Failed(fault_of(&e)),
@@ -206,6 +218,13 @@ impl Node {
         };
         match profile.unlock(passphrase) {
             Ok(()) => {
+                let now = self.now();
+                if let Err(e) = self.load_prekeys(now) {
+                    // The identity is usable but the ring is not: lock again rather
+                    // than run without key-agreement keys.
+                    self.lock_all().await;
+                    return Outcome::Failed(fault_of(&e));
+                }
                 let _ = self.event_tx.send(NodeEvent::Unlocked).await;
                 Outcome::Done
             }
@@ -213,11 +232,28 @@ impl Node {
         }
     }
 
+    /// Load (or, on first use, generate) the prekey ring for the unlocked
+    /// identity, rotating the signed prekey and refilling the one-time pool if due
+    /// (ADR-002 §2 cadence, applied on every unlock).
+    fn load_prekeys(&mut self, now: u64) -> crate::error::Result<()> {
+        let profile = self
+            .profile
+            .as_ref()
+            .ok_or(crate::error::Error::Profile("no identity in this profile"))?;
+        let signer = profile.signer()?;
+        let (ring, _created) = prekeys::load_or_create(profile.store(), signer, now)?;
+        self.prekeys = Some(ring);
+        Ok(())
+    }
+
     async fn lock_all(&mut self) {
         let was_unlocked = self.profile.as_ref().is_some_and(Profile::is_unlocked);
         for (_, mut ch) in std::mem::take(&mut self.channels) {
             ch.lock_now();
         }
+        // Drop the prekey ring: its secrets zeroize on drop, so a locked node holds
+        // no key-agreement material (ADR-015 lock/zeroize).
+        self.prekeys = None;
         if let Some(p) = self.profile.as_mut() {
             p.lock();
         }
@@ -402,6 +438,62 @@ mod tests {
 
     fn paths(tmp: &tempfile::TempDir, name: &str) -> Paths {
         Paths::resolve(name, Some(tmp.path()), Some(&tmp.path().join("cfg"))).unwrap()
+    }
+
+    /// A node built directly (not spawned), so a test can observe private state
+    /// the handle deliberately never exposes — here: that no prekey secret is
+    /// retained behind a lock.
+    fn unspawned(paths: Paths, t: u64) -> Node {
+        let (event_tx, _event_rx) = mpsc::channel(EVENT_QUEUE);
+        Node {
+            paths,
+            profile: None,
+            prekeys: None,
+            channels: BTreeMap::new(),
+            clock: fixed_clock(t),
+            argon2: Argon2Profile::REDUCED,
+            view_tx: watch::Sender::new(NodeView::default()),
+            event_tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_prekey_ring_is_loaded_on_unlock_and_dropped_on_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = 1_700_000_000;
+        let mut node = unspawned(paths(&tmp, "alice"), t);
+
+        // A created identity gets a usable, root-signed ring straight away.
+        assert_eq!(node.create_identity(&secret("id-pp")), Outcome::Done);
+        let root = crate::identity::composite::RootSigner::public_key(
+            node.profile.as_ref().unwrap().signer().unwrap(),
+        );
+        let ring = node.prekeys.as_ref().expect("ring after create");
+        let first_spk = ring.signed_prekey_id();
+        let bundle = ring.bundle(&root).unwrap();
+        bundle.verify().unwrap();
+        assert_eq!(bundle.root_pub, root.to_bytes());
+        assert!(bundle.one_time_prekey.is_some());
+
+        // Lock: the ring is dropped (its secrets zeroize on drop), like the
+        // identity signer and every channel SEK.
+        node.lock_all().await;
+        assert!(node.prekeys.is_none(), "no prekey secrets behind a lock");
+        assert!(!node.profile.as_ref().unwrap().is_unlocked());
+
+        // A wrong passphrase leaves it locked and ringless.
+        assert_eq!(
+            node.unlock(&secret("wrong")).await,
+            Outcome::Failed(Fault::WrongPassphrase)
+        );
+        assert!(node.prekeys.is_none());
+
+        // The right passphrase reloads the *same* ring — not a fresh one, which
+        // would invalidate every bundle already published.
+        assert_eq!(node.unlock(&secret("id-pp")).await, Outcome::Done);
+        let ring = node.prekeys.as_ref().expect("ring after unlock");
+        assert_eq!(ring.signed_prekey_id(), first_spk);
+        assert_eq!(ring.bundle(&root).unwrap(), bundle);
     }
 
     #[tokio::test]
