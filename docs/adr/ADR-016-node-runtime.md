@@ -236,7 +236,19 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `&SekWrap` — the store cannot be handed plaintext or a raw key. `Batch` wraps one write
   transaction so a log append and its chain-state advance commit together; a dropped batch writes
   nothing (tested). Kind codes `LogDb=1, PlaintextCache=2, Index=3, KeyMaterial=4` are part of the
-  on-disk key and never reordered. `compact()` is the explicit space-reclamation call.
+  on-disk key and never reordered. `compact()` is the explicit space-reclamation call. `put_meta` /
+  `get_meta` hold public facts only (schema version, identity fingerprint, creation time).
+- **Profile (`node::profile`, M13.2).** `Profile::create` generates the native root
+  (`SoftwareRootSigner`), the X25519 identity key and the `self_seed`, records the root's **OpenPGP v4
+  fingerprint** (ADR-002 §GPG *Generate*; computed by `identity::openpgp`, verified against the
+  draft-bre "Alice" sample key and a GnuPG-2.5.20-generated key) in the `IdentityBackup`, seals the
+  vault under the production Argon2id profile, writes `vault.cbor` (`0600`, atomic), opens the store
+  and records the public fingerprint + creation time in `meta`. `open` starts **locked**; `unlock`
+  yields the `VaultRootSigner` (and refuses a vault whose identity disagrees with the store's
+  fingerprint — the two must never silently diverge); `lock` drops it, zeroizing on drop. Every
+  identity-needing operation goes through `Profile::signer()`, which is `Error::Profile("locked")`
+  while locked. One identity per profile; a second `create` is refused. The passphrase is a `&[u8]`
+  the caller owns and wipes.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

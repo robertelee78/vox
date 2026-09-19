@@ -230,6 +230,27 @@ impl Store {
         Ok(out)
     }
 
+    /// Write a public metadata entry (its own durable transaction). Meta holds
+    /// only public facts (schema version, identity fingerprint, creation time).
+    pub fn put_meta(&self, name: &str, value: &[u8]) -> Result<()> {
+        let txn = self.db.begin_write().map_err(storage("begin write"))?;
+        {
+            let mut meta = txn.open_table(META).map_err(storage("open meta"))?;
+            meta.insert(name, value).map_err(storage("write meta"))?;
+        }
+        txn.commit().map_err(storage("commit"))
+    }
+
+    /// Read a public metadata entry.
+    pub fn get_meta(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let txn = self.db.begin_read().map_err(storage("begin read"))?;
+        let meta = txn.open_table(META).map_err(storage("open meta"))?;
+        Ok(meta
+            .get(name)
+            .map_err(storage("read meta"))?
+            .map(|v| v.value().to_vec()))
+    }
+
     /// Begin an atomic multi-write batch. Nothing is visible until
     /// [`Batch::commit`]; a dropped batch writes nothing.
     pub fn batch(&self) -> Result<Batch<'_>> {

@@ -58,6 +58,7 @@ pub mod binding;
 pub mod composite;
 pub mod device;
 pub mod keyagreement;
+pub mod openpgp;
 pub mod rng;
 
 pub use backup::{IdentityBackup, SelfSeed};

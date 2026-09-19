@@ -265,6 +265,12 @@ pub enum Error {
         detail: String,
     },
 
+    /// A profile lifecycle state error (ADR-016 §Profile): no identity in the
+    /// profile, an identity already present, or an operation that needs the
+    /// unlocked identity while the profile is locked. Carries a static reason.
+    #[error("profile: {0}")]
+    Profile(&'static str),
+
     /// A profile/store path could not be resolved or prepared (ADR-016 §Layout):
     /// no home directory, a directory that could not be created with the required
     /// mode, or an I/O failure on the vault file. Carries a static reason plus the
