@@ -56,8 +56,11 @@
 //!   if the responder can still complete the handshake, which needs the consumed
 //!   secret — so it is retained for [`ONE_TIME_CONSUMED_RETAIN_SECS`] (and at most
 //!   [`ONE_TIME_CONSUMED_MAX`] entries) and served from the consumed set, flagged.
-//!   The session layer applies the "last-resort-grade" label; the ring supplies the
-//!   detection signal.
+//!   The ring is the **persistent** record of consumption;
+//!   [`crate::pairwise::OtpReuseTracker`] is the per-process one that
+//!   `Session::accept` turns into the `is_last_resort_grade` flag. M14.5 must derive
+//!   that flag from this verdict (or seed the tracker from the retained set), or a
+//!   restart would silently lose the downgrade — recorded in ADR-004.
 //! - [`OneTimeUse::Unknown`] — never issued by this ring, or retained no longer.
 //!   The handshake cannot be completed and the initiator must refetch a bundle.
 //!   ADR-004 specifies only the *concurrent* case, so bounding retention to genuine
