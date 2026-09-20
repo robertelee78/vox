@@ -4,9 +4,12 @@
 surface, the `.vox` name, capability-bearing rooms and audience-encrypted advertisements are specified
 here)
 **Date**: 2026-09-21
-**Updated**: 2026-09-21 — a room created by `vox serve` is **location-hidden** by default
-(`PathPolicy::RelayOnly`, ADR-012): a connecting machine never learns the serving machine's address, so
-`tcpdump` on it shows traffic to the relay and nothing else. The person-facing address is a **`.vox`
+**Updated**: 2026-09-21 — decision 6: **the carried session has no IP addresses of its own** (ULA-to-ULA
+on the connecting machine, loopback-to-loopback on the serving one, so no packet anywhere pairs a real
+address with the service's port — and the service sees every Vox client as `127.0.0.1`, which makes its
+own IP-based controls inert and redundant — Vox gates on the client's key and the room, one layer up). **IP-level anonymity is recorded as a non-goal**: an earlier revision of
+this ADR specified a relay-mandatory "location-hidden" room, reverted for buying a guarantee Vox does not
+make at the cost of relaying every byte forever. The person-facing address is a **`.vox`
 hostname** and the local entry point is
 a **Vox network interface** (`vox up`), because the criterion is that an *unmodified* tool reaches the
 name; the SOCKS5 proxy first recorded here is superseded (decision 5). The service is named by its
@@ -172,9 +175,7 @@ Rules the surface must honour:
   weak link in an otherwise strong chain, and nobody needs to remember this one.
 - **`vox connect` prompts for the passphrase unechoed**, or reads it from a pipe. Never a flag.
 - **`vox serve` refuses to start rather than appear to work.** If the host cannot be reached and has no
-  anchor configured, it says so and says what to do, instead of minting an address nobody can use. A
-  location-hidden room (decision 6) *requires* an anchor by construction, since a relay is the only path
-  it will take.
+  anchor configured, it says so and says what to do, instead of minting an address nobody can use.
 
 ### 5. One local entry point: a Vox interface (`vox up`)
 
@@ -187,8 +188,7 @@ The data path, with the two machines named unambiguously:
    Vox owns that address, so the packets arrive on the Vox interface, and Vox terminates the TCP in
    userspace (`smoltcp`, ADR-013's stated choice).
 2. **Over the Vox layer**, that stream is carried as one QUIC stream per TCP connection (ADR-013),
-   authorized by `dial:<port>` against the room's evaluator (ADR-007), over whatever path ADR-012
-   allows — for a `vox serve` room, a relay circuit and never a direct one (decision 6).
+   authorized by `dial:<port>` against the room's evaluator (ADR-007).
 3. On the **serving machine**, Vox connects to the local endpoint chosen when the service was declared —
    `vox serve 22` means its own `127.0.0.1:22`, where the real `sshd` is already listening.
 
@@ -232,41 +232,56 @@ Where a machine genuinely cannot take the interface, `vox forward` (already ship
 port and the user types `ssh -p <port> user@127.0.0.1`. That is a worse experience, labelled as one — a
 fallback, not a second supported design.
 
-### 6. A service room hides where it is
+### 6. The carried session has no IP addresses of its own
 
-Replacing a Tor private service means the address of the machine running it must not be discoverable by
-the people connecting to it. That is not implied by encryption and it is not implied by the overlay: the
-ADR-012 ladder *prefers a direct path*, and a direct path is precisely one where each side learns the
-other's address.
+`ssh` over Vox runs at a different layer from the network the two machines share, and the consequence is
+the one worth stating plainly: **neither machine's real address appears anywhere in the port-22
+conversation.**
 
-**So a room created by `vox serve` carries `PathPolicy::RelayOnly` in its genesis** (ADR-012), and the
-guarantee is concrete and testable:
-
-> On the connecting machine, `tcpdump` shows QUIC to the **relay** and nothing else. The machine's Vox
-> node never holds an address for the serving peer, because it is never told one.
-
-That required closing four disclosure channels, each of which exists in the shipped code and any one of
-which alone would defeat the property:
-
-| Channel | What it did |
+| Vantage point | The port-22 flow looks like |
 |---|---|
-| `RendezvousRecord.endpoints` | a member published its real addresses to the board, readable by anyone who knows the channelID |
-| the invite link | appended the minting node's own addresses — and the link is the thing handed out |
-| `CoordMessage::Connect` | the hole-punch exchange exists to hand a peer your reflexive addresses |
-| relay-first `upgrade()` | swapped a direct path in underneath a working relayed one |
+| connecting machine, Vox interface | `<its own ULA> → <host's ULA>:22` — both derived from keys (ADR-013 `overlay_addr`), routable nowhere off the machine |
+| serving machine, loopback | `127.0.0.1 → 127.0.0.1:22` — Vox dials the local endpoint the host declared |
+| the `sshd` process itself | a peer of `127.0.0.1`; the client's address is not in its logs, in `last`, or in `who` |
 
-A room-bound service in an *existing* chat room does not get this, and cannot: that room's genesis was
-written with `PathPolicy::Ladder`, its members have already exchanged addresses, and the policy is
-immutable by design (ADR-007). The two shapes of decision 3 therefore differ in one more way — a service
-room hides its host, and a service added to a chat room does not. `vox serve` says so when it prints the
-address.
+The two real addresses do exist — but on a **different flow at a different layer**: one UDP/QUIC
+association between the two Vox nodes. That flow carries no port 22, no channelID, no service tag and no
+identity in cleartext: SNI is the constant `vox.invalid`, ALPN names only the protocol, and TLS 1.3
+encrypts both identity certificates, so not even a fingerprint is on the wire. ADR-013's
+`TunnelRequest{channel_id, service_tag}` and every carried byte are stream frames inside it. **No packet
+anywhere pairs a real address with the service's port.**
 
-**The honest gap from Tor, stated once.** `RelayOnly` hides the serving machine from every other member
-and from anyone watching either machine's traffic. It does **not** hide it from the relay operator, who
-sees both ends — Vox relays in one hop where Tor uses three plus a rendezvous point. Since the operator
-runs their own anchor, the practical difference is that **a Vox service operator learns its clients'
-addresses, where a Tor operator does not.** Multi-hop circuits would close it, the circuit mechanism
-already chains, and this ADR does not claim it (ADR-012 §"What `RelayOnly` does and does not hide").
+**Vox knows exactly who is calling — the service is simply not told by an address.** Identity at the Vox
+layer is at *key* level and is per room: `tunnel::session::accept` holds the client's composite
+fingerprint, pinned by the ADR-011 handshake, together with the channelID it claimed, and checks
+`dial:<port>` against that room's evaluator **before any local connect** (ADR-013). That is strictly
+better evidence than an address — unspoofable, not shared by a NAT, and revocable per member.
+
+What does not reach the carried service is that identity, because every Vox client arrives at it from
+`127.0.0.1`. Two consequences follow, and both are recorded rather than discovered later:
+
+- **IP-based controls on the service are inert** for Vox clients (`sshd` host patterns, `hosts.allow`,
+  `fail2ban`, anything reading a peer address). They are also redundant: an address was always a weak
+  stand-in for identity, and the room's `dial:` capability plus ADR-007 per-member revocation is the
+  strong form of the same control.
+- **Attribution is Vox's job, not the service's logs.** The node holds `(room, client fingerprint)` at the
+  gate, so it can say who reached what; surfacing that — as an event and in the client — is part of M17.2,
+  because a capability that cannot be audited is half a capability. Nothing is prepended to the byte
+  stream and no credential is minted for the carried protocol: this ADR's Non-goals forbid both, and the
+  reason stands — a second auth scheme per service is overhead for a weaker outcome.
+
+**Non-goal: IP-level anonymity.** The two nodes' addresses are visible to each other and to an on-path
+observer whenever ADR-012's ladder finds a direct path — which it prefers, because the alternative is the
+relay operator's bandwidth on every byte for the life of the room. Vox hides *what* is reached, *which
+room* authorized it, and every Vox *identity* involved; it does not hide *where* the parties are. A
+relay-mandatory mode was specified in an earlier revision of this ADR and reverted, because it bought a
+guarantee this project does not make at a permanent bandwidth cost. What remains is the quasi-anonymity a
+keys-not-accounts system gives: an observer sees two addresses speaking Vox, never a fingerprint, a room,
+a service or a name. Anything needing location anonymity composes Vox over Tor, and nothing here prevents
+that.
+
+Volume and timing remain visible on the outer association, as for any tunnel; ADR-009's deniability work
+is where padding belongs if it is ever wanted.
 
 ### 7. The anchor is configuration, not an argument
 
@@ -337,6 +352,9 @@ Discovery is **convenience, never authorization**. Seeing an advertisement never
 - **No room-wide plaintext service announcements.** See decision 7.
 - **No service reachable by a non-member.** There is no anonymous access tier and no "public" service:
   the room is the boundary. A host who wants the world to reach something should use a web server.
+- **No IP-level anonymity, and no relay-mandatory mode to buy it.** See decision 6. The ladder's
+  preference for a direct path stands, because a room that relayed every byte forever would spend the
+  operator's bandwidth on a guarantee Vox does not make.
 - **No global namespace, and no name resolution off the machine.** A `.vox` name is the channelID in
   base32; it resolves only inside a client that has joined that room, from data it already holds. There
   is no directory, no registration, no DNS suffix to own, nothing to squat and nothing to enumerate.
@@ -360,8 +378,10 @@ Discovery is **convenience, never authorization**. Seeing an advertisement never
   trust a first sighting.
 - Every tool works with nothing configured — including the ones that have no proxy support at all — and
   no port is ever bound on either machine, so a `.vox` service collides with nothing the host already runs.
-- A connecting machine cannot discover where the service is, by any means available to it: not from the
-  board, not from the link, not from a punch exchange, and not by observing its own traffic (decision 6).
+- The carried session has no IP addresses of its own: it runs ULA-to-ULA on the connecting machine and
+  loopback-to-loopback on the serving one, so no packet anywhere pairs a real address with the service's
+  port, and no observer on either machine learns which service or which room a connection is for
+  (decision 6).
 
 ### Negative
 - A leaked address **and** passphrase together yield service access with no further human step. This is
@@ -380,11 +400,6 @@ Discovery is **convenience, never authorization**. Seeing an advertisement never
 - The interface needs a userspace TCP stack and per-platform plumbing (`utun`/`NetworkExtension`,
   `/dev/net/tun`), which is the largest single piece of engineering this ADR implies and the one most
   exposed to OS policy changes.
-- A location-hidden room relays **every byte, forever**, with no upgrade to amortise it: the anchor's
-  bandwidth and an extra hop of latency are the standing price of hiding the host. This is Tor's cost too,
-  and it is why the policy is per room rather than global.
-- The relay operator sees both ends. For the intended deployment — the operator's own anchor — that means
-  the operator learns client addresses, which is strictly weaker than Tor on that one axis.
 - Naming the service by its port means a host offering two services on one port in one room must fall
   back to `vox service add <tag>`. The port-named form is for the single-service room `vox serve`
   creates, which is the case being optimised.
@@ -396,20 +411,14 @@ Discovery is **convenience, never authorization**. Seeing an advertisement never
 
 Each item is one branch, red→green, with the ADR updated in the same change (house rule).
 
-- **M17.0 — `PathPolicy` in the genesis, and the four disclosure channels closed.** The genesis field
-  (ADR-007), `RelayOnly` enforcement in the record publisher, the link minter, the coordinator and the
-  upgrade path, and strictest-policy-wins per connection (ADR-012). This lands **first**, because it
-  changes the genesis body and therefore the channelID, and `vox serve` cannot write a room it cannot
-  express. Gate: against the `tests/support/vnet.rs` virtual network, a connecting node reaches a hidden
-  service and its socket **never emits a datagram addressed to the serving node**, while its node holds no
-  endpoint for that peer; the same test with `PathPolicy::Ladder` does go direct, so the gate proves the
-  policy and not merely a broken ladder.
 - **M17.1 — the service grant.** A `service_grant` field in the genesis policy; the responder issues
   the certificate when it admits an author; the evaluator already handles the rest. Gate: a joiner who
   never received an explicit grant can dial the room's service, a joiner to a room without a service
   grant cannot, and revoking one member leaves the others working.
 - **M17.2 — `vox serve` and `vox connect`.** The two commands, the port-named service, the generated
-  passphrase, the unechoed prompt, the refusal-to-start when unreachable with no anchor. Gate: two
+  passphrase, the unechoed prompt, the refusal-to-start when unreachable with no anchor, and the
+  attribution the host needs: `(room, client fingerprint)` surfaced as an event when a tunnel is served,
+  since the service's own logs can only ever say `127.0.0.1` (decision 6). Gate: two
   commands, two machines, real bytes — the M16.1 gate re-expressed as the two-command flow.
 - **M17.3 — `vox up`: the `.vox` name and the Vox interface.** Three parts, each independently gateable:
   (a) the resolver — `b32` channelID ↔ hostname, the room's host read off the log, `AAAA` = the ADR-013
@@ -424,12 +433,9 @@ Each item is one branch, red→green, with the ADR updated in the same change (h
   in the client. Gate: a member with the capability sees the tag without being told it; a member
   without it sees nothing and learns nothing.
 
-**M17.0 is first and everything else waits on it**, because it changes the genesis body: a room created
-before it exists cannot express a path policy, and a hidden room has to be hidden from creation — there is
-no retrofit for an address already published. M17.1 then depends on nothing else outstanding. M17.2
-depends on M17.0 and M17.1, and on ADR-012's port mapping (done, M15.1c) for the case where the host is
-directly reachable — which a hidden room deliberately never is. M17.3's resolver and interface can be
-built and gated before M17.2; only the printed hint needs it. M17.5 is independent of the rest.
+M17.1 depends on nothing outstanding. M17.2 depends on M17.1 and on ADR-012's port mapping (done,
+M15.1c) for the two-step case. M17.3 depends on M17.2 only for the printed hint; the resolver and the
+listener can be built and gated first. M17.5 is independent of the rest.
 
 ## Links
 **Depends on**: ADR-005 (the invite and its passphrase separation), ADR-007 (capabilities, consent,
