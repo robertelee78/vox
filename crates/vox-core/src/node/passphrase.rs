@@ -18,8 +18,18 @@
 //! someone over a phone. It contains `l` and `o` but **no `0`, `1`, `8` or `9`**, and no
 //! uppercase at all — so only one of each confusable pair exists and there is nothing
 //! to disambiguate: no zero-vs-O, no one-vs-l, no eight-vs-B. Groups of four
-//! are for the eye only; the hyphens are not part of the secret
-//! ([`normalize`] removes them).
+//! are for the eye only.
+//!
+//! **The hyphens are part of the secret.** They are there to be read, but nothing strips
+//! them: the passphrase is used exactly as printed, byte for byte, on both sides. That is a
+//! deliberate reversal of a first attempt that treated them as decoration and removed them
+//! at "the node's boundary" — which broke the moment anything used the library without going
+//! through that boundary, because a room created through the node and joined through
+//! `NodeNet::start_join` then derived two different secrets. A rule any direct caller can
+//! violate silently is worse than no rule, and what it was buying — tolerating a listener
+//! who drops the dashes — is not worth a secret that sometimes does not match itself. A
+//! person moving this is copying a 24-character string beside a 277-character address; they
+//! will copy it, not retype it.
 //!
 //! ## Entropy
 //! [`DEFAULT_GROUPS`] = 5 groups × 4 characters × 5 bits = **100 bits**, sampled from
@@ -75,17 +85,10 @@ pub fn generate(groups: usize) -> Result<Zeroizing<String>> {
     Ok(out)
 }
 
-/// A passphrase with its display hyphens removed, which is what the CPace handshake
-/// consumes (ADR-005).
-///
-/// Grouping is a reading aid, so a person who retypes the secret without hyphens, or
-/// with them, must open the same room. Nothing else is stripped: leading and trailing
-/// whitespace goes, but an interior space is left alone, because a *user*-chosen
-/// passphrase may legitimately contain one and this function is applied to both.
-#[must_use]
-pub fn normalize(passphrase: &str) -> Zeroizing<String> {
-    Zeroizing::new(passphrase.trim().replace('-', ""))
-}
+// There is deliberately no canonicalizing function here. See the module docs: a room
+// passphrase is used exactly as printed, so the only way for two sides to disagree is for
+// one of them to alter it — and the way to guarantee that never happens is to give nobody a
+// function that could.
 
 #[cfg(test)]
 mod tests {
@@ -123,13 +126,17 @@ mod tests {
     }
 
     #[test]
-    fn normalize_makes_hyphens_optional_and_leaves_words_alone() {
-        assert_eq!(normalize("k7n2-qm4v").as_str(), "k7n2qm4v");
-        assert_eq!(normalize(" k7n2qm4v \n").as_str(), "k7n2qm4v");
-        // A user-chosen phrase for an ordinary room keeps its spaces.
+    fn the_printed_form_is_the_secret() {
+        // The bug this guards: `vox serve` printed a hyphenated passphrase and handed the
+        // node a *different* byte string, so every join was refused with no clue why. The
+        // invariant is that what a person is shown is exactly what both sides use.
+        let p = generate(DEFAULT_GROUPS).unwrap();
+        assert!(p.contains('-'), "the printed form is grouped");
+        assert!(p.is_ascii(), "bytes and characters agree");
         assert_eq!(
-            normalize("correct horse battery").as_str(),
-            "correct horse battery"
+            p.to_string().as_bytes(),
+            p.as_bytes(),
+            "nothing transforms it"
         );
     }
 

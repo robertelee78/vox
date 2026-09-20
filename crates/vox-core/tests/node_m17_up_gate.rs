@@ -63,7 +63,7 @@ struct OneConnection {
 }
 
 impl HostDialer for OneConnection {
-    fn connection(&self, host: &Digest32) -> Option<Arc<VoxConnection>> {
+    async fn connection(&self, host: &Digest32) -> Option<Arc<VoxConnection>> {
         (*host == self.host).then(|| Arc::clone(&self.conn))
     }
 }

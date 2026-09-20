@@ -464,6 +464,33 @@ Each item is one branch, red→green, with the ADR updated in the same change (h
     service on the host's loopback and come back — with **no device, no route, no firewall rule, no port
     below 1024 and no `sudo`**. Mutation-checked by dialling with the wrong tag. Plus the negative: a name
     for a room this machine has not joined is refused at the proxy, so nothing is dialled.
+  - **Rehearsed end to end, 2026-09-21.** Four real commands on one machine, two profiles and a
+    headless anchor: `vox node` → `vox serve 22` → `vox connect <address>` → `vox up <room>` →
+    `ssh user@<52-char>.vox`. The host's own `sshd` answered through the overlay — remote software
+    version `OpenSSH_10.3`, a completed SSH transport handshake, and authentication failing only for
+    want of a key. **Three defects the gates could not have caught**, all of them in the composition
+    rather than the mechanism, are recorded here because they are the argument for rehearsing at all:
+    1. **The generated passphrase did not match itself.** `vox serve` handed the node the hyphenated
+       form while `vox connect` stripped the hyphens, so every join was refused with no indication
+       why. The release gate could not see it: it drove the node API directly and used one passphrase
+       value for both sides.
+       The first fix was wrong and is worth recording. It canonicalized — strip hyphens — at "the
+       node's boundary", making a hyphen never part of a room passphrase. That broke an existing test
+       immediately, for the right reason: a joiner calling `NodeNet::start_join` directly bypasses that
+       boundary, so a room created through the node and joined through the library derived two
+       different secrets. A rule any direct caller can violate silently is worse than no rule.
+       **The fix is symmetry, not canonicalization:** the hyphens are part of the secret, nothing
+       strips them, and there is deliberately no function that could. What is printed is what both
+       sides use, byte for byte. The cost — a listener who drops the dashes gets it wrong — is real and
+       accepted: this string is copied beside a 277-character address, not retyped.
+    2. **`vox node` printed an anchor spec nobody could dial.** A wildcard bind advertises `0.0.0.0`,
+       which names every interface to the kernel and nothing to a peer; it was printed as something to
+       paste into `--anchor`. Undialable addresses are now filtered out of that line.
+    3. **`vox up` refused to start on a race.** It dialled the host *before* binding, so a node that
+       had only just joined — and therefore had not yet read the board — could not find the host and
+       the command failed intermittently. Retrying inside the actor would have made it worse, because
+       the actor is what reads the board. The dial is now **per request**: the proxy binds at once and
+       asks the node to reach the host when a connection arrives.
   - **Removed, deliberately:** the Vox network interface (a `smoltcp` userspace TCP stack behind a `tun`
     device) and the `.vox` DNS responder. Both were built and gated; both were heavier than anything Tor
     requires, and the DNS responder is only needed by the automap variant this ADR does not take. See
