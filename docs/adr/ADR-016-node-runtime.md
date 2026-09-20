@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.7c done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.7d done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -443,6 +443,35 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   records, the joiner reads the board through the parsed `vox://` link, joins with an out-of-band
   passphrase, both ends encrypt and decrypt over the resulting session, and the joiner then builds local
   channel state that reads **nothing** — joining released no keys.
+- **The actor owns the network (M14.7d).** `Node` gained a second input: client commands and the network's
+  inbound work are interleaved in one `select!`, so channel state still has exactly one writer. The
+  network's lifetime is the *unlocked* identity's — binding the endpoint needs the identity's signer, so a
+  locked node has no network identity to present and `Lock` closes every connection and the endpoint
+  (`NodeView::listening` shows what it is bound to, which is public information). Creating or opening a
+  channel files its genesis and this node's address record and bundle on its own board, so a joiner can
+  learn what the channel is and how to reach us; a refusal there is normal (the ADR-012 refresh floor
+  declining a faster refresh), not an error. Inbound joins are answered, and inbound SKDMs are taken and
+  backfilled, emitting `PeerJoined` / `SenderKeyReceived`.
+  Wiring this surfaced **three gaps in the Decision, all now closed**, each of which only appears once one
+  connection carries many channels:
+  1. **A join stream never said which channel it was for.** The Decision's frame list starts with the
+     responder's challenge, which assumes the responder knows. It cannot: a connection is per *peer*. The
+     joiner now opens with a `WANT {channelID, epoch}` frame and the responder answers only for a channel
+     it holds open and can answer for (ADR-005 Implementation notes).
+  2. **A pairwise SKDM never said which session sealed it.** A session is bound to a `(channelID, epoch)`,
+     so the recipient could not pick one. The frame now carries the channelID outside the sealed message —
+     not a secret, and inside the authenticated stream regardless (ADR-006 is unaffected).
+  3. **"Any pending pre-join identity, for the join stream only" needed a source of truth.** It is a
+     *board* fact: a joiner announces itself by publishing its pre-join record (`0x0008`, self-signed,
+     publishable by anyone), and `accept_stream` consults the board, so ADR-007's **open passphrase join**
+     works without anyone maintaining a list. An identity with no record stays `Unknown` and reaches the
+     board and nothing else.
+  Inbound **sync** is refused with the coded reason for now rather than left to hang: ADR-008's engine is
+  synchronous and a session needs its own blocking thread plus shared access to the channel's store, which
+  is M14.7e along with the client-side `JoinChannel` / `Consent` / `Invite` commands. A test drives the
+  whole inbound path: a networked node binds on unlock, publishes its channel to its own board, a peer
+  fetches the genesis and bundle, announces itself with a pre-join record, completes a real join, is
+  admitted as a log author while reading nothing, and the endpoint is gone after `Lock`.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

@@ -82,6 +82,10 @@ pub struct NodeView {
     /// Whether every open channel's SEK is `mlock`ed (`true` when none are open).
     /// `false` surfaces the documented zeroize-only degradation (ADR-010/015).
     pub mlock_active: bool,
+    /// The endpoints this node is listening on, in ADR-012 multiaddr text form —
+    /// empty when it is not networked or is locked (binding needs the identity).
+    /// Public information: it is what an invite link advertises.
+    pub listening: Vec<String>,
     /// Every channel in the profile, in channelID order.
     pub channels: Vec<ChannelSummary>,
     /// The open channels' detail, in channelID order.
@@ -200,6 +204,25 @@ pub enum NodeEvent {
     ChannelClosed {
         /// The channel.
         channel_id: Digest32,
+    },
+    /// A peer completed an ADR-005 join against this node, which verified its
+    /// identity and admitted it as a log author. It can read nothing until this
+    /// user consents (ADR-007).
+    PeerJoined {
+        /// The channel joined.
+        channel_id: Digest32,
+        /// The joiner's verified identity fingerprint.
+        peer: Digest32,
+    },
+    /// A peer's sender key arrived, so that peer's messages become readable. Any
+    /// message already held as ciphertext was backfilled.
+    SenderKeyReceived {
+        /// The channel.
+        channel_id: Digest32,
+        /// The author who released the key.
+        peer: Digest32,
+        /// How many already-stored messages became readable.
+        backfilled: u64,
     },
     /// The actor has stopped.
     Shutdown,
