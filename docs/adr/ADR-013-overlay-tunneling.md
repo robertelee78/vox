@@ -2,7 +2,7 @@
 
 **Status**: implemented and **reachable** — the per-stream port-forward model runs end to end through the node (`crates/vox-core/src/{tunnel,node/tunnel}.rs`, `crates/vox-tui` `service`/`grant`/`forward`), gated by a release test that reaches a TCP service between two symmetric-NAT clients through an anchor; SOCKS front-end, signed session events, the SSH-CA binding and the TUN datapath remain (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
+**Updated**: 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: tunneling, tcp, ssh, tun, socks, authorization, zero-trust
 
@@ -211,17 +211,35 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     service. Both clients are behind symmetric NATs, so the path is a relayed circuit and the anchor
     carried packets it cannot read. A second connection over the same forward works too. `ssh` over Vox is
     this test with `sshd` in place of the echo, which is why the echo is enough.
+- **The SSH CA is narrowed to optional (decider, 2026-09-21).** The Decision above offers "`ssh` over Vox"
+  partly as a Vox-issued OpenSSH certificate bound to the Vox identity, replacing host-key TOFU and
+  `authorized_keys`. That is **no longer a requirement of this ADR.** The decider's reasoning, recorded
+  because it generalises: Vox is the layer traffic is routed and authorized *over*, and a room-bound
+  service should not bring its own authentication scheme — "way too much overhead and possibly weaker
+  security outcomes." A second trust root, certificate lifetimes, and a per-protocol credential path are
+  large surface for gain that only materialises at fleet scale; a carried protocol authenticating itself
+  exactly as it always has is both simpler and better understood. The mental model is Tor's hidden
+  service: the overlay decides **reach**, the service decides **who its users are**.
+  What this ADR therefore specifies is the **per-stream port-forward model**, complete: a local port
+  forwarded to a member's service, gated by the `dial:` capability. "`ssh` over Vox" means forwarding to
+  a real `sshd`, which is what ADR-016's M16.1 gate proves. The CA remains a coherent *optional* later
+  capability — the case for it is "the room's membership decides who may `ssh` in, without touching
+  `authorized_keys`", which is real for a fleet and pointless for one box — and if it is ever built it
+  gets its own ADR with its own threat model, rather than riding along in this one. The existing
+  `tunnel::sshca` module stays as the researched seam it is, unwired, and is no longer counted as an
+  unfinished obligation of this ADR.
 - **Known gaps (recorded 2026-09-19, revised 2026-09-20).** ~~No CLI~~ — `vox service` / `vox grant` /
   `vox forward` exist (M16.1b); `vox up` does not, and may not need to. ~~Consumers are the in-crate tests
   only~~ — the node is the consumer. What remains: tunnel session establishment is still not recorded as
-  **signed events** (the "accountability" line has no entry type). The **SSH CA** is still a bare Ed25519
-  seed with no binding to the ADR-007 capability tree, `verify_user_cert` still ignores
-  extensions/critical options, and the capability still rides in an extension rather than a critical
-  option — so "ssh over Vox" today means forwarding a port to a real `sshd`, which works and is what the
-  gate proves, not Vox issuing the host's certificates. **SOCKS** is still a codec with no listener
+  **signed events** (the "accountability" line has no entry type). The ~~**SSH CA**~~ — no longer an obligation of
+  this ADR (narrowed to optional above); `tunnel::sshca` remains an unwired seam whose gaps
+  (no capability-tree binding, `verify_user_cert` ignoring extensions/critical options, the capability in
+  an extension rather than a critical option) would be that future ADR's to close, not this one's. **SOCKS** is still a codec with no listener
   composing negotiate → CONNECT → service map → `session::dial` → reply, and `Reply::NotAllowed` is never
   emitted. Service **advertisements** exist only pairwise (the audience-encrypted `0x000F` entry does not),
-  so a member learns another's service tags out of band. The TUN/VPN datapath remains ADR-014's, as the
+  so a member learns another's service tags out of band — **ADR-017 M17.4** owns closing this, having
+  chosen the audience-encrypted form over a room-wide announcement. The person-facing surface
+  (`vox serve` / `vox connect`, capability-bearing rooms, anchors as configuration) is ADR-017's. The TUN/VPN datapath remains ADR-014's, as the
   Decision says.
 
 ## Links

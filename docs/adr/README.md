@@ -23,6 +23,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [014](ADR-014-macos-client.md) | macOS Client (native SwiftUI + Rust core) | 002, 005–010, 012, 013 |
 | [015](ADR-015-rust-tui-client.md) | Rust TUI Client (chat, swarm create/join, verification) | 002, 005–010, 012, 013 |
 | [016](ADR-016-node-runtime.md) | Node Runtime — composing the core (persistence, rendezvous service, join over the network, sync, headless anchor) | 002, 003, 005–008, 010–013, 015 |
+| [017](ADR-017-room-bound-services.md) | Room-Bound Services (the Tor-hidden-service equivalent) | 005, 007, 012, 013, 016 |
 
 ## Tiers
 
@@ -33,6 +34,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 - **Tier 4 — Network & overlay:** 011, 012, 013
 - **Tier 5 — App / platform:** 014, 015
 - **Tier 6 — Integration:** 016 (the runtime that composes Tiers 1–5 into a running node)
+- **Tier 7 — Product surface:** 017 (what a person actually does with the overlay)
 
 ## Status (2026-09-19)
 
@@ -94,8 +96,10 @@ honest, not aspirational:
 - **Transport (ADR-011):** cross-version interop matrix (handshake + identity-PoP) as a hard gate. —
   **UNMET**: no second implementation, no matrix, no CI job.
 - **Sync (ADR-008):** frontier + Negentropy-v1 interop vectors; the wire error-code table is honored. —
-  **PARTIAL**: every wire error code `0x01–0x08` is asserted end-to-end; frames and Negentropy messages are
-  round-trip-tested only, with no interop bytes against a reference.
+  **PARTIAL**: every wire error code `0x01–0x09` is asserted end-to-end (`0x09 TransportFailed` was added
+  2026-09-20 — a transport failure used to be reported as a protocol-version mismatch); frames and
+  Negentropy messages are round-trip-tested only, with no interop bytes against a reference. Range mode
+  itself is tested in memory and **never runs over a transport** — ADR-008's own first known gap.
 
 ## Engineering Mantra
 
