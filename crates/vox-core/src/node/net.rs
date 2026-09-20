@@ -117,6 +117,18 @@ impl PeerPolicy {
         }
     }
 
+    /// How many members this policy knows.
+    #[must_use]
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    /// How many anchors this policy knows.
+    #[must_use]
+    pub fn anchor_count(&self) -> usize {
+        self.anchors.len()
+    }
+
     /// The identities this policy is currently expecting a join from.
     #[must_use]
     pub fn pending_joiners(&self) -> Vec<Digest32> {
@@ -130,9 +142,14 @@ impl PeerPolicy {
     /// - **Anchor**: `rendezvous` (the board), `sync` (it replicates ciphertext it
     ///   can never read) and `coord` (it relays hole-punch signalling). Never
     ///   `join` or `pairwise`: it has no channel authority.
-    /// - **PendingJoiner**: `join` and `rendezvous` only — exactly ADR-016's "for
-    ///   the join stream only", plus the board it must publish its pre-join record
-    ///   to.
+    /// - **PendingJoiner**: `join`, `rendezvous` and `pairwise`. ADR-016's Decision
+    ///   says "for the join stream only", which is one stream too few: the moment a
+    ///   join completes, the newcomer must deliver its **own** sender key (ADR-007
+    ///   step 2), and it cannot wait to be reclassified — the responder only admits
+    ///   it as a member *after* the join's final frame, and the ADR-004 responder
+    ///   cannot speak first on the new session anyway. Allowing `pairwise` costs
+    ///   nothing: a sealed message from a peer we hold no session with cannot be
+    ///   opened and is dropped. Never `sync` (no log authority) and never `tunnel`.
     /// - **Unknown**: `rendezvous` only, gated further by the service's own policy
     ///   (ADR-012: reads open, member-only writes refused there).
     #[must_use]
@@ -143,9 +160,10 @@ impl PeerPolicy {
                 kind,
                 StreamKind::Rendezvous | StreamKind::Sync | StreamKind::Coord
             ),
-            PeerClass::PendingJoiner => {
-                matches!(kind, StreamKind::Join | StreamKind::Rendezvous)
-            }
+            PeerClass::PendingJoiner => matches!(
+                kind,
+                StreamKind::Join | StreamKind::Rendezvous | StreamKind::Pairwise
+            ),
             PeerClass::Unknown => matches!(kind, StreamKind::Rendezvous),
         }
     }
@@ -331,12 +349,18 @@ pub async fn accept_authorized(
     let (kind, mut send, mut recv) = accept_typed(conn).await?;
     let class = policy.classify(&conn.peer_id());
     if !PeerPolicy::allows(class, kind) {
-        let code = close_code(WireError::AuthenticatorInvalid);
-        let _ = send.reset(code);
-        let _ = recv.stop(code);
+        refuse_stream(&mut send, &mut recv);
         return Err(Error::StreamRefused("peer may not open this stream kind"));
     }
     Ok((kind, send, recv))
+}
+
+/// Reset both halves of a stream with the coded rejection — the same code an
+/// unauthenticated peer gets, so probing stream kinds reveals nothing.
+pub fn refuse_stream(send: &mut SendStream, recv: &mut RecvStream) {
+    let code = close_code(WireError::AuthenticatorInvalid);
+    let _ = send.reset(code);
+    let _ = recv.stop(code);
 }
 
 #[cfg(test)]
@@ -409,12 +433,14 @@ mod tests {
         for k in [Join, Pairwise, Tunnel] {
             assert!(!PeerPolicy::allows(PeerClass::Anchor, k));
         }
-        // ADR-016 exactly: a pending joiner gets the join stream (and the board it
-        // must publish its pre-join record to) and nothing else.
-        for k in [Join, Rendezvous] {
+        // A pending joiner gets the join stream, the board it must publish its
+        // pre-join record to, and `pairwise` — it has to deliver its own sender key
+        // the instant the join completes, before the responder has reclassified it.
+        for k in [Join, Rendezvous, Pairwise] {
             assert!(PeerPolicy::allows(PeerClass::PendingJoiner, k));
         }
-        for k in [Sync, Pairwise, Tunnel, Coord] {
+        // But no log authority and no tunnels.
+        for k in [Sync, Tunnel, Coord] {
             assert!(!PeerPolicy::allows(PeerClass::PendingJoiner, k));
         }
         // An unknown peer reaches the rendezvous service and nothing else.

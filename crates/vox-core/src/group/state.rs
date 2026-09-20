@@ -205,6 +205,12 @@ impl SenderChain {
         self.epoch
     }
 
+    /// The author this chain belongs to (this identity).
+    #[must_use]
+    pub fn author_id(&self) -> Digest32 {
+        self.author_id
+    }
+
     /// The generation id of this sender key.
     #[must_use]
     pub fn chain_id(&self) -> u64 {

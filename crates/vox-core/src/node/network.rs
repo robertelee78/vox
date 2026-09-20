@@ -54,6 +54,7 @@ use crate::node::prekeys::PrekeyRing;
 use crate::node::store::Store;
 use crate::time::Clock;
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
+use crate::transport::streams::accept_typed;
 use crate::transport::streams::StreamKind;
 
 /// The peer classification the accept path reads, refreshed by the actor whenever
@@ -307,6 +308,14 @@ impl NodeNet {
     /// serve it if it is the board. Anything the actor must handle comes back as an
     /// [`Inbound`].
     pub async fn accept_stream(&self, conn: &VoxConnection) -> Result<Inbound> {
+        let peer = conn.peer_id();
+        // **Authorize when the stream arrives, not before.** Accepting blocks until
+        // the peer opens something, which may be long after this loop iteration began
+        // — and in that window the peer can become a member (a join completes, a
+        // channel opens). Classifying against a snapshot taken *before* the await
+        // refused exactly the stream that mattered: a member delivering its sender key
+        // on a connection we had dialled before we knew it.
+        let (kind, mut send, mut recv) = accept_typed(conn).await?;
         let mut snapshot = self.policy.snapshot();
         // ADR-016's "pending pre-join identity" is a *board* fact, not a list someone
         // maintains: a joiner announces itself by publishing a pre-join record
@@ -315,13 +324,18 @@ impl NodeNet {
         // passphrase joins possible (ADR-007) without the actor having to be told
         // about every PUT — and an identity with no record stays `Unknown`, so it
         // reaches the board and nothing else.
-        let peer = conn.peer_id();
         if snapshot.classify(&peer) == crate::node::net::PeerClass::Unknown
             && self.peer_has_prejoin(&peer)
         {
             snapshot.expect_joiner(peer);
         }
-        self.accept_stream_with(conn, &snapshot).await
+        if !PeerPolicy::allows(snapshot.classify(&peer), kind) {
+            crate::node::net::refuse_stream(&mut send, &mut recv);
+            return Err(crate::error::Error::StreamRefused(
+                "peer may not open this stream kind",
+            ));
+        }
+        self.dispatch(peer, kind, send, recv).await
     }
 
     /// Whether `peer` has a live pre-join record on this board for any channel this
@@ -339,7 +353,8 @@ impl NodeNet {
         })
     }
 
-    /// [`NodeNet::accept_stream`] against an explicit policy snapshot.
+    /// [`NodeNet::accept_stream`] against an explicit policy snapshot (for callers
+    /// that maintain their own view; the node uses [`NodeNet::accept_stream`]).
     pub async fn accept_stream_with(
         &self,
         conn: &VoxConnection,
@@ -347,6 +362,17 @@ impl NodeNet {
     ) -> Result<Inbound> {
         let peer = conn.peer_id();
         let (kind, send, recv) = accept_authorized(conn, policy).await?;
+        self.dispatch(peer, kind, send, recv).await
+    }
+
+    /// Serve or hand up an authorized stream.
+    async fn dispatch(
+        &self,
+        peer: Digest32,
+        kind: StreamKind,
+        send: SendStream,
+        recv: RecvStream,
+    ) -> Result<Inbound> {
         match kind {
             StreamKind::Rendezvous => {
                 self.service.serve_stream(send, recv).await?;

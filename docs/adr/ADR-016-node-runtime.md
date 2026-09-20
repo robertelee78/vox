@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.7d done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; **M14 (two machines chat) gate met 2026-09-20** (`crates/vox-core/tests/node_m14_gate.rs`); the reachability ladder's port-mapped rung, the TUI join/consent flows and the cross-process spike remain
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -472,6 +472,35 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   whole inbound path: a networked node binds on unlock, publishes its channel to its own board, a peer
   fetches the genesis and bundle, announces itself with a pre-join record, completes a real join, is
   admitted as a log author while reading nothing, and the endpoint is gone after `Lock`.
+- **The client commands, and the M14 gate (M14.7e).** `Invite`, `JoinChannel`, `Consent` and `Sync` complete
+  the client API, and inbound sync now runs for real: the ADR-008 engine is synchronous, so a session moves
+  the channel out of the actor's map onto a `spawn_blocking` thread with a shared store handle
+  (`Profile::store_handle`) and back. While a channel is away, commands naming it answer `UnknownChannel` —
+  the session is short and the client retries, which beats blocking the whole actor or mutating channel
+  state from two threads. To make that possible the channel's persistence-only methods now take `&Store`
+  rather than `&Profile` (signing still needs the signer), and `ChannelState::me` comes from its own sender
+  chain, so rendering needs no signer at all.
+  **The gate is met** (`tests/node_m14_gate.rs`, production Argon2id + `(200,9)` PoW, ≈ 11 s in release):
+  three nodes create, invite, join with an out-of-band passphrase, consent, exchange messages both ways,
+  and the third — which joined and was consented to by nobody — receives the entire log and renders
+  **nothing**. Writing it exposed four more things the Decision had wrong or unstated, all now fixed:
+  1. **A sync stream did not name its channel either** (the same gap as join and pairwise): a frontier
+     session reconciles one log, so the initiator now sends a `(channelID, epoch)` preamble before handing
+     the stream to the engine. ADR-008's frames are untouched.
+  2. **The ADR-004 responder cannot speak first.** It has no sending chain until it has *received*, so a
+     member could never answer a newcomer. ADR-007 step 2 already says the newcomer broadcasts its own
+     sender key — that is now done as part of joining (and recorded with a grant, since a key without a
+     grant is a key the recipient must not use), which also unblocks the responder.
+  3. **A pending joiner needed the `pairwise` stream too**, not "the join stream only": the instant a join
+     completes the newcomer must deliver that key, before the responder has reclassified it as a member.
+  4. **A node must publish its records to the *anchors*, not only to its own board**, and must **learn the
+     current members from the board before syncing**. A key nobody can find cannot be admitted, and an
+     ADR-008 session hard-fails on the first entry from an unadmitted author — so a member who joined after
+     us would otherwise make every later session fail. Both are now part of join and sync.
+  And one bug worth recording because the fix is a rule, not a patch: **authorization must be evaluated
+  when a stream arrives, not when the accept loop iteration began.** Snapshotting the peer policy before
+  awaiting `accept_bi` refused exactly the stream that mattered — a member delivering its sender key on a
+  connection we had dialled before we knew it was a member.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

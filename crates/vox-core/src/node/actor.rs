@@ -40,6 +40,7 @@ use crate::node::network::{Inbound, NodeNet};
 use crate::node::paths::Paths;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
+use crate::transport::quic::VoxConnection;
 
 /// Command queue depth (commands beyond it apply backpressure to the client).
 const COMMAND_QUEUE: usize = 64;
@@ -69,6 +70,34 @@ enum NetEvent {
 // `nat` must not depend on `node`); re-exported so this path stays stable.
 pub use crate::time::{system_clock, Clock};
 
+/// Serve every stream a peer opens on one connection, forwarding to the actor the
+/// ones that need channel state (the board is served inside `accept_stream`).
+///
+/// **Every** connection needs this, dialed or accepted: QUIC is symmetric, so a peer
+/// we dialed will open streams back at us — a member we joined through has to be able
+/// to deliver its sender key on the connection *we* opened.
+fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Sender<NetEvent>) {
+    tokio::spawn(async move {
+        loop {
+            match net.accept_stream(&conn).await {
+                Ok(Inbound::ServedRendezvous { .. }) => {}
+                Ok(inbound) => {
+                    let event = NetEvent::Stream {
+                        conn: Arc::clone(&conn),
+                        inbound,
+                    };
+                    if tx.send(event).await.is_err() {
+                        return; // the actor is gone
+                    }
+                }
+                // A refused or failed stream ends this connection's loop; the peer
+                // may reconnect.
+                Err(_) => return,
+            }
+        }
+    });
+}
+
 /// Accept connections and their streams forever, forwarding to the actor the ones
 /// that need channel state. Each connection gets its own task, so a slow peer
 /// cannot stall the others; the board is served inside `accept_stream`.
@@ -83,29 +112,7 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
                 .accept(crate::transport::quic::Admission::AcceptAnyAuthenticated)
                 .await;
             match accepted {
-                Ok(Some(conn)) => {
-                    let net = Arc::clone(&net);
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            match net.accept_stream(&conn).await {
-                                Ok(Inbound::ServedRendezvous { .. }) => {}
-                                Ok(inbound) => {
-                                    let event = NetEvent::Stream {
-                                        conn: Arc::clone(&conn),
-                                        inbound,
-                                    };
-                                    if tx.send(event).await.is_err() {
-                                        return; // the actor is gone
-                                    }
-                                }
-                                // A refused or failed stream ends this connection's
-                                // loop; the peer may reconnect.
-                                Err(_) => return,
-                            }
-                        }
-                    });
-                }
+                Ok(Some(conn)) => spawn_stream_loop(Arc::clone(&net), conn, tx.clone()),
                 // The endpoint closed, or a handshake failed. `accept` returns `Err`
                 // on a single failed handshake (ADR-011 known gap), so keep going on
                 // an error and stop only when the endpoint is closed.
@@ -175,6 +182,9 @@ pub struct Node {
     /// channel's own (production `(200,9)`); tests reduce them so the debug suite
     /// does not grind, exactly as they reduce the Argon2 profile.
     pow_params: Option<crate::join::pow::PowParams>,
+    /// Peers whose connection already has a stream loop, so dialing again does not
+    /// start a second one.
+    stream_loops: std::collections::BTreeSet<Digest32>,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012).
     record_seq: BTreeMap<Digest32, u64>,
@@ -257,6 +267,7 @@ impl Node {
             net_tx,
             bind,
             pow_params,
+            stream_loops: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
             prekeys: None,
@@ -329,6 +340,14 @@ impl Node {
             } => self.open_channel(&channel_id, &passphrase).await,
             NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id).await,
             NodeCommand::SendText { channel_id, text } => self.send_text(&channel_id, &text).await,
+            NodeCommand::Invite { channel_id } => self.invite(&channel_id).await,
+            NodeCommand::JoinChannel {
+                link,
+                local_name,
+                passphrase,
+            } => self.join_channel(&link, &local_name, &passphrase).await,
+            NodeCommand::Consent { channel_id, target } => self.consent(&channel_id, target).await,
+            NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
             NodeCommand::Shutdown => Outcome::Done,
         }
     }
@@ -413,6 +432,55 @@ impl Node {
             net.manager().close_all();
             net.manager().endpoint().close();
         }
+        self.stream_loops.clear();
+    }
+
+    /// Put a channel's genesis and this node's records on an **anchor's** board
+    /// (ADR-016: "the configured bootstrap set is simply the anchors a client
+    /// publishes to and reads from").
+    ///
+    /// Publishing only locally is not enough and the gate proved it: a member's key is
+    /// discoverable to *others* only where they will look for it, so a node that keeps
+    /// its bundle to itself cannot be admitted as a log author by anyone — and an
+    /// ADR-008 session then hard-fails on its first entry. A refusal is normal (the
+    /// ADR-012 refresh floor declining a faster refresh), not an error.
+    async fn publish_channel_to_anchor(
+        &mut self,
+        channel_id: &Digest32,
+        conn: &Arc<VoxConnection>,
+    ) {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let seq = {
+            let entry = self.record_seq.entry(*channel_id).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        let (genesis_wire, epoch) = match self.channels.get(channel_id) {
+            Some(c) => (c.genesis().to_wire(), c.epoch()),
+            None => return,
+        };
+        let records = {
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let Ok(signer) = profile.signer() else { return };
+            let Some(ring) = self.prekeys.as_ref() else {
+                return;
+            };
+            net.own_records(signer, channel_id, epoch, ring, seq)
+        };
+        let Ok((address, bundle)) = records else {
+            return;
+        };
+        let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await else {
+            return;
+        };
+        let _ = client.put(&genesis_wire).await;
+        let _ = client.put(&address.to_wire()).await;
+        let _ = client.put(&bundle.to_wire()).await;
+        client.finish();
     }
 
     /// Put a channel's genesis and this node's records on its own board, so a joiner
@@ -488,17 +556,7 @@ impl Node {
                         self.take_inbound_skdm(peer, recv).await;
                     }
                     Inbound::Sync { send, recv, .. } => {
-                        // ADR-008's engine is synchronous and would block this task, so a
-                        // session needs its own blocking thread plus shared access to the
-                        // channel's store — M14.7e. Refusing with the coded reason is the
-                        // honest interim: the peer learns at once instead of hanging.
-                        let code = crate::transport::quic::close_code(
-                            crate::wire::WireError::SyncModeUnsupported,
-                        );
-                        let mut send = send;
-                        let mut recv = recv;
-                        let _ = send.reset(code);
-                        let _ = recv.stop(code);
+                        self.run_sync_session(send, recv).await;
                     }
                     Inbound::NotYetSupported { .. } | Inbound::ServedRendezvous { .. } => {}
                 }
@@ -580,7 +638,7 @@ impl Node {
         // accepted (reading still needs consent).
         let admitted = match (self.profile.as_ref(), self.channels.get_mut(&channel_id)) {
             (Some(profile), Some(channel)) => channel
-                .admit_author(profile, &outcome.peer.identity, now)
+                .admit_author(profile.store(), &outcome.peer.identity, now)
                 .is_ok(),
             _ => false,
         };
@@ -597,6 +655,466 @@ impl Node {
             .await;
     }
 
+    /// Dial `peer`, reusing a live connection, and make sure a stream loop is serving
+    /// it — a connection we opened must still accept the streams the peer opens back
+    /// (its sender key arrives that way).
+    async fn dial(
+        &mut self,
+        peer: Digest32,
+        endpoints: &crate::nat::multiaddr::EndpointList,
+    ) -> crate::error::Result<Arc<VoxConnection>> {
+        let net = self
+            .net
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(crate::error::Error::Unreachable("node is not networked"))?;
+        let conn = net.manager().connect(peer, endpoints).await?;
+        if self.stream_loops.insert(peer) {
+            spawn_stream_loop(net, Arc::clone(&conn), self.net_tx.clone());
+        }
+        Ok(conn)
+    }
+
+    /// Produce an invite link naming this node as anchor and responder.
+    async fn invite(&mut self, channel_id: &Digest32) -> Outcome {
+        let Some(net) = self.net.as_ref() else {
+            return Outcome::Failed(Fault::NotNetworked);
+        };
+        if !self.channels.contains_key(channel_id) {
+            return Outcome::Failed(Fault::UnknownChannel);
+        }
+        let Ok(anchors) = net.local_endpoints() else {
+            return Outcome::Failed(Fault::NotNetworked);
+        };
+        let link =
+            match crate::node::link::InviteLink::new(*channel_id, anchors, Some(net.local_id())) {
+                Ok(l) => l,
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            };
+        let _ = self
+            .event_tx
+            .send(NodeEvent::InviteLink {
+                channel_id: *channel_id,
+                url: link.to_url(),
+            })
+            .await;
+        Outcome::Done
+    }
+
+    /// Join a channel from an invite link (ADR-016 §"Join over the network"): resolve
+    /// the anchor, read the board, announce a pre-join record, run the ADR-005 join,
+    /// then build local channel state and publish our own records.
+    async fn join_channel(&mut self, link: &str, local_name: &str, passphrase: &Secret) -> Outcome {
+        let parsed = match crate::node::link::InviteLink::parse(link) {
+            Ok(p) => p,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        let (Some(net), Some(_)) = (self.net.as_ref().map(Arc::clone), self.prekeys.as_ref())
+        else {
+            return Outcome::Failed(Fault::NotNetworked);
+        };
+        if self.channels.contains_key(&parsed.channel_id) {
+            return Outcome::Failed(Fault::IdentityExists);
+        }
+        let now = self.now();
+        // A pinned responder is dialled as that identity; otherwise the first anchor
+        // is also the responder we join through (M15 adds anchor-only bootstrap).
+        let Some(responder) = parsed.responder else {
+            return Outcome::Failed(Fault::BadLink);
+        };
+        // Dial before borrowing the profile: the dial needs `&mut self` to record that
+        // this connection now has a stream loop.
+        let conn = match self.dial(responder, &parsed.anchors).await {
+            Ok(c) => c,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        let outcome = {
+            let Some(profile) = self.profile.as_ref() else {
+                return Outcome::Failed(Fault::NoIdentity);
+            };
+            let Ok(signer) = profile.signer() else {
+                return Outcome::Failed(Fault::Locked);
+            };
+            let dh = *signer.x25519_identity_secret();
+            // The board tells us what the channel is and who is in it.
+            let set = match net.fetch_channel(&conn, &parsed.channel_id, 0).await {
+                Ok(s) => s,
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            };
+            let Some(genesis) = set.genesis.clone() else {
+                return Outcome::Failed(Fault::BadLink);
+            };
+            // Announce ourselves so the responder will accept a join stream from us
+            // (ADR-016: the pre-join record is what makes an unknown peer eligible).
+            let ring = match self.prekeys.as_ref() {
+                Some(r) => r,
+                None => return Outcome::Failed(Fault::NotNetworked),
+            };
+            let bundle =
+                match ring.bundle(&crate::identity::composite::RootSigner::public_key(signer)) {
+                    Ok(b) => b,
+                    Err(e) => return Outcome::Failed(fault_of(&e)),
+                };
+            let endpoints = match net.local_endpoints() {
+                Ok(e) => e,
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            };
+            let seq = {
+                let entry = self.record_seq.entry(parsed.channel_id).or_insert(0);
+                *entry = entry.saturating_add(1);
+                *entry
+            };
+            let prejoin = match crate::nat::record::PreJoinRecord::build(
+                signer,
+                &parsed.channel_id,
+                bundle,
+                endpoints,
+                seq,
+                now,
+            ) {
+                Ok(r) => r,
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            };
+            {
+                let mut client = match crate::nat::service::RendezvousClient::open(&conn).await {
+                    Ok(c) => c,
+                    Err(e) => return Outcome::Failed(fault_of(&e)),
+                };
+                // A **refusal is fine**: it means our previous announcement is still
+                // live (the ADR-012 refresh floor declines a faster replacement), and
+                // being announced is all this step is for. Only a transport failure
+                // aborts the join.
+                match client.put(&prejoin.to_wire()).await {
+                    Ok(()) | Err(crate::error::Error::RendezvousRejected(_)) => {}
+                    Err(e) => {
+                        client.finish();
+                        return Outcome::Failed(fault_of(&e));
+                    }
+                }
+                client.finish();
+            }
+            let mut ctx = match crate::node::channel::join_context_from_genesis(&genesis, 0) {
+                Ok(c) => c,
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            };
+            if let Some(pow) = self.pow_params {
+                ctx.pow_params = pow;
+            }
+            let ik = crate::identity::keyagreement::X25519IdentityKey::from_secret_bytes(dh);
+            match net.start_join(&conn, ctx, passphrase, signer, &ik).await {
+                Ok(o) => (o, genesis, set),
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            }
+        };
+        let (joined, genesis, set) = outcome;
+
+        // Local state for the channel we just joined.
+        let channel = {
+            let Some(profile) = self.profile.as_ref() else {
+                return Outcome::Failed(Fault::NoIdentity);
+            };
+            match ChannelState::join_channel_with_profile(
+                profile,
+                &genesis,
+                &parsed.channel_id,
+                local_name,
+                passphrase,
+                now,
+                self.argon2,
+            ) {
+                Ok(c) => c,
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            }
+        };
+        self.channels.insert(parsed.channel_id, channel);
+        // Every member whose bundle is on the board is an admitted author: the record
+        // carries its full composite key and is verified against it (ADR-016). Sync
+        // hard-fails on an entry from an author we never admitted, so this is what
+        // makes the log reconcilable at all.
+        if let (Some(profile), Some(channel)) = (
+            self.profile.as_ref(),
+            self.channels.get_mut(&parsed.channel_id),
+        ) {
+            for record in &set.bundles {
+                if let Ok(key) = crate::identity::composite::CompositePublicKey::from_bytes(
+                    &record.prekey_bundle.root_pub,
+                ) {
+                    if record.verify(&key).is_ok() {
+                        let _ = channel.admit_author(profile.store(), &key, now);
+                    }
+                }
+            }
+        }
+        self.sessions
+            .insert((parsed.channel_id, responder), joined.session);
+        self.refresh_network_view();
+        self.publish_channel_locally(&parsed.channel_id);
+        // And on the anchor we joined through, so every other member can find our key
+        // and admit us as a log author (without which their sync sessions fail).
+        self.publish_channel_to_anchor(&parsed.channel_id, &conn)
+            .await;
+        // ADR-007 step 2: the newcomer announces its **own** sender key. This is part
+        // of joining rather than a separate consent decision — "it has nothing to
+        // consent over" — and it must happen here for a second reason: the ADR-004
+        // responder has no sending chain until it receives the initiator's first
+        // message, so until the joiner speaks no member can answer at all. Step 3
+        // (members consenting to the newcomer) stays human-initiated, via `Consent`.
+        let released = self.release_key_to(&parsed.channel_id, responder).await;
+        if !released.is_done() {
+            return released;
+        }
+        let _ = self
+            .event_tx
+            .send(NodeEvent::Joined {
+                channel_id: parsed.channel_id,
+                responder,
+            })
+            .await;
+        Outcome::Done
+    }
+
+    /// Release this identity's sender key to `target` and record the grant: deliver
+    /// the SKDM over the pairwise session, then append the ADR-007 consent grant
+    /// carrying its `skdm_ref`.
+    ///
+    /// Both halves matter. The key alone lets the target *decrypt*; the grant on the
+    /// log is what makes a message *render*, because a reader requires both (ADR-007).
+    /// Doing one without the other leaves a peer holding a key it must not use, or a
+    /// grant it cannot act on.
+    async fn release_key_to(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return Outcome::Failed(Fault::NotNetworked);
+        };
+        let now = self.now();
+        let skdm = {
+            let (Some(profile), Some(channel)) =
+                (self.profile.as_ref(), self.channels.get(channel_id))
+            else {
+                return Outcome::Failed(Fault::UnknownChannel);
+            };
+            if !channel.is_author(&target) {
+                // We have not admitted this identity, so we hold no verified key for
+                // it and cannot know we are releasing to the right party.
+                return Outcome::Failed(Fault::UnknownChannel);
+            }
+            match channel.skdm_for_consent(profile) {
+                Ok(s) => s,
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            }
+        };
+        // A session must already exist with this member (from the join, or from their
+        // delivery to us); opening one from their bundle record is M15's "sessions to
+        // members we have not met".
+        let Some(conn) = net.manager().existing(&target) else {
+            return Outcome::Failed(Fault::Unreachable);
+        };
+        let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
+            return Outcome::Failed(Fault::Unreachable);
+        };
+        if let Err(e) =
+            crate::node::pairwise_stream::deliver_skdm(&conn, channel_id, session, &skdm).await
+        {
+            return Outcome::Failed(fault_of(&e));
+        }
+        let (Some(profile), Some(channel)) =
+            (self.profile.as_ref(), self.channels.get_mut(channel_id))
+        else {
+            return Outcome::Failed(Fault::UnknownChannel);
+        };
+        if let Err(e) = channel.issue_consent(profile, target, &skdm, now) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        Outcome::Done
+    }
+
+    /// Consent to `target` reading this identity's messages — ADR-007 step 3, the
+    /// human decision, taken per sender.
+    async fn consent(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
+        let outcome = self.release_key_to(channel_id, target).await;
+        if outcome.is_done() {
+            let _ = self
+                .event_tx
+                .send(NodeEvent::Consented {
+                    channel_id: *channel_id,
+                    target,
+                })
+                .await;
+        }
+        outcome
+    }
+
+    /// Admit every member whose prekey bundle is on `peer`'s board for this channel.
+    ///
+    /// This is not optional politeness: an ADR-008 session **hard-fails** on the first
+    /// entry from an author this node has not admitted, because it cannot verify it. A
+    /// member that joined after us is exactly such an author, and its full composite
+    /// key is on the board (ADR-016) — so learning the current membership from the
+    /// board is a precondition for reconciling at all, and doing it here means a node
+    /// never has to be told out of band that someone new arrived.
+    async fn learn_members(&mut self, channel_id: &Digest32, peer: Digest32) -> usize {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return 0;
+        };
+        let Some(conn) = net.manager().existing(&peer) else {
+            return 0;
+        };
+        let epoch = match self.channels.get(channel_id) {
+            Some(c) => c.epoch(),
+            None => return 0,
+        };
+        let Ok(set) = net.fetch_channel(&conn, channel_id, epoch).await else {
+            return 0;
+        };
+        let now = self.now();
+        let mut learned = 0usize;
+        if let (Some(profile), Some(channel)) =
+            (self.profile.as_ref(), self.channels.get_mut(channel_id))
+        {
+            for record in &set.bundles {
+                let Ok(key) = crate::identity::composite::CompositePublicKey::from_bytes(
+                    &record.prekey_bundle.root_pub,
+                ) else {
+                    continue;
+                };
+                // The board is availability only: the record must verify under the key
+                // it carries before that key becomes an author.
+                if record.verify(&key).is_ok()
+                    && matches!(channel.admit_author(profile.store(), &key, now), Ok(true))
+                {
+                    learned += 1;
+                }
+            }
+        }
+        if learned > 0 {
+            self.refresh_network_view();
+        }
+        learned
+    }
+
+    /// Reconcile a channel with every member this node can reach.
+    async fn sync_channel(&mut self, channel_id: &Digest32) -> Outcome {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return Outcome::Failed(Fault::NotNetworked);
+        };
+        let Some(channel) = self.channels.get(channel_id) else {
+            return Outcome::Failed(Fault::UnknownChannel);
+        };
+        let me = channel.me();
+        let epoch = channel.epoch();
+        let peers: Vec<Digest32> = channel.members().into_iter().filter(|m| *m != me).collect();
+        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let mut synced = 0usize;
+        for peer in peers {
+            if net.manager().existing(&peer).is_none() {
+                continue;
+            }
+            // Learn who else has joined before reconciling, or the first entry from a
+            // newer member kills the session.
+            self.learn_members(channel_id, peer).await;
+            let Some(conn) = net.manager().existing(&peer) else {
+                continue;
+            };
+            let handle = tokio::runtime::Handle::current();
+            let transport =
+                match crate::node::syncstream::open_sync(&conn, handle.clone(), channel_id, epoch)
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+            let Some(mut ch) = self.channels.remove(channel_id) else {
+                break;
+            };
+            let store = Arc::clone(&store);
+            let now = self.now();
+            let joined = tokio::task::spawn_blocking(move || {
+                let mut t = transport;
+                let out = ch.sync_over(&store, &mut t, now);
+                (ch, out)
+            })
+            .await;
+            if let Ok((ch, out)) = joined {
+                self.channels.insert(*channel_id, ch);
+                if let Ok(o) = out {
+                    synced += 1;
+                    if o.rendered > 0 || o.governance > 0 {
+                        let _ = self
+                            .event_tx
+                            .send(NodeEvent::Synced {
+                                channel_id: *channel_id,
+                                applied: o.applied as u64,
+                                rendered: o.rendered as u64,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+        self.refresh_network_view();
+        if synced == 0 {
+            return Outcome::Failed(Fault::Unreachable);
+        }
+        Outcome::Done
+    }
+
+    /// Reconcile one channel's log with a peer over an inbound `sync` stream
+    /// (ADR-008 frontier mode).
+    ///
+    /// The ADR-008 engine is **synchronous**, so the session runs on a blocking task:
+    /// the channel is moved out of the actor's map for the duration and put back
+    /// after, and the store is a shared handle (`Profile::store_handle`). While a
+    /// channel is away, commands naming it answer `UnknownChannel` — the session is
+    /// short and the client retries, which is better than blocking the whole actor
+    /// (its other channels keep working) or mutating channel state from two threads.
+    async fn run_sync_session(&mut self, send: quinn::SendStream, mut recv: quinn::RecvStream) {
+        use crate::node::syncstream::{accept_sync, read_sync_request};
+        let Ok((channel_id, epoch)) = read_sync_request(&mut recv).await else {
+            return;
+        };
+        let now = self.now();
+        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+            return;
+        };
+        // Only a channel we hold open at that epoch can be reconciled.
+        if self
+            .channels
+            .get(&channel_id)
+            .is_none_or(|c| c.epoch() != epoch)
+        {
+            return;
+        }
+        let Some(mut channel) = self.channels.remove(&channel_id) else {
+            return;
+        };
+        let handle = tokio::runtime::Handle::current();
+        let joined = tokio::task::spawn_blocking(move || {
+            let mut transport = accept_sync(handle, send, recv);
+            let outcome = channel.sync_over(&store, &mut transport, now);
+            (channel, outcome)
+        })
+        .await;
+        // A panicked blocking task loses the channel from the map rather than leaving
+        // it in an unknown state; reopening rebuilds it from disk.
+        if let Ok((channel, outcome)) = joined {
+            self.channels.insert(channel_id, channel);
+            if let Ok(out) = outcome {
+                if out.rendered > 0 || out.governance > 0 {
+                    let _ = self
+                        .event_tx
+                        .send(NodeEvent::Synced {
+                            channel_id,
+                            applied: out.applied as u64,
+                            rendered: out.rendered as u64,
+                        })
+                        .await;
+                }
+            }
+            self.refresh_network_view();
+        }
+    }
+
     /// Take an inbound sealed control message: an ADR-006 SKDM, which makes that
     /// author's messages readable and backfills any already held as ciphertext.
     async fn take_inbound_skdm(&mut self, peer: Digest32, mut recv: quinn::RecvStream) {
@@ -607,14 +1125,14 @@ impl Node {
         let now = self.now();
         let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
             // No session with this peer for that channel: nothing can open it. The
-            // sender will retry after a join or key exchange establishes one.
+            // sender retries once a join or key exchange establishes one.
             return;
         };
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
             return;
         };
         let backfilled = match (self.profile.as_ref(), self.channels.get_mut(&channel_id)) {
-            (Some(profile), Some(channel)) => channel.accept_skdm(profile, &skdm, now).ok(),
+            (Some(profile), Some(channel)) => channel.accept_skdm(profile.store(), &skdm, now).ok(),
             _ => None,
         };
         if let Some(n) = backfilled {
@@ -843,6 +1361,9 @@ fn fault_of(e: &Error) -> Fault {
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,
         Error::AtRestLocked => Fault::Locked,
         Error::SizeLimitExceeded(_) => Fault::TooLong,
+        Error::MalformedLink(_) => Fault::BadLink,
+        Error::Unreachable(_) => Fault::Unreachable,
+        Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,
         _ => Fault::Internal,
     }
@@ -879,6 +1400,7 @@ mod tests {
             // covered by `node::network` and the M14 gate).
             bind: None,
             pow_params: None,
+            stream_loops: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
             prekeys: None,

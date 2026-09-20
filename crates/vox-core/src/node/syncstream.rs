@@ -13,6 +13,16 @@
 //!   [`RANGE_MODE_AUTHOR_THRESHOLD`] authors, then range reconciliation
 //!   ([`should_use_range_mode`]) — the scale rule ADR-008 requires.
 //!
+//! ## The stream names its channel first
+//! A frontier session reconciles **one channel's** log, but a connection is per
+//! *peer* (ADR-016 §"Connections") and a peer may share several channels with us —
+//! so the ADR-008 frames alone are not enough to know which log to open. The
+//! initiator therefore sends a one-field preamble naming the `(channelID, epoch)`
+//! before handing the stream to the engine, exactly as the join stream does. The
+//! ADR-008 frame sequence itself is untouched; the channelID is not a secret (it is
+//! on the board and in the invite link) and the preamble is inside the authenticated
+//! stream regardless.
+//!
 //! ## Blocking, deliberately
 //! ADR-008's engine is synchronous, and [`QuicStreamTransport`] bridges it onto
 //! async quinn with [`tokio::runtime::Handle::block_on`]. A session therefore runs
@@ -22,7 +32,10 @@
 use quinn::{RecvStream, SendStream};
 use tokio::runtime::Handle;
 
-use crate::error::Result;
+use crate::cbor::{Decoder, Encoder};
+use crate::error::{Error, Result};
+use crate::hash::Digest32;
+use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::{QuicStreamTransport, VoxConnection};
 use crate::transport::streams::{open_typed, StreamKind};
 
@@ -106,12 +119,44 @@ impl Default for SyncSchedule {
     }
 }
 
-/// Open a `sync`-typed bi-stream on `conn` and wrap it as the ADR-008 transport.
-/// The kind frame is written first, so the peer dispatches it correctly (M5 sync
-/// used to open untyped streams).
-pub async fn open_sync(conn: &VoxConnection, handle: Handle) -> Result<QuicStreamTransport> {
-    let (send, recv) = open_typed(conn, StreamKind::Sync).await?;
+/// The largest sync preamble either side will read (`[channel_id, epoch]`).
+const MAX_SYNC_PREAMBLE: usize = 64;
+
+/// Open a `sync`-typed bi-stream on `conn` for one channel and wrap it as the
+/// ADR-008 transport. The kind frame is written first so the peer dispatches it,
+/// then the preamble naming the channel (see the module docs).
+pub async fn open_sync(
+    conn: &VoxConnection,
+    handle: Handle,
+    channel_id: &Digest32,
+    epoch: u64,
+) -> Result<QuicStreamTransport> {
+    let (mut send, recv) = open_typed(conn, StreamKind::Sync).await?;
+    let mut e = Encoder::new();
+    e.array(2).bytes(channel_id).uint(epoch);
+    write_frame(&mut send, &e.finish()).await?;
     Ok(QuicStreamTransport::new(handle, send, recv))
+}
+
+/// Read the preamble from an accepted `sync` stream: which `(channelID, epoch)` the
+/// peer wants to reconcile.
+pub async fn read_sync_request(recv: &mut quinn::RecvStream) -> Result<(Digest32, u64)> {
+    let bytes = read_frame(recv, MAX_SYNC_PREAMBLE)
+        .await?
+        .ok_or(Error::MalformedGovernance(
+            "sync stream closed before preamble",
+        ))?;
+    let mut d = Decoder::new(&bytes);
+    if d.array()? != 2 {
+        return Err(Error::MalformedGovernance("sync preamble arity"));
+    }
+    let channel_id: Digest32 = d
+        .bytes()?
+        .try_into()
+        .map_err(|_| Error::MalformedGovernance("sync preamble channel_id"))?;
+    let epoch = d.uint()?;
+    d.finish()?;
+    Ok((channel_id, epoch))
 }
 
 /// Wrap an already-accepted, already-authorized `sync` stream as the ADR-008
@@ -206,6 +251,7 @@ mod tests {
         (right, right_p, right_seed): (ChannelState, Arc<Profile>, u8),
         now: u64,
     ) -> (ChannelState, SyncOutcomePair, ChannelState) {
+        let channel_id = left.channel_id();
         rt.block_on(async move {
             let lm = manager(left_seed);
             let rm = manager(right_seed);
@@ -231,20 +277,24 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let right_t = open_sync(&conn, Handle::current()).await.unwrap();
-            let (send, recv, server_conn) = accept.await.unwrap();
+            let right_t = open_sync(&conn, Handle::current(), &channel_id, 0)
+                .await
+                .unwrap();
+            let (send, mut recv, server_conn) = accept.await.unwrap();
+            let (want, epoch) = read_sync_request(&mut recv).await.unwrap();
+            assert_eq!((want, epoch), (channel_id, 0));
             let left_t = accept_sync(Handle::current(), send, recv);
 
             let lh = std::thread::spawn(move || {
                 let mut ch = left;
                 let mut t = left_t;
-                let out = ch.sync_over(&left_p, &mut t, now);
+                let out = ch.sync_over(left_p.store(), &mut t, now);
                 (ch, out)
             });
             let rh = std::thread::spawn(move || {
                 let mut ch = right;
                 let mut t = right_t;
-                let out = ch.sync_over(&right_p, &mut t, now);
+                let out = ch.sync_over(right_p.store(), &mut t, now);
                 (ch, out)
             });
             let (left, out_l) = lh.join().unwrap();
@@ -325,20 +375,20 @@ mod tests {
             Argon2Profile::REDUCED,
         )
         .unwrap();
-        a.admit_author(&alice_p, &b_key, T0).unwrap();
-        a.admit_author(&alice_p, &c_key, T0).unwrap();
-        b.admit_author(&bob_p, &a_key, T0).unwrap();
-        c.admit_author(&carol_p, &a_key, T0).unwrap();
+        a.admit_author(alice_p.store(), &b_key, T0).unwrap();
+        a.admit_author(alice_p.store(), &c_key, T0).unwrap();
+        b.admit_author(bob_p.store(), &a_key, T0).unwrap();
+        c.admit_author(carol_p.store(), &a_key, T0).unwrap();
 
         // Alice consents to Bob (never to Carol); Bob consents to Alice. In
         // production the SKDMs travel over a `pairwise` stream (proven there); here
         // they are handed over directly so this test isolates sync.
         let skdm_a = a.skdm_for_consent(&alice_p).unwrap();
         a.issue_consent(&alice_p, b_fp, &skdm_a, T0).unwrap();
-        b.accept_skdm(&bob_p, &skdm_a, T0).unwrap();
+        b.accept_skdm(bob_p.store(), &skdm_a, T0).unwrap();
         let skdm_b = b.skdm_for_consent(&bob_p).unwrap();
         b.issue_consent(&bob_p, a_fp, &skdm_b, T0).unwrap();
-        a.accept_skdm(&alice_p, &skdm_b, T0).unwrap();
+        a.accept_skdm(alice_p.store(), &skdm_b, T0).unwrap();
 
         // Each writes a message the other should be able to read.
         a.append_text(&alice_p, "hello bob", T0 + 1).unwrap();
@@ -388,7 +438,7 @@ mod tests {
         // Carol admits Bob (whose key is on the board) and syncs again: the whole
         // log crosses — and she can still read none of it.
         let mut c = c;
-        c.admit_author(&carol_p, &b_key, T0 + 4).unwrap();
+        c.admit_author(carol_p.store(), &b_key, T0 + 4).unwrap();
         let (_a, out, c) = sync_pair(
             &rt,
             (a, Arc::clone(&alice_p), 41),
