@@ -9,6 +9,7 @@
 //! `VOX_CONFIG_DIR`, then XDG).
 
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -29,6 +30,16 @@ pub struct ProfileArgs {
     /// Config directory.
     #[arg(long, env = "VOX_CONFIG_DIR")]
     pub config_dir: Option<PathBuf>,
+    /// Address to listen on for peers (`ip:port`; port 0 picks one).
+    ///
+    /// The address is what invite links advertise, so it must be one peers can
+    /// actually reach: the loopback default works between profiles on this machine,
+    /// and a LAN address (`--listen 192.168.1.5:0`) works between machines. Automatic
+    /// address discovery and the ADR-012 port-mapped rung are the next milestone; a
+    /// wildcard (`0.0.0.0`) would advertise an address nobody can dial, so it is not
+    /// the default.
+    #[arg(long, env = "VOX_LISTEN", default_value = DEFAULT_LISTEN)]
+    pub listen: SocketAddr,
 }
 
 impl ProfileArgs {
@@ -41,6 +52,11 @@ impl ProfileArgs {
         )
     }
 }
+
+/// The default listen address: loopback with a kernel-chosen port. It works between
+/// profiles on one machine; reaching another machine needs an address peers can dial
+/// (see `--listen`).
+const DEFAULT_LISTEN: &str = "127.0.0.1:0";
 
 /// Vox Lux — serverless, end-to-end-encrypted terminal client.
 #[derive(Parser)]
@@ -73,6 +89,9 @@ pub fn run() -> ExitCode {
         profile: DEFAULT_PROFILE.to_owned(),
         data_dir: std::env::var_os("VOX_DATA_DIR").map(PathBuf::from),
         config_dir: std::env::var_os("VOX_CONFIG_DIR").map(PathBuf::from),
+        listen: DEFAULT_LISTEN
+            .parse()
+            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0))),
     });
     match cli.command.unwrap_or(default_tui) {
         Cmd::Tui(args) => {
@@ -83,7 +102,7 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match run_live(paths) {
+            match run_live(paths, args.listen) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox: {e}");

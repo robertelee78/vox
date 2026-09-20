@@ -39,6 +39,9 @@ pub struct LiveCore {
     unread: BTreeMap<Digest32, usize>,
     /// Local verification marks: `(channel, member)` pairs this device verified.
     verified: BTreeSet<(Digest32, Digest32)>,
+    /// The most recent network notice to show (an invite link, a join, a consent).
+    /// Public facts only — see [`ViewModel::notice`].
+    notice: Option<String>,
 }
 
 impl std::fmt::Debug for LiveCore {
@@ -65,6 +68,7 @@ impl LiveCore {
     #[must_use]
     pub fn new(node: NodeHandle, rt: tokio::runtime::Handle) -> Self {
         Self {
+            notice: None,
             node,
             rt,
             active: None,
@@ -108,6 +112,45 @@ impl LiveCore {
                     }
                 }
                 NodeEvent::Unlocked | NodeEvent::ChannelOpened { .. } => {}
+                // The network events, surfaced as short public notices. A link, a
+                // fingerprint prefix and a count are all public facts; nothing here
+                // can carry plaintext or key material (ADR-015).
+                NodeEvent::InviteLink { url, .. } => {
+                    self.notice = Some(format!("invite link: {url}"));
+                }
+                NodeEvent::Joined { responder, .. } => {
+                    self.notice = Some(format!("joined via {}", short_id(&responder)));
+                }
+                NodeEvent::PeerJoined { peer, .. } => {
+                    self.notice = Some(format!(
+                        "{} joined — they read nothing until you consent",
+                        short_id(&peer)
+                    ));
+                }
+                NodeEvent::Consented { target, .. } => {
+                    self.notice = Some(format!("consented to {}", short_id(&target)));
+                }
+                NodeEvent::SenderKeyReceived {
+                    peer, backfilled, ..
+                } => {
+                    self.notice = Some(if backfilled > 0 {
+                        format!(
+                            "{} consented to you — {backfilled} earlier message(s) now readable",
+                            short_id(&peer)
+                        )
+                    } else {
+                        format!("{} consented to you", short_id(&peer))
+                    });
+                }
+                NodeEvent::Synced {
+                    channel_id,
+                    rendered,
+                    ..
+                } => {
+                    if rendered > 0 && self.active != Some(channel_id) {
+                        *self.unread.entry(channel_id).or_insert(0) += rendered as usize;
+                    }
+                }
                 #[allow(unreachable_patterns)]
                 _ => {}
             }
@@ -178,6 +221,7 @@ impl LiveCore {
                 })
         });
         ViewModel {
+            notice: self.notice.clone(),
             channels,
             active,
             sync: SyncStatus::Idle,
@@ -200,6 +244,11 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::TooLong => UiError::TooLong,
         Fault::Storage => UiError::Storage,
         Fault::ShuttingDown | Fault::Internal => UiError::Internal,
+        // A link that will not parse is malformed input, not a network failure.
+        Fault::BadLink => UiError::Malformed,
+        Fault::Unreachable => UiError::Unreachable,
+        Fault::Refused => UiError::Refused,
+        Fault::NotNetworked => UiError::NotNetworked,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
     }
@@ -271,9 +320,23 @@ impl CoreHandle for LiveCore {
                 self.verified.insert((channel_id, member));
                 CommandStatus::Done
             }
-            Command::Join { .. }
-            | Command::GrantConsent { .. }
-            | Command::RevokeConsent { .. }
+            Command::Join {
+                local_name,
+                link,
+                passphrase,
+            } => self.send(NodeCommand::JoinChannel {
+                link,
+                local_name,
+                passphrase: Self::secret(&passphrase),
+            }),
+            Command::Invite { channel_id } => self.send(NodeCommand::Invite { channel_id }),
+            // ADR-007: consent is per-sender and human-initiated. This is the human
+            // act; the node delivers the sender key and records the grant.
+            Command::GrantConsent { channel_id, member } => self.send(NodeCommand::Consent {
+                channel_id,
+                target: member,
+            }),
+            Command::RevokeConsent { .. }
             | Command::SetVisibility { .. }
             | Command::Block { .. }
             | Command::Unblock { .. } => CommandStatus::Failed(UiError::NotAvailableYet),
@@ -420,9 +483,19 @@ mod tests {
         );
         assert_eq!(core.view().channels[0].unread, 0);
 
-        // Network verbs are honestly unavailable.
+        // Consent is wired to the node now (M14.7g); this core has no network, so the
+        // node says so rather than the client pretending the verb does not exist.
         assert_eq!(
             core.apply(Command::GrantConsent {
+                channel_id: cid,
+                member: [1; 32]
+            }),
+            CommandStatus::Failed(UiError::NotNetworked)
+        );
+        // The ADR-007 revocation and ADR-015 visibility verbs remain unimplemented and
+        // report that honestly.
+        assert_eq!(
+            core.apply(Command::RevokeConsent {
                 channel_id: cid,
                 member: [1; 32]
             }),
@@ -478,5 +551,62 @@ mod tests {
     #[test]
     fn short_id_is_eight_hex_chars() {
         assert_eq!(short_id(&[0xAB; 32]), "abababab");
+    }
+    #[test]
+    fn the_network_verbs_reach_the_node_and_the_unimplemented_ones_say_so() {
+        // The M14 verbs are wired: a bad link is refused *by the node* (BadLink),
+        // which proves the command reached it rather than being stubbed out.
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, mut core) = live(&tmp);
+        let _guard = rt.enter();
+        assert_eq!(
+            core.apply(Command::CreateIdentity {
+                passphrase: SecretString::from("id-pp".to_owned())
+            }),
+            CommandStatus::Done
+        );
+        let joined = core.apply(Command::Join {
+            local_name: "team".into(),
+            link: "not-a-vox-link".into(),
+            passphrase: SecretString::from("ch-pp".to_owned()),
+        });
+        assert_eq!(
+            joined,
+            CommandStatus::Failed(UiError::Malformed),
+            "a malformed link is refused by the node, not stubbed"
+        );
+        // This core's node is not networked (the test helper spawns it without a
+        // listen address), and consent and invite say exactly that rather than a
+        // placeholder — the node answered.
+        assert_eq!(
+            core.apply(Command::GrantConsent {
+                channel_id: [3; 32],
+                member: [4; 32],
+            }),
+            CommandStatus::Failed(UiError::NotNetworked)
+        );
+        assert_eq!(
+            core.apply(Command::Invite {
+                channel_id: [3; 32]
+            }),
+            CommandStatus::Failed(UiError::NotNetworked)
+        );
+        // The ADR-007 revocation and ADR-015 visibility verbs are honestly reported
+        // as not available rather than silently accepted.
+        for cmd in [
+            Command::RevokeConsent {
+                channel_id: [3; 32],
+                member: [4; 32],
+            },
+            Command::Block {
+                channel_id: [3; 32],
+                member: [4; 32],
+            },
+        ] {
+            assert_eq!(
+                core.apply(cmd),
+                CommandStatus::Failed(UiError::NotAvailableYet)
+            );
+        }
     }
 }
