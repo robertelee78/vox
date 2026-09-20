@@ -455,6 +455,9 @@ pub struct Node {
     /// The anchored channels' logs, by channelID (ADR-016 M15.2b). A channel is never
     /// both here and in `channels`: a member holds the real thing.
     anchored: BTreeMap<Digest32, Arc<tokio::sync::Mutex<crate::node::anchor::AnchorState>>>,
+    /// Live forwards by their bound local address (ADR-013 Dial, M16.1). Dropping one
+    /// stops its listener.
+    forwards: BTreeMap<std::net::SocketAddr, crate::node::tunnel::Forward>,
     /// The anchors this node is configured with (ADR-012 §"Bootstrap", ADR-016
     /// M15.1): dialled when the network starts, given the `Anchor` class, published
     /// to, and named in every invite link.
@@ -590,6 +593,7 @@ impl Node {
             anchor_logs,
             anchor_store: None,
             anchored: BTreeMap::new(),
+            forwards: BTreeMap::new(),
             pow_params,
             stream_loops: std::collections::BTreeSet::new(),
             port_mappings: Vec::new(),
@@ -709,6 +713,40 @@ impl Node {
                 passphrase,
             } => self.join_channel(&link, &local_name, &passphrase).await,
             NodeCommand::Consent { channel_id, target } => self.consent(&channel_id, target).await,
+            NodeCommand::AddService {
+                channel_id,
+                service_tag,
+                local,
+            } => self.add_service(&channel_id, &service_tag, local).await,
+            NodeCommand::RemoveService {
+                channel_id,
+                service_tag,
+            } => self.remove_service(&channel_id, &service_tag).await,
+            NodeCommand::GrantTunnel {
+                channel_id,
+                target,
+                service_tag,
+                may_bind,
+                expiry,
+            } => {
+                self.grant_tunnel(&channel_id, &target, &service_tag, may_bind, expiry)
+                    .await
+            }
+            NodeCommand::Forward {
+                channel_id,
+                host,
+                service_tag,
+                local,
+            } => self.forward(&channel_id, &host, &service_tag, local).await,
+            NodeCommand::StopForward { local } => {
+                // Dropping the forward aborts its listener; connections already
+                // spliced run to their own end.
+                if self.forwards.remove(&local).is_some() {
+                    Outcome::Done
+                } else {
+                    Outcome::Failed(Fault::UnknownChannel)
+                }
+            }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
             NodeCommand::Shutdown => Outcome::Done,
         }
@@ -1258,6 +1296,15 @@ impl Node {
                         recv,
                     } => {
                         self.answer_punch(peer, coordinator, send, recv);
+                    }
+                    Inbound::Tunnel { peer, send, recv } => {
+                        // The snapshot is taken here (only the actor reads channel
+                        // state) and the tunnel runs on its own task: it lives as long
+                        // as the TCP connection it carries, which may be hours.
+                        let snapshot = self.host_snapshot().await;
+                        tokio::spawn(async move {
+                            let _ = crate::node::tunnel::serve(peer, send, recv, snapshot).await;
+                        });
                     }
                     Inbound::NotYetSupported { .. }
                     | Inbound::ServedRendezvous { .. }
@@ -2249,6 +2296,162 @@ impl Node {
         }
     }
 
+    /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). The `bind:`
+    /// capability is checked by the channel, so a node cannot offer what the log does
+    /// not let it offer.
+    async fn add_service(
+        &mut self,
+        channel_id: &Digest32,
+        service_tag: &str,
+        local: std::net::SocketAddr,
+    ) -> Outcome {
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        let outcome = {
+            let mut channel = shared.lock().await;
+            channel.add_service(profile.store(), profile, service_tag, local)
+        };
+        match outcome {
+            Ok(_) => Outcome::Done,
+            Err(e) => Outcome::Failed(fault_of(&e)),
+        }
+    }
+
+    /// Stop offering a service.
+    async fn remove_service(&mut self, channel_id: &Digest32, service_tag: &str) -> Outcome {
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        let outcome = {
+            let mut channel = shared.lock().await;
+            channel.remove_service(profile.store(), service_tag)
+        };
+        match outcome {
+            Ok(true) => Outcome::Done,
+            Ok(false) => Outcome::Failed(Fault::UnknownChannel),
+            Err(e) => Outcome::Failed(fault_of(&e)),
+        }
+    }
+
+    /// Grant a member `dial:<tag>` (and optionally `bind:<tag>`) in a channel, as an
+    /// ADR-007 certificate on the log. The grant is pushed to peers like any other
+    /// local append, so it converges without anyone being told.
+    async fn grant_tunnel(
+        &mut self,
+        channel_id: &Digest32,
+        target: &Digest32,
+        service_tag: &str,
+        may_bind: bool,
+        expiry: u64,
+    ) -> Outcome {
+        use crate::governance::capability::{Capability, CapabilitySet};
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        let mut caps = CapabilitySet::from_iter_caps([Capability::dial(service_tag)]);
+        if may_bind {
+            caps.insert(Capability::bind(service_tag));
+        }
+        let outcome = {
+            let mut channel = shared.lock().await;
+            // The target must be an admitted author: a certificate naming an identity
+            // the channel does not know could never be verified by anyone.
+            let Some(key) = channel
+                .author_keys()
+                .into_iter()
+                .find(|k| k.fingerprint() == *target)
+            else {
+                return Outcome::Failed(Fault::UnknownChannel);
+            };
+            channel.grant_capabilities(profile, &key, caps, expiry, now)
+        };
+        match outcome {
+            Ok(_) => {
+                self.note_local_append(channel_id);
+                Outcome::Done
+            }
+            Err(e) => Outcome::Failed(fault_of(&e)),
+        }
+    }
+
+    /// Forward a local port to a member's service (ADR-013 Dial, M16.1): reach the
+    /// member through the whole ADR-012 ladder, then bind the port.
+    async fn forward(
+        &mut self,
+        channel_id: &Digest32,
+        host: &Digest32,
+        service_tag: &str,
+        local: std::net::SocketAddr,
+    ) -> Outcome {
+        if !self.channels.contains_key(channel_id) {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        }
+        // The member's advertised endpoints, from this node's board — the same hints
+        // any dial uses; the ladder does the rest.
+        let endpoints = self
+            .net
+            .as_ref()
+            .map(|net| net.board_endpoints(channel_id, host))
+            .unwrap_or_default();
+        let conn = match self.dial(*host, &endpoints).await {
+            Ok(c) => c,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        match crate::node::tunnel::Forward::bind(conn, *channel_id, service_tag.to_owned(), local)
+            .await
+        {
+            Ok(fwd) => {
+                let (channel_id, host, service_tag, bound) =
+                    (fwd.channel_id, fwd.host, fwd.service_tag.clone(), fwd.local);
+                self.forwards.insert(bound, fwd);
+                let _ = self
+                    .event_tx
+                    .send(NodeEvent::Forwarding {
+                        channel_id,
+                        host,
+                        service_tag,
+                        local: bound,
+                    })
+                    .await;
+                Outcome::Done
+            }
+            Err(e) => Outcome::Failed(fault_of(&e)),
+        }
+    }
+
+    /// The host-side snapshot for serving tunnels: every open channel's evaluator and
+    /// offered services (ADR-013, M16.1). Taken by the actor because only the actor
+    /// reads channel state; handed to the serving task whole, so a tunnel that lives
+    /// for hours never reaches back in.
+    async fn host_snapshot(&self) -> crate::node::tunnel::HostSnapshot {
+        let mut out = crate::node::tunnel::HostSnapshot::new();
+        for (cid, shared) in &self.channels {
+            let ch = shared.lock().await;
+            if ch.services().is_empty() {
+                continue;
+            }
+            out.insert(
+                *cid,
+                crate::node::tunnel::ChannelServices {
+                    evaluator: ch.evaluator_handle(),
+                    services: ch.services().clone(),
+                },
+            );
+        }
+        out
+    }
+
     async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
@@ -2314,6 +2517,7 @@ impl Node {
             anchoring: Vec::new(),
             channels,
             open_channels: Vec::new(),
+            forwards: Vec::new(),
         });
     }
 
@@ -2380,6 +2584,11 @@ impl Node {
                 epoch: ch.epoch(),
                 members: ch.members(),
                 timeline: ch.timeline().iter().map(row_of).collect(),
+                services: ch
+                    .services()
+                    .iter()
+                    .map(|(tag, addr)| (tag.clone(), *addr))
+                    .collect(),
             });
         }
         NodeView {
@@ -2390,6 +2599,16 @@ impl Node {
             channels,
             open_channels,
             anchoring,
+            forwards: self
+                .forwards
+                .values()
+                .map(|f| crate::node::api::ForwardInfo {
+                    channel_id: f.channel_id,
+                    host: f.host,
+                    service_tag: f.service_tag.clone(),
+                    local: f.local,
+                })
+                .collect(),
         }
     }
 }
@@ -2492,6 +2711,7 @@ mod tests {
             anchor_logs: false,
             anchor_store: None,
             anchored: BTreeMap::new(),
+            forwards: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             anchor_ids: std::collections::BTreeSet::new(),
             pow_params: None,

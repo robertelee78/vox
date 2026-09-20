@@ -24,6 +24,7 @@ pub mod cli;
 pub mod live;
 pub mod qr;
 pub mod state;
+pub mod tunnel_cli;
 pub mod ui;
 pub mod verify;
 pub mod viewmodel;

@@ -499,3 +499,239 @@ fn m15_members_never_online_together_converge_through_the_anchor() {
         }
     });
 }
+
+/// ADR-013's payoff, the M16.1 gate: **a TCP service reached across the overlay** by
+/// two clients that cannot reach each other at all. Alice runs a service on localhost
+/// — an `ssh` daemon, in the real use; here a byte-exact echo, because `ssh` over a
+/// tunnel is nothing more than TCP over a tunnel — grants Bob the capability to dial
+/// it, and Bob forwards a local port to it. His application connects to his own
+/// machine and its bytes come out of Alice's service, through the anchor.
+///
+/// What this proves that the library tests cannot: the capability travelled as a log
+/// fact through ordinary sync, the host resolved it through the *named channel's*
+/// evaluator, and the path was a relayed circuit — both clients are behind symmetric
+/// NATs, so no punch was possible.
+#[test]
+#[ignore = "production Argon2id, a relayed join and a tunneled TCP round trip: ~15 s in release"]
+fn m16_a_tcp_service_is_reached_across_the_overlay_between_two_nated_clients() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    rt.block_on(async {
+        // A byte-exact echo service on Alice's machine, standing in for sshd.
+        let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service_addr = service.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = service.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        let net = VirtualNet::new();
+        let c_addr = addr("198.51.100.1:443");
+        let c_sock = net.public(c_addr);
+        let a_sock = net.behind_nat(addr("10.0.1.2:5000"), NatKind::Symmetric, ip("203.0.113.1"));
+        let b_sock = net.behind_nat(addr("10.0.2.2:5000"), NatKind::Symmetric, ip("203.0.113.2"));
+
+        let carol_signer =
+            vox_core::node::headless::load_or_create_identity(&paths(&tmp, "anchor")).unwrap();
+        let carol_fp = carol_signer.fingerprint();
+        let carol = Node::spawn_config(
+            paths(&tmp, "anchor"),
+            NodeConfig::new()
+                .bind(Bind::Socket(c_sock))
+                .headless(carol_signer)
+                .anchor_logs(true),
+        )
+        .unwrap();
+        let mut anchors = BootstrapSet::new();
+        anchors
+            .add(
+                BootstrapNode::new(
+                    carol_fp,
+                    EndpointList::new(vec![Multiaddr::from(c_addr)]).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Alice creates the room and offers her service in it.
+        let alice = node(&tmp, "alice", a_sock, anchors).await;
+        let alice_fp = alice.view().identity.unwrap().fingerprint;
+        assert!(alice
+            .apply(NodeCommand::CreateChannel {
+                local_name: "infra".into(),
+                passphrase: secret("channel passphrase"),
+            })
+            .await
+            .is_done());
+        let cid = alice.view().channels[0].channel_id;
+        let out = alice
+            .apply(NodeCommand::AddService {
+                channel_id: cid,
+                service_tag: "ssh".into(),
+                local: service_addr,
+            })
+            .await;
+        assert!(
+            out.is_done(),
+            "the creator holds bind: by the genesis: {out:?}"
+        );
+        let offered = alice.view().open_channels[0].services.clone();
+        assert_eq!(offered, vec![("ssh".to_owned(), service_addr)]);
+
+        // Bob joins through the anchor.
+        assert!(alice
+            .apply(NodeCommand::Invite { channel_id: cid })
+            .await
+            .is_done());
+        let url = wait_for(&alice, |e| match e {
+            NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
+            _ => None,
+        })
+        .await;
+        let bob = node(&tmp, "bob", b_sock, BootstrapSet::new()).await;
+        let bob_fp = bob.view().identity.unwrap().fingerprint;
+        assert!(bob
+            .apply(NodeCommand::JoinChannel {
+                link: url,
+                local_name: "infra".into(),
+                passphrase: secret("channel passphrase"),
+            })
+            .await
+            .is_done());
+        let _ = wait_for(&bob, |e| match e {
+            NodeEvent::Joined { channel_id, .. } if channel_id == cid => Some(()),
+            _ => None,
+        })
+        .await;
+        let _ = wait_for(&alice, |e| match e {
+            NodeEvent::PeerJoined { channel_id, peer } if channel_id == cid && peer == bob_fp => {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+
+        // Before any grant the service is dark, even to a member: Bob's forward binds
+        // (that is local) but carries nothing.
+        let out = bob
+            .apply(NodeCommand::Forward {
+                channel_id: cid,
+                host: alice_fp,
+                service_tag: "ssh".into(),
+                local: addr("127.0.0.1:0"),
+            })
+            .await;
+        assert!(out.is_done(), "the forward binds locally: {out:?}");
+        let dark = wait_for(&bob, |e| match e {
+            NodeEvent::Forwarding { local, .. } => Some(local),
+            _ => None,
+        })
+        .await;
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut app = tokio::net::TcpStream::connect(dark).await.unwrap();
+            let _ = app.write_all(b"before the grant").await;
+            let mut buf = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(20), app.read(&mut buf)).await;
+            assert!(
+                matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+                "a service with no capability granted is dark: {read:?}"
+            );
+        }
+        assert!(bob
+            .apply(NodeCommand::StopForward { local: dark })
+            .await
+            .is_done());
+
+        // Alice grants Bob dial:ssh — a fact on the room's log.
+        let out = alice
+            .apply(NodeCommand::GrantTunnel {
+                channel_id: cid,
+                target: bob_fp,
+                service_tag: "ssh".into(),
+                may_bind: false,
+                expiry: 2_000_000_000,
+            })
+            .await;
+        assert!(out.is_done(), "Alice grants Bob dial:ssh: {out:?}");
+
+        // It reaches Bob by ordinary sync — nobody tells him.
+        let forwarded = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let out = bob
+                    .apply(NodeCommand::Forward {
+                        channel_id: cid,
+                        host: alice_fp,
+                        service_tag: "ssh".into(),
+                        local: addr("127.0.0.1:0"),
+                    })
+                    .await;
+                assert!(out.is_done(), "{out:?}");
+                let local = wait_for(&bob, |e| match e {
+                    NodeEvent::Forwarding { local, .. } => Some(local),
+                    _ => None,
+                })
+                .await;
+                // Try the round trip; until the grant has synced this closes.
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                if let Ok(mut app) = tokio::net::TcpStream::connect(local).await {
+                    let msg = b"ssh-over-vox, through the anchor";
+                    if app.write_all(msg).await.is_ok() {
+                        let mut buf = vec![0u8; msg.len()];
+                        if let Ok(Ok(_)) =
+                            tokio::time::timeout(Duration::from_secs(5), app.read_exact(&mut buf))
+                                .await
+                        {
+                            assert_eq!(buf, msg, "the service echoed byte for byte");
+                            break local;
+                        }
+                    }
+                }
+                let _ = bob.apply(NodeCommand::StopForward { local }).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .expect("the grant synced and the tunnel carried real bytes");
+
+        // The path was a relayed circuit: both clients are behind symmetric NATs, so
+        // no punch was possible, and the anchor carried the packets it cannot read.
+        let conn = bob
+            .view()
+            .forwards
+            .iter()
+            .find(|f| f.local == forwarded)
+            .map(|f| f.host);
+        assert_eq!(conn, Some(alice_fp));
+        assert!(net.filtered() > 0, "the NATs dropped the direct attempts");
+        assert!(
+            carol.view().open_channels.is_empty(),
+            "the anchor read nothing"
+        );
+
+        // A second connection over the same forward works too: one stream each.
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut app = tokio::net::TcpStream::connect(forwarded).await.unwrap();
+            app.write_all(b"second connection").await.unwrap();
+            let mut buf = vec![0u8; b"second connection".len()];
+            tokio::time::timeout(Duration::from_secs(20), app.read_exact(&mut buf))
+                .await
+                .expect("did not hang")
+                .expect("echoed");
+            assert_eq!(&buf, b"second connection");
+        }
+
+        for h in [&alice, &bob, &carol] {
+            assert!(h.apply(NodeCommand::Shutdown).await.is_done());
+        }
+    });
+}

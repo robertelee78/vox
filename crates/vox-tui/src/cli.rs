@@ -70,6 +70,163 @@ impl ProfileArgs {
     }
 }
 
+/// The room args of whichever `service` subcommand this is.
+fn sub_room(sub: &ServiceCmd) -> &RoomArgs {
+    match sub {
+        ServiceCmd::Add(a) => &a.room,
+        ServiceCmd::Remove(r) => &r.room,
+        ServiceCmd::List(r) => r,
+    }
+}
+
+/// The shape every one-shot tunnel verb shares: resolve the profile, collect the two
+/// passphrases, open the room, run the verb, report.
+fn run_tunnel_verb<F, Fut>(room: RoomArgs, body: F) -> ExitCode
+where
+    F: FnOnce(vox_core::node::actor::NodeHandle, vox_core::hash::Digest32) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
+{
+    let paths = match room.profile.paths() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let anchors = match room.profile.anchor_set() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("vox: --anchor: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let identity = match crate::tunnel_cli::passphrase_or_prompt(
+        room.identity_passphrase.as_ref(),
+        "identity passphrase",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let room_pp = match crate::tunnel_cli::passphrase_or_prompt(
+        room.passphrase.as_ref(),
+        "room passphrase",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let target = crate::tunnel_cli::RoomTarget {
+        paths,
+        listen: room.profile.listen,
+        anchors,
+        identity_passphrase: identity,
+        room: room.room.clone(),
+        room_passphrase: room_pp,
+    };
+    let outcome = rt.block_on(async move { crate::tunnel_cli::with_room(target, body).await });
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `vox service …`
+#[derive(Subcommand, Clone)]
+enum ServiceCmd {
+    /// Offer a local TCP service in a room.
+    Add(ServiceAddArgs),
+    /// Stop offering a service.
+    Remove(ServiceRemoveArgs),
+    /// List the services offered in a room.
+    List(RoomArgs),
+}
+
+/// Selecting a room, by the prefix of its channelID as `vox` prints it.
+#[derive(Args, Debug, Clone)]
+pub struct RoomArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The room's passphrase. Prompted for (unechoed) when omitted, which is the way
+    /// to give it: a passphrase in a flag is in the shell's history.
+    #[arg(long, env = "VOX_ROOM_PASSPHRASE")]
+    pub passphrase: Option<String>,
+    /// The identity passphrase. Prompted for when omitted.
+    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    pub identity_passphrase: Option<String>,
+}
+
+/// `vox service add`
+#[derive(Args, Debug, Clone)]
+pub struct ServiceAddArgs {
+    #[command(flatten)]
+    pub room: RoomArgs,
+    /// The service tag members will dial, e.g. `ssh`.
+    pub tag: String,
+    /// The local address the service listens on, e.g. `127.0.0.1:22`.
+    pub local: SocketAddr,
+}
+
+/// `vox service remove`
+#[derive(Args, Debug, Clone)]
+pub struct ServiceRemoveArgs {
+    #[command(flatten)]
+    pub room: RoomArgs,
+    /// The service tag to stop offering.
+    pub tag: String,
+}
+
+/// `vox forward`
+#[derive(Args, Debug, Clone)]
+pub struct ForwardArgs {
+    #[command(flatten)]
+    pub room: RoomArgs,
+    /// The member hosting the service (its fingerprint, or a unique prefix).
+    pub host: String,
+    /// The service tag to reach.
+    pub tag: String,
+    /// Where to listen locally; port 0 picks one.
+    #[arg(default_value = "127.0.0.1:0")]
+    pub local: SocketAddr,
+}
+
+/// `vox grant`
+#[derive(Args, Debug, Clone)]
+pub struct GrantArgs {
+    #[command(flatten)]
+    pub room: RoomArgs,
+    /// The member being granted (fingerprint or unique prefix).
+    pub member: String,
+    /// The service tag they may dial.
+    pub tag: String,
+    /// Also let them offer the service themselves.
+    #[arg(long)]
+    pub may_bind: bool,
+    /// How long the grant lasts, in days.
+    #[arg(long, default_value_t = 365)]
+    pub days: u64,
+}
+
 /// The default bind address: every interface, kernel-chosen port. The bound address
 /// is not what peers are told to dial (see [`ProfileArgs::listen`]), so binding
 /// broadly is right.
@@ -94,6 +251,18 @@ enum Cmd {
     /// read nothing; its identity is a key file in the profile directory, created on
     /// first run. Prints the `<fingerprint>@<multiaddr>` to give clients as `--anchor`.
     Node(ProfileArgs),
+    /// Offer a local TCP service to a room, or list what is offered (ADR-013).
+    ///
+    /// A service is dark by default: offering it grants nobody reach. Members reach it
+    /// only once they hold `dial:<tag>`, which `vox grant` puts on the room's log.
+    #[command(subcommand)]
+    Service(ServiceCmd),
+    /// Forward a local port to a member's service over the overlay — `ssh` over Vox
+    /// (ADR-013). Runs until interrupted.
+    Forward(ForwardArgs),
+    /// Grant a member the capability to dial one of your services, as a fact on the
+    /// room's log (ADR-007/ADR-013).
+    Grant(GrantArgs),
     /// Print shell completions for SHELL to stdout.
     Completions {
         /// The shell to generate completions for (bash, zsh, fish, …).
@@ -164,6 +333,40 @@ pub fn run() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
+            let sub = sub.clone();
+            async move {
+                match &sub {
+                    ServiceCmd::Add(a) => {
+                        crate::tunnel_cli::service_add(&node, cid, &a.tag, a.local).await
+                    }
+                    ServiceCmd::Remove(r) => {
+                        crate::tunnel_cli::service_remove(&node, cid, &r.tag).await
+                    }
+                    ServiceCmd::List(_) => {
+                        crate::tunnel_cli::service_list(&node, cid);
+                        Ok(())
+                    }
+                }
+            }
+        }),
+        Cmd::Grant(args) => {
+            let a = args.clone();
+            run_tunnel_verb(args.room.clone(), move |node, cid| async move {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default();
+                crate::tunnel_cli::grant(&node, cid, &a.member, &a.tag, a.may_bind, a.days, now)
+                    .await
+            })
+        }
+        Cmd::Forward(args) => {
+            let a = args.clone();
+            run_tunnel_verb(args.room.clone(), move |node, cid| async move {
+                crate::tunnel_cli::forward(&node, cid, &a.host, &a.tag, a.local).await
+            })
         }
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
