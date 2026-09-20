@@ -97,6 +97,7 @@ pub mod invite;
 pub mod membership;
 pub mod policy;
 pub mod rotation;
+pub mod servicegrant;
 pub mod visibility;
 
 #[cfg(test)]
@@ -112,4 +113,5 @@ pub use invite::{Invite, InviteMode};
 pub use membership::MembershipView;
 pub use policy::PolicyUpdate;
 pub use rotation::PassphraseRotation;
+pub use servicegrant::ServiceGrantExclusion;
 pub use visibility::VisibilitySet;

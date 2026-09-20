@@ -156,6 +156,21 @@ pub struct Evaluator {
     /// Consent edges: author `A` → set of targets `N` that `A` currently consents
     /// to (after single-writer latest-causal resolution + revocation rotation).
     consent: BTreeMap<Digest32, BTreeSet<Digest32>>,
+    /// The genesis **service grant** (ADR-017 decision 3): capabilities every member
+    /// holds with no certificate. Empty for every channel that does not use one.
+    service_grant: CapabilitySet,
+    /// The identities this node has admitted as authors of the channel — its view of
+    /// *who is a member*, which is what the service grant is conferred on.
+    ///
+    /// Membership in ADR-007 is emergent and has no roster: each node admits authors
+    /// from a join it witnessed or a vouched bundle record, so this is necessarily
+    /// local state. That is not a weakness here, because the decision it feeds is
+    /// local too — a host deciding whether to serve *its own* service consults the
+    /// keys it verified itself, and refuses anyone it has not (fail closed).
+    members: BTreeSet<Digest32>,
+    /// Members whose genesis-conferred capabilities have been withdrawn by an
+    /// authorized [`ServiceGrantExclusion`](crate::governance::servicegrant::ServiceGrantExclusion).
+    excluded: BTreeSet<Digest32>,
 }
 
 impl Evaluator {
@@ -182,6 +197,26 @@ impl Evaluator {
         entries: &[GovEntry],
         now_secs: u64,
         author_key: F,
+    ) -> Result<Self>
+    where
+        F: Fn(&Digest32) -> Option<CompositePublicKey>,
+    {
+        Self::build_with_members(genesis, entries, now_secs, author_key, BTreeSet::new())
+    }
+
+    /// [`Evaluator::build`] with this node's **admitted-author set**, which is what a
+    /// genesis service grant is conferred on (ADR-017 decision 3).
+    ///
+    /// [`Evaluator::build`] passes an empty set, so a genesis service grant confers
+    /// nothing there. That is deliberate and fail-closed: a caller that does not know
+    /// who the members are must not hand out capabilities on their behalf, and every
+    /// caller that *does* know — the node's channel state — uses this constructor.
+    pub fn build_with_members<F>(
+        genesis: &Genesis,
+        entries: &[GovEntry],
+        now_secs: u64,
+        author_key: F,
+        members: BTreeSet<Digest32>,
     ) -> Result<Self>
     where
         F: Fn(&Digest32) -> Option<CompositePublicKey>,
@@ -220,6 +255,7 @@ impl Evaluator {
         let current_epoch = head.epoch;
         let policy = resolver.resolve_policy(genesis)?;
         let consent = resolver.resolve_consent()?;
+        let excluded = resolver.resolve_service_grant_exclusions()?;
 
         Ok(Self {
             channel_id,
@@ -229,6 +265,9 @@ impl Evaluator {
             policy,
             current_epoch,
             consent,
+            service_grant: genesis.body.service_grant.clone(),
+            members,
+            excluded,
         })
     }
 
@@ -241,6 +280,7 @@ impl Evaluator {
             GovBody::AdminRevocation(r) => r.verify(author_key),
             GovBody::ConsentGrant(g) => g.verify(author_key),
             GovBody::ConsentRevocation(r) => r.verify(author_key),
+            GovBody::ServiceGrantExclusion(x) => x.verify(author_key),
             GovBody::PolicyUpdate(p) => p.verify(author_key),
             GovBody::PassphraseRotation(r) => r.verify(author_key),
         }
@@ -289,15 +329,32 @@ impl Evaluator {
 
     /// The authoritative verdict for "does `key` hold `cap`?": the governing
     /// capability + effective set on grant, or a stable [`DenyReason`] on denial.
+    ///
+    /// Two sources, checked in this order:
+    /// 1. **Certificates** — the ADR-007 delegation chain rooted at the genesis
+    ///    creator, already resolved with attenuation, expiry, revocation and the
+    ///    tie-break applied.
+    /// 2. **The genesis service grant** (ADR-017 decision 3) — conferred on every
+    ///    member this node has admitted, unless that member is excluded.
+    ///
+    /// Certificates are consulted first because only they can confer `admin`, which
+    /// implies everything; the grant can only ever add `dial:`/`bind:`
+    /// ([`validate_service_grant`](crate::governance::genesis::validate_service_grant)).
+    /// An exclusion suppresses **only** the grant, never a certificate — so an admin
+    /// who excluded a member and then deliberately certified them again has done
+    /// exactly that, and the later, explicit act stands.
     #[must_use]
     pub fn grants(&self, key: &Digest32, cap: &Capability) -> Verdict {
         match self.authority.get(key) {
-            None => Verdict::Denied(
-                self.denied
-                    .get(key)
-                    .copied()
-                    .unwrap_or(DenyReason::NotAdmin),
-            ),
+            None => match self.service_grant_verdict(key, cap) {
+                Some(v) => v,
+                None => Verdict::Denied(
+                    self.denied
+                        .get(key)
+                        .copied()
+                        .unwrap_or(DenyReason::NotAdmin),
+                ),
+            },
             Some(set) => {
                 if set.grants(cap) {
                     // The governing capability is `admin` if held (it implies all),
@@ -312,10 +369,45 @@ impl Evaluator {
                         effective_set: set.clone(),
                     }
                 } else {
-                    Verdict::Denied(DenyReason::CapabilityNotHeld)
+                    // A certified identity may still hold this one by membership.
+                    self.service_grant_verdict(key, cap)
+                        .unwrap_or(Verdict::Denied(DenyReason::CapabilityNotHeld))
                 }
             }
         }
+    }
+
+    /// The genesis-service-grant verdict for `key`, or `None` when the grant has
+    /// nothing to say (so the caller falls back to its certificate-based reason).
+    ///
+    /// `None` rather than a denial on purpose: a channel with no service grant, or a
+    /// capability outside it, must produce exactly the [`DenyReason`] the certificate
+    /// path would have produced, so this term can never blur why something was denied.
+    fn service_grant_verdict(&self, key: &Digest32, cap: &Capability) -> Option<Verdict> {
+        if !self.service_grant.grants(cap) || !self.members.contains(key) {
+            return None;
+        }
+        if self.excluded.contains(key) {
+            // Withdrawn deliberately: `Revoked` is the honest reason, and it
+            // outranks the passive ones for the same purpose it does elsewhere.
+            return Some(Verdict::Denied(DenyReason::Revoked));
+        }
+        Some(Verdict::Granted {
+            governing: cap.clone(),
+            effective_set: self.service_grant.clone(),
+        })
+    }
+
+    /// The genesis service grant this channel confers on its members (ADR-017).
+    #[must_use]
+    pub fn service_grant(&self) -> &CapabilitySet {
+        &self.service_grant
+    }
+
+    /// Whether `key` has been excluded from the genesis service grant (ADR-017).
+    #[must_use]
+    pub fn is_excluded(&self, key: &Digest32) -> bool {
+        self.excluded.contains(key)
     }
 
     /// Whether `reader` currently has consent to read `author` (outbound axis
@@ -687,6 +779,41 @@ impl<'a> Resolver<'a> {
             }
         }
         Ok(consent)
+    }
+
+    /// Resolve which members are excluded from the genesis service grant (ADR-017).
+    ///
+    /// An exclusion counts only if its issuer held `delegate` in the exclusion's
+    /// **strict causal past** — the same authorization test an admin-delegation
+    /// revocation passes, and for the same reason: authority is read from what
+    /// happened before the act, never from concurrent or later facts.
+    ///
+    /// Exclusion is **one-way within an epoch**: there is no un-exclude entry, so a
+    /// resolved exclusion cannot be undone by another exclusion arriving later, and
+    /// nothing about ordering can resurrect a withdrawn capability. An admin who
+    /// changes their mind issues an explicit certificate instead (which the grant term
+    /// in [`Evaluator::grants`] deliberately does not suppress), and a new epoch clears
+    /// every exclusion along with every certificate.
+    fn resolve_service_grant_exclusions(&mut self) -> Result<BTreeSet<Digest32>> {
+        let mut excluded = BTreeSet::new();
+        let order: Vec<&GovEntry> = self.causality.order.clone();
+        for e in order {
+            let GovBody::ServiceGrantExclusion(x) = &e.body else {
+                continue;
+            };
+            if !self.in_effect(e)? {
+                continue; // a stale/future-epoch exclusion has no effect
+            }
+            let before = self.strict_before(&e.entry_hash)?;
+            if before
+                .authority
+                .get(&x.body.issuer_id)
+                .is_some_and(|c| c.grants(&Capability::Delegate))
+            {
+                excluded.insert(x.body.target_id);
+            }
+        }
+        Ok(excluded)
     }
 }
 

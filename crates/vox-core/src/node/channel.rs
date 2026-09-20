@@ -56,6 +56,7 @@ use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, Histor
 use crate::governance::membership::{
     issue_consent_grant, issue_consent_revocation, MembershipView,
 };
+use crate::governance::servicegrant::ServiceGrantExclusion;
 use crate::group::history::OriginKeyStore;
 use crate::group::message::GroupMessage;
 use crate::group::skdm::Skdm;
@@ -621,6 +622,37 @@ impl ChannelState {
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
+        Self::create_with_grant(
+            profile,
+            local_name,
+            channel_passphrase,
+            CapabilitySet::new(),
+            now_secs,
+            argon2,
+        )
+    }
+
+    /// Create a channel whose **genesis confers `service_grant` on every member**
+    /// (ADR-017 decision 3) — the capability-bearing room `vox serve` makes.
+    ///
+    /// Joining such a room *is* the authorization: the joiner already proved it held
+    /// the passphrase and paid the ADR-005 proof of work, and the room's purpose is
+    /// the service, so "may this member dial it" and "is this person a member" are the
+    /// same question. No certificate is issued to anyone, so the host never waits for
+    /// the guest to appear in order to grant them something.
+    ///
+    /// The grant is immutable, being part of the genesis and therefore of the
+    /// channelID — a room cannot silently *become* an access list, and one created as
+    /// an access list cannot stop being one. Taking it back from a single member is
+    /// [`ChannelState::exclude_from_service_grant`].
+    pub fn create_with_grant(
+        profile: &Profile,
+        local_name: &str,
+        channel_passphrase: &[u8],
+        service_grant: CapabilitySet,
+        now_secs: u64,
+        argon2: Argon2Profile,
+    ) -> Result<Self> {
         if local_name.len() > MAX_LOCAL_NAME_LEN {
             return Err(Error::SizeLimitExceeded("channel local name"));
         }
@@ -631,7 +663,7 @@ impl ChannelState {
             ttl: 0,
             min_suite: SuiteFloor::DAY_ONE.id(),
         };
-        let genesis = Genesis::create(signer, now_secs, policy)?;
+        let genesis = Genesis::create_with_grant(signer, now_secs, policy, service_grant)?;
         let channel_id = genesis.channel_id();
         let epoch = 0u64;
         let me = signer.fingerprint();
@@ -906,9 +938,18 @@ impl ChannelState {
         gov_entries: &[GovEntry],
         now_secs: u64,
     ) -> Result<Evaluator> {
-        Evaluator::build(genesis, gov_entries, now_secs, |id| {
-            authors.get(id).cloned()
-        })
+        // The admitted authors are this node's view of *who is a member*, which is
+        // what a genesis service grant is conferred on (ADR-017 decision 3). It is
+        // local state by ADR-007's design — membership is emergent, there is no
+        // roster — and that is sound here because the decision it feeds is local too:
+        // a host serving its own service consults the keys it verified itself.
+        Evaluator::build_with_members(
+            genesis,
+            gov_entries,
+            now_secs,
+            |id| authors.get(id).cloned(),
+            authors.keys().copied().collect(),
+        )
     }
 
     /// Create the local state for a channel this identity **joined** (ADR-007
@@ -1532,6 +1573,49 @@ impl ChannelState {
         )?;
         self.append_governance(profile, &cert.to_wire(), now_secs)?;
         Ok(cert)
+    }
+
+    /// Withdraw the genesis service grant from `member` (ADR-017 decision 3): append
+    /// the signed [`ServiceGrantExclusion`] and fold it into the evaluator, so the
+    /// member stops holding what membership alone conferred.
+    ///
+    /// This is the counterpart a capability-bearing room needs. A genesis grant issues
+    /// nobody a certificate, so there is no delegation for ADR-007's
+    /// admin-delegation-revocation to name — without this, adding a genesis grant
+    /// would take away the per-member control the channel already had.
+    ///
+    /// It suppresses **only** the genesis-conferred capabilities: an explicit
+    /// [`AdminCert`] issued to the same identity is governed by its own revocation, so
+    /// an admin who excludes a member and then deliberately certifies them again has
+    /// done exactly that. The caller must hold `delegate` — the evaluator checks it
+    /// from the entry's strict causal past, so an unauthorized exclusion is simply
+    /// inert rather than rejected here.
+    pub fn exclude_from_service_grant(
+        &mut self,
+        profile: &Profile,
+        member: Digest32,
+        now_secs: u64,
+    ) -> Result<ServiceGrantExclusion> {
+        if self.genesis.body.service_grant.is_empty() {
+            return Err(Error::MalformedGovernance(
+                "channel has no genesis service grant to exclude from",
+            ));
+        }
+        if member == self.me() {
+            return Err(Error::MalformedGovernance(
+                "an identity cannot exclude itself from the service grant",
+            ));
+        }
+        let signer = profile.signer()?;
+        let exclusion = ServiceGrantExclusion::build(signer, &self.channel_id, self.epoch, member)?;
+        self.append_governance(profile, &exclusion.to_wire(), now_secs)?;
+        Ok(exclusion)
+    }
+
+    /// The capabilities this channel's genesis confers on every member (ADR-017).
+    #[must_use]
+    pub fn service_grant(&self) -> &CapabilitySet {
+        &self.genesis.body.service_grant
     }
 
     /// Whether `member` may **dial** `service_tag` in this channel, by this node's
@@ -2562,6 +2646,128 @@ mod tests {
         // The axes are independent: a dial capability granted nobody any reading.
         assert!(!a.may_read(&a_fp, &b_fp), "no message consent was implied");
         assert!(b.timeline().is_empty());
+    }
+
+    /// M17.1 (ADR-017 decision 3) — a capability-bearing room: joining it *is* the
+    /// authorization, and one member can still be cut off.
+    ///
+    /// The step this deletes is the worst one in the old flow — the host waiting for
+    /// the guest to appear and then granting them something. So the test's central
+    /// assertion is the absence of an act: Bob dials having received **no certificate
+    /// of any kind**, because the genesis says members may. Then:
+    /// - the same room confers nothing it did not name, and no authority at all;
+    /// - a room created without a grant is unchanged, which is every existing channel;
+    /// - excluding Bob stops him and leaves Carol working;
+    /// - the grant survives a reopen, because it is part of the channelID.
+    #[test]
+    fn a_room_whose_genesis_grants_dial_needs_no_certificate_and_can_still_exclude() {
+        use crate::governance::capability::Capability;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = profile(&tmp, "alice");
+        let bob = profile(&tmp, "bob");
+        let carol = profile(&tmp, "carol");
+        let t = 1_700_000_000;
+
+        let mut a = ChannelState::create_with_grant(
+            &alice,
+            "infra",
+            b"channel-pp",
+            CapabilitySet::from_iter_caps([Capability::dial("22")]),
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        let cid = a.channel_id();
+        let b_fp = RootSigner::public_key(bob.signer().unwrap()).fingerprint();
+        let c_fp = RootSigner::public_key(carol.signer().unwrap()).fingerprint();
+        assert_eq!(a.service_grant().to_tokens(), vec!["dial:22".to_owned()]);
+
+        // Bob joins the room from its genesis, exactly as a guest would.
+        let b_state = ChannelState::join_channel_with_profile(
+            &bob,
+            a.genesis(),
+            &cid,
+            "infra",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        // The joiner converges on the grant from the genesis alone — no governance
+        // history to fetch first, which is why it lives there.
+        assert_eq!(
+            b_state.service_grant().to_tokens(),
+            vec!["dial:22".to_owned()]
+        );
+
+        // Alice admits Bob and Carol as authors. That is *all* that happens: no
+        // `grant_capabilities`, no certificate, no waiting.
+        for who in [&bob, &carol] {
+            a.admit_author(
+                alice.store(),
+                &RootSigner::public_key(who.signer().unwrap()),
+                t,
+            )
+            .unwrap();
+        }
+        assert!(
+            a.can_dial(&b_fp, "22"),
+            "membership is the authorization (ADR-017 decision 3)"
+        );
+        assert!(a.can_dial(&c_fp, "22"));
+        // Conferred exactly what the genesis named, and no authority.
+        assert!(!a.can_dial(&b_fp, "2222"), "only the named service");
+        assert!(!a.can_bind(&b_fp, "22"), "dial is not bind");
+        assert!(
+            !a.evaluator().is_admin(&b_fp),
+            "a member is not an admin of the room they joined"
+        );
+        // And Bob himself agrees about Bob, from his own copy of the room.
+        assert!(b_state.can_dial(&b_fp, "22"));
+
+        // A room created the ordinary way is untouched: membership confers nothing.
+        let mut plain = ChannelState::create_with_profile(
+            &alice,
+            "chat",
+            b"other-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        plain
+            .admit_author(
+                alice.store(),
+                &RootSigner::public_key(bob.signer().unwrap()),
+                t,
+            )
+            .unwrap();
+        assert!(
+            !plain.can_dial(&b_fp, "22"),
+            "a chat room does not become an access list"
+        );
+        assert!(plain.service_grant().is_empty());
+        assert!(
+            plain.exclude_from_service_grant(&alice, b_fp, t).is_err(),
+            "there is no grant here to exclude from"
+        );
+
+        // Exclusion: Bob loses it, Carol keeps it.
+        assert!(a.exclude_from_service_grant(&alice, c_fp, t).is_ok());
+        assert!(!a.can_dial(&c_fp, "22"), "the excluded member is cut off");
+        assert!(a.can_dial(&b_fp, "22"), "the others are untouched");
+        assert!(
+            a.exclude_from_service_grant(&alice, a.me(), t).is_err(),
+            "an admin cannot exclude itself"
+        );
+
+        // Both facts survive a reopen — the grant because it is in the channelID, the
+        // exclusion because it is on the log.
+        drop(a);
+        let a = ChannelState::open(&alice, &cid, b"channel-pp", t + 1).unwrap();
+        assert_eq!(a.service_grant().to_tokens(), vec!["dial:22".to_owned()]);
+        assert!(a.can_dial(&b_fp, "22"));
+        assert!(!a.can_dial(&c_fp, "22"));
     }
 
     /// M18.1 (ADR-006 §History, ADR-007 §Revocation) — revocation *is* rotation with

@@ -60,6 +60,15 @@ established substrate and marked as such. This ADR specifies the complete tunnel
   ADR-006). A member can thus enumerate only the services it is authorized to consume; an
   unauthorized member sees at most opaque ciphertext and cannot even learn a service exists. This
   resolves the otherwise-contradiction between discovery-gating and the replicate-all log.
+- **Membership grants tunnel reach only where an immutable genesis says so (qualified 2026-09-21).**
+  ADR-017 decision 3 adds a genesis **service grant**: a room may declare that every member holds
+  `dial:`/`bind:` for named services, which is how a room created *for* a service stops needing a separate
+  authorization step. The invariant below still holds for every room that does not declare one — and a room
+  cannot acquire one later, because the grant is part of the channelID. So the path this invariant guards
+  against, "join my chat" silently becoming "you are on my LAN", remains closed: a chat room created
+  without a grant can never confer reach, and a service room is a different room whose stated purpose is
+  that reach. The grant may confer only `dial:`/`bind:`, never authority, and is revocable per member by a
+  `service-grant-exclusion` (ADR-007 `0x0013`).
 - **Chat membership grants NO tunnel reach — this is a hard invariant (but the two coexist freely in one
   swarm).** Joining a channel, holding the passphrase, or being consented-to for *messages* conveys
   **zero** tunnel reachability *by itself*. Tunnel capabilities are **never inherited from membership** —
