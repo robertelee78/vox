@@ -44,3 +44,4 @@ pub mod resolver;
 pub mod store;
 pub mod syncstream;
 pub mod tunnel;
+pub mod up;

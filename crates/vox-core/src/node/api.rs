@@ -236,6 +236,23 @@ pub enum NodeCommand {
         /// `127.0.0.1:<port>` — the same port, which is the case worth optimising.
         at: Option<std::net::SocketAddr>,
     },
+    /// Bring up the local entry point for a room's services: a SOCKS5 proxy on `bind`
+    /// that resolves that room's `.vox` name and carries connections to its host
+    /// (ADR-017 decision 5) — what `vox up` runs.
+    ///
+    /// Needs no privilege: loopback, a port above 1024, no device, no route and no
+    /// resolver entry. A tool reaches it the way a Tor user reaches `SocksPort` — `ssh`
+    /// through a `ProxyCommand`, most others through `ALL_PROXY=socks5h://…`.
+    ///
+    /// The room must be open, because its `.vox` name is derived from the genesis inside
+    /// the sealed store (ADR-010's double lock), and only a room this node holds has a
+    /// name at all.
+    Up {
+        /// The room whose services this proxy carries.
+        channel_id: Digest32,
+        /// Where to listen. Loopback only; `0` picks a port.
+        bind: std::net::SocketAddr,
+    },
     /// Offer a local TCP service to a channel (ADR-013 Bind). Host configuration:
     /// what a peer may *reach* is the `dial:` capability on the log, granted with
     /// [`NodeCommand::GrantTunnel`]. Requires `bind:<service_tag>` in that channel.
@@ -458,6 +475,15 @@ pub enum NodeEvent {
         client: Digest32,
         /// The service reached — for a port-named service (ADR-017), the port.
         service_tag: String,
+    },
+    /// The local entry point is up: a SOCKS5 proxy carrying one room's services.
+    ProxyUp {
+        /// The room it carries.
+        channel_id: Digest32,
+        /// The `.vox` hostname its services answer on.
+        hostname: String,
+        /// Where it is listening.
+        bind: std::net::SocketAddr,
     },
     /// A sync session applied entries to a channel's log.
     Synced {

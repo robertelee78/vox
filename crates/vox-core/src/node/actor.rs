@@ -726,6 +726,7 @@ impl Node {
                 port,
                 at,
             } => self.serve_room(&local_name, &passphrase, port, at).await,
+            NodeCommand::Up { channel_id, bind } => self.bring_up(&channel_id, bind).await,
             NodeCommand::AddService {
                 channel_id,
                 service_tag,
@@ -2563,6 +2564,63 @@ impl Node {
 
     /// Forward a local port to a member's service (ADR-013 Dial, M16.1): reach the
     /// member through the whole ADR-012 ladder, then bind the port.
+    /// Bring up the SOCKS5 entry point for one room (ADR-017 decision 5).
+    ///
+    /// The room's host is its genesis creator, which is why this needs nothing but the
+    /// room: no advertisement to wait for, and no configuration to hold. The connection to
+    /// that host is established here, through the ADR-012 ladder, so the proxy never dials
+    /// a peer itself — it asks the node for a connection and refuses if there is none.
+    async fn bring_up(&mut self, channel_id: &Digest32, bind: std::net::SocketAddr) -> Outcome {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        let genesis = shared.lock().await.genesis().clone();
+        let mut resolver = crate::node::resolver::VoxResolver::new();
+        if !resolver.insert(&genesis) {
+            // A room with no genesis service grant has no `.vox` name: its host is not
+            // determined by the genesis, so there is nothing to resolve to. Such a room is
+            // reached with `vox forward <member>/<tag>` instead (ADR-017 decision 4).
+            return Outcome::Failed(Fault::Refused);
+        }
+        let hostname = crate::node::link::vox_hostname(channel_id);
+        let host = genesis.creator_pubkey().fingerprint();
+        // Establish the connection now rather than on the first CONNECT: a proxy that
+        // bound and then failed every request would be the "appears to work" failure.
+        let endpoints = self
+            .net
+            .as_ref()
+            .map(|net| net.board_endpoints(channel_id, &host))
+            .unwrap_or_default();
+        if let Err(e) = self.dial(host, &endpoints).await {
+            return Outcome::Failed(fault_of(&e));
+        }
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return Outcome::Failed(Fault::NotNetworked);
+        };
+        let bound = match tokio::net::TcpListener::bind(bind).await {
+            Ok(l) => match l.local_addr() {
+                Ok(a) => {
+                    drop(l);
+                    a
+                }
+                Err(_) => return Outcome::Failed(Fault::Internal),
+            },
+            Err(_) => return Outcome::Failed(Fault::Unreachable),
+        };
+        let resolver = Arc::new(resolver);
+        let dialer = Arc::new(NodeDialer { net });
+        tokio::spawn(crate::node::up::serve(bound, resolver, dialer));
+        let _ = self
+            .event_tx
+            .send(NodeEvent::ProxyUp {
+                channel_id: *channel_id,
+                hostname,
+                bind: bound,
+            })
+            .await;
+        Outcome::Done
+    }
+
     async fn forward(
         &mut self,
         channel_id: &Digest32,
@@ -2814,6 +2872,22 @@ fn row_of(r: &Rendered) -> MessageRow {
 }
 
 /// Map a library error to the closed, redaction-safe [`Fault`] set.
+/// The node's answer to "give me a connection to this member", for the `vox up` proxy.
+///
+/// The proxy never dials: reaching a member is the ADR-012 ladder's job and the ladder
+/// lives in the node. This hands over a connection the node already has, and answers
+/// `None` otherwise — so a proxy request for an unreachable host is refused rather than
+/// blocked.
+struct NodeDialer {
+    net: Arc<NodeNet>,
+}
+
+impl crate::node::up::HostDialer for NodeDialer {
+    fn connection(&self, host: &Digest32) -> Option<Arc<VoxConnection>> {
+        self.net.manager().existing(host)
+    }
+}
+
 fn fault_of(e: &Error) -> Fault {
     match e {
         Error::Profile("no identity in this profile") => Fault::NoIdentity,

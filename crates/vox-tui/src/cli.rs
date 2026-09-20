@@ -327,6 +327,17 @@ pub struct ConnectArgs {
     pub identity_passphrase: Option<String>,
 }
 
+/// `vox up`
+#[derive(Args, Debug, Clone)]
+pub struct UpArgs {
+    #[command(flatten)]
+    pub room: RoomArgs,
+    /// Where the proxy listens. Loopback only, and a port above 1024 — nothing here needs
+    /// privilege.
+    #[arg(long, default_value = "127.0.0.1:1080")]
+    pub bind: SocketAddr,
+}
+
 /// The default bind address: every interface, kernel-chosen port. The bound address
 /// is not what peers are told to dial (see [`ProfileArgs::listen`]), so binding
 /// broadly is right.
@@ -370,6 +381,14 @@ enum Cmd {
     /// only once they hold `dial:<tag>`, which `vox grant` puts on the room's log.
     #[command(subcommand)]
     Service(ServiceCmd),
+    /// Bring up the local entry point for a room's services: a SOCKS5 proxy that resolves
+    /// the room's `.vox` name (ADR-017).
+    ///
+    /// This is how a tool reaches a room-bound service by name — the same shape a Tor user
+    /// reaches a `.onion` through, and for the same reason: it needs no privilege of any
+    /// kind. `ssh` is pointed at it with one `ProxyCommand` line, which `vox up` prints;
+    /// most other tools take `ALL_PROXY=socks5h://…`. Runs until interrupted.
+    Up(UpArgs),
     /// Forward a local port to a member's service over the overlay — `ssh` over Vox
     /// (ADR-013). Runs until interrupted.
     Forward(ForwardArgs),
@@ -503,6 +522,12 @@ pub fn run() -> ExitCode {
                     .unwrap_or_default();
                 crate::tunnel_cli::grant(&node, cid, &a.member, &a.tag, a.may_bind, a.days, now)
                     .await
+            })
+        }
+        Cmd::Up(args) => {
+            let bind = args.bind;
+            run_tunnel_verb(args.room.clone(), move |node, cid| async move {
+                crate::tunnel_cli::up(&node, cid, bind).await
             })
         }
         Cmd::Forward(args) => {
