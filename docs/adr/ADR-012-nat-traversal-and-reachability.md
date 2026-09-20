@@ -1,8 +1,8 @@
 # ADR-012: NAT Traversal, Bootstrap, and Reachability
 
-**Status**: implemented (M10 primitives, `crates/vox-core/src/nat/`) — not yet composed into the reachability ladder (see Known gaps)
+**Status**: implemented and composed — all four rungs of the reachability ladder run in the node (`crates/vox-core/src/nat/`, `crates/vox-core/src/node/{network,coordstream,circuitstream}.rs`, `crates/vox-core/src/transport/mux.rs`), proved against simulated RFC 4787 NATs; UPnP-IGD deliberately omitted, DHT not started (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b).
+**Updated**: 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
 
