@@ -75,6 +75,12 @@ const NET_QUEUE: usize = 64;
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
+    /// The ladder's publish side finished: this node now knows what to advertise, and
+    /// whether a gateway granted a port mapping that will need renewing.
+    AddressesDiscovered {
+        /// The granted mapping, if any.
+        mapping: Option<crate::nat::portmap::PortMapping>,
+    },
     /// A peer connected inbound: it gets a sync schedule, due immediately.
     Connected {
         /// The authenticated peer.
@@ -229,6 +235,9 @@ pub struct Node {
     /// Peers whose connection already has a stream loop, so dialing again does not
     /// start a second one.
     stream_loops: std::collections::BTreeSet<Digest32>,
+    /// The gateway port mapping in force, if one was granted. Held so it can be
+    /// renewed before its lifetime elapses (RFC 6886/6887 put renewal on the client).
+    port_mapping: Option<crate::nat::portmap::PortMapping>,
     /// Per-peer ADR-008 sync clock (ADR-016 §"Sync scheduling").
     schedules: BTreeMap<Digest32, SyncSchedule>,
     /// Channels with a local append not yet pushed to peers.
@@ -316,6 +325,7 @@ impl Node {
             bind,
             pow_params,
             stream_loops: std::collections::BTreeSet::new(),
+            port_mapping: None,
             schedules: BTreeMap::new(),
             pending_push: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
@@ -477,8 +487,17 @@ impl Node {
         )?);
         let net = Arc::new(NodeNet::new(endpoint, Arc::clone(&self.clock)));
         self.net = Some(Arc::clone(&net));
-        // No refresh here: the network only starts when the identity unlocks, and
-        // `lock_all` cleared every channel, so there is nothing to publish yet.
+        // No membership refresh here: the network only starts when the identity
+        // unlocks, and `lock_all` cleared every channel, so there is nothing to
+        // publish yet. The *address* discovery does run, on its own task, because it
+        // talks to the network (a route probe and a gateway request) and must not hold
+        // up the unlock.
+        let discover = Arc::clone(&net);
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let mapping = discover.refresh_advertised().await;
+            let _ = tx.send(NetEvent::AddressesDiscovered { mapping }).await;
+        });
         spawn_accept_loop(net, self.net_tx.clone());
         Ok(())
     }
@@ -491,6 +510,7 @@ impl Node {
             net.manager().endpoint().close();
         }
         self.stream_loops.clear();
+        self.port_mapping = None;
         self.schedules.clear();
         self.pending_push.clear();
     }
@@ -608,6 +628,15 @@ impl Node {
         match event {
             NetEvent::Stopped => {
                 self.net = None;
+            }
+            NetEvent::AddressesDiscovered { mapping } => {
+                // Re-publish every open channel's records: the addresses in them were
+                // composed before discovery and may name only loopback.
+                self.port_mapping = mapping;
+                let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+                for channel_id in channels {
+                    self.publish_channel_locally(&channel_id).await;
+                }
             }
             NetEvent::Connected { peer } => {
                 // A fresh connection syncs at once (ADR-016), then on the interval.
@@ -1615,6 +1644,7 @@ mod tests {
             bind: None,
             pow_params: None,
             stream_loops: std::collections::BTreeSet::new(),
+            port_mapping: None,
             schedules: BTreeMap::new(),
             pending_push: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),

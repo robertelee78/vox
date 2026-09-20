@@ -530,8 +530,20 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `vox` itself; `run_live` takes a listen address (`--listen`, `VOX_LISTEN`, default `127.0.0.1:0`). The
   default is loopback rather than a wildcard on purpose: the bound address is what an invite link
   advertises, and `0.0.0.0` would advertise an address nobody can dial. Reaching another machine needs an
-  address peers can reach (`--listen 192.168.1.5:0`) until automatic address discovery and the ADR-012
-  port-mapped rung land — that is the next milestone, and the honest limit until then.
+  address peers can reach until automatic address discovery lands.
+- **The node advertises what the ladder composes, not what it bound (M14.8a).** The previous note had this
+  backwards, and the `--listen` default with it. Binding is just binding: `--listen` now defaults to the
+  wildcard, and what a node *publishes* comes from the ADR-012 ladder's publish side — its routable
+  address, a gateway-mapped address when one can be had, loopback last (ADR-012 Implementation notes).
+  Discovery runs on its own task at network start, because it touches the network (a route probe and a
+  gateway request) and must not delay the unlock; when it finishes, every open channel's records are
+  re-published, since the ones written before it may name only loopback. A granted mapping is held so it can
+  be renewed inside its lifetime.
+  This matters for the use case the ADRs are actually built for (ADR-013: "the overlay carries arbitrary
+  TCP/IP between channel members", and a single swarm carries comms *and* tunnels): a client inside a
+  private network with only outbound access must be able to form and join a swarm. Its own address is not
+  what an invite link is for, and the remaining rungs — hole punching through a coordinator and a relay
+  fallback — are what close that case.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

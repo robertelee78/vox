@@ -229,6 +229,11 @@ pub enum Inbound {
 /// The node's network surface.
 pub struct NodeNet {
     manager: Arc<ConnectionManager>,
+    /// The endpoints this node advertises, composed by the ADR-012 ladder's publish
+    /// side rather than taken from the bound socket — a node that binds the wildcard
+    /// has no single bound address to publish, and a node behind NAT needs its
+    /// *mapped* address. Refreshed by [`NodeNet::refresh_advertised`].
+    advertised: Mutex<Option<EndpointList>>,
     service: RendezvousService,
     membership: SharedMembership,
     policy: SharedPolicy,
@@ -257,6 +262,7 @@ impl NodeNet {
         );
         Self {
             manager: Arc::new(ConnectionManager::new(endpoint, Arc::clone(&clock))),
+            advertised: Mutex::new(None),
             service,
             membership,
             policy: SharedPolicy::new(),
@@ -294,10 +300,36 @@ impl NodeNet {
         self.manager.local_id()
     }
 
-    /// The endpoints this node advertises: its bound socket address.
+    /// The endpoints this node advertises.
+    ///
+    /// After [`NodeNet::refresh_advertised`] this is the ADR-012 ladder's composed
+    /// set (routable address, port-mapped address, loopback). Before it — and if the
+    /// ladder found nothing — it falls back to the bound socket, which is right for a
+    /// node bound to a concrete address and merely useless for one bound to the
+    /// wildcard.
     pub fn local_endpoints(&self) -> Result<EndpointList> {
+        if let Some(list) = lock(&self.advertised).clone() {
+            return Ok(list);
+        }
         let addr = self.manager.endpoint().local_addr()?;
         EndpointList::new(vec![crate::nat::multiaddr::Multiaddr::from(addr)])
+    }
+
+    /// Run the ladder's publish side and cache what this node should advertise:
+    /// its routable address, a gateway-mapped address when one can be had, and
+    /// loopback. Returns the port mapping if a gateway granted one, so the caller can
+    /// renew it before it expires.
+    ///
+    /// Best-effort by design: a node with no dialable address is not broken. It still
+    /// reaches peers outbound and is reached through the ladder's later rungs, which
+    /// is the ordinary case for a client inside a private network.
+    pub async fn refresh_advertised(&self) -> Option<crate::nat::portmap::PortMapping> {
+        let Ok(bound) = self.manager.endpoint().local_addr() else {
+            return None;
+        };
+        let (list, mapping) = crate::nat::reachability::advertise_endpoints(bound.port()).await;
+        *lock(&self.advertised) = Some(list);
+        mapping
     }
 
     fn now(&self) -> u64 {
