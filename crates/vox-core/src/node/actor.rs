@@ -33,6 +33,7 @@ use crate::error::Error;
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::nat::bootstrap::{BootstrapNode, BootstrapSet};
+use crate::nat::record::{MemberBundleRecord, RendezvousRecord};
 use crate::node::api::{
     ChannelDetail, ChannelSummary, Fault, IdentityInfo, MessageRow, NodeCommand, NodeEvent,
     NodeView, Outcome, Secret,
@@ -141,6 +142,13 @@ pub struct NodeConfig {
     /// The anchors this node publishes to, reads from, climbs its ladder through and
     /// names in invite links (ADR-012 §"Bootstrap": the user's own always-on node).
     pub anchors: BootstrapSet,
+    /// A **headless** identity (ADR-016 `vox node`): a transport identity that is not
+    /// a vault. With one, the node networks the moment it is spawned — there is no
+    /// passphrase and nothing to unlock — and it holds no channel secrets, because
+    /// it has no profile to hold them in: it serves the board, coordinates, relays,
+    /// and stores ciphertext. The absence of secrets is structural: every path that
+    /// needs a profile finds none.
+    pub headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
 }
 
 impl std::fmt::Debug for NodeConfig {
@@ -170,7 +178,15 @@ impl NodeConfig {
             bind: None,
             pow_params: None,
             anchors: BootstrapSet::new(),
+            headless: None,
         }
+    }
+
+    /// Run headless as this identity: no vault, no unlock, networked from spawn.
+    #[must_use]
+    pub fn headless(mut self, signer: crate::identity::composite::SoftwareRootSigner) -> Self {
+        self.headless = Some(Arc::new(signer));
+        self
     }
 
     /// Use this clock.
@@ -405,6 +421,8 @@ pub struct Node {
     net_tx: mpsc::Sender<NetEvent>,
     /// Where the endpoint binds, if this node networks at all.
     bind: Option<Bind>,
+    /// The headless transport identity, if this node runs without a vault.
+    headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
     /// The anchors this node is configured with (ADR-012 §"Bootstrap", ADR-016
     /// M15.1): dialled when the network starts, given the `Anchor` class, published
     /// to, and named in every invite link.
@@ -515,6 +533,7 @@ impl Node {
             bind,
             pow_params,
             anchors,
+            headless,
         } = cfg;
         let profile = if Profile::exists(&paths) {
             Some(Profile::open(paths.clone())?)
@@ -532,6 +551,7 @@ impl Node {
             bind,
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             anchors,
+            headless,
             pow_params,
             stream_loops: std::collections::BTreeSet::new(),
             port_mappings: Vec::new(),
@@ -548,6 +568,11 @@ impl Node {
             event_tx,
         };
         let view_rx = node.view_tx.subscribe();
+        // A headless node has nothing to unlock: it is on the network from the start.
+        let mut node = node;
+        if node.headless.is_some() {
+            node.start_network()?;
+        }
         node.publish_initial();
         tokio::spawn(node.run(cmd_rx, net_rx));
         Ok(NodeHandle {
@@ -695,18 +720,27 @@ impl Node {
         if self.net.is_some() {
             return Ok(());
         }
-        let profile = self
-            .profile
-            .as_ref()
-            .ok_or(crate::error::Error::Profile("no identity in this profile"))?;
-        let endpoint = Arc::new(match bind {
-            Bind::Addr(addr) => {
-                crate::transport::quic::VoxEndpoint::bind(profile.signer()?, *addr)?
+        // The identity to network as: the unlocked vault's, or the headless one.
+        let endpoint = Arc::new(match (self.headless.as_ref(), self.profile.as_ref()) {
+            (Some(signer), _) => match bind {
+                Bind::Addr(addr) => crate::transport::quic::VoxEndpoint::bind(&**signer, *addr)?,
+                Bind::Socket(socket) => crate::transport::quic::VoxEndpoint::bind_abstract(
+                    &**signer,
+                    Arc::clone(socket),
+                )?,
+            },
+            (None, Some(profile)) => match bind {
+                Bind::Addr(addr) => {
+                    crate::transport::quic::VoxEndpoint::bind(profile.signer()?, *addr)?
+                }
+                Bind::Socket(socket) => crate::transport::quic::VoxEndpoint::bind_abstract(
+                    profile.signer()?,
+                    Arc::clone(socket),
+                )?,
+            },
+            (None, None) => {
+                return Err(crate::error::Error::Profile("no identity in this profile"))
             }
-            Bind::Socket(socket) => crate::transport::quic::VoxEndpoint::bind_abstract(
-                profile.signer()?,
-                Arc::clone(socket),
-            )?,
         });
         let net = Arc::new(NodeNet::new(endpoint, Arc::clone(&self.clock)));
         self.net = Some(Arc::clone(&net));
@@ -813,6 +847,13 @@ impl Node {
         let _ = client.put(&genesis_wire).await;
         let _ = client.put(&address.to_wire()).await;
         let _ = client.put(&bundle.to_wire()).await;
+        // And every other member's records this node's board holds: an anchor learns
+        // a channel's members only from a member that vouches for them (M15.2a), and
+        // a bundle carries the key an address record is verified against, so bundles
+        // go first.
+        for wire in net.board_records(channel_id, epoch) {
+            let _ = client.put(&wire).await;
+        }
         client.finish();
     }
 
@@ -1105,6 +1146,11 @@ impl Node {
         };
         if admitted {
             self.refresh_network_view().await;
+            // The newcomer's records reach the anchors through this node: it
+            // witnessed the join, so it vouches (ADR-016 M15.2a). The joiner has
+            // published to this board by the time its own join returns; whatever is
+            // there now goes up, and what arrives later goes with the next mirror.
+            self.publish_channel_to_anchors(&channel_id).await;
         }
         self.sessions.insert((channel_id, peer), outcome.session);
         if let Some(net) = self.net.as_ref() {
@@ -1661,6 +1707,24 @@ impl Node {
         if learned > 0 {
             self.refresh_network_view().await;
         }
+        // What the peer's board holds is filed on this node's own, so its board
+        // carries the whole membership it knows; whenever that gains a record, the
+        // anchors — which learn members only from members (M15.2a) — get a mirror.
+        // Bundles go first: they carry the key an address record is verified with.
+        let mut gained = 0usize;
+        for wire in set
+            .bundles
+            .iter()
+            .map(MemberBundleRecord::to_wire)
+            .chain(set.members.iter().map(RendezvousRecord::to_wire))
+        {
+            if net.publish_local(&wire).is_ok() {
+                gained += 1;
+            }
+        }
+        if gained > 0 {
+            self.publish_channel_to_anchors(channel_id).await;
+        }
         learned
     }
 
@@ -1981,11 +2045,21 @@ impl Node {
                 entries: 0,
             })
             .collect();
+        // A headless node is networked before its first view is published, and a
+        // client reads its addresses off that view: they are cheap to read and need
+        // no channel lock.
+        let listening = self
+            .net
+            .as_ref()
+            .and_then(|n| n.local_endpoints().ok())
+            .map(|eps| eps.addrs().iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
         self.view_tx.send_replace(NodeView {
             identity,
             locked,
             mlock_active: true,
-            listening: Vec::new(),
+            listening,
+            anchoring: Vec::new(),
             channels,
             open_channels: Vec::new(),
         });
@@ -2053,6 +2127,11 @@ impl Node {
             listening,
             channels,
             open_channels,
+            anchoring: self
+                .net
+                .as_ref()
+                .map(|n| n.anchored_channels())
+                .unwrap_or_default(),
         }
     }
 }
@@ -2151,6 +2230,7 @@ mod tests {
             // No bind address: this node does not network (the loopback paths are
             // covered by `node::network` and the M14 gate).
             bind: None,
+            headless: None,
             anchors: BootstrapSet::new(),
             anchor_ids: std::collections::BTreeSet::new(),
             pow_params: None,

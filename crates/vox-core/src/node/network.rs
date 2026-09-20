@@ -479,7 +479,7 @@ impl NodeNet {
         let peer = conn.peer_id();
         match kind {
             StreamKind::Rendezvous => {
-                self.service.serve_stream(send, recv).await?;
+                self.service.serve_stream(peer, send, recv).await?;
                 Ok(Inbound::ServedRendezvous { peer })
             }
             StreamKind::Join => Ok(Inbound::Join { peer, send, recv }),
@@ -755,15 +755,84 @@ impl NodeNet {
         Ok(self.manager.adopt(conn))
     }
 
+    /// What this node's board anchors: every channel it holds a genesis for, with
+    /// how many members and pending joiners it knows of each (ADR-016 M15.2a).
+    #[must_use]
+    pub fn anchored_channels(&self) -> Vec<crate::node::api::AnchoredChannel> {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut channels = guard.channels_with_genesis();
+        channels.sort_unstable();
+        channels
+            .into_iter()
+            .map(|channel_id| {
+                // A member is known by a bundle (the key) or an address record (the
+                // creator's, or one whose bundle came first); the creator is known by
+                // the genesis alone.
+                let mut members: std::collections::BTreeSet<Digest32> = guard
+                    .current_bundles(&channel_id, 0, now)
+                    .iter()
+                    .map(|r| r.author_id)
+                    .chain(
+                        guard
+                            .current_members(&channel_id, 0, now)
+                            .iter()
+                            .map(|r| r.author_id),
+                    )
+                    .collect();
+                if let Some(g) = guard.genesis(&channel_id) {
+                    members.insert(g.body.creator_pubkey.fingerprint());
+                }
+                crate::node::api::AnchoredChannel {
+                    channel_id,
+                    members: members.len(),
+                    pending: guard.current_prejoins(&channel_id, now).len(),
+                }
+            })
+            .collect()
+    }
+
+    /// Every *other* member's live records this node's board holds for `(channel,
+    /// epoch)` — bundles first, then address records — as wire frames, ready to be
+    /// mirrored to an anchor.
+    #[must_use]
+    pub fn board_records(&self, channel_id: &Digest32, epoch: u64) -> Vec<Vec<u8>> {
+        let now = self.now();
+        let me = self.local_id();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut out: Vec<Vec<u8>> = guard
+            .current_bundles(channel_id, epoch, now)
+            .into_iter()
+            .filter(|r| r.author_id != me)
+            .map(MemberBundleRecord::to_wire)
+            .collect();
+        out.extend(
+            guard
+                .current_members(channel_id, epoch, now)
+                .into_iter()
+                .filter(|r| r.author_id != me)
+                .map(RendezvousRecord::to_wire),
+        );
+        out
+    }
+
     /// Put a framed record on **this node's own** board, without a network round
     /// trip. A node is its own first anchor, and it would be absurd to dial itself;
     /// the record still goes through the service's full policy, so a local publish
     /// is gated exactly like a remote one.
     pub fn publish_local(&self, record: &[u8]) -> Result<()> {
         use crate::nat::service::{RendezvousRequest, RendezvousResponse};
-        let responses = self.service.handle(&RendezvousRequest::Put {
-            record: record.to_vec(),
-        });
+        // A local publish: this node is its own publisher, and it is a member of
+        // every channel it publishes to.
+        let me = self.local_id();
+        let responses = self.service.handle(
+            Some(&me),
+            &RendezvousRequest::Put {
+                record: record.to_vec(),
+            },
+        );
         match responses.first() {
             Some(RendezvousResponse::Accepted) => Ok(()),
             Some(RendezvousResponse::Rejected(r)) => {

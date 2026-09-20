@@ -90,6 +90,23 @@ pub struct NodeView {
     pub channels: Vec<ChannelSummary>,
     /// The open channels' detail, in channelID order.
     pub open_channels: Vec<ChannelDetail>,
+    /// Every channel this node's **board** holds a genesis for — the channels it
+    /// anchors, whether or not it is a member — in channelID order. What an anchor
+    /// can say about itself: which rooms it serves and how many members it knows of
+    /// each, never what any of them said.
+    pub anchoring: Vec<AnchoredChannel>,
+}
+
+/// A channel this node's board serves (ADR-016 M15.2a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredChannel {
+    /// The channelID.
+    pub channel_id: Digest32,
+    /// Members the board knows by a live record: the creator, and everyone a member
+    /// has vouched for.
+    pub members: usize,
+    /// Joiners with a live pre-join announcement.
+    pub pending: usize,
 }
 
 /// A command from a client to the node.

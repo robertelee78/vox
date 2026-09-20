@@ -358,6 +358,11 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   Two defects in this ADR's code were found by that gate and fixed here: `connect_direct` spun hot on an
   attempt that failed faster than its stagger (and dropped nothing an IPv4 socket could not address), and
   the sync transport had no per-frame bound. Details in ADR-016.
+- **The rendezvous oracle on an anchor (2026-09-20, ADR-016 M15.2a).** "Accept records only from channel
+  members" was enforced against the node's own membership view, which an anchor that is not a member has
+  none of. It is now enforced against what the board can *know*: the creator by the genesis, and every
+  further member by a bundle record that a known member published — vouching, the same trust members
+  already place in one another's boards. Details in ADR-016.
 - **Known gaps, after rung 4 (2026-09-20).** The ladder is complete and every rung is proved against a
   middlebox that behaves like the real one. What remains is around it, not in it: a helper (coordinator or
   relay) must already be connected to both peers, and is found by trial over current connections —
