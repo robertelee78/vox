@@ -111,27 +111,6 @@ pub async fn serve_reporting(
     .await
 }
 
-/// Carry one connection the Vox interface terminated into a tunnel (ADR-017 M17.3b).
-///
-/// This is the join between the two halves of `vox up`: the interface turned an inbound
-/// SYN into a byte stream and told us which overlay address and port it was for; the
-/// resolver turned that address into a room and its host; and this opens a tunnel stream
-/// to that host and asks for the port as a service tag.
-///
-/// **The port is the tag** (ADR-017 decision 4), so nothing here invents a name, and the
-/// host's evaluator decides whether the dial is allowed — this side claims nothing. A
-/// refusal closes the local stream, which the tool sees as the connection being reset,
-/// and says nothing about why (dark services, ADR-013).
-pub async fn carry(
-    conn: &Arc<VoxConnection>,
-    channel_id: &Digest32,
-    port: u16,
-    local: tokio::io::DuplexStream,
-) -> Result<()> {
-    let (send, recv) = open_typed(conn, StreamKind::Tunnel).await?;
-    session::dial(send, recv, channel_id, &port.to_string(), local).await
-}
-
 /// A live local port forwarded to a member's service over the overlay.
 ///
 /// Dropping it stops the listener. Connections already spliced run to their own end:

@@ -31,7 +31,6 @@ pub mod circuitstream;
 pub mod content;
 pub mod coordstream;
 pub mod headless;
-pub mod interface;
 pub mod joinstream;
 pub mod link;
 pub mod net;
