@@ -237,10 +237,22 @@ fn m14_two_nodes_chat_and_an_unconsented_third_reads_nothing() {
             })
             .await
             .is_done());
-        let a_sync = alice.apply(NodeCommand::Sync { channel_id: cid }).await;
-        assert!(a_sync.is_done(), "Alice syncs: {a_sync:?}");
-        let b_sync = bob.apply(NodeCommand::Sync { channel_id: cid }).await;
-        assert!(b_sync.is_done(), "Bob syncs: {b_sync:?}");
+        // No explicit Sync: the schedule pushes a local append by itself (ADR-016
+        // §"Sync scheduling"). Wait until each side renders the other's message.
+        let sees = |h: &NodeHandle, text: &str| -> bool {
+            h.view()
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == cid)
+                .is_some_and(|d| d.timeline.iter().any(|r| r.text == text))
+        };
+        tokio::time::timeout(TIMEOUT, async {
+            while !(sees(&alice, "hello alice") && sees(&bob, "hello bob")) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("automatic sync delivered both messages");
 
         let texts = |h: &NodeHandle| -> Vec<String> {
             h.view()
@@ -267,10 +279,23 @@ fn m14_two_nodes_chat_and_an_unconsented_third_reads_nothing() {
         );
 
         // ---- the unconsented third reads nothing ----
-        assert!(carol
-            .apply(NodeCommand::Sync { channel_id: cid })
-            .await
-            .is_done());
+        // Carol's schedule reconciles her too; wait until she holds the log.
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let has = carol
+                    .view()
+                    .channels
+                    .iter()
+                    .find(|c| c.channel_id == cid)
+                    .is_some_and(|c| c.entries > 3);
+                if has {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("automatic sync gave Carol the log");
         let carol_view = carol.view();
         let carol_summary = carol_view
             .channels
