@@ -133,6 +133,38 @@ pub enum NodeCommand {
         /// The text.
         text: String,
     },
+    /// Produce a `vox://` invite link for a channel this node holds open, naming
+    /// this node as anchor and responder. The link arrives as
+    /// [`NodeEvent::InviteLink`]; it carries no secret (ADR-016).
+    Invite {
+        /// The channel to invite to.
+        channel_id: Digest32,
+    },
+    /// Join a channel from an invite link. The passphrase is collected by the client
+    /// out of band and is **never** in the link.
+    JoinChannel {
+        /// The `vox://` link.
+        link: String,
+        /// The local (device-only) name to give the channel.
+        local_name: String,
+        /// The channel passphrase.
+        passphrase: Secret,
+    },
+    /// Consent to `target` reading this identity's messages in a channel (ADR-007:
+    /// per-sender, human-initiated). Delivers this identity's sender key to the
+    /// target and records the grant on the log.
+    Consent {
+        /// The channel.
+        channel_id: Digest32,
+        /// The member being consented to.
+        target: Digest32,
+    },
+    /// Reconcile a channel's log with the members this node can reach (ADR-008
+    /// frontier sync).
+    Sync {
+        /// The channel.
+        channel_id: Digest32,
+    },
     /// Stop the actor (locks first).
     Shutdown,
 }
@@ -159,6 +191,15 @@ pub enum Fault {
     Storage,
     /// The node is shutting down.
     ShuttingDown,
+    /// This node is not networked, or is locked, so it cannot reach anyone.
+    NotNetworked,
+    /// An invite link would not parse, or named a channel/anchor this node cannot
+    /// use.
+    BadLink,
+    /// A peer could not be reached (no live endpoint, or the dial failed).
+    Unreachable,
+    /// The remote refused: a join was refused, or a record was rejected.
+    Refused,
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }
@@ -223,6 +264,36 @@ pub enum NodeEvent {
         peer: Digest32,
         /// How many already-stored messages became readable.
         backfilled: u64,
+    },
+    /// An invite link for a channel (public: it carries no secret).
+    InviteLink {
+        /// The channel.
+        channel_id: Digest32,
+        /// The `vox://` URL.
+        url: String,
+    },
+    /// This node joined a channel.
+    Joined {
+        /// The channel joined.
+        channel_id: Digest32,
+        /// The member that answered the join.
+        responder: Digest32,
+    },
+    /// This identity consented to `target`, which may now read its messages.
+    Consented {
+        /// The channel.
+        channel_id: Digest32,
+        /// The member consented to.
+        target: Digest32,
+    },
+    /// A sync session applied entries to a channel's log.
+    Synced {
+        /// The channel.
+        channel_id: Digest32,
+        /// Entries applied to the log.
+        applied: u64,
+        /// How many of those became readable.
+        rendered: u64,
     },
     /// The actor has stopped.
     Shutdown,

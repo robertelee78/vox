@@ -39,7 +39,7 @@ const META_CREATED: &str = "identity_created";
 /// unlocked.
 pub struct Profile {
     paths: Paths,
-    store: Store,
+    store: std::sync::Arc<Store>,
     vault: IdentityVault,
     fingerprint: Digest32,
     created: u64,
@@ -94,7 +94,7 @@ impl Profile {
         // facts. A crash between the two leaves a vault without meta, which `open`
         // repairs from the vault on the next unlock.
         write_private_file(&paths.vault_file(), &vault.to_canonical_vec())?;
-        let store = Store::open(&paths.store_file())?;
+        let store = std::sync::Arc::new(Store::open(&paths.store_file())?);
         store.put_meta(META_FINGERPRINT, &fingerprint)?;
         store.put_meta(META_CREATED, &now_secs.to_be_bytes())?;
         let signer = VaultRootSigner::from_backup(&backup)?;
@@ -120,7 +120,7 @@ impl Profile {
             detail: format!("{}: {e}", vault_path.display()),
         })?;
         let vault = IdentityVault::from_canonical_slice(&bytes)?;
-        let store = Store::open(&paths.store_file())?;
+        let store = std::sync::Arc::new(Store::open(&paths.store_file())?);
         let fingerprint: Digest32 = store
             .get_meta(META_FINGERPRINT)?
             .and_then(|v| v.as_slice().try_into().ok())
@@ -203,9 +203,21 @@ impl Profile {
         &self.store
     }
 
-    /// Mutable access to the store (compaction).
-    pub fn store_mut(&mut self) -> &mut Store {
-        &mut self.store
+    /// A shared handle to the store, for work that must run on another thread (the
+    /// ADR-008 sync engine is synchronous and runs on a blocking task, M14.7e).
+    #[must_use]
+    pub fn store_handle(&self) -> std::sync::Arc<Store> {
+        std::sync::Arc::clone(&self.store)
+    }
+
+    /// Compact the store, which needs exclusive access. Returns `Ok(false)` without
+    /// compacting if another handle is outstanding — a sync session holds one while
+    /// it runs (M14.7e) — so compaction is attempted, never forced.
+    pub fn compact_store(&mut self) -> Result<bool> {
+        match std::sync::Arc::get_mut(&mut self.store) {
+            Some(store) => store.compact(),
+            None => Ok(false),
+        }
     }
 
     /// The profile's paths.

@@ -131,6 +131,12 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   prekey is consumed**, before the handshake completes, so a crash cannot leave it re-offerable. Any
   future session-establishment path (M14.5 onwards) must do the same; a `debug_assert` pins that the
   session's own `is_last_resort_grade` equals the ring's verdict.
+- **The responder cannot speak first, which orders the join flow (M14.7e).** A session created by
+  `Session::accept` has no sending chain until it has received the initiator's first message — the DH
+  ratchet step that creates one needs the initiator's ratchet public key, which arrives in that message.
+  So after an ADR-005 join the **joiner** must send first, and ADR-007 step 2 (the newcomer broadcasts its
+  own sender key) is not merely politeness: without it no member can answer at all. The node does it as
+  part of joining.
 - **Message nonce KDF has no fallback.** The per-message AEAD nonce is `HMAC-SHA-256(mk, 0x03)[..12]`;
   HMAC keying cannot fail for a 32-byte key, but the error is propagated (`Result`) rather than
   replaced by an all-zero nonce. *(2026-09-19 review.)*
