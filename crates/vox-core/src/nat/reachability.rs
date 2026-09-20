@@ -299,6 +299,26 @@ pub async fn connect_direct(
     expected_peer: Digest32,
     now_secs: u64,
 ) -> Result<VoxConnection> {
+    connect_direct_within(
+        endpoint,
+        candidates,
+        expected_peer,
+        now_secs,
+        PER_ATTEMPT_TIMEOUT,
+    )
+    .await
+}
+
+/// [`connect_direct`] with an explicit per-candidate timeout. A hole punch uses a
+/// shorter one than a plain dial: QUIC retransmits its Initial at about 1, 2 and 4 s,
+/// and a punch that has not landed by then will not.
+pub async fn connect_direct_within(
+    endpoint: Arc<VoxEndpoint>,
+    candidates: &[SocketAddr],
+    expected_peer: Digest32,
+    now_secs: u64,
+    per_attempt: Duration,
+) -> Result<VoxConnection> {
     // A candidate the socket cannot even address is not a candidate: quinn refuses
     // an IPv6 destination on an IPv4 socket outright (and maps IPv4 onto an IPv6
     // one, so the reverse is fine). Dropping them here is what keeps a dual-stack
@@ -331,6 +351,7 @@ pub async fn connect_direct(
                 candidates[next],
                 expected_peer,
                 now_secs,
+                per_attempt,
             );
             next += 1;
             continue;
@@ -340,7 +361,7 @@ pub async fn connect_direct(
             // any in-flight attempt (RFC 8305 staggered start).
             tokio::select! {
                 () = tokio::time::sleep(CONNECTION_ATTEMPT_DELAY) => {
-                    spawn_attempt(&mut set, &endpoint, candidates[next], expected_peer, now_secs);
+                    spawn_attempt(&mut set, &endpoint, candidates[next], expected_peer, now_secs, per_attempt);
                     next += 1;
                 }
                 joined = set.join_next() => {
@@ -370,15 +391,11 @@ fn spawn_attempt(
     addr: SocketAddr,
     expected_peer: Digest32,
     now_secs: u64,
+    per_attempt: Duration,
 ) {
     let ep = Arc::clone(endpoint);
     set.spawn(async move {
-        match tokio::time::timeout(
-            PER_ATTEMPT_TIMEOUT,
-            ep.connect(addr, expected_peer, now_secs),
-        )
-        .await
-        {
+        match tokio::time::timeout(per_attempt, ep.connect(addr, expected_peer, now_secs)).await {
             Ok(res) => res,
             Err(_) => Err(Error::Unreachable("direct attempt timed out")),
         }

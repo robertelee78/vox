@@ -425,13 +425,14 @@ async fn swarm_behind(seed: u8, nat: NatKind) -> Swarm {
 }
 
 #[test]
-fn two_nated_nodes_reach_each_other_through_a_coordinator() {
+fn two_nated_nodes_reach_each_other_through_a_coordinator_then_upgrade_to_a_punch() {
     rt().block_on(async {
         let s = swarm(20).await;
-        let b_id = s.ids[&'b'];
+        let (a_id, b_id) = (s.ids[&'a'], s.ids[&'b']);
         // B has no dialable endpoint at all: this is the ordinary case for a client
         // inside a private network, and rungs 1–2 have nothing to offer.
         let filtered_before = s.net.filtered();
+        let started = std::time::Instant::now();
         let conn = tokio::time::timeout(
             Duration::from_secs(30),
             s.a.reach(b_id, &EndpointList::default()),
@@ -439,15 +440,38 @@ fn two_nated_nodes_reach_each_other_through_a_coordinator() {
         .await
         .expect("reach did not hang")
         .expect("A reaches B through the coordinator");
-        assert_eq!(conn.peer_id(), b_id, "the punched peer is authenticated");
+        // Relay-first (M15.1b): the first path is the one that lands in a round trip
+        // — the circuit through C — not the one that would be best. Seconds, not the
+        // twenty-odd it took to wait out a dial and a punch first.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "reach took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(conn.peer_id(), b_id, "the peer is authenticated");
+        assert_eq!(path_class(&conn), PathClass::Relayed);
+        assert_eq!(conn.quinn().remote_address(), circuit_addr(&b_id));
+        assert_eq!(s.c.relaying(), 1, "the coordinator is carrying the circuit");
         // The connection is filed, so the next reach is free.
-        assert!(s.a.manager().existing(&b_id).is_some());
+        assert!(Arc::ptr_eq(&s.a.manager().existing(&b_id).unwrap(), &conn));
+
+        // Upgrade-later: a punch through C lands a direct path, which replaces the
+        // relayed one on both sides — the manager's preference rule, applied by each.
+        let better = tokio::time::timeout(
+            Duration::from_secs(30),
+            s.a.upgrade(b_id, &EndpointList::default()),
+        )
+        .await
+        .expect("upgrade did not hang")
+        .expect("a punch through cone NATs lands");
+        assert_eq!(better.peer_id(), b_id);
+        assert_eq!(path_class(&better), PathClass::Direct);
         // B discovered its own observed address to answer the punch.
         assert!(
             s.b.observed_addr().is_some(),
             "B asked the coordinator when the punch needed it"
         );
-        // Both sides' NATs were real: each dropped datagrams during the punch, and the
+        // Both sides' NATs were real: each dropped datagrams along the way, and the
         // addresses they exchanged were their mapped ones, not their private ones.
         assert!(s.net.filtered() >= filtered_before);
         assert_eq!(
@@ -457,49 +481,84 @@ fn two_nated_nodes_reach_each_other_through_a_coordinator() {
                 other => panic!("{other}"),
             })
         );
-        // The coordinator carried **signaling only**. A's connection to B goes straight
-        // to B's mapped address — not through C — and C still holds just its two peers:
-        // rung 3 produces a direct path, which is the whole point of punching rather
-        // than relaying.
+        // The punched connection goes straight to B's mapped address — not through C
+        // — and it is now the primary on both sides, the relayed one retiring.
         let b_mapped = s
             .net
             .observed(s.b_private, s.c_addr)
             .expect("B has a mapping");
         assert_eq!(
-            conn.quinn().remote_address(),
+            better.quinn().remote_address(),
             b_mapped,
             "the punched connection goes to B's NAT, not to the coordinator"
         );
-        assert_ne!(conn.quinn().remote_address(), s.c_addr);
+        assert!(Arc::ptr_eq(
+            &s.a.manager().existing(&b_id).unwrap(),
+            &better
+        ));
+        assert_eq!(
+            s.a.manager().retiring_count(),
+            1,
+            "A retired the relayed path"
+        );
+        let b_primary = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(c) = s.b.manager().existing(&a_id) {
+                    if path_class(&c) == PathClass::Direct {
+                        return c;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("B's primary became the direct path too");
+        assert_eq!(
+            b_primary.quinn().remote_address(),
+            s.net.observed(s.a_private, s.c_addr).unwrap()
+        );
+        assert_eq!(
+            s.b.manager().retiring_count(),
+            1,
+            "B retired the relayed path"
+        );
         assert_eq!(
             s.c.manager().peers().len(),
             2,
-            "the coordinator gained no new connection: it relayed signaling, not bytes"
+            "the coordinator gained no connection of its own"
         );
+        // A second upgrade has nothing to do: the path is already the best there is.
+        assert!(s.a.upgrade(b_id, &EndpointList::default()).await.is_none());
     });
 }
 
 #[test]
-#[ignore = "waits out a full direct-dial timeout (~10 s) before rung 3; CI runs it in release"]
-fn the_punch_is_what_happens_after_a_direct_dial_fails() {
+fn a_private_address_is_tried_and_dropped_while_the_circuit_carries_the_day() {
     rt().block_on(async {
         let s = swarm(30).await;
         let b_id = s.ids[&'b'];
         // B advertises its private address — honestly, because that is what it knows.
-        // A cannot route to it (the NAT drops it), so the direct rungs are exhausted
-        // first and the punch is the rung that actually connects.
+        // A cannot route to it (the NAT drops it); with the rungs raced, that costs
+        // nothing but a dropped datagram: the circuit lands first.
         let unroutable_before = s.net.unroutable();
+        let started = std::time::Instant::now();
         let conn = tokio::time::timeout(
-            Duration::from_secs(60),
+            Duration::from_secs(30),
             s.a.reach(b_id, &endpoints(s.b_private)),
         )
         .await
         .expect("reach did not hang")
-        .expect("A reaches B after the direct rung fails");
+        .expect("A reaches B while the direct dial is still failing");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         assert_eq!(conn.peer_id(), b_id);
+        assert_eq!(path_class(&conn), PathClass::Relayed);
         assert!(
             s.net.unroutable() > unroutable_before,
-            "the direct dial to a private address must have been dropped"
+            "the direct dial to a private address was attempted and dropped"
         );
     });
 }
@@ -508,6 +567,7 @@ fn the_punch_is_what_happens_after_a_direct_dial_fails() {
 // Rung 4: when the punch is defeated, a relay carries the packets.
 // ---------------------------------------------------------------------------
 
+use vox_core::node::net::{path_class, PathClass};
 use vox_core::transport::mux::circuit_addr;
 use vox_core::transport::streams::{open_typed, StreamKind};
 
@@ -522,13 +582,32 @@ fn two_nodes_behind_symmetric_nats_reach_each_other_through_a_relay() {
         let (a_id, b_id) = (s.ids[&'a'], s.ids[&'b']);
         assert_eq!(s.c.relaying(), 0);
 
+        let started = std::time::Instant::now();
         let conn = tokio::time::timeout(
             Duration::from_secs(60),
             s.a.reach(b_id, &EndpointList::default()),
         )
         .await
         .expect("reach did not hang")
-        .expect("A reaches B through the relay after the punch fails");
+        .expect("A reaches B through the relay");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // Behind symmetric NATs nothing better exists: the upgrade tries a punch (six
+        // seconds, not ten) and comes back empty, and the relayed path stays primary.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                s.a.upgrade(b_id, &EndpointList::default())
+            )
+            .await
+            .expect("upgrade did not hang")
+            .is_none(),
+            "a symmetric NAT defeats the punch; the relay stays"
+        );
+        assert_eq!(s.a.manager().retiring_count(), 0);
 
         // Pinned to and authenticated by B: the relay could not have stood in for it,
         // because B's identity is what the handshake proved.

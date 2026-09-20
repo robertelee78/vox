@@ -56,7 +56,7 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::nat::holepunch::{CoordMessage, Coordinator, PunchPlan, Role, Step};
 use crate::nat::multiaddr::{EndpointList, Multiaddr, MAX_ENDPOINTS};
-use crate::nat::reachability::connect_direct;
+use crate::nat::reachability::connect_direct_within;
 use crate::node::net::PeerClass;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
@@ -76,6 +76,11 @@ pub const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for one signaling frame from the peer.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the synchronized dial waits per target. Shorter than a plain dial's:
+/// QUIC retransmits its Initial at about 1, 2 and 4 s, so a punch that has not
+/// landed in six will not, and the ladder is not held up by it.
+pub const PUNCH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
 
 const OP_WHOAMI: u64 = 0;
 const OP_OBSERVED: u64 = 1;
@@ -538,7 +543,14 @@ pub async fn execute_punch(
     if !plan.fire_delay.is_zero() {
         tokio::time::sleep(plan.fire_delay).await;
     }
-    connect_direct(endpoint, &plan.targets, expected_peer, now_secs).await
+    connect_direct_within(
+        endpoint,
+        &plan.targets,
+        expected_peer,
+        now_secs,
+        PUNCH_ATTEMPT_TIMEOUT,
+    )
+    .await
 }
 
 #[cfg(test)]

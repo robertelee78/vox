@@ -197,10 +197,38 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// How a connection reaches its peer, in preference order (ADR-012: prefer direct).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathClass {
+    /// Through a relay circuit (rung 4): works anywhere, costs a third party.
+    Relayed,
+    /// Straight to the peer — dialled, or punched (rungs 1–3).
+    Direct,
+}
+
+/// The path a connection is on, read off its remote address.
+#[must_use]
+pub fn path_class(conn: &VoxConnection) -> PathClass {
+    if crate::transport::mux::is_circuit_addr(conn.quinn().remote_address()) {
+        PathClass::Relayed
+    } else {
+        PathClass::Direct
+    }
+}
+
+/// How long a connection displaced by a better one stays open before it is closed:
+/// long enough for anything in flight on it — a join exchange, a sync session (whose
+/// frames are bounded at 20 s) — to finish, because the peer's streams do not move.
+pub const RETIRE_GRACE_SECS: u64 = 60;
+
 /// One QUIC connection per peer fingerprint (see the module docs).
 pub struct ConnectionManager {
     endpoint: Arc<VoxEndpoint>,
     conns: Mutex<HashMap<Digest32, Arc<VoxConnection>>>,
+    /// Connections a better path displaced, with the time each may be closed. They
+    /// keep serving what is already on them; nothing new is opened on them.
+    retiring: Mutex<Vec<(Arc<VoxConnection>, u64)>>,
+    retire_grace_secs: u64,
     clock: Clock,
 }
 
@@ -217,9 +245,17 @@ impl ConnectionManager {
     /// A manager over a bound endpoint.
     #[must_use]
     pub fn new(endpoint: Arc<VoxEndpoint>, clock: Clock) -> Self {
+        Self::with_retire_grace(endpoint, clock, RETIRE_GRACE_SECS)
+    }
+
+    /// [`ConnectionManager::new`] with an explicit retirement grace (tests shorten it).
+    #[must_use]
+    pub fn with_retire_grace(endpoint: Arc<VoxEndpoint>, clock: Clock, grace_secs: u64) -> Self {
         Self {
             endpoint,
             conns: Mutex::new(HashMap::new()),
+            retiring: Mutex::new(Vec::new()),
+            retire_grace_secs: grace_secs,
             clock,
         }
     }
@@ -290,24 +326,59 @@ impl ConnectionManager {
         self.file(conn)
     }
 
-    /// File a connection under its peer id, keeping the live one if a connection
-    /// to that peer already exists (the newcomer is closed).
+    /// File a connection under its peer id. One connection per peer is a
+    /// **preference**, not a first-come rule (M15.1b, relay-first / upgrade-later):
+    ///
+    /// - a newcomer on a *better* path than the one held — direct where the held one
+    ///   is relayed — **replaces** it, and the old one is retired: kept open for
+    ///   [`RETIRE_GRACE_SECS`] so whatever is in flight on it finishes, closed after;
+    /// - otherwise the held one is kept and the newcomer closed with a clean code (a
+    ///   simultaneous dial from both sides lands here).
+    ///
+    /// Both ends apply the same rule, which is what lets an upgrade land without a
+    /// protocol: the side that punched files the direct connection as an improvement,
+    /// and the side that accepted it does too.
     fn file(&self, conn: VoxConnection) -> Arc<VoxConnection> {
         let peer = conn.peer_id();
         let mut map = lock(&self.conns);
         if let Some(existing) = map.get(&peer) {
             if is_live(existing) {
                 let existing = Arc::clone(existing);
-                drop(map);
-                // A simultaneous dial from both sides: keep one, close the other
-                // with a clean code rather than leaving two connections open.
-                conn.close(WireError::AuthenticatorInvalid);
-                return existing;
+                if path_class(&conn) <= path_class(&existing) {
+                    drop(map);
+                    conn.close(WireError::AuthenticatorInvalid);
+                    return existing;
+                }
+                let retire_at = (self.clock)().saturating_add(self.retire_grace_secs);
+                lock(&self.retiring).push((existing, retire_at));
             }
         }
         let conn = Arc::new(conn);
         map.insert(peer, Arc::clone(&conn));
         conn
+    }
+
+    /// Close every retired connection whose grace has elapsed (or that the peer
+    /// already closed). Returns how many were closed. The node's tick calls this.
+    pub fn retire_expired(&self) -> usize {
+        let now = (self.clock)();
+        let mut retiring = lock(&self.retiring);
+        let before = retiring.len();
+        retiring.retain(|(conn, at)| {
+            if now >= *at || !is_live(conn) {
+                conn.close(WireError::AuthenticatorInvalid);
+                false
+            } else {
+                true
+            }
+        });
+        before - retiring.len()
+    }
+
+    /// How many displaced connections are still within their grace.
+    #[must_use]
+    pub fn retiring_count(&self) -> usize {
+        lock(&self.retiring).len()
     }
 
     /// Drop every connection the peer or the network has closed. Returns how many
@@ -342,6 +413,9 @@ impl ConnectionManager {
 
     /// Close every connection (node shutdown).
     pub fn close_all(&self) {
+        for (conn, _) in lock(&self.retiring).drain(..) {
+            conn.close(WireError::AuthenticatorInvalid);
+        }
         for (_, conn) in lock(&self.conns).drain() {
             conn.close(WireError::AuthenticatorInvalid);
         }
@@ -615,5 +689,150 @@ mod tests {
             server.close_all();
             client.close_all();
         });
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    //! Relay-first / upgrade-later at the manager (M15.1b). This began as the spike
+    //! that showed the old first-come rule closing every upgrade on both sides, and
+    //! stays as the proof of the rule that replaced it. The relayed connection is made
+    //! the way rung 4 makes it — over circuits joined in-process — and the direct one
+    //! over loopback.
+    use super::*;
+    use crate::identity::composite::SoftwareRootSigner;
+    use crate::transport::mux::{circuit_addr, CircuitInlet, CircuitPort};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    fn signer(seed: u8) -> SoftwareRootSigner {
+        SoftwareRootSigner::from_component_seeds(&[seed; 32], &[seed ^ 0xFF; 32]).unwrap()
+    }
+
+    fn pipe(mut from: CircuitPort, to: CircuitInlet) -> CircuitPort {
+        let mut rx = from.take_outbound().unwrap();
+        tokio::spawn(async move {
+            while let Some(d) = rx.recv().await {
+                to.deliver(d);
+            }
+        });
+        from
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_direct_path_replaces_a_relayed_one_on_both_sides_and_the_old_one_finishes() {
+        let a_ep = Arc::new(VoxEndpoint::bind(&signer(1), "127.0.0.1:0".parse().unwrap()).unwrap());
+        let b_ep = Arc::new(VoxEndpoint::bind(&signer(2), "127.0.0.1:0".parse().unwrap()).unwrap());
+        let (a_id, b_id) = (a_ep.local_id(), b_ep.local_id());
+        let b_addr = b_ep.local_addr().unwrap();
+        // A clock the test advances, so the retirement grace can be crossed.
+        let now = Arc::new(AtomicU64::new(1_800_000_000));
+        let clock: Clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let a = Arc::new(ConnectionManager::with_retire_grace(
+            Arc::clone(&a_ep),
+            Arc::clone(&clock),
+            30,
+        ));
+        let b = Arc::new(ConnectionManager::with_retire_grace(
+            Arc::clone(&b_ep),
+            clock,
+            30,
+        ));
+
+        // Circuits joined in-process: the relayed path, minus the relay.
+        let a_port = a_ep.attach_circuit(&b_id);
+        let b_port = b_ep.attach_circuit(&a_id);
+        let (a_inlet, b_inlet) = (a_port.inlet(), b_port.inlet());
+        let _a_port = pipe(a_port, b_inlet);
+        let _b_port = pipe(b_port, a_inlet);
+
+        // B accepts everything A brings, filing each through the rule.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let b = Arc::clone(&b);
+            tokio::spawn(async move {
+                while let Ok(Some(conn)) = b.accept(Admission::AcceptAnyAuthenticated).await {
+                    let _ = tx.send(conn);
+                }
+            });
+        }
+
+        // 1. The relayed connection lands first, as rung 4 lands it.
+        let relayed_eps = EndpointList::new(vec![circuit_addr(&b_id).into()]).unwrap();
+        let a_relayed = a.connect(b_id, &relayed_eps).await.expect("relayed");
+        let b_relayed = rx.recv().await.unwrap();
+        assert_eq!(path_class(&a_relayed), PathClass::Relayed);
+        assert_eq!(path_class(&b_relayed), PathClass::Relayed);
+        // A stream on it, left in flight: what a join or a sync looks like mid-upgrade.
+        let (mut in_flight_send, _in_flight_recv) = a_relayed.open_stream().await.unwrap();
+        in_flight_send.write_all(b"part one, ").await.unwrap();
+        let (_bs, mut br) = b_relayed.accept_stream().await.unwrap();
+        let mut first = [0u8; 10];
+        br.read_exact(&mut first).await.unwrap();
+
+        // 2. A direct path becomes available: the upgrade. Both sides file it.
+        let a_direct = a_ep
+            .connect(b_addr, b_id, 1_800_000_000)
+            .await
+            .expect("direct");
+        let a_primary = a.adopt(a_direct);
+        let b_primary = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("B accepted the direct connection")
+            .unwrap();
+        assert_eq!(path_class(&a_primary), PathClass::Direct);
+        assert_eq!(
+            path_class(&b_primary),
+            PathClass::Direct,
+            "B took the better path too"
+        );
+        assert!(!Arc::ptr_eq(&a_primary, &a_relayed));
+        assert!(!Arc::ptr_eq(&b_primary, &b_relayed));
+        assert!(
+            Arc::ptr_eq(&a.existing(&b_id).unwrap(), &a_primary),
+            "A's primary is direct"
+        );
+        assert!(
+            Arc::ptr_eq(&b.existing(&a_id).unwrap(), &b_primary),
+            "B's primary is direct"
+        );
+        assert_eq!(a.retiring_count(), 1);
+        assert_eq!(b.retiring_count(), 1);
+
+        // 3. The displaced path is still serving what was in flight on it.
+        in_flight_send.write_all(b"part two").await.unwrap();
+        in_flight_send.finish().unwrap();
+        let rest = tokio::time::timeout(Duration::from_secs(3), br.read_to_end(64))
+            .await
+            .expect("the retired path still carries its stream")
+            .unwrap();
+        assert_eq!(rest, b"part two");
+
+        // 4. Inside the grace nothing is closed; past it, the retired path is.
+        assert_eq!(a.retire_expired(), 0);
+        now.fetch_add(31, Ordering::SeqCst);
+        assert_eq!(a.retire_expired(), 1);
+        assert_eq!(b.retire_expired(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), a_relayed.quinn().closed())
+                .await
+                .is_ok(),
+            "the retired connection is closed after the grace"
+        );
+        assert_eq!(a.retiring_count(), 0);
+        assert!(Arc::ptr_eq(&a.existing(&b_id).unwrap(), &a_primary));
+
+        // 5. A *worse* newcomer never displaces: a second relayed dial is closed and the
+        // direct primary kept — the rule that also settles a simultaneous dial.
+        let again = a_ep
+            .connect(circuit_addr(&b_id), b_id, 1_800_000_000)
+            .await
+            .expect("relayed again");
+        let kept = a.adopt(again);
+        assert!(Arc::ptr_eq(&kept, &a_primary));
+        assert_eq!(a.retiring_count(), 0);
     }
 }

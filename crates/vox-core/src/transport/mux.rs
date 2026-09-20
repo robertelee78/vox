@@ -62,9 +62,11 @@ pub fn circuit_addr(peer: &Digest32) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(ip, port))
 }
 
-/// Whether `addr` is in the synthetic range, whatever family quinn presented it in.
+/// Whether `addr` is in the synthetic range, whatever family quinn presented it in —
+/// which is how a connection's path is told apart: a peer whose remote address is a
+/// circuit's is being relayed.
 #[must_use]
-fn is_circuit_addr(addr: SocketAddr) -> bool {
+pub fn is_circuit_addr(addr: SocketAddr) -> bool {
     match addr.ip().to_canonical() {
         IpAddr::V4(v4) => v4.octets()[0] & 0xF0 == 0xF0,
         IpAddr::V6(_) => false,

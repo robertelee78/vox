@@ -214,10 +214,12 @@ enum NetEvent {
         /// The connection to the anchor.
         conn: Arc<VoxConnection>,
     },
-    /// A hole punch produced a connection (ADR-012 rung 3): it needs the same
-    /// bookkeeping a dialled one gets — a stream loop and a sync schedule.
-    Punched {
-        /// The connection the punch produced.
+    /// A better path to a peer landed — a punch answered, or an upgrade behind a
+    /// relayed dial (ADR-012 rungs 3–4, M15.1b): the connection needs the same
+    /// bookkeeping a dialled one gets — a stream loop and a sync schedule. The manager
+    /// has already made it the peer's primary and retired the old one.
+    BetterPath {
+        /// The connection that landed.
         conn: Arc<VoxConnection>,
     },
     /// A peer connected inbound: it gets a sync schedule, due immediately.
@@ -412,9 +414,10 @@ pub struct Node {
     /// channel's own (production `(200,9)`); tests reduce them so the debug suite
     /// does not grind, exactly as they reduce the Argon2 profile.
     pow_params: Option<crate::join::pow::PowParams>,
-    /// Peers whose connection already has a stream loop, so dialing again does not
-    /// start a second one.
-    stream_loops: std::collections::BTreeSet<Digest32>,
+    /// Connections (by quinn's stable id) that already have a stream loop, so adopting
+    /// one twice does not start a second. Keyed by connection, not by peer: an upgrade
+    /// gives a peer a second connection that needs its own loop (M15.1b).
+    stream_loops: std::collections::BTreeSet<usize>,
     /// The gateway port mapping in force, if one was granted. Held so it can be
     /// renewed before its lifetime elapses (RFC 6886/6887 put renewal on the client).
     port_mappings: Vec<crate::nat::portmap::PortMapping>,
@@ -580,6 +583,11 @@ impl Node {
                     self.publish().await;
                 }
                 _ = ticker.tick() => {
+                    if let Some(net) = self.net.as_ref() {
+                        // Connections a better path displaced are closed once their
+                        // grace is up (M15.1b).
+                        net.manager().retire_expired();
+                    }
                     self.renew_mappings_if_due();
                     if self.run_due_syncs().await {
                         self.publish().await;
@@ -937,7 +945,7 @@ impl Node {
                     self.publish_channel_to_anchor(&channel_id, &conn).await;
                 }
             }
-            NetEvent::Punched { conn } => {
+            NetEvent::BetterPath { conn } => {
                 self.adopt_connection(conn);
             }
             NetEvent::Connected { peer } => {
@@ -1105,10 +1113,20 @@ impl Node {
             .as_ref()
             .map(Arc::clone)
             .ok_or(crate::error::Error::Unreachable("node is not networked"))?;
-        // The whole ADR-012 ladder, not just a direct dial: a peer with no reachable
-        // advertised endpoint is punched to through a coordinator (rung 3).
+        // Whatever rung lands first (M15.1b): through an anchor that is one round
+        // trip, and possibly relayed — in which case a better path is tried behind it
+        // and swapped in underneath by the manager's preference rule.
         let conn = net.reach(peer, endpoints).await?;
         self.adopt_connection(Arc::clone(&conn));
+        if crate::node::net::path_class(&conn) == crate::node::net::PathClass::Relayed {
+            let tx = self.net_tx.clone();
+            let endpoints = endpoints.clone();
+            tokio::spawn(async move {
+                if let Some(better) = net.upgrade(peer, &endpoints).await {
+                    let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
+                }
+            });
+        }
         Ok(conn)
     }
 
@@ -1118,7 +1136,7 @@ impl Node {
     fn adopt_connection(&mut self, conn: Arc<VoxConnection>) {
         let peer = conn.peer_id();
         if let Some(net) = self.net.as_ref().map(Arc::clone) {
-            if self.stream_loops.insert(peer) {
+            if self.stream_loops.insert(conn.quinn().stable_id()) {
                 spawn_stream_loop(net, conn, self.net_tx.clone());
             }
         }
@@ -1146,7 +1164,7 @@ impl Node {
             // A punch that fails is the ADR-012 limit, not an error to report: the peer
             // keeps whatever path it had, and the coordinator keeps working.
             if let Ok(conn) = net.answer_punch(peer, coordinator, send, recv).await {
-                let _ = tx.send(NetEvent::Punched { conn }).await;
+                let _ = tx.send(NetEvent::BetterPath { conn }).await;
             }
         });
     }

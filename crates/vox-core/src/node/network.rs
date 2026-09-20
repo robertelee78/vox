@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use quinn::{RecvStream, SendStream};
+use tokio::task::JoinSet;
 
 use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
@@ -42,6 +43,7 @@ use crate::identity::keyagreement::X25519IdentityKey;
 use crate::join::pow::Difficulty;
 use crate::join::session::JoinContext;
 use crate::nat::multiaddr::{EndpointList, Multiaddr};
+use crate::nat::reachability::{connect_direct, direct_candidates};
 use crate::nat::record::{MemberBundleRecord, RendezvousRecord};
 use crate::nat::service::{
     MembershipOracle, RecordKinds, RecordSet, RendezvousClient, RendezvousService,
@@ -580,13 +582,19 @@ impl NodeNet {
         lock(&self.observed).remove(peer);
     }
 
-    /// The full ADR-012 ladder for reaching `peer`: a live connection, else a direct
-    /// dial of its advertised endpoints (rungs 1–2), else a **hole punch** coordinated
-    /// through any peer already connected that will relay signaling (rung 3), else a
-    /// **circuit** through any such peer that will carry the packets (rung 4).
+    /// Reach `peer` by whatever rung lands **first** (M15.1b, relay-first / upgrade-
+    /// later). A live connection is returned at once; otherwise a direct dial of the
+    /// advertised endpoints (rungs 1–2) and a circuit through every connected helper
+    /// (rung 4) are **raced**, and the first to produce an authenticated connection
+    /// wins — through the user's own anchor that is about one round trip, not the
+    /// twenty-odd seconds of waiting for a direct dial and then a punch to time out
+    /// first. The connection may therefore be relayed: the caller runs
+    /// [`NodeNet::upgrade`] behind it, and the manager's preference rule swaps a
+    /// better path in when one lands.
     ///
-    /// Every punch is tried before any circuit: a punch yields a direct path, a
-    /// circuit a relayed one. Exhausting all of it is [`Error::Unreachable`].
+    /// Exhausting every attempt is [`Error::Unreachable`]; the *last* helper's error is
+    /// kept rather than a flattened one, because a peer that will not relay, one that
+    /// cannot reach the target and a target that never answered are worth telling apart.
     pub async fn reach(
         &self,
         peer: Digest32,
@@ -595,53 +603,112 @@ impl NodeNet {
         if let Some(conn) = self.manager.existing(&peer) {
             return Ok(conn);
         }
-        if let Ok(conn) = self.manager.connect(peer, endpoints).await {
-            return Ok(conn);
+        let mut set: JoinSet<Result<VoxConnection>> = JoinSet::new();
+        let candidates = direct_candidates(endpoints);
+        if !candidates.is_empty() {
+            let endpoint = Arc::clone(self.manager.endpoint());
+            let now = self.now();
+            set.spawn(async move { connect_direct(endpoint, &candidates, peer, now).await });
         }
-        // Why the *last* helper's error and not a generic one: a rung fails for reasons
-        // worth telling apart — a peer that will not relay, one that cannot reach the
-        // target, a target that never answered, a NAT that defeats the punch — and
-        // flattening them all into "unreachable" makes the ladder undebuggable.
+        for relay in self.helpers(peer) {
+            let endpoint = Arc::clone(self.manager.endpoint());
+            let now = self.now();
+            set.spawn(
+                async move { circuitstream::connect_through(&relay, peer, &endpoint, now).await },
+            );
+        }
+        if set.is_empty() {
+            return Err(Error::Unreachable(
+                "no direct candidates, and no peer is connected to carry a circuit",
+            ));
+        }
         let mut last: Option<Error> = None;
-        let helpers: Vec<Arc<VoxConnection>> = self
-            .manager
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(Ok(conn)) => return Ok(self.manager.adopt(conn)),
+                Ok(Err(e)) => last = Some(e),
+                Err(_) => last = Some(Error::Unreachable("a reach attempt was cancelled")),
+            }
+        }
+        Err(last.unwrap_or(Error::Unreachable("no path to the peer")))
+    }
+
+    /// Try for a **better path** to a peer already reached over a relayed one: a direct
+    /// dial of its endpoints and a hole punch through every connected helper, raced,
+    /// each with the shorter punch timeout. The winner is filed through the manager's
+    /// preference rule, which retires the relayed connection underneath whatever is
+    /// in flight on it; the peer's manager does the same on its side.
+    ///
+    /// `None` when the current path is already direct, or when nothing better lands —
+    /// a peer behind a symmetric NAT stays relayed, honestly.
+    pub async fn upgrade(
+        &self,
+        peer: Digest32,
+        endpoints: &EndpointList,
+    ) -> Option<Arc<VoxConnection>> {
+        let current = self.manager.existing(&peer)?;
+        if crate::node::net::path_class(&current) == crate::node::net::PathClass::Direct {
+            return None;
+        }
+        let mut set: JoinSet<Result<VoxConnection>> = JoinSet::new();
+        let candidates = direct_candidates(endpoints);
+        if !candidates.is_empty() {
+            let endpoint = Arc::clone(self.manager.endpoint());
+            let now = self.now();
+            set.spawn(async move {
+                crate::nat::reachability::connect_direct_within(
+                    endpoint,
+                    &candidates,
+                    peer,
+                    now,
+                    coordstream::PUNCH_ATTEMPT_TIMEOUT,
+                )
+                .await
+            });
+        }
+        for coordinator in self.helpers(peer) {
+            // The observed address is asked for before the task starts, so the punch
+            // has it to offer without touching `self` from the task.
+            let observed = self.observed_or_ask(coordinator.peer_id()).await;
+            let Ok(local_eps) = self.local_endpoints() else {
+                continue;
+            };
+            let local = coordstream::punch_endpoints(observed, &local_eps);
+            let endpoint = Arc::clone(self.manager.endpoint());
+            let now = self.now();
+            set.spawn(async move {
+                let (mut send, mut recv) =
+                    coordstream::open_punch_session(&coordinator, peer).await?;
+                let plan = coordstream::run_punch_initiator(&mut send, &mut recv, local).await?;
+                coordstream::execute_punch(endpoint, plan, peer, now).await
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok(Ok(conn)) = joined {
+                let filed = self.manager.adopt(conn);
+                // `adopt` keeps the better of the two; only a real replacement is an
+                // upgrade.
+                if !Arc::ptr_eq(&filed, &current) {
+                    return Some(filed);
+                }
+            }
+        }
+        None
+    }
+
+    /// The connected peers that could help reach `peer`: every live connection but
+    /// the peer's own. Whether one *will* help is its policy's business.
+    fn helpers(&self, peer: Digest32) -> Vec<Arc<VoxConnection>> {
+        self.manager
             .peers()
             .into_iter()
             .filter(|p| *p != peer)
             .filter_map(|p| self.manager.existing(&p))
-            .collect();
-        for coordinator in &helpers {
-            match self.punch_through(coordinator, peer).await {
-                Ok(conn) => return Ok(conn),
-                Err(e) => last = Some(e),
-            }
-        }
-        for relay in &helpers {
-            match self.circuit_through(relay, peer).await {
-                Ok(conn) => return Ok(conn),
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(last.unwrap_or(Error::Unreachable(
-            "no direct path, and no peer is connected to coordinate a punch or carry a circuit",
-        )))
+            .collect()
     }
 
-    /// Rung 4: ask `relay` to carry a circuit to `peer` and dial `peer` through it. The
-    /// connection is pinned to and authenticated by `peer`; the relay forwards packets
-    /// it cannot read.
-    pub async fn circuit_through(
-        &self,
-        relay: &VoxConnection,
-        peer: Digest32,
-    ) -> Result<Arc<VoxConnection>> {
-        let conn = circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now())
-            .await?;
-        Ok(self.manager.adopt(conn))
-    }
-
-    /// The initiator's side of rung 3: ask `coordinator` to carry a punch session to
-    /// `peer`, run the DCUtR exchange, and fire the synchronized dial.
+    /// The initiator's side of rung 3 on its own: ask `coordinator` to carry a punch
+    /// session to `peer`, run the DCUtR exchange, and fire the synchronized dial.
     pub async fn punch_through(
         &self,
         coordinator: &VoxConnection,
@@ -654,6 +721,19 @@ impl NodeNet {
         let conn =
             coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
                 .await?;
+        Ok(self.manager.adopt(conn))
+    }
+
+    /// Rung 4 on its own: ask `relay` to carry a circuit to `peer` and dial `peer`
+    /// through it. The connection is pinned to and authenticated by `peer`; the relay
+    /// forwards packets it cannot read.
+    pub async fn circuit_through(
+        &self,
+        relay: &VoxConnection,
+        peer: Digest32,
+    ) -> Result<Arc<VoxConnection>> {
+        let conn = circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now())
+            .await?;
         Ok(self.manager.adopt(conn))
     }
 

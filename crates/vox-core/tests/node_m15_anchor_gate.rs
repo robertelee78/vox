@@ -10,9 +10,8 @@
 //!
 //! Everything goes through the client API — `NodeCommand` in, `NodeView`/`NodeEvent`
 //! out — over the nodes' real actors. Production Argon2id; the ADR-005 PoW is reduced
-//! to keep the gate to tens of seconds (ten of which are the honest cost of the direct
-//! dial and the punch each timing out before the relay is tried). `#[ignore]`d in the
-//! debug suite, run by CI's release step.
+//! to keep the gate to seconds. `#[ignore]`d in the debug suite, run by CI's release
+//! step.
 
 #[path = "support/vnet.rs"]
 mod vnet;
@@ -98,7 +97,7 @@ fn sees(h: &NodeHandle, cid: [u8; 32], text: &str) -> bool {
 }
 
 #[test]
-#[ignore = "production Argon2id, a defeated punch and a relayed join: ~40 s; CI runs it in release"]
+#[ignore = "production Argon2id and a relayed join: ~10 s in release; CI runs it there"]
 fn m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -162,6 +161,7 @@ fn m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor() {
         // ---- Bob, inside another private network, knows nothing but the link ----
         let bob = node(&tmp, "bob", b_sock, BootstrapSet::new()).await;
         let bob_fp = bob.view().identity.unwrap().fingerprint;
+        let join_started = std::time::Instant::now();
         let joined = tokio::time::timeout(
             TIMEOUT,
             bob.apply(NodeCommand::JoinChannel {
@@ -173,6 +173,15 @@ fn m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor() {
         .await
         .expect("the join did not hang");
         assert!(joined.is_done(), "Bob joins through the anchor: {joined:?}");
+        // Relay-first (M15.1b): the join rides the circuit the anchor carries the
+        // moment it is up, not after a direct dial and a punch have each timed out.
+        // The bound is generous — production Argon2id and the PoW are inside it — but
+        // well under the ~21 s the sequential ladder cost.
+        assert!(
+            join_started.elapsed() < Duration::from_secs(12),
+            "the join took {:?}",
+            join_started.elapsed()
+        );
         let (joined_cid, responder) = wait_for(&bob, |e| match e {
             NodeEvent::Joined {
                 channel_id,
