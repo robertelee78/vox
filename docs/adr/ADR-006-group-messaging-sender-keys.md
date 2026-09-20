@@ -2,7 +2,9 @@
 
 **Status**: implemented (M4, `crates/vox-core/src/group/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-20 — SKDMs are delivered over a `pairwise` stream and receiver chains persist their live state (`node::pairwise_stream`, `node::channel`, ADR-016 M14.5b). 2026-09-19 — status reconciled; Implementation notes (M4) added.
+**Updated**: 2026-09-21 — **rotation is live and enforced** (M18.1): the node consults
+`should_rotate` on every append, a rotation retains the new generation's origin key so the members who
+keep consent are re-keyed at iteration 0, and both are persisted. Known gap (2) is closed. 2026-09-20 — SKDMs are delivered over a `pairwise` stream and receiver chains persist their live state (`node::pairwise_stream`, `node::channel`, ADR-016 M14.5b). 2026-09-19 — status reconciled; Implementation notes (M4) added.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: group-messaging, sender-keys, channel, pq-kem
 
@@ -113,7 +115,26 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   a consumed key is deleted (replay fails). Out-of-order window `MAX_SKIP = 1000` / cache 2000, shared
   with ADR-004.
 - **Rotation bounds** `ROTATE_AFTER_MESSAGES = 1000`, `ROTATE_AFTER_SECS = 7 d` are exposed as
-  `SenderChain::should_rotate` for the governing layer to poll.
+  `SenderChain::should_rotate` for the governing layer to poll — and the node **does** poll it, on every
+  append (`node::actor::send_text` → `ChannelState::rotate_sender`, M18.1).
+- **A rotation retains the new generation's origin key, and re-keys at iteration 0 (M18.1).** This is
+  the decision that makes rotation free for the people who keep consent. The naive re-key — release the
+  author's *current* position, as first consent does — leaves a hole exactly the width of whatever the
+  author sent between rotating and reaching each recipient: a member who was merely offline for a minute
+  loses messages they were entitled to. So `SenderChain::rotated` is paired with
+  `OriginKeyStore::retain_origin` at the instant of minting (the origin is the live chain key only while
+  `next_iteration == 0`; one step later it is gone for good), and the re-key is
+  `OriginKeyStore::release_at(…, 0)`. It widens nothing: a generation minted *after* someone consented
+  contains, by construction, only messages sent after their consent, so releasing it whole can never
+  reveal history that consent did not already cover. The bound is `MAX_RETAINED_ORIGINS = 256`
+  generations, evicting the **oldest** — never the newest, which is the one a rotation must release.
+  Origins and the delivery ledger are sealed `KeyMaterial` segments (ADR-010), because a rotation that
+  persisted the chain but lost the origin would strand every remaining consenter permanently.
+- **What is owed is derived, never stored (M18.1).** `ChannelState::owed_rekeys` is the consent set on
+  the log minus the members whose delivery ledger row already names the current generation. A revoked
+  member drops out because the log says so, not because a cached list was updated — so no bookkeeping
+  error can re-key someone the log has excluded. Delivery is recorded only after the bytes go out, so a
+  failed delivery stays owed and the node's tick retries it when the peer is reachable.
 - **Sender keys are delivered and retained (ADR-016 M14.5b).** An SKDM now travels as one frame on a
   bi-stream typed `pairwise`, sealed into the recipient's ADR-004 session (`Skdm::seal_into`), so the
   ratchet — not the stream — provides confidentiality and authenticity; the recipient verifies it against
@@ -139,10 +160,11 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
 - **Known gaps (recorded 2026-09-19).** (1) The ADR-002 §3 cross-signature requirement is met by the
   root signature over the whole SKDM body; the separate `SenderKeyCrossSig` / `sender_key_binding_input`
   mechanism exists but is not wired anywhere — two mechanisms for one requirement, one dead (candidate
-  for removal). (2) Rotation is advisory: `SenderChain::encrypt` never refuses past the bound, and
-  because `OriginKeyStore::derive_at` caps history release at `iteration ≤ MAX_SKIP = ROTATE_AFTER_MESSAGES`,
-  an un-rotated chain past 1000 messages cannot release history at its head — the node runtime must
-  enforce rotation. (3) `GroupMessage::to_wire` reuses the *signing* label as its wire prefix rather
+  for removal). (2) **Closed 2026-09-21 (M18.1).** Rotation was advisory: `SenderChain::encrypt` never refuses past
+  the bound, and because `OriginKeyStore::derive_at` caps history release at
+  `iteration ≤ MAX_SKIP = ROTATE_AFTER_MESSAGES`, an un-rotated chain past 1000 messages could not
+  release history at its head. The node runtime now enforces the bound: every append consults
+  `should_rotate_sender` and rotates, so a chain never runs past it in the first place. (3) `GroupMessage::to_wire` reuses the *signing* label as its wire prefix rather
   than a struct-tag frame (safe — different arity — but inconsistent with the SKDM rule).
 
 ## Links

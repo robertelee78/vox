@@ -2,7 +2,10 @@
 
 **Status**: implemented (M6, `crates/vox-core/src/governance/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-20 — the join/consent flow now has a runtime: joiner-side channel state, author admission as a log fact, and consent grants appended and evaluated (`node::channel`, ADR-016 M14.5). 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin"; genesis policy and policy-update carry the ADR-003 `min_suite` floor.
+**Updated**: 2026-09-21 — **per-member revocation is live** (M18.1): `vox`'s `revoke` verb rotates the
+sender key, records the `consent-revocation` fact and re-keys the remaining consenters; it needs no
+network, and a release gate proves the revoked member reads nothing afterwards while the others lose
+nothing. 2026-09-20 — the join/consent flow now has a runtime: joiner-side channel state, author admission as a log fact, and consent grants appended and evaluated (`node::channel`, ADR-016 M14.5). 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin"; genesis policy and policy-update carry the ADR-003 `min_suite` floor.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: consent, membership, admin, governance, revocation, capabilities, differentiator
 
@@ -141,7 +144,19 @@ to forge — the Signalgate / Megolm membership-injection class is structurally 
   `A`'s own `chain_id`** (the per-author generation counter, ADR-006) — *not* the channel `epoch`. `A`
   distributes the new key to all members `A` still consents to *except* the revoked `N`, and records a
   revocation entry. `N` retains previously-held keys (uncallable) but cannot decrypt `A`'s future
-  messages. (Terminology, normative: **`epoch` is a single channel-global counter** set only by the
+  messages. **Revocation is rotation with one member left out** — there is no second mechanism, and the
+  rotation *is* the enforcement.
+
+  Three properties of the runtime are normative (M18.1, `ChannelState::revoke_consent`):
+  1. **The rotation and the log fact land first, unconditionally.** They are purely local: revoking
+     needs no network and no peer to be reachable, and a revocation that waited for the rest of the room
+     to come online would be a revocation in name only. The re-keys follow best-effort and are retried
+     by the node's tick.
+  2. **The entry names the generation that excludes `N`,** so `new_chain_id` is filled from a generation
+     that already exists; the fact cannot promise a rotation that failed to happen.
+  3. **The remaining consenters lose nothing, including the ones who were away.** They are re-keyed at
+     the new generation's *origin*, not at `A`'s current position, so a rotation is invisible to whoever
+     keeps consent (ADR-006 §"A rotation retains the new generation's origin key"). (Terminology, normative: **`epoch` is a single channel-global counter** set only by the
   genesis record and admin policy/passphrase-rotation entries; per-author rotation is always
   `chain_id`. There is no per-author "epoch contribution.")
 - **Inbound visibility opt-out ("whom I read"):** independently of the above, `A` may stop *seeing* any

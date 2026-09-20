@@ -29,12 +29,26 @@
 
 use std::collections::HashMap;
 
+use zeroize::Zeroizing;
+
+use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
-use crate::group::senderkey::ChainKey;
+use crate::group::senderkey::{ChainKey, CHAIN_KEY_LEN};
 use crate::group::skdm::Skdm;
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
 use crate::pairwise::MAX_SKIP;
+
+/// Hard cap on retained generations. A generation spans up to
+/// [`ROTATE_AFTER_MESSAGES`](crate::group::state::ROTATE_AFTER_MESSAGES) messages, so
+/// this is continuity across hundreds of thousands of messages — while keeping the
+/// sealed segment, and the memory holding live key material, bounded. At the cap the
+/// **oldest** generation is evicted, never the newest: the live generation must always
+/// be releasable (that is what a rotation's re-key needs).
+pub const MAX_RETAINED_ORIGINS: usize = 256;
+
+/// At-rest version of an [`OriginKeyStore`] state blob.
+const ORIGIN_STATE_VERSION: u64 = 1;
 
 /// A retained origin record for one `(channel_id, epoch, chain_id)` generation:
 /// the iteration-0 chain key, the composite Sender-Key signing public key, the
@@ -104,8 +118,14 @@ impl OriginKeyStore {
         signing_pubkey: [u8; crate::group::wire::SENDER_KEY_SIGNING_PUB_LEN],
         created_at: u64,
     ) {
+        let key = (*channel_id, epoch, chain_id);
+        // Make room before inserting, and only for a genuinely new generation:
+        // re-retaining one already held must not evict a bystander.
+        if !self.records.contains_key(&key) && self.records.len() >= MAX_RETAINED_ORIGINS {
+            self.evict_oldest();
+        }
         self.records.insert(
-            (*channel_id, epoch, chain_id),
+            key,
             OriginRecord {
                 channel_id: *channel_id,
                 epoch,
@@ -115,6 +135,102 @@ impl OriginKeyStore {
                 created_at,
             },
         );
+    }
+
+    /// Drop the generation with the smallest `created_at`, breaking ties on the key
+    /// so eviction is deterministic (two generations minted in the same second must
+    /// not evict differently on two nodes reading the same state).
+    fn evict_oldest(&mut self) {
+        let victim = self
+            .records
+            .iter()
+            .min_by_key(|(k, r)| (r.created_at, **k))
+            .map(|(k, _)| *k);
+        if let Some(k) = victim {
+            self.records.remove(&k);
+        }
+    }
+
+    /// Serialize the store's **secret** state for a sealed at-rest key-material
+    /// segment (ADR-010; ADR-016 M18.1). Canonical CBOR
+    /// `[1, [[channel_id, epoch, chain_id, author_id, origin_key, signing_pubkey,
+    /// created_at], …]]`, the generations in key order so the bytes are
+    /// deterministic. Returned zeroizing; it must only ever be handed to
+    /// [`crate::atrest::store::seal_segment`].
+    #[must_use]
+    pub fn to_state(&self) -> Zeroizing<Vec<u8>> {
+        let mut keys: Vec<&(Digest32, u64, u64)> = self.records.keys().collect();
+        keys.sort_unstable();
+        let mut e = Encoder::new();
+        e.array(2).uint(ORIGIN_STATE_VERSION).array(keys.len());
+        for k in keys {
+            let r = &self.records[k];
+            e.array(7)
+                .bytes(&r.channel_id)
+                .uint(r.epoch)
+                .uint(k.2)
+                .bytes(&r.author_id)
+                .bytes(r.origin_key.bytes())
+                .bytes(&r.signing_pubkey)
+                .uint(r.created_at);
+        }
+        Zeroizing::new(e.finish())
+    }
+
+    /// Restore a store from [`OriginKeyStore::to_state`] bytes (opened from a sealed
+    /// segment). Strict: arity, version, count bound, lengths, trailing bytes — the
+    /// blob is sealed, but a corrupt or rolled-back one must not become an
+    /// unbounded allocation or a key bound to the wrong channel.
+    pub fn from_state(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 2 {
+            return Err(Error::MalformedBundle("origin store state arity"));
+        }
+        if d.uint()? != ORIGIN_STATE_VERSION {
+            return Err(Error::MalformedBundle("origin store state version"));
+        }
+        let n = d.array()?;
+        if n > MAX_RETAINED_ORIGINS {
+            return Err(Error::SizeLimitExceeded("retained origin generations"));
+        }
+        let mut records = HashMap::with_capacity(n);
+        for _ in 0..n {
+            if d.array()? != 7 {
+                return Err(Error::MalformedBundle("origin record arity"));
+            }
+            let channel_id: Digest32 = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedBundle("origin record channel_id"))?;
+            let epoch = d.uint()?;
+            let chain_id = d.uint()?;
+            let author_id: Digest32 = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedBundle("origin record author_id"))?;
+            let ck: [u8; CHAIN_KEY_LEN] = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedBundle("origin record origin_key"))?;
+            let signing_pubkey: [u8; crate::group::wire::SENDER_KEY_SIGNING_PUB_LEN] = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedBundle("origin record signing_pubkey"))?;
+            let created_at = d.uint()?;
+            records.insert(
+                (channel_id, epoch, chain_id),
+                OriginRecord {
+                    channel_id,
+                    epoch,
+                    author_id,
+                    origin_key: ChainKey::from_bytes(ck),
+                    signing_pubkey,
+                    created_at,
+                },
+            );
+        }
+        d.finish()?;
+        Ok(Self { records })
     }
 
     /// Whether an origin key is retained for `(channel_id, epoch, chain_id)`.
@@ -244,6 +360,113 @@ mod tests {
 
     fn root(a: u8, b: u8) -> SoftwareRootSigner {
         SoftwareRootSigner::from_component_seeds(&[a; 32], &[b; 32]).unwrap()
+    }
+
+    /// A rotation's re-key depends on the live generation's origin still being
+    /// retained after a restart, so the store's sealed state must round-trip every
+    /// field a release is built from — including the channel binding.
+    #[test]
+    fn store_state_round_trips_and_still_releases() {
+        let cid = [0x51u8; 32];
+        let author = root(21, 22);
+        let spk = SenderKeySigningKey::from_component_seeds(&[23; 32], &[24; 32])
+            .unwrap()
+            .public_key_bytes();
+        let mut store = OriginKeyStore::new();
+        store.retain_origin(
+            &cid,
+            2,
+            &author.fingerprint(),
+            7,
+            ChainKey::from_bytes([0x42; CHAIN_KEY_LEN]),
+            spk,
+            9_000,
+        );
+        let restored = OriginKeyStore::from_state(&store.to_state()).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert!(restored.has(&cid, 2, 7));
+        // The restored record releases the same SKDM the live one would.
+        let a = store.release_at(&author, &cid, 2, 7, 3).unwrap();
+        let b = restored.release_at(&author, &cid, 2, 7, 3).unwrap();
+        assert_eq!(a.to_wire(), b.to_wire());
+    }
+
+    /// At the cap the *oldest* generation goes. Evicting the newest would strand
+    /// the live generation, which is precisely the one a rotation must re-key.
+    #[test]
+    fn at_the_cap_the_oldest_generation_is_evicted_not_the_newest() {
+        let cid = [0x52u8; 32];
+        let author = root(25, 26);
+        let spk = SenderKeySigningKey::from_component_seeds(&[27; 32], &[28; 32])
+            .unwrap()
+            .public_key_bytes();
+        let mut store = OriginKeyStore::new();
+        for g in 0..MAX_RETAINED_ORIGINS as u64 {
+            store.retain_origin(
+                &cid,
+                1,
+                &author.fingerprint(),
+                g,
+                ChainKey::from_bytes([0x11; CHAIN_KEY_LEN]),
+                spk,
+                1_000 + g,
+            );
+        }
+        assert_eq!(store.len(), MAX_RETAINED_ORIGINS);
+        let newest = MAX_RETAINED_ORIGINS as u64;
+        store.retain_origin(
+            &cid,
+            1,
+            &author.fingerprint(),
+            newest,
+            ChainKey::from_bytes([0x11; CHAIN_KEY_LEN]),
+            spk,
+            1_000 + newest,
+        );
+        assert_eq!(store.len(), MAX_RETAINED_ORIGINS, "the cap holds");
+        assert!(
+            store.has(&cid, 1, newest),
+            "the newest generation is retained"
+        );
+        assert!(!store.has(&cid, 1, 0), "the oldest generation was evicted");
+
+        // Re-retaining a generation already held must not evict a bystander.
+        store.retain_origin(
+            &cid,
+            1,
+            &author.fingerprint(),
+            newest,
+            ChainKey::from_bytes([0x11; CHAIN_KEY_LEN]),
+            spk,
+            1_000 + newest,
+        );
+        assert_eq!(store.len(), MAX_RETAINED_ORIGINS);
+        assert!(store.has(&cid, 1, 1));
+    }
+
+    /// The sealed blob is trusted for integrity, not for sanity: a blob carrying
+    /// more generations than the cap allows must be refused, not allocated. (The
+    /// live store cannot produce one — eviction prevents it — so this is the
+    /// rolled-back-or-tampered-and-resealed case.)
+    #[test]
+    fn a_state_blob_over_the_cap_is_refused() {
+        let over = MAX_RETAINED_ORIGINS + 1;
+        let mut e = Encoder::new();
+        e.array(2).uint(ORIGIN_STATE_VERSION).array(over);
+        for g in 0..over as u64 {
+            e.array(7)
+                .bytes(&[0x53u8; 32])
+                .uint(1)
+                .uint(g)
+                .bytes(&[0x54u8; 32])
+                .bytes(&[0x11u8; CHAIN_KEY_LEN])
+                .bytes(&[0u8; crate::group::wire::SENDER_KEY_SIGNING_PUB_LEN])
+                .uint(1_000 + g);
+        }
+        assert!(matches!(
+            OriginKeyStore::from_state(&e.finish()),
+            Err(Error::SizeLimitExceeded("retained origin generations"))
+        ));
     }
 
     #[test]
