@@ -469,13 +469,29 @@ Each item is one branch, red→green, with the ADR updated in the same change (h
     Gate: a real UDP socket answering real queries, a held room resolving to the derived address, a room
     not joined giving `NXDOMAIN` so `ssh` fails locally without a dial, and a sweep of malformed and
     hostile datagrams.
-  - **(b) The interface.** Device, ULA route, and userspace TCP termination that turns an inbound SYN into
-    `session::dial(channel, port)`. **Spiked 2026-09-21 and confirmed:** `smoltcp` 0.14 terminates a
-    connection to port 22 on a `fd00::/8` address off an in-process paired device, with no kernel, no
-    `bind()` and no privilege, and the accepting socket exposes both the destination address and the port
-    — which is exactly the `(room, service)` lookup key. So the datapath is gateable without root, by
-    cross-wiring two stacks the way `tests/support/vnet.rs` cross-wires UDP. Gate: an **unmodified** client
-    program reaches a real service *by name*, with nothing configured in that program.
+  - **(b) The interface. *Done 2026-09-21.*** `node::interface::Netstack`, generic over `smoltcp`'s
+    `Device` so the same code drives a real `tun`/`utun` and an in-process one.
+    - **Nothing binds a port.** A destination port arrives as a field in an IPv6/TCP header, is read, and
+      becomes the service tag — so 22 and 65532 are alike to it, it collides with nothing this machine
+      runs, and no part of the data path is privileged.
+    - **Ports are discovered, not configured.** A guest cannot know which ports a host offers, and a
+      userspace stack has no wildcard listen, so `SynSniffer` sits between device and stack and on a SYN
+      for an unlistened pair **holds the packet back**, arms a socket and replays it. Holding rather than
+      dropping is the difference between connecting now and connecting after the client's first SYN
+      retransmit. Both the held queue and the listener set are bounded, because a port scan must not be a
+      local memory attack.
+    - **The byte moving is not in the poll loop.** `smoltcp` sockets are only reachable from the
+      synchronous poll loop, so each connection gets a `tokio::io::duplex` pair and a small pump task; the
+      loop only ever does `try_recv`/`try_reserve`, which cannot stall the stack, and an unread byte stays
+      in the socket and closes the TCP window on the tool — backpressure both ways.
+    - `node::tunnel::carry` joins the halves: interface → `session::dial(channel, port)`.
+    **Gate met** (`node_m17_interface_gate`): a client TCP stack opens a connection to the address the
+    *resolver derived from the room's genesis*, the interface terminates it, the port becomes the tag of a
+    real tunnel request, a real ADR-007 evaluator authorizes it against the genesis service grant, and the
+    bytes reach a real TCP service on the host's loopback and come back — **with no `tun` device, no route,
+    no `sudo` and no `bind()` on port 22 anywhere.** Mutation-checked twice: suppressing SYN discovery, and
+    dialling with the wrong tag. Plus the negative: a name for a room this machine has not joined resolves
+    to nothing, so no dial happens and the interface answers for no such address.
   - **(c) The per-platform privileged setup**, owned by ADR-014. Real-hardware validation is recorded as
     pending there, as the UPnP work was.
 - **M17.4 — anchors as configuration.** `<config_dir>/anchors`, written by `vox node`, read by every

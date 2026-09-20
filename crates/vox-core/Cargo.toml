@@ -39,6 +39,8 @@ tokio.workspace = true
 bytes.workspace = true
 # Node runtime (ADR-016, M13).
 redb.workspace = true
+# Userspace TCP for the Vox interface (ADR-017 M17.3b).
+smoltcp.workspace = true
 # OpenPGP v4 fingerprint of the native root (ADR-002 §GPG).
 sha1.workspace = true
 
