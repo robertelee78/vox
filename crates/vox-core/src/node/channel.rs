@@ -44,6 +44,8 @@ use crate::atrest::sek::{Argon2Profile, Sek};
 use crate::atrest::store::{open_segment, seal_segment, SegmentKind};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
+use crate::governance::capability::CapabilitySet;
+use crate::governance::cert::AdminCert;
 use crate::governance::consent::ConsentGrant;
 use crate::governance::entry::GovEntry;
 use crate::governance::evaluator::Evaluator;
@@ -970,6 +972,55 @@ impl ChannelState {
         Ok(grant)
     }
 
+    /// Grant `target` a set of **tunnel capabilities** (ADR-013 authorization over the
+    /// single ADR-007 evaluator): issue an [`AdminCert`] delegating exactly those
+    /// capabilities, append it as a governance entry, and fold it into the evaluator,
+    /// so the grant is a log fact every member converges on rather than local
+    /// configuration.
+    ///
+    /// The caller must hold the capabilities being delegated — the evaluator enforces
+    /// `is_within` on the issuer's own set, so this cannot widen anyone's reach — and
+    /// `expiry` is the certificate's, after which the grant simply stops counting.
+    ///
+    /// Chat and tunnel axes stay independent (ADR-013): this grants no message
+    /// consent, and consent grants no tunnel reach.
+    pub fn grant_capabilities(
+        &mut self,
+        profile: &Profile,
+        target: &CompositePublicKey,
+        capabilities: CapabilitySet,
+        expiry: u64,
+        now_secs: u64,
+    ) -> Result<AdminCert> {
+        if capabilities.is_empty() {
+            return Err(Error::MalformedGovernance("a grant with no capabilities"));
+        }
+        let signer = profile.signer()?;
+        let cert = AdminCert::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            target.clone(),
+            capabilities,
+            expiry,
+        )?;
+        self.append_governance(profile, &cert.to_wire(), now_secs)?;
+        Ok(cert)
+    }
+
+    /// Whether `member` may **dial** `service_tag` in this channel, by this node's
+    /// evaluator (ADR-013 `dial:` capability).
+    #[must_use]
+    pub fn can_dial(&self, member: &Digest32, service_tag: &str) -> bool {
+        crate::tunnel::authz::can_dial(&self.evaluator, member, service_tag)
+    }
+
+    /// Whether `member` may **bind** (offer) `service_tag` in this channel.
+    #[must_use]
+    pub fn can_bind(&self, member: &Digest32, service_tag: &str) -> bool {
+        crate::tunnel::authz::can_bind(&self.evaluator, member, service_tag)
+    }
+
     /// Append an already-built governance struct as a signed log entry.
     fn append_governance(
         &mut self,
@@ -1891,6 +1942,84 @@ mod tests {
     /// a joiner builds local state from the board's genesis, each side admits the
     /// other as a log author, a message crosses and is **stored but unreadable**,
     /// and a consent grant becomes a governance fact both sides evaluate.
+    /// **Spike, kept as the proof (ADR-013 / M16.1).** A tunnel capability is a log
+    /// fact, not configuration: Alice grants Bob `dial:ssh` as an ADR-007 admin cert
+    /// appended to the log, and once the entry reaches Bob *both* evaluators agree he
+    /// may dial it — which is what `tunnel::session::accept` enforces on the host side.
+    /// A member with no grant may not, a different service is not covered, and the
+    /// grant is independent of message consent (ADR-013: the two axes do not imply
+    /// each other).
+    #[test]
+    fn a_tunnel_capability_is_a_log_fact_both_sides_converge_on() {
+        use crate::governance::capability::Capability;
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = profile(&tmp, "alice");
+        let bob = profile(&tmp, "bob");
+        let carol = profile(&tmp, "carol");
+        let t = 1_700_000_000;
+
+        let mut a = ChannelState::create_with_profile(
+            &alice,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        let cid = a.channel_id();
+        let a_fp = RootSigner::public_key(alice.signer().unwrap()).fingerprint();
+        let bob_key = RootSigner::public_key(bob.signer().unwrap());
+        let b_fp = bob_key.fingerprint();
+        let c_fp = RootSigner::public_key(carol.signer().unwrap()).fingerprint();
+        let mut b = ChannelState::join_channel_with_profile(
+            &bob,
+            a.genesis(),
+            &cid,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        assert!(a.admit_author(alice.store(), &bob_key, t).unwrap());
+
+        // Default-deny, before any grant: the creator may do anything (admin), and
+        // nobody else may dial anything.
+        assert!(a.can_bind(&a_fp, "ssh"), "the admin may offer a service");
+        assert!(!a.can_dial(&b_fp, "ssh"));
+        assert!(!b.can_dial(&b_fp, "ssh"));
+
+        // Alice grants Bob `dial:ssh`, as a governance entry on the log.
+        let caps = CapabilitySet::from_iter_caps([Capability::dial("ssh")]);
+        let cert = a
+            .grant_capabilities(&alice, &bob_key, caps, t + 86_400, t)
+            .unwrap();
+        assert_eq!(cert.body.delegate_pubkey.fingerprint(), b_fp);
+        assert!(a.can_dial(&b_fp, "ssh"), "the issuer sees it at once");
+        assert!(!a.can_dial(&c_fp, "ssh"), "and nobody else");
+        assert!(!a.can_dial(&b_fp, "http"), "nor another service");
+        // An empty grant is not a grant.
+        assert!(a
+            .grant_capabilities(&alice, &bob_key, CapabilitySet::new(), t + 86_400, t)
+            .is_err());
+
+        // The entry reaches Bob (sync carries it; here the bytes directly), and his
+        // evaluator converges on the same verdict.
+        let hash = a.gov_entries.last().unwrap().entry_hash;
+        let wire = a.dag.get_by_hash(&hash).unwrap().to_wire();
+        assert_eq!(
+            b.accept_entry(bob.store(), Entry::from_wire(&wire).unwrap(), t)
+                .unwrap(),
+            Accepted::Governance
+        );
+        assert!(b.can_dial(&b_fp, "ssh"), "Bob knows he may dial");
+        assert!(!b.can_dial(&c_fp, "ssh"));
+
+        // The axes are independent: a dial capability granted nobody any reading.
+        assert!(!a.may_read(&a_fp, &b_fp), "no message consent was implied");
+        assert!(b.timeline().is_empty());
+    }
+
     #[test]
     fn a_joiner_admits_authors_stores_unreadable_content_and_records_consent() {
         let tmp = tempfile::tempdir().unwrap();

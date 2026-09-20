@@ -22,6 +22,9 @@ use vox_core::tunnel::session;
 
 // The dialer/admin identity is shared as a spike constant so the host can build a
 // channel in which the dialer is the admin (and thus holds every Dial capability).
+/// The genesis's creation time, fixed so both processes derive one channelID.
+const GENESIS_CREATED: u64 = 1_800_000_000;
+
 const ADMIN_SEED_A: [u8; 32] = [3u8; 32];
 const ADMIN_SEED_B: [u8; 32] = [4u8; 32];
 
@@ -78,7 +81,12 @@ async fn host() {
 
     // The channel: the dialer (ADMIN_SEED) is the root admin, so it holds dial:echo.
     let admin = SoftwareRootSigner::from_component_seeds(&ADMIN_SEED_A, &ADMIN_SEED_B).unwrap();
-    let genesis = Genesis::create_with_nonce(&admin, now(), policy(), [9u8; 16]).unwrap();
+    // A fixed creation time, not `now()`: the channelID is the genesis hash, and the
+    // two processes must derive the *same* one or the dial names a channel the host
+    // does not serve.
+    let genesis = Genesis::create_with_nonce(&admin, GENESIS_CREATED, policy(), [9u8; 16]).unwrap();
+    // The dialer names this channel; the host checks the claim against its evaluator.
+    let channel_id = genesis.channel_id();
     let evaluator = Evaluator::build(&genesis, &[], now(), |_| None).unwrap();
 
     let host_signer = SoftwareRootSigner::from_component_seeds(&[1u8; 32], &[2u8; 32]).unwrap();
@@ -92,8 +100,8 @@ async fn host() {
     eprintln!("host: peer AUTHENTICATED as {}", hex(client_id));
     let (send, recv) = conn.accept_stream().await.unwrap();
     // accept() ENFORCES dial:echo for client_id before connecting the echo service.
-    match session::accept(send, recv, &client_id, &evaluator, |tag| {
-        (tag == "echo").then_some(echo_addr)
+    match session::accept(send, recv, &client_id, &evaluator, |cid, tag| {
+        (*cid == channel_id && tag == "echo").then_some(echo_addr)
     })
     .await
     {
@@ -105,8 +113,12 @@ async fn host() {
 
 async fn client(addr: &str, id_hex: &str) {
     let expected = parse_id(id_hex);
-    // The client IS the channel admin → holds dial:echo.
+    // The client IS the channel admin → holds dial:echo. It rebuilds the same genesis
+    // to name the channel it claims that capability under.
     let signer = SoftwareRootSigner::from_component_seeds(&ADMIN_SEED_A, &ADMIN_SEED_B).unwrap();
+    let channel_id = Genesis::create_with_nonce(&signer, GENESIS_CREATED, policy(), [9u8; 16])
+        .unwrap()
+        .channel_id();
     let ep = VoxEndpoint::bind(&signer, "127.0.0.1:0".parse().unwrap()).unwrap();
     let conn = ep
         .connect(addr.parse().unwrap(), expected, now())
@@ -120,7 +132,7 @@ async fn client(addr: &str, id_hex: &str) {
     let local_addr = local.local_addr().unwrap();
     tokio::spawn(async move {
         if let Ok((app_sock, _)) = local.accept().await {
-            let _ = session::dial(send, recv, "echo", app_sock).await;
+            let _ = session::dial(send, recv, &channel_id, "echo", app_sock).await;
         }
     });
 

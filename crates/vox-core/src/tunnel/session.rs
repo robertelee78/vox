@@ -36,35 +36,53 @@ pub const MAX_SERVICE_TAG_LEN: usize = 256;
 /// Maximum length of a length-delimited tunnel control frame on the stream.
 const MAX_CONTROL_FRAME: usize = 4 + MAX_SERVICE_TAG_LEN + 64;
 
-/// The dialer's opening request on a fresh tunnel stream: which service to reach.
+/// The dialer's opening request on a fresh tunnel stream: **which channel's
+/// authorization applies**, and which service to reach.
+///
+/// The channelID is not decoration. A QUIC connection is per *peer*, not per channel
+/// (ADR-016), and authorization lives in a channel's ADR-007 evaluator — so a host
+/// that was told only a service tag could not know which evaluator to ask, and two
+/// members who share several channels would be ambiguous. The dialer names the
+/// channel it claims the capability under, and the host checks that claim against
+/// that channel's evaluator or refuses uniformly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TunnelRequest {
+    /// The channel whose evaluator authorizes this dial.
+    pub channel_id: Digest32,
     /// The service tag to Dial (the `<tag>` of `dial:<tag>`), e.g. `"ssh-hosts"`.
     pub service_tag: String,
 }
 
 impl TunnelRequest {
-    /// Canonical CBOR: `[service_tag]`.
+    /// Canonical CBOR: `[channel_id, service_tag]`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(1).text(&self.service_tag);
+        e.array(2).bytes(&self.channel_id).text(&self.service_tag);
         e.finish()
     }
 
-    /// Strictly decode a request (rejects wrong arity, oversized tag, trailing bytes).
+    /// Strictly decode a request (rejects wrong arity, a channelID that is not 32
+    /// bytes, an oversized tag, trailing bytes).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
-        if d.array()? != 1 {
+        if d.array()? != 2 {
             return Err(Error::MalformedTunnel("tunnel request arity"));
         }
+        let channel_id: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedTunnel("tunnel request channelID"))?;
         let service_tag = d.text()?.to_owned();
         d.finish()
             .map_err(|_| Error::MalformedTunnel("tunnel request trailing bytes"))?;
         if service_tag.is_empty() || service_tag.len() > MAX_SERVICE_TAG_LEN {
             return Err(Error::MalformedTunnel("tunnel request tag length"));
         }
-        Ok(Self { service_tag })
+        Ok(Self {
+            channel_id,
+            service_tag,
+        })
     }
 }
 
@@ -135,10 +153,12 @@ async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
 pub async fn dial(
     mut send: SendStream,
     mut recv: RecvStream,
+    channel_id: &Digest32,
     service_tag: &str,
     local: TcpStream,
 ) -> Result<()> {
     let req = TunnelRequest {
+        channel_id: *channel_id,
         service_tag: service_tag.to_owned(),
     };
     write_frame(&mut send, &req.to_bytes()).await?;
@@ -178,15 +198,17 @@ pub async fn accept<F>(
     resolve_endpoint: F,
 ) -> Result<()>
 where
-    F: FnOnce(&str) -> Option<SocketAddr>,
+    F: FnOnce(&Digest32, &str) -> Option<SocketAddr>,
 {
     let req = TunnelRequest::from_bytes(&read_frame(&mut recv).await?)?;
 
     // (2) Authorization is enforced here, against the authenticated peer.
-    // (3) Service resolution is pure host config (no auth). Both denials are uniform.
+    // (3) Service resolution is pure host config (no auth) — and it is asked about
+    //     the channel the dialer named, so a service offered in one channel is not
+    //     reachable by a capability granted in another. Both denials are uniform.
     let decision = authorize_dial(evaluator, client_id, &req.service_tag)
         .ok()
-        .and_then(|()| resolve_endpoint(&req.service_tag));
+        .and_then(|()| resolve_endpoint(&req.channel_id, &req.service_tag));
     let Some(target) = decision else {
         // Finish the stream so the status reaches the dialer before we drop it.
         write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
@@ -229,20 +251,35 @@ mod tests {
     #[test]
     fn request_round_trips_and_rejects_bad() {
         let r = TunnelRequest {
+            channel_id: [0x5A; 32],
             service_tag: "ssh-hosts".to_owned(),
         };
         assert_eq!(TunnelRequest::from_bytes(&r.to_bytes()).unwrap(), r);
         // Empty tag rejected.
         let mut e = Encoder::new();
-        e.array(1).text("");
+        e.array(2).bytes(&[0x5A; 32]).text("");
         assert!(matches!(
             TunnelRequest::from_bytes(&e.finish()),
             Err(Error::MalformedTunnel(_))
         ));
-        // Wrong arity rejected.
+        // A channelID that is not 32 bytes is not a channelID.
+        let mut e = Encoder::new();
+        e.array(2).bytes(&[0x5A; 31]).text("ssh");
+        assert!(matches!(
+            TunnelRequest::from_bytes(&e.finish()),
+            Err(Error::MalformedTunnel("tunnel request channelID"))
+        ));
+        // Wrong arity rejected, either way.
         let mut e2 = Encoder::new();
-        e2.array(2).text("a").text("b");
+        e2.array(1).text("a");
         assert!(TunnelRequest::from_bytes(&e2.finish()).is_err());
+        let mut e3 = Encoder::new();
+        e3.array(3).bytes(&[0x5A; 32]).text("a").text("b");
+        assert!(TunnelRequest::from_bytes(&e3.finish()).is_err());
+        // Trailing bytes rejected.
+        let mut bytes = r.to_bytes();
+        bytes.push(0);
+        assert!(TunnelRequest::from_bytes(&bytes).is_err());
     }
 
     #[test]
@@ -279,9 +316,16 @@ mod tests {
 
     /// An evaluator whose root admin is `admin` (admin covers every Dial), built
     /// from a genesis-only channel.
-    fn evaluator_with_admin(admin: &SoftwareRootSigner) -> Evaluator {
+    /// An evaluator over a channel `admin` created, with that channel's id — which
+    /// the dialer must name and the host must check (a connection is per peer, not
+    /// per channel).
+    fn evaluator_with_admin(admin: &SoftwareRootSigner) -> (Evaluator, Digest32) {
         let genesis = Genesis::create_with_nonce(admin, 0, policy(), [0x55; 16]).unwrap();
-        Evaluator::build(&genesis, &[], 1000, |_| None).unwrap()
+        let cid = genesis.channel_id();
+        (
+            Evaluator::build(&genesis, &[], 1000, |_| None).unwrap(),
+            cid,
+        )
     }
 
     fn rt() -> Runtime {
@@ -321,7 +365,7 @@ mod tests {
             // The client identity is the channel's root admin, so it holds Dial for
             // every service via the ADR-007 lattice.
             let client_signer = signer(3, 4);
-            let evaluator = evaluator_with_admin(&client_signer);
+            let (evaluator, channel_id) = evaluator_with_admin(&client_signer);
 
             // Host QUIC endpoint with a one-shot accept that serves a tunnel to the
             // echo service, enforcing Dial for the authenticated peer.
@@ -334,8 +378,8 @@ mod tests {
                     let client_id = conn.peer_id(); // transport-authenticated peer
                     if let Ok((send, recv)) = conn.accept_stream().await {
                         // Resolver is pure config: this host offers "echo".
-                        let _ = accept(send, recv, &client_id, &evaluator, |tag| {
-                            (tag == "echo").then_some(echo_addr)
+                        let _ = accept(send, recv, &client_id, &evaluator, |cid, tag| {
+                            (*cid == channel_id && tag == "echo").then_some(echo_addr)
                         })
                         .await;
                     }
@@ -360,7 +404,7 @@ mod tests {
             // Accept the app-side socket and drive the dialer splice.
             tokio::spawn(async move {
                 if let Ok((app_sock, _)) = app_listener.accept().await {
-                    let _ = dial(send, recv, "echo", app_sock).await;
+                    let _ = dial(send, recv, &channel_id, "echo", app_sock).await;
                 }
             });
 
@@ -384,7 +428,7 @@ mod tests {
             // stranger holding no `dial:` capability → authorization denies even
             // though the host offers the service.
             let admin = signer(9, 9);
-            let evaluator = evaluator_with_admin(&admin);
+            let (evaluator, channel_id) = evaluator_with_admin(&admin);
 
             let host_signer = signer(5, 6);
             let host = VoxEndpoint::bind(&host_signer, loopback()).unwrap();
@@ -395,11 +439,10 @@ mod tests {
                     let client_id = conn.peer_id();
                     if let Ok((send, recv)) = conn.accept_stream().await {
                         // Host *offers* "echo", but the peer is unauthorized.
-                        let _ = accept(send, recv, &client_id, &evaluator, |tag| {
-                            (tag == "echo").then_some(SocketAddr::V4(SocketAddrV4::new(
-                                Ipv4Addr::LOCALHOST,
-                                9,
-                            )))
+                        let _ = accept(send, recv, &client_id, &evaluator, |cid, tag| {
+                            (*cid == channel_id && tag == "echo").then_some(SocketAddr::V4(
+                                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9),
+                            ))
                         })
                         .await;
                     }
@@ -427,9 +470,12 @@ mod tests {
                 let _ = l.accept().await;
             });
             let app = TcpStream::connect(la).await.unwrap();
-            let res = tokio::time::timeout(Duration::from_secs(10), dial(send, recv, "echo", app))
-                .await
-                .expect("did not hang");
+            let res = tokio::time::timeout(
+                Duration::from_secs(10),
+                dial(send, recv, &channel_id, "echo", app),
+            )
+            .await
+            .expect("did not hang");
             assert!(matches!(res, Err(Error::TunnelDenied(_))));
         });
     }

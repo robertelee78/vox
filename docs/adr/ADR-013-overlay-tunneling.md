@@ -163,6 +163,24 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
 
 **Scope decision — the TUN/VPN datapath is deferred to the client (ADR-014), not built in `vox-core`.** ADR-013 marks the TUN model *optional*; its datapath needs a privileged helper / `NetworkExtension` and a userspace TCP stack (`smoltcp`), which are platform-client concerns (the ADR ties TUN to ADR-014). `vox-core` therefore ships the **primary** per-stream SOCKS/port-forward model complete (the `ssh`-over-Vox path) plus the identity-derived addressing the TUN model will consume. This is a layering decision, not a false deferral: the per-service authorization, advertisement, addressing, and data-path are all complete and tested; only the OS interface binding (a client surface) is out of `vox-core` scope. `tun`/`utun` + `smoltcp` land with ADR-014.
 
+- **A tunnel request names its channel (2026-09-20, M16.1).** `TunnelRequest` carried only a service tag,
+  which cannot be authorized: a QUIC connection is per **peer**, not per channel (ADR-016), and the
+  capability that permits a dial lives in a *channel's* ADR-007 evaluator — so a host told only
+  `"ssh"` could not know which evaluator to ask, and two members who share several channels were
+  ambiguous. The wire is now `[channel_id, service_tag]`: the dialer names the channel it claims the
+  capability under, the host checks that claim against that channel's evaluator, and service resolution is
+  asked per `(channel, tag)` so a service offered in one channel is not reachable by a capability granted
+  in another. Refusals stay uniform (`TunnelStatus::Denied`) — unauthorized, unknown-channel,
+  unknown-service and connect-failed remain indistinguishable on the wire. This is the same correction
+  ADR-016 M14.7 made for the join, pairwise and sync streams, for the same reason.
+- **Capabilities are issued as log facts (2026-09-20, M16.1).** `ChannelState::grant_capabilities` issues
+  an ADR-007 `AdminCert` delegating exactly the `bind:`/`dial:` capabilities asked for, appends it as a
+  governance entry, and folds it into the evaluator — so a grant is a fact every member converges on
+  through ordinary sync, not local configuration, and the evaluator's `is_within` check means no issuer can
+  widen anyone's reach beyond its own. `can_dial` / `can_bind` on `ChannelState` are the queries. Proved
+  both-sided: the issuer authorizes at once, the grantee's evaluator agrees the moment the entry arrives,
+  a member with no grant and a different service are both refused, and the grant conveys **no** message
+  consent (the two axes stay independent, as the Decision requires).
 - **Known gaps (recorded 2026-09-19).** No `vox service add` / `vox forward` / `vox up` CLI exists (no
   CLI crate; the TUI's only "up" is navigation). Tunnel session establishment is not recorded as signed
   events (the "accountability" line above has no entry type). The SSH CA is a bare Ed25519 seed with
