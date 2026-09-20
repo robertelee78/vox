@@ -197,6 +197,20 @@ pub enum NodeCommand {
         /// The member being consented to.
         target: Digest32,
     },
+    /// Revoke `target`'s consent to read this identity's messages in a channel
+    /// (ADR-007 §Revocation). Rotates this identity's sender key to a generation
+    /// `target` holds no key for, records the revocation on the log, and re-keys the
+    /// members who keep consent.
+    ///
+    /// The forward guarantee is immediate and cryptographic: it does not wait on
+    /// anyone being reachable. What `target` already received is not recalled and
+    /// cannot be (ADR-007 §"Enforcement honesty").
+    Revoke {
+        /// The channel.
+        channel_id: Digest32,
+        /// The member whose consent is withdrawn.
+        target: Digest32,
+    },
     /// Offer a local TCP service to a channel (ADR-013 Bind). Host configuration:
     /// what a peer may *reach* is the `dial:` capability on the log, granted with
     /// [`NodeCommand::GrantTunnel`]. Requires `bind:<service_tag>` in that channel.
@@ -288,6 +302,10 @@ pub enum Fault {
     Unreachable,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
+    /// There is no consent to withdraw: the target was never consented to, or the
+    /// consent has already been revoked (ADR-007 — consent is single-writer, so this
+    /// is a settled fact, not a race).
+    NotConsented,
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }
@@ -385,6 +403,19 @@ pub enum NodeEvent {
         channel_id: Digest32,
         /// The member consented to.
         target: Digest32,
+    },
+    /// This identity revoked `target`, rotating its sender key to a generation
+    /// `target` cannot read. `rekeyed` counts the remaining consenters that were
+    /// re-keyed immediately; the rest are re-keyed as they become reachable.
+    Revoked {
+        /// The channel.
+        channel_id: Digest32,
+        /// The member whose consent was withdrawn.
+        target: Digest32,
+        /// The new sender-key generation.
+        generation: u64,
+        /// How many remaining consenters were re-keyed at once.
+        rekeyed: u64,
     },
     /// A sync session applied entries to a channel's log.
     Synced {

@@ -14,7 +14,9 @@
 //! the closed [`CommandStatus`] / [`UiError`] set — no free text from the core.
 //!
 //! M13 is single-device: reachability is honestly `Offline`, sync `Idle`, and the
-//! network verbs (join, consent, visibility, block) report `NotAvailableYet`.
+//! verbs that need a network (join, consent) report `NotNetworked`. Revocation needs
+//! none — it rotates a local key — so it reaches the node regardless. The ADR-015
+//! visibility and block verbs report `NotAvailableYet`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -248,6 +250,7 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::BadLink => UiError::Malformed,
         Fault::Unreachable => UiError::Unreachable,
         Fault::Refused => UiError::Refused,
+        Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
@@ -336,10 +339,16 @@ impl CoreHandle for LiveCore {
                 channel_id,
                 target: member,
             }),
-            Command::RevokeConsent { .. }
-            | Command::SetVisibility { .. }
-            | Command::Block { .. }
-            | Command::Unblock { .. } => CommandStatus::Failed(UiError::NotAvailableYet),
+            // ADR-007 revocation: rotating this identity's sender key to a generation
+            // the member holds no key for. Forward-only, and honest about it — what
+            // they already received is not recalled.
+            Command::RevokeConsent { channel_id, member } => self.send(NodeCommand::Revoke {
+                channel_id,
+                target: member,
+            }),
+            Command::SetVisibility { .. } | Command::Block { .. } | Command::Unblock { .. } => {
+                CommandStatus::Failed(UiError::NotAvailableYet)
+            }
         }
     }
 
@@ -492,14 +501,15 @@ mod tests {
             }),
             CommandStatus::Failed(UiError::NotNetworked)
         );
-        // The ADR-007 revocation and ADR-015 visibility verbs remain unimplemented and
-        // report that honestly.
+        // Revocation reaches the node now (M18.1) and needs no network — so on a
+        // single-device channel with nobody consented to, the honest answer is that
+        // there is nothing to revoke.
         assert_eq!(
             core.apply(Command::RevokeConsent {
                 channel_id: cid,
                 member: [1; 32]
             }),
-            CommandStatus::Failed(UiError::NotAvailableYet)
+            CommandStatus::Failed(UiError::NotConsented)
         );
 
         // Lock: locked, active cleared, channel listed closed by short id.
@@ -591,14 +601,25 @@ mod tests {
             }),
             CommandStatus::Failed(UiError::NotNetworked)
         );
-        // The ADR-007 revocation and ADR-015 visibility verbs are honestly reported
-        // as not available rather than silently accepted.
+        // Revocation reaches the node (M18.1). Unlike every other verb here it does
+        // **not** need the network — rotating the sender key and recording the fact
+        // are local acts, and the re-keys follow when peers are reachable — so the
+        // only thing missing is the channel.
+        assert_eq!(
+            core.apply(Command::RevokeConsent {
+                channel_id: [3; 32],
+                member: [4; 32],
+            }),
+            CommandStatus::Failed(UiError::ChannelNotOpen)
+        );
+        // The ADR-015 visibility verbs are still honestly reported as not available
+        // rather than silently accepted.
         for cmd in [
-            Command::RevokeConsent {
+            Command::Block {
                 channel_id: [3; 32],
                 member: [4; 32],
             },
-            Command::Block {
+            Command::Unblock {
                 channel_id: [3; 32],
                 member: [4; 32],
             },

@@ -668,6 +668,10 @@ impl Node {
                     self.renew_mappings_if_due();
                     self.adopt_anchored_from_board().await;
                     self.redial_anchors_if_due();
+                    // A rotation's re-keys go out as the remaining consenters become
+                    // reachable, which is why they are retried here and not only at
+                    // the moment of rotation (M18.1).
+                    self.deliver_owed_rekeys().await;
                     if self.run_due_syncs().await {
                         self.publish().await;
                     }
@@ -713,6 +717,7 @@ impl Node {
                 passphrase,
             } => self.join_channel(&link, &local_name, &passphrase).await,
             NodeCommand::Consent { channel_id, target } => self.consent(&channel_id, target).await,
+            NodeCommand::Revoke { channel_id, target } => self.revoke(&channel_id, target).await,
             NodeCommand::AddService {
                 channel_id,
                 service_tag,
@@ -1827,6 +1832,108 @@ impl Node {
         outcome
     }
 
+    /// Revoke `target`'s consent (ADR-007 §Revocation, M18.1): rotate this
+    /// identity's sender key, record the revocation, and re-key everyone who keeps
+    /// consent.
+    ///
+    /// The order is deliberate. The rotation and the log fact land **first** and
+    /// unconditionally; the re-keys follow on a best-effort basis and are retried by
+    /// the tick for whoever was unreachable. A revocation that waited for the rest of
+    /// the room to be online would be a revocation in name only.
+    async fn revoke(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
+        let now = self.now();
+        let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
+            return Outcome::Failed(Fault::UnknownChannel);
+        };
+        let generation = {
+            let mut channel = shared.lock().await;
+            match channel.revoke_consent(profile, target, now) {
+                Ok(r) => r.body.new_chain_id,
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            }
+        };
+        // The revocation is a log fact the whole channel converges on.
+        self.note_local_append(channel_id);
+        let rekeyed = self.deliver_rekeys_for(channel_id).await;
+        let _ = self
+            .event_tx
+            .send(NodeEvent::Revoked {
+                channel_id: *channel_id,
+                target,
+                generation,
+                rekeyed,
+            })
+            .await;
+        Outcome::Done
+    }
+
+    /// Deliver the current sender-key generation to every member of every open
+    /// channel that keeps consent and does not hold it yet.
+    async fn deliver_owed_rekeys(&mut self) {
+        let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+        for channel_id in channels {
+            let _ = self.deliver_rekeys_for(&channel_id).await;
+        }
+    }
+
+    /// Deliver the current generation to the members of one channel that are owed it,
+    /// returning how many were re-keyed. A member with no live pairwise session is
+    /// skipped, not failed: the tick tries again once there is one.
+    async fn deliver_rekeys_for(&mut self, channel_id: &Digest32) -> u64 {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return 0;
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return 0;
+        };
+        let (owed, generation, skdm) = {
+            let channel = shared.lock().await;
+            let owed = channel.owed_rekeys();
+            if owed.is_empty() {
+                return 0;
+            }
+            let Some(profile) = self.profile.as_ref() else {
+                return 0;
+            };
+            match channel.rekey_skdm(profile) {
+                Ok(s) => (owed, channel.sender_generation(), s),
+                Err(_) => return 0,
+            }
+        };
+        let mut delivered = 0u64;
+        for target in owed {
+            let Some(conn) = net.manager().existing(&target) else {
+                continue;
+            };
+            let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
+                continue;
+            };
+            if crate::node::pairwise_stream::deliver_skdm(&conn, channel_id, session, &skdm)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            // Recorded only after the bytes went out, so a failed delivery stays owed.
+            let noted = {
+                let Some(profile) = self.profile.as_ref() else {
+                    return delivered;
+                };
+                shared
+                    .lock()
+                    .await
+                    .note_delivered(profile.store(), target, generation)
+            };
+            if noted.is_ok() {
+                delivered += 1;
+            }
+        }
+        delivered
+    }
+
     /// Mark a channel as having a local append to push, and make every peer's
     /// schedule due (ADR-016: "a push immediately after a local append").
     fn note_local_append(&mut self, channel_id: &Digest32) {
@@ -2461,21 +2568,36 @@ impl Node {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
         let mut ch = shared.lock().await;
-        match ch.append_text(profile, text, now) {
-            Ok(r) => {
-                let row = row_of(r);
-                let channel_id = *channel_id;
-                let _ = self
-                    .event_tx
-                    .send(NodeEvent::NewEntry { channel_id, row })
-                    .await;
-                // ADR-016: push immediately after a local append. Marking it here and
-                // letting the tick do the work keeps authoring off the network path.
-                self.note_local_append(&channel_id);
-                Outcome::Done
-            }
-            Err(e) => Outcome::Failed(fault_of(&e)),
+        let appended = match ch.append_text(profile, text, now) {
+            Ok(r) => row_of(r),
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        // ADR-006's scheduled rotation: at `N` messages or `T` elapsed the sender key
+        // is retired and the next message rides a generation nobody holds yet, so the
+        // reach of any one compromised key is bounded in both directions. The
+        // remaining consenters are re-keyed below and by the tick.
+        //
+        // A rotation that cannot persist poisons the channel, which the *next*
+        // command reports; it does not un-send the message that just went out, so the
+        // append is still reported as the success it was.
+        let rotated =
+            ch.should_rotate_sender(now) && ch.rotate_sender(profile.store(), now).is_ok();
+        drop(ch);
+        let channel_id = *channel_id;
+        let _ = self
+            .event_tx
+            .send(NodeEvent::NewEntry {
+                channel_id,
+                row: appended,
+            })
+            .await;
+        // ADR-016: push immediately after a local append. Marking it here and
+        // letting the tick do the work keeps authoring off the network path.
+        self.note_local_append(&channel_id);
+        if rotated {
+            let _ = self.deliver_rekeys_for(&channel_id).await;
         }
+        Outcome::Done
     }
 
     /// Publish the current view (latest wins).
@@ -2640,6 +2762,11 @@ fn fault_of(e: &Error) -> Fault {
         // channel open) reaches the joiner as a malformed exchange; report it as the
         // refusal it is rather than an internal fault.
         Error::MalformedJoin(_) => Fault::Refused,
+        // A revocation the log has already settled, or one aimed at oneself: the
+        // caller's request cannot be honoured, which is not an internal failure.
+        Error::MalformedGovernance(
+            "no consent to revoke" | "an identity cannot revoke its own consent",
+        ) => Fault::NotConsented,
         _ => Fault::Internal,
     }
 }
@@ -3093,6 +3220,115 @@ mod tests {
             h.apply(NodeCommand::Lock).await,
             Outcome::Failed(Fault::ShuttingDown)
         ));
+    }
+
+    /// A clock a test can move, for the bounds that are measured in days.
+    fn movable_clock(t0: u64) -> (Clock, Arc<std::sync::atomic::AtomicU64>) {
+        let cell = Arc::new(std::sync::atomic::AtomicU64::new(t0));
+        let read = Arc::clone(&cell);
+        (
+            Arc::new(move || read.load(std::sync::atomic::Ordering::Relaxed)),
+            cell,
+        )
+    }
+
+    /// M18.1 — ADR-006's scheduled rotation is *enforced*, not merely advertised: the
+    /// node consults the bound on every append, so a chain cannot run past it. (Before
+    /// M18.1 `should_rotate` had no caller outside its own tests, which is why
+    /// ADR-006's known gap (2) said the runtime "must" enforce it.)
+    #[tokio::test]
+    async fn the_scheduled_rotation_bound_is_enforced_on_append() {
+        use crate::group::state::ROTATE_AFTER_SECS;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(&tmp, "alice");
+        let t0 = 1_700_000_000;
+        let (clock, now) = movable_clock(t0);
+        let cid;
+        {
+            let h = Node::spawn_with(p.clone(), clock, Argon2Profile::REDUCED).unwrap();
+            assert!(h
+                .apply(NodeCommand::CreateIdentity {
+                    passphrase: secret("id")
+                })
+                .await
+                .is_done());
+            assert!(h
+                .apply(NodeCommand::CreateChannel {
+                    local_name: "c".into(),
+                    passphrase: secret("ch")
+                })
+                .await
+                .is_done());
+            cid = h.view().channels[0].channel_id;
+            // Well inside the bound: no rotation.
+            now.store(t0 + 10, std::sync::atomic::Ordering::Relaxed);
+            assert!(h
+                .apply(NodeCommand::SendText {
+                    channel_id: cid,
+                    text: "inside the bound".into()
+                })
+                .await
+                .is_done());
+            assert!(h.apply(NodeCommand::Shutdown).await.is_done());
+        }
+        let generation = |t: u64| -> u64 {
+            let mut prof = Profile::open(p.clone()).unwrap();
+            prof.unlock(b"id").unwrap();
+            ChannelState::open(&prof, &cid, b"ch", t)
+                .unwrap()
+                .sender_generation()
+        };
+        assert_eq!(generation(t0 + 20), 0, "the bound was nowhere near");
+
+        // Past the time bound: the next append rotates, and the rotation is persisted.
+        let (clock, now) = movable_clock(t0 + ROTATE_AFTER_SECS + 1);
+        {
+            let h = Node::spawn_with(p.clone(), clock, Argon2Profile::REDUCED).unwrap();
+            assert!(h
+                .apply(NodeCommand::Unlock {
+                    passphrase: secret("id")
+                })
+                .await
+                .is_done());
+            assert!(h
+                .apply(NodeCommand::OpenChannel {
+                    channel_id: cid,
+                    passphrase: secret("ch")
+                })
+                .await
+                .is_done());
+            assert!(h
+                .apply(NodeCommand::SendText {
+                    channel_id: cid,
+                    text: "past the bound".into()
+                })
+                .await
+                .is_done());
+            // A second append on the fresh generation must *not* rotate again: the
+            // clock was reset by the rotation, so the bound is no longer met.
+            now.store(
+                t0 + ROTATE_AFTER_SECS + 2,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            assert!(h
+                .apply(NodeCommand::SendText {
+                    channel_id: cid,
+                    text: "and again".into()
+                })
+                .await
+                .is_done());
+            // Both messages are readable by their author either way.
+            let v = h.view();
+            let timeline = &v.open_channels[0].timeline;
+            assert_eq!(timeline.len(), 3, "{timeline:?}");
+            assert!(h.apply(NodeCommand::Shutdown).await.is_done());
+        }
+        assert_eq!(
+            generation(t0 + ROTATE_AFTER_SECS + 3),
+            1,
+            "exactly one rotation, and it survived the restart"
+        );
     }
 
     #[tokio::test]

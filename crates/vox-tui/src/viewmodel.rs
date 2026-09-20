@@ -237,6 +237,8 @@ pub enum UiError {
     /// accepting joins for that channel. Deliberately coarse — the responder does not
     /// say which, so neither does this (ADR-005).
     Refused,
+    /// There is no consent to withdraw from that member.
+    NotConsented,
     /// This client is not networked, or is locked, so it cannot reach anyone.
     NotNetworked,
     /// An unexpected internal error (never carries detail).
@@ -276,6 +278,7 @@ impl UiError {
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",
             UiError::Storage => "could not save — reopen the channel",
+            UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",

@@ -708,6 +708,91 @@ mod tests {
         assert_eq!(s2.chain_id(), 1);
         assert_eq!(s2.next_iteration(), 0);
     }
+    /// Spike (rotation, M18.1) — assumption 1: a rotation is a *cryptographic*
+    /// boundary, not a bookkeeping one. A recipient holding only the previous
+    /// generation must be unable to read the next one even though the author and
+    /// channel are unchanged. This is the whole security content of revocation.
+    #[test]
+    fn a_recipient_of_the_old_generation_cannot_read_the_new_one() {
+        let cid = [0xA1u8; 32];
+        let author = root(11, 12);
+        let mut gen0 = SenderChain::new(&cid, 1, &author.fingerprint(), 0, 1_000).unwrap();
+        let (it, key) = gen0.current_position();
+        let skdm0 = gen0.skdm_for(&author, it, key).unwrap();
+        let mut held = ReceiverChain::from_skdm(&skdm0, &author.public_key(), &cid, 1).unwrap();
+        assert_eq!(
+            held.decrypt(&gen0.encrypt(b"before").unwrap()).unwrap(),
+            b"before"
+        );
+
+        let mut gen1 = gen0.rotated(2_000).unwrap();
+        let after = gen1.encrypt(b"after").unwrap();
+        assert!(
+            held.decrypt(&after).is_err(),
+            "the old generation's chain must not open the new generation's message"
+        );
+    }
+
+    /// Spike (rotation, M18.1) — assumption 2: continuity for someone who keeps
+    /// consent across a rotation. Releasing the *new* generation at iteration 0
+    /// must let them read messages the author already sent on it, so a member who
+    /// was merely offline while the author rotated has no hole in their history.
+    /// Releasing at the author's *current* position would leave exactly that hole,
+    /// which is why the origin key of the live generation has to be retained.
+    #[test]
+    fn releasing_a_rotated_generation_at_its_origin_closes_the_gap() {
+        use crate::group::history::OriginKeyStore;
+
+        let cid = [0xA2u8; 32];
+        let author = root(13, 14);
+        let gen0 = SenderChain::new(&cid, 1, &author.fingerprint(), 0, 1_000).unwrap();
+        let mut gen1 = gen0.rotated(2_000).unwrap();
+
+        // The author retains the new generation's origin at the moment it is minted…
+        let mut origins = OriginKeyStore::new();
+        let (origin_iteration, origin_key) = gen1.current_position();
+        assert_eq!(origin_iteration, 0, "a fresh generation starts at 0");
+        origins.retain_origin(
+            &cid,
+            1,
+            &author.fingerprint(),
+            gen1.chain_id(),
+            origin_key,
+            gen1.signing_pubkey().to_bytes(),
+            2_000,
+        );
+
+        // …sends two messages while the consenter is offline…
+        let m0 = gen1.encrypt(b"sent while away").unwrap();
+        let m1 = gen1.encrypt(b"also while away").unwrap();
+
+        // …and releases at the origin when they come back.
+        let skdm = origins
+            .release_at(&author, &cid, 1, gen1.chain_id(), 0)
+            .unwrap();
+        let mut back = ReceiverChain::from_skdm(&skdm, &author.public_key(), &cid, 1).unwrap();
+        assert_eq!(back.decrypt(&m0).unwrap(), b"sent while away");
+        assert_eq!(back.decrypt(&m1).unwrap(), b"also while away");
+    }
+
+    /// Spike (rotation, M18.1) — assumption 3: a rotation survives a restart. The
+    /// sealed sender state must carry the generation id, or a reopened channel
+    /// would silently re-emit under a chain_id its recipients already hold at a
+    /// different position.
+    #[test]
+    fn a_rotation_survives_the_sealed_sender_state_round_trip() {
+        let cid = [0xA3u8; 32];
+        let author = root(15, 16);
+        let mut gen0 = SenderChain::new(&cid, 1, &author.fingerprint(), 0, 1_000).unwrap();
+        let _ = gen0.encrypt(b"x").unwrap();
+        let mut gen1 = gen0.rotated(2_000).unwrap();
+        let _ = gen1.encrypt(b"y").unwrap();
+
+        let restored = SenderChain::from_state(&gen1.to_state()).unwrap();
+        assert_eq!(restored.chain_id(), 1);
+        assert_eq!(restored.next_iteration(), gen1.next_iteration());
+    }
+
     #[test]
     fn receiver_chain_state_round_trips_and_preserves_replay_rejection() {
         // A receiver chain restored from its sealed state must reject an iteration

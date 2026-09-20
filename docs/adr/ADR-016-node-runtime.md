@@ -2,7 +2,9 @@
 
 **Status**: accepted (2026-09-19) — **M13 (single-device node), M14 (two machines chat), M15 (anchors: symmetric-NAT swarm formation *and* convergence between members never online together) and M16.1 (a TCP service reached across the overlay) are all gated in `crates/vox-core/tests/` and run in CI's release step**; the person-facing service surface moves to ADR-017
 **Date**: 2026-09-19
-**Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
+**Updated**: 2026-09-21 — M18.1: the node enforces ADR-006's rotation bound and carries ADR-007's
+per-member revocation end to end (`vox revoke`), with two new sealed segments and a re-key retry on the
+tick; gated by `node_m18_revocation_gate`. 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: runtime, node, integration, persistence, rendezvous, sync, headless
 
@@ -192,6 +194,21 @@ cross-process checks.
   in one process over loopback QUIC — create, invite, join with the passphrase, consent, exchange
   messages both ways, and a third node that joins and is *not* consented reads nothing; a
   cross-process spike does the same over two `vox` binaries.
+- **M18.1 — sender-key rotation and per-member revocation.** The node drives what ADR-006 and ADR-007
+  already specified: every append consults the rotation bound; a revocation rotates, records the fact and
+  re-keys the remaining consenters; two sealed `KeyMaterial` segments carry the retained origins
+  (`SEG_ORIGINS = 6`) and the delivery ledger (`SEG_DELIVERED = 7`); the tick retries a re-key owed to a
+  peer that was unreachable. **Gate:** three nodes over loopback QUIC — after one member is revoked, his
+  log catches up with the author's and he can open none of it, while the member who kept consent reads
+  the whole conversation across the rotation boundary (`node_m18_revocation_gate`).
+
+  **Reach, stated exactly.** A re-key travels over an ADR-004 pairwise session, and this node creates
+  those only on the join path — so a re-key reaches precisely the peers a *first* consent could reach,
+  and no fewer. Where it does not reach (the author restarted, so the in-memory session is gone, and the
+  member joined in an earlier process lifetime) the re-key stays owed and the tick keeps offering it;
+  what unblocks it is the same M15 gap that blocks consenting to a member never met — opening a session
+  from that member's bundle record. The security half is unaffected either way: the rotation is what
+  excludes the revoked member, and it takes effect with no delivery at all.
 - **M15 — the anchor and the tunnel surface.** `vox node` headless (store, rendezvous, sync peer,
   hole-punch signaling), range-mode sync over transport, and the ADR-013 CLI (`vox service add`,
   `vox forward`) over the tunnel module. **Gate:** two nodes that are never simultaneously online

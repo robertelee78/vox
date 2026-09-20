@@ -35,7 +35,7 @@
 //! alone. M14 adds other authors' entries, SKDMs, consent and sync on top of the
 //! same layout.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use zeroize::{Zeroize, Zeroizing};
 
@@ -49,11 +49,14 @@ use std::sync::Arc;
 
 use crate::governance::capability::CapabilitySet;
 use crate::governance::cert::AdminCert;
-use crate::governance::consent::ConsentGrant;
+use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::entry::GovEntry;
 use crate::governance::evaluator::Evaluator;
 use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
-use crate::governance::membership::{issue_consent_grant, MembershipView};
+use crate::governance::membership::{
+    issue_consent_grant, issue_consent_revocation, MembershipView,
+};
+use crate::group::history::OriginKeyStore;
 use crate::group::message::GroupMessage;
 use crate::group::skdm::Skdm;
 use crate::group::state::{ReceiverChain, SenderChain};
@@ -92,6 +95,20 @@ const SEG_ANCHORS: u64 = 4;
 /// `dial:` capability in the log, and the two are checked separately
 /// ([`crate::tunnel::session::accept`]).
 const SEG_SERVICES: u64 = 5;
+
+/// The retained-origins segment id within [`SegmentKind::KeyMaterial`] (M18.1): the
+/// iteration-0 chain key of each sender-key generation this identity has minted, so
+/// a member who keeps consent across a rotation can be re-keyed at the new
+/// generation's origin and reads it whole (ADR-006 §History, ADR-007 §Revocation).
+const SEG_ORIGINS: u64 = 6;
+
+/// The sender-key delivery ledger segment id within [`SegmentKind::KeyMaterial`]
+/// (M18.1): target → the highest generation this identity has delivered to it. What
+/// is *owed* is derived from this and the consent set, so it cannot go stale.
+const SEG_DELIVERED: u64 = 7;
+
+/// At-rest version of the delivery-ledger segment.
+const DELIVERED_VERSION: u64 = 1;
 /// Services encoding version.
 const SERVICES_VERSION: u64 = 1;
 /// The most services one channel may offer — a sanity bound on host config.
@@ -251,6 +268,16 @@ pub struct ChannelState {
     /// The services this node offers in this channel (ADR-013 Bind config, M16.1),
     /// persisted in `SEG_SERVICES`.
     services: BTreeMap<String, SocketAddr>,
+    /// The iteration-0 chain key of every sender-key generation this identity has
+    /// minted here (M18.1), persisted in `SEG_ORIGINS`. Held so a rotation can
+    /// re-key the members who keep consent *at the new generation's origin* — which
+    /// is what makes a rotation invisible to them (ADR-006 §History).
+    origins: OriginKeyStore,
+    /// Target → the highest generation delivered to it (M18.1), persisted in
+    /// `SEG_DELIVERED`. Combined with the consent set this yields
+    /// [`ChannelState::owed_rekeys`]; it is never itself the authority on who may
+    /// read (the log is).
+    delivered: BTreeMap<Digest32, u64>,
     /// The channel passphrase, retained **in memory only** for as long as the
     /// channel is open (M14.7c).
     ///
@@ -326,6 +353,76 @@ fn services_bytes(services: &BTreeMap<String, SocketAddr>) -> Vec<u8> {
         e.array(2).text(tag).text(&addr.to_string());
     }
     e.finish()
+}
+
+/// Retain a freshly minted generation's origin (iteration-0) chain key (M18.1).
+///
+/// Valid **only** at the moment of minting: the origin is the live chain key exactly
+/// while `next_iteration == 0`, and once the chain ratchets the origin is gone for
+/// good (one-way). Storing a ratcheted key as an origin would make every later
+/// release derive the wrong iteration, so a non-zero position is an error, not a
+/// thing to paper over.
+fn retain_generation(
+    origins: &mut OriginKeyStore,
+    channel_id: &Digest32,
+    epoch: u64,
+    author: &Digest32,
+    sender: &SenderChain,
+    created_at: u64,
+) -> Result<()> {
+    let (iteration, origin_key) = sender.current_position();
+    if iteration != 0 {
+        return Err(Error::MalformedBundle("origin retention past iteration 0"));
+    }
+    origins.retain_origin(
+        channel_id,
+        epoch,
+        author,
+        sender.chain_id(),
+        origin_key,
+        sender.signing_pubkey().to_bytes(),
+        created_at,
+    );
+    Ok(())
+}
+
+/// The delivery ledger segment: `[version, [[target, chain_id], …]]`, targets in
+/// canonical order.
+fn delivered_bytes(delivered: &BTreeMap<Digest32, u64>) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(DELIVERED_VERSION).array(delivered.len());
+    for (target, chain_id) in delivered {
+        e.array(2).bytes(target).uint(*chain_id);
+    }
+    e.finish()
+}
+
+fn parse_delivered(bytes: &[u8]) -> Result<BTreeMap<Digest32, u64>> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 {
+        return Err(Error::MalformedAtRest("delivery ledger arity"));
+    }
+    if d.uint()? != DELIVERED_VERSION {
+        return Err(Error::MalformedAtRest("delivery ledger version"));
+    }
+    let n = d.array()?;
+    // One row per author this identity could ever consent to.
+    if n > MAX_AUTHORS {
+        return Err(Error::SizeLimitExceeded("delivery ledger rows"));
+    }
+    let mut out = BTreeMap::new();
+    for _ in 0..n {
+        if d.array()? != 2 {
+            return Err(Error::MalformedAtRest("delivery ledger row arity"));
+        }
+        let target: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("delivery ledger target"))?;
+        out.insert(target, d.uint()?);
+    }
+    d.finish()?;
+    Ok(out)
 }
 
 fn parse_services(bytes: &[u8]) -> Result<BTreeMap<String, SocketAddr>> {
@@ -543,6 +640,11 @@ impl ChannelState {
         let factor = SignatureIdentityFactor::new(signer);
         let wrap = sek.seal(&factor, &channel_id, channel_passphrase, argon2)?;
         let sender = SenderChain::new(&channel_id, epoch, &me, 0, now_secs)?;
+        // Retain generation 0's origin at the moment it is minted: once the live
+        // chain ratchets past iteration 0 the origin is unrecoverable, so it is kept
+        // now or never (ADR-006 §History).
+        let mut origins = OriginKeyStore::new();
+        retain_generation(&mut origins, &channel_id, epoch, &me, &sender, now_secs)?;
 
         let manifest = manifest_bytes(&genesis, local_name, now_secs, epoch);
         let manifest_seg = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest)?;
@@ -551,6 +653,12 @@ impl ChannelState {
             SegmentKind::KeyMaterial,
             SEG_SENDER,
             &sender.to_state(),
+        )?;
+        let origins_seg = seal_segment(
+            &sek,
+            SegmentKind::KeyMaterial,
+            SEG_ORIGINS,
+            &origins.to_state(),
         )?;
         let mut authors = BTreeMap::new();
         authors.insert(me, signer.public_key());
@@ -581,6 +689,12 @@ impl ChannelState {
             SEG_SENDER,
             &sender_seg,
         )?;
+        batch.put_segment(
+            &channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_ORIGINS,
+            &origins_seg,
+        )?;
         batch.commit()?;
 
         let mut admission = AdmissionPolicy::new();
@@ -605,6 +719,8 @@ impl ChannelState {
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
+            origins,
+            delivered: BTreeMap::new(),
             poisoned: false,
         })
     }
@@ -733,6 +849,25 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
+        // The origins of this identity's own generations (M18.1). A channel from
+        // before the segment existed retains none, and cannot: the live chain has
+        // already ratcheted past iteration 0, so that generation is releasable only
+        // from the author's current position (see `rekey_skdm`).
+        let origins = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ORIGINS)? {
+            Some(seg) => {
+                let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_ORIGINS, &seg)?;
+                OriginKeyStore::from_state(&bytes)?
+            }
+            None => OriginKeyStore::new(),
+        };
+        let delivered =
+            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_DELIVERED)? {
+                Some(seg) => {
+                    let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_DELIVERED, &seg)?;
+                    parse_delivered(&bytes)?
+                }
+                None => BTreeMap::new(),
+            };
 
         let evaluator = Arc::new(Self::build_evaluator(
             &genesis,
@@ -759,6 +894,8 @@ impl ChannelState {
             receivers,
             anchors,
             services,
+            origins,
+            delivered,
             poisoned: false,
         })
     }
@@ -836,6 +973,8 @@ impl ChannelState {
         let factor = SignatureIdentityFactor::new(signer);
         let wrap = sek.seal(&factor, channel_id, channel_passphrase, argon2)?;
         let sender = SenderChain::new(channel_id, epoch, &me, 0, now_secs)?;
+        let mut origins = OriginKeyStore::new();
+        retain_generation(&mut origins, channel_id, epoch, &me, &sender, now_secs)?;
 
         let creator = genesis.body.creator_pubkey.fingerprint();
         let mut authors = BTreeMap::new();
@@ -856,6 +995,12 @@ impl ChannelState {
             SEG_AUTHORS,
             &authors_bytes(&authors),
         )?;
+        let origins_seg = seal_segment(
+            &sek,
+            SegmentKind::KeyMaterial,
+            SEG_ORIGINS,
+            &origins.to_state(),
+        )?;
         let mut batch = profile.store().batch()?;
         batch.put_sek_wrap(channel_id, &wrap)?;
         batch.put_segment(
@@ -875,6 +1020,12 @@ impl ChannelState {
             SegmentKind::KeyMaterial,
             SEG_AUTHORS,
             &authors_seg,
+        )?;
+        batch.put_segment(
+            channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_ORIGINS,
+            &origins_seg,
         )?;
         batch.commit()?;
 
@@ -902,6 +1053,8 @@ impl ChannelState {
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
+            origins,
+            delivered: BTreeMap::new(),
             poisoned: false,
         })
     }
@@ -1131,7 +1284,218 @@ impl ChannelState {
             self.genesis.body.policy.history_mode,
         )?;
         self.append_governance(profile, &grant.to_wire(), now_secs)?;
+        // The grant is the record that `target` holds this generation; the ledger is
+        // how a later rotation knows it has not yet been given the next one.
+        self.delivered.insert(target, self.sender.chain_id());
+        self.persist_delivered(profile.store())?;
         Ok(grant)
+    }
+
+    /// Whether this identity's sender key has reached its scheduled-rotation bound
+    /// (ADR-006: `N` messages or `T` elapsed). The caller rotates with
+    /// [`ChannelState::rotate_sender`] and re-keys whoever is
+    /// [`owed`](ChannelState::owed_rekeys).
+    #[must_use]
+    pub fn should_rotate_sender(&self, now_secs: u64) -> bool {
+        self.sender.should_rotate(now_secs)
+    }
+
+    /// The generation this identity is currently sending under.
+    #[must_use]
+    pub fn sender_generation(&self) -> u64 {
+        self.sender.chain_id()
+    }
+
+    /// Mint the next sender-key generation and persist it, returning its `chain_id`.
+    ///
+    /// Everything this identity sends from now on is sealed under keys nobody has
+    /// yet: **the rotation itself is the forward-secrecy boundary**, and it takes
+    /// effect whether or not any re-key is ever delivered. That is what makes
+    /// revocation a cryptographic act rather than a request (ADR-007
+    /// §"Enforcement honesty").
+    ///
+    /// The new generation's origin is retained, so members who keep consent can be
+    /// re-keyed at iteration 0 and read the generation whole — a rotation must not
+    /// silently narrow what an existing consenter can read (ADR-006 §History). The
+    /// sender state and the retained origins are written in **one batch**: a
+    /// rotation that persisted the chain but lost the origin would leave the members
+    /// who kept consent permanently unable to read the messages sent before their
+    /// re-key.
+    pub fn rotate_sender(&mut self, store: &Store, now_secs: u64) -> Result<u64> {
+        if self.poisoned {
+            return Err(Error::Profile(
+                "channel is poisoned after a failed persist; reopen it",
+            ));
+        }
+        let next = self.sender.rotated(now_secs)?;
+        let chain_id = next.chain_id();
+        let me = self.me();
+        retain_generation(
+            &mut self.origins,
+            &self.channel_id,
+            self.epoch,
+            &me,
+            &next,
+            now_secs,
+        )?;
+        let sender_seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_SENDER,
+            &next.to_state(),
+        )?;
+        let origins_seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_ORIGINS,
+            &self.origins.to_state(),
+        )?;
+        let persisted = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_SENDER,
+                &sender_seg,
+            )?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_ORIGINS,
+                &origins_seg,
+            )?;
+            batch.commit()
+        })();
+        if let Err(e) = persisted {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.sender = next;
+        Ok(chain_id)
+    }
+
+    /// Mint an SKDM releasing this identity's **current** generation at its
+    /// origin — the re-key for a member who already had consent when the generation
+    /// was minted.
+    ///
+    /// Releasing at iteration 0 rather than the author's current position is what
+    /// closes the hole a rotation would otherwise open: a member who was merely
+    /// offline while the author rotated reads every message of the new generation,
+    /// not just the ones sent after they reconnected. It widens nothing, because a
+    /// generation minted *after* someone consented contains, by construction, only
+    /// messages sent after their consent.
+    ///
+    /// If the generation's origin is not retained — a channel created before M18.1,
+    /// whose live chain has already ratcheted past iteration 0 — the origin is
+    /// unrecoverable and the only honest release is the current position, exactly as
+    /// [`ChannelState::skdm_for_consent`] does.
+    pub fn rekey_skdm(&self, profile: &Profile) -> Result<Skdm> {
+        let signer = profile.signer()?;
+        let chain_id = self.sender.chain_id();
+        if self.origins.has(&self.channel_id, self.epoch, chain_id) {
+            self.origins
+                .release_at(signer, &self.channel_id, self.epoch, chain_id, 0)
+        } else {
+            let (iteration, key) = self.sender.current_position();
+            self.sender.skdm_for(signer, iteration, key)
+        }
+    }
+
+    /// Record that `target` has been delivered generation `chain_id` of this
+    /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
+    pub fn note_delivered(&mut self, store: &Store, target: Digest32, chain_id: u64) -> Result<()> {
+        let entry = self.delivered.entry(target).or_default();
+        if *entry >= chain_id {
+            return Ok(());
+        }
+        *entry = chain_id;
+        self.persist_delivered(store)
+    }
+
+    /// The members this identity has consented to that do not yet hold its current
+    /// generation — who a rotation still owes a re-key.
+    ///
+    /// Derived from the consent set on the log and the delivery ledger, never stored:
+    /// a revoked member drops out because the log says so, not because a cached list
+    /// was updated. A consenter with no ledger row counts as owed; re-delivering a
+    /// generation it already holds is ignored by
+    /// [`ChannelState::accept_skdm`], so the safe direction is to send.
+    #[must_use]
+    pub fn owed_rekeys(&self) -> BTreeSet<Digest32> {
+        let me = self.me();
+        let current = self.sender.chain_id();
+        MembershipView::new(&self.evaluator)
+            .readers_of(&me)
+            .into_iter()
+            .filter(|t| *t != me)
+            .filter(|t| self.delivered.get(t).is_none_or(|d| *d < current))
+            .collect()
+    }
+
+    /// Revoke `target`'s consent to read this identity's messages (ADR-007
+    /// §Revocation): rotate this identity's sender key and append the signed
+    /// revocation naming the generation that excludes `target`.
+    ///
+    /// Revocation *is* rotation with one member left out. The forward guarantee is
+    /// cryptographic and immediate — `target` holds no key for the new generation and
+    /// no key it holds derives one. What `target` already received is not recalled
+    /// and cannot be: ADR-007 §"Enforcement honesty" says so, and no protocol can
+    /// say otherwise.
+    ///
+    /// The remaining consenters are re-keyed by the caller (the node's tick, from
+    /// [`ChannelState::owed_rekeys`]); the rotation does not wait on that, because a
+    /// revocation that took effect only once everyone else was reachable would be no
+    /// revocation at all.
+    pub fn revoke_consent(
+        &mut self,
+        profile: &Profile,
+        target: Digest32,
+        now_secs: u64,
+    ) -> Result<ConsentRevocation> {
+        let me = self.me();
+        if target == me {
+            return Err(Error::MalformedGovernance(
+                "an identity cannot revoke its own consent",
+            ));
+        }
+        if !MembershipView::new(&self.evaluator)
+            .readers_of(&me)
+            .contains(&target)
+        {
+            return Err(Error::MalformedGovernance("no consent to revoke"));
+        }
+        // Rotate first: the entry names the generation that excludes `target`, so
+        // that generation has to exist before the fact is signed.
+        let new_chain_id = self.rotate_sender(profile.store(), now_secs)?;
+        let signer = profile.signer()?;
+        let revocation =
+            issue_consent_revocation(signer, &self.channel_id, self.epoch, target, new_chain_id)?;
+        self.append_governance(profile, &revocation.to_wire(), now_secs)?;
+        // Nothing is owed to a revoked member; drop the row so a later re-consent
+        // starts from "holds nothing".
+        if self.delivered.remove(&target).is_some() {
+            self.persist_delivered(profile.store())?;
+        }
+        Ok(revocation)
+    }
+
+    fn persist_delivered(&mut self, store: &Store) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_DELIVERED,
+            &delivered_bytes(&self.delivered),
+        )?;
+        if let Err(e) = store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_DELIVERED,
+            &seg,
+        ) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Grant `target` a set of **tunnel capabilities** (ADR-013 authorization over the
@@ -1885,6 +2249,20 @@ mod tests {
             .unwrap()
     }
 
+    /// Copy every entry `from` holds that `to` has not accepted yet, oldest first —
+    /// what a sync session does (M14.6), performed directly so a test can control
+    /// exactly when a peer learns something.
+    fn ship(from: &ChannelState, to: &mut ChannelState, store: &Store, now: u64) {
+        for hash in from.dag.causal_order() {
+            if to.dag.contains(&hash) {
+                continue;
+            }
+            let wire = from.dag.get_by_hash(&hash).unwrap().to_wire();
+            let entry = Entry::from_wire(&wire).unwrap();
+            to.accept_entry(store, entry, now).unwrap();
+        }
+    }
+
     #[test]
     fn create_append_render_and_survive_reopen() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2184,6 +2562,173 @@ mod tests {
         // The axes are independent: a dial capability granted nobody any reading.
         assert!(!a.may_read(&a_fp, &b_fp), "no message consent was implied");
         assert!(b.timeline().is_empty());
+    }
+
+    /// M18.1 (ADR-006 §History, ADR-007 §Revocation) — revocation *is* rotation with
+    /// one member left out, and it must not cost the members who keep consent
+    /// anything, even the ones who were away while it happened.
+    ///
+    /// Alice consents to Bob and Carol, then revokes Bob. What must hold:
+    /// - Bob cannot read a single message Alice sends afterwards, and his own log
+    ///   tells him the consent is gone;
+    /// - Carol, who received nothing at the moment of the rotation, is re-keyed at
+    ///   the new generation's **origin** and reads every message sent while she was
+    ///   away — a rotation is invisible to whoever keeps consent;
+    /// - the re-key owed is derived from the log, so Bob is never in it;
+    /// - the retained origin survives a reopen, or the re-key would be impossible
+    ///   after a restart.
+    #[test]
+    fn revoking_one_member_rotates_the_key_and_leaves_the_others_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = profile(&tmp, "alice");
+        let bob = profile(&tmp, "bob");
+        let carol = profile(&tmp, "carol");
+        let t = 1_700_000_000;
+
+        let mut a = ChannelState::create_with_profile(
+            &alice,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        let cid = a.channel_id();
+        let a_fp = RootSigner::public_key(alice.signer().unwrap()).fingerprint();
+        let b_fp = RootSigner::public_key(bob.signer().unwrap()).fingerprint();
+        let c_fp = RootSigner::public_key(carol.signer().unwrap()).fingerprint();
+
+        let mut b = ChannelState::join_channel_with_profile(
+            &bob,
+            a.genesis(),
+            &cid,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        let mut c = ChannelState::join_channel_with_profile(
+            &carol,
+            a.genesis(),
+            &cid,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        a.admit_author(
+            alice.store(),
+            &RootSigner::public_key(bob.signer().unwrap()),
+            t,
+        )
+        .unwrap();
+        a.admit_author(
+            alice.store(),
+            &RootSigner::public_key(carol.signer().unwrap()),
+            t,
+        )
+        .unwrap();
+
+        // Alice consents to both, delivering a real SKDM each (M14.5b's job in
+        // production; here the two halves are performed directly).
+        for (target, who) in [(b_fp, &mut b), (c_fp, &mut c)] {
+            let skdm = a.skdm_for_consent(&alice).unwrap();
+            a.issue_consent(&alice, target, &skdm, t).unwrap();
+            who.accept_skdm(
+                match target {
+                    x if x == b_fp => bob.store(),
+                    _ => carol.store(),
+                },
+                &skdm,
+                t,
+            )
+            .unwrap();
+        }
+        assert_eq!(a.sender_generation(), 0);
+        assert!(
+            a.owed_rekeys().is_empty(),
+            "consent delivered the live generation to both"
+        );
+
+        // One message under generation 0, which both may read.
+        a.append_text(&alice, "before", t).unwrap();
+        ship(&a, &mut b, bob.store(), t);
+        ship(&a, &mut c, carol.store(), t);
+        // Both have Alice's grants on their own logs by now (shipped with the entries).
+        assert!(b.may_read(&a_fp, &b_fp));
+        assert!(c.may_read(&a_fp, &c_fp));
+        assert_eq!(b.timeline().len(), 1, "Bob read the pre-revocation message");
+        assert_eq!(c.timeline().len(), 1);
+
+        // Alice revokes Bob. The rotation is immediate and unconditional: nobody has
+        // been re-keyed yet, and it takes effect anyway.
+        let revocation = a.revoke_consent(&alice, b_fp, t + 1).unwrap();
+        assert_eq!(a.sender_generation(), 1, "a new generation exists");
+        assert_eq!(revocation.body.new_chain_id, 1);
+        assert!(!a.may_read(&a_fp, &b_fp), "Alice's own view drops Bob");
+        assert!(a.may_read(&a_fp, &c_fp), "Carol is untouched");
+        assert_eq!(
+            a.owed_rekeys(),
+            BTreeSet::from([c_fp]),
+            "exactly the members who kept consent are owed a re-key"
+        );
+        assert!(
+            a.revoke_consent(&alice, b_fp, t + 1).is_err(),
+            "there is no second consent to revoke"
+        );
+
+        // Two messages under generation 1 while Carol is away.
+        a.append_text(&alice, "after one", t + 2).unwrap();
+        a.append_text(&alice, "after two", t + 3).unwrap();
+        ship(&a, &mut b, bob.store(), t + 4);
+        ship(&a, &mut c, carol.store(), t + 4);
+
+        // Bob holds the bytes and can read none of them — and his own log says why.
+        assert_eq!(b.entry_count(), a.entry_count());
+        assert_eq!(
+            b.timeline().len(),
+            1,
+            "the revoked member reads nothing after the rotation"
+        );
+        assert!(!b.may_read(&a_fp, &b_fp), "the revocation is on Bob's log");
+        // Carol cannot read them either *yet*: she holds no key for generation 1.
+        assert_eq!(c.timeline().len(), 1);
+
+        // The re-key: released at the new generation's origin, so Carol reads both
+        // messages sent while she was away, not just what comes next.
+        let rekey = a.rekey_skdm(&alice).unwrap();
+        assert_eq!(rekey.body.chain_id, 1);
+        assert_eq!(rekey.body.iteration, 0, "released at the origin");
+        let rendered = c.accept_skdm(carol.store(), &rekey, t + 5).unwrap();
+        assert_eq!(rendered, 2, "both away-messages rendered on arrival");
+        assert_eq!(c.timeline().len(), 3);
+        a.note_delivered(alice.store(), c_fp, 1).unwrap();
+        assert!(a.owed_rekeys().is_empty());
+
+        // Bob is offered nothing, and the same SKDM in his hands is refused by his
+        // own consent view: even a leaked re-key does not restore him.
+        assert!(!a.owed_rekeys().contains(&b_fp));
+        b.accept_skdm(bob.store(), &rekey, t + 5).unwrap();
+        assert_eq!(
+            b.timeline().len(),
+            1,
+            "holding the key is not consent: the log gate still refuses"
+        );
+
+        // The retained origin survives a reopen — without it, a restart between the
+        // rotation and the re-key would strand every remaining consenter.
+        drop(a);
+        let a = ChannelState::open(&alice, &cid, b"channel-pp", t + 6).unwrap();
+        assert_eq!(a.sender_generation(), 1);
+        let after_reopen = a.rekey_skdm(&alice).unwrap();
+        assert_eq!(after_reopen.body.iteration, 0);
+        assert_eq!(after_reopen.body.chain_id, 1);
+        assert!(
+            a.owed_rekeys().is_empty(),
+            "the delivery ledger survived too"
+        );
     }
 
     #[test]
