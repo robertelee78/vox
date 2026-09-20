@@ -634,6 +634,18 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     actor is single-threaded over commands, so a join's dial ladder (up to ~25 s) holds it; the sync bound
     keeps that from deadlocking anyone, but the join should run off the actor.
 
+- **Relay-first, upgrade later (M15.1b, 2026-09-20).** The cold start through an anchor took ~25 s
+  because the ladder waited for a direct dial and then a punch to time out before trying the relay.
+  Now `reach` races the rungs and the actor's one dial site takes whatever lands first — a round trip
+  through the anchor — then, if that path was relayed, spawns `NodeNet::upgrade` and adopts the better
+  connection it lands (`NetEvent::BetterPath`, which the answered-punch path also uses). The manager's
+  one-per-peer rule became a preference with retirement, so the swap happens underneath in-flight
+  streams on both sides; stream loops are keyed by connection rather than by peer, because an upgrade
+  gives a peer a second connection that needs its own. The tick closes retired connections whose grace
+  is up. ADR-012's Implementation notes carry the mechanism; the M15.1 gate now bounds the join at 12 s
+  and runs in ~8 s. The spike behind it (`node::net::upgrade_tests`) showed the old rule closing every
+  upgrade on both sides — a defect no upgrade could have survived.
+
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
 ADR-013, ADR-015.

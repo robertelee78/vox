@@ -359,17 +359,38 @@ pub async fn connect_through(
         _ => return Err(Error::Unreachable("circuit: relay did not open")),
     }
     let port = endpoint.attach_circuit(&peer);
-    let driver = tokio::spawn(terminate(port, send, recv));
+    // The driver lives exactly as long as the attempt does, unless the attempt
+    // succeeds: a failed dial — or an attempt abandoned because another rung won the
+    // race (M15.1b) — aborts it on drop, which drops the port, which detaches the
+    // circuit and closes the stream, which tells the relay and the far side to let go.
+    let driver = DriverGuard::new(tokio::spawn(terminate(port, send, recv)));
     let target = circuit_addr(&peer);
-    match crate::nat::reachability::connect_direct(Arc::clone(endpoint), &[target], peer, now_secs)
-        .await
-    {
-        Ok(conn) => Ok(conn),
-        Err(e) => {
-            // No connection, no circuit: aborting the driver drops the port, which
-            // detaches the circuit and closes the stream.
-            driver.abort();
-            Err(e)
+    let conn =
+        crate::nat::reachability::connect_direct(Arc::clone(endpoint), &[target], peer, now_secs)
+            .await?;
+    driver.keep();
+    Ok(conn)
+}
+
+/// A circuit driver that is aborted when this is dropped, unless [`DriverGuard::keep`]
+/// let it live on.
+struct DriverGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl DriverGuard {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// The circuit is in use: the driver runs until the stream ends.
+    fn keep(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
         }
     }
 }

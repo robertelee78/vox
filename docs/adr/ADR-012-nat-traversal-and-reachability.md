@@ -263,10 +263,30 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     is bounded where carrying signaling was not: `MAX_RELAYED_CIRCUITS = 64` in total,
     `MAX_CIRCUITS_PER_ASKER = 4`, enforced by a ledger whose places return on drop. A relay is a last
     resort, not a service.
-  - **The ladder is complete.** `NodeNet::reach` is now all four rungs: live connection → direct dial →
-    a punch through each connected helper → a circuit through each. Every punch is tried before any
-    circuit, because a punch yields a direct path. A failed punch costs one `PER_ATTEMPT_TIMEOUT` (10 s)
-    before the relay is tried; that is the ladder's honest latency for a peer behind a symmetric NAT.
+  - **The ladder is complete.** `NodeNet::reach` covers all four rungs. *As first composed* it ran them
+    in order — direct, then a punch through each helper, then a circuit — so a peer behind a symmetric
+    NAT cost a 10 s dial timeout and a 10 s punch timeout before the relay was tried. That ordering was
+    replaced the same day; see the next note.
+- **Relay-first, upgrade later (2026-09-20, ADR-016 M15.1b).** The sequential ladder made the anchor-based
+  cold start ~25 s. The rungs are now **raced**: `reach` starts the direct dial and a circuit through every
+  connected helper at once and returns whichever lands first — through the user's own anchor, about one
+  round trip. If what landed was relayed, the node runs `upgrade` behind it: a direct dial and a punch
+  through every helper, raced, each with `PUNCH_ATTEMPT_TIMEOUT` (6 s: QUIC retransmits its Initial at
+  about 1, 2 and 4 s, so a punch that has not landed by then will not). What makes the swap safe is the
+  connection manager's rule, which changed from first-come to a **preference**: `PathClass::Direct` beats
+  `PathClass::Relayed` (read off the remote address — a circuit address means relayed), a better newcomer
+  replaces the held connection, and the displaced one is **retired**, not closed: kept open for
+  `RETIRE_GRACE_SECS` (60 s) so whatever is in flight on it — a join exchange, a sync session with its
+  20 s frame bound — finishes, then closed by the node's tick. A worse newcomer is closed as before, which
+  is also what settles a simultaneous dial. Both ends apply the same rule, so the upgrade lands with no
+  protocol: the side that punched files the direct connection as an improvement, and the side that
+  accepted it does too. A circuit attempt abandoned because another rung won tears itself down on drop
+  (its driver is aborted, the port detaches, the stream closes, and the relay and the far side let go).
+  Proved on the virtual NAT network: behind cone NATs `reach` returns a relayed connection in under 5 s
+  and `upgrade` lands a punched one whose remote address is the peer's mapped address, primary on both
+  sides with the relayed one retiring on each; behind symmetric NATs `reach` is as fast and `upgrade`
+  comes back empty; a private-only address record no longer costs the dial timeout. ADR-016's M15.1 gate
+  went from 22.9 s to 7.9 s, the join itself now bounded at 12 s.
   - **Proved on the virtual NAT network.** With both peers behind *symmetric* NATs — every earlier rung
     defeated, which the same file demonstrates — `reach` returns a connection pinned to and authenticated
     by the far peer, its remote address is the circuit's, the relay reports carrying exactly one
