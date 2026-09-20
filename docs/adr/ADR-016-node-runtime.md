@@ -672,8 +672,42 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   to its anchors: when it answers a join, and whenever learning members from a peer's board gains its own
   board a record — bundles first. The M15.1 gate now runs against a headless anchor and ends with the
   anchor knowing both members: the creator by her genesis, the joiner by her vouch.
-  **Not yet:** the anchor stores no log, so two members never online at once do not converge through it
-  (M15.2b); a headless node that receives `Lock` stops its network with nothing to unlock it.
+  **Not yet (closed by M15.2b below):** ~~the anchor stores no log, so two members never online at once do
+  not converge through it~~; a headless node that receives `Lock` stops its network with nothing to
+  unlock it.
+- **The anchor keeps the log, and the M15 convergence gate is met (M15.2b, 2026-09-20).** `node::anchor`
+  gives a node a **ciphertext log with no secrets** for every channel whose genesis lands on its board:
+  the genesis, the authors the board can vouch for, and the entries — sender-key ciphertext for content,
+  signed frames for governance. That is all the ADR-008 engine needs on either side of a session, because
+  the engine is secret-free: it verifies authorship and ordering, never plaintext. What is structurally
+  absent is everything else — no SEK, no sender chain, no receiver chains, no timeline; there is nothing
+  to render and no way to. The pages are sealed anyway, under a key derived per channel from the node's
+  own identity (`anchor_sek`, HKDF over ADR-010's `factor_id` with `vox/anchor-log-sek/v1`), in segment
+  kinds of their own (`AnchorLog`, `AnchorMeta`), so a stolen disk yields neither membership nor traffic
+  shape without the identity file, and a node that later *joins* a room it anchored never mistakes these
+  pages for its own.
+  `NodeConfig::anchor_logs(true)` is the role — `vox node` sets it, a client does not, so a stranger's
+  genesis on a client's board costs it nothing. The actor adopts an anchored channel when its board has
+  the genesis (on the tick, or on the spot when a member opens a sync stream for it), admits the authors
+  the board vouches for so their entries verify, reopens what the store holds after a restart and
+  republishes each genesis, and reconciles each anchored channel with that channel's known members.
+  Members reciprocate: a member now syncs with its **anchors** as well as its co-authors. Anchors are
+  redialled from the tick (`ANCHOR_REDIAL_SECS`), so a restarted anchor is picked back up.
+  **Gate** (`node_m15_anchor_gate.rs`, release): Alice and Bob meet once through the anchor, consent, and
+  Bob leaves; Alice speaks into an empty room and the anchor takes the whole log; Alice leaves; Bob comes
+  back to a room with nobody in it, configured with no anchor of his own — the one the link named was
+  persisted with the room (M15.1) — and reads what Alice said. The anchor ends having rendered nothing,
+  because it cannot.
+  **Two things the gate itself taught.** Its first wait was `held >= 1`, which a *governance* entry
+  already satisfied, so it shut Alice down before her message was pushed and then blamed the convergence:
+  a gate must wait for the peer to hold **everything it is about to be asked to serve**, not merely
+  something. And a session whose transport dies is reported as `sync failed: protocol version`, because
+  ADR-008's engine maps every send failure onto `ProtocolVersionUnsupported` — harmless here (a peer went
+  away mid-session and the next pass succeeded) but a misleading diagnostic, recorded as a known gap
+  rather than papered over.
+  **Still not yet:** the anchor tracks epoch 0 only (an epoch change is not yet carried on the board);
+  a headless node that receives `Lock` stops its network with nothing to unlock it; and the transport-failure
+  code above deserves its own `WireError`, which is an ADR-005/008 registry change.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

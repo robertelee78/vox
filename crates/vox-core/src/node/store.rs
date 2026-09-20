@@ -54,6 +54,8 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::Index => 3,
         SegmentKind::KeyMaterial => 4,
         SegmentKind::PrekeyRing => 5,
+        SegmentKind::AnchorLog => 6,
+        SegmentKind::AnchorMeta => 7,
     }
 }
 
@@ -227,6 +229,22 @@ impl Store {
         for item in t.iter().map_err(storage("iterate sek_wraps"))? {
             let (k, _) = item.map_err(storage("iterate sek_wraps"))?;
             out.push(k.value());
+        }
+        Ok(out)
+    }
+
+    /// Every channel this store holds an **anchor** copy of (an `AnchorMeta` segment),
+    /// in unspecified order — how a restarted anchor finds the rooms it was serving.
+    pub fn anchored_channels(&self) -> Result<Vec<Digest32>> {
+        let txn = self.db.begin_read().map_err(storage("begin read"))?;
+        let t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
+        let mut out: Vec<Digest32> = Vec::new();
+        for item in t.iter().map_err(storage("iterate segments"))? {
+            let (k, _) = item.map_err(storage("iterate segments"))?;
+            let (channel, kind, _) = k.value();
+            if kind == kind_code(SegmentKind::AnchorMeta) && !out.contains(&channel) {
+                out.push(channel);
+            }
         }
         Ok(out)
     }

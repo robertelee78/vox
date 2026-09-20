@@ -250,7 +250,8 @@ pub fn run_node(
     let cfg = vox_core::node::actor::NodeConfig::new()
         .bind(vox_core::node::actor::Bind::Addr(listen))
         .anchors(anchors)
-        .headless(signer);
+        .headless(signer)
+        .anchor_logs(true);
     let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
     let fp = vox_core::node::link::b32_encode(&fingerprint);
     println!("vox node: identity {fp}");

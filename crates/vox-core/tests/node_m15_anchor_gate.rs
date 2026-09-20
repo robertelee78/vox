@@ -307,3 +307,195 @@ fn m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor() {
         }
     });
 }
+
+/// ADR-016's M15 gate, as written: *two nodes that are never simultaneously online
+/// converge through an anchor.* The anchor keeps a ciphertext copy of the room's
+/// log (M15.2b); a member who was away gets what was said while it was, from the
+/// anchor, with the other member gone — and can read it, because the sender key it
+/// was given before survives its own restart.
+#[test]
+#[ignore = "production Argon2id, three node lifetimes and a relayed join: ~20 s in release; CI runs it there"]
+fn m15_members_never_online_together_converge_through_the_anchor() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    rt.block_on(async {
+        let net = VirtualNet::new();
+        let c_addr = addr("198.51.100.1:443");
+        let c_sock = net.public(c_addr);
+        let a_sock = net.behind_nat(addr("10.0.1.2:5000"), NatKind::Symmetric, ip("203.0.113.1"));
+        let b_sock = net.behind_nat(addr("10.0.2.2:5000"), NatKind::Symmetric, ip("203.0.113.2"));
+
+        // The anchor: headless, keeping logs.
+        let carol_signer =
+            vox_core::node::headless::load_or_create_identity(&paths(&tmp, "anchor")).unwrap();
+        let carol_fp = carol_signer.fingerprint();
+        let carol = Node::spawn_config(
+            paths(&tmp, "anchor"),
+            NodeConfig::new()
+                .bind(Bind::Socket(c_sock))
+                .headless(carol_signer)
+                .anchor_logs(true),
+        )
+        .unwrap();
+        let mut anchors = BootstrapSet::new();
+        anchors
+            .add(
+                BootstrapNode::new(
+                    carol_fp,
+                    EndpointList::new(vec![Multiaddr::from(c_addr)]).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // ---- both online once: create, join, consent ----
+        let alice = node(&tmp, "alice", Arc::clone(&a_sock), anchors.clone()).await;
+        let alice_fp = alice.view().identity.unwrap().fingerprint;
+        assert!(alice
+            .apply(NodeCommand::CreateChannel {
+                local_name: "team".into(),
+                passphrase: secret("channel passphrase"),
+            })
+            .await
+            .is_done());
+        let cid = alice.view().channels[0].channel_id;
+        assert!(alice
+            .apply(NodeCommand::Invite { channel_id: cid })
+            .await
+            .is_done());
+        let url = wait_for(&alice, |e| match e {
+            NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
+            _ => None,
+        })
+        .await;
+        let bob = node(&tmp, "bob", Arc::clone(&b_sock), BootstrapSet::new()).await;
+        let bob_fp = bob.view().identity.unwrap().fingerprint;
+        assert!(bob
+            .apply(NodeCommand::JoinChannel {
+                link: url,
+                local_name: "team".into(),
+                passphrase: secret("channel passphrase"),
+            })
+            .await
+            .is_done());
+        let _ = wait_for(&bob, |e| match e {
+            NodeEvent::Joined { channel_id, .. } if channel_id == cid => Some(()),
+            _ => None,
+        })
+        .await;
+        let _ = wait_for(&alice, |e| match e {
+            NodeEvent::SenderKeyReceived {
+                channel_id, peer, ..
+            } if channel_id == cid && peer == bob_fp => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(alice
+            .apply(NodeCommand::Consent {
+                channel_id: cid,
+                target: bob_fp,
+            })
+            .await
+            .is_done());
+        let _ = wait_for(&bob, |e| match e {
+            NodeEvent::SenderKeyReceived {
+                channel_id, peer, ..
+            } if channel_id == cid && peer == alice_fp => Some(()),
+            _ => None,
+        })
+        .await;
+
+        // ---- Bob leaves ----
+        assert!(bob.apply(NodeCommand::Shutdown).await.is_done());
+
+        // ---- Alice speaks into an empty room; the anchor takes it ----
+        assert!(alice
+            .apply(NodeCommand::SendText {
+                channel_id: cid,
+                text: "said while you were away".into(),
+            })
+            .await
+            .is_done());
+        // Wait for the anchor to hold **everything Alice has** — not merely something.
+        // Her log already had governance entries, so "at least one" would pass before
+        // the content entry was ever pushed, and the anchor would be asked to serve
+        // what it had never been given.
+        let alice_entries = |h: &NodeHandle| -> u64 {
+            h.view()
+                .channels
+                .iter()
+                .find(|c| c.channel_id == cid)
+                .map_or(0, |c| c.entries)
+        };
+        let anchor_holds = |h: &NodeHandle| -> u64 {
+            h.view()
+                .anchoring
+                .iter()
+                .find(|a| a.channel_id == cid)
+                .and_then(|a| a.entries)
+                .unwrap_or(0)
+        };
+        let wanted = alice_entries(&alice);
+        assert!(wanted >= 3, "genesis, consent and the message: {wanted}");
+        tokio::time::timeout(TIMEOUT, async {
+            while anchor_holds(&carol) < wanted {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the anchor holds the whole log Alice has");
+        assert!(
+            carol.view().open_channels.is_empty(),
+            "and reads none of it"
+        );
+
+        // ---- Alice leaves; Bob returns to a room with nobody in it ----
+        assert!(alice.apply(NodeCommand::Shutdown).await.is_done());
+        // Bob's earlier instance shares this process: its last session task lets go
+        // of the store a moment after its connections close, and the store's lock is
+        // exactly what keeps two instances from ever opening it at once.
+        let bob = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let socket: Arc<dyn quinn::AsyncUdpSocket> =
+                    Arc::clone(&b_sock) as Arc<dyn quinn::AsyncUdpSocket>;
+                let mut cfg = NodeConfig::new().bind(Bind::Socket(socket));
+                cfg.pow_params = Some(PowParams { n: 48, k: 5 });
+                match Node::spawn_config(paths(&tmp, "bob"), cfg) {
+                    Ok(h) => return h,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                }
+            }
+        })
+        .await
+        .expect("Bob's second instance opened its store");
+        assert!(bob
+            .apply(NodeCommand::Unlock {
+                passphrase: secret("identity passphrase")
+            })
+            .await
+            .is_done());
+        // Bob configured no anchor: the one the link named was persisted with the room.
+        assert!(bob
+            .apply(NodeCommand::OpenChannel {
+                channel_id: cid,
+                passphrase: secret("channel passphrase"),
+            })
+            .await
+            .is_done());
+        tokio::time::timeout(TIMEOUT, async {
+            while !sees(&bob, cid, "said while you were away") {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("Bob converged through the anchor and read what Alice said");
+
+        for h in [&bob, &carol] {
+            assert!(h.apply(NodeCommand::Shutdown).await.is_done());
+        }
+    });
+}

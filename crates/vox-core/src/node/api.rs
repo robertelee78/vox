@@ -107,6 +107,9 @@ pub struct AnchoredChannel {
     pub members: usize,
     /// Joiners with a live pre-join announcement.
     pub pending: usize,
+    /// Entries in the ciphertext copy of the log this node keeps for the channel
+    /// (`None` when it keeps none — a client's board, or an anchor not yet caught up).
+    pub entries: Option<u64>,
 }
 
 /// A command from a client to the node.

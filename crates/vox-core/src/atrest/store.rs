@@ -73,6 +73,15 @@ pub enum SegmentKind {
     /// sealed under a key derived from the identity factor alone
     /// ([`crate::node::prekeys`], ADR-016 M14.3).
     PrekeyRing,
+    /// A page of the **anchor's** copy of a channel's log — ciphertext content and
+    /// signed governance, held for a channel the node anchors but is not a member
+    /// of, sealed under a key derived from the node's own identity
+    /// ([`crate::node::anchor`], ADR-016 M15.2b). Distinct from [`SegmentKind::LogDb`]
+    /// so a node that later *joins* a channel it anchored never finds the wrong key's
+    /// pages under the member layout.
+    AnchorLog,
+    /// The anchor's per-channel metadata: the genesis and the authors it knows.
+    AnchorMeta,
 }
 
 impl SegmentKind {
@@ -84,6 +93,8 @@ impl SegmentKind {
             SegmentKind::Index => b"vox/seg/index/v1",
             SegmentKind::KeyMaterial => b"vox/seg/key-material/v1",
             SegmentKind::PrekeyRing => b"vox/seg/prekey-ring/v1",
+            SegmentKind::AnchorLog => b"vox/seg/anchor-log/v1",
+            SegmentKind::AnchorMeta => b"vox/seg/anchor-meta/v1",
         }
     }
 }

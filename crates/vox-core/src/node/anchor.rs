@@ -1,0 +1,439 @@
+//! The anchor's copy of a channel's log (ADR-016 M15.2b): a **ciphertext log with no
+//! secrets**, so two members who are never online at the same time still converge.
+//!
+//! A node that anchors a room it is not a member of holds, for that room, exactly
+//! what any peer can verify without a key: the genesis, the members the board knows
+//! (the creator, and everyone a member vouched for — `node::network`), and the log's
+//! entries — sender-key ciphertext for content, signed frames for governance. That is
+//! everything the ADR-008 sync engine needs, on either side of a session, because
+//! the engine is secret-free: it verifies authorship and ordering, never plaintext.
+//!
+//! What is *not* here, structurally: no SEK, no sender chain, no receiver chains, no
+//! passphrase, no timeline. There is nothing to render and no way to. The at-rest
+//! pages are sealed all the same — under a key derived from the anchor's own
+//! identity, per channel — so a stolen disk yields neither membership nor traffic
+//! shape without the identity file; the segment kinds are the anchor's own, so a
+//! node that later *joins* a room it anchored never mistakes these pages for its own.
+
+use std::collections::BTreeMap;
+
+use hkdf::Hkdf;
+use sha2::Sha256;
+use zeroize::Zeroizing;
+
+use crate::atrest::idfactor::{IdentityFactor, SignatureIdentityFactor};
+use crate::atrest::sek::{Sek, SEK_LEN};
+use crate::atrest::store::{open_segment, seal_segment, SegmentKind};
+use crate::cbor::{Decoder, Encoder};
+use crate::error::{Error, Result};
+use crate::governance::genesis::Genesis;
+use crate::hash::Digest32;
+use crate::identity::composite::{CompositePublicKey, RootSigner};
+use crate::log::dag::{AdmissionPolicy, Dag};
+use crate::log::entry::{Entry, EntryKind};
+use crate::log::sync::{frontier_session_peer, Transport};
+use crate::node::channel::{
+    authors_bytes, classify_payload, parse_authors, sync_failure, ChannelAuthors, SyncOutcome,
+};
+use crate::node::store::Store;
+
+/// HKDF `info` separating an anchor's per-channel sealing key from every other use
+/// of the identity factor.
+pub const ANCHOR_SEK_INFO: &[u8] = b"vox/anchor-log-sek/v1";
+
+/// The metadata segment's id within [`SegmentKind::AnchorMeta`].
+const SEG_META: u64 = 0;
+
+/// Metadata encoding version.
+const META_VERSION: u64 = 1;
+
+/// Derive the sealing key for the anchor's copy of `channel_id` from the anchor's
+/// identity: the identity factor for that channel (ADR-010's `factor_id`), expanded
+/// under [`ANCHOR_SEK_INFO`]. Deterministic, so a restart reopens its own pages.
+pub fn anchor_sek(signer: &dyn RootSigner, channel_id: &Digest32) -> Result<Sek> {
+    let factor = SignatureIdentityFactor::new(signer);
+    let factor_id = factor.factor_id(channel_id)?;
+    let hk = Hkdf::<Sha256>::new(None, factor_id.as_ref());
+    let mut key = Zeroizing::new([0u8; SEK_LEN]);
+    hk.expand(ANCHOR_SEK_INFO, key.as_mut())
+        .map_err(|_| Error::Argon2Failed)?;
+    Ok(Sek::from_bytes(key))
+}
+
+/// A channel as an anchor holds it.
+pub struct AnchorState {
+    channel_id: Digest32,
+    genesis: Genesis,
+    epoch: u64,
+    authors: BTreeMap<Digest32, CompositePublicKey>,
+    admission: AdmissionPolicy,
+    dag: Dag,
+    next_log_id: u64,
+    sek: Sek,
+    poisoned: bool,
+}
+
+impl std::fmt::Debug for AnchorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnchorState")
+            .field("channel_id", &crate::hash::Hex(&self.channel_id))
+            .field("authors", &self.authors.len())
+            .field("entries", &self.dag.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnchorState {
+    /// Start anchoring `genesis`'s channel: file the genesis and the creator, sealed
+    /// under `sek`. Fails if the channel is already anchored in `store`.
+    pub fn create(store: &Store, sek: Sek, genesis: &Genesis, now_secs: u64) -> Result<Self> {
+        genesis.verify()?;
+        let channel_id = genesis.channel_id();
+        if store
+            .get_segment(&channel_id, SegmentKind::AnchorMeta, SEG_META)?
+            .is_some()
+        {
+            return Err(Error::Profile("channel is already anchored"));
+        }
+        let mut authors = BTreeMap::new();
+        authors.insert(
+            genesis.body.creator_pubkey.fingerprint(),
+            genesis.body.creator_pubkey.clone(),
+        );
+        let mut state = Self {
+            channel_id,
+            genesis: genesis.clone(),
+            epoch: 0,
+            admission: AdmissionPolicy::new(),
+            authors,
+            dag: Dag::new(),
+            next_log_id: 1,
+            sek,
+            poisoned: false,
+        };
+        state.rebuild_admission();
+        state.persist_meta(store)?;
+        let _ = now_secs;
+        Ok(state)
+    }
+
+    /// Reopen an anchored channel from `store`: the metadata, then every stored
+    /// entry re-passes the acceptance predicate under the authors on file.
+    pub fn open(store: &Store, sek: Sek, channel_id: &Digest32, now_secs: u64) -> Result<Self> {
+        let meta_seg = store
+            .get_segment(channel_id, SegmentKind::AnchorMeta, SEG_META)?
+            .ok_or(Error::Profile("channel is not anchored here"))?;
+        let meta = open_segment(&sek, SegmentKind::AnchorMeta, SEG_META, &meta_seg)?;
+        let (genesis, authors) = parse_meta(&meta)?;
+        genesis.verify()?;
+        if genesis.channel_id() != *channel_id {
+            return Err(Error::MalformedAtRest("anchor meta genesis mismatch"));
+        }
+        let mut state = Self {
+            channel_id: *channel_id,
+            genesis,
+            epoch: 0,
+            admission: AdmissionPolicy::new(),
+            authors,
+            dag: Dag::new(),
+            next_log_id: 1,
+            sek,
+            poisoned: false,
+        };
+        state.rebuild_admission();
+        for (id, seg) in store.segments(channel_id, SegmentKind::AnchorLog)? {
+            let wire = open_segment(&state.sek, SegmentKind::AnchorLog, id, &seg)?;
+            let entry = Entry::from_wire(&wire)?;
+            let key = state
+                .authors
+                .get(&entry.skeleton.author_id)
+                .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?
+                .clone();
+            let payload = entry
+                .payload
+                .as_deref()
+                .ok_or(Error::MalformedAtRest("stored entry payload pruned"))?;
+            let kind = classify_payload(payload)?;
+            state
+                .dag
+                .accept(entry, kind, &key, &state.admission, now_secs)
+                .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
+            state.next_log_id = id.saturating_add(1);
+        }
+        Ok(state)
+    }
+
+    /// The channelID.
+    #[must_use]
+    pub fn channel_id(&self) -> Digest32 {
+        self.channel_id
+    }
+
+    /// The genesis.
+    #[must_use]
+    pub fn genesis(&self) -> &Genesis {
+        &self.genesis
+    }
+
+    /// The epoch this anchor tracks (0 until epoch changes are carried by the board).
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// How many entries the anchor holds.
+    #[must_use]
+    pub fn entries(&self) -> usize {
+        self.dag.len()
+    }
+
+    /// The authors whose entries this anchor accepts.
+    #[must_use]
+    pub fn authors(&self) -> Vec<Digest32> {
+        self.authors.keys().copied().collect()
+    }
+
+    /// The known authors' keys.
+    #[must_use]
+    pub fn author_keys(&self) -> Vec<CompositePublicKey> {
+        self.authors.values().cloned().collect()
+    }
+
+    /// Whether `fingerprint` is a known author.
+    #[must_use]
+    pub fn is_author(&self, fingerprint: &Digest32) -> bool {
+        self.authors.contains_key(fingerprint)
+    }
+
+    /// Admit authors the board has come to know (the creator is always one). Returns
+    /// how many were new; a key that differs from one on file for the same
+    /// fingerprint is refused, never replaced.
+    pub fn admit_authors(
+        &mut self,
+        store: &Store,
+        keys: impl IntoIterator<Item = CompositePublicKey>,
+    ) -> Result<usize> {
+        let mut added = 0;
+        for key in keys {
+            let fp = key.fingerprint();
+            match self.authors.get(&fp) {
+                Some(existing) if existing.to_bytes() == key.to_bytes() => {}
+                Some(_) => {
+                    return Err(Error::MalformedGovernance(
+                        "another key is already admitted for this fingerprint",
+                    ))
+                }
+                None => {
+                    self.authors.insert(fp, key);
+                    added += 1;
+                }
+            }
+        }
+        if added > 0 {
+            self.rebuild_admission();
+            self.persist_meta(store)?;
+        }
+        Ok(added)
+    }
+
+    /// Run one ADR-008 frontier session over `transport` — as responder or initiator,
+    /// the engine is symmetric — and durably file every entry that arrived. Nothing is
+    /// decrypted, because nothing can be.
+    pub fn sync_over<T: Transport>(
+        &mut self,
+        store: &Store,
+        transport: &mut T,
+        now_secs: u64,
+    ) -> Result<SyncOutcome> {
+        if self.poisoned {
+            return Err(Error::Profile(
+                "anchored channel is poisoned after a failed persist; reopen it",
+            ));
+        }
+        let before: BTreeMap<Digest32, u64> = self
+            .authors
+            .keys()
+            .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
+            .collect();
+        let resolver = ChannelAuthors::new(self.authors.clone());
+        let session = frontier_session_peer(
+            transport,
+            &mut self.dag,
+            &resolver,
+            &self.admission,
+            now_secs,
+        );
+        let mut arrived: Vec<Digest32> = Vec::new();
+        for (author, head) in &before {
+            let Some(feed) = self.dag.feed(author) else {
+                continue;
+            };
+            for seq in (head + 1)..=feed.max_seq() {
+                if let Some(entry) = feed.get(seq) {
+                    arrived.push(entry.entry_hash());
+                }
+            }
+        }
+        let mut out = SyncOutcome {
+            applied: session.unwrap_or(arrived.len()),
+            ..SyncOutcome::default()
+        };
+        for entry_hash in arrived {
+            let entry = self
+                .dag
+                .get_by_hash(&entry_hash)
+                .ok_or(Error::MalformedGovernance("synced entry vanished"))?;
+            let wire = entry.to_wire();
+            let is_governance = entry
+                .payload
+                .as_deref()
+                .map(classify_payload)
+                .transpose()?
+                .is_some_and(|k| k == EntryKind::Governance);
+            let id = self.next_log_id;
+            let seg = seal_segment(&self.sek, SegmentKind::AnchorLog, id, &wire)?;
+            if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::AnchorLog, id, &seg) {
+                self.poisoned = true;
+                return Err(e);
+            }
+            self.next_log_id = id.saturating_add(1);
+            if is_governance {
+                out.governance += 1;
+            }
+        }
+        match session {
+            Ok(_) => Ok(out),
+            Err(code) => Err(sync_failure(code)),
+        }
+    }
+
+    fn rebuild_admission(&mut self) {
+        let mut admission = AdmissionPolicy::new();
+        for author in self.authors.keys() {
+            admission.admit(self.channel_id, self.epoch, *author);
+        }
+        self.admission = admission;
+    }
+
+    fn persist_meta(&mut self, store: &Store) -> Result<()> {
+        let mut e = Encoder::new();
+        e.array(3)
+            .uint(META_VERSION)
+            .bytes(&self.genesis.to_wire())
+            .bytes(&authors_bytes(&self.authors));
+        let seg = seal_segment(&self.sek, SegmentKind::AnchorMeta, SEG_META, &e.finish())?;
+        if let Err(err) =
+            store.put_segment(&self.channel_id, SegmentKind::AnchorMeta, SEG_META, &seg)
+        {
+            self.poisoned = true;
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+fn parse_meta(bytes: &[u8]) -> Result<(Genesis, BTreeMap<Digest32, CompositePublicKey>)> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 3 {
+        return Err(Error::MalformedAtRest("anchor meta arity"));
+    }
+    if d.uint()? != META_VERSION {
+        return Err(Error::MalformedAtRest("anchor meta version"));
+    }
+    let genesis = Genesis::from_wire(d.bytes()?)?;
+    let authors = parse_authors(d.bytes()?)?;
+    d.finish()?;
+    Ok((genesis, authors))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, HistoryMode};
+    use crate::identity::composite::SoftwareRootSigner;
+
+    const T0: u64 = 1_700_000_000;
+
+    fn signer(a: u8, b: u8) -> SoftwareRootSigner {
+        SoftwareRootSigner::from_component_seeds(&[a; 32], &[b; 32]).unwrap()
+    }
+
+    fn genesis(creator: &SoftwareRootSigner) -> Genesis {
+        let policy = ChannelPolicy {
+            history_mode: HistoryMode::ForwardOnly,
+            deniability_mode: DeniabilityMode::Attributable,
+            ttl: 0,
+            min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
+        };
+        Genesis::create(creator, T0, policy).unwrap()
+    }
+
+    #[test]
+    fn the_sealing_key_is_per_channel_and_per_identity() {
+        let anchor = signer(1, 2);
+        let other = signer(3, 4);
+        let a = anchor_sek(&anchor, &[7u8; 32]).unwrap();
+        let again = anchor_sek(&anchor, &[7u8; 32]).unwrap();
+        assert_eq!(
+            a.key_bytes().unwrap(),
+            again.key_bytes().unwrap(),
+            "deterministic across restarts"
+        );
+        assert_ne!(
+            a.key_bytes().unwrap(),
+            anchor_sek(&anchor, &[8u8; 32])
+                .unwrap()
+                .key_bytes()
+                .unwrap(),
+            "per channel"
+        );
+        assert_ne!(
+            a.key_bytes().unwrap(),
+            anchor_sek(&other, &[7u8; 32]).unwrap().key_bytes().unwrap(),
+            "per identity"
+        );
+    }
+
+    #[test]
+    fn an_anchored_channel_is_created_reopened_and_knows_only_what_it_was_told() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("anchor.redb")).unwrap();
+        let anchor = signer(1, 2);
+        let creator = signer(5, 6);
+        let bob = signer(7, 8);
+        let g = genesis(&creator);
+        let cid = g.channel_id();
+        // `Sek` is deliberately not `Clone`; the anchor derives it afresh each time.
+        let sek = || anchor_sek(&anchor, &cid).unwrap();
+
+        let mut state = AnchorState::create(&store, sek(), &g, T0).unwrap();
+        assert_eq!(state.channel_id(), cid);
+        assert_eq!(state.entries(), 0);
+        assert!(
+            state.is_author(&creator.fingerprint()),
+            "the creator, from the genesis"
+        );
+        assert!(!state.is_author(&bob.fingerprint()));
+        assert!(
+            AnchorState::create(&store, sek(), &g, T0).is_err(),
+            "anchored once"
+        );
+        assert_eq!(store.anchored_channels().unwrap(), vec![cid]);
+
+        // Authors the board came to know are admitted and persisted.
+        assert_eq!(state.admit_authors(&store, [bob.public_key()]).unwrap(), 1);
+        assert_eq!(state.admit_authors(&store, [bob.public_key()]).unwrap(), 0);
+        // A different key for the same fingerprint would be a collision or a bug.
+        drop(state);
+        let reopened = AnchorState::open(&store, sek(), &cid, T0 + 1).unwrap();
+        assert!(
+            reopened.is_author(&bob.fingerprint()),
+            "authors survive a restart"
+        );
+        assert_eq!(reopened.genesis().channel_id(), cid);
+        // The wrong identity cannot open the pages: nothing yields to a stolen disk.
+        let wrong = anchor_sek(&signer(9, 9), &cid).unwrap();
+        assert!(AnchorState::open(&store, wrong, &cid, T0).is_err());
+        assert!(AnchorState::open(&store, sek(), &[0u8; 32], T0).is_err());
+    }
+}
