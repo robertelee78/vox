@@ -364,10 +364,14 @@ impl RendezvousService {
     /// the stream will carry. Pure with respect to the transport, so the policy
     /// is testable without QUIC.
     #[must_use]
-    pub fn handle(&self, request: &RendezvousRequest) -> Vec<RendezvousResponse> {
+    pub fn handle(
+        &self,
+        publisher: Option<&Digest32>,
+        request: &RendezvousRequest,
+    ) -> Vec<RendezvousResponse> {
         let now = (self.clock)();
         match request {
-            RendezvousRequest::Put { record } => vec![match self.put(record, now) {
+            RendezvousRequest::Put { record } => vec![match self.put(publisher, record, now) {
                 Ok(()) => RendezvousResponse::Accepted,
                 Err(e) => RendezvousResponse::Rejected(e),
             }],
@@ -414,30 +418,48 @@ impl RendezvousService {
         }
     }
 
-    /// The authenticated key for `author` in `(channel, epoch)`: what the oracle
-    /// knows, or — for a channel this node **anchors without being a member of** —
-    /// the creator's key from the genesis it holds (ADR-016 M15.1).
-    ///
-    /// The oracle is this node's own membership view, which is empty for a channel it
-    /// only anchors. The genesis is self-validating (its hash is the channelID) and
-    /// names its creator, so the creator's records can be admitted on the strength
-    /// of it alone; every other member's authority comes from governance entries the
-    /// anchor does not yet hold — recorded as the remaining gap in ADR-016.
-    fn resolve(
+    /// The authenticated key for `author` in `(channel, epoch)`, from what this node
+    /// knows: its own membership view (the oracle), the **creator** named by the
+    /// genesis it holds, or a **bundle record** it already holds for that author —
+    /// which carries the author's key, and was admitted only because a known member
+    /// published it (see `put`). This is how a node that *anchors* a channel it is not
+    /// a member of comes to know that channel's members (ADR-016 M15.2a).
+    fn known_key(
         &self,
+        store: &RendezvousStore,
         channel: &Digest32,
         epoch: u64,
         author: &Digest32,
-        creator: Option<&CompositePublicKey>,
+        now: u64,
     ) -> Option<CompositePublicKey> {
         if let Some(key) = self.oracle.member_key(channel, epoch, author) {
             return Some(key);
         }
-        creator.filter(|key| key.fingerprint() == *author).cloned()
+        if let Some(g) = store.genesis(channel) {
+            if g.body.creator_pubkey.fingerprint() == *author {
+                return Some(g.body.creator_pubkey.clone());
+            }
+        }
+        store
+            .bundle(channel, epoch, author, now)
+            .and_then(|b| CompositePublicKey::from_bytes(&b.prekey_bundle.root_pub).ok())
     }
 
     /// Admit one framed record by its struct tag.
-    fn put(&self, record: &[u8], now: u64) -> std::result::Result<(), RejectReason> {
+    /// `publisher` is the authenticated peer the record came in from (`None` for a
+    /// local publish). It matters for one case: a **bundle record from an author this
+    /// node does not know**, published by a peer it knows as a member of that channel,
+    /// is admitted with the key the record carries — the member is **vouching**, which
+    /// is exactly the trust members already extend to one another's boards (a member
+    /// learns new members from the boards of members who witnessed the join). The
+    /// record's own verification binds the carried key to the author; the vouch only
+    /// says "this author is one of us".
+    fn put(
+        &self,
+        publisher: Option<&Digest32>,
+        record: &[u8],
+        now: u64,
+    ) -> std::result::Result<(), RejectReason> {
         let tag = parse_frame(record)
             .map(|f| f.tag)
             .map_err(|e| RejectReason::for_error(&e))?;
@@ -445,26 +467,29 @@ impl RendezvousService {
             StructTag::RendezvousRecord => {
                 let rec =
                     RendezvousRecord::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
-                let (cid, epoch) = (rec.channel_id, rec.epoch);
+                let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
                 let mut store = lock(&self.store);
-                let creator = store.genesis(&cid).map(|g| g.body.creator_pubkey.clone());
-                store.accept_member(
-                    rec,
-                    |author| self.resolve(&cid, epoch, author, creator.as_ref()),
-                    now,
-                )
+                let key = self.known_key(&store, &cid, epoch, &author, now);
+                store.accept_member(rec, |_| key.clone(), now)
             }
             StructTag::MemberBundleRecord => {
                 let rec = MemberBundleRecord::from_wire(record)
                     .map_err(|e| RejectReason::for_error(&e))?;
-                let (cid, epoch) = (rec.channel_id, rec.epoch);
+                let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
                 let mut store = lock(&self.store);
-                let creator = store.genesis(&cid).map(|g| g.body.creator_pubkey.clone());
-                store.accept_bundle(
-                    rec,
-                    |author| self.resolve(&cid, epoch, author, creator.as_ref()),
-                    now,
-                )
+                let key = self
+                    .known_key(&store, &cid, epoch, &author, now)
+                    .or_else(|| {
+                        let vouched = publisher.is_some_and(|p| {
+                            *p != author && self.known_key(&store, &cid, epoch, p, now).is_some()
+                        });
+                        if vouched {
+                            CompositePublicKey::from_bytes(&rec.prekey_bundle.root_pub).ok()
+                        } else {
+                            None
+                        }
+                    });
+                store.accept_bundle(rec, |_| key.clone(), now)
             }
             StructTag::PreJoinRecord => {
                 let rec =
@@ -487,7 +512,12 @@ impl RendezvousService {
     /// (`Ok`) or sends something that is not a request (the stream is reset with
     /// the coded close and the error returned). Never holds the store lock across
     /// an `await`.
-    pub async fn serve_stream(&self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
+    pub async fn serve_stream(
+        &self,
+        publisher: Digest32,
+        mut send: SendStream,
+        mut recv: RecvStream,
+    ) -> Result<()> {
         loop {
             let frame = match read_frame(&mut recv, MAX_RENDEZVOUS_FRAME).await {
                 Ok(Some(f)) => f,
@@ -508,7 +538,7 @@ impl RendezvousService {
                     return Err(e);
                 }
             };
-            for response in self.handle(&request) {
+            for response in self.handle(Some(&publisher), &request) {
                 if let Err(e) = write_frame(&mut send, &response.to_frame()).await {
                     reset(&mut send, &mut recv, &e);
                     return Err(e);
@@ -767,6 +797,95 @@ mod tests {
         assert!(RendezvousResponse::from_frame(&put).is_err());
     }
 
+    /// An anchor that is not a member (an empty oracle) learns a channel's members
+    /// from what it holds: the creator by the genesis, and everyone else by a bundle
+    /// record a **known member** published — vouching (ADR-016 M15.2a). Nobody else
+    /// can introduce an author, and an address record cannot precede its bundle.
+    #[test]
+    fn an_anchor_learns_members_by_vouching_only() {
+        use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+        let creator = signer(11, 12);
+        let bob = signer(13, 14);
+        let stranger = signer(15, 16);
+        let policy = ChannelPolicy {
+            history_mode: HistoryMode::ForwardOnly,
+            deniability_mode: DeniabilityMode::Attributable,
+            ttl: 0,
+            min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
+        };
+        let genesis = Genesis::create(&creator, T0, policy).unwrap();
+        let cid = genesis.channel_id();
+        // No membership at all: this node only anchors.
+        let svc = service(cid, 0, &[]);
+        let put = |publisher: Option<&Digest32>, wire: Vec<u8>| {
+            svc.handle(publisher, &RendezvousRequest::Put { record: wire })
+        };
+        let (creator_fp, bob_fp, stranger_fp) = (
+            creator.fingerprint(),
+            bob.fingerprint(),
+            stranger.fingerprint(),
+        );
+
+        // The genesis anyone may file; the creator's records then verify against it.
+        assert_eq!(
+            put(None, genesis.to_wire()),
+            vec![RendezvousResponse::Accepted]
+        );
+        let creator_addr =
+            RendezvousRecord::build(&creator, &cid, 0, eps(1), 1, T0, MAX_TTL_SECS).unwrap();
+        assert_eq!(
+            put(Some(&creator_fp), creator_addr.to_wire()),
+            vec![RendezvousResponse::Accepted]
+        );
+
+        // Bob's own records, published by Bob: nobody knows him — refused. And an
+        // address record refused even from a member, because it carries no key.
+        let bob_bundle =
+            MemberBundleRecord::build(&bob, &cid, 0, bundle(&bob), 1, T0, 3600).unwrap();
+        let bob_addr = RendezvousRecord::build(&bob, &cid, 0, eps(2), 1, T0, MAX_TTL_SECS).unwrap();
+        assert_eq!(
+            put(Some(&bob_fp), bob_bundle.to_wire()),
+            vec![RendezvousResponse::Rejected(RejectReason::NotMember)]
+        );
+        assert_eq!(
+            put(Some(&creator_fp), bob_addr.to_wire()),
+            vec![RendezvousResponse::Rejected(RejectReason::NotMember)],
+            "no bundle, no key, no address record"
+        );
+        // A stranger cannot vouch.
+        assert_eq!(
+            put(Some(&stranger_fp), bob_bundle.to_wire()),
+            vec![RendezvousResponse::Rejected(RejectReason::NotMember)]
+        );
+        // The creator vouches: Bob's bundle, published by a known member, is in.
+        assert_eq!(
+            put(Some(&creator_fp), bob_bundle.to_wire()),
+            vec![RendezvousResponse::Accepted]
+        );
+        // From then on Bob is known by the bundle the board holds: his own address
+        // record verifies, and he can vouch for the next member himself.
+        assert_eq!(
+            put(Some(&bob_fp), bob_addr.to_wire()),
+            vec![RendezvousResponse::Accepted]
+        );
+        let stranger_bundle =
+            MemberBundleRecord::build(&stranger, &cid, 0, bundle(&stranger), 1, T0, 3600).unwrap();
+        assert_eq!(
+            put(Some(&bob_fp), stranger_bundle.to_wire()),
+            vec![RendezvousResponse::Accepted],
+            "a vouched member vouches in turn"
+        );
+        // A vouch never lets a record through its own verification: a bundle whose
+        // root is not its author is refused however trusted the publisher.
+        let mut forged = bob_bundle.to_wire();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        assert!(matches!(
+            put(Some(&creator_fp), forged)[0],
+            RendezvousResponse::Rejected(RejectReason::Malformed)
+        ));
+    }
+
     #[test]
     fn handle_gates_every_kind_through_the_store_policy() {
         let a = signer(1, 2);
@@ -774,7 +893,7 @@ mod tests {
         let stranger = signer(5, 6);
         let cid = [7u8; 32];
         let svc = service(cid, 1, &[&a, &b]);
-        let put = |wire: Vec<u8>| svc.handle(&RendezvousRequest::Put { record: wire });
+        let put = |wire: Vec<u8>| svc.handle(None, &RendezvousRequest::Put { record: wire });
 
         // Member address record from a member: accepted; replayed: policy.
         let ma = RendezvousRecord::build(&a, &cid, 1, eps(1), 1, T0, MAX_TTL_SECS).unwrap();
@@ -845,17 +964,23 @@ mod tests {
             "re-publishing the same genesis is a no-op"
         );
         // It is filed under its own hash, so it never answers another channel's GET.
-        let for_other = svc.handle(&RendezvousRequest::Get {
-            channel_id: cid,
-            epoch: 1,
-            kinds: RecordKinds::GENESIS,
-        });
+        let for_other = svc.handle(
+            None,
+            &RendezvousRequest::Get {
+                channel_id: cid,
+                epoch: 1,
+                kinds: RecordKinds::GENESIS,
+            },
+        );
         assert_eq!(for_other, vec![RendezvousResponse::End]);
-        let for_its_own = svc.handle(&RendezvousRequest::Get {
-            channel_id: g_cid,
-            epoch: 0,
-            kinds: RecordKinds::GENESIS,
-        });
+        let for_its_own = svc.handle(
+            None,
+            &RendezvousRequest::Get {
+                channel_id: g_cid,
+                epoch: 0,
+                kinds: RecordKinds::GENESIS,
+            },
+        );
         assert_eq!(
             for_its_own,
             vec![
@@ -866,11 +991,14 @@ mod tests {
 
         // GET by kinds.
         let get = |kinds| {
-            svc.handle(&RendezvousRequest::Get {
-                channel_id: cid,
-                epoch: 1,
-                kinds,
-            })
+            svc.handle(
+                None,
+                &RendezvousRequest::Get {
+                    channel_id: cid,
+                    epoch: 1,
+                    kinds,
+                },
+            )
         };
         let all = get(RecordKinds::ALL);
         assert_eq!(
@@ -888,11 +1016,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            svc.handle(&RendezvousRequest::Get {
-                channel_id: [8u8; 32],
-                epoch: 1,
-                kinds: RecordKinds::ALL
-            }),
+            svc.handle(
+                None,
+                &RendezvousRequest::Get {
+                    channel_id: [8u8; 32],
+                    epoch: 1,
+                    kinds: RecordKinds::ALL
+                }
+            ),
             vec![RendezvousResponse::End]
         );
     }
@@ -936,7 +1067,7 @@ mod tests {
                     let conn = server_ep.accept(T0).await.unwrap().unwrap();
                     let (kind, send, recv) = accept_typed(&conn).await.unwrap();
                     assert_eq!(kind, StreamKind::Rendezvous);
-                    outcomes.push(svc_server.serve_stream(send, recv).await);
+                    outcomes.push(svc_server.serve_stream([0u8; 32], send, recv).await);
                     conns.push(conn);
                 }
                 // Hand the connections and endpoint back so they outlive the

@@ -628,11 +628,10 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     transport had **no bound**: a session runs with the channel's lock held, so a peer that stopped
     answering held that lock — and everything else on the channel — for as long as it liked;
     `SYNC_FRAME_TIMEOUT = 20 s` on both directions ends such a session honestly.
-  - **Still open.** The anchor admits only the *creator's* records for a channel it is not a member of;
-    other members' authority comes from governance the anchor does not hold — the headless node's log sync
-    (M15.2) is what closes it, and until then a joiner's own records land only on boards that know it. The
-    actor is single-threaded over commands, so a join's dial ladder (up to ~25 s) holds it; the sync bound
-    keeps that from deadlocking anyone, but the join should run off the actor.
+  - **Still open (as of M15.1; the first item closed by M15.2a below).** ~~The anchor admits only the
+    *creator's* records for a channel it is not a member of~~ — closed by vouching (M15.2a). The actor is
+    single-threaded over commands, so a join's dial ladder holds it (now seconds, after M15.1b); the sync
+    bound keeps that from deadlocking anyone, but the join should run off the actor.
 
 - **Relay-first, upgrade later (M15.1b, 2026-09-20).** The cold start through an anchor took ~25 s
   because the ladder waited for a direct dial and then a punch to time out before trying the relay.
@@ -652,6 +651,29 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   would only grant permanently is never renewed and is deleted when the network stops (`stop_network`,
   best-effort on its own task). Mechanism, hardening and the pending real-router validation are in
   ADR-012's Implementation notes.
+
+- **`vox node`, the headless anchor, and how it learns a room's members (M15.2a, 2026-09-20).** The
+  anchor the user runs is now what this ADR said it would be: `vox node` embeds a node **constructed
+  without a vault**. `NodeConfig::headless(signer)` gives it a transport identity that is a
+  file-backed composite key (`node::headless`, two seeds in a `0600` file, rebuilt identically at every
+  start so peers keep pinning it) and no profile at all, so every path that would need a channel secret
+  finds none — the absence is structural, as designed. It is on the network from spawn (nothing to
+  unlock), serves the board, coordinates and relays, and prints the `<fingerprint>@<multiaddr>` a client
+  gives as `--anchor`. Ctrl-C shuts it down. `NodeView::anchoring` is what it can say about itself: the
+  rooms it serves and how many members it knows of each, never what any of them said.
+  **Membership is a board fact**, not a log fact — a member learns new members from the boards of
+  members who witnessed the join — and the anchor now learns it the same way, by **vouching**: a bundle
+  record from an author the anchor does not know, published over an authenticated connection by a peer
+  it *does* know as a member of that channel, is admitted with the key the record carries
+  (`RendezvousService::put` takes the publisher; `known_key` resolves an author through the oracle, the
+  genesis creator, or a bundle already held). The record's own verification binds key to author; the
+  vouch only says "one of us". An address record cannot precede its bundle (it carries no key), a stranger
+  cannot vouch, and a vouched member vouches in turn. On the member's side, a node **mirrors its board**
+  to its anchors: when it answers a join, and whenever learning members from a peer's board gains its own
+  board a record — bundles first. The M15.1 gate now runs against a headless anchor and ends with the
+  anchor knowing both members: the creator by her genesis, the joiner by her vouch.
+  **Not yet:** the anchor stores no log, so two members never online at once do not converge through it
+  (M15.2b); a headless node that receives `Lock` stops its network with nothing to unlock it.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

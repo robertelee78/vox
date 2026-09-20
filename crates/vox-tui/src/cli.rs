@@ -1,9 +1,9 @@
 //! The `vox` command-line surface (ADR-015 §"Distribution").
 //!
-//! The interactive TUI is the default (`vox` or `vox tui`); `vox completions
-//! <shell>` and `vox man` emit shell completions and a man page (built from the
-//! same clap model, so they never drift from the real flags). [`run`] is the
-//! single entry the binary calls. The TUI always runs an embedded node over a
+//! The interactive TUI is the default (`vox` or `vox tui`); `vox node` runs the
+//! headless anchor (ADR-016 M15.2a); `vox completions <shell>` and `vox man` emit
+//! shell completions and a man page (built from the same clap model, so they never
+//! drift from the real flags). [`run`] is the single entry the binary calls. The TUI always runs an embedded node over a
 //! profile (ADR-016 M13): `--profile`, `--data-dir`, `--config-dir` select it
 //! (ADR-015 precedence: flags > env > defaults; env `VOX_DATA_DIR` /
 //! `VOX_CONFIG_DIR`, then XDG).
@@ -18,7 +18,7 @@ use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::node::link::merge_anchor_spec;
 use vox_core::node::paths::{Paths, DEFAULT_PROFILE};
 
-use crate::app::run_live;
+use crate::app::{run_live, run_node};
 
 /// Profile selection shared by the interactive commands.
 #[derive(Args, Debug, Clone)]
@@ -89,6 +89,11 @@ pub struct Cli {
 enum Cmd {
     /// Run the interactive terminal client (the default).
     Tui(ProfileArgs),
+    /// Run a headless node: the always-on anchor that serves the board, coordinates
+    /// hole punches and carries circuits for your rooms. It holds no room and can
+    /// read nothing; its identity is a key file in the profile directory, created on
+    /// first run. Prints the `<fingerprint>@<multiaddr>` to give clients as `--anchor`.
+    Node(ProfileArgs),
     /// Print shell completions for SHELL to stdout.
     Completions {
         /// The shell to generate completions for (bash, zsh, fish, …).
@@ -133,6 +138,29 @@ pub fn run() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Node(args) => {
+            let paths = match args.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox node: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let anchors = match args.anchor_set() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("vox node: --anchor: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match run_node(paths, args.listen, anchors) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox node: {e}");
                     ExitCode::FAILURE
                 }
             }

@@ -229,6 +229,59 @@ pub fn run_tui(core: impl CoreHandle) -> Result<(), AppError> {
 ///
 /// `listen` is where the node accepts peers; it is what invite links advertise, so it
 /// must be an address peers can reach (see the `--listen` flag).
+/// Run the headless anchor (`vox node`, ADR-016 M15.2a) until interrupted.
+///
+/// No terminal, no vault, no rooms: the node comes up as its file-backed identity,
+/// prints what a client should be given as `--anchor` once it knows its addresses,
+/// and serves. Ctrl-C shuts it down cleanly (closing connections, deleting any
+/// permanent port mapping it took).
+pub fn run_node(
+    paths: Paths,
+    listen: std::net::SocketAddr,
+    anchors: vox_core::nat::bootstrap::BootstrapSet,
+) -> Result<(), AppError> {
+    use vox_core::identity::composite::RootSigner;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let signer = vox_core::node::headless::load_or_create_identity(&paths)?;
+    let fingerprint = signer.fingerprint();
+    let cfg = vox_core::node::actor::NodeConfig::new()
+        .bind(vox_core::node::actor::Bind::Addr(listen))
+        .anchors(anchors)
+        .headless(signer);
+    let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
+    let fp = vox_core::node::link::b32_encode(&fingerprint);
+    println!("vox node: identity {fp}");
+    rt.block_on(async {
+        // Addresses are discovered on a task after start-up (a route probe and a
+        // gateway request); print the anchor specs once they are known, then serve.
+        let mut printed: Vec<String> = Vec::new();
+        let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            tokio::select! {
+                _ = ticks.tick() => {
+                    let listening = node.view().listening;
+                    if listening != printed && !listening.is_empty() {
+                        println!("vox node: give clients --anchor with one of:");
+                        for addr in &listening {
+                            println!("  {fp}@{addr}");
+                        }
+                        printed = listening;
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    println!("vox node: shutting down");
+                    let _ = node.apply(NodeCommand::Shutdown).await;
+                    break;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
 pub fn run_live(
     paths: Paths,
     listen: std::net::SocketAddr,

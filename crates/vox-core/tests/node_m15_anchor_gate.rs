@@ -4,9 +4,10 @@
 //! reached, by any direct means: both sit behind **symmetric** NATs on the virtual
 //! network of `support/vnet.rs`, where a direct dial is dropped and a hole punch is
 //! defeated. What makes it work is the user's own always-on **anchor** (ADR-012
-//! §"Bootstrap"): a publicly reachable node that holds no channel, serves the board,
-//! coordinates the punch attempt, and — when that fails — carries the circuit the two
-//! clients' QUIC packets ride on.
+//! §"Bootstrap"): a **headless** node (`vox node`, M15.2a) — no vault, no passphrase,
+//! no room, a file-backed identity — that serves the board, coordinates the punch
+//! attempt, carries the circuit the two clients' QUIC packets ride on when that
+//! fails, and comes to know the room's members only because a member vouched.
 //!
 //! Everything goes through the client API — `NodeCommand` in, `NodeView`/`NodeEvent`
 //! out — over the nodes' real actors. Production Argon2id; the ADR-005 PoW is reduced
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vnet::{NatKind, VirtualNet};
+use vox_core::identity::composite::RootSigner;
 use vox_core::join::pow::PowParams;
 use vox_core::nat::bootstrap::{BootstrapNode, BootstrapSet};
 use vox_core::nat::multiaddr::{EndpointList, Multiaddr};
@@ -112,9 +114,25 @@ fn m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor() {
         let a_sock = net.behind_nat(addr("10.0.1.2:5000"), NatKind::Symmetric, ip("203.0.113.1"));
         let b_sock = net.behind_nat(addr("10.0.2.2:5000"), NatKind::Symmetric, ip("203.0.113.2"));
 
-        // ---- the anchor: the user's always-on node, holding no channel ----
-        let carol = node(&tmp, "anchor", c_sock, BootstrapSet::new()).await;
-        let carol_fp = carol.view().identity.unwrap().fingerprint;
+        // ---- the anchor: `vox node`, headless — a key file, no vault, no room ----
+        let carol_signer =
+            vox_core::node::headless::load_or_create_identity(&paths(&tmp, "anchor")).unwrap();
+        let carol_fp = carol_signer.fingerprint();
+        let carol = Node::spawn_config(
+            paths(&tmp, "anchor"),
+            NodeConfig::new()
+                .bind(Bind::Socket(c_sock))
+                .headless(carol_signer),
+        )
+        .unwrap();
+        assert!(
+            carol.view().identity.is_none(),
+            "a headless node has no profile identity to unlock"
+        );
+        assert!(
+            !carol.view().listening.is_empty(),
+            "and is on the network from the start"
+        );
         let mut anchors = BootstrapSet::new();
         anchors
             .add(
@@ -259,6 +277,30 @@ fn m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor() {
         // all, and the only thing it ever stored is the board.
         assert!(carol.view().open_channels.is_empty());
         assert!(carol.view().channels.is_empty());
+        // What it does know: the room it anchors, and — because Alice vouched for
+        // Bob when she admitted him — both members. Bob's own records were refused
+        // until then: an anchor learns a room's members only from a member.
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let anchoring = carol.view().anchoring;
+                if anchoring
+                    .iter()
+                    .any(|a| a.channel_id == cid && a.members >= 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the anchor came to know both members");
+        let anchored = carol.view().anchoring;
+        assert_eq!(anchored.len(), 1, "one room anchored: {anchored:?}");
+        assert_eq!(anchored[0].channel_id, cid);
+        assert_eq!(
+            anchored[0].members, 2,
+            "Alice by her genesis, Bob by Alice's vouch"
+        );
 
         for h in [&alice, &bob, &carol] {
             assert!(h.apply(NodeCommand::Shutdown).await.is_done());
