@@ -2,7 +2,7 @@
 
 **Status**: implemented and composed — all four rungs of the reachability ladder run in the node (`crates/vox-core/src/nat/`, `crates/vox-core/src/node/{network,coordstream,circuitstream}.rs`, `crates/vox-core/src/transport/mux.rs`), proved against simulated RFC 4787 NATs; rung 2 complete including UPnP-IGD (proved against a specification-faithful in-process gateway, real-router validation pending); DHT not started (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
+**Updated**: 2026-09-21 — recorded that **preferring a direct path is deliberate and address privacy is not a goal**; a relay-mandatory "location-hidden" mode was specified and reverted the same day (see the Decision). 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
 
@@ -26,6 +26,14 @@ anchor for their channels — user-controlled, open-source, ciphertext-only. Thi
 dual-symmetric-NAT 2-member case work, and is strictly better than the author's prior Tor-onion+ssh
 approach (faster; signaling-only coordination, not a full relayed circuit; any peer, not a fixed
 hidden service).
+
+**Preferring a direct path is deliberate, and address privacy is not a goal (recorded 2026-09-21).** A
+direct path means each peer learns the other's transport address. That is accepted: Vox is a
+confidentiality system, not an anonymity network — it hides what is carried, which channel authorized it
+and every Vox identity involved, never where the parties are (ADR-017 decision 6). A relay-mandatory mode
+was specified here briefly and reverted: it would have spent the relay operator's bandwidth on every byte
+for the life of a room, permanently, to buy a guarantee this project does not make. Anyone wanting
+location anonymity composes Vox over Tor.
 
 **Reachability strategy (prefer direct, in order):**
 1. **IPv6 direct first.** On IPv6 there is no translation — only a stateful firewall; open an
