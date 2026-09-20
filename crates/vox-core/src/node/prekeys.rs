@@ -208,18 +208,38 @@ impl std::fmt::Debug for PrekeyRing {
 }
 
 impl PrekeyRing {
-    /// Generate a fresh ring: identity DH key, first signed prekey (id 1) and a
-    /// full one-time pool ([`ONE_TIME_PREKEY_TARGET`]), all root-signed.
-    pub fn generate(signer: &dyn RootSigner, now_secs: u64) -> Result<Self> {
-        Self::generate_sized(signer, now_secs, ONE_TIME_PREKEY_TARGET)
+    /// Generate a fresh ring: the **identity's** DH key, a first signed prekey
+    /// (id 1) and a full one-time pool ([`ONE_TIME_PREKEY_TARGET`]), all root-signed.
+    ///
+    /// `identity_dh_secret` is the X25519 identity DH scalar from the identity itself
+    /// (the vault's `x25519_identity_secret`, part of the ADR-002 backup) — **not** a
+    /// freshly generated one. The identity DH key is an identity-level artifact: an
+    /// identity restored from its backup must advertise the *same* one, or every
+    /// bundle published before the restore would name a key the identity no longer
+    /// holds.
+    pub fn generate(
+        signer: &dyn RootSigner,
+        identity_dh_secret: &[u8; 32],
+        now_secs: u64,
+    ) -> Result<Self> {
+        Self::generate_sized(signer, identity_dh_secret, now_secs, ONE_TIME_PREKEY_TARGET)
     }
 
     /// [`PrekeyRing::generate`] with an explicit initial pool size. Private: the
     /// production size is the constant, and tests use a small pool so the debug
     /// suite does not pay for 64 ML-KEM keygens plus composite signatures per ring
     /// (one test still exercises the real size).
-    fn generate_sized(signer: &dyn RootSigner, now_secs: u64, one_time: usize) -> Result<Self> {
-        let identity_dh = SignedIdentityDhKey::generate(signer, now_secs)?;
+    fn generate_sized(
+        signer: &dyn RootSigner,
+        identity_dh_secret: &[u8; 32],
+        now_secs: u64,
+        one_time: usize,
+    ) -> Result<Self> {
+        let identity_dh = SignedIdentityDhKey::from_key(
+            signer,
+            X25519IdentityKey::from_secret_bytes(*identity_dh_secret),
+            now_secs,
+        )?;
         let current = SignedPrekey::generate(signer, 1, now_secs)?;
         let pool = OneTimePrekeyPool::generate(signer, one_time, 1, now_secs)?;
         Ok(Self {
@@ -579,13 +599,15 @@ pub fn load(store: &Store, signer: &dyn RootSigner) -> Result<Option<PrekeyRing>
     PrekeyRing::decode(&signer.public_key(), &plain).map(Some)
 }
 
-/// Load the ring, generating and storing one on first use, then run
+/// Load the ring, generating and storing one on first use (from the identity's own
+/// DH secret — see [`PrekeyRing::generate`]), then run
 /// [`PrekeyRing::maintain`] and persist if anything changed. This is the single
 /// entry point the node calls after unlocking. Returns the ring and whether it was
 /// freshly generated.
 pub fn load_or_create(
     store: &Store,
     signer: &dyn RootSigner,
+    identity_dh_secret: &[u8; 32],
     now_secs: u64,
 ) -> Result<(PrekeyRing, bool)> {
     match load(store, signer)? {
@@ -596,7 +618,7 @@ pub fn load_or_create(
             Ok((ring, false))
         }
         None => {
-            let ring = PrekeyRing::generate(signer, now_secs)?;
+            let ring = PrekeyRing::generate(signer, identity_dh_secret, now_secs)?;
             save(store, signer, &ring)?;
             Ok((ring, true))
         }
@@ -611,6 +633,8 @@ mod tests {
     const T0: u64 = 1_700_000_000;
     /// Small pool for the fast tests (see `generate_sized`).
     const FEW: usize = 3;
+    /// A stand-in for the identity's X25519 DH secret (the vault's, in production).
+    const DH: [u8; 32] = [0x5C; 32];
 
     fn signer(a: u8, b: u8) -> SoftwareRootSigner {
         SoftwareRootSigner::from_component_seeds(&[a; 32], &[b; 32]).unwrap()
@@ -623,7 +647,7 @@ mod tests {
     }
 
     fn small(s: &SoftwareRootSigner) -> PrekeyRing {
-        PrekeyRing::generate_sized(s, T0, FEW).unwrap()
+        PrekeyRing::generate_sized(s, &DH, T0, FEW).unwrap()
     }
 
     #[test]
@@ -653,7 +677,7 @@ mod tests {
     #[test]
     fn a_depleted_pool_still_publishes_a_signed_prekey_never_no_prekey() {
         let s = signer(5, 6);
-        let mut ring = PrekeyRing::generate_sized(&s, T0, 1).unwrap();
+        let mut ring = PrekeyRing::generate_sized(&s, &DH, T0, 1).unwrap();
         assert_eq!(ring.use_one_time(1, T0), OneTimeUse::Fresh);
         assert_eq!(ring.one_time_len(), 0);
         let bundle = ring.bundle(&s.public_key()).unwrap();
@@ -772,7 +796,7 @@ mod tests {
         // The one test at production size: a real ring, drained to the low-water
         // mark, refills to the real target.
         let s = signer(15, 16);
-        let mut ring = PrekeyRing::generate(&s, T0).unwrap();
+        let mut ring = PrekeyRing::generate(&s, &DH, T0).unwrap();
         assert_eq!(ring.one_time_len(), ONE_TIME_PREKEY_TARGET);
 
         // Above the mark: no refill (and no rotation, so nothing changed).
@@ -848,7 +872,7 @@ mod tests {
         assert_eq!(ring.use_one_time(id, late), OneTimeUse::Unknown);
 
         // The cap bounds a drain attack: consumed entries never exceed the maximum.
-        let mut ring = PrekeyRing::generate_sized(&s, T0, 0).unwrap();
+        let mut ring = PrekeyRing::generate_sized(&s, &DH, T0, 0).unwrap();
         ring.pool.add(&s, ONE_TIME_CONSUMED_MAX + 2, T0).unwrap();
         let ids: Vec<u64> = ring.pool.iter().map(|o| o.public().prekey_id).collect();
         for (i, id) in ids.iter().enumerate() {
@@ -868,25 +892,61 @@ mod tests {
     }
 
     #[test]
+    fn the_rings_identity_dh_key_is_the_identitys_own_not_a_fresh_one() {
+        // ADR-002: the identity DH key is an identity-level artifact. A ring built
+        // from the same identity secret always advertises the same DH key, so an
+        // identity restored from its backup still matches every bundle it published.
+        let s = signer(25, 26);
+        let a = PrekeyRing::generate_sized(&s, &DH, T0, 1).unwrap();
+        let b = PrekeyRing::generate_sized(&s, &DH, T0 + 99, 1).unwrap();
+        assert_eq!(
+            a.identity_dh().public_bytes(),
+            b.identity_dh().public_bytes(),
+            "the identity DH key is not regenerated per ring"
+        );
+        assert_eq!(
+            a.bundle(&s.public_key())
+                .unwrap()
+                .identity_dh_key
+                .x25519_pub,
+            b.bundle(&s.public_key())
+                .unwrap()
+                .identity_dh_key
+                .x25519_pub
+        );
+        // A different identity secret yields a different key (it really is the input).
+        let other = PrekeyRing::generate_sized(&s, &[0x11; 32], T0, 1).unwrap();
+        assert_ne!(
+            a.identity_dh().public_bytes(),
+            other.identity_dh().public_bytes()
+        );
+        // And the advertised key is the one the secret derives.
+        let expected = X25519IdentityKey::from_secret_bytes(DH).public_bytes();
+        assert_eq!(a.identity_dh().public_bytes(), expected);
+        a.bundle(&s.public_key()).unwrap().verify().unwrap();
+    }
+
+    #[test]
     fn load_or_create_generates_once_then_reuses_and_maintains() {
         let s = signer(17, 18);
         let (_tmp, st) = store();
         assert!(load(&st, &s).unwrap().is_none(), "no ring yet");
 
-        let (ring, created) = load_or_create(&st, &s, T0).unwrap();
+        let (ring, created) = load_or_create(&st, &s, &DH, T0).unwrap();
         assert!(created);
         let first = ring.signed_prekey_id();
         drop(ring);
 
         // Second call: the same ring, not a new one (a regenerated ring would
         // invalidate every published bundle).
-        let (ring, created) = load_or_create(&st, &s, T0 + 1).unwrap();
+        let (ring, created) = load_or_create(&st, &s, &DH, T0 + 1).unwrap();
         assert!(!created);
         assert_eq!(ring.signed_prekey_id(), first);
         drop(ring);
 
         // A cadence later it rotates and the rotation is persisted by the call.
-        let (ring, created) = load_or_create(&st, &s, T0 + SIGNED_PREKEY_CADENCE_SECS).unwrap();
+        let (ring, created) =
+            load_or_create(&st, &s, &DH, T0 + SIGNED_PREKEY_CADENCE_SECS).unwrap();
         assert!(!created);
         let rotated = ring.signed_prekey_id();
         assert_ne!(rotated, first);

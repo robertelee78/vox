@@ -1,6 +1,6 @@
 # ADR-016: Node Runtime — Composing the Core
 
-**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.7b done 2026-09-20
+**Status**: accepted (2026-09-19) — **M13 (single-device node) complete 2026-09-20**; M14 (network) in progress — M14.1–M14.7c done 2026-09-20
 **Date**: 2026-09-19
 **Updated**: 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -426,6 +426,23 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   (ADR-012 Implementation notes explain why it needs neither a membership check nor a TTL). Without it the
   §"Join over the network" flow could dial the anchors and read the board but never construct
   `ChannelState`, since that needs the genesis whose hash is the channelID.
+- **The network surface (M14.7c).** `node::network::NodeNet` composes M14.1–M14.7b into the flows a node
+  performs, while keeping the actor the single writer of channel state: `accept_stream` authorizes an
+  inbound stream and **serves the board itself** (it needs no channel state), handing every other kind back
+  as an `Inbound` for the actor; `publish_local` / `own_records` file this node's genesis, address record
+  and bundle on its own board (a node is its own first anchor, and dialing itself would be absurd);
+  `publish_channel_records` and `publish_genesis` do the same to a remote anchor; `fetch_channel` reads the
+  board; `start_join` / `answer_join` run the two sides of the ADR-005 exchange. `SharedMembership` is the
+  seam the served board reads: the actor publishes a membership snapshot whenever it changes, and staleness
+  fails **closed** — a member missing from the snapshot is refused and retries, never wrongly admitted.
+  Two decisions are recorded in the ADRs they belong to: a node **retains the channel passphrase** while a
+  channel is open, because CPace needs it live to answer a join (ADR-005 Implementation notes; ADR-010
+  explains why the group factor may sit in memory while the individual one may not), and the join's binding
+  parameters are passed explicitly rather than re-derived on each side, since both ends must land on
+  identical values. The flow is proven over loopback QUIC end to end: the member files its genesis and
+  records, the joiner reads the board through the parsed `vox://` link, joins with an out-of-band
+  passphrase, both ends encrypt and decrypt over the resulting session, and the joiner then builds local
+  channel state that reads **nothing** — joining released no keys.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

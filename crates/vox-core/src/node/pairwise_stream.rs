@@ -196,7 +196,7 @@ mod tests {
 
             // Alice is the PQXDH responder: her ring supplies the bundle Bob uses.
             let store = Store::open(&tmp.path().join("alice.redb")).unwrap();
-            let mut ring = PrekeyRing::generate(&alice_s, T0).unwrap();
+            let mut ring = PrekeyRing::generate(&alice_s, &[0x5C; 32], T0).unwrap();
             let bundle = ring.bundle(&alice_s.public_key()).unwrap();
 
             // Bob initiates a session against that bundle; Alice accepts it.

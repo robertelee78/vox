@@ -776,7 +776,7 @@ mod tests {
             policy.expect_joiner(joiner_id);
 
             let st = store(&tmp, "responder.redb");
-            let mut ring = PrekeyRing::generate(&responder_s, T0).unwrap();
+            let mut ring = PrekeyRing::generate(&responder_s, &[0x5C; 32], T0).unwrap();
 
             let server = {
                 let responder = Arc::clone(&responder);

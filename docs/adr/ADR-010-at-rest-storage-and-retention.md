@@ -2,7 +2,7 @@
 
 **Status**: implemented (M8, `crates/vox-core/src/atrest/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-20 — identity-level key material (the prekey ring) given its at-rest home and derivation (ADR-016 M14.3); admitted channel authors and received sender keys sealed as key material (M14.5). 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
+**Updated**: 2026-09-20 — identity-level key material (the prekey ring) given its at-rest home and derivation (ADR-016 M14.3); admitted channel authors and received sender keys sealed as key material (M14.5); the two factors' compromise populations stated explicitly (M14.7c). 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: storage, at-rest, encryption, retention, ttl, device-seizure, app-lock
 
@@ -148,6 +148,17 @@ plainly rather than implying a guarantee we cannot make.
 
 These record the concrete decisions made building this ADR (`crates/vox-core/src/atrest/`), so the spec and code stay in lockstep:
 
+- **The two factors have disjoint compromise populations (stated 2026-09-20).** §"Double-lock key
+  derivation" says the factors are independent; what makes that true in practice is *who knows each one*.
+  The **identity factor** is known to exactly one person — it is the passphrase on that person's private
+  key, in the same sense as an SSH or GPG key passphrase. The **channel passphrase** is known to the
+  channel's quorum and to nobody else: group-confidential, not public. Breaking one therefore tells an
+  attacker nothing about the other, and the case this most protects is the obvious one — a member (or a
+  former member) who knows the channel passphrase still cannot open *another* member's store without that
+  device's identity factor. A further property worth keeping: one factor lives **off the device**, in
+  people's heads and out-of-band channels, which a device-local secret would not — so device compromise
+  alone does not hand over both. Only the *group* factor is ever held in memory, and only while a channel
+  is open (ADR-016 M14.7c); the identity credential unlocks the vault and is dropped, never retained.
 - **Received sender keys are per-channel key material (M14.5b).** The `ReceiverChain`s built from other
   members' SKDMs are sealed under the channel SEK as a `KeyMaterial` segment (`SEG_RECEIVERS`) — this is
   §"Two distinct encryption layers"'s "received SKDMs" clause, made concrete. The **live** chain state is

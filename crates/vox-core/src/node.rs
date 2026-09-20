@@ -30,6 +30,7 @@ pub mod content;
 pub mod joinstream;
 pub mod link;
 pub mod net;
+pub mod network;
 pub mod pairwise_stream;
 pub mod paths;
 pub mod prekeys;
