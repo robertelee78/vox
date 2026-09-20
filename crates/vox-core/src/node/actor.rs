@@ -2583,17 +2583,6 @@ impl Node {
             return Outcome::Failed(Fault::Refused);
         }
         let hostname = crate::node::link::vox_hostname(channel_id);
-        let host = genesis.creator_pubkey().fingerprint();
-        // Establish the connection now rather than on the first CONNECT: a proxy that
-        // bound and then failed every request would be the "appears to work" failure.
-        let endpoints = self
-            .net
-            .as_ref()
-            .map(|net| net.board_endpoints(channel_id, &host))
-            .unwrap_or_default();
-        if let Err(e) = self.dial(host, &endpoints).await {
-            return Outcome::Failed(fault_of(&e));
-        }
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return Outcome::Failed(Fault::NotNetworked);
         };
@@ -2608,7 +2597,13 @@ impl Node {
             Err(_) => return Outcome::Failed(Fault::Unreachable),
         };
         let resolver = Arc::new(resolver);
-        let dialer = Arc::new(NodeDialer { net });
+        // No dial here: the host is reached per request (see `up::HostDialer`). Dialling
+        // first would refuse to start on a race — a node that has just joined has not read
+        // the board — and retrying here would block the actor tick that reads it.
+        let dialer = Arc::new(NodeDialer {
+            net,
+            channel_id: *channel_id,
+        });
         tokio::spawn(crate::node::up::serve(bound, resolver, dialer));
         let _ = self
             .event_tx
@@ -2880,11 +2875,18 @@ fn row_of(r: &Rendered) -> MessageRow {
 /// blocked.
 struct NodeDialer {
     net: Arc<NodeNet>,
+    /// The room whose board names the host's endpoints.
+    channel_id: Digest32,
 }
 
 impl crate::node::up::HostDialer for NodeDialer {
-    fn connection(&self, host: &Digest32) -> Option<Arc<VoxConnection>> {
-        self.net.manager().existing(host)
+    async fn connection(&self, host: &Digest32) -> Option<Arc<VoxConnection>> {
+        // `reach` returns a live connection when there is one and otherwise runs the whole
+        // ADR-012 ladder, so this is both "give me the connection" and "make one". The
+        // endpoint hints come from the board, which is also why this must happen per
+        // request: a node that has only just joined has not read the board yet.
+        let endpoints = self.net.board_endpoints(&self.channel_id, host);
+        self.net.reach(*host, &endpoints).await.ok()
     }
 }
 

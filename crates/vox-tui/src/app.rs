@@ -239,6 +239,24 @@ pub fn run_tui(core: impl CoreHandle) -> Result<(), AppError> {
 /// prints what a client should be given as `--anchor` once it knows its addresses,
 /// and serves. Ctrl-C shuts it down cleanly (closing connections, deleting any
 /// permanent port mapping it took).
+/// Keep only the advertised addresses a client could actually dial.
+///
+/// A node bound to the wildcard advertises `0.0.0.0` (or `::`), which names every local
+/// interface to the *kernel* and nothing at all to a peer. It is not an error in the
+/// advertised set — the ADR-012 ladder composes it from what the socket reports — but it
+/// must never reach an operator as something to paste into `--anchor`.
+fn dialable(listening: Vec<String>) -> Vec<String> {
+    listening
+        .into_iter()
+        .filter(|text| {
+            vox_core::nat::multiaddr::Multiaddr::parse(text)
+                .ok()
+                .and_then(|m| m.socket_addr())
+                .is_none_or(|sa| !sa.ip().is_unspecified())
+        })
+        .collect()
+}
+
 pub fn run_node(
     paths: Paths,
     listen: std::net::SocketAddr,
@@ -267,7 +285,10 @@ pub fn run_node(
         loop {
             tokio::select! {
                 _ = ticks.tick() => {
-                    let listening = node.view().listening;
+                    // A wildcard bind advertises `0.0.0.0`, which is a *bind* address and
+                    // not one any client can dial. Printing it as an `--anchor` spec hands
+                    // the operator a string guaranteed not to work.
+                    let listening = dialable(node.view().listening);
                     if listening != printed && !listening.is_empty() {
                         println!("vox node: give clients --anchor with one of:");
                         for addr in &listening {

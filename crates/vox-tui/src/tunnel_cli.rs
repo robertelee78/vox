@@ -423,11 +423,10 @@ pub async fn connect(
         .apply(NodeCommand::JoinChannel {
             link: url.to_owned(),
             local_name: name.to_owned(),
-            passphrase: Secret::new(
-                vox_core::node::passphrase::normalize(room_passphrase)
-                    .as_bytes()
-                    .to_vec(),
-            ),
+            // Canonicalization is the node's, at its one boundary — see
+            // `actor::room_passphrase`. Doing it here as well would be a second place
+            // for the two sides to disagree.
+            passphrase: Secret::new(room_passphrase.as_bytes().to_vec()),
         })
         .await;
     if !out.is_done() {

@@ -47,14 +47,27 @@ use crate::tunnel::socks::{self, Reply, Target};
 /// and needs no privilege.
 pub const DEFAULT_SOCKS_PORT: u16 = 1080;
 
-/// What the proxy needs in order to carry a connection: the room, and a live connection to
-/// its host.
+/// How the proxy reaches a room's host.
 ///
-/// The proxy does not dial peers itself — reaching a member is the node's job, through the
-/// ADR-012 ladder — so it asks for the connection and refuses if there is none.
+/// The proxy does not know how to reach anybody — that is the ADR-012 ladder's job, and the
+/// ladder lives in the node. It asks here, **per connection**, and the node decides whether
+/// that means handing back a live connection or dialling one.
+///
+/// Asking per connection rather than once at startup is deliberate, and it is a correction:
+/// an earlier version dialled the host *before* binding, so that a proxy which came up could
+/// never refuse every request. That traded one failure for a worse one — a node that has only
+/// just joined has not yet read the board, so it does not know where the host is, and
+/// `vox up` refused to start on a race the user cannot see or avoid. Retrying inside the
+/// actor would not help either: the actor is what fetches the board, so sleeping in a command
+/// handler blocks the progress it is waiting for. Binding immediately and dialling on demand
+/// removes the race instead of timing it.
 pub trait HostDialer: Send + Sync {
-    /// A live connection to `host`, or `None` if this node has none.
-    fn connection(&self, host: &Digest32) -> Option<Arc<VoxConnection>>;
+    /// A connection to `host`, dialling if this node has none. `None` when the host cannot be
+    /// reached at all.
+    fn connection(
+        &self,
+        host: &Digest32,
+    ) -> impl core::future::Future<Output = Option<Arc<VoxConnection>>> + Send;
 }
 
 /// Serve SOCKS5 on `bind` until the task is dropped.
@@ -118,7 +131,7 @@ async fn handle<D: HostDialer>(
         socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
         return Err(Error::MalformedTunnel("no such .vox name on this machine"));
     };
-    let Some(conn) = dialer.connection(&room.host) else {
+    let Some(conn) = dialer.connection(&room.host).await else {
         socks::write_reply(&mut stream, Reply::GeneralFailure, UNSPECIFIED).await?;
         return Err(Error::Unreachable("no connection to that room's host"));
     };
@@ -168,7 +181,7 @@ mod tests {
 
     struct NoConnections;
     impl HostDialer for NoConnections {
-        fn connection(&self, _host: &Digest32) -> Option<Arc<VoxConnection>> {
+        async fn connection(&self, _host: &Digest32) -> Option<Arc<VoxConnection>> {
             None
         }
     }
