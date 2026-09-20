@@ -517,6 +517,21 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
      `Arc<tokio::sync::Mutex<ChannelState>>`: the actor is still the only thing that adds or removes them,
      but a session *guards* a channel for a few milliseconds instead of hiding it, and anything else waits
      rather than failing. The session takes the guard with `blocking_lock` from its blocking thread.
+- **The client can do it too (M14.7g).** The TUI's network verbs stop reporting "not available yet":
+  `:join` opens a masked prompt whose **first** field is the `vox://` link — typed in the clear, because it
+  carries no secret — followed by the local name and the masked passphrase, which is the one thing the link
+  deliberately omits; `:invite` is a one-line command, since a link is public; and `consent grant` is the
+  ADR-007 human act, which the node turns into a sender-key delivery plus a grant. `verify` stays local
+  (TOFU marking). The ADR-007 revocation and ADR-015 visibility verbs still report "not available yet",
+  which is honest rather than silently accepted. A `ViewModel::notice` carries the short public lines the
+  network produces — an invite link, "X joined — they read nothing until you consent", "X consented to
+  you", a backfill count — and a synced channel's rendered count feeds the unread badge.
+  **The binary now listens.** It spawned a non-networked node, which would have left all of M14 dead in
+  `vox` itself; `run_live` takes a listen address (`--listen`, `VOX_LISTEN`, default `127.0.0.1:0`). The
+  default is loopback rather than a wildcard on purpose: the bound address is what an invite link
+  advertises, and `0.0.0.0` would advertise an address nobody can dial. Reaching another machine needs an
+  address peers can reach (`--listen 192.168.1.5:0`) until automatic address discovery and the ADR-012
+  port-mapped rung land — that is the next milestone, and the honest limit until then.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
