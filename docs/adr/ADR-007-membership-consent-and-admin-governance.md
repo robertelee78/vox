@@ -2,9 +2,7 @@
 
 **Status**: implemented (M6, `crates/vox-core/src/governance/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-21 — the genesis policy gains **`path_policy`** (ADR-012): genesis-immutable like
-`deniability_mode`, and `RelayOnly` is what makes a room location-hidden. **Per-member revocation is
-live** (M18.1): `vox`'s `revoke` verb rotates the
+**Updated**: 2026-09-21 — **per-member revocation is live** (M18.1): `vox`'s `revoke` verb rotates the
 sender key, records the `consent-revocation` fact and re-keys the remaining consenters; it needs no
 network, and a release gate proves the revoked member reads nothing afterwards while the others lose
 nothing. 2026-09-20 — the join/consent flow now has a runtime: joiner-side channel state, author admission as a log fact, and consent grants appended and evaluated (`node::channel`, ADR-016 M14.5). 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin"; genesis policy and policy-update carry the ADR-003 `min_suite` floor.
@@ -93,14 +91,9 @@ New capability types are added only here (versioned), preserving the single-eval
   fully independent of outbound consent — the two functions answer two different questions ("who may
   read me" vs "whom do I read") and are set independently per member.
 - **Policy update** — issued by a `policy`-capability holder, changes **history-mode and TTL** from its
-  causal position forward. **Two axes are genesis-immutable:** `deniability_mode` and `path_policy` are
-  set once in the genesis record and a policy-update MUST NOT change either (an evaluator rejects a
-  policy-update that attempts to). `path_policy` (ADR-012, added 2026-09-21) decides whether a member may
-  ever take a *direct* transport path to another member, or only a relayed one; `RelayOnly` is what makes
-  a room location-hidden, and it is immutable for the same reason deniability is — a room that could
-  silently stop hiding its members' addresses would change the threat model under people who joined
-  because it hid them. The one-way direction is not offered either: a hidden room cannot be un-hidden,
-  because an address disclosed once is disclosed. Rationale: members join under a fixed authorship-accountability contract; flipping
+  causal position forward. **The deniability axis is genesis-immutable:** `deniability_mode` is set once
+  in the genesis record and a policy-update MUST NOT change it (an evaluator rejects a policy-update that
+  attempts to). Rationale: members join under a fixed authorship-accountability contract; flipping
   attributable↔deniable mid-life would change the threat model under existing members and the
   fork-handling split (ADR-008). History/TTL are retention conveniences with no such trust-contract
   inversion, so they stay mutable.
@@ -255,9 +248,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   everything collapsed to `NotAdmin`, contradicting the "golden vectors can pin the exact reason"
   intent.)*
 - **Genesis policy carries the ciphersuite floor (ADR-003).** The genesis canonical body is
-  `[nonce, created, [history_mode, deniability_mode, ttl, min_suite, path_policy], creator_pubkey,
-  [sign_algo]]` (`path_policy` added 2026-09-21, ADR-012 — it is part of the signed body and therefore of
-  the channelID, so a room's path policy is as immutable as its identity);
+  `[nonce, created, [history_mode, deniability_mode, ttl, min_suite], creator_pubkey, [sign_algo]]`;
   `min_suite` must name a registered suite (validated at creation and on decode) and, being part of
   the signed body, is bound into the channelID. The policy-update body (`0x0006`, kind 1) is
   `[kind, channelID, epoch, issuer_id, history_present, history_mode?, ttl_present, ttl?,

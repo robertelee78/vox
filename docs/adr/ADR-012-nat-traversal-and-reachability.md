@@ -2,7 +2,7 @@
 
 **Status**: implemented and composed — all four rungs of the reachability ladder run in the node (`crates/vox-core/src/nat/`, `crates/vox-core/src/node/{network,coordstream,circuitstream}.rs`, `crates/vox-core/src/transport/mux.rs`), proved against simulated RFC 4787 NATs; rung 2 complete including UPnP-IGD (proved against a specification-faithful in-process gateway, real-router validation pending); DHT not started (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-21 — the ladder gains a **path policy**: a room's genesis may set `PathPolicy::RelayOnly`, under which Vox never learns, publishes or dials a member's transport address and every path is a relay circuit — the location hiding ADR-017's `vox serve` needs. Strictest policy wins per connection; the honest gap from Tor (one hop, so the relay operator sees both ends) is recorded in the Decision. 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
+**Updated**: 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
 
@@ -26,45 +26,6 @@ anchor for their channels — user-controlled, open-source, ciphertext-only. Thi
 dual-symmetric-NAT 2-member case work, and is strictly better than the author's prior Tor-onion+ssh
 approach (faster; signaling-only coordination, not a full relayed circuit; any peer, not a fixed
 hidden service).
-
-**Path policy — a room may forbid a direct path (`PathPolicy`, added 2026-09-21).** The ladder below
-*prefers direct*, and a direct path means each peer learns the other's address. For a room-bound service
-that is meant to replace a Tor private service (ADR-017) that is a defect, not an optimisation: anyone
-running `tcpdump` on a connecting machine would see the serving machine's real address. So the room's
-**genesis** carries a path policy, immutable and therefore part of the channelID:
-
-- **`PathPolicy::Ladder`** — the strategy below, unchanged. The default for a chat room, whose members
-  already know who each other are and benefit from the shortest path.
-- **`PathPolicy::RelayOnly` (location-hidden)** — rung 4 *only*. Vox must never **learn**, publish, or
-  dial a member's transport address for that channel. This is the default for a room created by
-  `vox serve` (ADR-017), because location hiding is the point of that room.
-
-`RelayOnly` is enforced at four places, each of which is a disclosure channel that exists today:
-
-1. **No endpoints on the board.** A `RendezvousRecord` for the channel carries no endpoint other than a
-   relay hint. (The join/prekey `MemberBundleRecord` already carries none.)
-2. **No own endpoints in the invite link.** The link names anchors only; a hidden room's link with the
-   host's own addresses in it *is* the leak, since the link is the thing handed out.
-3. **No hole punch.** `CoordMessage::Connect` — which exists to hand a peer your reflexive endpoints — is
-   neither sent nor accepted for the channel.
-4. **No upgrade.** A relayed connection to a peer in a `RelayOnly` channel is terminal; relay-first
-   never swaps a direct path in underneath it.
-
-**Strictest policy wins, per connection.** One connection serves a peer across every channel shared with
-it (a connection is per *peer*), so if any shared channel is `RelayOnly` that peer's connection is
-relayed. A member cannot be in a hidden room and a direct room with the same peer and keep the shortest
-path for the second — and should not be able to, because the shared connection would disclose the address
-the hidden room is hiding.
-
-**What `RelayOnly` does and does not hide — stated plainly, because the gap from Tor is real.** It hides
-the serving machine's address from **every other member** and from **anyone observing either machine's
-traffic**: a connecting machine's packets go to the relay and nowhere else, and its node never holds an
-address for the peer. It does **not** hide anything from the **relay operator**, who sees both ends. Vox
-relays in one hop; Tor uses three plus a rendezvous point, so a Tor hidden service is hidden from its own
-clients *and* from any single relay. Because the operator here runs their own anchor (see "Any node can
-serve"), the practical consequence is that **the service operator learns its clients' addresses, which a
-Tor operator does not.** Multi-hop circuits would close that gap and the circuit mechanism already
-supports chaining; it is not built, and this ADR does not claim it.
 
 **Reachability strategy (prefer direct, in order):**
 1. **IPv6 direct first.** On IPv6 there is no translation — only a stateful firewall; open an
@@ -123,9 +84,7 @@ replaces the earlier "possibly piggyback public DHT" wording, which was a false 
 gate + `(channelID, epoch)`-bound PoW join tokens + identity-bound log acceptance with per-author
 quotas), not by rate-limiting alone. There is no admin admission step (ADR-007).
 
-**Honest limit (documented).** A `RelayOnly` room pays the relay's bandwidth and latency for every byte,
-forever — there is no upgrade to amortise it, which is the deliberate price of location hiding. And two
-peers both behind CGNAT/symmetric NAT with no IPv6 and no
+**Honest limit (documented).** Two peers both behind CGNAT/symmetric NAT with no IPv6 and no
 reachable coordinator cannot connect. Global joint-IPv6 probability for a random pair is only
 ~0.17–0.20 today (rising), so a coordinator/relay remains mandatory for the residual — satisfied by
 the user's own node.
