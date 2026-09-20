@@ -121,6 +121,20 @@ sha1 = { version = "0.11", default-features = false }
 # design (ADR-008 quotas), every stored value is an already-sealed blob (ADR-010),
 # and the single-writer transaction matches the Node actor's single-writer rule.
 redb = "4.3"
+# Userspace TCP/IP for the Vox interface (ADR-013 TUN model, ADR-017 decision 5).
+# Pure Rust, no_std-capable, no C anywhere in the build (ADR-001's Rust-only rule).
+# It is what lets the interface terminate TCP from raw packets rather than binding a
+# socket: nothing on the data path needs privilege, and a service's port is a header
+# field rather than a port this machine has to own. `medium-ip` only — the interface is
+# a point-to-point tunnel, so there is no Ethernet, no ARP and no neighbour discovery to
+# carry. Verified by spike before adopting: it terminates a connection to port 22 on a
+# `fd00::/8` address off an in-process device with no kernel involved.
+smoltcp = { version = "0.14", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv6",
+    "socket-tcp",
+] }
 # Temp directories for store/vault tests only (pure Rust).
 tempfile = "3.27"
 
