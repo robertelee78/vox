@@ -162,9 +162,16 @@ impl PeerPolicy {
             ),
             PeerClass::PendingJoiner => matches!(
                 kind,
-                StreamKind::Join | StreamKind::Rendezvous | StreamKind::Pairwise
+                StreamKind::Join
+                    | StreamKind::Rendezvous
+                    | StreamKind::Pairwise
+                    | StreamKind::Coord
             ),
-            PeerClass::Unknown => matches!(kind, StreamKind::Rendezvous),
+            // An unknown peer reaches the board — and the coord stream, where the only
+            // verb open to it is `WHOAMI`, whose answer is its own address (enforced in
+            // `node::coordstream`). A NATed client cannot learn its reflexive address
+            // any other way, and this ADR exists for that client.
+            PeerClass::Unknown => matches!(kind, StreamKind::Rendezvous | StreamKind::Coord),
         }
     }
 
@@ -274,6 +281,12 @@ impl ConnectionManager {
             return Ok(None);
         };
         Ok(Some(self.file(conn)))
+    }
+
+    /// Take ownership of a connection this manager did not dial — one a hole punch
+    /// produced (ADR-012 rung 3) — under the same one-per-peer rule.
+    pub fn adopt(&self, conn: VoxConnection) -> Arc<VoxConnection> {
+        self.file(conn)
     }
 
     /// File a connection under its peer id, keeping the live one if a connection
@@ -436,16 +449,22 @@ mod tests {
         // A pending joiner gets the join stream, the board it must publish its
         // pre-join record to, and `pairwise` — it has to deliver its own sender key
         // the instant the join completes, before the responder has reclassified it.
-        for k in [Join, Rendezvous, Pairwise] {
+        // It also gets `coord`: a joiner behind NAT must learn its own address, and a
+        // member that is itself behind NAT can only be reached by a punch the
+        // coordinator relays (ADR-012 rung 3).
+        for k in [Join, Rendezvous, Pairwise, Coord] {
             assert!(PeerPolicy::allows(PeerClass::PendingJoiner, k));
         }
         // But no log authority and no tunnels.
-        for k in [Sync, Tunnel, Coord] {
+        for k in [Sync, Tunnel] {
             assert!(!PeerPolicy::allows(PeerClass::PendingJoiner, k));
         }
-        // An unknown peer reaches the rendezvous service and nothing else.
-        assert!(PeerPolicy::allows(PeerClass::Unknown, Rendezvous));
-        for k in [Sync, Join, Pairwise, Tunnel, Coord] {
+        // An unknown peer reaches the rendezvous service and the coord stream, where
+        // `WHOAMI` — its own address — is the only verb open to it.
+        for k in [Rendezvous, Coord] {
+            assert!(PeerPolicy::allows(PeerClass::Unknown, k));
+        }
+        for k in [Sync, Join, Pairwise, Tunnel] {
             assert!(!PeerPolicy::allows(PeerClass::Unknown, k));
         }
 

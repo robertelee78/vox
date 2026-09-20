@@ -34,20 +34,21 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use quinn::{RecvStream, SendStream};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
 use crate::hash::Digest32;
 use crate::identity::composite::{CompositePublicKey, RootSigner};
 use crate::identity::keyagreement::X25519IdentityKey;
 use crate::join::pow::Difficulty;
 use crate::join::session::JoinContext;
-use crate::nat::multiaddr::EndpointList;
+use crate::nat::multiaddr::{EndpointList, Multiaddr};
 use crate::nat::record::{MemberBundleRecord, RendezvousRecord};
 use crate::nat::service::{
     MembershipOracle, RecordKinds, RecordSet, RendezvousClient, RendezvousService,
 };
 use crate::nat::store::RendezvousStore;
 use crate::node::channel::ChannelState;
+use crate::node::coordstream;
 use crate::node::joinstream::{run_initiator, run_responder, JoinOutcome, ResponderConfig};
 use crate::node::net::{accept_authorized, ConnectionManager, PeerPolicy};
 use crate::node::prekeys::PrekeyRing;
@@ -215,9 +216,27 @@ pub enum Inbound {
         /// The authenticated peer.
         peer: Digest32,
     },
-    /// A `tunnel` or `coord` stream: accepted and authorized, but the ADR-013 /
-    /// hole-punch handlers are M15. The stream is dropped (reset), never silently
-    /// left open.
+    /// A coord stream was served (a `WHOAMI` answered); nothing for the actor to do.
+    ServedCoord {
+        /// The authenticated peer.
+        peer: Digest32,
+    },
+    /// A coordinator has relayed a punch session to this node: the DCUtR exchange is
+    /// still to be run on these streams, and then the synchronized dial fired. The
+    /// actor spawns it, because it takes seconds and must not block the coordinator's
+    /// other streams.
+    Punch {
+        /// The peer on the far side of the relay — the one to punch to.
+        peer: Digest32,
+        /// The coordinator that carried the session.
+        coordinator: Digest32,
+        /// The session's send half.
+        send: SendStream,
+        /// The session's receive half.
+        recv: RecvStream,
+    },
+    /// A `tunnel` stream: accepted and authorized, but the ADR-013 handler is M15.
+    /// The stream is dropped (reset), never silently left open.
     NotYetSupported {
         /// The authenticated peer.
         peer: Digest32,
@@ -234,6 +253,11 @@ pub struct NodeNet {
     /// has no single bound address to publish, and a node behind NAT needs its
     /// *mapped* address. Refreshed by [`NodeNet::refresh_advertised`].
     advertised: Mutex<Option<EndpointList>>,
+    /// What each connected peer reports as this node's source address (ADR-012 rung
+    /// 3's "observed address"). Kept per reporter, never published in a record: it is
+    /// what this node offers a peer to dial during a punch, and a lying peer should
+    /// cost a failed punch rather than a poisoned address record.
+    observed: Mutex<BTreeMap<Digest32, Multiaddr>>,
     service: RendezvousService,
     membership: SharedMembership,
     policy: SharedPolicy,
@@ -263,6 +287,7 @@ impl NodeNet {
         Self {
             manager: Arc::new(ConnectionManager::new(endpoint, Arc::clone(&clock))),
             advertised: Mutex::new(None),
+            observed: Mutex::new(BTreeMap::new()),
             service,
             membership,
             policy: SharedPolicy::new(),
@@ -367,7 +392,7 @@ impl NodeNet {
                 "peer may not open this stream kind",
             ));
         }
-        self.dispatch(peer, kind, send, recv).await
+        self.dispatch(conn, kind, send, recv).await
     }
 
     /// Whether `peer` has a live pre-join record on this board for any channel this
@@ -392,19 +417,19 @@ impl NodeNet {
         conn: &VoxConnection,
         policy: &PeerPolicy,
     ) -> Result<Inbound> {
-        let peer = conn.peer_id();
         let (kind, send, recv) = accept_authorized(conn, policy).await?;
-        self.dispatch(peer, kind, send, recv).await
+        self.dispatch(conn, kind, send, recv).await
     }
 
     /// Serve or hand up an authorized stream.
     async fn dispatch(
         &self,
-        peer: Digest32,
+        conn: &VoxConnection,
         kind: StreamKind,
         send: SendStream,
         recv: RecvStream,
     ) -> Result<Inbound> {
+        let peer = conn.peer_id();
         match kind {
             StreamKind::Rendezvous => {
                 self.service.serve_stream(send, recv).await?;
@@ -413,8 +438,155 @@ impl NodeNet {
             StreamKind::Join => Ok(Inbound::Join { peer, send, recv }),
             StreamKind::Pairwise => Ok(Inbound::Pairwise { peer, send, recv }),
             StreamKind::Sync => Ok(Inbound::Sync { peer, send, recv }),
-            StreamKind::Tunnel | StreamKind::Coord => Ok(Inbound::NotYetSupported { peer, kind }),
+            StreamKind::Coord => {
+                // The answer to `WHOAMI` is this connection's source address as *this*
+                // node sees it — the peer's reflexive address (ADR-012 rung 3).
+                let observed = Multiaddr::from(conn.quinn().remote_address());
+                let manager = Arc::clone(&self.manager);
+                match coordstream::serve_coord(
+                    peer,
+                    observed,
+                    &self.policy.snapshot(),
+                    send,
+                    recv,
+                    move |p| manager.existing(p),
+                )
+                .await?
+                {
+                    coordstream::CoordInbound::Answered => Ok(Inbound::ServedCoord { peer }),
+                    coordstream::CoordInbound::Punch {
+                        peer: origin,
+                        send,
+                        recv,
+                    } => Ok(Inbound::Punch {
+                        peer: origin,
+                        coordinator: peer,
+                        send,
+                        recv,
+                    }),
+                }
+            }
+            StreamKind::Tunnel => Ok(Inbound::NotYetSupported { peer, kind }),
         }
+    }
+
+    /// Ask `peer` what source address it sees for this node and remember the answer
+    /// (ADR-012 rung 3). One small round trip per connection.
+    pub async fn learn_observed(&self, peer: Digest32) -> Result<Multiaddr> {
+        let conn = self
+            .manager
+            .existing(&peer)
+            .ok_or(Error::Unreachable("no connection to ask"))?;
+        let addr = coordstream::ask_observed(&conn).await?;
+        lock(&self.observed).insert(peer, addr);
+        Ok(addr)
+    }
+
+    /// The address peers agree they see for this node, if any: the one most of them
+    /// report. Behind a symmetric NAT reporters disagree (a different mapping per
+    /// destination), and then the punch this feeds is the one ADR-012 says cannot
+    /// work — it fails honestly rather than silently dialling the wrong port.
+    #[must_use]
+    pub fn observed_addr(&self) -> Option<Multiaddr> {
+        // A handful of reporters at most, so a scan beats keeping an ordered index
+        // (`Multiaddr` is deliberately not `Ord` — its ordering is preference, not
+        // value).
+        let mut tally: Vec<(Multiaddr, usize)> = Vec::new();
+        for addr in lock(&self.observed).values() {
+            match tally.iter_mut().find(|(a, _)| a == addr) {
+                Some((_, n)) => *n += 1,
+                None => tally.push((*addr, 1)),
+            }
+        }
+        tally.into_iter().max_by_key(|(_, n)| *n).map(|(a, _)| a)
+    }
+
+    /// The agreed observed address, asking `coordinator` if no peer has reported one
+    /// yet — the punch is about to offer it, so it is worth one round trip.
+    async fn observed_or_ask(&self, coordinator: Digest32) -> Option<Multiaddr> {
+        match self.observed_addr() {
+            Some(addr) => Some(addr),
+            None => self.learn_observed(coordinator).await.ok(),
+        }
+    }
+
+    /// Forget what a peer reported (its connection is gone).
+    pub fn forget_observed(&self, peer: &Digest32) {
+        lock(&self.observed).remove(peer);
+    }
+
+    /// The full ADR-012 ladder for reaching `peer`: a live connection, else a direct
+    /// dial of its advertised endpoints (rungs 1–2), else a **hole punch** coordinated
+    /// through any peer already connected that will relay signaling (rung 3).
+    ///
+    /// Rung 4 (relay of last resort) has no data plane yet, so exhausting this is
+    /// [`Error::Unreachable`] — the honest ADR-012 limit.
+    pub async fn reach(
+        &self,
+        peer: Digest32,
+        endpoints: &EndpointList,
+    ) -> Result<Arc<VoxConnection>> {
+        if let Some(conn) = self.manager.existing(&peer) {
+            return Ok(conn);
+        }
+        if let Ok(conn) = self.manager.connect(peer, endpoints).await {
+            return Ok(conn);
+        }
+        // Why the *last* coordinator's error and not a generic one: a punch fails for
+        // reasons worth telling apart — a coordinator that will not relay, one that
+        // cannot reach the peer, a peer that never answered, a NAT that defeats the
+        // punch — and flattening them all into "unreachable" makes rung 3 undebuggable.
+        let mut last: Option<Error> = None;
+        for candidate in self.manager.peers() {
+            if candidate == peer {
+                continue;
+            }
+            let Some(coordinator) = self.manager.existing(&candidate) else {
+                continue;
+            };
+            match self.punch_through(&coordinator, peer).await {
+                Ok(conn) => return Ok(conn),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or(Error::Unreachable(
+            "no direct path, and no peer is connected to coordinate a hole punch",
+        )))
+    }
+
+    /// The initiator's side of rung 3: ask `coordinator` to carry a punch session to
+    /// `peer`, run the DCUtR exchange, and fire the synchronized dial.
+    pub async fn punch_through(
+        &self,
+        coordinator: &VoxConnection,
+        peer: Digest32,
+    ) -> Result<Arc<VoxConnection>> {
+        let (mut send, mut recv) = coordstream::open_punch_session(coordinator, peer).await?;
+        let observed = self.observed_or_ask(coordinator.peer_id()).await;
+        let local = coordstream::punch_endpoints(observed, &self.local_endpoints()?);
+        let plan = coordstream::run_punch_initiator(&mut send, &mut recv, local).await?;
+        let conn =
+            coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
+                .await?;
+        Ok(self.manager.adopt(conn))
+    }
+
+    /// The responder's side of rung 3, on a session a coordinator relayed here: run the
+    /// exchange and fire immediately, so the dial coincides with the initiator's.
+    pub async fn answer_punch(
+        &self,
+        peer: Digest32,
+        coordinator: Digest32,
+        mut send: SendStream,
+        mut recv: RecvStream,
+    ) -> Result<Arc<VoxConnection>> {
+        let observed = self.observed_or_ask(coordinator).await;
+        let local = coordstream::punch_endpoints(observed, &self.local_endpoints()?);
+        let plan = coordstream::run_punch_responder(&mut send, &mut recv, local).await?;
+        let conn =
+            coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
+                .await?;
+        Ok(self.manager.adopt(conn))
     }
 
     /// Put a framed record on **this node's own** board, without a network round
@@ -603,6 +775,81 @@ mod tests {
     }
 
     /// The board a node serves is usable end to end: a member publishes the genesis,
+    /// An unknown peer may still ask what address it is seen at — that is the one coord
+    /// verb open to everyone, and a NATed client has no other way to learn it. Asking
+    /// the same peer to *relay* a punch is refused.
+    #[test]
+    fn whoami_is_answered_for_anyone_and_a_relay_is_not() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let server_s = signer(11, 12);
+            let client_s = signer(13, 14);
+            let server = net(&server_s);
+            let client = net(&client_s);
+            let server_id = server.local_id();
+            let server_eps = server.local_endpoints().unwrap();
+            // The server knows nobody: every peer is `Unknown`.
+            let serving = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    let conn = server
+                        .manager()
+                        .accept(Admission::AcceptAnyAuthenticated)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let whoami = server.accept_stream(&conn).await;
+                    let relay = server.accept_stream(&conn).await;
+                    (whoami, relay, conn)
+                })
+            };
+            let conn =
+                tokio::time::timeout(TIMEOUT, client.manager().connect(server_id, &server_eps))
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+            // The answer is the client's own source address as the server sees it: over
+            // loopback that is the port the client bound, which is exactly the fact a
+            // NATed client cannot discover by itself.
+            let observed = tokio::time::timeout(TIMEOUT, client.learn_observed(server_id))
+                .await
+                .unwrap()
+                .unwrap();
+            let bound = client.manager().endpoint().local_addr().unwrap();
+            assert_eq!(observed, Multiaddr::from(bound));
+            assert_eq!(client.observed_addr(), Some(observed));
+
+            // Relaying is not open: an unknown peer asking for a punch session is
+            // refused, and told so rather than left hanging.
+            let refused =
+                tokio::time::timeout(TIMEOUT, coordstream::open_punch_session(&conn, [7u8; 32]))
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(refused, Err(Error::HolePunchFailed(_))),
+                "an unknown peer may not ask for a relay: {refused:?}"
+            );
+
+            let (whoami, relay, _conn) = tokio::time::timeout(TIMEOUT, serving)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(whoami, Ok(Inbound::ServedCoord { .. })),
+                "{whoami:?}"
+            );
+            assert!(matches!(relay, Err(Error::StreamRefused(_))), "{relay:?}");
+            // Forgetting a peer forgets what it reported.
+            client.forget_observed(&server_id);
+            assert_eq!(client.observed_addr(), None);
+        });
+    }
+
     /// its address record and its prekey bundle, and a peer fetches all three; the
     /// membership snapshot is what gates the member-only writes.
     #[test]
@@ -829,7 +1076,7 @@ mod tests {
                 StreamKind::Join,
                 StreamKind::Pairwise,
                 StreamKind::Sync,
-                StreamKind::Coord,
+                StreamKind::Tunnel,
             ] {
                 let (mut send, _recv) = open_typed(&conn, kind).await.unwrap();
                 let _ = send.write(b"x").await;
@@ -842,10 +1089,12 @@ mod tests {
             assert!(matches!(out[0], Inbound::Join { peer, .. } if peer == client_fp));
             assert!(matches!(out[1], Inbound::Pairwise { peer, .. } if peer == client_fp));
             assert!(matches!(out[2], Inbound::Sync { peer, .. } if peer == client_fp));
+            // `coord` is served in place now (ADR-012 rung 3); `tunnel` is the kind
+            // still waiting on its ADR-013 handler.
             assert!(matches!(
                 out[3],
                 Inbound::NotYetSupported {
-                    kind: StreamKind::Coord,
+                    kind: StreamKind::Tunnel,
                     ..
                 }
             ));

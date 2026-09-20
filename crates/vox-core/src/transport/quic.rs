@@ -145,6 +145,36 @@ impl VoxEndpoint {
     /// its own verifier output slot), so `bind` itself only stores the local leaf
     /// + the provider's supported-signature algorithms.
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
+        Self::bind_with(signer, |cfg| Endpoint::server(cfg, addr))
+    }
+
+    /// Bind on a caller-supplied datagram socket instead of a real UDP socket.
+    ///
+    /// Everything above the datagram — the ADR-011 handshake, the composite identity
+    /// pinning, the streams — is identical; only where the bytes go changes. This is
+    /// how a simulated network with NAT devices is driven in tests (ADR-012 rungs 3
+    /// and 4 cannot be demonstrated without a middlebox to traverse), and it is the
+    /// hook any other datagram substrate would use.
+    pub fn bind_abstract<S: RootSigner>(
+        signer: &S,
+        socket: Arc<dyn quinn::AsyncUdpSocket>,
+    ) -> Result<Self> {
+        Self::bind_with(signer, |cfg| {
+            Endpoint::new_with_abstract_socket(
+                quinn::EndpointConfig::default(),
+                Some(cfg),
+                socket,
+                Arc::new(quinn::TokioRuntime),
+            )
+        })
+    }
+
+    /// The shared body of the constructors: build this node's leaf credentials and
+    /// hand the resulting server config to `make` to produce the endpoint.
+    fn bind_with<S: RootSigner>(
+        signer: &S,
+        make: impl FnOnce(quinn::ServerConfig) -> std::io::Result<Endpoint>,
+    ) -> Result<Self> {
         let leaf = build_leaf_certificate(signer)?;
         let leaf_chain = leaf.cert_chain();
         let leaf_key = leaf.private_key();
@@ -166,8 +196,8 @@ impl VoxEndpoint {
             .map_err(|_| Error::MalformedBundle("quic server config"))?;
         let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
 
-        let endpoint = Endpoint::server(server_cfg, addr)
-            .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
+        let endpoint =
+            make(server_cfg).map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
 
         Ok(Self {
             endpoint,

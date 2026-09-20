@@ -179,6 +179,57 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     because a renewal that came back with a different external port must be advertised.
 - **Reachability ladder (`nat::reachability`).** `connect_direct` races a peer's direct candidates Happy-Eyeballs-style (RFC 8305, 250 ms staggered start) over the M9 QUIC endpoint via a tokio `JoinSet`, returning the first attempt that authenticates as the expected composite identity; ladder exhaustion is `Error::Unreachable` (the honest ADR-012 limit), never a false success.
 - **Hole-punch (`nat::holepunch`).** The DCUtR Connect/Sync coordination is a pure, deterministic state machine + message codec; the initiator fires RTT/2 after `Sync`, the responder fires on receiving `Sync`, so the simultaneous opens coincide. The synchronized dial reuses `reachability::connect_direct` on the shared endpoint (same local port the peer observed).
+- **Rung 3 is composed, and proved against real NAT behaviour (2026-09-20, ADR-016 M14.9).** The state
+  machine existed with nothing to drive it: no way to learn the address a peer must dial, no channel to
+  carry `Connect`/`Sync` to a peer one cannot reach, and nothing to execute a `PunchPlan`. All three are
+  here, and so is the middlebox needed to prove any of it.
+  - **The proof first (`crates/vox-core/tests/support/vnet.rs`).** Hole punching is a claim about
+    middleboxes, and on loopback there is none — a "punch" test there passes without any punch. So the
+    tests run on an in-process virtual UDP network of `quinn::AsyncUdpSocket`s (reached through the new
+    `VoxEndpoint::bind_abstract`) whose hosts sit behind NAT devices that map and filter per RFC 4787:
+    endpoint-independent mapping with address-and-port-dependent filtering ("port-restricted cone"), or
+    address-and-port-dependent mapping ("symmetric"). A private address is routable only from behind its
+    own NAT, and every drop is counted, so a test can assert the NAT really refused something. Nothing is
+    lost, reordered or delayed, so a failure is behavioural, never a flake. Measured on it: an unsolicited
+    dial to a peer's mapped address **is dropped**; a simultaneous open **traverses** two port-restricted
+    cone NATs and authenticates; the punch tolerates **1.5 s of skew** between the two dials, because
+    QUIC retransmits its Initial — so the RTT/2 timer buys a faster punch, not the only possible one, and
+    a missed timer degrades rather than fails; and a symmetric NAT **defeats** the punch, which is this
+    ADR's documented limit and the reason rung 4 must exist.
+  - **Observed addresses (`node::coordstream`, the `coord` stream).** `WHOAMI` → `OBSERVED <multiaddr>`:
+    the peer answers with the source address it sees for the connection the stream arrived on — what a STUN
+    server answers, from a peer already authenticated. It is open to **any** authenticated peer, including
+    one this node shares no channel with, because the answer is the asker's own address and a NATed client
+    has no other way to learn it (the same openness the board's reads have). A node keeps the answers per
+    reporter and uses the one most of them agree on. It is deliberately **not** published in an address
+    record: a lying peer would then make this node advertise somebody else's address, whereas in a punch a
+    wrong answer costs one failed punch.
+  - **Signaling relay (same stream).** `RELAY <peer>` asks a coordinator to carry a session; the
+    coordinator opens its own `coord` stream to the target with `FROM <peer>`, and on `RELAYING` from both
+    ends forwards `COORD` frames — one encoded `CoordMessage` each, opaque to it — in both directions,
+    at most `MAX_RELAYED_FRAMES` per direction within `RELAY_SESSION_TIMEOUT`. It forwards nothing else,
+    so the verb cannot become a free tunnel (byte forwarding is ADR-013's, with its own consent rules).
+    Each direction is its own task: `read_frame` is not cancel-safe, so a `select!` over both could abandon
+    a half-read frame and desynchronize the stream. Both ends of a relayed session must be peers the
+    coordinator knows — a member, an anchor, or a **pending joiner** (a peer with a live self-signed
+    pre-join record on this board, which is what classified it). Including the joiner is deliberate:
+    without it a newcomer could only join a swarm that already has a publicly reachable member, which is
+    the dependency this ADR exists to remove, and a joiner already holds the far more expensive PoW-gated
+    join stream. An unknown peer gets `WHOAMI` and nothing else.
+  - **The ladder is now one call.** `NodeNet::reach(peer, endpoints)` is rungs 1–3 in order: a live
+    connection, else a direct dial of the advertised endpoints, else a punch coordinated through any
+    connected peer that will relay for it. `punch_endpoints` offers the observed address first and this
+    node's advertised set behind it (a peer on the same LAN can use those), capped at `MAX_ENDPOINTS`.
+    Exhausting it returns the *last* coordinator's error rather than a flattened "unreachable", because a
+    coordinator that will not relay, one that cannot reach the peer, a peer that never answered and a NAT
+    that defeats the punch are worth telling apart. The node's single dial site goes through it, so every
+    connection the node makes now climbs the whole ladder.
+  - **One stream failing is not the connection failing.** Serving `coord` in place exposed a latent defect
+    in the node's per-connection stream loop: any stream error ended the loop, so a peer that opened one
+    bad stream — or a `WHOAMI` that timed out behind a busy actor — silently stopped that connection being
+    served at all, and the node went quiet until it reconnected. The loop now ends only when the connection
+    itself is gone (or after 16 consecutive failures, which cannot happen on a usable connection and keeps
+    a pathological peer from spinning the task).
 - **Relay data-plane boundary.** M10 expresses relay *hints* (`Multiaddr::Relay`) and the bootstrap/relay node set (`nat::bootstrap`), and can reach a relay node over M9. The actual **byte-forwarding** a relay performs is the tunnel mechanism of ADR-013/M11 (a relay is a special tunnel); this is a layering decision, not a deferral of the rendezvous/signaling work, which is complete here.
 
 - **Known gaps (recorded 2026-09-19).** The rungs exist as independent, tested primitives and nothing
@@ -202,6 +253,15 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   is unchosen), `BootstrapSet` is still pure configuration with no node wiring, and UPnP-IGD remains a
   deliberate omission (see the port-mapping note). IPv6 route discovery is Linux-only for the *real*
   route; elsewhere the rung depends on the RFC 7723 anycast address being answered.
+- **Known gaps, revised again (2026-09-20, after rung 3).** Rung 3 is composed and proved through
+  simulated NATs. What remains: **rung 4 has no data plane** — `Multiaddr::Relay` is still a hint, and the
+  both-symmetric-NAT case therefore still ends in `Error::Unreachable`, honestly but unhelpfully.
+  A punch also needs a coordinator that is *already connected to both peers*, and finding one is by trial
+  over the current connections (there is no "who can reach X?" query, and no DHT to ask). The relayed
+  session is not itself authenticated end to end: the coordinator is trusted to forward frames between the
+  two peers it named, which is bounded (it can drop or garble signaling, making the punch fail) but means a
+  hostile coordinator can deny a punch it was asked to carry. `BootstrapSet` remains unwired, so the
+  coordinators a node can use are whichever peers it happens to be connected to.
 
 ## Links
 **Depends on**: ADR-005, ADR-011.

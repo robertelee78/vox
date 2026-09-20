@@ -554,6 +554,18 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   ADR-012's Implementation notes; what changes here is that a node's advertised addresses now stay true
   for as long as the node runs, instead of only for the first two hours.
 
+- **Rung 3: the node punches through a coordinator (M14.9).** A node could only reach peers that were
+  already dialable, which for the use case this runtime exists to serve — a client inside a private
+  network, forming a swarm other things ride on — is most of the time nobody. `NodeNet::reach` is now the
+  whole ADR-012 ladder, so the actor's one dial site climbs it: live connection, direct dial, then a
+  DCUtR hole punch coordinated over the `coord` stream by any connected peer that will relay signaling.
+  The responder side arrives as `Inbound::Punch` and is answered on its own task, because the exchange
+  plus the synchronized dial takes seconds and must not block the coordinator's other streams; the
+  connection it produces is adopted with the same bookkeeping a dialled one gets (a stream loop and a sync
+  schedule). Every connection also asks its peer what address it is seen at, on its own task, so a punch
+  has a mapped address to offer. The details and the NAT simulation that proves it are in ADR-012's
+  Implementation notes.
+
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
 ADR-013, ADR-015.
