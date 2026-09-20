@@ -130,6 +130,12 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   this channel's default `ForwardOnly` history mode an SKDM released at the author's current position
   renders *nothing* earlier, which a test asserts as intended behaviour rather than a plumbing failure.
   A second SKDM for a generation already held is ignored rather than rewinding the chain head.
+- **The pairwise frame names its channel (M14.7d).** An SKDM is delivered inside an ADR-004 session, and a
+  session is bound to a `(channelID, epoch)` while a connection is per *peer* — so the recipient needs to
+  know which session to open the frame with before it can decrypt anything. The `pairwise` frame therefore
+  carries the channelID alongside the sealed message. It is not a secret (it is on the board and in the
+  invite link) and the frame is inside the authenticated QUIC stream either way, so nothing this ADR
+  protects is weakened; the SKDM itself is unchanged.
 - **Known gaps (recorded 2026-09-19).** (1) The ADR-002 §3 cross-signature requirement is met by the
   root signature over the whole SKDM body; the separate `SenderKeyCrossSig` / `sender_key_binding_input`
   mechanism exists but is not wired anywhere — two mechanisms for one requirement, one dead (candidate

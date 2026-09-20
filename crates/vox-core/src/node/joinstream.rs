@@ -7,6 +7,7 @@
 //!
 //! | # | direction | frame | drives |
 //! |---|---|---|---|
+//! | 0 | joiner → responder | `WANT` — which `(channelID, epoch)` this join is for | — |
 //! | 1 | responder → joiner | `CHALLENGE` — signed [`ResponderNonce`], the `sid`, the responder's composite key and its prekey bundle | — |
 //! | 2 | joiner → responder | `SOLVE` — [`PowToken`] + CPace share | [`join_initiate`] |
 //! | 3 | responder → joiner | `SHARE` — CPace share | [`join_accept`] (PoW verified **before** any CPace work) |
@@ -14,6 +15,16 @@
 //! | 5 | responder → joiner | `PROOF` — sealed identity PoP | [`JoinResponder::complete_cpace`], [`JoinProofPending::verify_peer_sealed`] |
 //! | 6 | joiner → responder | `INIT` — PQXDH [`InitialMessage`] | [`JoinInitiatorBootstrap::bootstrap`] |
 //! | 7 | responder → joiner | `ACCEPTED` / `REJECTED` | [`JoinResponderBootstrap::bootstrap`] |
+//!
+//! ## Why the joiner speaks first
+//! ADR-016's frame list starts with the responder's challenge, which silently assumes
+//! the responder already knows which channel is being joined. It does not: a
+//! connection is **per peer**, not per channel (ADR-016 §"Connections"), and a member
+//! may hold many channels with the same peer. So the joiner opens with `WANT`, naming
+//! the `(channelID, epoch)`; the responder answers a challenge only for a channel it
+//! actually holds open and can answer for, and otherwise refuses. The channelID is
+//! not a secret — it is on the board and in the invite link — and the frame is inside
+//! the authenticated QUIC stream either way.
 //!
 //! ## The transport identities are the join's expected identities
 //! Both ends take the peer fingerprint they verify the PoP against from the
@@ -76,6 +87,7 @@ pub const MAX_JOIN_FRAME: usize = 64 * 1024;
 /// Bound on the `sid` a peer may propose (the local one is 16 bytes).
 const MAX_SID: usize = 64;
 
+const OP_WANT: u64 = 0;
 const OP_CHALLENGE: u64 = 1;
 const OP_SOLVE: u64 = 2;
 const OP_SHARE: u64 = 3;
@@ -121,6 +133,13 @@ impl JoinReject {
 /// One frame of the join exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinFrame {
+    /// The joiner names the channel and epoch it wants to join.
+    Want {
+        /// The channelID from the invite link.
+        channel_id: Digest32,
+        /// The epoch it expects (the board's current one).
+        epoch: u64,
+    },
     /// The responder's signed challenge, run `sid`, identity key and bundle.
     Challenge {
         /// The responder's composite public key (must hash to the dialled peer).
@@ -176,6 +195,9 @@ impl JoinFrame {
     pub fn to_frame(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Self::Want { channel_id, epoch } => {
+                e.array(3).uint(OP_WANT).bytes(channel_id).uint(*epoch);
+            }
             Self::Challenge {
                 responder_pub,
                 challenge_sig,
@@ -233,6 +255,10 @@ impl JoinFrame {
         let n = d.array()?;
         let op = d.uint()?;
         let frame = match (op, n) {
+            (OP_WANT, 3) => Self::Want {
+                channel_id: *take_fixed::<32>(&mut d, "want channel_id")?,
+                epoch: d.uint()?,
+            },
             (OP_CHALLENGE, 9) => {
                 let responder_pub = take_fixed::<COMPOSITE_PUB_LEN>(&mut d, "challenge key")?;
                 let challenge_sig = take_fixed::<COMPOSITE_SIG_LEN>(&mut d, "challenge sig")?;
@@ -338,6 +364,16 @@ pub async fn run_initiator(
 ) -> Result<JoinOutcome> {
     let responder_fp = conn.peer_id();
     let (mut send, mut recv) = open_typed(conn, StreamKind::Join).await?;
+
+    // 0. WANT — the responder holds many channels; say which one.
+    send_frame(
+        &mut send,
+        &JoinFrame::Want {
+            channel_id: ctx.channel_id,
+            epoch: ctx.epoch,
+        },
+    )
+    .await?;
 
     // 1. CHALLENGE. The responder's key must be the identity the QUIC handshake
     //    already proved, and its bundle must be its own.
@@ -463,6 +499,24 @@ pub struct ResponderConfig<'a> {
     pub pending_joins: u32,
     /// Wall clock (for the prekey-ring consume record).
     pub now_secs: u64,
+}
+
+/// Read the joiner's opening `WANT` frame, so the caller can select the channel
+/// before it builds the [`ResponderConfig`] (see the module docs for why the joiner
+/// speaks first).
+pub async fn read_join_request(recv: &mut RecvStream) -> Result<(Digest32, u64)> {
+    match recv_frame(recv).await? {
+        JoinFrame::Want { channel_id, epoch } => Ok((channel_id, epoch)),
+        _ => Err(Error::MalformedJoin("expected want")),
+    }
+}
+
+/// Refuse a join on a stream whose `WANT` named a channel this node cannot answer
+/// for (it does not hold it, or it is app-locked so the passphrase is gone). The
+/// reason is the same opaque `Refused` every post-work refusal uses.
+pub async fn refuse_join(mut send: SendStream) {
+    let _ = send_frame(&mut send, &JoinFrame::Rejected(JoinReject::Refused)).await;
+    let _ = send.finish();
 }
 
 /// Run the **responder** side on an already-accepted, already-authorized `join`
@@ -669,6 +723,10 @@ mod tests {
     #[test]
     fn join_frames_round_trip_and_refuse_malformed() {
         let frames = [
+            JoinFrame::Want {
+                channel_id: CHANNEL,
+                epoch: EPOCH,
+            },
             JoinFrame::Challenge {
                 responder_pub: Box::new([7u8; COMPOSITE_PUB_LEN]),
                 challenge_sig: Box::new([8u8; COMPOSITE_SIG_LEN]),
@@ -787,8 +845,12 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                    let (kind, send, recv) = accept_authorized(&conn, &policy).await.unwrap();
+                    let (kind, send, mut recv) = accept_authorized(&conn, &policy).await.unwrap();
                     assert_eq!(kind, StreamKind::Join);
+                    // The joiner names the channel first (M14.7d).
+                    let (want_cid, want_epoch) = read_join_request(&mut recv).await.unwrap();
+                    assert_eq!(want_cid, CHANNEL);
+                    assert_eq!(want_epoch, EPOCH);
                     let cfg = ResponderConfig {
                         ctx,
                         passphrase: responder_pass,

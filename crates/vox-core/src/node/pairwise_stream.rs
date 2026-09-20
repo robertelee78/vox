@@ -10,7 +10,13 @@
 //!
 //! | direction | frame |
 //! |---|---|
-//! | either | `SKDM` — one ratchet [`Message`] whose plaintext is an SKDM |
+//! | either | `SKDM` — the `channelID` plus one ratchet [`Message`] whose plaintext is an SKDM |
+//!
+//! The channelID travels **outside** the sealed message because the recipient needs
+//! it to pick the session that decrypts it: an ADR-004 session is bound to a
+//! `(channelID, epoch)`, a connection is per *peer*, and one peer may share several
+//! channels with us. It is not a secret (it is on the board and in the invite link),
+//! and the frame is inside the authenticated QUIC stream regardless.
 //!
 //! Both sides may send; a stream carries one frame per SKDM and the sender
 //! half-closes when done, so delivering a key needs no round trip and cannot block
@@ -51,6 +57,8 @@ pub enum PairwiseFrame {
     /// A sealed sender-key distribution message: the wire bytes of one ratchet
     /// [`Message`] whose plaintext is an [`Skdm`].
     Skdm {
+        /// The channel whose session seals this message.
+        channel_id: crate::hash::Digest32,
         /// `Message::to_wire` bytes.
         sealed: Vec<u8>,
     },
@@ -62,8 +70,8 @@ impl PairwiseFrame {
     pub fn to_frame(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
-            Self::Skdm { sealed } => {
-                e.array(2).uint(OP_SKDM).bytes(sealed);
+            Self::Skdm { channel_id, sealed } => {
+                e.array(3).uint(OP_SKDM).bytes(channel_id).bytes(sealed);
             }
         }
         e.finish()
@@ -75,7 +83,11 @@ impl PairwiseFrame {
         let n = d.array()?;
         let op = d.uint()?;
         let frame = match (op, n) {
-            (OP_SKDM, 2) => Self::Skdm {
+            (OP_SKDM, 3) => Self::Skdm {
+                channel_id: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedBundle("pairwise channel_id length"))?,
                 sealed: d.bytes()?.to_vec(),
             },
             _ => return Err(Error::MalformedBundle("pairwise frame op")),
@@ -85,37 +97,56 @@ impl PairwiseFrame {
     }
 }
 
-/// Seal `skdm` into `session` and write it as one frame.
-pub async fn send_skdm(send: &mut SendStream, session: &mut Session, skdm: &Skdm) -> Result<()> {
+/// Seal `skdm` into `session` and write it as one frame for `channel_id`.
+pub async fn send_skdm(
+    send: &mut SendStream,
+    channel_id: &crate::hash::Digest32,
+    session: &mut Session,
+    skdm: &Skdm,
+) -> Result<()> {
     let sealed = skdm.seal_into(session)?.to_wire();
-    let frame = PairwiseFrame::Skdm { sealed };
+    let frame = PairwiseFrame::Skdm {
+        channel_id: *channel_id,
+        sealed,
+    };
     write_frame(send, &frame.to_frame()).await
 }
 
 /// Open a `pairwise` stream on `conn`, deliver one SKDM, and half-close. The
 /// stream's lifetime is the delivery: nothing is expected back.
-pub async fn deliver_skdm(conn: &VoxConnection, session: &mut Session, skdm: &Skdm) -> Result<()> {
+pub async fn deliver_skdm(
+    conn: &VoxConnection,
+    channel_id: &crate::hash::Digest32,
+    session: &mut Session,
+    skdm: &Skdm,
+) -> Result<()> {
     let (mut send, _recv) = open_typed(conn, StreamKind::Pairwise).await?;
-    send_skdm(&mut send, session, skdm).await?;
+    send_skdm(&mut send, channel_id, session, skdm).await?;
     let _ = send.finish();
     Ok(())
 }
 
 /// Read the next frame from an already-accepted, already-authorized `pairwise`
-/// stream and open it into an SKDM (still unverified — the channel verifies it
-/// against the author's admitted key). `Ok(None)` on a clean half-close with no
-/// further frames.
-pub async fn recv_skdm(
+/// stream, returning which channel it is for and the still-sealed bytes.
+///
+/// Opening it needs the session for `(channel, peer)`, which only the actor knows,
+/// so the two steps are separate: this reads, [`open_skdm`] decrypts. `Ok(None)` on
+/// a clean half-close with no further frames.
+pub async fn recv_pairwise(
     recv: &mut RecvStream,
-    session: &mut Session,
-    now_secs: u64,
-) -> Result<Option<Skdm>> {
+) -> Result<Option<(crate::hash::Digest32, Vec<u8>)>> {
     let Some(bytes) = read_frame(recv, MAX_PAIRWISE_FRAME).await? else {
         return Ok(None);
     };
-    let PairwiseFrame::Skdm { sealed } = PairwiseFrame::from_frame(&bytes)?;
-    let message = Message::from_wire(&sealed)?;
-    Skdm::open_from(session, &message, now_secs).map(Some)
+    let PairwiseFrame::Skdm { channel_id, sealed } = PairwiseFrame::from_frame(&bytes)?;
+    Ok(Some((channel_id, sealed)))
+}
+
+/// Open sealed bytes from [`recv_pairwise`] into an SKDM (still unverified — the
+/// channel verifies it against the author's admitted key).
+pub fn open_skdm(session: &mut Session, sealed: &[u8], now_secs: u64) -> Result<Skdm> {
+    let message = Message::from_wire(sealed)?;
+    Skdm::open_from(session, &message, now_secs)
 }
 
 #[cfg(test)]
@@ -144,18 +175,19 @@ mod tests {
     #[test]
     fn pairwise_frames_round_trip_and_refuse_malformed() {
         let f = PairwiseFrame::Skdm {
+            channel_id: [0xA1; 32],
             sealed: vec![1, 2, 3, 4],
         };
         assert_eq!(PairwiseFrame::from_frame(&f.to_frame()).unwrap(), f);
         // Unknown op and wrong arity are refused.
         let mut e = Encoder::new();
-        e.array(2).uint(9).bytes(&[]);
+        e.array(3).uint(9).bytes(&[]).bytes(&[]);
         assert!(matches!(
             PairwiseFrame::from_frame(&e.finish()),
             Err(Error::MalformedBundle("pairwise frame op"))
         ));
         let mut e = Encoder::new();
-        e.array(1).uint(OP_SKDM);
+        e.array(2).uint(OP_SKDM).bytes(&[]);
         assert!(PairwiseFrame::from_frame(&e.finish()).is_err());
         assert!(PairwiseFrame::from_frame(&[]).is_err());
     }
@@ -253,7 +285,14 @@ mod tests {
                         .unwrap();
                     let (kind, _send, mut recv) = accept_authorized(&conn, &policy).await.unwrap();
                     assert_eq!(kind, StreamKind::Pairwise);
-                    let got = recv_skdm(&mut recv, &mut alice_session, T0).await;
+                    let got = match recv_pairwise(&mut recv).await {
+                        Ok(Some((cid, sealed))) => {
+                            assert_eq!(cid, CHANNEL, "the frame names its channel");
+                            open_skdm(&mut alice_session, &sealed, T0).map(Some)
+                        }
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(e),
+                    };
                     (got, conn)
                 })
             };
@@ -264,7 +303,9 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            deliver_skdm(&conn, &mut bob_session, &skdm).await.unwrap();
+            deliver_skdm(&conn, &CHANNEL, &mut bob_session, &skdm)
+                .await
+                .unwrap();
 
             let (got, _conn) = tokio::time::timeout(TIMEOUT, server)
                 .await

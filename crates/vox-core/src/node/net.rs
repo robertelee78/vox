@@ -117,6 +117,12 @@ impl PeerPolicy {
         }
     }
 
+    /// The identities this policy is currently expecting a join from.
+    #[must_use]
+    pub fn pending_joiners(&self) -> Vec<Digest32> {
+        self.pending_joiners.iter().copied().collect()
+    }
+
     /// Whether a peer of `class` may open a `kind` stream.
     ///
     /// - **Member**: everything. It is in the channel; the log, consent and

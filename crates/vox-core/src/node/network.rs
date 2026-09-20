@@ -56,6 +56,53 @@ use crate::time::Clock;
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
 use crate::transport::streams::StreamKind;
 
+/// The peer classification the accept path reads, refreshed by the actor whenever
+/// channel membership or the pending-joiner set changes.
+///
+/// Same seam as [`SharedMembership`] and for the same reason: a stream is served on
+/// its own task, while the policy is derived from state the actor owns. Staleness
+/// fails **closed** — a peer missing from the snapshot is classified `Unknown` and
+/// may open only the board.
+#[derive(Clone, Default)]
+pub struct SharedPolicy {
+    inner: Arc<Mutex<PeerPolicy>>,
+}
+
+impl std::fmt::Debug for SharedPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedPolicy").finish_non_exhaustive()
+    }
+}
+
+impl SharedPolicy {
+    /// An empty policy (every peer is unknown).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the policy wholesale (the actor rebuilds it from channel state).
+    pub fn replace(&self, policy: PeerPolicy) {
+        *lock(&self.inner) = policy;
+    }
+
+    /// Expect a join from `joiner` until it is forgotten.
+    pub fn expect_joiner(&self, joiner: Digest32) {
+        lock(&self.inner).expect_joiner(joiner);
+    }
+
+    /// Stop expecting a join from `joiner`.
+    pub fn forget_joiner(&self, joiner: &Digest32) -> bool {
+        lock(&self.inner).forget_joiner(joiner)
+    }
+
+    /// A snapshot to authorize one stream against.
+    #[must_use]
+    pub fn snapshot(&self) -> PeerPolicy {
+        lock(&self.inner).clone()
+    }
+}
+
 /// One `(channel, epoch)` bucket's members, keyed by fingerprint.
 type MemberMap = BTreeMap<Digest32, CompositePublicKey>;
 
@@ -93,6 +140,12 @@ impl SharedMembership {
     /// Forget every epoch of `channel_id` (the channel was closed or locked).
     pub fn clear_channel(&self, channel_id: &Digest32) {
         lock(&self.inner).retain(|(cid, _), _| cid != channel_id);
+    }
+
+    /// The `(channel, epoch)` buckets the snapshot holds.
+    #[must_use]
+    pub fn channels(&self) -> Vec<(Digest32, u64)> {
+        lock(&self.inner).keys().copied().collect()
     }
 
     /// How many `(channel, epoch)` buckets the snapshot holds.
@@ -177,6 +230,7 @@ pub struct NodeNet {
     manager: Arc<ConnectionManager>,
     service: RendezvousService,
     membership: SharedMembership,
+    policy: SharedPolicy,
     clock: Clock,
 }
 
@@ -204,6 +258,7 @@ impl NodeNet {
             manager: Arc::new(ConnectionManager::new(endpoint, Arc::clone(&clock))),
             service,
             membership,
+            policy: SharedPolicy::new(),
             clock,
         }
     }
@@ -218,6 +273,12 @@ impl NodeNet {
     #[must_use]
     pub fn membership(&self) -> &SharedMembership {
         &self.membership
+    }
+
+    /// The peer policy the accept path authorizes against (the actor refreshes it).
+    #[must_use]
+    pub fn policy(&self) -> &SharedPolicy {
+        &self.policy
     }
 
     /// The board this node serves.
@@ -242,9 +303,44 @@ impl NodeNet {
         (self.clock)()
     }
 
-    /// Accept the next stream on `conn`, authorize it, and serve it if it is the
-    /// board. Anything the actor must handle comes back as an [`Inbound`].
-    pub async fn accept_stream(
+    /// Accept the next stream on `conn`, authorize it against the shared policy, and
+    /// serve it if it is the board. Anything the actor must handle comes back as an
+    /// [`Inbound`].
+    pub async fn accept_stream(&self, conn: &VoxConnection) -> Result<Inbound> {
+        let mut snapshot = self.policy.snapshot();
+        // ADR-016's "pending pre-join identity" is a *board* fact, not a list someone
+        // maintains: a joiner announces itself by publishing a pre-join record
+        // (`0x0008`, self-signed, which anyone may publish), and that is what makes it
+        // eligible to open a `join` stream. Consulting the board here keeps open
+        // passphrase joins possible (ADR-007) without the actor having to be told
+        // about every PUT — and an identity with no record stays `Unknown`, so it
+        // reaches the board and nothing else.
+        let peer = conn.peer_id();
+        if snapshot.classify(&peer) == crate::node::net::PeerClass::Unknown
+            && self.peer_has_prejoin(&peer)
+        {
+            snapshot.expect_joiner(peer);
+        }
+        self.accept_stream_with(conn, &snapshot).await
+    }
+
+    /// Whether `peer` has a live pre-join record on this board for any channel this
+    /// node holds.
+    #[must_use]
+    pub fn peer_has_prejoin(&self, peer: &Digest32) -> bool {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        self.membership.channels().iter().any(|(cid, _)| {
+            guard
+                .current_prejoins(cid, now)
+                .iter()
+                .any(|r| r.asserted_id() == *peer)
+        })
+    }
+
+    /// [`NodeNet::accept_stream`] against an explicit policy snapshot.
+    pub async fn accept_stream_with(
         &self,
         conn: &VoxConnection,
         policy: &PeerPolicy,
@@ -506,7 +602,7 @@ mod tests {
                     let policy = PeerPolicy::new(); // the member is "unknown": board only
                     let mut served = Vec::new();
                     for _ in 0..3 {
-                        served.push(anchor.accept_stream(&conn, &policy).await.unwrap());
+                        served.push(anchor.accept_stream_with(&conn, &policy).await.unwrap());
                     }
                     (served, conn)
                 })
@@ -587,8 +683,8 @@ mod tests {
                         .unwrap();
                     let policy = PeerPolicy::new();
                     // Two rendezvous streams: before and after the refresh.
-                    let a = anchor.accept_stream(&conn, &policy).await;
-                    let b = anchor.accept_stream(&conn, &policy).await;
+                    let a = anchor.accept_stream_with(&conn, &policy).await;
+                    let b = anchor.accept_stream_with(&conn, &policy).await;
                     (a, b, conn)
                 })
             };
@@ -661,7 +757,7 @@ mod tests {
                         .unwrap();
                     let mut out = Vec::new();
                     for _ in 0..4 {
-                        out.push(server.accept_stream(&conn, &policy).await.unwrap());
+                        out.push(server.accept_stream_with(&conn, &policy).await.unwrap());
                     }
                     (out, conn)
                 })
@@ -822,9 +918,16 @@ mod tests {
                 let peer = conn.peer_id();
                 assert_eq!(peer, bob_fp);
                 loop {
-                    match alice_net.accept_stream(&conn, &policy).await.unwrap() {
+                    match alice_net.accept_stream_with(&conn, &policy).await.unwrap() {
                         Inbound::ServedRendezvous { .. } => {}
-                        Inbound::Join { send, recv, .. } => {
+                        Inbound::Join { send, mut recv, .. } => {
+                            // The joiner names the channel before we choose one.
+                            let (want, epoch) =
+                                crate::node::joinstream::read_join_request(&mut recv)
+                                    .await
+                                    .unwrap();
+                            assert_eq!(want, cid);
+                            assert_eq!(epoch, 0);
                             break alice_net
                                 .answer_join(
                                     peer,
