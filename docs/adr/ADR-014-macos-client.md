@@ -48,8 +48,10 @@ ADRs) are referenced, not duplicated, and are not deferrals.
   Developer ID** (direct download / DMG), **not** the Mac App Store. Rationale: the App Store sandbox
   cannot accommodate the `NetworkExtension` + privileged helper that tunneling requires (ADR-013) or
   a long-lived background node agent. App Sandbox entitlements are applied where compatible with those
-  components; the privileged helper / system extension is added only where a TUN interface later
-  requires it (ADR-013).
+  components. **The privileged helper / system extension is load-bearing, not conditional** (amended
+  2026-09-21): ADR-017 decision 5 makes the Vox interface the way a person reaches a room-bound service,
+  so `ssh user@<id>.vox` does not work without it. It claims an interface and the `.vox` resolver **once,
+  at install** — nothing on the data path is privileged, and no port is ever bound.
 
 ### Identity & onboarding
 

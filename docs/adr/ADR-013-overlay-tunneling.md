@@ -2,7 +2,7 @@
 
 **Status**: implemented and **reachable** — the per-stream port-forward model runs end to end through the node (`crates/vox-core/src/{tunnel,node/tunnel}.rs`, `crates/vox-tui` `service`/`grant`/`forward`), gated by a release test that reaches a TCP service between two symmetric-NAT clients through an anchor; SOCKS front-end, signed session events, the SSH-CA binding and the TUN datapath remain (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
+**Updated**: 2026-09-21 — the **TUN interface is promoted from optional to the person-facing path** (ADR-017 decision 5): an unmodified tool reaches a service by its `.vox` name, Vox terminates TCP off the interface, and no port is bound on either machine. The per-stream forward stays the tool-facing path and the fallback; the SOCKS front-end is no longer on the product path. 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: tunneling, tcp, ssh, tun, socks, authorization, zero-trust
 
@@ -21,13 +21,21 @@ established substrate and marked as such. This ADR specifies the complete tunnel
 
 ### Interface models — offer both, mapped onto QUIC streams (ADR-011)
 
-- **Per-stream SOCKS / port-forward (ssh-style) — primary.** Targeted, least-privilege: forward a
-  single local port to a specific member's service, or expose a local SOCKS proxy. This is the
-  default and the path for `ssh` over Vox.
-- **TUN virtual interface (VPN-style) — optional.** A `utun` interface with identity-derived
-  addressing for "everything just routes" between members; on macOS via `NetworkExtension` /
-  privileged helper (notarized, ADR-014). Per-service authorization (below) still applies on the
-  TUN path — the interface is convenience, not a bypass of policy.
+- **TUN virtual interface — the person-facing path (ADR-017 decision 5, amended 2026-09-21).** A
+  `utun`/`tun` interface with identity-derived addressing, so an *unmodified* tool reaches a service by
+  name: `ssh user@<id>.vox` with nothing configured in `ssh`. Vox reads IP packets off the interface and
+  terminates TCP in userspace, so **no port is bound on either machine** — the port in a `.vox` address
+  is a Vox-layer identifier the serving side translates to whatever local endpoint it chose, the way a
+  NAT does. On macOS via `NetworkExtension` / privileged helper (notarized, ADR-014). Per-service
+  authorization (below) applies in full on this path — the interface is reach, never a bypass of policy.
+  *This was recorded as "optional" until 2026-09-21; ADR-017 promoted it, because a proxy or a loopback
+  socket cannot be reached by an unmodified tool.*
+- **Per-stream port-forward (ssh-style) — the tool-facing path, and the fallback.** Targeted and
+  least-privilege: forward a single local port to a specific member's service (`vox forward`). This is
+  what a script wants, what addresses a member directly when a room has several hosts, and what a
+  machine that cannot take the interface is left with. A local SOCKS proxy over the same codec
+  (`tunnel::socks`) remains an unfinished item here and is **not** on ADR-017's path: it needs every tool
+  told about it, which is the requirement it fails.
 
 ### Authorization model (evidence-driven): zero-trust, capability-scoped, consent-gated
 

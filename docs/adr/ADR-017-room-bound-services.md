@@ -4,9 +4,10 @@
 surface, the `.vox` name, capability-bearing rooms and audience-encrypted advertisements are specified
 here)
 **Date**: 2026-09-21
-**Updated**: 2026-09-21 — the person-facing address is a **`.vox` hostname**, and the local entry point
-is a **SOCKS5 proxy** (`vox up`), chosen over a loopback-alias scheme and over the TUN interface for the
-reason given in decision 5. The service is named by its **port**, not by a tag.
+**Updated**: 2026-09-21 — the person-facing address is a **`.vox` hostname** and the local entry point is
+a **Vox network interface** (`vox up`), because the criterion is that an *unmodified* tool reaches the
+name; the SOCKS5 proxy first recorded here is superseded (decision 5). The service is named by its
+**port**, which is a Vox-layer identifier, not a bound port on either machine.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: services, tunneling, ux, capability, discovery, hidden-service
 
@@ -109,11 +110,15 @@ joined. reachable as f6wxkoxq36ofp5zxvmtlx6mg6gr2t2tfcr66aq3l5w5cctqmxg3q.vox
 $ ssh user@f6wxkoxq36ofp5zxvmtlx6mg6gr2t2tfcr66aq3l5w5cctqmxg3q.vox
 ```
 
+`vox up` (decision 5) is what makes the third line work, and it is run once per machine, not per room.
+
 #### The port names the service
 
-There is no tag for a person to invent, share or remember. `vox serve 22` offers the host's local
-`127.0.0.1:22`, and the guest reaches it on **port 22 of the `.vox` name** — the port the tool would
-have used anyway. ADR-013's `TunnelRequest` already carries a free-form `service_tag: String`, so the
+There is no tag for a person to invent, share or remember. `vox serve 22` offers the serving machine's
+own `127.0.0.1:22`, and the connecting machine reaches it on **port 22 of the `.vox` name** — the port the
+tool would have used anyway. The two are the same number by default and need not be: the port in a `.vox`
+address is a Vox-layer identifier that the serving machine translates to whatever local endpoint it
+chose, so it collides with nothing and binds nothing (decision 5). ADR-013's `TunnelRequest` already carries a free-form `service_tag: String`, so the
 tag of a port-named service is simply its port in decimal; this is a UX decision with **no wire
 change**. `vox serve 22 --at 10.0.0.5:2222` covers the case where the local endpoint is not
 `127.0.0.1:<same port>`, and `vox service add <tag> <endpoint>` remains for the
@@ -165,44 +170,60 @@ Rules the surface must honour:
 - **`vox serve` refuses to start rather than appear to work.** If the host cannot be reached and has no
   anchor configured, it says so and says what to do, instead of minting an address nobody can use.
 
-### 5. One local entry point: a SOCKS5 proxy (`vox up`)
+### 5. One local entry point: a Vox interface (`vox up`)
 
-A `.vox` name is not in DNS and Vox is not in the kernel, so something local must turn
-`ssh user@….vox` into a Vox dial. Exactly three mechanisms can do that, because a TCP connection to
-loopback carries no hostname: **tell a proxy the name**, **give every name its own local IP address**,
-or **own a network interface**. The decision is the first:
+The criterion is exactly one thing: **`ssh user@<id>.vox` works, unmodified, with nothing configured in
+`ssh`.** Everything below follows from that and nothing else.
 
-> **`vox up` runs a SOCKS5 proxy on `127.0.0.1:1080`.** It resolves `.vox` names itself (`socks5h`,
-> hostname passed through unresolved), maps each to the room it belongs to, and splices the connection
-> to `tunnel::session::dial` with the requested port as the service tag. ADR-013's SOCKS5 front-end
-> (`tunnel::socks`, RFC 1928, already coded and tested including `ATYP_DOMAIN`) is the implementation.
+The data path, with the two machines named unambiguously:
 
-It wins on one criterion that outranks elegance: **it never needs privilege, on any platform, ever.**
-Per-name loopback addresses require `ifconfig lo0 alias` on macOS, and a TUN interface requires a
-privileged helper or a NetworkExtension — both make "try Vox" begin with `sudo`. A tool that replaces a
-Tor private service must be installable by a person who cannot install a system extension on the
-machine they are using.
+1. On the **connecting machine**, `ssh` resolves `<id>.vox` and opens TCP to the address it gets back.
+   Vox owns that address, so the packets arrive on the Vox interface, and Vox terminates the TCP in
+   userspace (`smoltcp`, ADR-013's stated choice).
+2. **Over the Vox layer**, that stream is carried as one QUIC stream per TCP connection (ADR-013),
+   authorized by `dial:<port>` against the room's evaluator (ADR-007).
+3. On the **serving machine**, Vox connects to the local endpoint chosen when the service was declared —
+   `vox serve 22` means its own `127.0.0.1:22`, where the real `sshd` is already listening.
 
-The cost is honest and small: a proxy-aware tool needs to be told once. For `ssh` that is a
-`ProxyCommand` block in `~/.ssh/config`, matched on `*.vox` and written once for all rooms forever;
-for most other tools it is the standard `ALL_PROXY=socks5h://127.0.0.1:1080`. **This is precisely what a
-Tor user already does** — `torsocks`, or the same `ProxyCommand` shape against port 9050 — so the guest
-experience is at parity with the bar this ADR is measured against, not below it.
+**Nothing binds a port at either end.** The serving machine dials *out* to its own endpoint; the
+connecting machine reads *packets*. The port in a `.vox` address is therefore a **Vox-layer
+identifier**, translated at step 3 to whatever local endpoint the host picked — it behaves like a NAT
+over the overlay, and it is entirely userland. 22, 65532, or anything else is the same to it, and
+neither machine's port-privilege model is on the data path.
 
-Tools with no proxy support at all (`psql` is the honest example) are served by `vox forward`, which
-already exists and binds a real local port. Nothing is unreachable; one class of tool is one command
-less convenient.
+> **`vox up` brings up the Vox interface and answers `.vox` names.** It is the one local entry point,
+> and the only mechanism that meets the criterion.
 
-**The TUN interface is the later upgrade, not a rival.** It is the only mechanism that needs nothing
-configured in any tool, and it remains specified — under ADR-014, which owns the privileged helper and
-the packaging that makes a system extension acceptable. When it lands it arrives *under the same verb*:
-`vox up` means "make `.vox` names reachable from this machine", and it will then do so with an
-interface where today it does so with a proxy. Nothing a user learns now becomes wrong. This amends
-ADR-013, where `vox up` named the TUN path specifically.
+- **The address is ADR-013's identity-derived ULA**, already implemented and tested
+  (`tunnel::addr::overlay_addr`): `0xFD ‖ high-120-bits(SHA-256("vox/ula/v1" ‖ pubkey))`. Self-certifying,
+  allocation-free, and recomputable from the identity the ADR-011 handshake pins — so the address the
+  kernel routes and the key the connection authenticates are the same fact.
+- **Vox answers DNS for `.vox` and for nothing else**, on loopback: `<52-char-base32>.vox` → the `AAAA`
+  of the member serving that room, read from the room's own signed log. A name for a room this machine
+  has not joined is `NXDOMAIN`, so `ssh` says "could not resolve hostname" — the honest message, and no
+  dial is attempted.
+- **A room with more than one member offering the same port** is addressed per member, not by the room
+  name; the room name resolves to the host that declared the service. That is the
+  service-in-an-existing-room shape, and `vox forward <member>/<tag>` already covers it.
 
-The loopback-alias scheme is rejected outright rather than deferred: it buys only the deletion of a
-one-time `ProxyCommand` block, costs a privileged setup step to buy it, and is strictly dominated by
-the TUN path it resembles.
+**A proxy cannot meet the criterion, which is why this reverses an earlier decision here.** This ADR
+previously specified a SOCKS5 proxy on the grounds that it never needs privilege. That optimised the
+wrong variable: a proxy has to be *told about* by every tool — `ProxyCommand` for `ssh`, `ALL_PROXY` for
+`curl`, nothing at all for `psql` — and the requirement is zero configuration, not zero privilege. Per-name
+loopback addresses fail the same test for a different reason: they need a privileged alias per address on
+macOS, and they still leave Vox holding sockets instead of packets. The interface is the only mechanism
+where an unmodified tool reaches a `.vox` name.
+
+**What it costs, stated plainly: one privileged step at install, and none afterwards.** Creating the
+interface, routing the ULA prefix, and registering the `.vox` resolver are privileged because they claim
+an interface and a DNS suffix — not because of anything to do with ports. On Linux a persistent device
+owned by the user (`ip tuntap add mode tun user <you>`, once) leaves `vox up` itself unprivileged
+thereafter; on macOS it is the `NetworkExtension` ADR-014 already plans for. This is the same install a
+VPN asks for, once per machine, and it buys every tool working with nothing configured, forever.
+
+Where a machine genuinely cannot take the interface, `vox forward` (already shipped) still gives a local
+port and the user types `ssh -p <port> user@127.0.0.1`. That is a worse experience, labelled as one — a
+fallback, not a second supported design.
 
 ### 6. The anchor is configuration, not an argument
 
@@ -222,13 +243,15 @@ Stated honestly, side by side with the thing being replaced, and counting the gu
 |---|---|---|
 | **host, once** | two `torrc` lines, restart, read the `.onion` | `vox serve 22`, read the address and the passphrase |
 | **host, per guest** | — | — (the service grant is in the genesis, decision 3) |
-| **guest, once** | `ProxyCommand` for `*.onion`, or `torsocks` | `vox connect <address>` + passphrase; `vox up`; `ProxyCommand` for `*.vox` |
-| **guest, per use** | `ssh user@<id>.onion` | `ssh user@<id>.vox` |
+| **guest, once per machine** | `ProxyCommand` for `*.onion`, or `torsocks` | `vox up` (install: an interface and a `.vox` resolver) |
+| **guest, once per room** | — | `vox connect <address>` + passphrase |
+| **guest, per use** | `torsocks ssh user@<id>.onion` | `ssh user@<id>.vox` |
 
-The per-use line is identical, and the one-time proxy configuration is identical in kind and in effort.
-Vox's guest does two things Tor's does not: **join the room** and **hold a passphrase**. Neither is
-overhead to be apologised for — they are the second factor and the revocability that Tor has no
-equivalent of (decision 3's trade, and `Consequences`).
+The per-use line is where Vox is **better than the bar**, not level with it: a Tor user wraps or
+configures every tool, and a Vox user does not. The trade is one privileged install against
+per-tool configuration forever. Vox's guest also does two things Tor's does not: **join the room** and
+**hold a passphrase**. Neither is overhead to be apologised for — they are the second factor and the
+revocability that Tor has no equivalent of (decision 3's trade, and `Consequences`).
 
 The host side varies with reachability, because the ADR-012 ladder is not uniform:
 
@@ -275,9 +298,10 @@ Discovery is **convenience, never authorization**. Seeing an advertisement never
   base32; it resolves only inside a client that has joined that room, from data it already holds. There
   is no directory, no registration, no DNS suffix to own, nothing to squat and nothing to enumerate.
   Vox will not publish a `.vox` resolver and will not ask for the TLD to be delegated (decision 4).
-- **No privileged installation on the default path.** `vox up` is an unprivileged local proxy. Anything
-  needing a helper, a system extension or a kernel interface belongs to ADR-014 and is additive
-  (decision 5). "Try Vox" must never begin with `sudo`.
+- **No privilege on the data path, and none per use.** `vox up` claims an interface and a DNS suffix
+  once, at install; after that nothing Vox does to carry a connection is privileged, and no port on
+  either machine is ever bound (decision 5). A second privileged step — per room, per service, per
+  connection — is out of scope by construction.
 
 ## Consequences
 
@@ -291,7 +315,8 @@ Discovery is **convenience, never authorization**. Seeing an advertisement never
 - The address a person types is the string they were already given, at the port the tool already uses,
   and it certifies itself: there is no moment in the flow where a user must compare two fingerprints or
   trust a first sighting.
-- The entry point needs no privilege, so Vox is usable on a machine the user does not administer.
+- Every tool works with nothing configured — including the ones that have no proxy support at all — and
+  no port is ever bound on either machine, so a `.vox` service collides with nothing the host already runs.
 
 ### Negative
 - A leaked address **and** passphrase together yield service access with no further human step. This is
@@ -303,9 +328,13 @@ Discovery is **convenience, never authorization**. Seeing an advertisement never
   cannot silently become an access list), but it means `vox serve` and "add a service to my chat room"
   are genuinely different flows.
 - A host that is unreachable still needs an anchor, and that is one step Tor does not have.
-- A tool with no SOCKS support (`psql` is the honest example) cannot use a `.vox` name until the ADR-014
-  TUN path lands; such tools use `vox forward` and a local port. This is the price of refusing to
-  require privilege, and it is paid by a minority of tools.
+- `vox up` needs one privileged step per machine to claim an interface and a DNS suffix, so Vox cannot be
+  fully set up by a person who administers nothing. That person still reaches every service through
+  `vox forward` and a local port, with the address quality that implies. This is the deliberate cost of
+  the "unmodified tool" criterion, and it is paid once rather than per tool.
+- The interface needs a userspace TCP stack and per-platform plumbing (`utun`/`NetworkExtension`,
+  `/dev/net/tun`), which is the largest single piece of engineering this ADR implies and the one most
+  exposed to OS policy changes.
 - Naming the service by its port means a host offering two services on one port in one room must fall
   back to `vox service add <tag>`. The port-named form is for the single-service room `vox serve`
   creates, which is the case being optimised.
@@ -324,12 +353,13 @@ Each item is one branch, red→green, with the ADR updated in the same change (h
 - **M17.2 — `vox serve` and `vox connect`.** The two commands, the port-named service, the generated
   passphrase, the unechoed prompt, the refusal-to-start when unreachable with no anchor. Gate: two
   commands, two machines, real bytes — the M16.1 gate re-expressed as the two-command flow.
-- **M17.3 — `vox up`: the `.vox` name and the SOCKS entry point.** `b32` channelID ↔ hostname (encode,
-  decode, reject a name for a room not held); a SOCKS5 listener on `127.0.0.1:1080` wiring ADR-013's
-  `tunnel::socks` `ATYP_DOMAIN` path to `session::dial` with the requested port as the service tag; the
-  `ProxyCommand` line printed by `vox connect` so nobody has to derive it. Gate: a real client program
-  reaches a real service *through the proxy, by name*, with no privileged step anywhere in the test, and
-  a name for a room the client has not joined is refused locally without a dial.
+- **M17.3 — `vox up`: the `.vox` name and the Vox interface.** Three parts, each independently gateable:
+  (a) the resolver — `b32` channelID ↔ hostname, the room's host read off the log, `AAAA` = the ADR-013
+  ULA, `NXDOMAIN` for a room not held; (b) the interface — device, ULA route, and a userspace TCP
+  termination (`smoltcp`) that turns an inbound SYN into `session::dial(channel, port)`; (c) the
+  per-platform privileged setup, owned by ADR-014. Gate: an **unmodified** client program reaches a real
+  service *by name*, with nothing configured in that program, and a name for a room the client has not
+  joined never reaches a dial.
 - **M17.4 — anchors as configuration.** `<config_dir>/anchors`, written by `vox node`, read by every
   client; `--anchor` still overrides. Gate: a client on the anchor's machine needs no flag.
 - **M17.5 — service advertisements (`0x000F`).** Audience-encrypted, published to the room, surfaced
@@ -345,14 +375,18 @@ listener can be built and gated first. M17.5 is independent of the rest.
 revocation), ADR-012 (reachability, anchors), ADR-013 (the tunnel data path), ADR-016 (the node that
 runs it).
 - Amends ADR-013, in three places: the SSH CA is narrowed to an optional later capability; the
-  port-forward model is the specified one; **`vox up` names the local entry point generally** — the
-  unprivileged SOCKS5 proxy now, the TUN interface later under the same verb (decision 5). And it
+  port-forward model is the specified one for a *tool-facing* forward; and **the TUN interface is
+  promoted from "optional" to the specified person-facing datapath** — ADR-013 listed it as an
+  alternative to the per-stream SOCKS/forward model, and decision 5 makes it the one that carries
+  `<id>.vox`. The SOCKS5 front-end stays an unfinished ADR-013 item, no longer on this ADR's path. It
   qualifies ADR-013's invariant that *"tunnel capabilities are never inherited from membership"*: they
   still never are, **except** where a room's immutable genesis says so at creation (decision 3). A room
   made without a service grant can never acquire one, so the path ADR-013 was guarding against — "join
   my chat" silently becoming "you are on my LAN" — remains closed.
-- Amends ADR-014: the TUN interface is the named successor to the SOCKS entry point, and inherits the
-  `vox up` verb rather than introducing its own.
+- Amends ADR-014: its privileged helper / `NetworkExtension` is **load-bearing for the primary flow**,
+  not an optional extra added "only where a TUN interface later" appears — `ssh user@<id>.vox` does not
+  work without it. ADR-014 keeps ownership of the packaging, entitlements and notarization; this ADR owns
+  what the interface is for.
 - Depended on by: ADR-014, ADR-015 (the clients surface these verbs).
 
 ## Engineering Mantra
