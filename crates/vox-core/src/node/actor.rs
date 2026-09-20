@@ -97,6 +97,12 @@ enum NetEvent {
         /// Every granted mapping or pinhole, possibly none.
         mappings: Vec<crate::nat::portmap::PortMapping>,
     },
+    /// A hole punch produced a connection (ADR-012 rung 3): it needs the same
+    /// bookkeeping a dialled one gets — a stream loop and a sync schedule.
+    Punched {
+        /// The connection the punch produced.
+        conn: Arc<VoxConnection>,
+    },
     /// A peer connected inbound: it gets a sync schedule, due immediately.
     Connected {
         /// The authenticated peer.
@@ -137,11 +143,32 @@ pub use crate::time::{system_clock, Clock};
 /// we dialed will open streams back at us — a member we joined through has to be able
 /// to deliver its sender key on the connection *we* opened.
 fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Sender<NetEvent>) {
+    let peer = conn.peer_id();
+    // Ask this peer what source address it sees for us (ADR-012 rung 3's observed
+    // address), on its own task so the stream loop starts serving immediately. It is
+    // best-effort: a peer that will not answer costs nothing but a punch that has one
+    // fewer candidate to offer.
+    {
+        let net = Arc::clone(&net);
+        tokio::spawn(async move {
+            let _ = net.learn_observed(peer).await;
+        });
+    }
     tokio::spawn(async move {
+        // One stream failing is **not** the connection failing. A refused kind, a
+        // malformed frame or a peer that abandons a stream must not stop the others
+        // being served: a peer that opens a bad `coord` stream would otherwise take its
+        // own sync path down with it, and the node would go quiet until it reconnected.
+        // The loop ends when the connection itself is gone — or after this many
+        // consecutive failures, which cannot happen without the connection being
+        // unusable and which keeps a pathological peer from spinning this task.
+        const MAX_CONSECUTIVE_STREAM_FAILURES: u32 = 16;
+        let mut failures = 0;
         loop {
             match net.accept_stream(&conn).await {
-                Ok(Inbound::ServedRendezvous { .. }) => {}
+                Ok(Inbound::ServedRendezvous { .. } | Inbound::ServedCoord { .. }) => failures = 0,
                 Ok(inbound) => {
+                    failures = 0;
                     let event = NetEvent::Stream {
                         conn: Arc::clone(&conn),
                         inbound,
@@ -150,11 +177,19 @@ fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Send
                         return; // the actor is gone
                     }
                 }
-                // A refused or failed stream ends this connection's loop; the peer
-                // may reconnect.
-                Err(_) => return,
+                Err(_) => {
+                    if conn.quinn().close_reason().is_some() {
+                        break; // the peer or the network closed it
+                    }
+                    failures += 1;
+                    if failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
+                        break;
+                    }
+                }
             }
         }
+        // This peer's report of our address dies with its connection.
+        net.forget_observed(&peer);
     });
 }
 
@@ -663,6 +698,9 @@ impl Node {
                     self.publish_channel_locally(&channel_id).await;
                 }
             }
+            NetEvent::Punched { conn } => {
+                self.adopt_connection(conn);
+            }
             NetEvent::Connected { peer } => {
                 // A fresh connection syncs at once (ADR-016), then on the interval.
                 self.schedules
@@ -701,7 +739,17 @@ impl Node {
                     Inbound::Sync { send, recv, .. } => {
                         self.run_sync_session(send, recv).await;
                     }
-                    Inbound::NotYetSupported { .. } | Inbound::ServedRendezvous { .. } => {}
+                    Inbound::Punch {
+                        peer,
+                        coordinator,
+                        send,
+                        recv,
+                    } => {
+                        self.answer_punch(peer, coordinator, send, recv);
+                    }
+                    Inbound::NotYetSupported { .. }
+                    | Inbound::ServedRendezvous { .. }
+                    | Inbound::ServedCoord { .. } => {}
                 }
             }
         }
@@ -817,15 +865,50 @@ impl Node {
             .as_ref()
             .map(Arc::clone)
             .ok_or(crate::error::Error::Unreachable("node is not networked"))?;
-        let conn = net.manager().connect(peer, endpoints).await?;
-        if self.stream_loops.insert(peer) {
-            spawn_stream_loop(net, Arc::clone(&conn), self.net_tx.clone());
+        // The whole ADR-012 ladder, not just a direct dial: a peer with no reachable
+        // advertised endpoint is punched to through a coordinator (rung 3).
+        let conn = net.reach(peer, endpoints).await?;
+        self.adopt_connection(Arc::clone(&conn));
+        Ok(conn)
+    }
+
+    /// Give a connection the bookkeeping every connection needs, however it arrived:
+    /// a stream loop (a connection we opened must still accept the streams the peer
+    /// opens back — its sender key arrives that way) and a sync schedule.
+    fn adopt_connection(&mut self, conn: Arc<VoxConnection>) {
+        let peer = conn.peer_id();
+        if let Some(net) = self.net.as_ref().map(Arc::clone) {
+            if self.stream_loops.insert(peer) {
+                spawn_stream_loop(net, conn, self.net_tx.clone());
+            }
         }
         // A new connection syncs at once, then on the interval (ADR-016).
         self.schedules
             .entry(peer)
             .or_insert_with(SyncSchedule::connected);
-        Ok(conn)
+    }
+
+    /// Answer a punch session a coordinator relayed here (ADR-012 rung 3), on its own
+    /// task: the DCUtR exchange plus the synchronized dial takes seconds, and the
+    /// actor must keep serving meanwhile.
+    fn answer_punch(
+        &mut self,
+        peer: Digest32,
+        coordinator: Digest32,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+    ) {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            // A punch that fails is the ADR-012 limit, not an error to report: the peer
+            // keeps whatever path it had, and the coordinator keeps working.
+            if let Ok(conn) = net.answer_punch(peer, coordinator, send, recv).await {
+                let _ = tx.send(NetEvent::Punched { conn }).await;
+            }
+        });
     }
 
     /// Produce an invite link naming this node as anchor and responder.
