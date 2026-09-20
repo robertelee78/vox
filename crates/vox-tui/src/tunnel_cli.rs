@@ -448,6 +448,42 @@ pub async fn connect(
     Ok(())
 }
 
+/// `vox up` — the local entry point: a SOCKS5 proxy carrying one room's services
+/// (ADR-017 decision 5). Runs until interrupted.
+///
+/// Prints the `ProxyCommand` block rather than writing it: `~/.ssh/config` is the user's
+/// file, and a tool that edits it unasked is a tool that will one day edit it wrongly.
+pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Result<(), AppError> {
+    let out = node.apply(NodeCommand::Up { channel_id, bind }).await;
+    if !out.is_done() {
+        return Err(AppError::Usage(format!(
+            "cannot bring the proxy up: {out:?} — is the room a `vox serve` room, and is its host reachable?"
+        )));
+    }
+    let (hostname, bound) = loop {
+        match node.next_event().await {
+            Some(NodeEvent::ProxyUp { hostname, bind, .. }) => break (hostname, bind),
+            Some(_) => {}
+            None => return Err(AppError::Usage("the node stopped".into())),
+        }
+    };
+    println!("vox up on {bound} — carrying {hostname}");
+    println!();
+    println!("add this to ~/.ssh/config, once, for every room there will ever be:");
+    println!();
+    for line in vox_core::node::up::ssh_config_hint(bound).lines() {
+        println!("    {line}");
+    }
+    println!();
+    println!("then:  ssh user@{hostname}");
+    println!("other tools:  ALL_PROXY=socks5h://{bound}");
+    println!("Ctrl-C to stop");
+    let _ = tokio::signal::ctrl_c().await;
+    println!("vox: stopping the proxy");
+    let _ = node.apply(NodeCommand::Shutdown).await;
+    Ok(())
+}
+
 /// The first 12 characters of a fingerprint, as `vox` shows ids on screen.
 fn short(d: &Digest32) -> String {
     b32_encode(d).chars().take(12).collect()

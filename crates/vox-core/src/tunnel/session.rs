@@ -21,7 +21,6 @@
 use std::net::SocketAddr;
 
 use quinn::{RecvStream, SendStream};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 use crate::cbor::{Decoder, Encoder};
@@ -153,16 +152,13 @@ async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
 /// splices bytes until either side closes. A [`TunnelStatus::Denied`] (or any other
 /// status) returns [`Error::TunnelDenied`] without exposing whether the service
 /// exists.
-pub async fn dial<L>(
+pub async fn dial(
     mut send: SendStream,
     mut recv: RecvStream,
     channel_id: &Digest32,
     service_tag: &str,
-    local: L,
-) -> Result<()>
-where
-    L: AsyncRead + AsyncWrite + Unpin,
-{
+    local: TcpStream,
+) -> Result<()> {
     let req = TunnelRequest {
         channel_id: *channel_id,
         service_tag: service_tag.to_owned(),
@@ -287,10 +283,7 @@ where
 /// when one side reaches EOF it shuts down the opposite writer (a quinn `finish`
 /// or a TCP FIN) and drains the other direction before returning, so neither a
 /// one-way close nor an idle reverse path leaks the tunnel.
-async fn splice<L>(send: SendStream, recv: RecvStream, mut tcp: L) -> Result<()>
-where
-    L: AsyncRead + AsyncWrite + Unpin,
-{
+async fn splice(send: SendStream, recv: RecvStream, mut tcp: TcpStream) -> Result<()> {
     let mut quic = tokio::io::join(recv, send);
     tokio::io::copy_bidirectional(&mut tcp, &mut quic)
         .await
