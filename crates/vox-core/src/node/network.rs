@@ -315,21 +315,21 @@ impl NodeNet {
         EndpointList::new(vec![crate::nat::multiaddr::Multiaddr::from(addr)])
     }
 
-    /// Run the ladder's publish side and cache what this node should advertise:
-    /// its routable address, a gateway-mapped address when one can be had, and
-    /// loopback. Returns the port mapping if a gateway granted one, so the caller can
-    /// renew it before it expires.
+    /// Run the ladder's publish side and cache what this node should advertise: its
+    /// routable addresses (both families, IPv6 first), a gateway-mapped address when
+    /// one can be had, and loopback. Returns every port mapping or IPv6 pinhole a
+    /// gateway granted, so the caller can renew them before they expire.
     ///
     /// Best-effort by design: a node with no dialable address is not broken. It still
     /// reaches peers outbound and is reached through the ladder's later rungs, which
     /// is the ordinary case for a client inside a private network.
-    pub async fn refresh_advertised(&self) -> Option<crate::nat::portmap::PortMapping> {
+    pub async fn refresh_advertised(&self) -> Vec<crate::nat::portmap::PortMapping> {
         let Ok(bound) = self.manager.endpoint().local_addr() else {
-            return None;
+            return Vec::new();
         };
-        let (list, mapping) = crate::nat::reachability::advertise_endpoints(bound.port()).await;
+        let (list, mappings) = crate::nat::reachability::advertise_endpoints(bound.port()).await;
         *lock(&self.advertised) = Some(list);
-        mapping
+        mappings
     }
 
     fn now(&self) -> u64 {

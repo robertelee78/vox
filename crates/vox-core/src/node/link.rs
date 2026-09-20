@@ -25,7 +25,7 @@
 //! input, so a link survives being spoken, re-typed or lower-cased by a chat
 //! client, and with no `+`/`/` that would need percent-encoding. Multiaddrs use the
 //! exact ADR-012 text form ([`Multiaddr::parse`] round-trips
-//! [`Multiaddr`](crate::nat::multiaddr::Multiaddr)'s `Display`), whose characters
+//! [`Multiaddr`]'s `Display`), whose characters
 //! are all legal in a URL query.
 //!
 //! Parsing is strict: the scheme must match exactly, an unknown query key, a
