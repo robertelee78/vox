@@ -586,14 +586,8 @@ where
     R: AuthorResolver,
     P: FnMut(&mut TA, &mut TB) -> usize,
 {
-    let send_a = |t: &mut TA, f: Vec<u8>| {
-        t.send(&f)
-            .map_err(|_| WireError::ProtocolVersionUnsupported)
-    };
-    let send_b = |t: &mut TB, f: Vec<u8>| {
-        t.send(&f)
-            .map_err(|_| WireError::ProtocolVersionUnsupported)
-    };
+    let send_a = |t: &mut TA, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
+    let send_b = |t: &mut TB, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
 
     // 1. HELLO exchange + mode negotiation.
     send_a(ta, encode_hello(SYNC_MODE_FRONTIER))?;
@@ -686,10 +680,7 @@ where
     T: Transport,
     R: AuthorResolver,
 {
-    let send = |t: &mut T, f: Vec<u8>| {
-        t.send(&f)
-            .map_err(|_| WireError::ProtocolVersionUnsupported)
-    };
+    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
 
     // 1. HELLO exchange + mode negotiation.
     send(t, encode_hello(SYNC_MODE_FRONTIER))?;
@@ -736,10 +727,7 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
     now_secs: u64,
 ) -> std::result::Result<usize, WireError> {
     let mut applied = 0;
-    while let Some(frame) = t
-        .recv()
-        .map_err(|_| WireError::ProtocolVersionUnsupported)?
-    {
+    while let Some(frame) = t.recv().map_err(|_| WireError::TransportFailed)? {
         match decode_frame(&frame) {
             Ok(SyncFrame::Entry(wire)) => {
                 if matches!(
@@ -757,32 +745,33 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
 }
 
 fn expect_hello(r: Result<Option<Vec<u8>>>) -> std::result::Result<u8, WireError> {
-    match r.map_err(|_| WireError::ProtocolVersionUnsupported)? {
+    match r.map_err(|_| WireError::TransportFailed)? {
         Some(frame) => match decode_frame(&frame) {
             Ok(SyncFrame::Hello(bitmap)) => Ok(bitmap),
             _ => Err(WireError::SyncModeUnsupported),
         },
-        None => Err(WireError::ProtocolVersionUnsupported),
+        // A clean end-of-stream where a frame was due: the peer hung up mid-session.
+        None => Err(WireError::TransportFailed),
     }
 }
 
 fn expect_have(r: Result<Option<Vec<u8>>>) -> std::result::Result<Vec<FeedFrontier>, WireError> {
-    match r.map_err(|_| WireError::ProtocolVersionUnsupported)? {
+    match r.map_err(|_| WireError::TransportFailed)? {
         Some(frame) => match decode_frame(&frame) {
             Ok(SyncFrame::Have(v)) => Ok(v),
             _ => Err(WireError::SyncModeUnsupported),
         },
-        None => Err(WireError::ProtocolVersionUnsupported),
+        None => Err(WireError::TransportFailed),
     }
 }
 
 fn expect_want(r: Result<Option<Vec<u8>>>) -> std::result::Result<Vec<WantRange>, WireError> {
-    match r.map_err(|_| WireError::ProtocolVersionUnsupported)? {
+    match r.map_err(|_| WireError::TransportFailed)? {
         Some(frame) => match decode_frame(&frame) {
             Ok(SyncFrame::Want(v)) => Ok(v),
             _ => Err(WireError::SyncModeUnsupported),
         },
-        None => Err(WireError::ProtocolVersionUnsupported),
+        None => Err(WireError::TransportFailed),
     }
 }
 
@@ -1266,6 +1255,77 @@ mod tests {
     }
 
     // ---- HIGH-3: exact M0 WireError mapping per error class ----
+
+    /// A transport that breaks in one chosen way, so the engine's reason can be
+    /// observed. With neither flag set it accepts sends and returns a clean
+    /// end-of-stream — the peer that hung up where a frame was due.
+    #[derive(Default)]
+    struct BrokenTransport {
+        /// Fail every send.
+        fail_send: bool,
+        /// Fail every receive.
+        fail_recv: bool,
+        closed: Option<WireError>,
+    }
+
+    impl Transport for BrokenTransport {
+        fn send(&mut self, _frame: &[u8]) -> Result<()> {
+            if self.fail_send {
+                return Err(Error::MalformedBundle("test: send failed"));
+            }
+            Ok(())
+        }
+
+        fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+            if self.fail_recv {
+                return Err(Error::MalformedBundle("test: recv failed"));
+            }
+            Ok(None)
+        }
+
+        fn close(&mut self, code: WireError) {
+            self.closed = Some(code);
+        }
+    }
+
+    /// A peer that goes away mid-session is reported as a **transport** failure, not
+    /// as a protocol-version mismatch: before `0x09` existed, closing a laptop looked
+    /// identical to speaking the wrong version (ADR-008 §Implementation notes).
+    #[test]
+    fn a_transport_failure_is_not_reported_as_a_version_mismatch() {
+        let ra = root(20, 21);
+        let adm = admit_all(&[&ra]);
+        let resolver = MapResolver {
+            keys: vec![(ra.fingerprint(), ra.public_key())],
+        };
+        for (broken, why) in [
+            (
+                BrokenTransport {
+                    fail_send: true,
+                    ..BrokenTransport::default()
+                },
+                "a send that fails",
+            ),
+            (
+                BrokenTransport {
+                    fail_recv: true,
+                    ..BrokenTransport::default()
+                },
+                "a receive that fails",
+            ),
+            (
+                BrokenTransport::default(),
+                "a peer that hangs up where a frame was due",
+            ),
+        ] {
+            let mut t = broken;
+            let mut dag = Dag::new();
+            let err = frontier_session_peer(&mut t, &mut dag, &resolver, &adm, 0).unwrap_err();
+            assert_eq!(err, WireError::TransportFailed, "{why}");
+            // The coded reason reaches the peer, as ADR-008 requires.
+            assert_eq!(t.closed, Some(WireError::TransportFailed), "{why}");
+        }
+    }
 
     #[test]
     fn wire_error_mapping_is_per_class() {

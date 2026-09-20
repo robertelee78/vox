@@ -127,7 +127,8 @@ unknown struct tag or algo ID; sync mode mismatch; signature/authenticator failu
 surfaced — never silently downgraded — by **closing the QUIC stream (or connection) with a Vox
 application error code**: `0x01` protocol-version-unsupported, `0x02` suite-below-floor (ADR-003),
 `0x03` unknown-struct-tag, `0x04` unknown-algo-id, `0x05` authenticator-invalid, `0x06` quota-exceeded,
-`0x07` sync-mode-unsupported, `0x08` epoch-mismatch. The peer logs the coded reason and surfaces it
+`0x07` sync-mode-unsupported, `0x08` epoch-mismatch, `0x09` transport-failed (the peer went away or the
+stream reset — nothing about the protocol was wrong; added 2026-09-20, see Implementation notes). The peer logs the coded reason and surfaces it
 (ADR-014). This is the single wire-error contract referenced by ADR-003/ADR-011.
 
 **Per-entry-type authentication (binding — resolves the deniable/governance split).** Authentication
@@ -284,11 +285,16 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `frontier_session_peer` over that channel's log as either side, because the session verifies authorship
   and ordering and nothing else. `node::anchor::AnchorState` is that peer — genesis, vouched authors,
   entries — and it is what lets two members who are never online together converge.
-- **Known gap (observed 2026-09-20).** Every transport failure inside a session is reported as
-  `WireError::ProtocolVersionUnsupported`, because the engine's `send` closure maps all send errors onto
-  that code. A peer that simply went away is therefore diagnosed as a protocol-version mismatch. The
-  behaviour is correct (the session hard-fails and the next pass succeeds); the code is misleading, and
-  giving it its own `WireError` is a registry change this ADR should make deliberately.
+- **A transport failure is not a protocol failure (2026-09-20, ADR-016 M15.2c).** Observed while gating
+  the anchor: every transport failure inside a session was reported as
+  `WireError::ProtocolVersionUnsupported`, because the engine mapped all send and receive errors onto that
+  code — so a peer that simply closed its laptop was diagnosed as speaking the wrong version. The registry
+  gains `0x09 TransportFailed` and the engine uses it for a failed send, a failed receive, and a clean
+  end-of-stream where a frame was due (the peer hung up mid-session). Genuine version mismatches — a frame
+  that decodes to an unsupported version — still map to `0x01`, which is what that code is for. The
+  behaviour is unchanged (the session still hard-fails and the next pass succeeds); what changes is that
+  the reason no longer lies, which matters because the ADR's own words are that a peer "logs the coded
+  reason and surfaces it".
 
 ## Links
 **Depends on**: ADR-002, ADR-006.
