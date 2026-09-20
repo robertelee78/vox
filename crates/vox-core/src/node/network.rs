@@ -245,8 +245,20 @@ pub enum Inbound {
         /// The session's receive half.
         recv: RecvStream,
     },
-    /// A `tunnel` stream: accepted and authorized, but the ADR-013 handler is M15.
-    /// The stream is dropped (reset), never silently left open.
+    /// A peer is opening an ADR-013 **tunnel**: the actor answers it with the named
+    /// channel's evaluator and offered services, on its own task (a tunnel lives as
+    /// long as the TCP connection it carries).
+    Tunnel {
+        /// The authenticated peer — the client whose `dial:` capability is enforced.
+        peer: Digest32,
+        /// The stream's send half.
+        send: SendStream,
+        /// The stream's receive half.
+        recv: RecvStream,
+    },
+    /// A stream kind with no handler yet. The stream is dropped (reset), never
+    /// silently left open. Every kind ADR-011 defines is served today; this remains
+    /// for a kind a newer peer knows and this node does not.
     NotYetSupported {
         /// The authenticated peer.
         peer: Digest32,
@@ -527,7 +539,7 @@ impl NodeNet {
                 .await?;
                 Ok(Inbound::ServedCircuit { peer })
             }
-            StreamKind::Tunnel => Ok(Inbound::NotYetSupported { peer, kind }),
+            StreamKind::Tunnel => Ok(Inbound::Tunnel { peer, send, recv }),
         }
     }
 
@@ -792,6 +804,22 @@ impl NodeNet {
                 }
             })
             .collect()
+    }
+
+    /// The endpoints this node's board advertises for `member` in `channel_id` — the
+    /// dial hints any reach starts from (the identity is pinned, so a wrong hint only
+    /// fails).
+    #[must_use]
+    pub fn board_endpoints(&self, channel_id: &Digest32, member: &Digest32) -> EndpointList {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .current_members(channel_id, 0, now)
+            .into_iter()
+            .find(|r| r.author_id == *member)
+            .map(|r| r.endpoints.clone())
+            .unwrap_or_default()
     }
 
     /// The genesis this node's board holds for `channel_id`, if any.
@@ -1355,15 +1383,10 @@ mod tests {
             assert!(matches!(out[0], Inbound::Join { peer, .. } if peer == client_fp));
             assert!(matches!(out[1], Inbound::Pairwise { peer, .. } if peer == client_fp));
             assert!(matches!(out[2], Inbound::Sync { peer, .. } if peer == client_fp));
-            // `coord` is served in place now (ADR-012 rung 3); `tunnel` is the kind
-            // still waiting on its ADR-013 handler.
-            assert!(matches!(
-                out[3],
-                Inbound::NotYetSupported {
-                    kind: StreamKind::Tunnel,
-                    ..
-                }
-            ));
+            // `coord` and `circuit` are served in place (ADR-012 rungs 3–4); `tunnel`
+            // is handed up for the actor to answer with the named channel's evaluator
+            // (ADR-013, M16.1). Every kind ADR-011 defines now has a handler.
+            assert!(matches!(out[3], Inbound::Tunnel { peer, .. } if peer == client_fp));
             server.manager().close_all();
             client.manager().close_all();
         });

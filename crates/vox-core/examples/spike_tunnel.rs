@@ -87,7 +87,7 @@ async fn host() {
     let genesis = Genesis::create_with_nonce(&admin, GENESIS_CREATED, policy(), [9u8; 16]).unwrap();
     // The dialer names this channel; the host checks the claim against its evaluator.
     let channel_id = genesis.channel_id();
-    let evaluator = Evaluator::build(&genesis, &[], now(), |_| None).unwrap();
+    let evaluator = std::sync::Arc::new(Evaluator::build(&genesis, &[], now(), |_| None).unwrap());
 
     let host_signer = SoftwareRootSigner::from_component_seeds(&[1u8; 32], &[2u8; 32]).unwrap();
     let ep = VoxEndpoint::bind(&host_signer, "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -100,8 +100,11 @@ async fn host() {
     eprintln!("host: peer AUTHENTICATED as {}", hex(client_id));
     let (send, recv) = conn.accept_stream().await.unwrap();
     // accept() ENFORCES dial:echo for client_id before connecting the echo service.
-    match session::accept(send, recv, &client_id, &evaluator, |cid, tag| {
-        (*cid == channel_id && tag == "echo").then_some(echo_addr)
+    match session::accept(send, recv, &client_id, |cid, tag| {
+        (*cid == channel_id && tag == "echo").then_some(session::HostService {
+            evaluator: std::sync::Arc::clone(&evaluator),
+            endpoint: echo_addr,
+        })
     })
     .await
     {

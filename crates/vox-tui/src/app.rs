@@ -53,6 +53,10 @@ pub enum AppError {
     /// The embedded node could not be started (profile/store error).
     #[error("node: {0}")]
     Core(#[from] vox_core::error::Error),
+    /// The command cannot be carried out as asked, with a reason for the person —
+    /// a room that is not here, an ambiguous id, a capability they do not hold.
+    #[error("{0}")]
+    Usage(String),
 }
 
 /// The contract the loop uses to talk to the running core: it provides the current

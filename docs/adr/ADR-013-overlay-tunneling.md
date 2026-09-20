@@ -1,8 +1,8 @@
 # ADR-013: Overlay Tunneling (TCP-over-Vox)
 
-**Status**: implemented (M11, `crates/vox-core/src/tunnel/`) — library only; no CLI surface yet (see Known gaps)
+**Status**: implemented and **reachable** — the per-stream port-forward model runs end to end through the node (`crates/vox-core/src/{tunnel,node/tunnel}.rs`, `crates/vox-tui` `service`/`grant`/`forward`), gated by a release test that reaches a TCP service between two symmetric-NAT clients through an anchor; SOCKS front-end, signed session events, the SSH-CA binding and the TUN datapath remain (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — status reconciled; Known gaps recorded.
+**Updated**: 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: tunneling, tcp, ssh, tun, socks, authorization, zero-trust
 
@@ -181,15 +181,48 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
   both-sided: the issuer authorizes at once, the grantee's evaluator agrees the moment the entry arrives,
   a member with no grant and a different service are both refused, and the grant conveys **no** message
   consent (the two axes stay independent, as the Decision requires).
-- **Known gaps (recorded 2026-09-19).** No `vox service add` / `vox forward` / `vox up` CLI exists (no
-  CLI crate; the TUI's only "up" is navigation). Tunnel session establishment is not recorded as signed
-  events (the "accountability" line above has no entry type). The SSH CA is a bare Ed25519 seed with
-  no binding to the ADR-007 capability tree, `verify_user_cert` ignores extensions/critical options,
-  and the capability rides in an extension rather than a critical option. SOCKS is a codec only — no
-  listener composes negotiate → CONNECT → service map → `session::dial` → reply, and `Reply::NotAllowed`
-  is never emitted. Only the pairwise service-advertisement delivery exists (the SKDM-style
-  audience-encrypted entry does not). The TUN/VPN datapath is deferred to ADR-014 as the Decision
-  says. Consumers of this module are the in-crate tests and `examples/spike_tunnel.rs` only.
+- **The surface a person uses (2026-09-20, M16.1b).** The library had no consumer but its own tests; now
+  the node carries both halves.
+  - **Host side.** `StreamKind::Tunnel` is dispatched (it was `NotYetSupported`) to `node::tunnel::serve`,
+    which hands the stream to `session::accept` with a **snapshot** the actor takes of every open channel's
+    evaluator and offered services. The snapshot matters twice: only the actor may read channel state, and
+    a tunnel lives as long as the TCP connection it carries — possibly hours — so it must never reach back
+    into the actor. A channel absent from the snapshot resolves to `None` and is refused exactly as an
+    unauthorized request is, because telling the two apart would leak which channels this node is in.
+  - **Bind configuration.** A channel persists `service_tag → local address` in its own sealed segment
+    (`SEG_SERVICES`, `MAX_SERVICES = 64`), so a restart still offers what it offered. `add_service` checks
+    `bind:<tag>` against the channel's own evaluator: a node cannot offer what the log does not let it
+    offer. This is configuration, never authorization — what a peer may *reach* is its `dial:` grant.
+  - **Dial side.** `node::tunnel::Forward` binds a local TCP port and gives every accepted connection its
+    own tunnel stream (ADR-013's one-stream-per-connection), so a forward carries as many connections as
+    the application makes and a dead one takes nothing else with it. Binding happens eagerly, so a port
+    already in use is an error the person sees rather than a task that dies quietly; dropping the forward
+    stops the listener and leaves spliced connections to finish.
+  - **The verbs.** `vox service add|remove|list`, `vox grant`, `vox forward` — each opens the room (a
+    room's services and governance live inside the SEK-sealed store, so there is no offering or granting
+    without the passphrase), does its work and leaves; `forward` serves until interrupted and prints the
+    `ssh -p <port>` line. Ids are given as unique prefixes of the base32 rendering, refused with a count
+    rather than a guess when ambiguous. Passphrases are prompted for unechoed (crossterm raw mode) and
+    read from a pipe when stdin is not a terminal, so nothing lands in shell history.
+  - **Gate** (`node_m15_anchor_gate.rs`, release): Alice offers a localhost TCP service in a room, Bob
+    joins through the anchor, and **before any grant his forward binds but carries nothing** — the service
+    is dark to a member. Alice grants `dial:ssh`; the grant reaches Bob by ordinary sync, with nobody
+    telling him, and his application connects to his own machine and gets byte-exact replies from Alice's
+    service. Both clients are behind symmetric NATs, so the path is a relayed circuit and the anchor
+    carried packets it cannot read. A second connection over the same forward works too. `ssh` over Vox is
+    this test with `sshd` in place of the echo, which is why the echo is enough.
+- **Known gaps (recorded 2026-09-19, revised 2026-09-20).** ~~No CLI~~ — `vox service` / `vox grant` /
+  `vox forward` exist (M16.1b); `vox up` does not, and may not need to. ~~Consumers are the in-crate tests
+  only~~ — the node is the consumer. What remains: tunnel session establishment is still not recorded as
+  **signed events** (the "accountability" line has no entry type). The **SSH CA** is still a bare Ed25519
+  seed with no binding to the ADR-007 capability tree, `verify_user_cert` still ignores
+  extensions/critical options, and the capability still rides in an extension rather than a critical
+  option — so "ssh over Vox" today means forwarding a port to a real `sshd`, which works and is what the
+  gate proves, not Vox issuing the host's certificates. **SOCKS** is still a codec with no listener
+  composing negotiate → CONNECT → service map → `session::dial` → reply, and `Reply::NotAllowed` is never
+  emitted. Service **advertisements** exist only pairwise (the audience-encrypted `0x000F` entry does not),
+  so a member learns another's service tags out of band. The TUN/VPN datapath remains ADR-014's, as the
+  Decision says.
 
 ## Links
 **Depends on**: ADR-002, ADR-007, ADR-011, ADR-012.

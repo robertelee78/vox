@@ -27,6 +27,8 @@ use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::governance::evaluator::Evaluator;
 use crate::hash::Digest32;
+use std::sync::Arc;
+
 use crate::tunnel::authz::authorize_dial;
 
 /// Maximum length of a service tag carried in a tunnel request (matches the
@@ -171,44 +173,60 @@ pub async fn dial(
     splice(send, recv, local).await
 }
 
+/// What the host knows about one `(channel, service)` pair a dialer named: the
+/// channel's ADR-007 evaluator — the authority that decides — and where the service
+/// lives locally. Returning one of these says only "I hold that channel and offer
+/// that service"; whether the *peer* may reach it is still
+/// [`accept`]'s to enforce.
+pub struct HostService {
+    /// The named channel's governance evaluator.
+    pub evaluator: Arc<Evaluator>,
+    /// The local address the service listens on.
+    pub endpoint: SocketAddr,
+}
+
 /// Host side: accept a tunnel on a fresh inbound stream pair, **enforcing the Dial
 /// capability** of the transport-authenticated peer before any local connection.
 ///
 /// `client_id` is the composite-identity fingerprint the QUIC transport
-/// authenticated for this connection (`VoxConnection::peer_id`, ADR-011);
-/// `evaluator` is the channel's ADR-007 governance evaluator. The host:
+/// authenticated for this connection (`VoxConnection::peer_id`, ADR-011). The host:
 /// 1. reads the [`TunnelRequest`];
-/// 2. enforces `dial:<service_tag>` for `client_id` via
-///    [`authorize_dial`] — **the authorization gate lives here, not in the
-///    caller**, so a misconfigured resolver cannot grant reach;
-/// 3. resolves the service to a local endpoint via `resolve_endpoint` (pure
-///    host-side Bind config: `Some(addr)` if this host offers the service, `None`
-///    if it does not — *no* authorization logic);
+/// 2. asks `resolve` about the `(channel, service_tag)` it named — pure host
+///    configuration: `Some(HostService)` if this node holds that channel and offers
+///    that service, `None` otherwise, and *no* authorization logic;
+/// 3. enforces `dial:<service_tag>` for `client_id` against **that channel's**
+///    evaluator via [`authorize_dial`] — the authorization gate lives here, not in
+///    the caller, so a misconfigured resolver cannot grant reach;
 /// 4. connects the local endpoint and splices bytes.
 ///
+/// The evaluator comes from the resolver rather than the caller because a QUIC
+/// connection is per peer, not per channel: which authority applies is known only
+/// once the request has been read (ADR-013 Implementation notes).
+///
 /// Steps 2 and 3 both fail to a **uniform** [`TunnelStatus::Denied`] (and
-/// [`Error::TunnelDenied`]) — unauthorized, unknown, and connect-failed are
-/// indistinguishable on the wire (dark services, default-deny). The local connect
-/// happens only after authorization succeeds.
+/// [`Error::TunnelDenied`]) — unauthorized, unknown channel, unknown service and
+/// connect-failed are indistinguishable on the wire (dark services, default-deny).
+/// The local connect happens only after authorization succeeds.
 pub async fn accept<F>(
     mut send: SendStream,
     mut recv: RecvStream,
     client_id: &Digest32,
-    evaluator: &Evaluator,
-    resolve_endpoint: F,
+    resolve: F,
 ) -> Result<()>
 where
-    F: FnOnce(&Digest32, &str) -> Option<SocketAddr>,
+    F: FnOnce(&Digest32, &str) -> Option<HostService>,
 {
     let req = TunnelRequest::from_bytes(&read_frame(&mut recv).await?)?;
 
-    // (2) Authorization is enforced here, against the authenticated peer.
-    // (3) Service resolution is pure host config (no auth) — and it is asked about
-    //     the channel the dialer named, so a service offered in one channel is not
-    //     reachable by a capability granted in another. Both denials are uniform.
-    let decision = authorize_dial(evaluator, client_id, &req.service_tag)
-        .ok()
-        .and_then(|()| resolve_endpoint(&req.channel_id, &req.service_tag));
+    // (2) Resolution is pure host config, asked about the channel the dialer named,
+    //     so a service offered in one channel is not reachable by a capability
+    //     granted in another. (3) Authorization is enforced here, against the
+    //     authenticated peer and that channel's authority. Both denials are uniform.
+    let decision = resolve(&req.channel_id, &req.service_tag).and_then(|h| {
+        authorize_dial(&h.evaluator, client_id, &req.service_tag)
+            .ok()
+            .map(|()| h.endpoint)
+    });
     let Some(target) = decision else {
         // Finish the stream so the status reaches the dialer before we drop it.
         write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
@@ -319,11 +337,11 @@ mod tests {
     /// An evaluator over a channel `admin` created, with that channel's id — which
     /// the dialer must name and the host must check (a connection is per peer, not
     /// per channel).
-    fn evaluator_with_admin(admin: &SoftwareRootSigner) -> (Evaluator, Digest32) {
+    fn evaluator_with_admin(admin: &SoftwareRootSigner) -> (Arc<Evaluator>, Digest32) {
         let genesis = Genesis::create_with_nonce(admin, 0, policy(), [0x55; 16]).unwrap();
         let cid = genesis.channel_id();
         (
-            Evaluator::build(&genesis, &[], 1000, |_| None).unwrap(),
+            Arc::new(Evaluator::build(&genesis, &[], 1000, |_| None).unwrap()),
             cid,
         )
     }
@@ -378,8 +396,11 @@ mod tests {
                     let client_id = conn.peer_id(); // transport-authenticated peer
                     if let Ok((send, recv)) = conn.accept_stream().await {
                         // Resolver is pure config: this host offers "echo".
-                        let _ = accept(send, recv, &client_id, &evaluator, |cid, tag| {
-                            (*cid == channel_id && tag == "echo").then_some(echo_addr)
+                        let _ = accept(send, recv, &client_id, |cid, tag| {
+                            (*cid == channel_id && tag == "echo").then_some(HostService {
+                                evaluator: Arc::clone(&evaluator),
+                                endpoint: echo_addr,
+                            })
                         })
                         .await;
                     }
@@ -439,10 +460,11 @@ mod tests {
                     let client_id = conn.peer_id();
                     if let Ok((send, recv)) = conn.accept_stream().await {
                         // Host *offers* "echo", but the peer is unauthorized.
-                        let _ = accept(send, recv, &client_id, &evaluator, |cid, tag| {
-                            (*cid == channel_id && tag == "echo").then_some(SocketAddr::V4(
-                                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9),
-                            ))
+                        let _ = accept(send, recv, &client_id, |cid, tag| {
+                            (*cid == channel_id && tag == "echo").then_some(HostService {
+                                evaluator: Arc::clone(&evaluator),
+                                endpoint: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)),
+                            })
                         })
                         .await;
                     }

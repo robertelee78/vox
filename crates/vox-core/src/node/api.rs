@@ -70,6 +70,9 @@ pub struct ChannelDetail {
     pub members: Vec<Digest32>,
     /// The render-gated timeline, oldest first.
     pub timeline: Vec<MessageRow>,
+    /// The services this node offers in this channel: `(service_tag, local address)`
+    /// in tag order (ADR-013 Bind config — host configuration, not authorization).
+    pub services: Vec<(String, std::net::SocketAddr)>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -90,11 +93,26 @@ pub struct NodeView {
     pub channels: Vec<ChannelSummary>,
     /// The open channels' detail, in channelID order.
     pub open_channels: Vec<ChannelDetail>,
+    /// The live forwards, in bound-address order (ADR-013 Dial).
+    pub forwards: Vec<ForwardInfo>,
     /// Every channel this node's **board** holds a genesis for — the channels it
     /// anchors, whether or not it is a member — in channelID order. What an anchor
     /// can say about itself: which rooms it serves and how many members it knows of
     /// each, never what any of them said.
     pub anchoring: Vec<AnchoredChannel>,
+}
+
+/// A live local port forwarded to a member's service (ADR-013).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardInfo {
+    /// The channel the capability is claimed under.
+    pub channel_id: Digest32,
+    /// The member hosting the service.
+    pub host: Digest32,
+    /// The service tag.
+    pub service_tag: String,
+    /// The local address accepting connections.
+    pub local: std::net::SocketAddr,
 }
 
 /// A channel this node's board serves (ADR-016 M15.2a).
@@ -178,6 +196,56 @@ pub enum NodeCommand {
         channel_id: Digest32,
         /// The member being consented to.
         target: Digest32,
+    },
+    /// Offer a local TCP service to a channel (ADR-013 Bind). Host configuration:
+    /// what a peer may *reach* is the `dial:` capability on the log, granted with
+    /// [`NodeCommand::GrantTunnel`]. Requires `bind:<service_tag>` in that channel.
+    AddService {
+        /// The channel the service is offered in.
+        channel_id: Digest32,
+        /// The service tag peers dial (the `<tag>` of `dial:<tag>`).
+        service_tag: String,
+        /// The local address the service listens on.
+        local: std::net::SocketAddr,
+    },
+    /// Stop offering a service.
+    RemoveService {
+        /// The channel.
+        channel_id: Digest32,
+        /// The service tag.
+        service_tag: String,
+    },
+    /// Grant a member the capability to dial (and optionally to offer) a service in a
+    /// channel, as an ADR-007 admin certificate on the log — a fact every member
+    /// converges on, not local configuration (ADR-013).
+    GrantTunnel {
+        /// The channel.
+        channel_id: Digest32,
+        /// The member being granted.
+        target: Digest32,
+        /// The service tag.
+        service_tag: String,
+        /// Also grant `bind:<tag>`, so the member may offer the service too.
+        may_bind: bool,
+        /// When the grant stops counting (unix seconds).
+        expiry: u64,
+    },
+    /// Forward a local TCP port to a member's service over the overlay (ADR-013
+    /// Dial). Answers [`NodeEvent::Forwarding`] with the port actually bound.
+    Forward {
+        /// The channel whose capability this claims.
+        channel_id: Digest32,
+        /// The member hosting the service.
+        host: Digest32,
+        /// The service tag to reach.
+        service_tag: String,
+        /// Where to listen locally (port 0 picks one).
+        local: std::net::SocketAddr,
+    },
+    /// Stop a forward and release its port.
+    StopForward {
+        /// The local address the forward is listening on.
+        local: std::net::SocketAddr,
     },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).
@@ -284,6 +352,18 @@ pub enum NodeEvent {
         peer: Digest32,
         /// How many already-stored messages became readable.
         backfilled: u64,
+    },
+    /// A forward is live: the local port is accepting connections for a member's
+    /// service (ADR-013).
+    Forwarding {
+        /// The channel the capability is claimed under.
+        channel_id: Digest32,
+        /// The member hosting the service.
+        host: Digest32,
+        /// The service tag.
+        service_tag: String,
+        /// The local address actually bound (a requested port 0 is resolved here).
+        local: std::net::SocketAddr,
     },
     /// An invite link for a channel (public: it carries no secret).
     InviteLink {
