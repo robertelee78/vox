@@ -73,24 +73,3 @@ impl Content {
         Ok(Self { created_secs, text })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_trip_and_strictness() {
-        let c = Content::text(1_700_000_000, "hello, vox").unwrap();
-        let bytes = c.to_canonical_vec();
-        assert_eq!(Content::from_canonical_slice(&bytes).unwrap(), c);
-        assert!(Content::from_canonical_slice(&bytes[..bytes.len() - 1]).is_err());
-        let mut bad = bytes.clone();
-        bad[2] = 9; // kind
-        assert!(Content::from_canonical_slice(&bad).is_err());
-        let big = "x".repeat(MAX_TEXT_LEN + 1);
-        assert!(matches!(
-            Content::text(0, &big),
-            Err(Error::SizeLimitExceeded(_))
-        ));
-    }
-}

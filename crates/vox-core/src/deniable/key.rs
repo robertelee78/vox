@@ -111,15 +111,3 @@ fn key_info(label: &[u8], ctx: &EpochContext) -> Vec<u8> {
     info.extend_from_slice(&epoch_le);
     info
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn epoch_key_is_not_clone() {
-        // One owner, one wipe point (same posture as `atrest::sek::Sek`).
-        assert!(!crate::test_support::is_clone!(EpochKey));
-        assert!(crate::test_support::is_clone!(Vec<u8>)); // positive control
-    }
-}

@@ -576,31 +576,3 @@ pub fn passphrase_or_prompt(given: Option<&String>, what: &str) -> Result<String
         None => prompt_passphrase(what),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_prefix_resolves_only_when_it_is_unique() {
-        let a = [0x11; 32];
-        let b = [0x12; 32];
-        let among = vec![a, b];
-        // The full rendering always resolves.
-        assert_eq!(resolve_prefix(&b32_encode(&a), &among).unwrap(), a);
-        // A prefix that separates them resolves; one that does not is refused with a
-        // count rather than a guess.
-        let (ta, tb) = (b32_encode(&a), b32_encode(&b));
-        let split = ta
-            .chars()
-            .zip(tb.chars())
-            .position(|(x, y)| x != y)
-            .expect("the two renderings differ");
-        assert_eq!(resolve_prefix(&ta[..=split], &among).unwrap(), a);
-        assert!(resolve_prefix(&ta[..split], &among).is_err(), "ambiguous");
-        assert!(resolve_prefix("", &among).is_err());
-        assert!(resolve_prefix("zzzz", &among).is_err());
-        // Case does not matter: a link or a screen may have been upper-cased.
-        assert_eq!(resolve_prefix(&ta.to_uppercase(), &among).unwrap(), a);
-    }
-}

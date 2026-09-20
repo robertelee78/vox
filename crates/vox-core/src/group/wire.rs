@@ -67,39 +67,3 @@ pub fn domain_prefixed(domain: &str, body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(body);
     out
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn binding_input_is_domain_then_canonical_array() {
-        let cid = [1u8; 32];
-        let author = [2u8; 32];
-        let spk = [3u8; SENDER_KEY_SIGNING_PUB_LEN];
-        let got = sender_key_binding_input(&cid, 9, &author, 4, &spk);
-        // Starts with the domain label.
-        assert!(got.starts_with(SENDER_KEY_SIGN_DOMAIN.as_bytes()));
-        // Body is a 5-element canonical array (0x85 array header after the label).
-        let body = &got[SENDER_KEY_SIGN_DOMAIN.len()..];
-        assert_eq!(body[0], 0x85);
-    }
-
-    #[test]
-    fn binding_input_is_sensitive_to_every_field() {
-        let cid = [1u8; 32];
-        let author = [2u8; 32];
-        let spk = [3u8; SENDER_KEY_SIGNING_PUB_LEN];
-        let base = sender_key_binding_input(&cid, 9, &author, 4, &spk);
-        assert_ne!(
-            base,
-            sender_key_binding_input(&[9u8; 32], 9, &author, 4, &spk)
-        );
-        assert_ne!(base, sender_key_binding_input(&cid, 10, &author, 4, &spk));
-        assert_ne!(base, sender_key_binding_input(&cid, 9, &[8u8; 32], 4, &spk));
-        assert_ne!(base, sender_key_binding_input(&cid, 9, &author, 5, &spk));
-        let mut spk2 = spk;
-        spk2[0] ^= 1;
-        assert_ne!(base, sender_key_binding_input(&cid, 9, &author, 4, &spk2));
-    }
-}

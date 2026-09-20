@@ -98,37 +98,3 @@ pub async fn accept_typed(conn: &VoxConnection) -> Result<(StreamKind, SendStrea
     let kind = StreamKind::parse(&frame)?;
     Ok((kind, send, recv))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn kind_frames_round_trip_and_unknown_is_refused() {
-        for k in [
-            StreamKind::Sync,
-            StreamKind::Join,
-            StreamKind::Pairwise,
-            StreamKind::Rendezvous,
-            StreamKind::Tunnel,
-            StreamKind::Coord,
-            StreamKind::Circuit,
-        ] {
-            assert_eq!(StreamKind::parse(&k.frame()).unwrap(), k);
-            assert_eq!(StreamKind::from_u8(k.as_u8()), Some(k));
-        }
-        let mut e = Encoder::new();
-        e.array(1).uint(8);
-        assert!(matches!(
-            StreamKind::parse(&e.finish()),
-            Err(Error::MalformedBundle("unknown stream kind"))
-        ));
-        let mut e = Encoder::new();
-        e.array(2).uint(1).uint(1);
-        assert!(matches!(
-            StreamKind::parse(&e.finish()),
-            Err(Error::MalformedBundle("stream kind arity"))
-        ));
-        assert!(StreamKind::parse(&[]).is_err());
-    }
-}

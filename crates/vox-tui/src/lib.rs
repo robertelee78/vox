@@ -23,6 +23,7 @@ pub mod app;
 pub mod cli;
 pub mod live;
 pub mod qr;
+pub mod shell;
 pub mod state;
 pub mod tunnel_cli;
 pub mod ui;

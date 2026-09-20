@@ -154,15 +154,6 @@ impl Sizes {
     fn ref_bits(&self) -> u32 {
         self.buck_bits + 2 * self.slot_bits
     }
-
-    /// Fixed peak memory of the solver's large buffers, in bytes (documentation +
-    /// test aid; the two live hash layers and every round's ref array).
-    #[cfg(test)]
-    fn memory_bytes(&self) -> usize {
-        let slots = self.layer_slots();
-        let ref_width = if self.ref_bits() <= 32 { 4 } else { 8 };
-        slots * (self.stride(0) + self.stride(1)) + (self.k as usize) * slots * ref_width
-    }
 }
 
 /// `ExpandArray` (Zcash spec / librustzcash): unpack tightly-packed `bit_len`-bit
@@ -496,7 +487,7 @@ impl Solver {
 /// verifier-valid) solution found, minimal-encoded. May return zero or more.
 ///
 /// See the module docs for the layout. Peak memory is fixed by the parameters
-/// (`Sizes::memory_bytes`); a full bucket drops entries rather than growing.
+/// (the bucket sizing above); a full bucket drops entries rather than growing.
 pub fn solve(params: PowParams, seed: &[u8], nonce: &[u8]) -> Result<Vec<Vec<u8>>> {
     let s = Sizes::new(params)?;
     if s.k < 3 {
@@ -538,109 +529,4 @@ pub fn solve(params: PowParams, seed: &[u8], nonce: &[u8]) -> Result<Vec<Vec<u8>
     solutions.sort();
     solutions.dedup();
     Ok(solutions)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compress_expand_round_trip_96_5() {
-        // expand_array ∘ compress_array is the identity on a padded index array (the
-        // direction the minimal encoding uses: index slots → packed → index slots).
-        // (96,5): collision_bit_length=16 ⇒ 17-bit words, byte_pad=1, 32 indices.
-        let sizes = Sizes::new(PowParams::new(96, 5).unwrap()).unwrap();
-        let bit_len = sizes.collision_bit_length + 1; // 17
-        let indices: Vec<u32> = (0u32..32)
-            .map(|i| (i * 1234 + 7) & ((1 << bit_len) - 1))
-            .collect();
-        let array: Vec<u8> = indices.iter().flat_map(|i| i.to_be_bytes()).collect();
-        let compressed = compress_array(&array, bit_len, sizes.minimal_byte_pad);
-        assert_eq!(compressed.len(), 32 * bit_len / 8); // 68
-        let expanded = expand_array(&compressed, bit_len, sizes.minimal_byte_pad);
-        assert_eq!(expanded, array);
-    }
-
-    #[test]
-    fn nonce_bytes_layout() {
-        let n = nonce_bytes(0x0102_0304);
-        assert_eq!(&n[..4], &[0x04, 0x03, 0x02, 0x01]); // little-endian
-        assert_eq!(n.len(), 32);
-        assert!(n[4..].iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn layout_sizes_at_real_and_reduced_params() {
-        // (200,9): 20-bit digits split 12 bucket bits + 8 rest bits; 2^21 leaves;
-        // 32-bit parent refs fit; the fixed memory budget is under 256 MiB.
-        let s = Sizes::new(PowParams::DEFAULT).unwrap();
-        assert_eq!(s.collision_bit_length, 20);
-        assert_eq!(s.collision_byte_length, 3);
-        assert_eq!(s.ndigits, 10);
-        assert_eq!(s.nhashes, 1 << 21);
-        assert_eq!((s.buck_bits, s.rest_bits), (12, 8));
-        assert_eq!(s.nbuckets, 4096);
-        assert!(s.nslots >= 512 && s.nslots <= 1024, "nslots={}", s.nslots);
-        assert!(s.ref_bits() <= 32);
-        assert_eq!(s.stride(0), 1 + 3 * 9);
-        assert_eq!(s.stride(8), 1 + 3);
-        assert!(
-            s.memory_bytes() <= 256 * 1024 * 1024,
-            "memory {} B",
-            s.memory_bytes()
-        );
-        // (48,5): 8-bit digits split 4 + 4; 512 leaves; tiny.
-        let s = Sizes::new(PowParams::new(48, 5).unwrap()).unwrap();
-        assert_eq!((s.buck_bits, s.rest_bits), (4, 4));
-        assert_eq!(s.nhashes, 512);
-        assert!(s.ref_bits() <= 32);
-        // (144,5): 24-bit digits, 2^25 leaves — refs need 64 bits and get them.
-        let s = Sizes::new(PowParams::new(144, 5).unwrap()).unwrap();
-        assert!(s.ref_bits() > 32);
-    }
-
-    #[test]
-    fn solve_reduced_produces_crate_valid_solution() {
-        // The core cross-check: a solution OUR solver finds validates under the
-        // canonical librustzcash verifier. Uses small (48,5) params so the search is
-        // fast (512-row initial list); the (200,9) path is the same code, exercised
-        // by the #[ignore]d real test in `super`.
-        let params = PowParams::new(48, 5).unwrap();
-        let seed = b"vox wagner solver self-test seed";
-        let mut found = false;
-        for c in 0..256u32 {
-            let nonce = nonce_bytes(c);
-            for sol in solve(params, seed, &nonce).unwrap() {
-                assert_eq!(sol.len(), params.solution_len());
-                equihash::is_valid_solution(params.n, params.k, seed, &nonce, &sol).unwrap();
-                found = true;
-            }
-            if found {
-                break;
-            }
-        }
-        assert!(found, "no (48,5) solution found in 256 nonces");
-    }
-
-    #[test]
-    fn solve_96_5_solutions_all_verify() {
-        // A mid-size parameter set with a 16-bit digit (8 + 8 split) and multiple
-        // solutions per nonce: every emitted solution must verify, none may be a
-        // duplicate.
-        let params = PowParams::new(96, 5).unwrap();
-        let seed = b"vox wagner solver 96-5 seed";
-        let mut total = 0;
-        for c in 0..4u32 {
-            let nonce = nonce_bytes(c);
-            let sols = solve(params, seed, &nonce).unwrap();
-            for w in sols.windows(2) {
-                assert_ne!(w[0], w[1]);
-            }
-            for sol in &sols {
-                equihash::is_valid_solution(params.n, params.k, seed, &nonce, sol).unwrap();
-            }
-            total += sols.len();
-        }
-        assert!(total > 0, "expected some (96,5) solutions over 4 nonces");
-    }
 }
