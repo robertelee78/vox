@@ -646,6 +646,13 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   and runs in ~8 s. The spike behind it (`node::net::upgrade_tests`) showed the old rule closing every
   upgrade on both sides — a defect no upgrade could have survived.
 
+- **UPnP-IGD (M15.1c, 2026-09-20).** The decider reopened ADR-012's omission: an anchor on a home
+  router should forward its own port, and two peers with no anchor should find each other when one has a
+  cooperative router. The node's publish side now tries UPnP after PCP and NAT-PMP; a mapping the router
+  would only grant permanently is never renewed and is deleted when the network stops (`stop_network`,
+  best-effort on its own task). Mechanism, hardening and the pending real-router validation are in
+  ADR-012's Implementation notes.
+
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
 ADR-013, ADR-015.

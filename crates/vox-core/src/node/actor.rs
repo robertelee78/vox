@@ -92,11 +92,14 @@ async fn announce(conn: &VoxConnection, prejoin_wire: &[u8]) -> crate::error::Re
 /// granted anything and so there is nothing to keep alive.
 ///
 /// Half the *shortest* lifetime, not the requested one: a gateway may grant less than
-/// asked, and the mapping that expires first is the one that governs.
+/// asked, and the mapping that expires first is the one that governs. A lifetime of
+/// zero is a **permanent** grant (UPnP routers that refuse timed leases) and never
+/// needs renewing — it is deleted when the network stops instead.
 fn renew_at(now: u64, mappings: &[crate::nat::portmap::PortMapping]) -> Option<u64> {
     mappings
         .iter()
         .map(|m| m.lifetime_secs)
+        .filter(|l| *l > 0)
         .min()
         // `max(2)` keeps the interval at one second or more: a zero would re-request
         // on every tick.
@@ -743,7 +746,20 @@ impl Node {
             net.manager().endpoint().close();
         }
         self.stream_loops.clear();
-        self.port_mappings.clear();
+        // A UPnP mapping the router granted only *permanently* (lifetime 0) would
+        // outlive this node; it is deleted, best-effort, on its own task. Timed
+        // mappings of every kind expire by themselves.
+        for m in self.port_mappings.drain(..) {
+            if m.method == crate::nat::portmap::Method::UpnpIgd && m.lifetime_secs == 0 {
+                tokio::spawn(async move {
+                    let _ = crate::nat::portmap::unmap_port_upnp(
+                        crate::nat::portmap::Protocol::Udp,
+                        m.internal_port,
+                    )
+                    .await;
+                });
+            }
+        }
         self.renew_mappings_at = None;
         self.schedules.clear();
         self.pending_push.clear();
@@ -2104,6 +2120,13 @@ mod tests {
         // A tiny grant still moves the clock forward, or the renewal would re-fire on
         // every tick.
         assert_eq!(renew_at(1_000, &[mapping(1)]), Some(1_001));
+        // A permanent grant (UPnP, lifetime 0) is never renewed — and never drags a
+        // timed one's renewal down to "every second".
+        assert_eq!(renew_at(1_000, &[mapping(0)]), None);
+        assert_eq!(
+            renew_at(1_000, &[mapping(0), mapping(7200)]),
+            Some(1_000 + 3600)
+        );
     }
 
     fn fixed_clock(t: u64) -> Clock {

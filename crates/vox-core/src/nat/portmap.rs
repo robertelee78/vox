@@ -33,6 +33,7 @@
 pub mod gateway;
 pub mod natpmp;
 pub mod pcp;
+pub mod upnp;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -72,6 +73,8 @@ pub enum Method {
     /// A PCP **IPv6 firewall pinhole** — an identity mapping, translating nothing
     /// (ADR-012 rung 1).
     PcpV6Pinhole,
+    /// UPnP-IGD (ADR-012 rung 2's third fallback, ADR-016 M15.1c).
+    UpnpIgd,
 }
 
 /// A successfully established port mapping (ADR-012 step 2).
@@ -244,6 +247,41 @@ async fn query_external_v4(socket: &UdpSocket) -> Option<Ipv4Addr> {
     natpmp::parse_external_addr_response(&resp)
         .ok()
         .map(|e| e.addr)
+}
+
+/// Map `port` through a UPnP Internet Gateway Device found by SSDP (ADR-012 rung 2's
+/// third fallback). `client_ip` is this node's address on the LAN, which the router
+/// forwards to. A lifetime of `0` in the result means the router granted only a
+/// permanent mapping; the caller deletes it when done ([`unmap_port_upnp`]).
+pub async fn map_port_upnp(
+    protocol: Protocol,
+    port: u16,
+    client_ip: Ipv4Addr,
+    lifetime_secs: u32,
+) -> Result<PortMapping> {
+    let gw = upnp::discover(client_ip, upnp::SSDP_MULTICAST, upnp::SSDP_TIMEOUT).await?;
+    let granted =
+        upnp::add_port_mapping(&gw, protocol, port, port, client_ip, lifetime_secs).await?;
+    let external = upnp::get_external_ip(&gw).await?;
+    Ok(PortMapping {
+        external_port: port,
+        external_ip: Some(IpAddr::V4(external)),
+        lifetime_secs: granted,
+        internal_port: port,
+        method: Method::UpnpIgd,
+    })
+}
+
+/// Remove a mapping [`map_port_upnp`] added. Best-effort: the gateway is found again
+/// by SSDP (from whichever interface the OS routes multicast on), which costs a search.
+pub async fn unmap_port_upnp(protocol: Protocol, port: u16) -> Result<()> {
+    let gw = upnp::discover(
+        Ipv4Addr::UNSPECIFIED,
+        upnp::SSDP_MULTICAST,
+        upnp::SSDP_TIMEOUT,
+    )
+    .await?;
+    upnp::delete_port_mapping(&gw, protocol, port).await
 }
 
 /// Open an **IPv6 firewall pinhole** for `port` via PCP (ADR-012 rung 1).
