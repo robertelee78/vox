@@ -264,6 +264,26 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   evaluate independently; `may_read` is the resulting per-sender verdict. A test walks it: Bob joins, each
   side admits the other, Alice's message crosses and is unreadable, her grant crosses and flips only
   `Alice → Bob` (consent is per-sender, not mutual), and all of it survives a reopen.
+- **History is the consenting member's choice, per grant (decider, 2026-09-21).** The Decision treats
+  history mode as **channel policy** (set in the genesis, changed by a `policy`-capability holder). The
+  decider has narrowed it: *"each existing member, as they accept the new member, should individually
+  make that decision, and it should only impact messages they shared to the room."*
+  This is a better fit for the mechanism than the policy reading, and the data already has the shape:
+  a member's consent releases **that member's own** sender key and nothing else, so whether the newcomer
+  receives the *current* key (forward-only) or the *origin* key (that member's retained history) is
+  inherently a per-member, per-grant decision — and `ConsentGrant.history_mode_at_grant` already records
+  it per grant. What was missing is only that the node passes the channel policy instead of letting the
+  consenter choose.
+  The channel policy therefore becomes the **default** a client offers, not a constraint it enforces: a
+  member may always be more conservative than the room's default (release the current key in a
+  full-history room), and a client may offer to be less conservative where the room's default is
+  forward-only. Nothing is lost by this, because a member who wants to hand over their own history can
+  do so outside the protocol regardless — the decider's point that *"there's nothing stopping them from
+  copy-pasting more, but no need to make that part of the UX/protocol"* is the correct boundary. What the
+  protocol owes is that the choice is **recorded** (it is, in the grant) and that it can never expose
+  another member's history (it cannot, structurally: nobody holds another member's origin key).
+  Consequence for the evaluator's known gap below: `history_mode_at_grant` moves from "recorded but never
+  validated" to *the* authority on what a grant released, which is what it should always have been.
 - **Known gaps (recorded 2026-09-19).** Role-tag ABAC (`#ops` may `dial:` `#ssh-hosts`) is not
   evaluated anywhere — `Capability::Role` exists, `is_at_or_below` is exact-match, and `tunnel/authz`
   checks only `bind:`/`dial:` tags; `Invite` has no wire encoding or signature yet; any `delegate`-holder
