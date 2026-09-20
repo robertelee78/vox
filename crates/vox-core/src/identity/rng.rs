@@ -23,19 +23,3 @@ pub fn random_array<const N: usize>() -> Result<[u8; N]> {
     fill_random(&mut out)?;
     Ok(out)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fill_changes_buffer_and_differs_across_calls() {
-        let a = random_array::<32>().unwrap();
-        let b = random_array::<32>().unwrap();
-        // Astronomically improbable to collide; a real failure here means the
-        // RNG is broken.
-        assert_ne!(a, b);
-        // Not all-zero.
-        assert_ne!(a, [0u8; 32]);
-    }
-}

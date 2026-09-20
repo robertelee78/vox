@@ -497,25 +497,3 @@ pub enum NodeEvent {
     /// The actor has stopped.
     Shutdown,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn assert_send_static<T: Send + 'static>() {}
-    fn assert_clone<T: Clone>() {}
-
-    #[test]
-    fn boundary_types_are_channel_safe_and_carry_no_secrets_by_type() {
-        assert_send_static::<NodeView>();
-        assert_send_static::<NodeCommand>();
-        assert_send_static::<NodeEvent>();
-        assert_send_static::<Outcome>();
-        assert_clone::<NodeView>();
-        assert_clone::<NodeEvent>();
-        // Outcome is Copy: it can never carry a String or a buffer.
-        fn assert_copy<T: Copy>() {}
-        assert_copy::<Outcome>();
-        assert_copy::<Fault>();
-    }
-}

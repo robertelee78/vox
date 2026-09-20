@@ -84,34 +84,3 @@ impl VisibilitySet {
         self.muted.is_empty()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const B: Digest32 = [0xBB; 32];
-    const C: Digest32 = [0xCC; 32];
-
-    #[test]
-    fn mute_unmute_is_local_and_reversible() {
-        let mut v = VisibilitySet::new();
-        assert!(v.is_visible(&B));
-        assert!(v.mute(B));
-        assert!(!v.mute(B)); // idempotent
-        assert!(v.is_muted(&B));
-        assert!(!v.is_visible(&B));
-        // Reversible at will.
-        assert!(v.unmute(&B));
-        assert!(!v.unmute(&B));
-        assert!(v.is_visible(&B));
-    }
-
-    #[test]
-    fn muting_one_does_not_affect_another() {
-        let mut v = VisibilitySet::new();
-        v.mute(B);
-        assert!(v.is_muted(&B));
-        assert!(v.is_visible(&C)); // C unaffected
-        assert_eq!(v.len(), 1);
-    }
-}

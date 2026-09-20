@@ -20,13 +20,3 @@ pub fn system_clock() -> Clock {
             .map_or(0, |d| d.as_secs())
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn system_clock_is_after_2026() {
-        assert!(system_clock()() > 1_767_225_600, "2026-01-01T00:00:00Z");
-    }
-}

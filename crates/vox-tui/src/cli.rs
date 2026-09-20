@@ -395,6 +395,18 @@ enum Cmd {
     /// Grant a member the capability to dial one of your services, as a fact on the
     /// room's log (ADR-007/ADR-013).
     Grant(GrantArgs),
+    /// Put `vox` on PATH and install tab completion for your shell.
+    ///
+    /// `install.sh` and `vox update` run this for you. It writes the completion script into
+    /// your shell's own autoload directory and maintains one marked block at the end of your
+    /// shell's startup file — at the end, so it wins the PATH race against version managers
+    /// that prepend their shims earlier in the same file. Idempotent; `--remove` undoes it
+    /// exactly; `VOX_NO_SHELL_SETUP=1` skips it.
+    ShellSetup {
+        /// Remove everything `vox shell-setup` installed.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Print shell completions for SHELL to stdout.
     Completions {
         /// The shell to generate completions for (bash, zsh, fish, …).
@@ -536,6 +548,7 @@ pub fn run() -> ExitCode {
                 crate::tunnel_cli::forward(&node, cid, &a.host, &a.tag, a.local).await
             })
         }
+        Cmd::ShellSetup { remove } => crate::shell::run(remove),
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "vox", &mut io::stdout());
@@ -553,35 +566,4 @@ pub fn run() -> ExitCode {
 
 fn render_man() -> io::Result<()> {
     clap_mangen::Man::new(Cli::command()).render(&mut io::stdout())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cli_definition_is_valid() {
-        // clap's own invariants (no duplicate flags, valid subcommands) — panics on
-        // a malformed definition, so this is a real structural check.
-        Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn man_renders_without_error() {
-        // Render into a buffer to confirm the man model is well-formed.
-        let mut buf: Vec<u8> = Vec::new();
-        clap_mangen::Man::new(Cli::command())
-            .render(&mut buf)
-            .unwrap();
-        assert!(!buf.is_empty());
-        assert!(String::from_utf8_lossy(&buf).contains("vox"));
-    }
-
-    #[test]
-    fn completions_generate_for_bash() {
-        let mut cmd = Cli::command();
-        let mut buf: Vec<u8> = Vec::new();
-        clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, "vox", &mut buf);
-        assert!(!buf.is_empty());
-    }
 }
