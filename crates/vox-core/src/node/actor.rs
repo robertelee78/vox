@@ -23,6 +23,7 @@
 //! locks (wiping every SEK and the signer) and exits.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
+use crate::governance::capability::{Capability, CapabilitySet};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::nat::bootstrap::{BootstrapNode, BootstrapSet};
@@ -718,6 +720,12 @@ impl Node {
             } => self.join_channel(&link, &local_name, &passphrase).await,
             NodeCommand::Consent { channel_id, target } => self.consent(&channel_id, target).await,
             NodeCommand::Revoke { channel_id, target } => self.revoke(&channel_id, target).await,
+            NodeCommand::Serve {
+                local_name,
+                passphrase,
+                port,
+                at,
+            } => self.serve_room(&local_name, &passphrase, port, at).await,
             NodeCommand::AddService {
                 channel_id,
                 service_tag,
@@ -1307,8 +1315,18 @@ impl Node {
                         // state) and the tunnel runs on its own task: it lives as long
                         // as the TCP connection it carries, which may be hours.
                         let snapshot = self.host_snapshot().await;
+                        // The host is told who reached what, because the carried
+                        // service only ever sees loopback (ADR-017 decision 6).
+                        let events = self.event_tx.clone();
                         tokio::spawn(async move {
-                            let _ = crate::node::tunnel::serve(peer, send, recv, snapshot).await;
+                            let _ = crate::node::tunnel::serve_reporting(
+                                peer,
+                                send,
+                                recv,
+                                snapshot,
+                                Some(events),
+                            )
+                            .await;
                         });
                     }
                     Inbound::NotYetSupported { .. }
@@ -2350,6 +2368,57 @@ impl Node {
             }
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
+    }
+
+    /// Create a service room and offer its one service, atomically (ADR-017).
+    ///
+    /// The two halves are one command because either alone is a lie: a room with a
+    /// service grant and no service hands out an address for nothing, and a service in a
+    /// room nobody can join is unreachable. If the service cannot be offered the room is
+    /// not kept.
+    async fn serve_room(
+        &mut self,
+        local_name: &str,
+        passphrase: &Secret,
+        port: u16,
+        at: Option<SocketAddr>,
+    ) -> Outcome {
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let tag = port.to_string();
+        let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)));
+        let grant = CapabilitySet::from_iter_caps([Capability::dial(tag.clone())]);
+        let mut channel = match ChannelState::create_with_grant(
+            profile,
+            local_name,
+            passphrase,
+            grant,
+            now,
+            self.argon2,
+        ) {
+            Ok(ch) => ch,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        let id = channel.channel_id();
+        if let Err(e) = channel.add_service(profile.store(), profile, &tag, endpoint) {
+            // Drop the room rather than keep a half-made one. Nothing outside this
+            // function has seen it: it is not in `self.channels` and has not been
+            // published, so forgetting it here is the whole of the rollback.
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.channels
+            .insert(id, Arc::new(tokio::sync::Mutex::new(channel)));
+        self.adopt_channel_anchors(&id, None).await;
+        self.refresh_network_view().await;
+        self.publish_channel_locally(&id).await;
+        self.publish_channel_to_anchors(&id).await;
+        let _ = self
+            .event_tx
+            .send(NodeEvent::ChannelOpened { channel_id: id })
+            .await;
+        Outcome::Done
     }
 
     async fn open_channel(&mut self, channel_id: &Digest32, passphrase: &Secret) -> Outcome {

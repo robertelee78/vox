@@ -36,6 +36,7 @@ pub mod link;
 pub mod net;
 pub mod network;
 pub mod pairwise_stream;
+pub mod passphrase;
 pub mod paths;
 pub mod prekeys;
 pub mod profile;

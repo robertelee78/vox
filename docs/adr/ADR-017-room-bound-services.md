@@ -152,8 +152,12 @@ address is a Vox-layer identifier that the serving machine translates to whateve
 chose, so it collides with nothing and binds nothing (decision 5). ADR-013's `TunnelRequest` already
 carries a free-form `service_tag: String`, so the tag of a port-named service is simply its port in
 decimal; this is a UX decision with **no wire change**. `vox serve 22 --at 10.0.0.5:2222` covers the
-case where the local endpoint is not `127.0.0.1:<same port>`, and `vox service add <tag> <endpoint>` remains for the
-service-in-an-existing-room shape, where a name is more useful than a number.
+case where the local endpoint is not `127.0.0.1:<same port>`, and `vox service add <tag> <endpoint>`
+remains for the service-in-an-existing-room shape, where a name is more useful than a number.
+
+Declaring the room and declaring the service are **one command and one act**: a room whose genesis grants
+`dial:22` while nothing is offered on 22 hands out an address for nothing, so if the service cannot be
+offered the room is not kept.
 
 #### The hostname is the channelID
 

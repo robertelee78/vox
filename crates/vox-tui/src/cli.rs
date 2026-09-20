@@ -149,6 +149,68 @@ where
     }
 }
 
+/// The shape the room-*making* verbs share (`vox serve`, `vox connect`): resolve the
+/// profile, unlock the identity — creating it on first use — and run the verb.
+///
+/// Unlike [`run_tunnel_verb`] these do not open an existing room: `serve` is about to
+/// create one and `connect` is about to join one, so neither has a room id or a room
+/// passphrase to collect up front.
+fn run_new_room_verb<F, Fut>(
+    profile: ProfileArgs,
+    identity_passphrase: Option<String>,
+    body: F,
+) -> ExitCode
+where
+    F: FnOnce(vox_core::node::actor::NodeHandle, BootstrapSet) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
+{
+    let paths = match profile.paths() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let anchors = match profile.anchor_set() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("vox: --anchor: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let identity = match crate::tunnel_cli::identity_passphrase_for(&paths, identity_passphrase) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let listen = profile.listen;
+    let anchors_for_body = anchors.clone();
+    let outcome = rt.block_on(async move {
+        let node = crate::tunnel_cli::open_profile(paths, listen, anchors, &identity).await?;
+        body(node, anchors_for_body).await
+    });
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `vox service …`
 #[derive(Subcommand, Clone)]
 enum ServiceCmd {
@@ -227,6 +289,44 @@ pub struct GrantArgs {
     pub days: u64,
 }
 
+/// `vox serve`
+#[derive(Args, Debug, Clone)]
+pub struct ServeArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The local TCP port to offer. It is also the service's name: guests reach it at
+    /// this port of the room's `.vox` hostname.
+    pub port: u16,
+    /// The local endpoint to carry connections to, when it is not `127.0.0.1:<port>`.
+    #[arg(long)]
+    pub at: Option<SocketAddr>,
+    /// A local name for the room (this device only; never leaves it).
+    #[arg(long, default_value = "service")]
+    pub name: String,
+    /// The identity passphrase. Prompted for when omitted.
+    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    pub identity_passphrase: Option<String>,
+}
+
+/// `vox connect`
+#[derive(Args, Debug, Clone)]
+pub struct ConnectArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The `vox://…` address you were given.
+    pub address: String,
+    /// The room passphrase. Prompted for (unechoed) when omitted, which is the way to
+    /// give it: a passphrase in a flag is in the shell's history.
+    #[arg(long, env = "VOX_ROOM_PASSPHRASE")]
+    pub passphrase: Option<String>,
+    /// A local name for the room (this device only).
+    #[arg(long, default_value = "service")]
+    pub name: String,
+    /// The identity passphrase. Prompted for when omitted.
+    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    pub identity_passphrase: Option<String>,
+}
+
 /// The default bind address: every interface, kernel-chosen port. The bound address
 /// is not what peers are told to dial (see [`ProfileArgs::listen`]), so binding
 /// broadly is right.
@@ -251,6 +351,19 @@ enum Cmd {
     /// read nothing; its identity is a key file in the profile directory, created on
     /// first run. Prints the `<fingerprint>@<multiaddr>` to give clients as `--anchor`.
     Node(ProfileArgs),
+    /// Offer a local TCP port as a room-bound service, in one command (ADR-017).
+    ///
+    /// Creates a room whose genesis grants every member the right to reach that port —
+    /// so joining the room *is* the authorization and you never wait to grant anyone
+    /// anything — offers the port in it, and prints the address, the machine-generated
+    /// passphrase and the `.vox` hostname it answers on. Runs until interrupted,
+    /// reporting who reaches the service (the service itself cannot tell you: every Vox
+    /// client arrives at it from loopback).
+    Serve(ServeArgs),
+    /// Join a room from the address you were given, and print the name its services
+    /// answer on (ADR-017). One-shot: joining is durable, so there is nothing to keep
+    /// running — `vox up` is what makes the name resolve.
+    Connect(ConnectArgs),
     /// Offer a local TCP service to a room, or list what is offered (ADR-013).
     ///
     /// A service is dark by default: offering it grants nobody reach. Members reach it
@@ -333,6 +446,36 @@ pub fn run() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Cmd::Serve(args) => {
+            let a = args.clone();
+            run_new_room_verb(
+                args.profile.clone(),
+                args.identity_passphrase.clone(),
+                move |node, anchors| async move {
+                    crate::tunnel_cli::serve(&node, &anchors, &a.name, a.port, a.at).await
+                },
+            )
+        }
+        Cmd::Connect(args) => {
+            let room_pp = match crate::tunnel_cli::passphrase_or_prompt(
+                args.passphrase.as_ref(),
+                "room passphrase",
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let a = args.clone();
+            run_new_room_verb(
+                args.profile.clone(),
+                args.identity_passphrase.clone(),
+                move |node, _anchors| async move {
+                    crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp).await
+                },
+            )
         }
         Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
             let sub = sub.clone();

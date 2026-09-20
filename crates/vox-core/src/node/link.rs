@@ -59,6 +59,41 @@ const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 /// Length of a 32-byte digest in unpadded base32.
 const B32_DIGEST_LEN: usize = 52;
 
+/// The DNS suffix a Vox name ends in (ADR-017 decision 4). It is resolved only on a
+/// machine running `vox up`, from rooms that machine has joined — there is no global
+/// namespace and nothing is looked up off the machine.
+pub const VOX_TLD: &str = ".vox";
+
+/// The person-facing hostname of a room: `<52-char-base32-channelID>.vox`.
+///
+/// It is the *same 52 characters that begin the invite link*, so a client derives the
+/// name from the link it was given with no additional field anywhere, and the name is
+/// self-certifying: it decodes to the channelID, which is the hash of the genesis
+/// (ADR-008), so a typo names a room this machine has not joined and fails locally
+/// instead of being misdirected.
+#[must_use]
+pub fn vox_hostname(channel_id: &Digest32) -> String {
+    let mut out = b32_encode(channel_id);
+    out.push_str(VOX_TLD);
+    out
+}
+
+/// The channelID a `.vox` hostname names, or [`Error::MalformedLink`].
+///
+/// Case-insensitive (DNS is), and strict about everything else: the label must be
+/// exactly the 52 base32 characters of a digest, so a subdomain, a padded label or a
+/// truncated one is refused rather than guessed at.
+pub fn channel_of_hostname(host: &str) -> Result<Digest32> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let label = host
+        .strip_suffix(VOX_TLD)
+        .ok_or(Error::MalformedLink("not a .vox hostname"))?;
+    if label.contains('.') {
+        return Err(Error::MalformedLink("a .vox hostname has one label"));
+    }
+    b32_decode(label, "vox hostname")
+}
+
 /// Encode a 32-byte digest as lowercase unpadded base32 (the link's, and the CLI's,
 /// rendering of a fingerprint).
 #[must_use]
@@ -340,6 +375,42 @@ mod tests {
 
     fn v4(d: u8, port: u16) -> Multiaddr {
         Multiaddr::Ip4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, d), port))
+    }
+
+    #[test]
+    fn a_vox_hostname_is_the_room_id_and_round_trips() {
+        let cid = [0x5Au8; 32];
+        let host = vox_hostname(&cid);
+        // The name *is* the 52 characters that begin an invite link, plus the suffix —
+        // which is why a client needs no extra field to derive it (ADR-017 decision 4).
+        assert_eq!(host, format!("{}{}", b32_encode(&cid), VOX_TLD));
+        assert_eq!(host.len(), 52 + VOX_TLD.len());
+        assert_eq!(channel_of_hostname(&host).unwrap(), cid);
+        // DNS is case-insensitive and may hand back a trailing dot.
+        assert_eq!(channel_of_hostname(&host.to_uppercase()).unwrap(), cid);
+        assert_eq!(channel_of_hostname(&format!("{host}.")).unwrap(), cid);
+        assert_eq!(channel_of_hostname(&format!("  {host}  ")).unwrap(), cid);
+    }
+
+    #[test]
+    fn a_malformed_vox_hostname_is_refused_rather_than_guessed_at() {
+        let cid = [0x5Au8; 32];
+        let good = b32_encode(&cid);
+        for bad in [
+            "example.com".to_owned(),
+            good.clone(),                    // no suffix
+            format!("{good}.onion"),         // the wrong suffix
+            format!("www.{good}.vox"),       // a subdomain: one label only
+            format!("{}.vox", &good[..51]),  // truncated
+            format!("{good}a.vox"),          // too long
+            format!("{}0.vox", &good[..51]), // outside the base32 alphabet
+            ".vox".to_owned(),
+        ] {
+            assert!(
+                channel_of_hostname(&bad).is_err(),
+                "{bad:?} must not resolve"
+            );
+        }
     }
 
     #[test]

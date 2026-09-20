@@ -208,13 +208,39 @@ pub struct HostService {
 /// connect-failed are indistinguishable on the wire (dark services, default-deny).
 /// The local connect happens only after authorization succeeds.
 pub async fn accept<F>(
-    mut send: SendStream,
-    mut recv: RecvStream,
+    send: SendStream,
+    recv: RecvStream,
     client_id: &Digest32,
     resolve: F,
 ) -> Result<()>
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
+{
+    accept_reporting(send, recv, client_id, resolve, |_, _| {}).await
+}
+
+/// [`accept`], reporting each authorized request to `served` before the local connect.
+///
+/// The host needs this because the carried service cannot tell its Vox clients apart:
+/// they all arrive from loopback, so `sshd`'s log says `127.0.0.1` and nothing else
+/// (ADR-017 decision 6). The identity is right here — transport-authenticated and
+/// checked against the room's evaluator — so this is where it can be surfaced.
+///
+/// `served` is called **only after authorization succeeds**, so it reports grants and
+/// never attempts; a denial is silent to it, exactly as it is to the dialer. It runs
+/// inside the accept path, so it must not block: the intended use is to hand an event
+/// to a queue. It is informational for a live client, *not* an audit log — a durable,
+/// signed record of session establishment is ADR-013's own open item.
+pub async fn accept_reporting<F, S>(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    client_id: &Digest32,
+    resolve: F,
+    served: S,
+) -> Result<()>
+where
+    F: FnOnce(&Digest32, &str) -> Option<HostService>,
+    S: FnOnce(&Digest32, &str),
 {
     let req = TunnelRequest::from_bytes(&read_frame(&mut recv).await?)?;
 
@@ -233,6 +259,9 @@ where
         let _ = send.finish();
         return Err(Error::TunnelDenied("service unauthorized or unknown"));
     };
+    // Authorized, and not before: the host learns who reached what, and learns nothing
+    // about a refusal it did not grant.
+    served(&req.channel_id, &req.service_tag);
 
     let tcp = match TcpStream::connect(target).await {
         Ok(t) => t,
