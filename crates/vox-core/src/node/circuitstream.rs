@@ -38,8 +38,8 @@ use quinn::{RecvStream, SendStream};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
-use crate::node::coordstream::relays_for;
-use crate::node::net::PeerPolicy;
+use crate::node::coordstream::{accepts_relayed, relays_for};
+use crate::node::net::PeerClass;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::mux::{circuit_addr, CircuitPort};
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
@@ -275,7 +275,7 @@ impl Drop for CircuitSlot {
 /// table); `endpoint` is where a circuit terminating here is attached.
 pub async fn serve_circuit<F>(
     peer: Digest32,
-    policy: &PeerPolicy,
+    classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
     mut send: SendStream,
     mut recv: RecvStream,
     connected: F,
@@ -287,7 +287,7 @@ where
 {
     match opening_answer(&mut recv).await? {
         CircuitFrame::Open { peer: target } => {
-            if !relays_for(policy.classify(&peer)) || !relays_for(policy.classify(&target)) {
+            if !relays_for(classify(&peer)) || !relays_for(classify(&target)) {
                 refuse(&mut send, CircuitRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused(
                     "circuit: peer may not ask for a relay",
@@ -317,7 +317,9 @@ where
             Ok(())
         }
         CircuitFrame::Incoming { peer: origin } => {
-            if !relays_for(policy.classify(&peer)) || !relays_for(policy.classify(&origin)) {
+            // The same rule as a relayed punch session, anchor's vouching included:
+            // a circuit is how an anchor introduces a peer nothing else can reach.
+            if !accepts_relayed(classify(&peer), classify(&origin)) {
                 refuse(&mut send, CircuitRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused("circuit: peer may not relay to us"));
             }

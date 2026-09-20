@@ -306,6 +306,14 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   two peers it named, which is bounded (it can drop or garble signaling, making the punch fail) but means a
   hostile coordinator can deny a punch it was asked to carry. `BootstrapSet` remains unwired, so the
   coordinators a node can use are whichever peers it happens to be connected to.
+- **Helpers exist now (2026-09-20, ADR-016 M15.1).** The ladder's rungs 3 and 4 climb through *a peer
+  already connected to both sides*, and ADR-016 M15.1 is what makes such a peer exist for two clients
+  inside private networks: the configured `BootstrapSet` is dialled at network start, named in invite
+  links (with fingerprints, so the dial is pinned), persisted per channel, published to, and — as the
+  node the user configured to introduce peers — trusted to vouch for the far side of a session it relays.
+  Two defects in this ADR's code were found by that gate and fixed here: `connect_direct` spun hot on an
+  attempt that failed faster than its stagger (and dropped nothing an IPv4 socket could not address), and
+  the sync transport had no per-frame bound. Details in ADR-016.
 - **Known gaps, after rung 4 (2026-09-20).** The ladder is complete and every rung is proved against a
   middlebox that behaves like the real one. What remains is around it, not in it: a helper (coordinator or
   relay) must already be connected to both peers, and is found by trial over current connections —

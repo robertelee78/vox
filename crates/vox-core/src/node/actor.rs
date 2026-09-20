@@ -32,6 +32,7 @@ use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
+use crate::nat::bootstrap::{BootstrapNode, BootstrapSet};
 use crate::node::api::{
     ChannelDetail, ChannelSummary, Fault, IdentityInfo, MessageRow, NodeCommand, NodeEvent,
     NodeView, Outcome, Secret,
@@ -72,6 +73,20 @@ const TICK: Duration = Duration::from_secs(1);
 /// rather than dropped: a full queue slows the accept loop, it never loses work.
 const NET_QUEUE: usize = 64;
 
+/// Put a pre-join record on the board at `conn`. A **refusal is fine**: it means our
+/// previous announcement is still live (the ADR-012 refresh floor declines a faster
+/// replacement), and being announced is all this is for. Only a transport failure is
+/// an error.
+async fn announce(conn: &VoxConnection, prejoin_wire: &[u8]) -> crate::error::Result<()> {
+    let mut client = crate::nat::service::RendezvousClient::open(conn).await?;
+    let res = match client.put(prejoin_wire).await {
+        Ok(()) | Err(crate::error::Error::RendezvousRejected(_)) => Ok(()),
+        Err(e) => Err(e),
+    };
+    client.finish();
+    res
+}
+
 /// When granted mappings must be re-requested: half the shortest granted lifetime
 /// (the renewal interval RFC 6887 §11.2.1 recommends), or `None` when no gateway
 /// granted anything and so there is nothing to keep alive.
@@ -88,6 +103,102 @@ fn renew_at(now: u64, mappings: &[crate::nat::portmap::PortMapping]) -> Option<u
         .map(|l| now + u64::from(l.max(2) / 2))
 }
 
+/// Where a node's endpoint binds.
+#[derive(Clone)]
+pub enum Bind {
+    /// A UDP address (the wildcard is the normal choice: what the node *advertises*
+    /// comes from the ADR-012 ladder, not from here).
+    Addr(std::net::SocketAddr),
+    /// A caller-supplied datagram socket — a simulated network with NAT devices, or
+    /// any other substrate (`VoxEndpoint::bind_abstract`).
+    Socket(Arc<dyn quinn::AsyncUdpSocket>),
+}
+
+impl std::fmt::Debug for Bind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Bind::Addr(a) => write!(f, "Bind::Addr({a})"),
+            Bind::Socket(s) => write!(f, "Bind::Socket({s:?})"),
+        }
+    }
+}
+
+/// Everything a node is configured with. [`Node::spawn_config`] takes it; the other
+/// constructors are shorthands for common shapes of it.
+#[derive(Clone)]
+pub struct NodeConfig {
+    /// The wall clock (tests inject a fixed one).
+    pub clock: Clock,
+    /// The Argon2id profile for every at-rest derivation.
+    pub argon2: Argon2Profile,
+    /// Where to bind, or `None` for a node that does not network.
+    pub bind: Option<Bind>,
+    /// An override for the ADR-005 PoW parameters a join binds (tests reduce them).
+    pub pow_params: Option<crate::join::pow::PowParams>,
+    /// The anchors this node publishes to, reads from, climbs its ladder through and
+    /// names in invite links (ADR-012 §"Bootstrap": the user's own always-on node).
+    pub anchors: BootstrapSet,
+}
+
+impl std::fmt::Debug for NodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeConfig")
+            .field("bind", &self.bind)
+            .field("pow_params", &self.pow_params)
+            .field("anchors", &self.anchors.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NodeConfig {
+    /// The production shape: system clock, production Argon2id, not networked, no
+    /// anchors.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            clock: system_clock(),
+            argon2: Argon2Profile::default(),
+            bind: None,
+            pow_params: None,
+            anchors: BootstrapSet::new(),
+        }
+    }
+
+    /// Use this clock.
+    #[must_use]
+    pub fn clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Use this Argon2id profile.
+    #[must_use]
+    pub fn argon2(mut self, argon2: Argon2Profile) -> Self {
+        self.argon2 = argon2;
+        self
+    }
+
+    /// Network, binding here.
+    #[must_use]
+    pub fn bind(mut self, bind: Bind) -> Self {
+        self.bind = Some(bind);
+        self
+    }
+
+    /// Use these anchors.
+    #[must_use]
+    pub fn anchors(mut self, anchors: BootstrapSet) -> Self {
+        self.anchors = anchors;
+        self
+    }
+}
+
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
@@ -96,6 +207,12 @@ enum NetEvent {
     AddressesDiscovered {
         /// Every granted mapping or pinhole, possibly none.
         mappings: Vec<crate::nat::portmap::PortMapping>,
+    },
+    /// A configured anchor answered its dial (ADR-016 M15.1): it gets the ordinary
+    /// bookkeeping, the `Anchor` class, and every open channel's records.
+    AnchorConnected {
+        /// The connection to the anchor.
+        conn: Arc<VoxConnection>,
     },
     /// A hole punch produced a connection (ADR-012 rung 3): it needs the same
     /// bookkeeping a dialled one gets — a stream loop and a sync schedule.
@@ -281,8 +398,16 @@ pub struct Node {
     net: Option<Arc<NodeNet>>,
     /// Sender the actor keeps so the network queue never closes under it.
     net_tx: mpsc::Sender<NetEvent>,
-    /// The bind address for the endpoint, if this node networks at all.
-    bind: Option<std::net::SocketAddr>,
+    /// Where the endpoint binds, if this node networks at all.
+    bind: Option<Bind>,
+    /// The anchors this node is configured with (ADR-012 §"Bootstrap", ADR-016
+    /// M15.1): dialled when the network starts, given the `Anchor` class, published
+    /// to, and named in every invite link.
+    anchors: BootstrapSet,
+    /// Every identity this node treats as an anchor: the configured set plus the
+    /// anchors of each open channel. The peer policy is rebuilt from channel
+    /// membership whenever channels change, and these are carried into it.
+    anchor_ids: std::collections::BTreeSet<Digest32>,
     /// An override for the ADR-005 PoW parameters a join binds. `None` means the
     /// channel's own (production `(200,9)`); tests reduce them so the debug suite
     /// does not grind, exactly as they reduce the Argon2 profile.
@@ -369,6 +494,22 @@ impl Node {
         bind: Option<std::net::SocketAddr>,
         pow_params: Option<crate::join::pow::PowParams>,
     ) -> crate::error::Result<NodeHandle> {
+        let mut cfg = NodeConfig::new().clock(clock).argon2(argon2);
+        cfg.bind = bind.map(Bind::Addr);
+        cfg.pow_params = pow_params;
+        Self::spawn_config(paths, cfg)
+    }
+
+    /// Spawn the node with a full [`NodeConfig`]: the one constructor every other
+    /// one is a shorthand for.
+    pub fn spawn_config(paths: Paths, cfg: NodeConfig) -> crate::error::Result<NodeHandle> {
+        let NodeConfig {
+            clock,
+            argon2,
+            bind,
+            pow_params,
+            anchors,
+        } = cfg;
         let profile = if Profile::exists(&paths) {
             Some(Profile::open(paths.clone())?)
         } else {
@@ -383,6 +524,8 @@ impl Node {
             net: None,
             net_tx,
             bind,
+            anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
+            anchors,
             pow_params,
             stream_loops: std::collections::BTreeSet::new(),
             port_mappings: Vec::new(),
@@ -535,7 +678,9 @@ impl Node {
     /// identity and spawn the accept loop. A no-op when this node does not network,
     /// or when it is already up.
     fn start_network(&mut self) -> crate::error::Result<()> {
-        let Some(bind) = self.bind else { return Ok(()) };
+        let Some(bind) = self.bind.as_ref() else {
+            return Ok(());
+        };
         if self.net.is_some() {
             return Ok(());
         }
@@ -543,12 +688,30 @@ impl Node {
             .profile
             .as_ref()
             .ok_or(crate::error::Error::Profile("no identity in this profile"))?;
-        let endpoint = Arc::new(crate::transport::quic::VoxEndpoint::bind(
-            profile.signer()?,
-            bind,
-        )?);
+        let endpoint = Arc::new(match bind {
+            Bind::Addr(addr) => {
+                crate::transport::quic::VoxEndpoint::bind(profile.signer()?, *addr)?
+            }
+            Bind::Socket(socket) => crate::transport::quic::VoxEndpoint::bind_abstract(
+                profile.signer()?,
+                Arc::clone(socket),
+            )?,
+        });
         let net = Arc::new(NodeNet::new(endpoint, Arc::clone(&self.clock)));
         self.net = Some(Arc::clone(&net));
+        // The configured anchors are dialled at once, each on its own task: they are
+        // where this node's records go and the helpers its ladder climbs through, and
+        // an anchor that is down must not hold up the ones that are not.
+        for anchor in self.anchors.nodes() {
+            let net = Arc::clone(&net);
+            let tx = self.net_tx.clone();
+            let (id, endpoints) = (anchor.id, anchor.endpoints.clone());
+            tokio::spawn(async move {
+                if let Ok(conn) = net.manager().connect(id, &endpoints).await {
+                    let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                }
+            });
+        }
         // No membership refresh here: the network only starts when the identity
         // unlocks, and `lock_all` cleared every channel, so there is nothing to
         // publish yet. The *address* discovery does run, on its own task, because it
@@ -629,6 +792,63 @@ impl Node {
         client.finish();
     }
 
+    /// Make a channel's anchors this node's: record `more` on the channel (persisted
+    /// under its SEK) and the configured set with it, treat every one as an anchor,
+    /// and dial any not yet connected. Called when a channel is created, opened or
+    /// joined.
+    async fn adopt_channel_anchors(&mut self, channel_id: &Digest32, more: Option<&BootstrapSet>) {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let anchors = {
+            let mut channel = shared.lock().await;
+            if let Some(profile) = self.profile.as_ref() {
+                let mut add = self.anchors.clone();
+                if let Some(more) = more {
+                    let _ = add.merge(more);
+                }
+                let _ = channel.add_anchors(profile.store(), &add);
+            }
+            channel.anchors().clone()
+        };
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        for anchor in anchors.nodes() {
+            if anchor.id == net.local_id() {
+                continue;
+            }
+            self.anchor_ids.insert(anchor.id);
+            if net.manager().existing(&anchor.id).is_some() {
+                continue;
+            }
+            let net = Arc::clone(&net);
+            let tx = self.net_tx.clone();
+            let (id, endpoints) = (anchor.id, anchor.endpoints.clone());
+            tokio::spawn(async move {
+                if let Ok(conn) = net.manager().connect(id, &endpoints).await {
+                    let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                }
+            });
+        }
+    }
+
+    /// Put a channel's genesis and this node's records on every anchor this node is
+    /// connected to (its configured set and the channel's own).
+    async fn publish_channel_to_anchors(&mut self, channel_id: &Digest32) {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let anchors: Vec<Arc<VoxConnection>> = self
+            .anchor_ids
+            .iter()
+            .filter_map(|id| net.manager().existing(id))
+            .collect();
+        for conn in anchors {
+            self.publish_channel_to_anchor(channel_id, &conn).await;
+        }
+    }
+
     /// Put a channel's genesis and this node's records on its own board, so a joiner
     /// can find out what the channel is and how to reach us (ADR-007/ADR-012). A
     /// refusal here is normal, not an error: the board already holds a current record
@@ -677,6 +897,10 @@ impl Node {
             policy.add_members(members.keys().copied());
             net.membership().set_channel(*cid, ch.epoch(), members);
         }
+        // Anchors are not channel membership: they are carried in by hand.
+        for anchor in &self.anchor_ids {
+            policy.add_anchor(*anchor);
+        }
         // Replacing wholesale would drop the pending joiners the actor is expecting,
         // so they are carried over.
         let previous = net.policy().snapshot();
@@ -700,6 +924,17 @@ impl Node {
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
                     self.publish_channel_locally(&channel_id).await;
+                    self.publish_channel_to_anchors(&channel_id).await;
+                }
+            }
+            NetEvent::AnchorConnected { conn } => {
+                let peer = conn.peer_id();
+                self.anchor_ids.insert(peer);
+                self.adopt_connection(Arc::clone(&conn));
+                self.refresh_network_view().await;
+                let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+                for channel_id in channels {
+                    self.publish_channel_to_anchor(&channel_id, &conn).await;
                 }
             }
             NetEvent::Punched { conn } => {
@@ -924,9 +1159,28 @@ impl Node {
         if !self.channels.contains_key(channel_id) {
             return Outcome::Failed(Fault::UnknownChannel);
         }
-        let Ok(anchors) = net.local_endpoints() else {
-            return Outcome::Failed(Fault::NotNetworked);
-        };
+        // The link names the swarm's anchors — the channel's own, then the configured
+        // set — and this node last: an anchor is reachable by design, this node's own
+        // addresses may not be, and a joiner tries them in this order.
+        let mut anchors: Vec<BootstrapNode> = Vec::new();
+        if let Some(shared) = self.channels.get(channel_id) {
+            for n in shared.lock().await.anchors().nodes() {
+                anchors.push(n.clone());
+            }
+        }
+        for n in self.anchors.nodes() {
+            if !anchors.iter().any(|a| a.id == n.id) {
+                anchors.push(n.clone());
+            }
+        }
+        if let Ok(own) = net.local_endpoints() {
+            if !anchors.iter().any(|a| a.id == net.local_id()) {
+                if let Ok(me) = BootstrapNode::new(net.local_id(), own) {
+                    anchors.push(me);
+                }
+            }
+        }
+        anchors.truncate(crate::node::link::MAX_LINK_ANCHORS);
         let link =
             match crate::node::link::InviteLink::new(*channel_id, anchors, Some(net.local_id())) {
                 Ok(l) => l,
@@ -958,35 +1212,60 @@ impl Node {
             return Outcome::Failed(Fault::IdentityExists);
         }
         let now = self.now();
-        // A pinned responder is dialled as that identity; otherwise the first anchor
-        // is also the responder we join through (M15 adds anchor-only bootstrap).
-        let Some(responder) = parsed.responder else {
-            return Outcome::Failed(Fault::BadLink);
+        // First, a board: the link's anchors in its order, pinned to the identity the
+        // link names for each. An anchor that does not answer is skipped.
+        let me = net.local_id();
+        let mut board: Option<Arc<VoxConnection>> = None;
+        for anchor in parsed.anchors.iter().filter(|a| a.id != me) {
+            if let Ok(conn) = self.dial(anchor.id, &anchor.endpoints).await {
+                self.anchor_ids.insert(anchor.id);
+                board = Some(conn);
+                break;
+            }
+        }
+        let Some(board) = board else {
+            return Outcome::Failed(Fault::Unreachable);
         };
-        // Dial before borrowing the profile: the dial needs `&mut self` to record that
-        // this connection now has a stream loop.
-        let conn = match self.dial(responder, &parsed.anchors).await {
-            Ok(c) => c,
+        self.refresh_network_view().await;
+        // The board tells us what the channel is and who is in it.
+        let set = match net.fetch_channel(&board, &parsed.channel_id, 0).await {
+            Ok(s) => s,
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
-        let outcome = {
+        let Some(genesis) = set.genesis.clone() else {
+            return Outcome::Failed(Fault::BadLink);
+        };
+        // The member to join through: the pinned responder, else any member the board
+        // has an address record for. Its record's endpoints are dial hints — a wrong
+        // one just fails, the identity is pinned — and the ladder does the rest: the
+        // anchor we are connected to is exactly the helper a punch or a circuit
+        // through needs when the responder is behind a NAT too.
+        let responder = match parsed.responder {
+            Some(r) => r,
+            None => match set.members.first() {
+                Some(record) => record.author_id,
+                None => return Outcome::Failed(Fault::BadLink),
+            },
+        };
+        let responder_endpoints = set
+            .members
+            .iter()
+            .find(|r| r.author_id == responder)
+            .map(|r| r.endpoints.clone())
+            .unwrap_or_default();
+        // Announce ourselves — **before** reaching for the responder. The pre-join
+        // record is what makes an unknown peer eligible (ADR-016): on the anchor it is
+        // what lets the anchor coordinate a punch or carry a circuit for us to a
+        // responder behind a NAT, and on the responder it is what authorizes the join
+        // stream. So it goes on the anchor's board now, and on the responder's own
+        // board the moment we reach it.
+        let prejoin_wire = {
             let Some(profile) = self.profile.as_ref() else {
                 return Outcome::Failed(Fault::NoIdentity);
             };
             let Ok(signer) = profile.signer() else {
                 return Outcome::Failed(Fault::Locked);
             };
-            let dh = *signer.x25519_identity_secret();
-            // The board tells us what the channel is and who is in it.
-            let set = match net.fetch_channel(&conn, &parsed.channel_id, 0).await {
-                Ok(s) => s,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            };
-            let Some(genesis) = set.genesis.clone() else {
-                return Outcome::Failed(Fault::BadLink);
-            };
-            // Announce ourselves so the responder will accept a join stream from us
-            // (ADR-016: the pre-join record is what makes an unknown peer eligible).
             let ring = match self.prekeys.as_ref() {
                 Some(r) => r,
                 None => return Outcome::Failed(Fault::NotNetworked),
@@ -1005,7 +1284,7 @@ impl Node {
                 *entry = entry.saturating_add(1);
                 *entry
             };
-            let prejoin = match crate::nat::record::PreJoinRecord::build(
+            match crate::nat::record::PreJoinRecord::build(
                 signer,
                 &parsed.channel_id,
                 bundle,
@@ -1013,27 +1292,33 @@ impl Node {
                 seq,
                 now,
             ) {
-                Ok(r) => r,
+                Ok(r) => r.to_wire(),
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            }
+        };
+        if let Err(e) = announce(&board, &prejoin_wire).await {
+            return Outcome::Failed(fault_of(&e));
+        }
+        let conn = if board.peer_id() == responder {
+            Arc::clone(&board)
+        } else {
+            let conn = match self.dial(responder, &responder_endpoints).await {
+                Ok(c) => c,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             };
-            {
-                let mut client = match crate::nat::service::RendezvousClient::open(&conn).await {
-                    Ok(c) => c,
-                    Err(e) => return Outcome::Failed(fault_of(&e)),
-                };
-                // A **refusal is fine**: it means our previous announcement is still
-                // live (the ADR-012 refresh floor declines a faster replacement), and
-                // being announced is all this step is for. Only a transport failure
-                // aborts the join.
-                match client.put(&prejoin.to_wire()).await {
-                    Ok(()) | Err(crate::error::Error::RendezvousRejected(_)) => {}
-                    Err(e) => {
-                        client.finish();
-                        return Outcome::Failed(fault_of(&e));
-                    }
-                }
-                client.finish();
+            if let Err(e) = announce(&conn, &prejoin_wire).await {
+                return Outcome::Failed(fault_of(&e));
             }
+            conn
+        };
+        let outcome = {
+            let Some(profile) = self.profile.as_ref() else {
+                return Outcome::Failed(Fault::NoIdentity);
+            };
+            let Ok(signer) = profile.signer() else {
+                return Outcome::Failed(Fault::Locked);
+            };
+            let dh = *signer.x25519_identity_secret();
             let mut ctx = match crate::node::channel::join_context_from_genesis(&genesis, 0) {
                 Ok(c) => c,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
@@ -1092,12 +1377,24 @@ impl Node {
         }
         self.sessions
             .insert((parsed.channel_id, responder), joined.session);
+        // The link's anchors are this channel's anchors from now on (persisted, so a
+        // restart still knows where the swarm's board is), together with our own.
+        let mut learned = BootstrapSet::new();
+        for a in parsed.anchors.iter().filter(|a| a.id != me) {
+            let _ = learned.add(a.clone());
+        }
+        let _ = learned.merge(&self.anchors);
+        self.adopt_channel_anchors(&parsed.channel_id, Some(&learned))
+            .await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&parsed.channel_id).await;
-        // And on the anchor we joined through, so every other member can find our key
-        // and admit us as a log author (without which their sync sessions fail).
-        self.publish_channel_to_anchor(&parsed.channel_id, &conn)
-            .await;
+        // And on every anchor we hold, so every other member can find our key and
+        // admit us as a log author (without which their sync sessions fail).
+        self.publish_channel_to_anchors(&parsed.channel_id).await;
+        if !self.anchor_ids.contains(&conn.peer_id()) {
+            self.publish_channel_to_anchor(&parsed.channel_id, &conn)
+                .await;
+        }
         // ADR-007 step 2: the newcomer announces its **own** sender key. This is part
         // of joining rather than a separate consent decision — "it has nothing to
         // consent over" — and it must happen here for a second reason: the ADR-004
@@ -1537,8 +1834,10 @@ impl Node {
                 let id = ch.channel_id();
                 self.channels
                     .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
+                self.adopt_channel_anchors(&id, None).await;
                 self.refresh_network_view().await;
                 self.publish_channel_locally(&id).await;
+                self.publish_channel_to_anchors(&id).await;
                 let _ = self
                     .event_tx
                     .send(NodeEvent::ChannelOpened { channel_id: id })
@@ -1561,8 +1860,10 @@ impl Node {
             Ok(ch) => {
                 self.channels
                     .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+                self.adopt_channel_anchors(channel_id, None).await;
                 self.refresh_network_view().await;
                 self.publish_channel_locally(channel_id).await;
+                self.publish_channel_to_anchors(channel_id).await;
                 let _ = self
                     .event_tx
                     .send(NodeEvent::ChannelOpened {
@@ -1809,6 +2110,8 @@ mod tests {
             // No bind address: this node does not network (the loopback paths are
             // covered by `node::network` and the M14 gate).
             bind: None,
+            anchors: BootstrapSet::new(),
+            anchor_ids: std::collections::BTreeSet::new(),
             pow_params: None,
             stream_loops: std::collections::BTreeSet::new(),
             port_mappings: Vec::new(),

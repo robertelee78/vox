@@ -34,6 +34,14 @@
 //! join stream. An *unknown* peer, which has published nothing, gets `WHOAMI` and
 //! nothing else.
 //!
+//! One more rule, for the joining case: a session relayed **by this node's own
+//! anchor** is accepted whoever the far peer is. The anchor already applied its own
+//! rule — it relays only for peers with records on its board — and it is the node the
+//! user configured to introduce peers (ADR-012 §"Bootstrap": "bootstrap nodes only
+//! introduce peers"). Without this, a newcomer whose pre-join record is on the
+//! anchor's board could never be punched to by a member that has not seen that
+//! record yet, which is every member behind a NAT.
+//!
 //! This is signaling for two peers, never a data path: the coordinator forwards `COORD`
 //! frames and nothing else, at most [`MAX_RELAYED_FRAMES`] of them per direction within
 //! [`RELAY_SESSION_TIMEOUT`], so the verb cannot be turned into a free tunnel.
@@ -49,7 +57,7 @@ use crate::hash::Digest32;
 use crate::nat::holepunch::{CoordMessage, Coordinator, PunchPlan, Role, Step};
 use crate::nat::multiaddr::{EndpointList, Multiaddr, MAX_ENDPOINTS};
 use crate::nat::reachability::connect_direct;
-use crate::node::net::{PeerClass, PeerPolicy};
+use crate::node::net::PeerClass;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
 use crate::transport::streams::{open_typed, StreamKind};
@@ -287,7 +295,7 @@ pub enum CoordInbound {
 pub async fn serve_coord<F>(
     peer: Digest32,
     observed: Multiaddr,
-    policy: &PeerPolicy,
+    classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
     mut send: SendStream,
     mut recv: RecvStream,
     connected: F,
@@ -306,7 +314,7 @@ where
         CoordFrame::Relay { peer: target } => {
             // Both ends must be peers this node relays for: a member may not make it
             // open a coord stream to an identity it knows nothing about.
-            if !relays_for(policy.classify(&peer)) || !relays_for(policy.classify(&target)) {
+            if !relays_for(classify(&peer)) || !relays_for(classify(&target)) {
                 refuse(&mut send, CoordRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused("coord: peer may not ask for a relay"));
             }
@@ -319,9 +327,7 @@ where
         }
         // A coordinator offering a session: accept only from a member or anchor.
         CoordFrame::From { peer: origin } => {
-            // The coordinator must be a peer this node trusts to coordinate, and the
-            // far side must be one it would punch with at all.
-            if !relays_for(policy.classify(&peer)) || !relays_for(policy.classify(&origin)) {
+            if !accepts_relayed(classify(&peer), classify(&origin)) {
                 refuse(&mut send, CoordRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused("coord: peer may not coordinate"));
             }
@@ -344,6 +350,15 @@ pub(crate) fn relays_for(class: PeerClass) -> bool {
         class,
         PeerClass::Member | PeerClass::Anchor | PeerClass::PendingJoiner
     )
+}
+
+/// Whether this node takes part in a session that `relay` carried here from
+/// `origin`: the relay must be one this node would relay for, and the origin too —
+/// unless the relay is this node's own **anchor**, which vouches for whoever it
+/// introduces (see the module docs).
+#[must_use]
+pub(crate) fn accepts_relayed(relay: PeerClass, origin: PeerClass) -> bool {
+    relays_for(relay) && (relays_for(origin) || relay == PeerClass::Anchor)
 }
 
 async fn refuse(send: &mut SendStream, reason: CoordRefusal) {
@@ -631,7 +646,16 @@ mod tests {
         assert!(relays_for(PeerClass::PendingJoiner));
         // An unknown peer has published nothing.
         assert!(!relays_for(PeerClass::Unknown));
+        // A session from an unknown peer is refused — unless this node's own anchor
+        // carried it, because the anchor introduces peers.
+        assert!(!accepts_relayed(PeerClass::Member, PeerClass::Unknown));
+        assert!(accepts_relayed(PeerClass::Anchor, PeerClass::Unknown));
+        assert!(accepts_relayed(PeerClass::Member, PeerClass::PendingJoiner));
+        assert!(!accepts_relayed(PeerClass::Unknown, PeerClass::Member));
         // But the coord stream itself is open, because `WHOAMI` is.
-        assert!(PeerPolicy::allows(PeerClass::Unknown, StreamKind::Coord));
+        assert!(crate::node::net::PeerPolicy::allows(
+            PeerClass::Unknown,
+            StreamKind::Coord
+        ));
     }
 }

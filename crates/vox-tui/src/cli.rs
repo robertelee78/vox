@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use vox_core::nat::bootstrap::BootstrapSet;
+use vox_core::node::link::merge_anchor_spec;
 use vox_core::node::paths::{Paths, DEFAULT_PROFILE};
 
 use crate::app::run_live;
@@ -38,6 +40,11 @@ pub struct ProfileArgs {
     /// and needs no configuration.
     #[arg(long, env = "VOX_LISTEN", default_value = DEFAULT_LISTEN)]
     pub listen: SocketAddr,
+    /// An anchor to publish to, read from and reach peers through, as
+    /// `<fingerprint>@<multiaddr>` (repeatable; `VOX_ANCHORS` takes a comma-separated
+    /// list). The user's own always-on node, typically (ADR-012 §"Bootstrap").
+    #[arg(long = "anchor", env = "VOX_ANCHORS", value_delimiter = ',')]
+    pub anchors: Vec<String>,
 }
 
 impl ProfileArgs {
@@ -48,6 +55,18 @@ impl ProfileArgs {
             self.data_dir.as_deref(),
             self.config_dir.as_deref(),
         )
+    }
+
+    /// The configured anchors, parsed and merged by identity.
+    pub fn anchor_set(&self) -> vox_core::error::Result<BootstrapSet> {
+        let mut set = BootstrapSet::new();
+        for spec in &self.anchors {
+            if spec.trim().is_empty() {
+                continue;
+            }
+            merge_anchor_spec(&mut set, spec)?;
+        }
+        Ok(set)
     }
 }
 
@@ -90,6 +109,9 @@ pub fn run() -> ExitCode {
         listen: DEFAULT_LISTEN
             .parse()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0))),
+        anchors: std::env::var("VOX_ANCHORS")
+            .map(|v| v.split(',').map(str::to_owned).collect())
+            .unwrap_or_default(),
     });
     match cli.command.unwrap_or(default_tui) {
         Cmd::Tui(args) => {
@@ -100,7 +122,14 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match run_live(paths, args.listen) {
+            let anchors = match args.anchor_set() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("vox: --anchor: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match run_live(paths, args.listen, anchors) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox: {e}");

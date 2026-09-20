@@ -12,6 +12,9 @@
 //! No packet is ever lost, reordered or delayed, so a failure is a real behavioural
 //! failure rather than a flake.
 
+// Shared by several test binaries, each of which uses a different part of it.
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};

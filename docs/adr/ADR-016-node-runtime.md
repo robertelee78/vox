@@ -576,6 +576,64 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   works over it unchanged. The relay forwards QUIC packets it cannot read, bounded in number and by
   idleness. Details and the symmetric-NAT proof are in ADR-012's Implementation notes.
 
+- **Anchors, and the swarm forms for two clients that nothing can reach (M15.1, 2026-09-20).** The
+  ladder was complete and had nobody to climb through: a punch or a circuit needs a helper already
+  connected to both peers, and a node's helpers were whichever peers it happened to have dialled. For two
+  clients inside private networks that is nobody. ADR-012's answer is the user's own always-on node, and
+  this wires it in as the runtime's `BootstrapSet`:
+  - **Configuration.** `NodeConfig { clock, argon2, bind, pow_params, anchors }` is the one constructor
+    (`Node::spawn_config`); the older ones are shorthands. `Bind` is an address or a caller-supplied
+    datagram socket, so the same actor runs on a simulated network. `vox --anchor <fingerprint>@<multiaddr>`
+    (repeatable; `VOX_ANCHORS` comma-separated) is the CLI; `node::link::{parse_anchor_spec,
+    merge_anchor_spec, anchor_specs}` is the text form. Configured anchors are dialled — pinned — the
+    moment the network starts, each on its own task; an anchor that answers is adopted, classified
+    `Anchor` (carried into every policy rebuild), and given every open channel's genesis and records.
+  - **Anchors are named in links and persisted per channel.** ADR-011 pins the identity on every dial and
+    there is no "connect to whoever answers", so a link's anchors carry their fingerprints:
+    `vox://<cid>?a=<fp>&b=<multiaddr>…[&a=…&b=…][&r=<responder>]`, each `b=` belonging to the `a=` before
+    it, at most `MAX_LINK_ANCHORS = 4`. An invite names the channel's anchors first, the configured set
+    next and the inviting node last — an anchor is reachable by design, the node's own addresses may not
+    be, and a joiner tries them in that order. The anchors a channel was joined through, merged with the
+    configured set, are persisted in a new sealed segment (`SEG_ANCHORS = 4`, `ChannelState::anchors` /
+    `add_anchors`), because a node that forgot them after a restart could not republish its address and
+    would fall off the swarm.
+  - **The join is board-first.** The joiner dials the link's anchors in order until one answers, reads the
+    channel from that board, **announces its pre-join record there before anything else** — on the anchor
+    it is what lets the anchor coordinate a punch or carry a circuit for it, on the responder it is what
+    authorizes the join stream — then `reach`es the responder (the `r=` pin, else any member the board has
+    an address record for; the record's endpoints are dial hints, the identity is pinned) through the
+    whole ladder, announces itself on the responder's own board, and runs the join. This retires the
+    M14-era conflation of the anchor's address with the responder's identity.
+  - **What an anchor that holds no channel can do.** Its membership oracle is empty, so three things were
+    added: the board's own genesis names the channel **creator**, whose records the oracle now admits on
+    the strength of it (`RendezvousService::resolve`); `NodeNet::classify` consults the board when the
+    policy has no answer — a member of an anchored channel, or a joiner with a live pre-join record — and
+    every stream authorization goes through it; and a session **relayed by a node's own anchor** is
+    accepted whoever the far peer is (`coordstream::accepts_relayed`), because the anchor already applied
+    its own rule and is the node the user configured to introduce peers. Without the last, a newcomer whose
+    pre-join is on the anchor's board could never be punched or relayed to by a member that has not seen
+    it yet — which is every member behind a NAT.
+  - **Gate** (`tests/node_m15_anchor_gate.rs`, release): an anchor holding no channel; Alice, behind a
+    symmetric NAT and configured with it, creates a channel and invites; Bob, behind another symmetric NAT
+    and knowing only the link, joins — through the anchor's board, a defeated punch and a relayed
+    circuit — Alice consents, and messages cross both ways by automatic sync. The anchor ends with no
+    channel open and nothing but the board. Twenty-three seconds, ten of them the honest cost of the direct
+    dial and the punch each timing out first.
+  - **Two defects the gate found, both older than it.** `connect_direct` **spun hot** when an attempt
+    failed faster than its 250 ms stagger: waiting on an empty `JoinSet` returns at once, and the loop
+    re-armed a fresh timer around it every time — a busy loop that starved the runtime and, because M14.8b
+    made dual-stack advertising real, was reachable by any IPv4-bound node dialling a peer with an IPv6
+    entry (quinn refuses an IPv6 destination on an IPv4 socket instantly). Now an empty set launches the
+    next candidate at once, and candidates the socket cannot address are dropped up front. And the sync
+    transport had **no bound**: a session runs with the channel's lock held, so a peer that stopped
+    answering held that lock — and everything else on the channel — for as long as it liked;
+    `SYNC_FRAME_TIMEOUT = 20 s` on both directions ends such a session honestly.
+  - **Still open.** The anchor admits only the *creator's* records for a channel it is not a member of;
+    other members' authority comes from governance the anchor does not hold — the headless node's log sync
+    (M15.2) is what closes it, and until then a joiner's own records land only on boards that know it. The
+    actor is single-threaded over commands, so a join's dial ladder (up to ~25 s) holds it; the sync bound
+    keeps that from deadlocking anyone, but the join should run off the actor.
+
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
 ADR-013, ADR-015.

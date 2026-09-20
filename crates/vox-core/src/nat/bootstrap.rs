@@ -8,9 +8,10 @@
 //! authenticity. This type is therefore plain, user-owned configuration: an ordered
 //! set of `(identity, endpoints)` entries to contact when joining the swarm.
 
+use crate::cbor::{Decoder, Encoder};
 use crate::error::Error;
 use crate::error::Result;
-use crate::hash::Digest32;
+use crate::hash::{Digest32, DIGEST_LEN};
 use crate::nat::multiaddr::EndpointList;
 
 /// The maximum number of bootstrap nodes one set may hold — a sanity bound on
@@ -39,6 +40,27 @@ impl BootstrapNode {
             ));
         }
         Ok(Self { id, endpoints })
+    }
+
+    /// Encode into an in-progress canonical-CBOR stream as `[id, endpoints]`.
+    pub(crate) fn encode_into(&self, e: &mut Encoder) {
+        e.array(2).bytes(&self.id);
+        self.endpoints.encode_into(e);
+    }
+
+    /// Strictly decode one node from an in-progress stream.
+    pub(crate) fn decode_from(d: &mut Decoder<'_>) -> Result<Self> {
+        if d.array()? != 2 {
+            return Err(Error::MalformedRendezvous("bootstrap node arity"));
+        }
+        let raw = d.bytes()?;
+        if raw.len() != DIGEST_LEN {
+            return Err(Error::MalformedRendezvous("bootstrap node id length"));
+        }
+        let mut id = [0u8; DIGEST_LEN];
+        id.copy_from_slice(raw);
+        let endpoints = EndpointList::decode_from(d)?;
+        Self::new(id, endpoints)
     }
 }
 
@@ -87,6 +109,53 @@ impl BootstrapSet {
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
+
+    /// The node with this fingerprint, if it is in the set.
+    #[must_use]
+    pub fn get(&self, id: &Digest32) -> Option<&BootstrapNode> {
+        self.nodes.iter().find(|n| n.id == *id)
+    }
+
+    /// Canonical CBOR (`[[id, endpoints], …]`), the form a node persists per channel
+    /// (ADR-016: the anchors a client publishes to and reads from).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(self.nodes.len());
+        for n in &self.nodes {
+            n.encode_into(&mut e);
+        }
+        e.finish()
+    }
+
+    /// Strictly decode a set: wrong arity, a bad node, a duplicate id, growth past
+    /// the cap or trailing bytes are all refused.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        let n = d.array()?;
+        if n > MAX_BOOTSTRAP_NODES {
+            return Err(Error::SizeLimitExceeded("bootstrap set"));
+        }
+        let mut set = Self::new();
+        for _ in 0..n {
+            let node = BootstrapNode::decode_from(&mut d)?;
+            if set.get(&node.id).is_some() {
+                return Err(Error::MalformedRendezvous("bootstrap set duplicate id"));
+            }
+            set.add(node)?;
+        }
+        d.finish()?;
+        Ok(set)
+    }
+
+    /// Every node of `other` this set does not have, appended in `other`'s order
+    /// (the set's own entries keep their higher preference).
+    pub fn merge(&mut self, other: &BootstrapSet) -> Result<()> {
+        for n in other.nodes() {
+            self.add(n.clone())?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -94,6 +163,60 @@ mod tests {
     use super::*;
     use crate::nat::multiaddr::Multiaddr;
     use std::net::{Ipv4Addr, SocketAddrV4};
+
+    #[test]
+    fn a_set_round_trips_canonically_and_decodes_strictly() {
+        let mut set = BootstrapSet::new();
+        set.add(BootstrapNode::new([1u8; 32], eps(1)).unwrap())
+            .unwrap();
+        set.add(BootstrapNode::new([2u8; 32], eps(2)).unwrap())
+            .unwrap();
+        let bytes = set.to_bytes();
+        assert_eq!(BootstrapSet::from_bytes(&bytes).unwrap(), set);
+        assert_eq!(
+            BootstrapSet::from_bytes(&BootstrapSet::new().to_bytes()).unwrap(),
+            BootstrapSet::new()
+        );
+        assert_eq!(set.get(&[2u8; 32]).map(|n| &n.endpoints), Some(&eps(2)));
+        assert!(set.get(&[3u8; 32]).is_none());
+
+        // Trailing bytes.
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(BootstrapSet::from_bytes(&extra).is_err());
+        // A duplicate id on the wire is not a set.
+        let mut e = Encoder::new();
+        e.array(2);
+        for _ in 0..2 {
+            BootstrapNode::new([1u8; 32], eps(1))
+                .unwrap()
+                .encode_into(&mut e);
+        }
+        assert!(BootstrapSet::from_bytes(&e.finish()).is_err());
+        // A node with no endpoints on the wire is not a node.
+        let mut e = Encoder::new();
+        e.array(1).array(2).bytes(&[1u8; 32]);
+        EndpointList::default().encode_into(&mut e);
+        assert!(BootstrapSet::from_bytes(&e.finish()).is_err());
+        // A wrong-length id.
+        let mut e = Encoder::new();
+        e.array(1).array(2).bytes(&[1u8; 31]);
+        eps(1).encode_into(&mut e);
+        assert!(BootstrapSet::from_bytes(&e.finish()).is_err());
+
+        // Merging keeps this set's order and skips what it already has.
+        let mut other = BootstrapSet::new();
+        other
+            .add(BootstrapNode::new([2u8; 32], eps(9)).unwrap())
+            .unwrap();
+        other
+            .add(BootstrapNode::new([3u8; 32], eps(3)).unwrap())
+            .unwrap();
+        set.merge(&other).unwrap();
+        assert_eq!(set.len(), 3);
+        assert_eq!(set.get(&[2u8; 32]).map(|n| &n.endpoints), Some(&eps(2)));
+        assert_eq!(set.nodes()[2].id, [3u8; 32]);
+    }
 
     fn eps(d: u8) -> EndpointList {
         EndpointList::new(vec![Multiaddr::Ip4(SocketAddrV4::new(

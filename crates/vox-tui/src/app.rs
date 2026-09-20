@@ -229,12 +229,19 @@ pub fn run_tui(core: impl CoreHandle) -> Result<(), AppError> {
 ///
 /// `listen` is where the node accepts peers; it is what invite links advertise, so it
 /// must be an address peers can reach (see the `--listen` flag).
-pub fn run_live(paths: Paths, listen: std::net::SocketAddr) -> Result<(), AppError> {
+pub fn run_live(
+    paths: Paths,
+    listen: std::net::SocketAddr,
+    anchors: vox_core::nat::bootstrap::BootstrapSet,
+) -> Result<(), AppError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
-    let node = rt.block_on(async { Node::spawn_networked(paths, listen) })?;
+    let cfg = vox_core::node::actor::NodeConfig::new()
+        .bind(vox_core::node::actor::Bind::Addr(listen))
+        .anchors(anchors);
+    let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
     let cancel = CancellationToken::new();
     #[cfg(unix)]
     {

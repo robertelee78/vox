@@ -2,12 +2,19 @@
 //! ADR-005's magnet-link design.
 //!
 //! ```text
-//! vox://<channelID-base32>?b=<multiaddr>[&b=<multiaddr>…][&r=<responder-fingerprint-base32>]
+//! vox://<channelID-base32>?a=<anchor-fingerprint-base32>&b=<multiaddr>[&b=<multiaddr>…][&a=…&b=…][&r=<responder-fingerprint-base32>]
 //! ```
 //!
-//! It carries **only** what is needed to find the swarm: the channelID, the
-//! bootstrap multiaddrs of one or more anchor nodes, and optionally a pin of the
-//! responder's identity fingerprint.
+//! It carries **only** what is needed to find the swarm: the channelID, one or more
+//! anchor nodes — each its identity fingerprint followed by the multiaddrs it is
+//! reached at — and optionally a pin of the responder's identity fingerprint.
+//!
+//! ## Anchors are named, not just addressed
+//! ADR-011 pins the expected identity on every dial; there is no "connect to whoever
+//! answers". So an anchor in a link is a [`BootstrapNode`] — fingerprint *and*
+//! endpoints — exactly the entry a node keeps in its configured bootstrap set, and
+//! the joiner dials it as that identity. A `b=` therefore always follows the `a=` it
+//! belongs to, and a link with an address that belongs to no anchor is refused.
 //!
 //! ## The passphrase is never in the link
 //! That is the load-bearing property (ADR-016, ADR-005's separation): the joining
@@ -29,13 +36,19 @@
 //! are all legal in a URL query.
 //!
 //! Parsing is strict: the scheme must match exactly, an unknown query key, a
-//! duplicate `r`, a missing `b`, more anchors than [`MAX_ENDPOINTS`], or any
+//! duplicate `r`, a `b=` before any `a=`, an anchor with no `b=`, more than
+//! [`MAX_LINK_ANCHORS`] anchors or [`MAX_ENDPOINTS`] addresses for one, or any
 //! malformed component is [`Error::MalformedLink`] — a link is untrusted input from
 //! a chat message, so nothing about it is guessed.
 
 use crate::error::{Error, Result};
 use crate::hash::{Digest32, DIGEST_LEN};
+use crate::nat::bootstrap::BootstrapNode;
 use crate::nat::multiaddr::{EndpointList, Multiaddr, MAX_ENDPOINTS};
+
+/// The most anchors one link names. A link is pasted into a chat message; a handful
+/// of introducers is what it needs, and a longer one is not a link.
+pub const MAX_LINK_ANCHORS: usize = 4;
 
 /// The URL scheme, including the separator.
 pub const LINK_SCHEME: &str = "vox://";
@@ -46,8 +59,10 @@ const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 /// Length of a 32-byte digest in unpadded base32.
 const B32_DIGEST_LEN: usize = 52;
 
-/// Encode a 32-byte digest as lowercase unpadded base32.
-fn b32_encode(bytes: &Digest32) -> String {
+/// Encode a 32-byte digest as lowercase unpadded base32 (the link's, and the CLI's,
+/// rendering of a fingerprint).
+#[must_use]
+pub fn b32_encode(bytes: &Digest32) -> String {
     let mut out = String::with_capacity(B32_DIGEST_LEN);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
@@ -68,7 +83,9 @@ fn b32_encode(bytes: &Digest32) -> String {
 }
 
 /// Decode lowercase-or-uppercase unpadded base32 into a 32-byte digest.
-fn b32_decode(text: &str, ctx: &'static str) -> Result<Digest32> {
+/// Decode a fingerprint rendered by [`b32_encode`] (case-insensitive, canonical
+/// trailing bits required); `ctx` names the field for the error.
+pub fn b32_decode(text: &str, ctx: &'static str) -> Result<Digest32> {
     if text.len() != B32_DIGEST_LEN {
         return Err(Error::MalformedLink(ctx));
     }
@@ -102,29 +119,93 @@ fn b32_decode(text: &str, ctx: &'static str) -> Result<Digest32> {
     Ok(out)
 }
 
+/// Parse one anchor as a command line or configuration names it:
+/// `<fingerprint-base32>@<multiaddr>` — the identity the node is pinned to when
+/// dialled, and one address to dial. The same fingerprint given more than once
+/// merges into one node with several addresses (`BootstrapSet::add` keeps the first;
+/// callers that want the merge use [`merge_anchor_spec`]).
+pub fn parse_anchor_spec(text: &str) -> Result<BootstrapNode> {
+    let (id, addr) = text.split_once('@').ok_or(Error::MalformedLink(
+        "anchor spec: expected <fingerprint>@<multiaddr>",
+    ))?;
+    let id = b32_decode(id.trim(), "anchor spec fingerprint")?;
+    let addr =
+        Multiaddr::parse(addr.trim()).map_err(|_| Error::MalformedLink("anchor spec address"))?;
+    BootstrapNode::new(id, EndpointList::new(vec![addr])?)
+        .map_err(|_| Error::MalformedLink("anchor spec"))
+}
+
+/// Add an anchor spec to a set, merging its address into an anchor already named.
+pub fn merge_anchor_spec(set: &mut crate::nat::bootstrap::BootstrapSet, text: &str) -> Result<()> {
+    let node = parse_anchor_spec(text)?;
+    match set.get(&node.id).cloned() {
+        Some(existing) => {
+            let mut addrs: Vec<Multiaddr> = existing.endpoints.addrs().to_vec();
+            for a in node.endpoints.addrs() {
+                if !addrs.contains(a) {
+                    addrs.push(*a);
+                }
+            }
+            let merged = BootstrapNode::new(existing.id, EndpointList::new(addrs)?)?;
+            let mut rebuilt = crate::nat::bootstrap::BootstrapSet::new();
+            for n in set.nodes() {
+                rebuilt.add(if n.id == merged.id {
+                    merged.clone()
+                } else {
+                    n.clone()
+                })?;
+            }
+            *set = rebuilt;
+            Ok(())
+        }
+        None => set.add(node),
+    }
+}
+
+/// Render an anchor the way [`parse_anchor_spec`] reads it, one line per address.
+#[must_use]
+pub fn anchor_specs(node: &BootstrapNode) -> Vec<String> {
+    node.endpoints
+        .addrs()
+        .iter()
+        .map(|a| format!("{}@{a}", b32_encode(&node.id)))
+        .collect()
+}
+
 /// A parsed `vox://` invite link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteLink {
     /// The channelID (ADR-005: `SHA-256(genesis)`), which the joiner checks the
     /// fetched genesis against.
     pub channel_id: Digest32,
-    /// The anchor endpoints to bootstrap from (at least one).
-    pub anchors: EndpointList,
+    /// The anchors to bootstrap from (at least one), in preference order, each with
+    /// the identity the joiner pins when it dials.
+    pub anchors: Vec<BootstrapNode>,
     /// An optional pin of the responder's identity fingerprint. When present the
-    /// joiner dials that identity specifically and the QUIC handshake enforces it.
+    /// joiner joins through that member specifically; otherwise through any member
+    /// the board names.
     pub responder: Option<Digest32>,
 }
 
 impl InviteLink {
     /// Build a link. At least one anchor is required — a link with none names no
-    /// way to reach the swarm.
+    /// way to reach the swarm — and at most [`MAX_LINK_ANCHORS`]; a duplicate anchor
+    /// identity is refused.
     pub fn new(
         channel_id: Digest32,
-        anchors: EndpointList,
+        anchors: Vec<BootstrapNode>,
         responder: Option<Digest32>,
     ) -> Result<Self> {
         if anchors.is_empty() {
             return Err(Error::MalformedLink("invite link has no anchors"));
+        }
+        if anchors.len() > MAX_LINK_ANCHORS {
+            return Err(Error::MalformedLink("invite link anchor count"));
+        }
+        for (i, a) in anchors.iter().enumerate() {
+            if anchors[..i].iter().any(|b| b.id == a.id) {
+                return Err(Error::MalformedLink("invite link duplicate anchor"));
+            }
         }
         Ok(Self {
             channel_id,
@@ -136,15 +217,20 @@ impl InviteLink {
     /// Render the link.
     #[must_use]
     pub fn to_url(&self) -> String {
-        let mut out = String::with_capacity(96);
+        let mut out = String::with_capacity(160);
         out.push_str(LINK_SCHEME);
         out.push_str(&b32_encode(&self.channel_id));
         let mut sep = '?';
-        for addr in self.anchors.addrs() {
+        for anchor in &self.anchors {
             out.push(sep);
             sep = '&';
-            out.push_str("b=");
-            out.push_str(&addr.to_string());
+            out.push_str("a=");
+            out.push_str(&b32_encode(&anchor.id));
+            for addr in anchor.endpoints.addrs() {
+                out.push('&');
+                out.push_str("b=");
+                out.push_str(&addr.to_string());
+            }
         }
         if let Some(r) = &self.responder {
             out.push(sep);
@@ -164,20 +250,49 @@ impl InviteLink {
             None => (rest, None),
         };
         let channel_id = b32_decode(id_part, "invite link channelID")?;
-        let mut addrs = Vec::new();
+        // Anchors are built as they are read: an `a=` opens one, the `b=`s that
+        // follow belong to it.
+        let mut anchors: Vec<BootstrapNode> = Vec::new();
+        let mut current: Option<(Digest32, Vec<Multiaddr>)> = None;
         let mut responder = None;
+        let close = |current: Option<(Digest32, Vec<Multiaddr>)>,
+                     anchors: &mut Vec<BootstrapNode>|
+         -> Result<()> {
+            if let Some((id, addrs)) = current {
+                let endpoints = EndpointList::new(addrs)
+                    .map_err(|_| Error::MalformedLink("invite link anchor addresses"))?;
+                let node = BootstrapNode::new(id, endpoints)
+                    .map_err(|_| Error::MalformedLink("invite link anchor has no address"))?;
+                anchors.push(node);
+            }
+            Ok(())
+        };
         for field in query.unwrap_or("").split('&').filter(|f| !f.is_empty()) {
             let (key, value) = field
                 .split_once('=')
                 .ok_or(Error::MalformedLink("invite link field"))?;
             match key {
-                "b" => {
-                    if addrs.len() >= MAX_ENDPOINTS {
+                "a" => {
+                    close(current.take(), &mut anchors)?;
+                    if anchors.len() >= MAX_LINK_ANCHORS {
                         return Err(Error::MalformedLink("invite link anchor count"));
+                    }
+                    let id = b32_decode(value, "invite link anchor")?;
+                    if anchors.iter().any(|a| a.id == id) {
+                        return Err(Error::MalformedLink("invite link duplicate anchor"));
+                    }
+                    current = Some((id, Vec::new()));
+                }
+                "b" => {
+                    let Some((_, addrs)) = current.as_mut() else {
+                        return Err(Error::MalformedLink("invite link address before anchor"));
+                    };
+                    if addrs.len() >= MAX_ENDPOINTS {
+                        return Err(Error::MalformedLink("invite link anchor addresses"));
                     }
                     addrs.push(
                         Multiaddr::parse(value)
-                            .map_err(|_| Error::MalformedLink("invite link anchor"))?,
+                            .map_err(|_| Error::MalformedLink("invite link anchor address"))?,
                     );
                 }
                 "r" => {
@@ -192,11 +307,10 @@ impl InviteLink {
                 _ => return Err(Error::MalformedLink("invite link unknown field")),
             }
         }
-        if addrs.is_empty() {
+        close(current.take(), &mut anchors)?;
+        if anchors.is_empty() {
             return Err(Error::MalformedLink("invite link has no anchors"));
         }
-        let anchors =
-            EndpointList::new(addrs).map_err(|_| Error::MalformedLink("invite link anchors"))?;
         Ok(Self {
             channel_id,
             anchors,
@@ -218,6 +332,10 @@ mod tests {
 
     fn eps(list: Vec<Multiaddr>) -> EndpointList {
         EndpointList::new(list).unwrap()
+    }
+
+    fn anchor(id: u8, list: Vec<Multiaddr>) -> BootstrapNode {
+        BootstrapNode::new([id; 32], eps(list)).unwrap()
     }
 
     fn v4(d: u8, port: u16) -> Multiaddr {
@@ -263,35 +381,74 @@ mod tests {
             0,
             0,
         ));
-        let with = InviteLink::new(cid, eps(vec![ipv6, v4(9, 4433)]), Some(responder)).unwrap();
+        let with = InviteLink::new(
+            cid,
+            vec![
+                anchor(0xA1, vec![ipv6, v4(9, 4433)]),
+                anchor(0xA2, vec![v4(3, 1)]),
+            ],
+            Some(responder),
+        )
+        .unwrap();
         let url = with.to_url();
         assert!(url.starts_with("vox://"));
-        assert!(url.contains("?b=/ip6/2001:db8::7/udp/4433"));
+        assert!(url.contains(&format!(
+            "?a={}&b=/ip6/2001:db8::7/udp/4433",
+            b32_encode(&[0xA1; 32])
+        )));
         assert!(url.contains("&b=/ip4/10.0.0.9/udp/4433"));
+        assert!(url.contains(&format!(
+            "&a={}&b=/ip4/10.0.0.3/udp/1",
+            b32_encode(&[0xA2; 32])
+        )));
         assert!(url.contains("&r="));
         assert!(
-            !url.contains("pass") && url.len() < 300,
+            !url.contains("pass") && url.len() < 400,
             "the link carries no secret: {url}"
         );
         assert_eq!(InviteLink::parse(&url).unwrap(), with);
         assert_eq!(with.to_string(), url);
 
-        let without = InviteLink::new(cid, eps(vec![v4(1, 1234)]), None).unwrap();
+        let without = InviteLink::new(cid, vec![anchor(1, vec![v4(1, 1234)])], None).unwrap();
         let url = without.to_url();
         assert_eq!(
             url,
-            format!("vox://{}?b=/ip4/10.0.0.1/udp/1234", b32_encode(&cid))
+            format!(
+                "vox://{}?a={}&b=/ip4/10.0.0.1/udp/1234",
+                b32_encode(&cid),
+                b32_encode(&[1; 32])
+            )
         );
         assert_eq!(InviteLink::parse(&url).unwrap(), without);
-        // Anchor order is preserved: it is the reachability preference (ADR-012).
-        let ordered = InviteLink::new(cid, eps(vec![v4(2, 1), v4(1, 2)]), None).unwrap();
+        // Anchor order, and address order within an anchor, are preserved: both are
+        // the reachability preference (ADR-012).
+        let ordered = InviteLink::new(
+            cid,
+            vec![
+                anchor(2, vec![v4(2, 1), v4(1, 2)]),
+                anchor(1, vec![v4(5, 5)]),
+            ],
+            None,
+        )
+        .unwrap();
+        let back = InviteLink::parse(&ordered.to_url()).unwrap();
+        assert_eq!(back.anchors[0].id, [2; 32]);
         assert_eq!(
-            InviteLink::parse(&ordered.to_url())
-                .unwrap()
-                .anchors
-                .addrs(),
-            ordered.anchors.addrs()
+            back.anchors[0].endpoints.addrs(),
+            ordered.anchors[0].endpoints.addrs()
         );
+        assert_eq!(back.anchors[1].id, [1; 32]);
+        // A duplicate anchor, or too many, is not a link.
+        assert!(InviteLink::new(
+            cid,
+            vec![anchor(1, vec![v4(1, 1)]), anchor(1, vec![v4(2, 2)])],
+            None
+        )
+        .is_err());
+        let many: Vec<BootstrapNode> = (0..=MAX_LINK_ANCHORS as u8)
+            .map(|i| anchor(i, vec![v4(i, 1)]))
+            .collect();
+        assert!(InviteLink::new(cid, many, None).is_err());
         // Upper-cased digests still parse to the same link.
         let shouted = with
             .to_url()
@@ -300,28 +457,74 @@ mod tests {
     }
 
     #[test]
+    fn anchor_specs_round_trip_and_merge_by_identity() {
+        let node = anchor(0x5A, vec![v4(1, 4433), v4(2, 4433)]);
+        let specs = anchor_specs(&node);
+        assert_eq!(specs.len(), 2);
+        assert!(specs[0].starts_with(&b32_encode(&[0x5A; 32])));
+        assert!(specs[0].ends_with("@/ip4/10.0.0.1/udp/4433"));
+        let mut set = crate::nat::bootstrap::BootstrapSet::new();
+        for spec in &specs {
+            merge_anchor_spec(&mut set, spec).unwrap();
+        }
+        assert_eq!(set.len(), 1, "one identity, two addresses");
+        assert_eq!(set.nodes()[0], node);
+        // Order of anchors is preserved across a merge into an existing one.
+        merge_anchor_spec(&mut set, &anchor_specs(&anchor(0x5B, vec![v4(3, 1)]))[0]).unwrap();
+        merge_anchor_spec(
+            &mut set,
+            &format!("{}@/ip4/10.0.0.9/udp/9", b32_encode(&[0x5A; 32])),
+        )
+        .unwrap();
+        assert_eq!(set.nodes()[0].id, [0x5A; 32]);
+        assert_eq!(set.nodes()[0].endpoints.len(), 3);
+        assert_eq!(set.nodes()[1].id, [0x5B; 32]);
+        for bad in ["", "nope", "@/ip4/10.0.0.1/udp/1", "zz@/ip4/10.0.0.1/udp/1"] {
+            assert!(parse_anchor_spec(bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(parse_anchor_spec(&format!("{}@/ip4/bad", b32_encode(&[1; 32]))).is_err());
+    }
+
+    #[test]
     fn malformed_links_are_refused_field_by_field() {
         let cid = b32_encode(&[0x33; 32]);
-        let ok = format!("vox://{cid}?b=/ip4/10.0.0.1/udp/443");
+        let a = b32_encode(&[0x44; 32]);
+        let ok = format!("vox://{cid}?a={a}&b=/ip4/10.0.0.1/udp/443");
         assert!(InviteLink::parse(&ok).is_ok());
         for (bad, why) in [
             ("http://x", "wrong scheme"),
             ("vox://", "no channelID"),
-            ("vox://short?b=/ip4/10.0.0.1/udp/443", "short channelID"),
+            (
+                &format!("vox://short?a={a}&b=/ip4/10.0.0.1/udp/443"),
+                "short channelID",
+            ),
             (&format!("vox://{cid}"), "no anchors"),
             (&format!("vox://{cid}?"), "empty query"),
-            (&format!("vox://{cid}?b="), "empty anchor"),
+            (&format!("vox://{cid}?a={a}"), "anchor with no address"),
+            (&format!("vox://{cid}?a={a}&b="), "empty address"),
             (
-                &format!("vox://{cid}?b=/ip4/10.0.0.1/udp/443&x=1"),
+                &format!("vox://{cid}?b=/ip4/10.0.0.1/udp/443"),
+                "address before any anchor",
+            ),
+            (
+                &format!("vox://{cid}?a=zz&b=/ip4/10.0.0.1/udp/443"),
+                "bad anchor id",
+            ),
+            (
+                &format!("vox://{cid}?a={a}&b=/ip4/10.0.0.1/udp/443&a={a}&b=/ip4/10.0.0.2/udp/443"),
+                "duplicate anchor",
+            ),
+            (
+                &format!("vox://{cid}?a={a}&b=/ip4/10.0.0.1/udp/443&x=1"),
                 "unknown field",
             ),
             (
-                &format!("vox://{cid}?b=/ip4/10.0.0.1/udp/443&r=zz"),
+                &format!("vox://{cid}?a={a}&b=/ip4/10.0.0.1/udp/443&r=zz"),
                 "bad responder",
             ),
             (&format!("vox://{cid}?bogus"), "field without ="),
             (
-                &format!("vox://{cid}?b=/ip4/10.0.0.1/udp/443&r={cid}&r={cid}"),
+                &format!("vox://{cid}?a={a}&b=/ip4/10.0.0.1/udp/443&r={cid}&r={cid}"),
                 "duplicate r",
             ),
         ] {
@@ -330,9 +533,18 @@ mod tests {
                 "accepted {why}: {bad}"
             );
         }
-        // More anchors than the ADR-012 cap.
+        // More addresses for one anchor than the ADR-012 cap.
         let many: Vec<String> = (0..MAX_ENDPOINTS + 1)
             .map(|i| format!("b=/ip4/10.0.0.{}/udp/443", i + 1))
+            .collect();
+        let over = format!("vox://{cid}?a={a}&{}", many.join("&"));
+        assert!(matches!(
+            InviteLink::parse(&over),
+            Err(Error::MalformedLink("invite link anchor addresses"))
+        ));
+        // More anchors than a link may name.
+        let many: Vec<String> = (0..=MAX_LINK_ANCHORS as u8)
+            .map(|i| format!("a={}&b=/ip4/10.0.0.{}/udp/443", b32_encode(&[i; 32]), i + 1))
             .collect();
         let over = format!("vox://{cid}?{}", many.join("&"));
         assert!(matches!(
@@ -340,6 +552,6 @@ mod tests {
             Err(Error::MalformedLink("invite link anchor count"))
         ));
         // A link with no anchors cannot even be constructed.
-        assert!(InviteLink::new([0; 32], EndpointList::new(vec![]).unwrap(), None).is_err());
+        assert!(InviteLink::new([0; 32], Vec::new(), None).is_err());
     }
 }
