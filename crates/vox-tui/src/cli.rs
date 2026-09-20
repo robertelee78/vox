@@ -30,14 +30,12 @@ pub struct ProfileArgs {
     /// Config directory.
     #[arg(long, env = "VOX_CONFIG_DIR")]
     pub config_dir: Option<PathBuf>,
-    /// Address to listen on for peers (`ip:port`; port 0 picks one).
+    /// Address to bind for peer connections (`ip:port`; port 0 picks one).
     ///
-    /// The address is what invite links advertise, so it must be one peers can
-    /// actually reach: the loopback default works between profiles on this machine,
-    /// and a LAN address (`--listen 192.168.1.5:0`) works between machines. Automatic
-    /// address discovery and the ADR-012 port-mapped rung are the next milestone; a
-    /// wildcard (`0.0.0.0`) would advertise an address nobody can dial, so it is not
-    /// the default.
+    /// This is only where the socket binds. What the node *advertises* is worked out
+    /// separately by the ADR-012 ladder — its routable address, a gateway-mapped
+    /// address when one can be had, and loopback — so the wildcard default is correct
+    /// and needs no configuration.
     #[arg(long, env = "VOX_LISTEN", default_value = DEFAULT_LISTEN)]
     pub listen: SocketAddr,
 }
@@ -53,10 +51,10 @@ impl ProfileArgs {
     }
 }
 
-/// The default listen address: loopback with a kernel-chosen port. It works between
-/// profiles on one machine; reaching another machine needs an address peers can dial
-/// (see `--listen`).
-const DEFAULT_LISTEN: &str = "127.0.0.1:0";
+/// The default bind address: every interface, kernel-chosen port. The bound address
+/// is not what peers are told to dial (see [`ProfileArgs::listen`]), so binding
+/// broadly is right.
+const DEFAULT_LISTEN: &str = "0.0.0.0:0";
 
 /// Vox Lux — serverless, end-to-end-encrypted terminal client.
 #[derive(Parser)]
@@ -91,7 +89,7 @@ pub fn run() -> ExitCode {
         config_dir: std::env::var_os("VOX_CONFIG_DIR").map(PathBuf::from),
         listen: DEFAULT_LISTEN
             .parse()
-            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0))),
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0))),
     });
     match cli.command.unwrap_or(default_tui) {
         Cmd::Tui(args) => {
