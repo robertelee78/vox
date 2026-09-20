@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 use crate::error::{Error, Result};
 use crate::governance::evaluator::Evaluator;
 use crate::hash::Digest32;
+use crate::node::api::NodeEvent;
 use crate::transport::quic::VoxConnection;
 use crate::transport::streams::{open_typed, StreamKind};
 use crate::tunnel::session::{self, HostService};
@@ -65,14 +66,48 @@ pub async fn serve(
     recv: quinn::RecvStream,
     snapshot: HostSnapshot,
 ) -> Result<()> {
-    session::accept(send, recv, &client, |channel_id, tag| {
-        let channel = snapshot.get(channel_id)?;
-        let endpoint = *channel.services.get(tag)?;
-        Some(HostService {
-            evaluator: Arc::clone(&channel.evaluator),
-            endpoint,
-        })
-    })
+    serve_reporting(client, send, recv, snapshot, None).await
+}
+
+/// [`serve`], emitting [`NodeEvent::TunnelServed`] for each authorized request.
+///
+/// The host cannot learn this from the service's own logs — every Vox client reaches it
+/// from loopback, so `sshd` records `127.0.0.1` for all of them (ADR-017 decision 6).
+/// The identity is known here, so this is where it is surfaced.
+///
+/// `try_send`, not `send`: this runs inside the accept path, between authorization and
+/// the local connect, and a client that has stopped draining its event queue must not
+/// be able to stall a tunnel. The event is therefore best-effort for a live client and
+/// is **not** an audit record — ADR-013's signed session events remain its own item.
+pub async fn serve_reporting(
+    client: Digest32,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    snapshot: HostSnapshot,
+    events: Option<tokio::sync::mpsc::Sender<NodeEvent>>,
+) -> Result<()> {
+    session::accept_reporting(
+        send,
+        recv,
+        &client,
+        |channel_id, tag| {
+            let channel = snapshot.get(channel_id)?;
+            let endpoint = *channel.services.get(tag)?;
+            Some(HostService {
+                evaluator: Arc::clone(&channel.evaluator),
+                endpoint,
+            })
+        },
+        |channel_id, tag| {
+            if let Some(tx) = events {
+                let _ = tx.try_send(NodeEvent::TunnelServed {
+                    channel_id: *channel_id,
+                    client,
+                    service_tag: tag.to_owned(),
+                });
+            }
+        },
+    )
     .await
 }
 

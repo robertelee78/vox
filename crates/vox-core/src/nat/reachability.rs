@@ -45,6 +45,47 @@ pub const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 /// fails within this window is abandoned (its slot frees for the next candidate).
 pub const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Whether `ip` is an address a peer elsewhere on the internet could plausibly reach.
+///
+/// "Plausibly" is exact, not hedging: a NAT-mapped public address appears in this
+/// node's advertised set only because a port map succeeded (ADR-012 rung 2), and that
+/// is precisely the case this must accept. What it rejects is every address whose scope
+/// is known to be local — so a node holding nothing but these is one that needs a relay,
+/// which is what the caller wants to know before minting an address for someone.
+///
+/// Rejected: unspecified, loopback, multicast, IPv4 link-local (169.254/16), RFC 1918
+/// private (10/8, 172.16/12, 192.168/16), RFC 6598 CGNAT (100.64/10), RFC 5737
+/// documentation ranges, IPv6 link-local (fe80::/10) and unique-local (fc00::/7) —
+/// which includes Vox's own overlay prefix (ADR-013).
+#[must_use]
+pub fn is_routable(ip: &IpAddr) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // RFC 6598 carrier-grade NAT: 100.64.0.0/10.
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                // RFC 1112 reserved 240.0.0.0/4 — Vox's own circuit addresses live here.
+                || o[0] >= 240)
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            // fe80::/10 link-local, fc00::/7 unique-local (the ADR-013 overlay prefix
+            // is inside the latter), and 2001:db8::/32 documentation — the same
+            // classes rejected for IPv4, so the two families answer alike.
+            !((seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xfe00) == 0xfc00
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8))
+        }
+    }
+}
+
 /// The ordered direct-connection candidates for a peer (IPv6 first, then IPv4),
 /// taken from its advertised endpoints. This is the input to [`connect_direct`].
 #[must_use]
@@ -442,6 +483,52 @@ mod tests {
 
     fn loopback(port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    }
+
+    #[test]
+    fn routable_rejects_every_local_scope() {
+        for s in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            // RFC 5737 documentation ranges, both families.
+            "192.0.2.1",
+            "203.0.113.9",
+            "198.51.100.7",
+            "240.0.0.1",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "fd00::1",
+            "ff02::1",
+            "2001:db8::1",
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!is_routable(&ip), "{s} must not count as routable");
+        }
+        for s in [
+            "1.1.1.1",
+            "9.255.255.255",
+            "11.0.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "172.15.255.255",
+            "172.32.0.1",
+            "2606:4700::1111",
+            "2a00:1450:4001::1",
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_routable(&ip), "{s} must count as routable");
+        }
     }
 
     #[test]

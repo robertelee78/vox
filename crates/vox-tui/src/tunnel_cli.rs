@@ -12,12 +12,18 @@
 use std::net::SocketAddr;
 
 use vox_core::hash::Digest32;
+use vox_core::nat::bootstrap::BootstrapSet;
+use vox_core::nat::multiaddr::Multiaddr;
+use vox_core::nat::reachability::is_routable;
 use vox_core::node::actor::{Bind, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
-use vox_core::node::link::b32_encode;
+use vox_core::node::link::{b32_encode, vox_hostname};
 use vox_core::node::paths::Paths;
 
 use crate::app::AppError;
+
+/// Groups in a generated room passphrase — 100 bits (ADR-017 decision 4).
+const PASSPHRASE_GROUPS: usize = vox_core::node::passphrase::DEFAULT_GROUPS;
 
 /// How the verbs identify a room or a member: the full base32 rendering, or any
 /// unique prefix of it (what a person can reasonably retype from a screen).
@@ -39,6 +45,64 @@ pub fn resolve_prefix(prefix: &str, among: &[Digest32]) -> Result<Digest32, AppE
             many.len()
         ))),
     }
+}
+
+/// Collect the identity passphrase, asking for confirmation when the profile has no
+/// identity yet and this will therefore *create* one.
+///
+/// The confirmation is not politeness. A profile's identity is unlocked by this
+/// passphrase and by nothing else (ADR-010's double lock), so a typo on first use does
+/// not produce a warning later — it produces an identity nobody can ever open.
+pub fn identity_passphrase_for(paths: &Paths, given: Option<String>) -> Result<String, AppError> {
+    if let Some(p) = given {
+        return Ok(p);
+    }
+    let exists = vox_core::node::profile::Profile::exists(paths);
+    if exists {
+        return prompt_passphrase("identity passphrase");
+    }
+    println!("vox: this profile has no identity yet; creating one.");
+    let first = prompt_passphrase("new identity passphrase")?;
+    let again = prompt_passphrase("again")?;
+    if first != again {
+        return Err(AppError::Usage(
+            "the two passphrases differ; nothing was created".into(),
+        ));
+    }
+    if first.is_empty() {
+        return Err(AppError::Usage("an empty identity passphrase".into()));
+    }
+    Ok(first)
+}
+
+/// Spawn a node and make its identity usable: unlock an existing one, or create one on
+/// first use. Returns the running handle.
+///
+/// The room-making verbs need this instead of the room-opening preamble the one-shot
+/// verbs share: `serve` is about to create a room and `connect` to join one, so neither
+/// has a room to open yet.
+pub async fn open_profile(
+    paths: Paths,
+    listen: SocketAddr,
+    anchors: vox_core::nat::bootstrap::BootstrapSet,
+    identity_passphrase: &str,
+) -> Result<NodeHandle, AppError> {
+    let existed = vox_core::node::profile::Profile::exists(&paths);
+    let cfg = NodeConfig::new().bind(Bind::Addr(listen)).anchors(anchors);
+    let node = Node::spawn_config(paths, cfg)?;
+    let secret = Secret::new(identity_passphrase.as_bytes().to_vec());
+    let out = if existed {
+        node.apply(NodeCommand::Unlock { passphrase: secret }).await
+    } else {
+        node.apply(NodeCommand::CreateIdentity { passphrase: secret })
+            .await
+    };
+    if !out.is_done() {
+        return Err(AppError::Usage(format!(
+            "cannot open this profile's identity: {out:?}"
+        )));
+    }
+    Ok(node)
 }
 
 /// Spawn a node, unlock it, and open one room — the preamble every verb shares.
@@ -234,6 +298,152 @@ pub async fn forward(
     let _ = tokio::signal::ctrl_c().await;
     println!("vox: stopping the forward");
     let _ = node.apply(NodeCommand::StopForward { local: bound }).await;
+    let _ = node.apply(NodeCommand::Shutdown).await;
+    Ok(())
+}
+
+/// Whether this node could be reached by someone who was handed its address — a
+/// routable advertised endpoint, or an anchor that will relay for it.
+///
+/// `vox serve` refuses to start when neither holds (ADR-017 decision 4): minting an
+/// address nobody can use is worse than saying so, because the host would hand it out
+/// and only learn later.
+fn reachable_or_relayed(node: &NodeHandle, anchors: &BootstrapSet) -> bool {
+    if !anchors.nodes().is_empty() {
+        return true;
+    }
+    node.view().listening.iter().any(|text| {
+        Multiaddr::parse(text)
+            .ok()
+            .and_then(|m| m.socket_addr())
+            .is_some_and(|sa: SocketAddr| is_routable(&sa.ip()))
+    })
+}
+
+/// `vox serve <port>` — create a service room, offer the port in it, and serve until
+/// interrupted (ADR-017 decisions 3 and 4).
+///
+/// Prints three things and says plainly that two of them must travel separately: the
+/// address is a rendezvous, and the passphrase is what turns it into access (ADR-005).
+pub async fn serve(
+    node: &NodeHandle,
+    anchors: &BootstrapSet,
+    name: &str,
+    port: u16,
+    at: Option<SocketAddr>,
+) -> Result<(), AppError> {
+    if !reachable_or_relayed(node, anchors) {
+        return Err(AppError::Usage(
+            "this machine has no address a guest could reach and no anchor to relay \
+             through.\n       Run `vox node` somewhere reachable and pass its \
+             `<fingerprint>@<multiaddr>` here as --anchor,\n       or open a port on \
+             your router. Refusing to mint an address nobody can use."
+                .into(),
+        ));
+    }
+    let passphrase = vox_core::node::passphrase::generate(PASSPHRASE_GROUPS)?;
+    let before: Vec<Digest32> = node.view().channels.iter().map(|c| c.channel_id).collect();
+    let out = node
+        .apply(NodeCommand::Serve {
+            local_name: name.to_owned(),
+            passphrase: Secret::new(passphrase.as_bytes().to_vec()),
+            port,
+            at,
+        })
+        .await;
+    if !out.is_done() {
+        return Err(AppError::Usage(format!(
+            "cannot serve port {port}: {out:?}"
+        )));
+    }
+    let channel_id = node
+        .view()
+        .channels
+        .iter()
+        .map(|c| c.channel_id)
+        .find(|id| !before.contains(id))
+        .ok_or_else(|| AppError::Usage("the room was not created".into()))?;
+
+    let out = node.apply(NodeCommand::Invite { channel_id }).await;
+    if !out.is_done() {
+        return Err(AppError::Usage(format!("cannot mint an address: {out:?}")));
+    }
+    let url = loop {
+        match node.next_event().await {
+            Some(NodeEvent::InviteLink { url, .. }) => break url,
+            Some(_) => {}
+            None => return Err(AppError::Usage("the node stopped".into())),
+        }
+    };
+
+    let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)));
+    println!("room       {}", b32_encode(&channel_id));
+    println!("address    {url}");
+    println!("passphrase {}", passphrase.as_str());
+    println!("           ^ send this by a different channel than the address");
+    println!();
+    println!("serving {endpoint}. anyone who joins with both may reach it, at");
+    println!("port {port} of {}", vox_hostname(&channel_id));
+    println!("Ctrl-C to stop");
+
+    // Until interrupted: report who reaches the service. The service itself cannot say
+    // — every Vox client arrives at it from loopback (ADR-017 decision 6).
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            event = node.next_event() => match event {
+                Some(NodeEvent::TunnelServed { client, service_tag, .. }) => {
+                    println!("vox: {} reached {service_tag:?}", short(&client));
+                }
+                Some(NodeEvent::PeerJoined { peer, .. }) => {
+                    println!("vox: {} joined", short(&peer));
+                }
+                Some(_) => {}
+                None => return Err(AppError::Usage("the node stopped".into())),
+            },
+        }
+    }
+    println!("vox: stopping");
+    let _ = node.apply(NodeCommand::Shutdown).await;
+    Ok(())
+}
+
+/// `vox connect <address>` — join the room an address names, and print the name its
+/// services answer on (ADR-017 decision 4).
+///
+/// One-shot: joining is a durable act recorded in the profile, so there is nothing to
+/// keep running. What makes the printed name resolve is `vox up` (decision 5).
+pub async fn connect(
+    node: &NodeHandle,
+    url: &str,
+    name: &str,
+    room_passphrase: &str,
+) -> Result<(), AppError> {
+    let out = node
+        .apply(NodeCommand::JoinChannel {
+            link: url.to_owned(),
+            local_name: name.to_owned(),
+            passphrase: Secret::new(
+                vox_core::node::passphrase::normalize(room_passphrase)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        })
+        .await;
+    if !out.is_done() {
+        return Err(AppError::Usage(format!(
+            "cannot join: {out:?} — check the address and the passphrase"
+        )));
+    }
+    let channel_id = loop {
+        match node.next_event().await {
+            Some(NodeEvent::Joined { channel_id, .. }) => break channel_id,
+            Some(_) => {}
+            None => return Err(AppError::Usage("the node stopped".into())),
+        }
+    };
+    println!("joined. reachable as {}", vox_hostname(&channel_id));
+    println!("        run `vox up` on this machine to make that name resolve");
     let _ = node.apply(NodeCommand::Shutdown).await;
     Ok(())
 }
