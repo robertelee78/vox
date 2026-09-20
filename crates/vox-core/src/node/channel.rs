@@ -59,6 +59,7 @@ use crate::log::dag::{AdmissionPolicy, Dag};
 use crate::log::entry::{Entry, EntryKind, EntrySkeleton, ZERO_HASH};
 use crate::log::feed::lipmaa;
 use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
+use crate::nat::bootstrap::BootstrapSet;
 use crate::node::content::Content;
 use crate::node::profile::Profile;
 use crate::node::store::Store;
@@ -74,6 +75,12 @@ const SEG_AUTHORS: u64 = 2;
 const SEG_RECEIVERS: u64 = 3;
 /// Segment id of this identity's sender chain in `KeyMaterial`.
 const SEG_SENDER: u64 = 1;
+/// The anchors segment id within [`SegmentKind::KeyMaterial`] (M15.1): the
+/// bootstrap nodes this channel's records are published to and read from — the
+/// configured set plus whatever the invite link that brought this node in named.
+/// A node that forgot them after a restart could not republish its address and
+/// would fall off the swarm.
+const SEG_ANCHORS: u64 = 4;
 /// Manifest encoding version.
 const MANIFEST_VERSION: u64 = 1;
 /// Plaintext-cache row encoding version.
@@ -213,6 +220,8 @@ pub struct ChannelState {
     /// (M14.5b). Present only for authors that consented; its presence is what
     /// makes their content readable.
     receivers: BTreeMap<(Digest32, u64), ReceiverChain>,
+    /// The anchors this channel is published to (M15.1), persisted in `SEG_ANCHORS`.
+    anchors: BootstrapSet,
     /// The channel passphrase, retained **in memory only** for as long as the
     /// channel is open (M14.7c).
     ///
@@ -522,6 +531,7 @@ impl ChannelState {
             timeline: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
+            anchors: BootstrapSet::new(),
             poisoned: false,
         })
     }
@@ -632,6 +642,15 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
+        // The anchors this channel is published to (M15.1). A channel from before the
+        // segment existed has none recorded, which is what it had.
+        let anchors = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ANCHORS)? {
+            Some(seg) => {
+                let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_ANCHORS, &seg)?;
+                BootstrapSet::from_bytes(&bytes)?
+            }
+            None => BootstrapSet::new(),
+        };
 
         let evaluator = Self::build_evaluator(&genesis, &authors, &gov_entries, now_secs)?;
         Ok(Self {
@@ -651,6 +670,7 @@ impl ChannelState {
             timeline,
             gov_entries,
             receivers,
+            anchors,
             poisoned: false,
         })
     }
@@ -792,6 +812,7 @@ impl ChannelState {
             timeline: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
+            anchors: BootstrapSet::new(),
             poisoned: false,
         })
     }
@@ -846,6 +867,39 @@ impl ChannelState {
         self.evaluator =
             Self::build_evaluator(&self.genesis, &self.authors, &self.gov_entries, now_secs)?;
         Ok(true)
+    }
+
+    /// The anchors this channel is published to and read from (M15.1).
+    #[must_use]
+    pub fn anchors(&self) -> &BootstrapSet {
+        &self.anchors
+    }
+
+    /// Add anchors for this channel — the set is persisted sealed under the SEK
+    /// like every other per-channel segment, so a restart still knows where the
+    /// swarm's board is. Returns how many were new.
+    pub fn add_anchors(&mut self, store: &Store, more: &BootstrapSet) -> Result<usize> {
+        let before = self.anchors.len();
+        self.anchors.merge(more)?;
+        if self.anchors.len() == before {
+            return Ok(0);
+        }
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_ANCHORS,
+            &self.anchors.to_bytes(),
+        )?;
+        if let Err(e) = store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_ANCHORS,
+            &seg,
+        ) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(self.anchors.len() - before)
     }
 
     /// This identity's fingerprint in this channel — structurally the author of its

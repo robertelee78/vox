@@ -51,7 +51,7 @@ use crate::node::channel::ChannelState;
 use crate::node::circuitstream::{self, CircuitLedger};
 use crate::node::coordstream;
 use crate::node::joinstream::{run_initiator, run_responder, JoinOutcome, ResponderConfig};
-use crate::node::net::{accept_authorized, ConnectionManager, PeerPolicy};
+use crate::node::net::{accept_authorized, ConnectionManager, PeerClass, PeerPolicy};
 use crate::node::prekeys::PrekeyRing;
 use crate::node::store::Store;
 use crate::time::Clock;
@@ -384,20 +384,7 @@ impl NodeNet {
         // refused exactly the stream that mattered: a member delivering its sender key
         // on a connection we had dialled before we knew it.
         let (kind, mut send, mut recv) = accept_typed(conn).await?;
-        let mut snapshot = self.policy.snapshot();
-        // ADR-016's "pending pre-join identity" is a *board* fact, not a list someone
-        // maintains: a joiner announces itself by publishing a pre-join record
-        // (`0x0008`, self-signed, which anyone may publish), and that is what makes it
-        // eligible to open a `join` stream. Consulting the board here keeps open
-        // passphrase joins possible (ADR-007) without the actor having to be told
-        // about every PUT — and an identity with no record stays `Unknown`, so it
-        // reaches the board and nothing else.
-        if snapshot.classify(&peer) == crate::node::net::PeerClass::Unknown
-            && self.peer_has_prejoin(&peer)
-        {
-            snapshot.expect_joiner(peer);
-        }
-        if !PeerPolicy::allows(snapshot.classify(&peer), kind) {
+        if !PeerPolicy::allows(self.classify(&peer), kind) {
             crate::node::net::refuse_stream(&mut send, &mut recv);
             return Err(crate::error::Error::StreamRefused(
                 "peer may not open this stream kind",
@@ -406,18 +393,65 @@ impl NodeNet {
         self.dispatch(conn, kind, send, recv).await
     }
 
+    /// How this node classifies `peer` right now: the actor's policy where it has an
+    /// answer, else what the **board** knows.
+    ///
+    /// ADR-016's "pending pre-join identity" is a board fact, not a list someone
+    /// maintains: a joiner announces itself by publishing a pre-join record
+    /// (`0x0008`, self-signed, which anyone may publish), and that is what makes it
+    /// eligible to open a `join` stream. And a node that *anchors* a channel it is
+    /// not a member of (M15.1) still has to serve, coordinate and relay for that
+    /// channel's members, whom the board is what it knows them by — the creator
+    /// through the genesis it holds, any other through a record the genesis-backed
+    /// oracle admitted. Consulting the board here keeps all of that possible without
+    /// the actor being told about every PUT; an identity with no record stays
+    /// `Unknown`, so it reaches the board and `WHOAMI` and nothing else.
+    #[must_use]
+    pub fn classify(&self, peer: &Digest32) -> PeerClass {
+        let class = self.policy.snapshot().classify(peer);
+        if class != PeerClass::Unknown {
+            return class;
+        }
+        if self.peer_is_member_on_board(peer) {
+            PeerClass::Member
+        } else if self.peer_has_prejoin(peer) {
+            PeerClass::PendingJoiner
+        } else {
+            PeerClass::Unknown
+        }
+    }
+
     /// Whether `peer` has a live pre-join record on this board for any channel this
-    /// node holds.
+    /// node holds or anchors.
     #[must_use]
     pub fn peer_has_prejoin(&self, peer: &Digest32) -> bool {
         let now = self.now();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
-        self.membership.channels().iter().any(|(cid, _)| {
+        guard.channels_with_genesis().iter().any(|cid| {
             guard
                 .current_prejoins(cid, now)
                 .iter()
                 .any(|r| r.asserted_id() == *peer)
+        })
+    }
+
+    /// Whether the board knows `peer` as a member of some channel it anchors: the
+    /// creator named by a genesis it holds, or the author of a live member record
+    /// (which the board only admitted from an authenticated member).
+    #[must_use]
+    pub fn peer_is_member_on_board(&self, peer: &Digest32) -> bool {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.channels_with_genesis().iter().any(|cid| {
+            guard
+                .genesis(cid)
+                .is_some_and(|g| g.body.creator_pubkey.fingerprint() == *peer)
+                || guard
+                    .current_members(cid, 0, now)
+                    .iter()
+                    .any(|r| r.author_id == *peer)
         })
     }
 
@@ -457,7 +491,7 @@ impl NodeNet {
                 match coordstream::serve_coord(
                     peer,
                     observed,
-                    &self.policy.snapshot(),
+                    &|p| self.classify(p),
                     send,
                     recv,
                     move |p| manager.existing(p),
@@ -481,7 +515,7 @@ impl NodeNet {
                 let manager = Arc::clone(&self.manager);
                 circuitstream::serve_circuit(
                     peer,
-                    &self.policy.snapshot(),
+                    &|p| self.classify(p),
                     send,
                     recv,
                     move |p| manager.existing(p),
@@ -1237,15 +1271,21 @@ mod tests {
                     .unwrap();
 
             // The invite link Alice hands out: rendezvous only, no secret.
+            // Alice is her own anchor here, so the link names her as both.
             let link = crate::node::link::InviteLink::new(
                 cid,
-                alice_net.local_endpoints().unwrap(),
+                vec![crate::nat::bootstrap::BootstrapNode::new(
+                    alice_fp,
+                    alice_net.local_endpoints().unwrap(),
+                )
+                .unwrap()],
                 Some(alice_fp),
             )
             .unwrap();
             let parsed = crate::node::link::InviteLink::parse(&link.to_url()).unwrap();
             assert_eq!(parsed.channel_id, cid);
             assert_eq!(parsed.responder, Some(alice_fp));
+            assert_eq!(parsed.anchors[0].id, alice_fp);
 
             // Alice expects this joiner: the pending-joiner class opens `join` and the
             // board, nothing else.
@@ -1309,7 +1349,7 @@ mod tests {
             let join = Box::pin(async {
                 let conn = bob_net
                     .manager()
-                    .connect(parsed.responder.unwrap(), &parsed.anchors)
+                    .connect(parsed.anchors[0].id, &parsed.anchors[0].endpoints)
                     .await
                     .unwrap();
                 let set = bob_net

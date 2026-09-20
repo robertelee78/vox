@@ -299,6 +299,16 @@ pub async fn connect_direct(
     expected_peer: Digest32,
     now_secs: u64,
 ) -> Result<VoxConnection> {
+    // A candidate the socket cannot even address is not a candidate: quinn refuses
+    // an IPv6 destination on an IPv4 socket outright (and maps IPv4 onto an IPv6
+    // one, so the reverse is fine). Dropping them here is what keeps a dual-stack
+    // peer's IPv6 entries from costing an IPv4-bound node anything.
+    let local_v6 = endpoint.local_addr().is_ok_and(|a| a.is_ipv6());
+    let candidates: Vec<SocketAddr> = candidates
+        .iter()
+        .copied()
+        .filter(|c| local_v6 || c.is_ipv4())
+        .collect();
     if candidates.is_empty() {
         return Err(Error::Unreachable("no direct candidates"));
     }
@@ -306,17 +316,25 @@ pub async fn connect_direct(
     let mut set: JoinSet<Result<VoxConnection>> = JoinSet::new();
     let mut next = 0usize;
 
-    // Launch the first candidate immediately.
-    spawn_attempt(
-        &mut set,
-        &endpoint,
-        candidates[next],
-        expected_peer,
-        now_secs,
-    );
-    next += 1;
-
     loop {
+        // Nothing in flight: launch the next candidate at once — there is nothing to
+        // stagger behind. (Waiting on an empty set returns immediately, and a loop
+        // that re-armed the stagger timer around that would spin, hot, forever: the
+        // defect the M15.1 gate caught when an attempt failed faster than the timer.)
+        if set.is_empty() {
+            if next >= candidates.len() {
+                return Err(Error::Unreachable("all direct candidates failed"));
+            }
+            spawn_attempt(
+                &mut set,
+                &endpoint,
+                candidates[next],
+                expected_peer,
+                now_secs,
+            );
+            next += 1;
+            continue;
+        }
         if next < candidates.len() {
             // Race a staggered launch of the next candidate against completion of
             // any in-flight attempt (RFC 8305 staggered start).
@@ -497,6 +515,45 @@ mod tests {
             assert!(matches!(res, Err(Error::Unreachable(_))));
         });
     }
+    /// An attempt that fails faster than the stagger timer used to leave the loop
+    /// waiting on an empty set — which returns at once — and re-arming a fresh timer
+    /// each time round: a hot spin that starved the runtime. An IPv6 candidate on an
+    /// IPv4 socket is exactly such an attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fast_failing_candidate_does_not_spin_and_ipv6_is_skipped_on_ipv4() {
+        let server_signer = signer(5, 6);
+        let server = VoxEndpoint::bind(&server_signer, loopback(0)).unwrap();
+        let live = server.local_addr().unwrap();
+        let server_id = server.local_id();
+        let accept = tokio::spawn(async move { server.accept(1000).await });
+        let client = Arc::new(VoxEndpoint::bind(&signer(7, 8), loopback(0)).unwrap());
+        // IPv6 first (unaddressable from an IPv4 socket), then the live one.
+        let v6: SocketAddr = "[2001:db8::1]:4433".parse().unwrap();
+        let started = std::time::Instant::now();
+        let conn = tokio::time::timeout(
+            Duration::from_secs(15),
+            connect_direct(Arc::clone(&client), &[v6, live], server_id, 1000),
+        )
+        .await
+        .expect("did not spin")
+        .expect("the live candidate connects");
+        assert_eq!(conn.peer_id(), server_id);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the IPv6 candidate cost nothing: {:?}",
+            started.elapsed()
+        );
+        let _ = accept.await;
+        // Only unaddressable candidates: an immediate, honest failure.
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_direct(client, &[v6], server_id, 1000),
+        )
+        .await
+        .expect("did not spin");
+        assert!(matches!(res, Err(Error::Unreachable(_))));
+    }
+
     #[tokio::test]
     async fn the_route_probe_never_sends_and_yields_a_usable_or_absent_address() {
         // Whatever the host's networking looks like, the probe must not panic, must

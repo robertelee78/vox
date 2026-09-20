@@ -414,6 +414,28 @@ impl RendezvousService {
         }
     }
 
+    /// The authenticated key for `author` in `(channel, epoch)`: what the oracle
+    /// knows, or — for a channel this node **anchors without being a member of** —
+    /// the creator's key from the genesis it holds (ADR-016 M15.1).
+    ///
+    /// The oracle is this node's own membership view, which is empty for a channel it
+    /// only anchors. The genesis is self-validating (its hash is the channelID) and
+    /// names its creator, so the creator's records can be admitted on the strength
+    /// of it alone; every other member's authority comes from governance entries the
+    /// anchor does not yet hold — recorded as the remaining gap in ADR-016.
+    fn resolve(
+        &self,
+        channel: &Digest32,
+        epoch: u64,
+        author: &Digest32,
+        creator: Option<&CompositePublicKey>,
+    ) -> Option<CompositePublicKey> {
+        if let Some(key) = self.oracle.member_key(channel, epoch, author) {
+            return Some(key);
+        }
+        creator.filter(|key| key.fingerprint() == *author).cloned()
+    }
+
     /// Admit one framed record by its struct tag.
     fn put(&self, record: &[u8], now: u64) -> std::result::Result<(), RejectReason> {
         let tag = parse_frame(record)
@@ -424,9 +446,11 @@ impl RendezvousService {
                 let rec =
                     RendezvousRecord::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch) = (rec.channel_id, rec.epoch);
-                lock(&self.store).accept_member(
+                let mut store = lock(&self.store);
+                let creator = store.genesis(&cid).map(|g| g.body.creator_pubkey.clone());
+                store.accept_member(
                     rec,
-                    |author| self.oracle.member_key(&cid, epoch, author),
+                    |author| self.resolve(&cid, epoch, author, creator.as_ref()),
                     now,
                 )
             }
@@ -434,9 +458,11 @@ impl RendezvousService {
                 let rec = MemberBundleRecord::from_wire(record)
                     .map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch) = (rec.channel_id, rec.epoch);
-                lock(&self.store).accept_bundle(
+                let mut store = lock(&self.store);
+                let creator = store.genesis(&cid).map(|g| g.body.creator_pubkey.clone());
+                store.accept_bundle(
                     rec,
-                    |author| self.oracle.member_key(&cid, epoch, author),
+                    |author| self.resolve(&cid, epoch, author, creator.as_ref()),
                     now,
                 )
             }

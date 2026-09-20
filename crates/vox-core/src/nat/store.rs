@@ -300,6 +300,13 @@ impl RendezvousStore {
         self.genesis.get(channel_id)
     }
 
+    /// Every channel this board holds a genesis for — the channels it anchors, in
+    /// no particular order.
+    #[must_use]
+    pub fn channels_with_genesis(&self) -> Vec<Digest32> {
+        self.genesis.keys().copied().collect()
+    }
+
     /// Admit (or refresh) a **pre-join** rendezvous record, enforcing the ADR-012
     /// reader policy. The record is self-verifying (the asserted identity and the
     /// embedded prekey bundle are checked); it conveys no channel authority.
