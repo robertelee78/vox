@@ -24,12 +24,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
 use crate::hash::Digest32;
+use crate::identity::composite::CompositePublicKey;
 use crate::node::api::{
     ChannelDetail, ChannelSummary, Fault, IdentityInfo, MessageRow, NodeCommand, NodeEvent,
     NodeView, Outcome, Secret,
@@ -40,6 +42,7 @@ use crate::node::network::{Inbound, NodeNet};
 use crate::node::paths::Paths;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
+use crate::node::syncstream::{SyncSchedule, SyncTrigger};
 use crate::transport::quic::VoxConnection;
 
 /// Command queue depth (commands beyond it apply backpressure to the client).
@@ -48,6 +51,23 @@ const COMMAND_QUEUE: usize = 64;
 /// actor's event emission; the TUI drains continuously (ADR-015).
 const EVENT_QUEUE: usize = 256;
 
+/// A channel's state, shared so a long-running ADR-008 session can hold it without
+/// making it invisible to everything else.
+///
+/// The actor remains the only thing that *adds or removes* channels; what changed in
+/// M14.7f is that a sync session no longer takes ownership. Taking the channel out of
+/// the map meant a join, a send or a key delivery arriving mid-session found no
+/// channel and failed — three symptoms of one cause. A guard makes them wait the few
+/// milliseconds instead, which is the behaviour a client expects.
+type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
+
+/// How often the actor re-evaluates its sync schedule. The ADR-016 policy itself
+/// (on connect, after a local append, every 30 s otherwise) lives in
+/// [`SyncSchedule`]; this is only the resolution at which it is checked, so "a push
+/// immediately after a local append" means *within one tick* — authoring never waits
+/// on the network.
+const TICK: Duration = Duration::from_secs(1);
+
 /// Bound on the internal network→actor queue. Inbound streams are back-pressured
 /// rather than dropped: a full queue slows the accept loop, it never loses work.
 const NET_QUEUE: usize = 64;
@@ -55,6 +75,24 @@ const NET_QUEUE: usize = 64;
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
+    /// A peer connected inbound: it gets a sync schedule, due immediately.
+    Connected {
+        /// The authenticated peer.
+        peer: Digest32,
+    },
+    /// A sync session finished and is handing the channel back.
+    ///
+    /// A session **cannot** be awaited inside the actor loop: two nodes that each
+    /// start one at the same moment would each be waiting for the other to serve the
+    /// responder side, and neither could — a deadlock the M14 gate reproduced the
+    /// moment sync became automatic. So a session owns the channel on its own task
+    /// and returns it here, leaving the actor free to serve the peer meanwhile.
+    SyncDone {
+        /// The channel that was reconciled.
+        channel_id: Digest32,
+        /// What the session did, or why it failed.
+        outcome: crate::error::Result<crate::node::channel::SyncOutcome>,
+    },
     /// A peer connected and opened a stream the actor must handle.
     Stream {
         /// The connection it arrived on, kept alive for the reply.
@@ -112,7 +150,13 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
                 .accept(crate::transport::quic::Admission::AcceptAnyAuthenticated)
                 .await;
             match accepted {
-                Ok(Some(conn)) => spawn_stream_loop(Arc::clone(&net), conn, tx.clone()),
+                Ok(Some(conn)) => {
+                    let peer = conn.peer_id();
+                    spawn_stream_loop(Arc::clone(&net), conn, tx.clone());
+                    if tx.send(NetEvent::Connected { peer }).await.is_err() {
+                        break; // the actor is gone
+                    }
+                }
                 // The endpoint closed, or a handshake failed. `accept` returns `Err`
                 // on a single failed handshake (ADR-011 known gap), so keep going on
                 // an error and stop only when the endpoint is closed.
@@ -185,6 +229,10 @@ pub struct Node {
     /// Peers whose connection already has a stream loop, so dialing again does not
     /// start a second one.
     stream_loops: std::collections::BTreeSet<Digest32>,
+    /// Per-peer ADR-008 sync clock (ADR-016 §"Sync scheduling").
+    schedules: BTreeMap<Digest32, SyncSchedule>,
+    /// Channels with a local append not yet pushed to peers.
+    pending_push: std::collections::BTreeSet<Digest32>,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012).
     record_seq: BTreeMap<Digest32, u64>,
@@ -198,7 +246,7 @@ pub struct Node {
     /// after the identity unlocks and dropped on lock, so no prekey secret is in
     /// memory behind a lock (ADR-010/015). M14.4+ publishes its bundle.
     prekeys: Option<PrekeyRing>,
-    channels: BTreeMap<Digest32, ChannelState>,
+    channels: BTreeMap<Digest32, SharedChannel>,
     clock: Clock,
     argon2: Argon2Profile,
     view_tx: watch::Sender<NodeView>,
@@ -268,6 +316,8 @@ impl Node {
             bind,
             pow_params,
             stream_loops: std::collections::BTreeSet::new(),
+            schedules: BTreeMap::new(),
+            pending_push: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
             prekeys: None,
@@ -278,7 +328,7 @@ impl Node {
             event_tx,
         };
         let view_rx = node.view_tx.subscribe();
-        node.publish();
+        node.publish_initial();
         tokio::spawn(node.run(cmd_rx, net_rx));
         Ok(NodeHandle {
             cmd_tx,
@@ -296,13 +346,15 @@ impl Node {
         // interleaved here, so channel state is only ever mutated by this task
         // (ADR-016). The actor holds a `net_tx` clone, so `net_rx` never closes and
         // this select cannot spin on a dead branch.
+        let mut ticker = tokio::time::interval(TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 received = cmd_rx.recv() => {
                     let Some((command, reply)) = received else { break };
                     let shutdown = matches!(command, NodeCommand::Shutdown);
                     let outcome = self.handle(command).await;
-                    self.publish();
+                    self.publish().await;
                     // A dropped reply receiver is the caller's choice, not an error.
                     let _ = reply.send(outcome);
                     if shutdown {
@@ -311,14 +363,19 @@ impl Node {
                 }
                 Some(event) = net_rx.recv() => {
                     self.handle_net(event).await;
-                    self.publish();
+                    self.publish().await;
+                }
+                _ = ticker.tick() => {
+                    if self.run_due_syncs().await {
+                        self.publish().await;
+                    }
                 }
             }
         }
         // Channel closed or shutdown: lock (wipe every SEK + the signer) and stop.
         self.stop_network();
         self.lock_all().await;
-        self.publish();
+        self.publish().await;
         let _ = self.event_tx.send(NodeEvent::Shutdown).await;
     }
 
@@ -420,7 +477,8 @@ impl Node {
         )?);
         let net = Arc::new(NodeNet::new(endpoint, Arc::clone(&self.clock)));
         self.net = Some(Arc::clone(&net));
-        self.refresh_network_view();
+        // No refresh here: the network only starts when the identity unlocks, and
+        // `lock_all` cleared every channel, so there is nothing to publish yet.
         spawn_accept_loop(net, self.net_tx.clone());
         Ok(())
     }
@@ -433,6 +491,8 @@ impl Node {
             net.manager().endpoint().close();
         }
         self.stream_loops.clear();
+        self.schedules.clear();
+        self.pending_push.clear();
     }
 
     /// Put a channel's genesis and this node's records on an **anchor's** board
@@ -458,7 +518,10 @@ impl Node {
             *entry
         };
         let (genesis_wire, epoch) = match self.channels.get(channel_id) {
-            Some(c) => (c.genesis().to_wire(), c.epoch()),
+            Some(shared) => {
+                let c = shared.lock().await;
+                (c.genesis().to_wire(), c.epoch())
+            }
             None => return,
         };
         let records = {
@@ -487,7 +550,7 @@ impl Node {
     /// can find out what the channel is and how to reach us (ADR-007/ADR-012). A
     /// refusal here is normal, not an error: the board already holds a current record
     /// and the ADR-012 refresh floor declines a faster one.
-    fn publish_channel_locally(&mut self, channel_id: &Digest32) {
+    async fn publish_channel_locally(&mut self, channel_id: &Digest32) {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
@@ -500,9 +563,10 @@ impl Node {
             return;
         };
         let Ok(signer) = profile.signer() else { return };
-        let Some(channel) = self.channels.get(channel_id) else {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
+        let channel = shared.lock().await;
         let Some(ring) = self.prekeys.as_ref() else {
             return;
         };
@@ -517,11 +581,12 @@ impl Node {
 
     /// Republish the membership snapshot and peer policy the served board and the
     /// accept path read (see `node::network`). Called whenever channels change.
-    fn refresh_network_view(&self) {
+    async fn refresh_network_view(&self) {
         let Some(net) = self.net.as_ref() else { return };
         let mut policy = PeerPolicy::new();
-        for (cid, ch) in &self.channels {
-            let members: BTreeMap<Digest32, crate::identity::composite::CompositePublicKey> = ch
+        for (cid, shared) in &self.channels {
+            let ch = shared.lock().await;
+            let members: BTreeMap<Digest32, CompositePublicKey> = ch
                 .author_keys()
                 .into_iter()
                 .map(|k| (k.fingerprint(), k))
@@ -543,6 +608,30 @@ impl Node {
         match event {
             NetEvent::Stopped => {
                 self.net = None;
+            }
+            NetEvent::Connected { peer } => {
+                // A fresh connection syncs at once (ADR-016), then on the interval.
+                self.schedules
+                    .entry(peer)
+                    .or_insert_with(SyncSchedule::connected);
+            }
+            NetEvent::SyncDone {
+                channel_id,
+                outcome,
+            } => {
+                self.refresh_network_view().await;
+                if let Ok(o) = outcome {
+                    if o.rendered > 0 || o.governance > 0 {
+                        let _ = self
+                            .event_tx
+                            .send(NodeEvent::Synced {
+                                channel_id,
+                                applied: o.applied as u64,
+                                rendered: o.rendered as u64,
+                            })
+                            .await;
+                    }
+                }
             }
             NetEvent::Stream { conn, inbound } => {
                 // Held for the whole handler: the connection must outlive the streams
@@ -583,10 +672,13 @@ impl Node {
             refuse_join(send).await;
             return;
         };
-        let answerable = self
-            .channels
-            .get(&channel_id)
-            .is_some_and(|c| c.can_answer_join() && c.epoch() == epoch);
+        let answerable = match self.channels.get(&channel_id) {
+            Some(shared) => {
+                let c = shared.lock().await;
+                c.can_answer_join() && c.epoch() == epoch
+            }
+            None => false,
+        };
         if !answerable || self.net.is_none() || self.prekeys.is_none() {
             refuse_join(send).await;
             return;
@@ -605,10 +697,11 @@ impl Node {
                 refuse_join(send).await;
                 return;
             };
-            let Some(channel) = self.channels.get(&channel_id) else {
+            let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
                 refuse_join(send).await;
                 return;
             };
+            let channel = shared.lock().await;
             let Ok(mut ctx) = channel.join_context() else {
                 refuse_join(send).await;
                 return;
@@ -625,7 +718,7 @@ impl Node {
                 send,
                 recv,
                 ctx,
-                channel,
+                &channel,
                 signer,
                 profile.store(),
                 ring,
@@ -636,14 +729,16 @@ impl Node {
         let Ok(outcome) = outcome else { return };
         // The join proved this identity; admit it as an author so its entries are
         // accepted (reading still needs consent).
-        let admitted = match (self.profile.as_ref(), self.channels.get_mut(&channel_id)) {
-            (Some(profile), Some(channel)) => channel
+        let admitted = match (self.profile.as_ref(), self.channels.get(&channel_id)) {
+            (Some(profile), Some(shared)) => shared
+                .lock()
+                .await
                 .admit_author(profile.store(), &outcome.peer.identity, now)
                 .is_ok(),
             _ => false,
         };
         if admitted {
-            self.refresh_network_view();
+            self.refresh_network_view().await;
         }
         self.sessions.insert((channel_id, peer), outcome.session);
         if let Some(net) = self.net.as_ref() {
@@ -672,6 +767,10 @@ impl Node {
         if self.stream_loops.insert(peer) {
             spawn_stream_loop(net, Arc::clone(&conn), self.net_tx.clone());
         }
+        // A new connection syncs at once, then on the interval (ADR-016).
+        self.schedules
+            .entry(peer)
+            .or_insert_with(SyncSchedule::connected);
         Ok(conn)
     }
 
@@ -826,15 +925,19 @@ impl Node {
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
-        self.channels.insert(parsed.channel_id, channel);
+        self.channels.insert(
+            parsed.channel_id,
+            Arc::new(tokio::sync::Mutex::new(channel)),
+        );
         // Every member whose bundle is on the board is an admitted author: the record
         // carries its full composite key and is verified against it (ADR-016). Sync
         // hard-fails on an entry from an author we never admitted, so this is what
         // makes the log reconcilable at all.
-        if let (Some(profile), Some(channel)) = (
+        if let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
-            self.channels.get_mut(&parsed.channel_id),
+            self.channels.get(&parsed.channel_id).map(Arc::clone),
         ) {
+            let mut channel = shared.lock().await;
             for record in &set.bundles {
                 if let Ok(key) = crate::identity::composite::CompositePublicKey::from_bytes(
                     &record.prekey_bundle.root_pub,
@@ -847,8 +950,8 @@ impl Node {
         }
         self.sessions
             .insert((parsed.channel_id, responder), joined.session);
-        self.refresh_network_view();
-        self.publish_channel_locally(&parsed.channel_id);
+        self.refresh_network_view().await;
+        self.publish_channel_locally(&parsed.channel_id).await;
         // And on the anchor we joined through, so every other member can find our key
         // and admit us as a log author (without which their sync sessions fail).
         self.publish_channel_to_anchor(&parsed.channel_id, &conn)
@@ -887,11 +990,13 @@ impl Node {
         };
         let now = self.now();
         let skdm = {
-            let (Some(profile), Some(channel)) =
-                (self.profile.as_ref(), self.channels.get(channel_id))
-            else {
+            let (Some(profile), Some(shared)) = (
+                self.profile.as_ref(),
+                self.channels.get(channel_id).map(Arc::clone),
+            ) else {
                 return Outcome::Failed(Fault::UnknownChannel);
             };
+            let channel = shared.lock().await;
             if !channel.is_author(&target) {
                 // We have not admitted this identity, so we hold no verified key for
                 // it and cannot know we are releasing to the right party.
@@ -916,12 +1021,17 @@ impl Node {
         {
             return Outcome::Failed(fault_of(&e));
         }
-        let (Some(profile), Some(channel)) =
-            (self.profile.as_ref(), self.channels.get_mut(channel_id))
-        else {
+        let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
             return Outcome::Failed(Fault::UnknownChannel);
         };
-        if let Err(e) = channel.issue_consent(profile, target, &skdm, now) {
+        if let Err(e) = shared
+            .lock()
+            .await
+            .issue_consent(profile, target, &skdm, now)
+        {
             return Outcome::Failed(fault_of(&e));
         }
         Outcome::Done
@@ -943,6 +1053,66 @@ impl Node {
         outcome
     }
 
+    /// Mark a channel as having a local append to push, and make every peer's
+    /// schedule due (ADR-016: "a push immediately after a local append").
+    fn note_local_append(&mut self, channel_id: &Digest32) {
+        if self.net.is_none() {
+            return;
+        }
+        self.pending_push.insert(*channel_id);
+        for schedule in self.schedules.values_mut() {
+            schedule.note_local_append();
+        }
+    }
+
+    /// Run whatever the ADR-016 sync schedule says is due. Returns whether anything
+    /// ran, so the caller only republishes the view when it might have changed.
+    ///
+    /// A peer with no live connection is skipped, not retried in place: it gets a
+    /// fresh schedule when it reconnects.
+    async fn run_due_syncs(&mut self) -> bool {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return false;
+        };
+        let now = self.now();
+        let due: Vec<(Digest32, SyncTrigger)> = self
+            .schedules
+            .iter()
+            .filter_map(|(peer, s)| s.due(now).map(|t| (*peer, t)))
+            .collect();
+        if due.is_empty() {
+            return false;
+        }
+        let mut ran = false;
+        for (peer, trigger) in due {
+            if net.manager().existing(&peer).is_none() {
+                continue;
+            }
+            // Which channels this pass covers: a local-append push touches only the
+            // channels that changed; a connect or interval pass covers every channel
+            // shared with this peer.
+            let mut channels: Vec<Digest32> = Vec::new();
+            for (cid, shared) in &self.channels {
+                if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
+                    continue;
+                }
+                if shared.lock().await.is_author(&peer) {
+                    channels.push(*cid);
+                }
+            }
+            for channel_id in channels {
+                if self.sync_one(&channel_id, peer).await {
+                    ran = true;
+                }
+            }
+            if let Some(schedule) = self.schedules.get_mut(&peer) {
+                schedule.note_synced(now);
+            }
+        }
+        self.pending_push.clear();
+        ran
+    }
+
     /// Admit every member whose prekey bundle is on `peer`'s board for this channel.
     ///
     /// This is not optional politeness: an ADR-008 session **hard-fails** on the first
@@ -959,7 +1129,7 @@ impl Node {
             return 0;
         };
         let epoch = match self.channels.get(channel_id) {
-            Some(c) => c.epoch(),
+            Some(shared) => shared.lock().await.epoch(),
             None => return 0,
         };
         let Ok(set) = net.fetch_channel(&conn, channel_id, epoch).await else {
@@ -967,9 +1137,11 @@ impl Node {
         };
         let now = self.now();
         let mut learned = 0usize;
-        if let (Some(profile), Some(channel)) =
-            (self.profile.as_ref(), self.channels.get_mut(channel_id))
-        {
+        if let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) {
+            let mut channel = shared.lock().await;
             for record in &set.bundles {
                 let Ok(key) = crate::identity::composite::CompositePublicKey::from_bytes(
                     &record.prekey_bundle.root_pub,
@@ -986,133 +1158,125 @@ impl Node {
             }
         }
         if learned > 0 {
-            self.refresh_network_view();
+            self.refresh_network_view().await;
         }
         learned
     }
 
-    /// Reconcile a channel with every member this node can reach.
-    async fn sync_channel(&mut self, channel_id: &Digest32) -> Outcome {
+    /// Start reconciling one channel with one peer: learn who else has joined, then
+    /// hand the channel to a detached session task.
+    ///
+    /// Returns whether a session was *started*. It is deliberately not awaited — see
+    /// [`NetEvent::SyncDone`] for why awaiting deadlocks two nodes that start at the
+    /// same moment. While the channel is away it is invisible to commands (they answer
+    /// `UnknownChannel`) and, usefully, to this function, so a second pass cannot start
+    /// a concurrent session for the same channel.
+    async fn sync_one(&mut self, channel_id: &Digest32, peer: Digest32) -> bool {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
-            return Outcome::Failed(Fault::NotNetworked);
+            return false;
         };
-        let Some(channel) = self.channels.get(channel_id) else {
+        if net.manager().existing(&peer).is_none() {
+            return false;
+        }
+        // Learn who else has joined before reconciling, or the first entry from a
+        // newer member kills the session (ADR-008 Implementation notes).
+        self.learn_members(channel_id, peer).await;
+        let epoch = match self.channels.get(channel_id) {
+            Some(shared) => shared.lock().await.epoch(),
+            None => return false,
+        };
+        let Some(conn) = net.manager().existing(&peer) else {
+            return false;
+        };
+        let handle = tokio::runtime::Handle::current();
+        let transport =
+            match crate::node::syncstream::open_sync(&conn, handle, channel_id, epoch).await {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+        self.start_session(*channel_id, transport);
+        true
+    }
+
+    /// Take the channel out of the actor's map and run a session on its own task,
+    /// returning it through [`NetEvent::SyncDone`].
+    fn start_session(
+        &mut self,
+        channel_id: Digest32,
+        transport: crate::transport::quic::QuicStreamTransport,
+    ) {
+        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+            return;
+        };
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            return;
+        };
+        let now = self.now();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let joined = tokio::task::spawn_blocking(move || {
+                // `blocking_lock` is the sanctioned way to take a tokio mutex off a
+                // blocking thread. Anything else wanting this channel waits for the
+                // session — a few milliseconds — instead of finding it missing.
+                let mut channel = shared.blocking_lock();
+                let mut t = transport;
+                channel.sync_over(&store, &mut t, now)
+            })
+            .await;
+            if let Ok(outcome) = joined {
+                let _ = tx
+                    .send(NetEvent::SyncDone {
+                        channel_id,
+                        outcome,
+                    })
+                    .await;
+            }
+        });
+    }
+
+    /// Reconcile a channel with every member this node can reach, now (the `Sync`
+    /// command; the schedule does this automatically — ADR-016 §"Sync scheduling").
+    async fn sync_channel(&mut self, channel_id: &Digest32) -> Outcome {
+        if self.net.is_none() {
+            return Outcome::Failed(Fault::NotNetworked);
+        }
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::UnknownChannel);
         };
-        let me = channel.me();
-        let epoch = channel.epoch();
-        let peers: Vec<Digest32> = channel.members().into_iter().filter(|m| *m != me).collect();
-        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
-            return Outcome::Failed(Fault::NoIdentity);
+        let peers: Vec<Digest32> = {
+            let channel = shared.lock().await;
+            let me = channel.me();
+            channel.members().into_iter().filter(|m| *m != me).collect()
         };
         let mut synced = 0usize;
         for peer in peers {
-            if net.manager().existing(&peer).is_none() {
-                continue;
-            }
-            // Learn who else has joined before reconciling, or the first entry from a
-            // newer member kills the session.
-            self.learn_members(channel_id, peer).await;
-            let Some(conn) = net.manager().existing(&peer) else {
-                continue;
-            };
-            let handle = tokio::runtime::Handle::current();
-            let transport =
-                match crate::node::syncstream::open_sync(&conn, handle.clone(), channel_id, epoch)
-                    .await
-                {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-            let Some(mut ch) = self.channels.remove(channel_id) else {
-                break;
-            };
-            let store = Arc::clone(&store);
-            let now = self.now();
-            let joined = tokio::task::spawn_blocking(move || {
-                let mut t = transport;
-                let out = ch.sync_over(&store, &mut t, now);
-                (ch, out)
-            })
-            .await;
-            if let Ok((ch, out)) = joined {
-                self.channels.insert(*channel_id, ch);
-                if let Ok(o) = out {
-                    synced += 1;
-                    if o.rendered > 0 || o.governance > 0 {
-                        let _ = self
-                            .event_tx
-                            .send(NodeEvent::Synced {
-                                channel_id: *channel_id,
-                                applied: o.applied as u64,
-                                rendered: o.rendered as u64,
-                            })
-                            .await;
-                    }
-                }
+            if self.sync_one(channel_id, peer).await {
+                synced += 1;
             }
         }
-        self.refresh_network_view();
         if synced == 0 {
             return Outcome::Failed(Fault::Unreachable);
         }
         Outcome::Done
     }
 
-    /// Reconcile one channel's log with a peer over an inbound `sync` stream
-    /// (ADR-008 frontier mode).
-    ///
-    /// The ADR-008 engine is **synchronous**, so the session runs on a blocking task:
-    /// the channel is moved out of the actor's map for the duration and put back
-    /// after, and the store is a shared handle (`Profile::store_handle`). While a
-    /// channel is away, commands naming it answer `UnknownChannel` — the session is
-    /// short and the client retries, which is better than blocking the whole actor
-    /// (its other channels keep working) or mutating channel state from two threads.
+    /// Reconcile one channel's log with a peer over an inbound `sync` stream (ADR-008
+    /// frontier mode), on its own task for the reason [`NetEvent::SyncDone`] gives.
     async fn run_sync_session(&mut self, send: quinn::SendStream, mut recv: quinn::RecvStream) {
         use crate::node::syncstream::{accept_sync, read_sync_request};
         let Ok((channel_id, epoch)) = read_sync_request(&mut recv).await else {
             return;
         };
-        let now = self.now();
-        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
-            return;
-        };
         // Only a channel we hold open at that epoch can be reconciled.
-        if self
-            .channels
-            .get(&channel_id)
-            .is_none_or(|c| c.epoch() != epoch)
-        {
-            return;
-        }
-        let Some(mut channel) = self.channels.remove(&channel_id) else {
-            return;
+        let matches_epoch = match self.channels.get(&channel_id) {
+            Some(shared) => shared.lock().await.epoch() == epoch,
+            None => false,
         };
-        let handle = tokio::runtime::Handle::current();
-        let joined = tokio::task::spawn_blocking(move || {
-            let mut transport = accept_sync(handle, send, recv);
-            let outcome = channel.sync_over(&store, &mut transport, now);
-            (channel, outcome)
-        })
-        .await;
-        // A panicked blocking task loses the channel from the map rather than leaving
-        // it in an unknown state; reopening rebuilds it from disk.
-        if let Ok((channel, outcome)) = joined {
-            self.channels.insert(channel_id, channel);
-            if let Ok(out) = outcome {
-                if out.rendered > 0 || out.governance > 0 {
-                    let _ = self
-                        .event_tx
-                        .send(NodeEvent::Synced {
-                            channel_id,
-                            applied: out.applied as u64,
-                            rendered: out.rendered as u64,
-                        })
-                        .await;
-                }
-            }
-            self.refresh_network_view();
+        if !matches_epoch {
+            return;
         }
+        let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
+        self.start_session(channel_id, transport);
     }
 
     /// Take an inbound sealed control message: an ADR-006 SKDM, which makes that
@@ -1131,8 +1295,15 @@ impl Node {
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
             return;
         };
-        let backfilled = match (self.profile.as_ref(), self.channels.get_mut(&channel_id)) {
-            (Some(profile), Some(channel)) => channel.accept_skdm(profile.store(), &skdm, now).ok(),
+        let backfilled = match (
+            self.profile.as_ref(),
+            self.channels.get(&channel_id).map(Arc::clone),
+        ) {
+            (Some(profile), Some(shared)) => shared
+                .lock()
+                .await
+                .accept_skdm(profile.store(), &skdm, now)
+                .ok(),
             _ => None,
         };
         if let Some(n) = backfilled {
@@ -1166,8 +1337,8 @@ impl Node {
 
     async fn lock_all(&mut self) {
         let was_unlocked = self.profile.as_ref().is_some_and(Profile::is_unlocked);
-        for (_, mut ch) in std::mem::take(&mut self.channels) {
-            ch.lock_now();
+        for (_, shared) in std::mem::take(&mut self.channels) {
+            shared.lock().await.lock_now();
         }
         // Drop the prekey ring: its secrets zeroize on drop, so a locked node holds
         // no key-agreement material (ADR-015 lock/zeroize).
@@ -1194,9 +1365,10 @@ impl Node {
         match ChannelState::create_with_profile(profile, local_name, passphrase, now, self.argon2) {
             Ok(ch) => {
                 let id = ch.channel_id();
-                self.channels.insert(id, ch);
-                self.refresh_network_view();
-                self.publish_channel_locally(&id);
+                self.channels
+                    .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
+                self.refresh_network_view().await;
+                self.publish_channel_locally(&id).await;
                 let _ = self
                     .event_tx
                     .send(NodeEvent::ChannelOpened { channel_id: id })
@@ -1217,9 +1389,10 @@ impl Node {
         };
         match ChannelState::open(profile, channel_id, passphrase, now) {
             Ok(ch) => {
-                self.channels.insert(*channel_id, ch);
-                self.refresh_network_view();
-                self.publish_channel_locally(channel_id);
+                self.channels
+                    .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+                self.refresh_network_view().await;
+                self.publish_channel_locally(channel_id).await;
                 let _ = self
                     .event_tx
                     .send(NodeEvent::ChannelOpened {
@@ -1234,15 +1407,15 @@ impl Node {
 
     async fn close_channel(&mut self, channel_id: &Digest32) -> Outcome {
         match self.channels.remove(channel_id) {
-            Some(mut ch) => {
-                ch.lock_now();
+            Some(shared) => {
+                shared.lock().await.lock_now();
                 // The channel is gone from the view the board reads, so its members
                 // are no longer classified from it and its records stop being served
                 // on our behalf.
                 if let Some(net) = self.net.as_ref() {
                     net.membership().clear_channel(channel_id);
                 }
-                self.refresh_network_view();
+                self.refresh_network_view().await;
                 let _ = self
                     .event_tx
                     .send(NodeEvent::ChannelClosed {
@@ -1260,19 +1433,21 @@ impl Node {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        let Some(ch) = self.channels.get_mut(channel_id) else {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
+        let mut ch = shared.lock().await;
         match ch.append_text(profile, text, now) {
             Ok(r) => {
                 let row = row_of(r);
+                let channel_id = *channel_id;
                 let _ = self
                     .event_tx
-                    .send(NodeEvent::NewEntry {
-                        channel_id: *channel_id,
-                        row,
-                    })
+                    .send(NodeEvent::NewEntry { channel_id, row })
                     .await;
+                // ADR-016: push immediately after a local append. Marking it here and
+                // letting the tick do the work keeps authoring off the network path.
+                self.note_local_append(&channel_id);
                 Outcome::Done
             }
             Err(e) => Outcome::Failed(fault_of(&e)),
@@ -1280,12 +1455,43 @@ impl Node {
     }
 
     /// Publish the current view (latest wins).
-    fn publish(&self) {
-        let view = self.view_of();
+    /// The view at spawn time, built without locks: nothing is open yet, so every
+    /// channel the store knows is listed closed.
+    fn publish_initial(&self) {
+        let identity = self.profile.as_ref().map(|p| IdentityInfo {
+            fingerprint: p.fingerprint(),
+            created: p.created(),
+        });
+        let locked = !self.profile.as_ref().is_some_and(Profile::is_unlocked);
+        let channels = self
+            .profile
+            .as_ref()
+            .and_then(|p| p.store().channels().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|channel_id| ChannelSummary {
+                channel_id,
+                local_name: None,
+                open: false,
+                entries: 0,
+            })
+            .collect();
+        self.view_tx.send_replace(NodeView {
+            identity,
+            locked,
+            mlock_active: true,
+            listening: Vec::new(),
+            channels,
+            open_channels: Vec::new(),
+        });
+    }
+
+    async fn publish(&self) {
+        let view = self.view_of().await;
         self.view_tx.send_replace(view);
     }
 
-    fn view_of(&self) -> NodeView {
+    async fn view_of(&self) -> NodeView {
         let identity = self.profile.as_ref().map(|p| IdentityInfo {
             fingerprint: p.fingerprint(),
             created: p.created(),
@@ -1302,35 +1508,39 @@ impl Node {
             .as_ref()
             .and_then(|p| p.store().channels().ok())
             .unwrap_or_default();
-        let channels = known
-            .iter()
-            .map(|id| match self.channels.get(id) {
-                Some(ch) => ChannelSummary {
-                    channel_id: *id,
-                    local_name: Some(ch.local_name().to_owned()),
-                    open: true,
-                    entries: ch.entry_count() as u64,
-                },
+        let mut channels = Vec::with_capacity(known.len());
+        for id in &known {
+            channels.push(match self.channels.get(id) {
+                Some(shared) => {
+                    let ch = shared.lock().await;
+                    ChannelSummary {
+                        channel_id: *id,
+                        local_name: Some(ch.local_name().to_owned()),
+                        open: true,
+                        entries: ch.entry_count() as u64,
+                    }
+                }
                 None => ChannelSummary {
                     channel_id: *id,
                     local_name: None,
                     open: false,
                     entries: 0,
                 },
-            })
-            .collect();
-        let open_channels = self
-            .channels
-            .values()
-            .map(|ch| ChannelDetail {
+            });
+        }
+        let mut open_channels = Vec::with_capacity(self.channels.len());
+        let mut mlock_active = true;
+        for shared in self.channels.values() {
+            let ch = shared.lock().await;
+            mlock_active &= ch.mlock_active();
+            open_channels.push(ChannelDetail {
                 channel_id: ch.channel_id(),
                 local_name: ch.local_name().to_owned(),
                 epoch: ch.epoch(),
                 members: ch.members(),
                 timeline: ch.timeline().iter().map(row_of).collect(),
-            })
-            .collect();
-        let mlock_active = self.channels.values().all(ChannelState::mlock_active);
+            });
+        }
         NodeView {
             identity,
             locked,
@@ -1365,6 +1575,10 @@ fn fault_of(e: &Error) -> Fault {
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,
+        // A join refused before the challenge (the responder does not hold that
+        // channel open) reaches the joiner as a malformed exchange; report it as the
+        // refusal it is rather than an internal fault.
+        Error::MalformedJoin(_) => Fault::Refused,
         _ => Fault::Internal,
     }
 }
@@ -1401,6 +1615,8 @@ mod tests {
             bind: None,
             pow_params: None,
             stream_loops: std::collections::BTreeSet::new(),
+            schedules: BTreeMap::new(),
+            pending_push: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
             prekeys: None,

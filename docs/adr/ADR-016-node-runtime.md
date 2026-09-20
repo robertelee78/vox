@@ -501,6 +501,22 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   when a stream arrives, not when the accept loop iteration began.** Snapshotting the peer policy before
   awaiting `accept_bi` refused exactly the stream that mattered — a member delivering its sender key on a
   connection we had dialled before we knew it was a member.
+- **Sync happens on its own (M14.7f).** `SyncSchedule` is now driven: the actor ticks once a second and
+  applies §"Sync scheduling" — a session per shared channel on a new connection, a push when a local append
+  is pending, and the 30-second interval otherwise. "Immediately after a local append" is realized as
+  *within one tick*, so authoring never waits on the network. The M14 gate no longer issues a single `Sync`
+  command; it waits for the messages to arrive by themselves, which is the property that matters.
+  Two structural changes were forced, and both are improvements:
+  1. **A session must not be awaited inside the actor loop.** Two nodes whose schedules fire together each
+     awaited their own outbound session while the peer waited for *them* to serve the responder side —
+     a deadlock, and the gate reproduced it the moment sync became automatic. A session now runs on its own
+     task and reports back through `NetEvent::SyncDone`, so the actor stays free to serve the peer.
+  2. **A channel is shared, not moved.** Handing ownership to the session made the channel invisible to
+     everything else, so a join, a send or a key delivery arriving mid-session found no channel and failed —
+     three symptoms of one cause (the gate hit the join one). Channels now live behind
+     `Arc<tokio::sync::Mutex<ChannelState>>`: the actor is still the only thing that adds or removes them,
+     but a session *guards* a channel for a few milliseconds instead of hiding it, and anything else waits
+     rather than failing. The session takes the guard with `blocking_lock` from its blocking thread.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
