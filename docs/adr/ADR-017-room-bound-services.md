@@ -7,7 +7,8 @@ here)
 **Updated**: 2026-09-21 — decision 6: **the carried session has no IP addresses of its own** (ULA-to-ULA
 on the connecting machine, loopback-to-loopback on the serving one, so no packet anywhere pairs a real
 address with the service's port — and the service sees every Vox client as `127.0.0.1`, which makes its
-own IP-based controls inert and redundant — Vox gates on the client's key and the room, one layer up). **IP-level anonymity is recorded as a non-goal**: an earlier revision of
+own IP-based controls inert and redundant — Vox gates on the client's key and the room, one layer up).
+**IP-level anonymity is recorded as a non-goal**: an earlier revision of
 this ADR specified a relay-mandatory "location-hidden" room, reverted for buying a guarantee Vox does not
 make at the cost of relaying every byte forever. The person-facing address is a **`.vox`
 hostname** and the local entry point is
@@ -72,9 +73,24 @@ The six-step flow's worst step is the sixth: the host must wait for the guest to
 them something. That round trip is what Tor does not have.
 
 A room's genesis may therefore carry a **service grant**: a set of capabilities conferred on *every*
-identity admitted to that room. When a responder admits a new author (ADR-016's join), it issues the
-ordinary ADR-007 admin certificate for those capabilities in the same step. The grant is a normal log
-fact — it converges by sync, every member sees it, and it is revocable per member afterwards.
+identity admitted to that room, **with no certificate issued to anyone**.
+
+An earlier draft of this ADR had the responder issue an ordinary admin certificate at admission. That is
+wrong and is not what was built: the responder to a join is whichever member answered it, who in general
+holds no `delegate` and therefore cannot issue anything — so the flow would work for the room's creator and
+silently fail for every guest who admitted the next guest. Instead the grant is evaluated directly: the
+ADR-007 evaluator reads it from the genesis and confers it on the identities this node has admitted as
+authors. One engine, no new credential, and it converges from the genesis alone — an anchor that is not a
+member reaches the same conclusion with no governance history fetched.
+
+**It is revocable per member, and that part is not optional.** Because no certificate exists, ADR-007's
+admin-delegation-revocation has nothing to name — it points at a delegation's entry hash. So ADR-007 gains
+a `service-grant-exclusion` (`0x0013`) naming the *identity*. Without it, adding a genesis grant would
+*remove* the per-member control the channel already had, since an explicit `vox grant` can always be
+revoked; a capability-bearing room must not be a one-way door. An exclusion suppresses only the
+genesis-conferred capabilities — a certificate issued to the same identity is governed by its own
+revocation, so an admin who excludes a member and then deliberately certifies them again has done exactly
+that.
 
 The authorization basis is exactly the basis on which the joiner became a member at all: they held the
 room passphrase and paid the ADR-005 proof of work. The room's purpose *is* the service, so "may this
@@ -90,6 +106,14 @@ This yields two shapes, and both are wanted:
 The genesis is the right home for the rule: it is immutable, self-validating (its hash is the
 channelID), and every node that holds the room — including an anchor that is not a member — converges
 on it from the genesis alone, with no governance history to fetch first.
+
+Two limits keep it from being a foot-gun. **Only `dial:`/`bind:` may be conferred** (at most 16),
+validated at creation and on decode: a genesis granting `admin`, `delegate`, `policy`,
+`passphrase-rotate` or a `#role` to every member would make membership permanently equal to control of a
+room nothing could govern back. And **"member" is the node's own admitted-author set** — membership is
+emergent with no roster (ADR-007), so it is local state, which is sound because the decision it feeds is
+local too: a host serving its own service consults the keys it verified itself and refuses anyone it has
+not.
 
 ### 4. Two commands, and a `.vox` hostname
 
@@ -127,8 +151,8 @@ tool would have used anyway. The two are the same number by default and need not
 address is a Vox-layer identifier that the serving machine translates to whatever local endpoint it
 chose, so it collides with nothing and binds nothing (decision 5). ADR-013's `TunnelRequest` already
 carries a free-form `service_tag: String`, so the tag of a port-named service is simply its port in
-decimal; this is a UX decision with **no wire change**. `vox serve 22 --at 10.0.0.5:2222` covers the case where the local endpoint is not
-`127.0.0.1:<same port>`, and `vox service add <tag> <endpoint>` remains for the
+decimal; this is a UX decision with **no wire change**. `vox serve 22 --at 10.0.0.5:2222` covers the
+case where the local endpoint is not `127.0.0.1:<same port>`, and `vox service add <tag> <endpoint>` remains for the
 service-in-an-existing-room shape, where a name is more useful than a number.
 
 #### The hostname is the channelID
@@ -411,10 +435,17 @@ Discovery is **convenience, never authorization**. Seeing an advertisement never
 
 Each item is one branch, red→green, with the ADR updated in the same change (house rule).
 
-- **M17.1 — the service grant.** A `service_grant` field in the genesis policy; the responder issues
-  the certificate when it admits an author; the evaluator already handles the rest. Gate: a joiner who
-  never received an explicit grant can dial the room's service, a joiner to a room without a service
-  grant cannot, and revoking one member leaves the others working.
+- **M17.1 — the service grant. *Done 2026-09-21.*** `GenesisBody::service_grant` (beside the policy, not
+  inside it — the policy is what a policy-update may change and this is immutable), validated to
+  `dial:`/`bind:` only; the evaluator confers it on this node's admitted authors
+  (`Evaluator::build_with_members`, fail-closed without them) and honours a new
+  `service-grant-exclusion` (`0x0013`) resolved from its issuer's strict causal past, exactly as an
+  admin-delegation revocation is. `ChannelState::{create_with_grant, exclude_from_service_grant}`.
+  **Gate met:** seven golden vectors (a member with no certificate dials; it confers nothing it did not
+  name and no authority; a non-member is refused; a room without a grant is unchanged; an authorized
+  exclusion removes one member only; an unauthorized one is inert; an explicit certificate survives an
+  exclusion; a genesis cannot confer authority on every member) plus a channel-level test where a joiner
+  dials having received no certificate of any kind, and both the grant and the exclusion survive a reopen.
 - **M17.2 — `vox serve` and `vox connect`.** The two commands, the port-named service, the generated
   passphrase, the unechoed prompt, the refusal-to-start when unreachable with no anchor, and the
   attribution the host needs: `(room, client fingerprint)` surfaced as an event when a tunnel is served,

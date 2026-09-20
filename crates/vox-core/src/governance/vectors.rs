@@ -23,6 +23,7 @@ pub mod harness {
     use crate::governance::genesis::{Genesis, HistoryMode};
     use crate::governance::policy::PolicyUpdate;
     use crate::governance::rotation::PassphraseRotation;
+    use crate::governance::servicegrant::ServiceGrantExclusion;
     use crate::hash::{sha256, Digest32};
     use crate::identity::composite::{CompositePublicKey, RootSigner, SoftwareRootSigner};
     use crate::log::entry::{Entry, EntrySkeleton, ZERO_HASH};
@@ -260,6 +261,25 @@ pub mod harness {
                 author,
                 framed,
                 GovBody::ConsentRevocation(Box::new(r)),
+                preds,
+            )
+        }
+
+        /// Append a service-grant exclusion from `issuer` against `target` (ADR-017).
+        pub fn service_grant_exclusion(
+            &mut self,
+            issuer: &SoftwareRootSigner,
+            channel_id: &Digest32,
+            epoch: u64,
+            target: Digest32,
+        ) -> Digest32 {
+            let x = ServiceGrantExclusion::build(issuer, channel_id, epoch, target).unwrap();
+            let framed = x.to_wire();
+            let preds = self.default_preds(issuer.fingerprint());
+            self.push_entry(
+                issuer,
+                framed,
+                GovBody::ServiceGrantExclusion(Box::new(x)),
                 preds,
             )
         }
@@ -899,6 +919,241 @@ mod golden {
         )
         .unwrap();
         assert!(eval.can_read(&b.fingerprint(), &a.fingerprint()));
+    }
+
+    // ---- Service-grant vectors (ADR-017 decision 3). ----
+
+    fn genesis_with_grant(creator: &SoftwareRootSigner, grant: CapabilitySet) -> Genesis {
+        let policy = ChannelPolicy {
+            history_mode: HistoryMode::ForwardOnly,
+            deniability_mode: DeniabilityMode::Attributable,
+            ttl: 0,
+            min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
+        };
+        Genesis::create_with_nonce_and_grant(creator, 1_000, policy, grant, [0x5A; 16]).unwrap()
+    }
+
+    /// The whole point: a member holding **no certificate at all** dials, because the
+    /// genesis says membership confers it. And the same member holds nothing else.
+    #[test]
+    fn vector_service_grant_confers_dial_on_a_member_with_no_cert() {
+        let creator = root(1, 1);
+        let member = root(2, 2);
+        let grant = CapabilitySet::from_iter_caps([Capability::dial("22")]);
+        let genesis = genesis_with_grant(&creator, grant);
+        let h = LogBuilder::new(&genesis);
+
+        let eval = Evaluator::build_with_members(
+            &genesis,
+            &h.entries(),
+            2_000,
+            key_resolver(vec![&creator, &member]),
+            [creator.fingerprint(), member.fingerprint()]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        assert!(matches!(
+            eval.grants(&member.fingerprint(), &Capability::dial("22")),
+            Verdict::Granted { .. }
+        ));
+        // Membership confers exactly what the genesis named, and nothing adjacent.
+        assert!(matches!(
+            eval.grants(&member.fingerprint(), &Capability::dial("23")),
+            Verdict::Denied(_)
+        ));
+        assert!(matches!(
+            eval.grants(&member.fingerprint(), &Capability::bind("22")),
+            Verdict::Denied(_)
+        ));
+        assert!(
+            !eval.is_admin(&member.fingerprint()),
+            "the grant confers capabilities, never authority"
+        );
+    }
+
+    /// A non-member is refused even though the capability is in the genesis — the
+    /// grant is conferred on *members*, and this node decides who those are.
+    #[test]
+    fn vector_service_grant_denies_a_non_member() {
+        let creator = root(1, 1);
+        let stranger = root(9, 9);
+        let grant = CapabilitySet::from_iter_caps([Capability::dial("22")]);
+        let genesis = genesis_with_grant(&creator, grant);
+        let h = LogBuilder::new(&genesis);
+
+        let eval = Evaluator::build_with_members(
+            &genesis,
+            &h.entries(),
+            2_000,
+            key_resolver(vec![&creator, &stranger]),
+            [creator.fingerprint()].into_iter().collect(),
+        )
+        .unwrap();
+        assert!(matches!(
+            eval.grants(&stranger.fingerprint(), &Capability::dial("22")),
+            Verdict::Denied(DenyReason::NotAdmin)
+        ));
+    }
+
+    /// A room with no service grant is unchanged: membership confers nothing, which is
+    /// how every channel created before the field existed behaves.
+    #[test]
+    fn vector_no_service_grant_means_membership_confers_nothing() {
+        let creator = root(1, 1);
+        let member = root(2, 2);
+        let genesis = genesis_for(&creator);
+        let h = LogBuilder::new(&genesis);
+
+        let eval = Evaluator::build_with_members(
+            &genesis,
+            &h.entries(),
+            2_000,
+            key_resolver(vec![&creator, &member]),
+            [creator.fingerprint(), member.fingerprint()]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        assert!(matches!(
+            eval.grants(&member.fingerprint(), &Capability::dial("22")),
+            Verdict::Denied(DenyReason::NotAdmin)
+        ));
+    }
+
+    /// An authorized exclusion withdraws the grant from one member and leaves the
+    /// others holding it — the per-member control a capability-bearing room must keep.
+    #[test]
+    fn vector_service_grant_exclusion_removes_one_member_only() {
+        let creator = root(1, 1);
+        let out = root(2, 2);
+        let kept = root(3, 3);
+        let grant = CapabilitySet::from_iter_caps([Capability::dial("22")]);
+        let genesis = genesis_with_grant(&creator, grant);
+        let cid = genesis.channel_id();
+
+        let mut h = LogBuilder::new(&genesis);
+        h.service_grant_exclusion(&creator, &cid, 0, out.fingerprint());
+
+        let eval = Evaluator::build_with_members(
+            &genesis,
+            &h.entries(),
+            2_000,
+            key_resolver(vec![&creator, &out, &kept]),
+            [out.fingerprint(), kept.fingerprint()]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                eval.grants(&out.fingerprint(), &Capability::dial("22")),
+                Verdict::Denied(DenyReason::Revoked)
+            ),
+            "a deliberate withdrawal reports as Revoked"
+        );
+        assert!(eval.is_excluded(&out.fingerprint()));
+        assert!(matches!(
+            eval.grants(&kept.fingerprint(), &Capability::dial("22")),
+            Verdict::Granted { .. }
+        ));
+    }
+
+    /// An exclusion from an identity that holds no `delegate` is inert — the same
+    /// authorization test an admin-delegation revocation must pass.
+    #[test]
+    fn vector_unauthorized_service_grant_exclusion_ignored() {
+        let creator = root(1, 1);
+        let nobody = root(4, 4);
+        let target = root(2, 2);
+        let grant = CapabilitySet::from_iter_caps([Capability::dial("22")]);
+        let genesis = genesis_with_grant(&creator, grant);
+        let cid = genesis.channel_id();
+
+        let mut h = LogBuilder::new(&genesis);
+        h.service_grant_exclusion(&nobody, &cid, 0, target.fingerprint());
+
+        let eval = Evaluator::build_with_members(
+            &genesis,
+            &h.entries(),
+            2_000,
+            key_resolver(vec![&creator, &nobody, &target]),
+            [nobody.fingerprint(), target.fingerprint()]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        assert!(!eval.is_excluded(&target.fingerprint()));
+        assert!(matches!(
+            eval.grants(&target.fingerprint(), &Capability::dial("22")),
+            Verdict::Granted { .. }
+        ));
+    }
+
+    /// An exclusion suppresses the *grant*, never a certificate. An admin who excludes
+    /// a member and then deliberately certifies them again has done exactly that.
+    #[test]
+    fn vector_an_explicit_cert_survives_a_service_grant_exclusion() {
+        let creator = root(1, 1);
+        let member = root(2, 2);
+        let grant = CapabilitySet::from_iter_caps([Capability::dial("22")]);
+        let genesis = genesis_with_grant(&creator, grant);
+        let cid = genesis.channel_id();
+
+        let mut h = LogBuilder::new(&genesis);
+        h.service_grant_exclusion(&creator, &cid, 0, member.fingerprint());
+        h.admin_cert(
+            &creator,
+            &cid,
+            0,
+            &member,
+            CapabilitySet::from_iter_caps([Capability::dial("22")]),
+            0,
+        );
+
+        let eval = Evaluator::build_with_members(
+            &genesis,
+            &h.entries(),
+            2_000,
+            key_resolver(vec![&creator, &member]),
+            [member.fingerprint()].into_iter().collect(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                eval.grants(&member.fingerprint(), &Capability::dial("22")),
+                Verdict::Granted { .. }
+            ),
+            "the certificate is governed by its own revocation, not by the exclusion"
+        );
+    }
+
+    /// A genesis may confer only `dial:`/`bind:`. Anything else is refused at creation
+    /// — a room granting `admin` to every member could never be governed back.
+    #[test]
+    fn vector_a_genesis_cannot_confer_authority_on_every_member() {
+        let creator = root(1, 1);
+        let policy = ChannelPolicy {
+            history_mode: HistoryMode::ForwardOnly,
+            deniability_mode: DeniabilityMode::Attributable,
+            ttl: 0,
+            min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
+        };
+        for cap in [
+            Capability::Admin,
+            Capability::Delegate,
+            Capability::Policy,
+            Capability::PassphraseRotate,
+            Capability::Invite,
+            Capability::role("ops"),
+        ] {
+            let grant = CapabilitySet::from_iter_caps([cap.clone()]);
+            assert!(
+                Genesis::create_with_nonce_and_grant(&creator, 1_000, policy, grant, [0x5A; 16])
+                    .is_err(),
+                "a genesis must not confer {cap:?} on every member"
+            );
+        }
     }
 
     // ---- Policy vectors. ----

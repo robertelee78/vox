@@ -66,11 +66,15 @@ pub enum StructTag {
     /// `0x0012` — member prekey-bundle rendezvous record (ADR-016 M14): a
     /// member's root-signed prekey bundle on the rendezvous board.
     MemberBundleRecord = 0x0012,
+    /// `0x0013` — service-grant exclusion (ADR-007/ADR-017): withdraws the genesis
+    /// service grant from one member, which is the only way to take back a
+    /// capability nobody was ever issued a certificate for.
+    ServiceGrantExclusion = 0x0013,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 18] = [
+    pub const ALL: [StructTag; 19] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -89,6 +93,7 @@ impl StructTag {
         StructTag::EskPublication,
         StructTag::SessionEstablishment,
         StructTag::MemberBundleRecord,
+        StructTag::ServiceGrantExclusion,
     ];
 
     /// The 2-byte tag value.
@@ -99,7 +104,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over an 18-element table: trivial and avoids an
+        // Linear scan over a 19-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -118,6 +123,7 @@ impl StructTag {
             StructTag::AdminCert => "vox/admin-cert/v1",
             StructTag::ConsentGrant => "vox/consent-grant/v1",
             StructTag::ConsentRevocation => "vox/consent-revocation/v1",
+            StructTag::ServiceGrantExclusion => "vox/service-grant-exclusion/v1",
             StructTag::PolicyRotation => "vox/policy-rotation/v1",
             StructTag::RendezvousRecord => "vox/rendezvous-record/v1",
             StructTag::PreJoinRecord => "vox/pre-join-record/v1",
@@ -315,10 +321,10 @@ mod tests {
             assert!(d.starts_with("vox/"), "{d}");
             assert!(d.ends_with("/v1"), "{d}");
         }
-        // Registry covers exactly 0x0001..=0x0012.
+        // Registry covers exactly 0x0001..=0x0013.
         assert_eq!(seen.iter().min(), Some(&0x0001));
-        assert_eq!(seen.iter().max(), Some(&0x0012));
-        assert_eq!(seen.len(), 18);
+        assert_eq!(seen.iter().max(), Some(&0x0013));
+        assert_eq!(seen.len(), 19);
     }
 
     #[test]

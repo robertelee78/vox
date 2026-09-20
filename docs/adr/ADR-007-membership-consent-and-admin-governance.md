@@ -2,7 +2,7 @@
 
 **Status**: implemented (M6, `crates/vox-core/src/governance/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-21 — **per-member revocation is live** (M18.1): `vox`'s `revoke` verb rotates the
+**Updated**: 2026-09-21 — the genesis body gains a **service grant** (ADR-017 decision 3: capabilities conferred on every admitted member, no certificate issued to anyone) and a new **`service-grant-exclusion`** (`0x0013`) takes it back per member, which is what keeps a capability-bearing room from being a one-way door. **Per-member consent revocation is live** (M18.1): `vox`'s `revoke` verb rotates the
 sender key, records the `consent-revocation` fact and re-keys the remaining consenters; it needs no
 network, and a release gate proves the revoked member reads nothing afterwards while the others lose
 nothing. 2026-09-20 — the join/consent flow now has a runtime: joiner-side channel state, author admission as a log fact, and consent grants appended and evaluated (`node::channel`, ADR-016 M14.5). 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin"; genesis policy and policy-update carry the ADR-003 `min_suite` floor.
@@ -107,6 +107,9 @@ above, each governance struct has this canonical body (ADR-008 tags in parenthes
   over ADR-004), history_mode_at_grant }` — the SKDM itself travels in the pairwise session, not inline;
   the entry carries only its hash.
 - **consent-revocation** (`0x0005`): `{ target_id(composite fpr), new_chain_id }`.
+- **service-grant-exclusion** (`0x0013`, added 2026-09-21): `{ target_id(composite fpr) }` — withdraws
+  the genesis **service grant** from one member. Issued by a `delegate` holder, authorized from the
+  entry's strict causal past exactly as an admin-delegation-revocation is.
 - **policy-update** (`0x0006`): `{ history_mode?, ttl? }` (never `deniability_mode`).
 
 ### Invite modes (how a joiner's identity is known — no admin "admit" step)
@@ -137,6 +140,40 @@ The passphrase gates the swarm; per-sender consent gates reading. There is no ad
 Because possession of credentials releases no keys, and readability is granted only by each member's
 own consent grant (no admin admission, no central roster), there is no server-controlled member list
 to forge — the Signalgate / Megolm membership-injection class is structurally absent.
+
+### The genesis service grant, and taking it back (ADR-017 decision 3)
+
+The genesis body may carry a **service grant**: a capability set conferred on every identity a node has
+admitted as an author of the channel, **with no certificate issued to anyone**. It exists to delete the
+worst step in offering a room-bound service — the host waiting for a guest to appear and then granting
+them something. The authorization basis is the one on which the joiner became a member at all: they held
+the passphrase and paid the ADR-005 proof of work, and in a room whose purpose *is* the service, "may this
+member dial it" and "is this person a member" are the same question.
+
+Four properties make it safe, and all four are normative:
+
+1. **Only `dial:` and `bind:` may appear**, at most `MAX_SERVICE_GRANT = 16` of them, validated at
+   creation and on decode. A genesis conferring `admin`, `delegate`, `policy`, `passphrase-rotate` or a
+   `#role` on every member would make membership permanently equal to control of the channel, and the
+   genesis is immutable — no later governance could undo it. A `#role` is excluded for the subtler reason
+   that a role is an attribute other certificates attenuate *from*.
+2. **It is genesis-immutable**, being part of the signed body and therefore of the channelID. A chat room
+   cannot silently *become* an access list, and a service room cannot stop being one. The two shapes are
+   different rooms, deliberately.
+3. **"Member" is this node's own admitted-author set.** Membership is emergent and there is no roster
+   (above), so who is a member is necessarily local state — and that is sound because the decision it
+   feeds is local too: a host serving its own service consults the keys it verified itself, and refuses
+   anyone it has not (fail closed). An evaluator built without a member set confers nothing, which is the
+   safe default for any caller that does not know who the members are.
+4. **It is revocable per member, by a `service-grant-exclusion` (`0x0013`).** This is not a convenience.
+   ADR-007's admin-delegation-revocation names *the entry hash of a delegation*, and a genesis grant
+   issues no delegation — so without a fact that names the **identity**, adding a genesis grant would
+   *remove* the per-member control the channel already had, since an explicit certificate can always be
+   revoked. An exclusion suppresses **only** the genesis-conferred capabilities: a certificate issued to
+   the same identity is governed by its own revocation, so an admin who excludes a member and then
+   deliberately certifies them again has done exactly that, and the later explicit act stands. Exclusion
+   is one-way within an epoch (there is no un-exclude entry); a passphrase rotation clears every exclusion
+   along with every certificate, and the room starts again from its genesis.
 
 ### Revocation and epochs
 
@@ -248,7 +285,8 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   everything collapsed to `NotAdmin`, contradicting the "golden vectors can pin the exact reason"
   intent.)*
 - **Genesis policy carries the ciphersuite floor (ADR-003).** The genesis canonical body is
-  `[nonce, created, [history_mode, deniability_mode, ttl, min_suite], creator_pubkey, [sign_algo]]`;
+  `[nonce, created, [history_mode, deniability_mode, ttl, min_suite], [service_grant_token…],
+  creator_pubkey, [sign_algo]]` (`service_grant` added 2026-09-21, ADR-017 decision 3 — see below);
   `min_suite` must name a registered suite (validated at creation and on decode) and, being part of
   the signed body, is bound into the channelID. The policy-update body (`0x0006`, kind 1) is
   `[kind, channelID, epoch, issuer_id, history_present, history_mode?, ttl_present, ttl?,
