@@ -455,13 +455,29 @@ Each item is one branch, red→green, with the ADR updated in the same change (h
   attribution the host needs: `(room, client fingerprint)` surfaced as an event when a tunnel is served,
   since the service's own logs can only ever say `127.0.0.1` (decision 6). Gate: two
   commands, two machines, real bytes — the M16.1 gate re-expressed as the two-command flow.
-- **M17.3 — `vox up`: the `.vox` name and the Vox interface.** Three parts, each independently gateable:
-  (a) the resolver — `b32` channelID ↔ hostname, the room's host read off the log, `AAAA` = the ADR-013
-  ULA, `NXDOMAIN` for a room not held; (b) the interface — device, ULA route, and a userspace TCP
-  termination (`smoltcp`) that turns an inbound SYN into `session::dial(channel, port)`; (c) the
-  per-platform privileged setup, owned by ADR-014. Gate: an **unmodified** client program reaches a real
-  service *by name*, with nothing configured in that program, and a name for a room the client has not
-  joined never reaches a dial.
+- **M17.3 — `vox up`: the `.vox` name and the Vox interface.** Three parts, each independently gateable.
+  - **(a) The resolver. *Done 2026-09-21.*** `node::resolver`: the name decodes to a channelID, the room's
+    **genesis creator** is its host, and the answer is that key's ADR-013 derived address — so the chain is
+    self-certifying with nothing looked up and no advertisement to wait for (the creator is the one fact
+    about a room that is immutable, self-validating and known to every member). A room **without** a
+    genesis service grant is deliberately unnameable: its host is not determined by the genesis, so
+    guessing at the creator would be inventing a fact, and that shape is reached with
+    `vox forward <member>/<tag>`. The responder is a small strict DNS server on loopback only (enforced,
+    not assumed), port 5354 rather than 53 because 53 needs privilege and nothing here may: one question,
+    `IN` only, `AAAA` answered, `A` answered `NOERROR`-with-no-answer (truthful — a Vox address is IPv6 by
+    derivation — and it stops a resolver retrying), compression pointers in a question refused outright.
+    Gate: a real UDP socket answering real queries, a held room resolving to the derived address, a room
+    not joined giving `NXDOMAIN` so `ssh` fails locally without a dial, and a sweep of malformed and
+    hostile datagrams.
+  - **(b) The interface.** Device, ULA route, and userspace TCP termination that turns an inbound SYN into
+    `session::dial(channel, port)`. **Spiked 2026-09-21 and confirmed:** `smoltcp` 0.14 terminates a
+    connection to port 22 on a `fd00::/8` address off an in-process paired device, with no kernel, no
+    `bind()` and no privilege, and the accepting socket exposes both the destination address and the port
+    — which is exactly the `(room, service)` lookup key. So the datapath is gateable without root, by
+    cross-wiring two stacks the way `tests/support/vnet.rs` cross-wires UDP. Gate: an **unmodified** client
+    program reaches a real service *by name*, with nothing configured in that program.
+  - **(c) The per-platform privileged setup**, owned by ADR-014. Real-hardware validation is recorded as
+    pending there, as the UPnP work was.
 - **M17.4 — anchors as configuration.** `<config_dir>/anchors`, written by `vox node`, read by every
   client; `--anchor` still overrides. Gate: a client on the anchor's machine needs no flag.
 - **M17.5 — service advertisements (`0x000F`).** Audience-encrypted, published to the room, surfaced
