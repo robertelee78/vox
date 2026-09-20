@@ -166,7 +166,11 @@ fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Send
         let mut failures = 0;
         loop {
             match net.accept_stream(&conn).await {
-                Ok(Inbound::ServedRendezvous { .. } | Inbound::ServedCoord { .. }) => failures = 0,
+                Ok(
+                    Inbound::ServedRendezvous { .. }
+                    | Inbound::ServedCoord { .. }
+                    | Inbound::ServedCircuit { .. },
+                ) => failures = 0,
                 Ok(inbound) => {
                     failures = 0;
                     let event = NetEvent::Stream {
@@ -749,7 +753,8 @@ impl Node {
                     }
                     Inbound::NotYetSupported { .. }
                     | Inbound::ServedRendezvous { .. }
-                    | Inbound::ServedCoord { .. } => {}
+                    | Inbound::ServedCoord { .. }
+                    | Inbound::ServedCircuit { .. } => {}
                 }
             }
         }

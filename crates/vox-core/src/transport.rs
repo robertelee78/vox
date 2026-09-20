@@ -59,6 +59,7 @@
 pub mod datagram;
 pub mod framing;
 pub mod identity_cert;
+pub mod mux;
 pub mod provider;
 pub mod quic;
 pub mod session;

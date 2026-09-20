@@ -1,7 +1,7 @@
 //! Typed streams (ADR-016 §"Connections, reachability and sync"): every logical
 //! flow on a [`VoxConnection`] opens its own bi-stream and **types it by its first
 //! frame**, so the accepting side can dispatch — `sync`, `join`, `pairwise`,
-//! `rendezvous`, `tunnel`, `coord` — without a side channel. The kind frame is a
+//! `rendezvous`, `tunnel`, `coord`, `circuit` — without a side channel. The kind frame is a
 //! one-element canonical-CBOR array `[kind]`; an unknown kind is refused before
 //! any flow-specific bytes are read.
 
@@ -28,6 +28,8 @@ pub enum StreamKind {
     Tunnel = 5,
     /// Hole-punch coordination (ADR-012 DCUtR) relayed through an anchor.
     Coord = 6,
+    /// A relay circuit (ADR-012 rung 4): QUIC packets carried through a peer.
+    Circuit = 7,
 }
 
 /// The largest kind frame we will read: `[kind]` is 2 bytes; anything bigger is
@@ -45,6 +47,7 @@ impl StreamKind {
             4 => Some(Self::Rendezvous),
             5 => Some(Self::Tunnel),
             6 => Some(Self::Coord),
+            7 => Some(Self::Circuit),
             _ => None,
         }
     }
@@ -109,12 +112,13 @@ mod tests {
             StreamKind::Rendezvous,
             StreamKind::Tunnel,
             StreamKind::Coord,
+            StreamKind::Circuit,
         ] {
             assert_eq!(StreamKind::parse(&k.frame()).unwrap(), k);
             assert_eq!(StreamKind::from_u8(k.as_u8()), Some(k));
         }
         let mut e = Encoder::new();
-        e.array(1).uint(7);
+        e.array(1).uint(8);
         assert!(matches!(
             StreamKind::parse(&e.finish()),
             Err(Error::MalformedBundle("unknown stream kind"))

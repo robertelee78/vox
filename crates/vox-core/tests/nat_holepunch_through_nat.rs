@@ -248,10 +248,14 @@ fn clock() -> vox_core::time::Clock {
     Arc::new(|| NOW)
 }
 
+/// Streams the node's loop hands up to "the actor" — here, the test — as the actor
+/// would receive them: a `sync` stream arrives as `Inbound::Sync`.
+type Handoff = tokio::sync::mpsc::UnboundedSender<(Digest32, quinn::SendStream, quinn::RecvStream)>;
+
 /// Accept connections and serve every stream on them, exactly as the node actor does:
-/// the board and `WHOAMI` are answered inside `accept_stream`, and a relayed punch
-/// session is answered on its own task.
-fn run_node(net: Arc<NodeNet>) {
+/// the board, `WHOAMI` and circuits are handled inside `accept_stream`, a relayed
+/// punch session is answered on its own task, and a `sync` stream is handed up.
+fn run_node(net: Arc<NodeNet>, handoff: Option<Handoff>) {
     let accept = Arc::clone(&net);
     tokio::spawn(async move {
         while let Ok(Some(conn)) = accept
@@ -259,12 +263,16 @@ fn run_node(net: Arc<NodeNet>) {
             .accept(Admission::AcceptAnyAuthenticated)
             .await
         {
-            serve_streams(Arc::clone(&accept), conn);
+            serve_streams(Arc::clone(&accept), conn, handoff.clone());
         }
     });
 }
 
-fn serve_streams(net: Arc<NodeNet>, conn: Arc<vox_core::transport::quic::VoxConnection>) {
+fn serve_streams(
+    net: Arc<NodeNet>,
+    conn: Arc<vox_core::transport::quic::VoxConnection>,
+    handoff: Option<Handoff>,
+) {
     tokio::spawn(async move {
         loop {
             match net.accept_stream(&conn).await {
@@ -275,11 +283,17 @@ fn serve_streams(net: Arc<NodeNet>, conn: Arc<vox_core::transport::quic::VoxConn
                     recv,
                 }) => {
                     let net = Arc::clone(&net);
+                    let handoff = handoff.clone();
                     tokio::spawn(async move {
                         if let Ok(punched) = net.answer_punch(peer, coordinator, send, recv).await {
-                            serve_streams(net, punched);
+                            serve_streams(net, punched, handoff);
                         }
                     });
+                }
+                Ok(Inbound::Sync { peer, send, recv }) => {
+                    if let Some(h) = &handoff {
+                        let _ = h.send((peer, send, recv));
+                    }
                 }
                 Ok(_) => {}
                 Err(_) => break,
@@ -311,15 +325,22 @@ struct Swarm {
     a_private: SocketAddr,
     b_private: SocketAddr,
     ids: HashMap<char, Digest32>,
+    /// The `sync` streams B's node loop handed up.
+    b_inbound:
+        tokio::sync::mpsc::UnboundedReceiver<(Digest32, quinn::SendStream, quinn::RecvStream)>,
 }
 
 async fn swarm(seed: u8) -> Swarm {
+    swarm_behind(seed, NatKind::PortRestrictedCone).await
+}
+
+async fn swarm_behind(seed: u8, nat: NatKind) -> Swarm {
     let net = VirtualNet::new();
     let a_private = addr("10.0.1.2:5000");
     let b_private = addr("10.0.2.2:5000");
     let c_addr = addr("198.51.100.1:443");
-    let a_sock = net.behind_nat(a_private, NatKind::PortRestrictedCone, ip("203.0.113.1"));
-    let b_sock = net.behind_nat(b_private, NatKind::PortRestrictedCone, ip("203.0.113.2"));
+    let a_sock = net.behind_nat(a_private, nat, ip("203.0.113.1"));
+    let b_sock = net.behind_nat(b_private, nat, ip("203.0.113.2"));
     let c_sock = net.public(c_addr);
     let (sa, sb, sc) = (signer(seed), signer(seed + 1), signer(seed + 2));
     let a = Arc::new(NodeNet::new(
@@ -338,9 +359,10 @@ async fn swarm(seed: u8) -> Swarm {
     members(&a, &[b_id, c_id]);
     members(&b, &[a_id, c_id]);
     members(&c, &[a_id, b_id]);
-    run_node(Arc::clone(&a));
-    run_node(Arc::clone(&b));
-    run_node(Arc::clone(&c));
+    let (b_handoff, b_inbound) = tokio::sync::mpsc::unbounded_channel();
+    run_node(Arc::clone(&a), None);
+    run_node(Arc::clone(&b), Some(b_handoff));
+    run_node(Arc::clone(&c), None);
 
     // Both peers reach the coordinator outbound — the one thing a client inside a
     // private network can always do — and serve the streams it opens back.
@@ -349,13 +371,13 @@ async fn swarm(seed: u8) -> Swarm {
         .connect(c_id, &endpoints(c_addr))
         .await
         .expect("A reaches C");
-    serve_streams(Arc::clone(&a), a_to_c);
+    serve_streams(Arc::clone(&a), a_to_c, None);
     let b_to_c = b
         .manager()
         .connect(c_id, &endpoints(c_addr))
         .await
         .expect("B reaches C");
-    serve_streams(Arc::clone(&b), b_to_c);
+    serve_streams(Arc::clone(&b), b_to_c, None);
     // A learns its observed address up front (the actor does this on every connection);
     // B is left to discover it lazily when the punch needs it.
     let a_observed = a.learn_observed(c_id).await.expect("C answers WHOAMI");
@@ -398,6 +420,7 @@ async fn swarm(seed: u8) -> Swarm {
         a_private,
         b_private,
         ids,
+        b_inbound,
     }
 }
 
@@ -477,6 +500,108 @@ fn the_punch_is_what_happens_after_a_direct_dial_fails() {
         assert!(
             s.net.unroutable() > unroutable_before,
             "the direct dial to a private address must have been dropped"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Rung 4: when the punch is defeated, a relay carries the packets.
+// ---------------------------------------------------------------------------
+
+use vox_core::transport::mux::circuit_addr;
+use vox_core::transport::streams::{open_typed, StreamKind};
+
+#[test]
+fn two_nodes_behind_symmetric_nats_reach_each_other_through_a_relay() {
+    rt().block_on(async {
+        // Symmetric NATs on both sides: every earlier rung is defeated — the private
+        // addresses are unroutable, and the address the coordinator observed is not
+        // the one either NAT will map for the other. This is ADR-012's residual case,
+        // the one it keeps a relay of last resort for.
+        let mut s = swarm_behind(40, NatKind::Symmetric).await;
+        let (a_id, b_id) = (s.ids[&'a'], s.ids[&'b']);
+        assert_eq!(s.c.relaying(), 0);
+
+        let conn = tokio::time::timeout(
+            Duration::from_secs(60),
+            s.a.reach(b_id, &EndpointList::default()),
+        )
+        .await
+        .expect("reach did not hang")
+        .expect("A reaches B through the relay after the punch fails");
+
+        // Pinned to and authenticated by B: the relay could not have stood in for it,
+        // because B's identity is what the handshake proved.
+        assert_eq!(conn.peer_id(), b_id);
+        // The path is a circuit, not the wire — and the relay is carrying exactly one.
+        assert_eq!(conn.quinn().remote_address(), circuit_addr(&b_id));
+        assert_eq!(s.c.relaying(), 1, "the relay carries one circuit");
+        assert_eq!(s.a.manager().endpoint().circuit_count(), 1);
+        assert_eq!(s.b.manager().endpoint().circuit_count(), 1);
+        // The connection is filed like any other, so the next reach is free.
+        assert!(s.a.manager().existing(&b_id).is_some());
+
+        // Traffic flows end to end. The relay forwarded every byte of it and could
+        // read none: they are QUIC packets of a connection it is not party to. The
+        // stream is typed `sync` so B's node loop hands it up the way the actor gets
+        // one, and B answers on it.
+        let (mut send, mut recv) = open_typed(&conn, StreamKind::Sync).await.unwrap();
+        let (peer, mut bs, mut br) =
+            tokio::time::timeout(Duration::from_secs(30), s.b_inbound.recv())
+                .await
+                .expect("B's loop handed the stream up")
+                .expect("harness alive");
+        assert_eq!(peer, a_id, "B sees the stream from A, authenticated");
+        let b_conn =
+            s.b.manager()
+                .existing(&a_id)
+                .expect("B holds A's relayed connection");
+        assert_eq!(b_conn.quinn().remote_address(), circuit_addr(&a_id));
+        let b_side = tokio::spawn(async move {
+            let got = br.read_to_end(1 << 20).await.unwrap();
+            bs.write_all(&got).await.unwrap();
+            bs.finish().unwrap();
+            got.len()
+        });
+        // More than one packet's worth, so the circuit carries a real stream, not a
+        // single datagram.
+        let payload = vec![0xA5u8; 64 * 1024];
+        send.write_all(&payload).await.unwrap();
+        send.finish().unwrap();
+        let echoed = tokio::time::timeout(Duration::from_secs(30), recv.read_to_end(1 << 20))
+            .await
+            .expect("echo did not hang")
+            .unwrap();
+        assert_eq!(
+            echoed, payload,
+            "64 KiB round-tripped through the relay intact"
+        );
+        assert_eq!(b_side.await.unwrap(), payload.len());
+    });
+}
+
+#[test]
+fn a_relay_refuses_a_circuit_for_a_peer_it_does_not_know() {
+    rt().block_on(async {
+        let s = swarm_behind(50, NatKind::Symmetric).await;
+        let (b_id, c_id) = (s.ids[&'b'], s.ids[&'c']);
+        // C stops knowing A: A is now an unknown peer to it, and unknown peers get
+        // the board and `WHOAMI` — not a relay's bandwidth.
+        members(&s.c, &[b_id]);
+        let relay = s.a.manager().existing(&c_id).expect("A is connected to C");
+        let refused =
+            tokio::time::timeout(Duration::from_secs(15), s.a.circuit_through(&relay, b_id))
+                .await
+                .expect("did not hang");
+        assert!(
+            refused.is_err(),
+            "C must not carry for a peer it does not know"
+        );
+        assert_eq!(s.c.relaying(), 0);
+        assert_eq!(
+            s.a.manager().endpoint().circuit_count(),
+            0,
+            "nothing attached"
         );
     });
 }

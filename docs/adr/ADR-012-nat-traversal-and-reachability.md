@@ -231,6 +231,50 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     itself is gone (or after 16 consecutive failures, which cannot happen on a usable connection and keeps
     a pathological peer from spinning the task).
 - **Relay data-plane boundary.** M10 expresses relay *hints* (`Multiaddr::Relay`) and the bootstrap/relay node set (`nat::bootstrap`), and can reach a relay node over M9. The actual **byte-forwarding** a relay performs is the tunnel mechanism of ADR-013/M11 (a relay is a special tunnel); this is a layering decision, not a deferral of the rendezvous/signaling work, which is complete here.
+- **Rung 4 is composed: the relay carries QUIC packets, so it is ciphertext-only by construction
+  (2026-09-20, ADR-016 M14.10).** The layering claim above was wrong in one respect worth stating: a
+  relay is *not* an ADR-013 tunnel. A tunnel is a consented, capability-gated data path whose plaintext
+  the two ends share; a relay of last resort must carry a **connection** between two peers that cannot
+  reach each other, and must learn nothing doing it. The mechanism that gives both is to relay the
+  peers' QUIC packets themselves:
+  - **The socket is where paths meet (`transport::mux`).** quinn binds one endpoint to one socket, so
+    every `VoxEndpoint` now runs on a `MuxSocket`: the real socket (or a simulation's abstract one) plus
+    **circuits** — synthetic destination addresses whose datagrams go to, and arrive from, a relay stream
+    instead of the wire. A circuit's address is derived from the far peer's fingerprint into
+    `240.0.0.0/4` (reserved, never routed), always IPv4 because quinn refuses an IPv6 destination on an
+    IPv4 socket and maps an IPv4 one on an IPv6 socket; a datagram for a circuit that no longer exists is
+    dropped here, never handed to the kernel. Above the socket nothing changes: a relayed peer is an
+    address to dial, the handshake and the identity pinning are exactly those of a direct connection,
+    one-connection-per-peer still holds, and every stream kind works over it — join, pairwise, sync,
+    coord, tunnel — which is what makes this a network layer rather than a feature of one application.
+    A circuit's outbound queue is bounded and drops when full: a relay stream that cannot keep up is a
+    slow path, and QUIC on a slow path drops packets, it does not buffer without bound.
+  - **The `circuit` stream (`node::circuitstream`, `StreamKind::Circuit = 7`).** `OPEN <peer>` asks a
+    relay to carry a circuit; the relay opens its own `circuit` stream to the target with
+    `INCOMING <peer>`; on `OPENED` from the target it answers `OPENED` and forwards `DATAGRAM` frames — one
+    QUIC packet each — both ways, one task per direction (`read_frame` is not cancel-safe), until either
+    side is done or the circuit idles for `CIRCUIT_IDLE_TIMEOUT` (5 min; QUIC keeps a live connection
+    ticking well inside it). It forwards nothing but datagrams and never looks inside one. The **stream**
+    is the carrier rather than QUIC DATAGRAM frames on purpose: a QUIC Initial is at least 1200 bytes and
+    the outer connection's datagram limit is not guaranteed to hold one plus a header, whereas a stream
+    carries any size; the price — no inner loss, head-of-line blocking — is the ordinary price of
+    QUIC-over-reliable and acceptable for a last resort. Both ends of a circuit must be peers the relay
+    knows (member, anchor or pending joiner, the rung-3 rule for the rung-3 reasons), and carrying bytes
+    is bounded where carrying signaling was not: `MAX_RELAYED_CIRCUITS = 64` in total,
+    `MAX_CIRCUITS_PER_ASKER = 4`, enforced by a ledger whose places return on drop. A relay is a last
+    resort, not a service.
+  - **The ladder is complete.** `NodeNet::reach` is now all four rungs: live connection → direct dial →
+    a punch through each connected helper → a circuit through each. Every punch is tried before any
+    circuit, because a punch yields a direct path. A failed punch costs one `PER_ATTEMPT_TIMEOUT` (10 s)
+    before the relay is tried; that is the ladder's honest latency for a peer behind a symmetric NAT.
+  - **Proved on the virtual NAT network.** With both peers behind *symmetric* NATs — every earlier rung
+    defeated, which the same file demonstrates — `reach` returns a connection pinned to and authenticated
+    by the far peer, its remote address is the circuit's, the relay reports carrying exactly one
+    circuit and gains no connection of its own, and 64 KiB round-trips over a `sync`-typed stream that
+    the far node's loop hands up as it would any other. A relay refuses a circuit for a peer it does not
+    know, and nothing is left attached when it does. The transport-level premise — a pinned handshake and
+    streams both ways over circuits *alone*, no real socket carrying a byte between the two — is a unit
+    test in `transport::mux`.
 
 - **Known gaps (recorded 2026-09-19).** The rungs exist as independent, tested primitives and nothing
   composes them: `connect_direct`, `map_port` and the DCUtR `Coordinator` have no orchestrator.
@@ -262,6 +306,14 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   two peers it named, which is bounded (it can drop or garble signaling, making the punch fail) but means a
   hostile coordinator can deny a punch it was asked to carry. `BootstrapSet` remains unwired, so the
   coordinators a node can use are whichever peers it happens to be connected to.
+- **Known gaps, after rung 4 (2026-09-20).** The ladder is complete and every rung is proved against a
+  middlebox that behaves like the real one. What remains is around it, not in it: a helper (coordinator or
+  relay) must already be connected to both peers, and is found by trial over current connections —
+  `Multiaddr::Relay` hints in address records are still not consulted, there is no "who can reach X?"
+  query and no DHT; `BootstrapSet` is still unwired, so the helpers a node has are whichever peers it
+  happens to hold. A relayed circuit is torn down by its idle timeout, not the instant the inner
+  connection closes. A hostile helper can deny (never read or alter) what it was asked to carry. IPv6
+  route discovery is Linux-only for the real route, and UPnP-IGD remains a deliberate omission.
 
 ## Links
 **Depends on**: ADR-005, ADR-011.
