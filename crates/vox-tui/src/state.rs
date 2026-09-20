@@ -37,6 +37,12 @@ pub enum PromptKind {
     CreateChannel,
     /// Open a closed channel: `[passphrase]` for `Prompt::target`.
     OpenChannel,
+    /// Join from a `vox://` invite link: `[link, name, passphrase]`.
+    ///
+    /// The link is shown as it is typed because it carries no secret (ADR-016); the
+    /// channel passphrase that follows is masked, because it travels out of band and
+    /// is the one thing the link deliberately does not contain.
+    JoinChannel,
 }
 
 impl PromptKind {
@@ -50,13 +56,24 @@ impl PromptKind {
                 &["channel name", "channel passphrase", "confirm passphrase"]
             }
             PromptKind::OpenChannel => &["channel passphrase"],
+            PromptKind::JoinChannel => &[
+                "invite link (vox://…)",
+                "channel name",
+                "channel passphrase",
+            ],
         }
     }
 
     /// Whether field `i` is secret (masked while typing, zeroized after).
     #[must_use]
     pub fn is_secret(self, i: usize) -> bool {
-        !(self == PromptKind::CreateChannel && i == 0)
+        match self {
+            // A channel's local name is not a secret.
+            PromptKind::CreateChannel => i != 0,
+            // Neither the link nor the local name is; only the passphrase.
+            PromptKind::JoinChannel => i == 2,
+            _ => true,
+        }
     }
 
     /// The prompt's title.
@@ -67,6 +84,7 @@ impl PromptKind {
             PromptKind::CreateIdentity => "Create identity",
             PromptKind::CreateChannel => "Create channel",
             PromptKind::OpenChannel => "Open channel",
+            PromptKind::JoinChannel => "Join channel",
         }
     }
 }
@@ -412,6 +430,22 @@ impl UiState {
                     deniable: false,
                 })
             }
+            PromptKind::JoinChannel => {
+                let link = p.fields[0].trim().to_owned();
+                let name = p.fields[1].trim().to_owned();
+                if link.is_empty() || name.is_empty() {
+                    self.status_message = Some("a link and a channel name are required".into());
+                    let mut again = Prompt::new(PromptKind::JoinChannel, None);
+                    again.fields[0] = Zeroizing::new(link);
+                    self.mode = Mode::Prompt(again);
+                    return Action::Redraw;
+                }
+                Action::Dispatch(Command::Join {
+                    local_name: name,
+                    link,
+                    passphrase: secret(&p.fields[2]),
+                })
+            }
         }
     }
 
@@ -568,15 +602,16 @@ pub enum Parsed {
 /// - `open` / `back` / `focus` / `up` / `down` — navigation
 ///
 /// Channel-scoped verbs require an active channel:
-/// - `send <text…>`, `consent grant|revoke`, `show` / `hide`, `block` / `unblock`,
-///   `verify` (acts on the selected member).
+/// - `send <text…>`, `invite`, `consent grant|revoke`, `show` / `hide`,
+///   `block` / `unblock`, `verify` (acts on the selected member).
 ///
 /// **Create / join / unlock / init are not one-line palette commands.** They require
 /// a passphrase, which ADR-015 mandates be entered through a **masked** prompt and
 /// shared out-of-band — never echoed on the palette line or stored in a status
 /// string. The verbs `init`, `unlock`, `new <name>` therefore *open the prompt*;
-/// the secret is typed there. This is a security-driven exception to "one-line
-/// command", not a chord-only path. Every *non-secret* action is reachable here by
+/// the secret is typed there — and so does `join`, whose prompt takes the `vox://`
+/// link in the clear (it carries no secret) and the passphrase masked. This is a
+/// security-driven exception to "one-line command", not a chord-only path. Every *non-secret* action is reachable here by
 /// a typed command. `close` closes the active channel (wipes its SEK).
 pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed> {
     let line = line.trim();
@@ -597,6 +632,9 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
             ))
         }
         "new" => return Some(Parsed::Prompt(PromptKind::CreateChannel, None)),
+        // Joining needs the channel passphrase, so like `new` it opens the masked
+        // prompt (the link itself is not secret and is typed there in the clear).
+        "join" => return Some(Parsed::Prompt(PromptKind::JoinChannel, None)),
         "open" => return Some(Parsed::Nav(Nav::Open)),
         "back" => return Some(Parsed::Nav(Nav::Back)),
         "focus" => return Some(Parsed::Nav(Nav::FocusNext)),
@@ -612,6 +650,10 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
             text: rest.to_owned(),
         },
         "close" => Command::CloseChannel {
+            channel_id: channel,
+        },
+        // The link is public; it can be produced by a one-line command.
+        "invite" => Command::Invite {
             channel_id: channel,
         },
         "consent" => match rest {
@@ -676,6 +718,7 @@ mod tests {
 
     fn vm_with_channel() -> ViewModel {
         ViewModel {
+            notice: None,
             channels: vec![crate::viewmodel::ChannelSummary {
                 open: true,
                 channel_id: [7; 32],
@@ -867,6 +910,7 @@ mod tests {
 
     fn vm_locked_with_closed_channel() -> ViewModel {
         ViewModel {
+            notice: None,
             channels: vec![crate::viewmodel::ChannelSummary {
                 open: false,
                 channel_id: [9; 32],
@@ -1081,5 +1125,87 @@ mod tests {
             !idle_lock_due(2_000, 1_000),
             "clock going backwards never locks"
         );
+    }
+    #[test]
+    fn the_join_prompt_shows_the_link_and_masks_only_the_passphrase() {
+        // ADR-016: the link carries no secret, so it is typed in the clear; the
+        // passphrase travels out of band and is masked.
+        assert_eq!(PromptKind::JoinChannel.fields().len(), 3);
+        assert!(!PromptKind::JoinChannel.is_secret(0), "the link is public");
+        assert!(!PromptKind::JoinChannel.is_secret(1), "the name is local");
+        assert!(
+            PromptKind::JoinChannel.is_secret(2),
+            "the passphrase is not"
+        );
+        assert_eq!(PromptKind::JoinChannel.title(), "Join channel");
+
+        // `:join` opens the prompt rather than taking a passphrase on the palette.
+        let vm = vm_with_channel();
+        let ui = UiState::default();
+        assert!(matches!(
+            parse_command("join", &ui, &vm),
+            Some(Parsed::Prompt(PromptKind::JoinChannel, None))
+        ));
+
+        // Completing it dispatches the link and the passphrase together.
+        let mut ui = UiState {
+            mode: Mode::Prompt(Prompt::new(PromptKind::JoinChannel, None)),
+            ..UiState::default()
+        };
+        if let Mode::Prompt(p) = &mut ui.mode {
+            p.fields[0] = Zeroizing::new("vox://abc?b=/ip4/10.0.0.1/udp/443".into());
+            p.fields[1] = Zeroizing::new("team".into());
+            p.fields[2] = Zeroizing::new("channel-pp".into());
+        }
+        match ui.submit_prompt() {
+            Action::Dispatch(Command::Join {
+                local_name,
+                link,
+                passphrase,
+            }) => {
+                assert_eq!(local_name, "team");
+                assert_eq!(link, "vox://abc?b=/ip4/10.0.0.1/udp/443");
+                use secrecy::ExposeSecret as _;
+                assert_eq!(passphrase.expose_secret(), "channel-pp");
+            }
+            other => panic!("expected a join dispatch, got {other:?}"),
+        }
+
+        // A missing link or name re-opens the prompt instead of dispatching, keeping
+        // the link that was already typed.
+        let mut ui = UiState {
+            mode: Mode::Prompt(Prompt::new(PromptKind::JoinChannel, None)),
+            ..UiState::default()
+        };
+        if let Mode::Prompt(p) = &mut ui.mode {
+            p.fields[0] = Zeroizing::new("vox://abc?b=/ip4/10.0.0.1/udp/443".into());
+        }
+        assert!(matches!(ui.submit_prompt(), Action::Redraw));
+        match &ui.mode {
+            Mode::Prompt(p) => {
+                assert_eq!(p.kind, PromptKind::JoinChannel);
+                assert_eq!(p.fields[0].as_str(), "vox://abc?b=/ip4/10.0.0.1/udp/443");
+            }
+            other => panic!("expected the prompt to reopen, got {other:?}"),
+        }
+        assert!(ui.status_message.is_some());
+    }
+
+    #[test]
+    fn invite_is_a_one_line_command_because_the_link_is_public() {
+        let vm = vm_with_channel();
+        let ui = UiState {
+            screen: Screen::Channel,
+            selected_channel: 0,
+            ..UiState::default()
+        };
+        let cid = vm.channels[0].channel_id;
+        assert!(matches!(
+            parse_command("invite", &ui, &vm),
+            Some(Parsed::Core(Command::Invite { channel_id })) if channel_id == cid
+        ));
+        // And it needs an open channel, like every channel-scoped verb.
+        let empty = ViewModel::default();
+        assert!(parse_command("invite", &UiState::default(), &empty).is_none());
     }
 }

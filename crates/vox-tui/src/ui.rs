@@ -84,7 +84,7 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &UiState) {
         Screen::Channel => render_channel(frame, chunks[0], vm, ui),
     }
     render_status_bar(frame, chunks[1], vm);
-    render_hint_bar(frame, chunks[2], ui);
+    render_hint_bar(frame, chunks[2], ui, vm);
 
     match ui.mode {
         Mode::CommandPalette(ref buf) => render_palette(frame, area, buf),
@@ -260,18 +260,24 @@ fn render_status_bar(frame: &mut Frame, area: Rect, vm: &ViewModel) {
     frame.render_widget(Paragraph::new(text), area);
 }
 
-fn render_hint_bar(frame: &mut Frame, area: Rect, ui: &UiState) {
-    // A transient status/alert takes precedence over the static keybind hint.
+fn render_hint_bar(frame: &mut Frame, area: Rect, ui: &UiState, vm: &ViewModel) {
+    // A transient status/alert takes precedence over the static keybind hint, and a
+    // core notice (an invite link, a join, a consent) over the hint but not over a
+    // status the user's own last command produced.
     if let Some(msg) = ui.status_message.as_ref() {
         frame.render_widget(Paragraph::new(format!(" {msg}")), area);
         return;
     }
+    if let Some(notice) = vm.notice.as_ref() {
+        frame.render_widget(Paragraph::new(format!(" {notice}")), area);
+        return;
+    }
     let hint = match ui.screen {
         Screen::ChannelList => {
-            " ↑/↓ select · Enter open · :new <name> · :unlock · :lock · Ctrl-C quit"
+            " ↑/↓ select · Enter open · :new <name> · :join · :unlock · :lock · Ctrl-C quit"
         }
         Screen::Channel => {
-            " Tab switch pane · Enter (composer) send · : command · Esc back · Ctrl-C quit"
+            " Tab switch pane · Enter send · :invite · :consent grant · : command · Esc back"
         }
     };
     frame.render_widget(Paragraph::new(hint), area);
@@ -308,6 +314,7 @@ mod tests {
 
     fn channel_vm() -> ViewModel {
         ViewModel {
+            notice: None,
             channels: vec![ChannelSummary {
                 open: true,
                 channel_id: [7; 32],

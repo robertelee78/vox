@@ -164,6 +164,11 @@ pub struct ViewModel {
     pub mlock_active: bool,
     /// Whether the profile has an identity at all (`false` ⇒ onboarding: create one).
     pub has_identity: bool,
+    /// A short, non-secret line the core wants shown: the most recent invite link,
+    /// join, consent or sync notice. Public facts only — never plaintext or key
+    /// material (ADR-015's rule for the status channel), and never free-form text
+    /// derived from a message.
+    pub notice: Option<String>,
 }
 
 /// An ordered core→UI event that must never coalesce (`mpsc`).
@@ -228,6 +233,12 @@ pub enum UiError {
     Storage,
     /// This action needs the network milestone (M14) — not available yet.
     NotAvailableYet,
+    /// The other side refused: the channel passphrase is wrong, or it is not
+    /// accepting joins for that channel. Deliberately coarse — the responder does not
+    /// say which, so neither does this (ADR-005).
+    Refused,
+    /// This client is not networked, or is locked, so it cannot reach anyone.
+    NotNetworked,
     /// An unexpected internal error (never carries detail).
     Internal,
 }
@@ -266,6 +277,8 @@ impl UiError {
             UiError::TooLong => "too long",
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
+            UiError::Refused => "refused — check the channel passphrase",
+            UiError::NotNetworked => "not connected (unlock first)",
             UiError::Internal => "internal error",
         }
     }
@@ -354,14 +367,21 @@ pub enum Command {
         /// Whether authorship is deniable (genesis-immutable; default attributable).
         deniable: bool,
     },
-    /// Join a channel by channelID + passphrase.
+    /// Join a channel from a `vox://` invite link plus the passphrase, which travels
+    /// out of band and is deliberately **not** in the link (ADR-016).
     Join {
         /// The local name to give the joined channel.
         local_name: String,
-        /// The channelID being joined.
-        channel_id: Digest32,
+        /// The `vox://` invite link.
+        link: String,
         /// The channel passphrase (out-of-band; redacted/zeroized).
         passphrase: SecretString,
+    },
+    /// Ask for a `vox://` invite link for a channel this node holds open. The link
+    /// comes back as a notice; it carries no secret.
+    Invite {
+        /// The channel to invite to.
+        channel_id: Digest32,
     },
     /// Send text to a channel.
     SendText {
