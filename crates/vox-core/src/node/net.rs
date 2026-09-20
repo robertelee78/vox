@@ -158,7 +158,7 @@ impl PeerPolicy {
             PeerClass::Member => true,
             PeerClass::Anchor => matches!(
                 kind,
-                StreamKind::Rendezvous | StreamKind::Sync | StreamKind::Coord
+                StreamKind::Rendezvous | StreamKind::Sync | StreamKind::Coord | StreamKind::Circuit
             ),
             PeerClass::PendingJoiner => matches!(
                 kind,
@@ -166,6 +166,7 @@ impl PeerPolicy {
                     | StreamKind::Rendezvous
                     | StreamKind::Pairwise
                     | StreamKind::Coord
+                    | StreamKind::Circuit
             ),
             // An unknown peer reaches the board — and the coord stream, where the only
             // verb open to it is `WHOAMI`, whose answer is its own address (enforced in
@@ -433,14 +434,14 @@ mod tests {
         assert_eq!(p.classify(&joiner), PeerClass::PendingJoiner);
         assert_eq!(p.classify(&stranger), PeerClass::Unknown);
 
-        use StreamKind::{Coord, Join, Pairwise, Rendezvous, Sync, Tunnel};
+        use StreamKind::{Circuit, Coord, Join, Pairwise, Rendezvous, Sync, Tunnel};
         // A member may open anything; the log/consent gates do the real work.
-        for k in [Sync, Join, Pairwise, Rendezvous, Tunnel, Coord] {
+        for k in [Sync, Join, Pairwise, Rendezvous, Tunnel, Coord, Circuit] {
             assert!(PeerPolicy::allows(PeerClass::Member, k));
         }
-        // An anchor stores, syncs and relays signalling — it has no channel
-        // authority, so no join and no pairwise.
-        for k in [Rendezvous, Sync, Coord] {
+        // An anchor stores, syncs, relays signalling and carries circuits — it has no
+        // channel authority, so no join and no pairwise.
+        for k in [Rendezvous, Sync, Coord, Circuit] {
             assert!(PeerPolicy::allows(PeerClass::Anchor, k));
         }
         for k in [Join, Pairwise, Tunnel] {
@@ -449,10 +450,11 @@ mod tests {
         // A pending joiner gets the join stream, the board it must publish its
         // pre-join record to, and `pairwise` — it has to deliver its own sender key
         // the instant the join completes, before the responder has reclassified it.
-        // It also gets `coord`: a joiner behind NAT must learn its own address, and a
-        // member that is itself behind NAT can only be reached by a punch the
-        // coordinator relays (ADR-012 rung 3).
-        for k in [Join, Rendezvous, Pairwise, Coord] {
+        // It also gets `coord` and `circuit`: a joiner behind NAT must learn its own
+        // address, and a member that is itself behind NAT can only be reached by a
+        // punch the coordinator relays or, failing that, a circuit it carries
+        // (ADR-012 rungs 3–4).
+        for k in [Join, Rendezvous, Pairwise, Coord, Circuit] {
             assert!(PeerPolicy::allows(PeerClass::PendingJoiner, k));
         }
         // But no log authority and no tunnels.
@@ -464,7 +466,7 @@ mod tests {
         for k in [Rendezvous, Coord] {
             assert!(PeerPolicy::allows(PeerClass::Unknown, k));
         }
-        for k in [Sync, Join, Pairwise, Tunnel] {
+        for k in [Sync, Join, Pairwise, Tunnel, Circuit] {
             assert!(!PeerPolicy::allows(PeerClass::Unknown, k));
         }
 

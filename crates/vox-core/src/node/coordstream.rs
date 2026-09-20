@@ -339,7 +339,7 @@ where
 /// Whether this node will relay signaling for a peer of `class` — see the module docs
 /// for why a pending joiner counts and an unknown peer does not.
 #[must_use]
-fn relays_for(class: PeerClass) -> bool {
+pub(crate) fn relays_for(class: PeerClass) -> bool {
     matches!(
         class,
         PeerClass::Member | PeerClass::Anchor | PeerClass::PendingJoiner

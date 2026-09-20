@@ -566,6 +566,16 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   has a mapped address to offer. The details and the NAT simulation that proves it are in ADR-012's
   Implementation notes.
 
+- **Rung 4: the relay of last resort, and the ladder is complete (M14.10).** The earlier note on this
+  page said the relay data plane "remains ADR-013's mechanism"; it does not — a relay carries a
+  *connection*, not a consented plaintext path, and the two must not be confused. Every `VoxEndpoint` now
+  runs on a socket multiplexer with **circuits**, and `NodeNet::reach` climbs all four ADR-012 rungs: a
+  peer that a direct dial and a punch cannot reach is dialled through a circuit that a connected member,
+  anchor or pending joiner carries, and the connection that results is the same authenticated
+  `VoxConnection` as any other — so every stream kind this runtime has, and every application above it,
+  works over it unchanged. The relay forwards QUIC packets it cannot read, bounded in number and by
+  idleness. Details and the symmetric-NAT proof are in ADR-012's Implementation notes.
+
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
 ADR-013, ADR-015.

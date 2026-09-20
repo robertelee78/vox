@@ -26,6 +26,7 @@
 pub mod actor;
 pub mod api;
 pub mod channel;
+pub mod circuitstream;
 pub mod content;
 pub mod coordstream;
 pub mod joinstream;

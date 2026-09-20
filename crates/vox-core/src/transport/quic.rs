@@ -39,13 +39,14 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, Endpoint, RecvStream, Runtime, SendStream};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
 use crate::transport::datagram::{parse_datagram, DatagramSender, ReplayWindow, SEQ_PREFIX_LEN};
 use crate::transport::identity_cert::build_leaf_certificate;
+use crate::transport::mux::{CircuitPort, MuxSocket};
 use crate::transport::provider::{client_config, server_config, X25519MLKEM768_CODE_POINT};
 use crate::transport::session::SessionEstablishment;
 use crate::transport::verifier::{VerifiedPeer, VoxClientCertVerifier, VoxServerCertVerifier};
@@ -71,6 +72,9 @@ pub fn close_code(err: WireError) -> quinn::VarInt {
 /// supported-signature-algorithms set the verifiers need.
 pub struct VoxEndpoint {
     endpoint: Endpoint,
+    /// The socket the endpoint runs on: the real one plus relay circuits (ADR-012
+    /// rung 4). Held so circuits can be attached after binding.
+    mux: Arc<MuxSocket>,
     /// The local leaf cert chain + key, re-offered on each dial for mutual auth.
     leaf_chain: Vec<rustls_pki_types::CertificateDer<'static>>,
     leaf_key: rustls_pki_types::PrivateKeyDer<'static>,
@@ -145,7 +149,12 @@ impl VoxEndpoint {
     /// its own verifier output slot), so `bind` itself only stores the local leaf
     /// + the provider's supported-signature algorithms.
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
-        Self::bind_with(signer, |cfg| Endpoint::server(cfg, addr))
+        let socket = std::net::UdpSocket::bind(addr)
+            .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
+        let wrapped = quinn::TokioRuntime
+            .wrap_udp_socket(socket)
+            .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
+        Self::bind_abstract(signer, wrapped)
     }
 
     /// Bind on a caller-supplied datagram socket instead of a real UDP socket.
@@ -159,20 +168,41 @@ impl VoxEndpoint {
         signer: &S,
         socket: Arc<dyn quinn::AsyncUdpSocket>,
     ) -> Result<Self> {
-        Self::bind_with(signer, |cfg| {
+        // Every endpoint runs on the multiplexer, so a relay circuit can be attached
+        // to a real socket and a simulated one alike.
+        let mux = MuxSocket::new(socket);
+        let for_endpoint: Arc<dyn quinn::AsyncUdpSocket> =
+            Arc::clone(&mux) as Arc<dyn quinn::AsyncUdpSocket>;
+        Self::bind_with(signer, mux, |cfg| {
             Endpoint::new_with_abstract_socket(
                 quinn::EndpointConfig::default(),
                 Some(cfg),
-                socket,
+                for_endpoint,
                 Arc::new(quinn::TokioRuntime),
             )
         })
+    }
+
+    /// Attach a relay circuit to `peer` (ADR-012 rung 4): datagrams the endpoint
+    /// sends to [`circuit_addr`](crate::transport::mux::circuit_addr)`(peer)` come out of the returned port, and datagrams
+    /// its inlet is fed arrive from that address. Dialling that address then runs
+    /// the ordinary handshake, pinned to `peer`, over whatever carries the port.
+    #[must_use]
+    pub fn attach_circuit(&self, peer: &Digest32) -> CircuitPort {
+        self.mux.attach(peer)
+    }
+
+    /// How many relay circuits are attached.
+    #[must_use]
+    pub fn circuit_count(&self) -> usize {
+        self.mux.circuit_count()
     }
 
     /// The shared body of the constructors: build this node's leaf credentials and
     /// hand the resulting server config to `make` to produce the endpoint.
     fn bind_with<S: RootSigner>(
         signer: &S,
+        mux: Arc<MuxSocket>,
         make: impl FnOnce(quinn::ServerConfig) -> std::io::Result<Endpoint>,
     ) -> Result<Self> {
         let leaf = build_leaf_certificate(signer)?;
@@ -201,6 +231,7 @@ impl VoxEndpoint {
 
         Ok(Self {
             endpoint,
+            mux,
             leaf_chain,
             leaf_key,
             supported,
