@@ -2,7 +2,7 @@
 
 **Status**: implemented (M1, `crates/vox-core/src/identity/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M1) added; all private-key accessors now return non-`Copy` zeroizing buffers. 2026-09-20 — §2 rotation cadence and retain-previous logic implemented (`node::prekeys`, ADR-016 M14.3); at-rest restore constructors added; that known gap is closed.
+**Updated**: 2026-09-19 — Implementation notes (M1) added; all private-key accessors now return non-`Copy` zeroizing buffers. 2026-09-20 — §2 rotation cadence and retain-previous logic implemented (`node::prekeys`, ADR-016 M14.3); at-rest restore constructors added; that known gap is closed. The prekey ring now uses the identity's own X25519 DH key rather than generating one (M14.7c).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: identity, keys, gpg, ed25519, multi-device, pseudonymity, post-quantum
 
@@ -174,6 +174,14 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   fails to compile if any getter regresses. *(2026-09-19 review: the key-agreement getters predated the
   ADR-010 secret-hygiene audit and returned bare `Copy` arrays; PQXDH re-wrapped them, the ratchet did
   not.)*
+- **The identity DH key comes from the identity, not from the ring (fixed 2026-09-20, M14.7c).** §2 lists
+  the X25519 identity DH key as part of the *identity*, and it is carried in the ADR-002 backup
+  (`x25519_identity_secret`). `PrekeyRing::generate` therefore takes that secret as an input and signs
+  the corresponding public record, rather than generating a fresh DH key of its own: otherwise an identity
+  restored from its backup would advertise a *different* identity DH key than the one every previously
+  published bundle names, and the key would not be an identity-level artifact at all. A test pins that two
+  rings built from the same identity secret advertise the same key, and that the advertised key is the one
+  the secret derives.
 - **Prekey persistence and rotation live one layer up (`node::prekeys`, M14.3).** `keyagreement` owns
   the primitives; the *policy* — the 7-day signed-prekey cadence, retaining the previous prekey exactly
   one cadence, refilling the one-time pool at its low-water mark, and consuming a one-time prekey once —

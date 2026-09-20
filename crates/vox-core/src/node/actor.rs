@@ -241,7 +241,10 @@ impl Node {
             .as_ref()
             .ok_or(crate::error::Error::Profile("no identity in this profile"))?;
         let signer = profile.signer()?;
-        let (ring, _created) = prekeys::load_or_create(profile.store(), signer, now)?;
+        // The ring's identity DH key is the identity's own (ADR-002), taken from the
+        // unlocked vault — never a fresh one, or a restore would change it.
+        let dh_secret = *signer.x25519_identity_secret();
+        let (ring, _created) = prekeys::load_or_create(profile.store(), signer, &dh_secret, now)?;
         self.prekeys = Some(ring);
         Ok(())
     }

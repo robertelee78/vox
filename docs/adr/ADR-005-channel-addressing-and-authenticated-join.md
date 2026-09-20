@@ -2,7 +2,7 @@
 
 **Status**: implemented (M3, `crates/vox-core/src/join/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — KDF error paths (`K_pop`, rendezvous) now surface as errors instead of an all-zero key; `K_pop` returned zeroizing. C++ solver carve-out rejected (Rust only); difficulty defaults, cap and load-adaptation policy added; solver rewritten with a bucket-sorted flat layout — (200,9) measured 1.1 s / 245 MB (was 7.5 s / 1.65 GB), target met. 2026-09-20 — the join exchange now has a transport (`node::joinstream`, ADR-016 M14.4); the state machine's borrowed signer is `Send + Sync` so it can be driven across `await`s.
+**Updated**: 2026-09-19 — KDF error paths (`K_pop`, rendezvous) now surface as errors instead of an all-zero key; `K_pop` returned zeroizing. C++ solver carve-out rejected (Rust only); difficulty defaults, cap and load-adaptation policy added; solver rewritten with a bucket-sorted flat layout — (200,9) measured 1.1 s / 245 MB (was 7.5 s / 1.65 GB), target met. 2026-09-20 — the join exchange now has a transport (`node::joinstream`, ADR-016 M14.4); the state machine's borrowed signer is `Send + Sync` so it can be driven across `await`s; answering a join requires the channel passphrase live, so a node retains it while the channel is open (M14.7c).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: channel, addressing, pake, cpace, rendezvous, join
 
@@ -163,6 +163,16 @@ caps (ADR-012), not by join PoW.
   `base.adapted_for_load(pending_joins)`, so the load-adaptation policy above is applied where the load
   is actually known. A full join runs over loopback QUIC in a test, at reduced and at **production
   (200,9)** parameters (1.95 s in release, including the solve).
+- **Answering a join needs the passphrase live, which is why a node retains it (M14.7c).** CPace derives
+  its generator from the passphrase *per run*, against a fresh `sid`, so there is nothing a responder can
+  precompute and keep instead: to prove it knows the passphrase it must have the passphrase at handshake
+  time. The at-rest SEK is a one-way derivative and cannot stand in. So a node can only answer an inbound
+  join for a channel whose passphrase it holds, and the node therefore keeps it (zeroizing, in memory
+  only, wiped on close/app-lock) for exactly the lifetime of the open channel — the alternative is that
+  nobody can ever join a channel unless its members first enter a special mode. This is a bounded
+  decision, not a relaxation: the channel passphrase is the *group* factor (ADR-010 Implementation notes),
+  every member already holds it, it is scoped to one channel and epoch, and it sits beside the SEK it
+  derives, which an attacker able to read that memory would find strictly more valuable.
 - **Proof-of-possession confidentiality.** The identity PoP exchanged inside the CPace-protected
   session is AEAD-sealed (AES-256-GCM) under a key derived from the CPace ISK,
   `K_pop = HKDF-SHA-256(ISK, info="vox/cpace-pop/v1")`, so the identity public keys and signature are

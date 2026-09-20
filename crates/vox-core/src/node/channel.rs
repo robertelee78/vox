@@ -37,7 +37,7 @@
 
 use std::collections::BTreeMap;
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::atrest::idfactor::SignatureIdentityFactor;
 use crate::atrest::sek::{Argon2Profile, Sek};
@@ -92,6 +92,22 @@ pub const MAX_RECEIVER_CHAINS: usize = 4096;
 pub const MAX_AUTHORS: usize = 1024;
 /// Cap on a local channel name.
 pub const MAX_LOCAL_NAME_LEN: usize = 128;
+
+/// The ADR-005 join binding parameters for a channel, derived from its **genesis**
+/// — which is what a joiner has (from the board) before it has any channel state at
+/// all. Both ends derive these identically or CPace simply fails to agree.
+pub fn join_context_from_genesis(
+    genesis: &Genesis,
+    epoch: u64,
+) -> Result<crate::join::session::JoinContext> {
+    let floor = genesis.body.policy.suite_floor()?;
+    crate::join::session::JoinContext::new(
+        genesis.channel_id(),
+        epoch,
+        crate::suite::VOX_SUITE_1.id,
+        floor,
+    )
+}
 
 /// Map an ADR-008 coded sync failure onto the error taxonomy, keeping the reason
 /// (the ADR's rule is that a failure is never silently downgraded).
@@ -196,6 +212,20 @@ pub struct ChannelState {
     /// (M14.5b). Present only for authors that consented; its presence is what
     /// makes their content readable.
     receivers: BTreeMap<(Digest32, u64), ReceiverChain>,
+    /// The channel passphrase, retained **in memory only** for as long as the
+    /// channel is open (M14.7c).
+    ///
+    /// ADR-005's CPace needs the passphrase live at each join handshake, so a node
+    /// can only answer an inbound join while it holds one; the alternative is that
+    /// nobody can ever join a channel unless its members are in a special mode.
+    /// Retaining it is a deliberate, bounded decision (recorded in ADR-016): it is a
+    /// **group** secret every member already holds, scoped to one channel and one
+    /// epoch, and it sits beside the SEK it derives — an attacker who can read this
+    /// memory already has the SEK and the decrypted timeline, which are strictly
+    /// more valuable. It is wiped by [`ChannelState::lock_now`] with the SEK, never
+    /// written to disk, and never crosses the client boundary (no view, event or
+    /// `Debug` output carries it).
+    passphrase: Zeroizing<Vec<u8>>,
     poisoned: bool,
 }
 
@@ -478,6 +508,7 @@ impl ChannelState {
             channel_id,
             genesis,
             local_name: local_name.to_owned(),
+            passphrase: Zeroizing::new(channel_passphrase.to_vec()),
             created: now_secs,
             epoch,
             sek,
@@ -606,6 +637,7 @@ impl ChannelState {
             channel_id: *channel_id,
             genesis,
             local_name,
+            passphrase: Zeroizing::new(channel_passphrase.to_vec()),
             created,
             epoch,
             sek,
@@ -746,6 +778,7 @@ impl ChannelState {
             channel_id: *channel_id,
             genesis: genesis.clone(),
             local_name: local_name.to_owned(),
+            passphrase: Zeroizing::new(channel_passphrase.to_vec()),
             created: now_secs,
             epoch,
             sek,
@@ -1531,6 +1564,38 @@ impl ChannelState {
     /// afterwards; any further seal/open fails with [`Error::AtRestLocked`].
     pub fn lock_now(&mut self) {
         self.sek.lock_now();
+        // Wipe the retained passphrase with the SEK: after an app-lock this channel
+        // can neither unseal nor answer a join until it is reopened (ADR-010/015).
+        self.passphrase.zeroize();
+        self.passphrase = Zeroizing::new(Vec::new());
+    }
+
+    /// The retained channel passphrase, for answering an ADR-005 join (the only
+    /// thing that needs it). Fails once the channel has been app-locked.
+    ///
+    /// Stays crate-internal: it is a secret, and the only legitimate consumer is the
+    /// node's own join-responder path.
+    pub(crate) fn join_passphrase(&self) -> Result<&[u8]> {
+        if self.passphrase.is_empty() {
+            return Err(Error::AtRestLocked);
+        }
+        Ok(self.passphrase.as_slice())
+    }
+
+    /// The ADR-005 binding parameters for a join in this channel: its channelID,
+    /// current epoch, the negotiated suite, and the genesis policy's floor.
+    ///
+    /// Both ends must derive identical values or CPace simply fails to agree, so
+    /// deriving them from the shared genesis (rather than passing them around) is
+    /// what keeps the two sides honest.
+    pub fn join_context(&self) -> Result<crate::join::session::JoinContext> {
+        join_context_from_genesis(&self.genesis, self.epoch)
+    }
+
+    /// Whether this channel can currently answer an inbound join.
+    #[must_use]
+    pub fn can_answer_join(&self) -> bool {
+        !self.passphrase.is_empty()
     }
 }
 
@@ -1717,6 +1782,38 @@ mod tests {
             0,
             "a rejected message must not advance anything"
         );
+    }
+
+    #[test]
+    fn the_retained_passphrase_lives_exactly_as_long_as_the_open_channel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prof = profile(&tmp, "alice");
+        let t = 1_700_000_000;
+        let mut ch = ChannelState::create_with_profile(
+            &prof,
+            "team",
+            b"channel-pp",
+            t,
+            Argon2Profile::REDUCED,
+        )
+        .unwrap();
+        // Held while open, so this channel can answer a join (ADR-005 CPace needs it
+        // live at handshake time).
+        assert!(ch.can_answer_join());
+        assert_eq!(ch.join_passphrase().unwrap(), b"channel-pp");
+        // It never reaches the client boundary: not in Debug output.
+        let shown = format!("{ch:?}");
+        assert!(!shown.contains("channel-pp"), "{shown}");
+
+        // App-lock wipes it with the SEK: no join can be answered until reopen.
+        ch.lock_now();
+        assert!(!ch.can_answer_join());
+        assert!(matches!(ch.join_passphrase(), Err(Error::AtRestLocked)));
+
+        // Reopening restores it (the user supplied it again to unwrap the SEK).
+        let ch = ChannelState::open(&prof, &ch.channel_id(), b"channel-pp", t).unwrap();
+        assert!(ch.can_answer_join());
+        assert_eq!(ch.join_passphrase().unwrap(), b"channel-pp");
     }
 
     #[test]
