@@ -149,6 +149,12 @@ pub struct NodeConfig {
     /// and stores ciphertext. The absence of secrets is structural: every path that
     /// needs a profile finds none.
     pub headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
+    /// Keep a **ciphertext copy of the log** for every channel whose genesis lands on
+    /// this node's board (ADR-016 M15.2b, `node::anchor`): the store-and-forward that
+    /// lets members who are never online together converge. A role, not a secret:
+    /// the copy holds nothing this node could read. `vox node` turns it on; a client
+    /// leaves it off, so a stranger's genesis on its board costs it nothing.
+    pub anchor_logs: bool,
 }
 
 impl std::fmt::Debug for NodeConfig {
@@ -179,7 +185,15 @@ impl NodeConfig {
             pow_params: None,
             anchors: BootstrapSet::new(),
             headless: None,
+            anchor_logs: false,
         }
+    }
+
+    /// Keep a ciphertext copy of every anchored channel's log.
+    #[must_use]
+    pub fn anchor_logs(mut self, on: bool) -> Self {
+        self.anchor_logs = on;
+        self
     }
 
     /// Run headless as this identity: no vault, no unlock, networked from spawn.
@@ -216,6 +230,16 @@ impl NodeConfig {
         self.anchors = anchors;
         self
     }
+}
+
+/// How often a node checks that its anchors are still connected, and redials the
+/// ones that are not.
+const ANCHOR_REDIAL_SECS: u64 = 30;
+
+/// What a sync session runs against: a member's channel, or an anchor's copy.
+enum SessionTarget {
+    Channel(SharedChannel),
+    Anchored(Arc<tokio::sync::Mutex<crate::node::anchor::AnchorState>>),
 }
 
 /// Work the network produced that only the actor can handle, because it needs
@@ -423,6 +447,14 @@ pub struct Node {
     bind: Option<Bind>,
     /// The headless transport identity, if this node runs without a vault.
     headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
+    /// Whether this node keeps a ciphertext copy of every anchored channel's log.
+    anchor_logs: bool,
+    /// The store a headless node keeps its anchored logs in (a profile node uses its
+    /// profile's store).
+    anchor_store: Option<Arc<crate::node::store::Store>>,
+    /// The anchored channels' logs, by channelID (ADR-016 M15.2b). A channel is never
+    /// both here and in `channels`: a member holds the real thing.
+    anchored: BTreeMap<Digest32, Arc<tokio::sync::Mutex<crate::node::anchor::AnchorState>>>,
     /// The anchors this node is configured with (ADR-012 §"Bootstrap", ADR-016
     /// M15.1): dialled when the network starts, given the `Anchor` class, published
     /// to, and named in every invite link.
@@ -442,6 +474,8 @@ pub struct Node {
     /// The gateway port mapping in force, if one was granted. Held so it can be
     /// renewed before its lifetime elapses (RFC 6886/6887 put renewal on the client).
     port_mappings: Vec<crate::nat::portmap::PortMapping>,
+    /// When the anchors are next checked for a dropped connection (unix seconds).
+    redial_anchors_at: u64,
     /// When the granted mappings must be renewed (unix seconds), or `None` when there
     /// is nothing to renew. A mapping a gateway grants for two hours outlives no
     /// long-running node by itself: it is re-requested at half its lifetime, the
@@ -534,6 +568,7 @@ impl Node {
             pow_params,
             anchors,
             headless,
+            anchor_logs,
         } = cfg;
         let profile = if Profile::exists(&paths) {
             Some(Profile::open(paths.clone())?)
@@ -552,9 +587,13 @@ impl Node {
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             anchors,
             headless,
+            anchor_logs,
+            anchor_store: None,
+            anchored: BTreeMap::new(),
             pow_params,
             stream_loops: std::collections::BTreeSet::new(),
             port_mappings: Vec::new(),
+            redial_anchors_at: 0,
             renew_mappings_at: None,
             schedules: BTreeMap::new(),
             pending_push: std::collections::BTreeSet::new(),
@@ -571,7 +610,13 @@ impl Node {
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
         if node.headless.is_some() {
+            if node.anchor_logs {
+                node.anchor_store = Some(Arc::new(crate::node::store::Store::open(
+                    &node.paths.store_file(),
+                )?));
+            }
             node.start_network()?;
+            node.reopen_anchored()?;
         }
         node.publish_initial();
         tokio::spawn(node.run(cmd_rx, net_rx));
@@ -617,6 +662,8 @@ impl Node {
                         net.manager().retire_expired();
                     }
                     self.renew_mappings_if_due();
+                    self.adopt_anchored_from_board().await;
+                    self.redial_anchors_if_due();
                     if self.run_due_syncs().await {
                         self.publish().await;
                     }
@@ -857,6 +904,147 @@ impl Node {
         client.finish();
     }
 
+    /// The store anchored logs and channels live in: the profile's, or the headless
+    /// node's own.
+    fn log_store(&self) -> Option<Arc<crate::node::store::Store>> {
+        self.profile
+            .as_ref()
+            .map(Profile::store_handle)
+            .or_else(|| self.anchor_store.as_ref().map(Arc::clone))
+    }
+
+    /// The sealing key for the anchor's copy of `channel_id`: derived from whichever
+    /// identity this node networks as.
+    fn anchor_sek(&self, channel_id: &Digest32) -> Option<crate::atrest::sek::Sek> {
+        if let Some(signer) = self.headless.as_ref() {
+            return crate::node::anchor::anchor_sek(&**signer, channel_id).ok();
+        }
+        let profile = self.profile.as_ref()?;
+        let signer = profile.signer().ok()?;
+        crate::node::anchor::anchor_sek(signer, channel_id).ok()
+    }
+
+    /// Start keeping a log for `channel_id` if this node anchors logs, its board holds
+    /// the genesis, and it is neither a member of the channel nor already keeping it.
+    /// Reopens a copy the store already has (a restart), else creates one.
+    async fn adopt_anchored(&mut self, channel_id: &Digest32) {
+        if !self.anchor_logs
+            || self.channels.contains_key(channel_id)
+            || self.anchored.contains_key(channel_id)
+        {
+            return;
+        }
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let Some(genesis) = net.board_genesis(channel_id) else {
+            return;
+        };
+        let (Some(store), Some(sek)) = (self.log_store(), self.anchor_sek(channel_id)) else {
+            return;
+        };
+        let now = self.now();
+        let opened =
+            crate::node::anchor::AnchorState::open(&store, sek, channel_id, now).or_else(|_| {
+                let sek = self
+                    .anchor_sek(channel_id)
+                    .ok_or(Error::Profile("no anchor key"))?;
+                crate::node::anchor::AnchorState::create(&store, sek, &genesis, now)
+            });
+        if let Ok(state) = opened {
+            self.anchored
+                .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(state)));
+            self.refresh_anchored_authors(channel_id).await;
+            self.refresh_network_view().await;
+        }
+    }
+
+    /// Adopt every channel the board holds a genesis for (the tick's pass).
+    async fn adopt_anchored_from_board(&mut self) {
+        if !self.anchor_logs {
+            return;
+        }
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let ids: Vec<Digest32> = net
+            .anchored_channels()
+            .into_iter()
+            .map(|a| a.channel_id)
+            .filter(|cid| !self.channels.contains_key(cid) && !self.anchored.contains_key(cid))
+            .collect();
+        for cid in ids {
+            self.adopt_anchored(&cid).await;
+        }
+    }
+
+    /// Admit into an anchored channel every author its board knows (the creator, and
+    /// everyone a member vouched for), so their entries verify.
+    async fn refresh_anchored_authors(&mut self, channel_id: &Digest32) {
+        let (Some(net), Some(state), Some(store)) = (
+            self.net.as_ref().map(Arc::clone),
+            self.anchored.get(channel_id).map(Arc::clone),
+            self.log_store(),
+        ) else {
+            return;
+        };
+        let keys = net.board_member_keys(channel_id, 0);
+        let added = state.lock().await.admit_authors(&store, keys).unwrap_or(0);
+        if added > 0 {
+            self.refresh_network_view().await;
+        }
+    }
+
+    /// After a restart, reopen every anchored channel the store holds and put its
+    /// genesis back on the board, so members find the room where they left it.
+    fn reopen_anchored(&mut self) -> crate::error::Result<()> {
+        if !self.anchor_logs {
+            return Ok(());
+        }
+        let (Some(store), Some(net)) = (self.log_store(), self.net.as_ref().map(Arc::clone)) else {
+            return Ok(());
+        };
+        let now = self.now();
+        for cid in store.anchored_channels()? {
+            let Some(sek) = self.anchor_sek(&cid) else {
+                continue;
+            };
+            if let Ok(state) = crate::node::anchor::AnchorState::open(&store, sek, &cid, now) {
+                let _ = net.publish_local(&state.genesis().to_wire());
+                self.anchored
+                    .insert(cid, Arc::new(tokio::sync::Mutex::new(state)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Dial any configured or learned anchor this node is not connected to. Runs on
+    /// the tick, throttled: an anchor that restarted, or a link that dropped, is
+    /// re-established without anyone noticing.
+    fn redial_anchors_if_due(&mut self) {
+        let now = self.now();
+        if now < self.redial_anchors_at {
+            return;
+        }
+        self.redial_anchors_at = now + ANCHOR_REDIAL_SECS;
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let known: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
+        for anchor in known {
+            if anchor.id == net.local_id() || net.manager().existing(&anchor.id).is_some() {
+                continue;
+            }
+            let net = Arc::clone(&net);
+            let tx = self.net_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(conn) = net.manager().connect(anchor.id, &anchor.endpoints).await {
+                    let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                }
+            });
+        }
+    }
+
     /// Make a channel's anchors this node's: record `more` on the channel (persisted
     /// under its SEK) and the configured set with it, treat every one as an anchor,
     /// and dial any not yet connected. Called when a channel is created, opened or
@@ -961,6 +1149,19 @@ impl Node {
                 .collect();
             policy.add_members(members.keys().copied());
             net.membership().set_channel(*cid, ch.epoch(), members);
+        }
+        // An anchored channel's known authors are its members as far as this node's
+        // board and streams are concerned (M15.2b): their records verify, and they may
+        // open what a member may.
+        for (cid, state) in &self.anchored {
+            let st = state.lock().await;
+            let members: BTreeMap<Digest32, CompositePublicKey> = st
+                .author_keys()
+                .into_iter()
+                .map(|k| (k.fingerprint(), k))
+                .collect();
+            policy.add_members(members.keys().copied());
+            net.membership().set_channel(*cid, st.epoch(), members);
         }
         // Anchors are not channel membership: they are carried in by hand.
         for anchor in &self.anchor_ids {
@@ -1639,11 +1840,25 @@ impl Node {
             // channels that changed; a connect or interval pass covers every channel
             // shared with this peer.
             let mut channels: Vec<Digest32> = Vec::new();
+            // A member reconciles a channel with its co-authors — and with its
+            // anchors, which keep the log for whoever is away (M15.2b).
+            let peer_is_anchor = self.anchor_ids.contains(&peer);
+
             for (cid, shared) in &self.channels {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
                     continue;
                 }
-                if shared.lock().await.is_author(&peer) {
+                if peer_is_anchor || shared.lock().await.is_author(&peer) {
+                    channels.push(*cid);
+                }
+            }
+            // An anchor reconciles every channel it keeps with each of that channel's
+            // known members.
+            for (cid, state) in &self.anchored {
+                if trigger == SyncTrigger::LocalAppend {
+                    continue;
+                }
+                if state.lock().await.is_author(&peer) {
                     channels.push(*cid);
                 }
             }
@@ -1745,10 +1960,18 @@ impl Node {
         }
         // Learn who else has joined before reconciling, or the first entry from a
         // newer member kills the session (ADR-008 Implementation notes).
-        self.learn_members(channel_id, peer).await;
-        let epoch = match self.channels.get(channel_id) {
-            Some(shared) => shared.lock().await.epoch(),
-            None => return false,
+        let epoch = if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
+            self.learn_members(channel_id, peer).await;
+            shared.lock().await.epoch()
+        } else if self.anchored.contains_key(channel_id) {
+            // The anchor's authors come from its board, not from a peer's.
+            self.refresh_anchored_authors(channel_id).await;
+            match self.anchored.get(channel_id) {
+                Some(state) => state.lock().await.epoch(),
+                None => return false,
+            }
+        } else {
+            return false;
         };
         let Some(conn) = net.manager().existing(&peer) else {
             return false;
@@ -1770,11 +1993,16 @@ impl Node {
         channel_id: Digest32,
         transport: crate::transport::quic::QuicStreamTransport,
     ) {
-        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+        let Some(store) = self.log_store() else {
             return;
         };
-        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
-            return;
+        let target = match (
+            self.channels.get(&channel_id).map(Arc::clone),
+            self.anchored.get(&channel_id).map(Arc::clone),
+        ) {
+            (Some(shared), _) => SessionTarget::Channel(shared),
+            (None, Some(state)) => SessionTarget::Anchored(state),
+            (None, None) => return,
         };
         let now = self.now();
         let tx = self.net_tx.clone();
@@ -1783,9 +2011,15 @@ impl Node {
                 // `blocking_lock` is the sanctioned way to take a tokio mutex off a
                 // blocking thread. Anything else wanting this channel waits for the
                 // session — a few milliseconds — instead of finding it missing.
-                let mut channel = shared.blocking_lock();
                 let mut t = transport;
-                channel.sync_over(&store, &mut t, now)
+                match target {
+                    SessionTarget::Channel(shared) => {
+                        shared.blocking_lock().sync_over(&store, &mut t, now)
+                    }
+                    SessionTarget::Anchored(state) => {
+                        state.blocking_lock().sync_over(&store, &mut t, now)
+                    }
+                }
             })
             .await;
             if let Ok(outcome) = joined {
@@ -1832,11 +2066,22 @@ impl Node {
         let Ok((channel_id, epoch)) = read_sync_request(&mut recv).await else {
             return;
         };
-        // Only a channel we hold open at that epoch can be reconciled.
-        let matches_epoch = match self.channels.get(&channel_id) {
-            Some(shared) => shared.lock().await.epoch() == epoch,
-            None => false,
+        // Only a channel we hold open at that epoch — or keep as an anchor — can be
+        // reconciled. An anchor whose board just received the genesis adopts it here
+        // rather than making the member wait for the next tick.
+        if !self.channels.contains_key(&channel_id) {
+            self.adopt_anchored(&channel_id).await;
+            self.refresh_anchored_authors(&channel_id).await;
+        }
+        let matches_epoch = match (
+            self.channels.get(&channel_id),
+            self.anchored.get(&channel_id),
+        ) {
+            (Some(shared), _) => shared.lock().await.epoch() == epoch,
+            (None, Some(state)) => state.lock().await.epoch() == epoch,
+            (None, None) => false,
         };
+
         if !matches_epoch {
             return;
         }
@@ -2087,6 +2332,16 @@ impl Node {
             .as_ref()
             .and_then(|p| p.store().channels().ok())
             .unwrap_or_default();
+        let mut anchoring = self
+            .net
+            .as_ref()
+            .map(|n| n.anchored_channels())
+            .unwrap_or_default();
+        for a in &mut anchoring {
+            if let Some(state) = self.anchored.get(&a.channel_id) {
+                a.entries = Some(state.lock().await.entries() as u64);
+            }
+        }
         let mut channels = Vec::with_capacity(known.len());
         for id in &known {
             channels.push(match self.channels.get(id) {
@@ -2127,11 +2382,7 @@ impl Node {
             listening,
             channels,
             open_channels,
-            anchoring: self
-                .net
-                .as_ref()
-                .map(|n| n.anchored_channels())
-                .unwrap_or_default(),
+            anchoring,
         }
     }
 }
@@ -2231,11 +2482,15 @@ mod tests {
             // covered by `node::network` and the M14 gate).
             bind: None,
             headless: None,
+            anchor_logs: false,
+            anchor_store: None,
+            anchored: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             anchor_ids: std::collections::BTreeSet::new(),
             pow_params: None,
             stream_loops: std::collections::BTreeSet::new(),
             port_mappings: Vec::new(),
+            redial_anchors_at: 0,
             renew_mappings_at: None,
             schedules: BTreeMap::new(),
             pending_push: std::collections::BTreeSet::new(),

@@ -788,9 +788,40 @@ impl NodeNet {
                     channel_id,
                     members: members.len(),
                     pending: guard.current_prejoins(&channel_id, now).len(),
+                    entries: None,
                 }
             })
             .collect()
+    }
+
+    /// The genesis this node's board holds for `channel_id`, if any.
+    #[must_use]
+    pub fn board_genesis(&self, channel_id: &Digest32) -> Option<Genesis> {
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.genesis(channel_id).cloned()
+    }
+
+    /// Every member key this node's board can vouch for in `(channel, epoch)`: the
+    /// creator's from the genesis, and every author with a live bundle record (which
+    /// carries its key, and was admitted only through a member).
+    #[must_use]
+    pub fn board_member_keys(&self, channel_id: &Digest32, epoch: u64) -> Vec<CompositePublicKey> {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut out: Vec<CompositePublicKey> = Vec::new();
+        if let Some(g) = guard.genesis(channel_id) {
+            out.push(g.body.creator_pubkey.clone());
+        }
+        for r in guard.current_bundles(channel_id, epoch, now) {
+            if let Ok(key) = CompositePublicKey::from_bytes(&r.prekey_bundle.root_pub) {
+                if !out.iter().any(|k| k.fingerprint() == key.fingerprint()) {
+                    out.push(key);
+                }
+            }
+        }
+        out
     }
 
     /// Every *other* member's live records this node's board holds for `(channel,

@@ -119,7 +119,7 @@ pub fn join_context_from_genesis(
 
 /// Map an ADR-008 coded sync failure onto the error taxonomy, keeping the reason
 /// (the ADR's rule is that a failure is never silently downgraded).
-fn sync_failure(code: crate::wire::WireError) -> Error {
+pub(crate) fn sync_failure(code: crate::wire::WireError) -> Error {
     Error::MalformedGovernance(match code {
         crate::wire::WireError::ProtocolVersionUnsupported => "sync failed: protocol version",
         crate::wire::WireError::SuiteBelowFloor => "sync failed: suite below floor",
@@ -138,6 +138,14 @@ fn sync_failure(code: crate::wire::WireError) -> Error {
 /// received via sync got the content fork remedy).
 pub struct ChannelAuthors {
     authors: BTreeMap<Digest32, CompositePublicKey>,
+}
+
+impl ChannelAuthors {
+    /// A resolver over exactly these authors.
+    #[must_use]
+    pub fn new(authors: BTreeMap<Digest32, CompositePublicKey>) -> Self {
+        Self { authors }
+    }
 }
 
 impl AuthorResolver for ChannelAuthors {
@@ -287,7 +295,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
 
 /// The admitted-authors segment: `[version, [[fingerprint, composite_pubkey], …]]`
 /// in fingerprint order (a `BTreeMap`, so the bytes are canonical).
-fn authors_bytes(authors: &BTreeMap<Digest32, CompositePublicKey>) -> Vec<u8> {
+pub(crate) fn authors_bytes(authors: &BTreeMap<Digest32, CompositePublicKey>) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(2).uint(AUTHORS_VERSION).array(authors.len());
     for (fp, key) in authors {
@@ -296,7 +304,7 @@ fn authors_bytes(authors: &BTreeMap<Digest32, CompositePublicKey>) -> Vec<u8> {
     e.finish()
 }
 
-fn parse_authors(bytes: &[u8]) -> Result<BTreeMap<Digest32, CompositePublicKey>> {
+pub(crate) fn parse_authors(bytes: &[u8]) -> Result<BTreeMap<Digest32, CompositePublicKey>> {
     let mut d = Decoder::new(bytes);
     if d.array()? != 2 {
         return Err(Error::MalformedAtRest("channel authors arity"));
@@ -373,7 +381,7 @@ fn parse_receivers(bytes: &[u8]) -> Result<BTreeMap<(Digest32, u64), ReceiverCha
 /// is a struct-tagged ADR-008 frame, while a sender-key message is domain-prefixed
 /// with `vox/group-msg/v1`. Anything else is neither, and is refused rather than
 /// optimistically treated as content.
-fn classify_payload(payload: &[u8]) -> Result<EntryKind> {
+pub(crate) fn classify_payload(payload: &[u8]) -> Result<EntryKind> {
     if payload.starts_with(GROUP_MSG_SIGN_DOMAIN.as_bytes()) {
         return Ok(EntryKind::Content);
     }

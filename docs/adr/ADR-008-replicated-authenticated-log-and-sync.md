@@ -279,6 +279,17 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   Test-vector obligation: only the log-entry skeleton is byte-pinned; there is no golden canonical-CBOR
   suite for tags `0x0001–0x0012` and no frontier/Negentropy interop bytes against a reference.
 
+- **A secret-free peer is a real peer (2026-09-20, ADR-016 M15.2b).** The engine's independence from
+  plaintext is load-bearing, not incidental: an **anchor** that holds no key for a channel runs
+  `frontier_session_peer` over that channel's log as either side, because the session verifies authorship
+  and ordering and nothing else. `node::anchor::AnchorState` is that peer — genesis, vouched authors,
+  entries — and it is what lets two members who are never online together converge.
+- **Known gap (observed 2026-09-20).** Every transport failure inside a session is reported as
+  `WireError::ProtocolVersionUnsupported`, because the engine's `send` closure maps all send errors onto
+  that code. A peer that simply went away is therefore diagnosed as a protocol-version mismatch. The
+  behaviour is correct (the session hard-fails and the next pass succeeds); the code is misleading, and
+  giving it its own `WireError` is a registry change this ADR should make deliberately.
+
 ## Links
 **Depends on**: ADR-002, ADR-006.
 - Depended on by: ADR-007, ADR-009, ADR-010, ADR-011.
