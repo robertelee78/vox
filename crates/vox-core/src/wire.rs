@@ -266,6 +266,14 @@ pub enum WireError {
     /// `0x08` — `(channelID, epoch)` mismatch.
     #[error("epoch mismatch")]
     EpochMismatch = 0x08,
+    /// `0x09` — the **transport** failed mid-session: the peer went away, the stream
+    /// reset, a frame could not be written or read. Nothing about the protocol or the
+    /// peer's frames was wrong, which is exactly why it has its own code: before this
+    /// existed every such failure was reported as `0x01`
+    /// (protocol-version-unsupported), so a peer that simply closed its laptop was
+    /// diagnosed as speaking the wrong version (ADR-008, ADR-016 M15.2c).
+    #[error("transport failed")]
+    TransportFailed = 0x09,
 }
 
 impl WireError {
@@ -286,6 +294,7 @@ impl WireError {
             0x06 => Some(WireError::QuotaExceeded),
             0x07 => Some(WireError::SyncModeUnsupported),
             0x08 => Some(WireError::EpochMismatch),
+            0x09 => Some(WireError::TransportFailed),
             _ => None,
         }
     }
@@ -361,12 +370,17 @@ mod tests {
 
     #[test]
     fn wire_error_codes_roundtrip() {
-        for c in 0x01u8..=0x08 {
+        for c in 0x01u8..=0x09 {
             let e = WireError::from_code(c).unwrap();
             assert_eq!(e.code(), c);
         }
+        assert_eq!(
+            WireError::from_code(0x09),
+            Some(WireError::TransportFailed),
+            "a transport failure is not a version mismatch (ADR-016 M15.2c)"
+        );
         assert!(WireError::from_code(0x00).is_none());
-        assert!(WireError::from_code(0x09).is_none());
+        assert!(WireError::from_code(0x0A).is_none());
     }
 
     #[test]

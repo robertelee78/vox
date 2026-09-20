@@ -682,6 +682,13 @@ impl Node {
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
             NodeCommand::Lock => {
+                // A headless node has no vault, so there is nothing to lock and no
+                // passphrase to unlock it with: locking it would take the anchor off
+                // the network permanently, until somebody noticed and restarted it.
+                // Refused rather than obeyed (ADR-016 M15.2c).
+                if self.headless.is_some() {
+                    return Outcome::Failed(Fault::NoIdentity);
+                }
                 self.lock_all().await;
                 Outcome::Done
             }

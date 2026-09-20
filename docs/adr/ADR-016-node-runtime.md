@@ -705,9 +705,18 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   ADR-008's engine maps every send failure onto `ProtocolVersionUnsupported` — harmless here (a peer went
   away mid-session and the next pass succeeded) but a misleading diagnostic, recorded as a known gap
   rather than papered over.
-  **Still not yet:** the anchor tracks epoch 0 only (an epoch change is not yet carried on the board);
-  a headless node that receives `Lock` stops its network with nothing to unlock it; and the transport-failure
-  code above deserves its own `WireError`, which is an ADR-005/008 registry change.
+  **Still not yet:** the anchor tracks epoch 0 only (an epoch change is not yet carried on the board —
+  unreachable today, since nothing removes a member, and a landmine for the day something does).
+- **Two small refusals, and an honest error code (M15.2c, 2026-09-20).** Both gaps the M15.2b note left
+  behind, closed:
+  - **`Lock` is refused on a headless node.** It has no vault to lock and no passphrase to unlock with, so
+    obeying `Lock` took the anchor off the network permanently — until a human noticed and restarted it.
+    Nothing sends it today; that is what made it worth closing before something does.
+  - **A transport failure is no longer reported as a protocol-version mismatch.** The ADR-005/008 registry
+    gains `0x09 TransportFailed`, and ADR-008's engine uses it for a failed send, a failed receive, and a
+    clean end-of-stream where a frame was due. A peer that closed its laptop now says so. Genuine version
+    mismatches still map to `0x01`. Recorded in ADR-008's Implementation notes with the registry table
+    updated; the behaviour is unchanged, the diagnosis is true.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
