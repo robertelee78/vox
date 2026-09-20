@@ -544,6 +544,15 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   private network with only outbound access must be able to form and join a swarm. Its own address is not
   what an invite link is for, and the remaining rungs — hole punching through a coordinator and a relay
   fallback — are what close that case.
+- **Rung 1 of the ladder, and mappings that stay alive (M14.8b).** The publish side advertised an IPv6
+  address without asking the firewall in front of it to let anything in, guessed the IPv4 gateway, and
+  held a granted mapping without ever renewing it. Now: a PCP **identity mapping** opens the IPv6 pinhole,
+  the real default route is read from the OS (with the RFC 7723 PCP anycast address as the portable
+  fallback), candidates and families are raced so the whole publish side costs one retransmission
+  schedule, and the actor re-runs discovery at half the shortest granted lifetime — republishing the
+  address records, because a renewal may come back on a different external port. The details are in
+  ADR-012's Implementation notes; what changes here is that a node's advertised addresses now stay true
+  for as long as the node runs, instead of only for the first two hours.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,

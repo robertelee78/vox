@@ -34,7 +34,7 @@ pub mod gateway;
 pub mod natpmp;
 pub mod pcp;
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -69,6 +69,9 @@ pub enum Method {
     Pcp,
     /// NAT-PMP (RFC 6886).
     NatPmp,
+    /// A PCP **IPv6 firewall pinhole** — an identity mapping, translating nothing
+    /// (ADR-012 rung 1).
+    PcpV6Pinhole,
 }
 
 /// A successfully established port mapping (ADR-012 step 2).
@@ -76,9 +79,10 @@ pub enum Method {
 pub struct PortMapping {
     /// The external port the gateway assigned.
     pub external_port: u16,
-    /// The external IPv4 address, when the gateway reported one (NAT-PMP always;
-    /// PCP when the assigned address is IPv4-mapped).
-    pub external_ip: Option<Ipv4Addr>,
+    /// The external address the gateway assigned, when it reported one (NAT-PMP
+    /// always; PCP when it assigns one). An IPv6 pinhole reports the node's own
+    /// address, since nothing is translated.
+    pub external_ip: Option<IpAddr>,
     /// The lifetime the gateway granted, in seconds. The caller MUST renew before
     /// this elapses (RFC 6886/6887): re-issue the same request well before expiry.
     pub lifetime_secs: u32,
@@ -148,7 +152,7 @@ async fn try_pcp(
         Ok(m) if m.lifetime_secs == 0 => Ok(None),
         Ok(m) => Ok(Some(PortMapping {
             external_port: m.external_port,
-            external_ip: m.external_ipv4(),
+            external_ip: m.external_ipv4().map(IpAddr::V4),
             lifetime_secs: m.lifetime_secs,
             internal_port,
             method: Method::Pcp,
@@ -223,7 +227,7 @@ pub async fn map_port(
     let external_ip = query_external_v4(&socket).await;
     Ok(PortMapping {
         external_port: m.external_port,
-        external_ip,
+        external_ip: external_ip.map(IpAddr::V4),
         lifetime_secs: m.lifetime_secs,
         internal_port,
         method: Method::NatPmp,
@@ -242,11 +246,74 @@ async fn query_external_v4(socket: &UdpSocket) -> Option<Ipv4Addr> {
         .map(|e| e.addr)
 }
 
+/// Open an **IPv6 firewall pinhole** for `port` via PCP (ADR-012 rung 1).
+///
+/// On IPv6 nothing is translated: the node's address is already globally routable and
+/// what stands in the way is a stateful firewall, so this asks the PCP server for an
+/// *identity* mapping — same port, same address — and the address a peer dials is the
+/// node's own IPv6. There is no NAT-PMP fallback: RFC 6886 is IPv4-only.
+///
+/// `client_ip` must be the node's address on the link to `gateway`.
+pub async fn open_ipv6_pinhole(
+    gateway: SocketAddr,
+    protocol: Protocol,
+    client_ip: Ipv6Addr,
+    port: u16,
+    lifetime_secs: u32,
+) -> Result<PortMapping> {
+    if !gateway.is_ipv6() {
+        return Err(Error::PortMappingFailed("pinhole: gateway is not IPv6"));
+    }
+    let bind: SocketAddr = (Ipv6Addr::UNSPECIFIED, 0).into();
+    let socket = UdpSocket::bind(bind)
+        .await
+        .map_err(|_| Error::PortMappingFailed("pinhole: socket bind failed"))?;
+    socket
+        .connect(gateway)
+        .await
+        .map_err(|_| Error::PortMappingFailed("pinhole: connect failed"))?;
+    let nonce: [u8; pcp::NONCE_LEN] = random_array()?;
+    let request = pcp::encode_map_request_pinhole(&nonce, protocol, client_ip, port, lifetime_secs);
+    let resp = exchange(&socket, &request, "pinhole: no response").await?;
+    let m = pcp::parse_map_response(&resp, &nonce, protocol, port)?;
+    if m.lifetime_secs == 0 {
+        // A zero lifetime is a delete confirmation, not a live pinhole.
+        return Err(Error::PortMappingFailed("pinhole: zero lifetime"));
+    }
+    if m.external_ipv4().is_some() {
+        // An IPv4-mapped external address answers a question this rung did not ask:
+        // the pinhole is for the node's own IPv6 address.
+        return Err(Error::PortMappingFailed(
+            "pinhole: gateway answered with IPv4",
+        ));
+    }
+    Ok(PortMapping {
+        external_port: m.external_port,
+        external_ip: Some(IpAddr::V6(m.external_ip)),
+        lifetime_secs: m.lifetime_secs,
+        internal_port: port,
+        method: Method::PcpV6Pinhole,
+    })
+}
+
 /// Convenience: build a [`SocketAddr`] for the standard gateway port 5351 from a
 /// gateway IP (RFC 6886/6887).
 #[must_use]
 pub fn gateway_addr(ip: IpAddr) -> SocketAddr {
     SocketAddr::new(ip, natpmp::NATPMP_PORT)
+}
+
+/// The same for an IPv6 server that may be **link-local**: a link-local address is
+/// meaningless without the interface to send it on, which is the `scope` (the kernel
+/// interface index, as [`gateway::server_candidates_v6`] supplies it).
+#[must_use]
+pub fn gateway_addr_v6(ip: Ipv6Addr, scope: u32) -> SocketAddr {
+    SocketAddr::V6(std::net::SocketAddrV6::new(
+        ip,
+        natpmp::NATPMP_PORT,
+        0,
+        scope,
+    ))
 }
 
 #[cfg(test)]
@@ -304,7 +371,10 @@ mod tests {
             let m = map_port(addr, Protocol::Udp, 4433, 0, 3600).await.unwrap();
             assert_eq!(m.method, Method::NatPmp);
             assert_eq!(m.external_port, 51820);
-            assert_eq!(m.external_ip, Some(Ipv4Addr::new(203, 0, 113, 1)));
+            assert_eq!(
+                m.external_ip,
+                Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)))
+            );
             handle.await.unwrap();
         });
     }
@@ -361,9 +431,113 @@ mod tests {
             let m = map_port(addr, Protocol::Udp, 4433, 0, 7200).await.unwrap();
             assert_eq!(m.method, Method::Pcp);
             assert_eq!(m.external_port, 62000);
-            assert_eq!(m.external_ip, Some(Ipv4Addr::new(198, 51, 100, 4)));
+            assert_eq!(
+                m.external_ip,
+                Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4)))
+            );
             handle.await.unwrap();
         });
+    }
+
+    /// A PCP server on IPv6 loopback that echoes one MAP request as a firewall
+    /// pinhole would: same internal port, and `external_ip` taken from the request's
+    /// own client-address field (`override_external` replaces it, to exercise a
+    /// gateway that answers the wrong family).
+    async fn mock_pcp_v6(
+        lifetime: u32,
+        override_external: Option<[u8; 16]>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let sock = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
+            assert_eq!(n, pcp::MAP_MESSAGE_LEN, "PCP request length");
+            let req = &buf[..n];
+            let mut client = [0u8; 16];
+            client.copy_from_slice(&req[8..24]);
+            let mut resp = vec![0u8; pcp::MAP_MESSAGE_LEN];
+            resp[0] = pcp::PCP_VERSION;
+            resp[1] = 0x81; // R=1 | MAP
+            resp[3] = 0; // SUCCESS
+            resp[4..8].copy_from_slice(&lifetime.to_be_bytes());
+            resp[24..36].copy_from_slice(&req[24..36]); // echo the nonce
+            resp[36] = req[36]; // echo the protocol
+            resp[40..44].copy_from_slice(&req[40..44]); // internal == external port
+            resp[44..60].copy_from_slice(&override_external.unwrap_or(client));
+            sock.send_to(&resp, peer).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn ipv6_pinhole_is_an_identity_mapping_of_our_own_address() {
+        let rt = rt();
+        rt.block_on(async {
+            let me: Ipv6Addr = "2001:db8::5".parse().unwrap();
+            let (addr, handle) = mock_pcp_v6(7200, None).await;
+            let m = open_ipv6_pinhole(addr, Protocol::Udp, me, 4433, 7200)
+                .await
+                .unwrap();
+            assert_eq!(m.method, Method::PcpV6Pinhole);
+            // Nothing is translated: the port and address a peer dials are ours.
+            assert_eq!(m.internal_port, 4433);
+            assert_eq!(m.external_port, 4433);
+            assert_eq!(m.external_ip, Some(IpAddr::V6(me)));
+            assert_eq!(m.lifetime_secs, 7200);
+            handle.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_pinhole_answered_with_ipv4_or_no_lifetime_is_not_a_pinhole() {
+        let rt = rt();
+        rt.block_on(async {
+            let me: Ipv6Addr = "2001:db8::5".parse().unwrap();
+            // A v4-mapped external address answers a question this rung did not ask.
+            let v4_mapped = Ipv4Addr::new(198, 51, 100, 4).to_ipv6_mapped().octets();
+            let (addr, handle) = mock_pcp_v6(7200, Some(v4_mapped)).await;
+            let err = open_ipv6_pinhole(addr, Protocol::Udp, me, 4433, 7200)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::PortMappingFailed(_)));
+            handle.await.unwrap();
+            // SUCCESS with a zero lifetime is a deletion, not a live pinhole.
+            let (addr, handle) = mock_pcp_v6(0, None).await;
+            let err = open_ipv6_pinhole(addr, Protocol::Udp, me, 4433, 7200)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::PortMappingFailed(_)));
+            handle.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_pinhole_needs_an_ipv6_server_and_carries_the_scope() {
+        let rt = rt();
+        rt.block_on(async {
+            let me: Ipv6Addr = "2001:db8::5".parse().unwrap();
+            // An IPv4 gateway cannot hold an IPv6 pinhole: refused before any packet.
+            let err = open_ipv6_pinhole(
+                gateway_addr(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                Protocol::Udp,
+                me,
+                4433,
+                7200,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, Error::PortMappingFailed(_)));
+        });
+        // A link-local server is only meaningful with the interface to send it on.
+        let scoped = gateway_addr_v6("fe80::1".parse().unwrap(), 7);
+        match scoped {
+            SocketAddr::V6(s) => {
+                assert_eq!(s.scope_id(), 7);
+                assert_eq!(s.port(), 5351);
+            }
+            SocketAddr::V4(_) => panic!("v6 address built as v4"),
+        }
     }
 
     #[test]

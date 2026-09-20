@@ -72,14 +72,30 @@ const TICK: Duration = Duration::from_secs(1);
 /// rather than dropped: a full queue slows the accept loop, it never loses work.
 const NET_QUEUE: usize = 64;
 
+/// When granted mappings must be re-requested: half the shortest granted lifetime
+/// (the renewal interval RFC 6887 §11.2.1 recommends), or `None` when no gateway
+/// granted anything and so there is nothing to keep alive.
+///
+/// Half the *shortest* lifetime, not the requested one: a gateway may grant less than
+/// asked, and the mapping that expires first is the one that governs.
+fn renew_at(now: u64, mappings: &[crate::nat::portmap::PortMapping]) -> Option<u64> {
+    mappings
+        .iter()
+        .map(|m| m.lifetime_secs)
+        .min()
+        // `max(2)` keeps the interval at one second or more: a zero would re-request
+        // on every tick.
+        .map(|l| now + u64::from(l.max(2) / 2))
+}
+
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
     /// The ladder's publish side finished: this node now knows what to advertise, and
-    /// whether a gateway granted a port mapping that will need renewing.
+    /// which mappings a gateway granted (each of which will need renewing).
     AddressesDiscovered {
-        /// The granted mapping, if any.
-        mapping: Option<crate::nat::portmap::PortMapping>,
+        /// Every granted mapping or pinhole, possibly none.
+        mappings: Vec<crate::nat::portmap::PortMapping>,
     },
     /// A peer connected inbound: it gets a sync schedule, due immediately.
     Connected {
@@ -237,7 +253,12 @@ pub struct Node {
     stream_loops: std::collections::BTreeSet<Digest32>,
     /// The gateway port mapping in force, if one was granted. Held so it can be
     /// renewed before its lifetime elapses (RFC 6886/6887 put renewal on the client).
-    port_mapping: Option<crate::nat::portmap::PortMapping>,
+    port_mappings: Vec<crate::nat::portmap::PortMapping>,
+    /// When the granted mappings must be renewed (unix seconds), or `None` when there
+    /// is nothing to renew. A mapping a gateway grants for two hours outlives no
+    /// long-running node by itself: it is re-requested at half its lifetime, the
+    /// interval RFC 6887 §11.2.1 recommends.
+    renew_mappings_at: Option<u64>,
     /// Per-peer ADR-008 sync clock (ADR-016 §"Sync scheduling").
     schedules: BTreeMap<Digest32, SyncSchedule>,
     /// Channels with a local append not yet pushed to peers.
@@ -325,7 +346,8 @@ impl Node {
             bind,
             pow_params,
             stream_loops: std::collections::BTreeSet::new(),
-            port_mapping: None,
+            port_mappings: Vec::new(),
+            renew_mappings_at: None,
             schedules: BTreeMap::new(),
             pending_push: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
@@ -376,6 +398,7 @@ impl Node {
                     self.publish().await;
                 }
                 _ = ticker.tick() => {
+                    self.renew_mappings_if_due();
                     if self.run_due_syncs().await {
                         self.publish().await;
                     }
@@ -495,8 +518,8 @@ impl Node {
         let discover = Arc::clone(&net);
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
-            let mapping = discover.refresh_advertised().await;
-            let _ = tx.send(NetEvent::AddressesDiscovered { mapping }).await;
+            let mappings = discover.refresh_advertised().await;
+            let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
         });
         spawn_accept_loop(net, self.net_tx.clone());
         Ok(())
@@ -510,7 +533,8 @@ impl Node {
             net.manager().endpoint().close();
         }
         self.stream_loops.clear();
-        self.port_mapping = None;
+        self.port_mappings.clear();
+        self.renew_mappings_at = None;
         self.schedules.clear();
         self.pending_push.clear();
     }
@@ -629,10 +653,11 @@ impl Node {
             NetEvent::Stopped => {
                 self.net = None;
             }
-            NetEvent::AddressesDiscovered { mapping } => {
+            NetEvent::AddressesDiscovered { mappings } => {
                 // Re-publish every open channel's records: the addresses in them were
                 // composed before discovery and may name only loopback.
-                self.port_mapping = mapping;
+                self.renew_mappings_at = renew_at(self.now(), &mappings);
+                self.port_mappings = mappings;
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
                     self.publish_channel_locally(&channel_id).await;
@@ -1099,6 +1124,34 @@ impl Node {
     ///
     /// A peer with no live connection is skipped, not retried in place: it gets a
     /// fresh schedule when it reconnects.
+    /// Re-run the ladder's publish side when the granted mappings are halfway through
+    /// their lifetime, so a node that outlives a two-hour mapping stays dialable.
+    ///
+    /// Nothing happens while the network is down: the renewal instant is left in place
+    /// so the next unlock's discovery supersedes it.
+    ///
+    /// The re-request runs on its own task (it talks to a gateway) and lands back as
+    /// [`NetEvent::AddressesDiscovered`], which republishes the address records too —
+    /// a renewal that came back with a *different* external port must be advertised.
+    fn renew_mappings_if_due(&mut self) {
+        let Some(due) = self.renew_mappings_at else {
+            return;
+        };
+        if self.now() < due {
+            return;
+        }
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        // Cleared now, not when the refresh returns: one renewal in flight at a time.
+        self.renew_mappings_at = None;
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let mappings = net.refresh_advertised().await;
+            let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
+        });
+    }
+
     async fn run_due_syncs(&mut self) -> bool {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return false;
@@ -1620,6 +1673,32 @@ mod tests {
         Secret::new(s.as_bytes().to_vec())
     }
 
+    fn mapping(lifetime_secs: u32) -> crate::nat::portmap::PortMapping {
+        crate::nat::portmap::PortMapping {
+            internal_port: 4433,
+            external_port: 4433,
+            external_ip: None,
+            lifetime_secs,
+            method: crate::nat::portmap::Method::Pcp,
+        }
+    }
+
+    #[test]
+    fn mappings_are_renewed_at_half_the_shortest_granted_lifetime() {
+        // Nothing granted: nothing to renew (and no tick work forever after).
+        assert_eq!(renew_at(1_000, &[]), None);
+        // The ADR-012 two-hour lifetime renews after one hour.
+        assert_eq!(renew_at(1_000, &[mapping(7200)]), Some(1_000 + 3600));
+        // The shortest governs: a gateway may grant less than was asked.
+        assert_eq!(
+            renew_at(1_000, &[mapping(7200), mapping(600)]),
+            Some(1_000 + 300)
+        );
+        // A tiny grant still moves the clock forward, or the renewal would re-fire on
+        // every tick.
+        assert_eq!(renew_at(1_000, &[mapping(1)]), Some(1_001));
+    }
+
     fn fixed_clock(t: u64) -> Clock {
         Arc::new(move || t)
     }
@@ -1644,7 +1723,8 @@ mod tests {
             bind: None,
             pow_params: None,
             stream_loops: std::collections::BTreeSet::new(),
-            port_mapping: None,
+            port_mappings: Vec::new(),
+            renew_mappings_at: None,
             schedules: BTreeMap::new(),
             pending_push: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),

@@ -129,7 +129,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `MAX_GENESIS_CHANNELS`.
 - **The rendezvous service (`nat::service`, ADR-016 M14.2).** The board becomes reachable: `RendezvousService` (a `RendezvousStore` behind a lock, a `MembershipOracle` — the channel's authenticated membership, `member_key(channel, epoch, author)` — and a `Clock`) serves a bi-stream typed `StreamKind::Rendezvous` (ADR-011 notes) as a request/response protocol of canonical-CBOR frames: `PUT <record>` (any of `0x0007`/`0x0008`/`0x0012`, identified by the record's own struct tag) answered `ACCEPTED` or `REJECTED <reason>` with a closed reason set (`NotMember`, `Malformed`, `Policy`, `Capacity`, `UnknownKind`), and `GET <channelID, epoch, kinds>` answered by `RECORD <wire>` frames then `END`. Every PUT goes through the store's existing policy, so member-only admission is enforced by the same code the M10 tests pin; the record is self-authenticating, so the connection's peer need not be its author (a member may re-publish a peer's current record to a second anchor). **Reading is open to any authenticated peer that knows the channelID** — the rendezvous half of the ADR-005 link is the read capability; the passphrase gates the join — and records come back parsed but **unverified**: a member verifies against its membership view, a joiner against the out-of-band fingerprint (a forged endpoint simply fails the pinned QUIC handshake). Caps: frames at `MAX_RENDEZVOUS_FRAME = 48 KiB` (measured 2026-09-20: a member bundle record with a full one-time prekey is 18 084 B, a pre-join record with eight IPv6 endpoints 20 211 B, an address record 3 634 B; the hard bundle cap is 32 KiB + ~3.5 KiB of signature and fields), a GET reply at `MAX_GET_RECORDS = 2304` frames. A frame that is not a request resets the stream with the ADR-008 coded close (a loopback test observes `0x05` at the peer); a record the server can parse but must refuse is answered, not reset. `RendezvousClient::{put, get, finish}` is the client; the store lock is never held across an `await`.
 - **Open board reads survive the connection manager (M14.4).** ADR-016's Decision would accept inbound connections with `Admission::Callback` over the union of channel memberships, which would also reject the peers this ADR requires a rendezvous server to serve — reads are open to any authenticated peer that knows the channelID, and a joiner must publish its pre-join record before anyone knows it. `node::net::ConnectionManager` reconciles this by accepting any authenticated identity when it serves rendezvous (ADR-011's open-swarm default) and moving the membership rule to the **stream kind**: `PeerPolicy` classifies the peer (member / anchor / pending joiner / unknown) and an unknown peer may open the `rendezvous` stream and nothing else, a pending joiner `join` and `rendezvous` only, an anchor `rendezvous`/`sync`/`coord` but never `join` or `pairwise`. A refused stream is reset with the same coded rejection an unauthenticated peer gets, so probing kinds is not an oracle. A node that does *not* serve rendezvous can still close the transport with `PeerPolicy::closed_admission`.
-- **Port-mapping ladder (`nat::portmap`).** PCP (RFC 6887, nonce-authenticated) → NAT-PMP (RFC 6886) implemented as real UDP clients with RFC exponential-backoff retransmission; any PCP failure falls through to NAT-PMP; a total failure is hard (`Error::PortMappingFailed`), never a phantom mapping. A SUCCESS response carrying a **zero lifetime** (the delete-confirmation form) is treated as no live mapping on the create path — PCP falls through, NAT-PMP errors — so a zero-lifetime reply can never masquerade as an established mapping. **UPnP-IGD is intentionally not implemented**: ADR-012 itself flags its security baggage (CallStranger, CVE-2020-12695) and low reliability ("many routers ship UPnP disabled"); SSDP+SOAP is a large, fraught surface for marginal gain over PCP/NAT-PMP, so the shipped ladder is PCP+NAT-PMP and is *complete as shipped* (a deliberate scoping decision, not an unfinished rung — UPnP would be its own ADR if a deployment proved it necessary). Default-gateway discovery is provided for Linux via `/proc/net/route` (pure parse, no `unsafe`/shell); on other platforms the deployment supplies the gateway, which `map_port` takes explicitly.
+- **Port-mapping ladder (`nat::portmap`).** PCP (RFC 6887, nonce-authenticated) → NAT-PMP (RFC 6886) implemented as real UDP clients with RFC exponential-backoff retransmission; any PCP failure falls through to NAT-PMP; a total failure is hard (`Error::PortMappingFailed`), never a phantom mapping. A SUCCESS response carrying a **zero lifetime** (the delete-confirmation form) is treated as no live mapping on the create path — PCP falls through, NAT-PMP errors — so a zero-lifetime reply can never masquerade as an established mapping. **UPnP-IGD is intentionally not implemented**: ADR-012 itself flags its security baggage (CallStranger, CVE-2020-12695) and low reliability ("many routers ship UPnP disabled"); SSDP+SOAP is a large, fraught surface for marginal gain over PCP/NAT-PMP, so the shipped ladder is PCP+NAT-PMP and is *complete as shipped* (a deliberate scoping decision, not an unfinished rung — UPnP would be its own ADR if a deployment proved it necessary). Default-gateway discovery is provided for Linux via `/proc/net/route` and `/proc/net/ipv6_route` (pure parses, no `unsafe`/shell, link-local next hops paired with the sysfs interface index); on other platforms the deployment supplies the gateway, which `map_port` takes explicitly, **or the RFC 7723 PCP anycast address carries the request** (see the rung-1 note below).
 - **The ladder's publish side is composed (2026-09-20, ADR-016 M14.8a).** A node no longer advertises its
   bound socket. `local_route_ip` finds the address the OS would use to reach the internet **without sending
   a packet** — a UDP socket is "connected" to TEST-NET-1 (RFC 5737, never routed) purely so the kernel picks
@@ -141,9 +141,42 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   behind NAT is otherwise not dialable at all. Every rung is best-effort — no route, no gateway, or a
   refusing gateway just omits that entry — because **a node with no dialable address is not broken**: it
   reaches peers outbound and is reached through hole punching or a relay, which is the ordinary case for a
-  client inside a private network. The gateway address is still guessed as the first host on the same /24
-  (RFC 6886 §3.2.1 notes clients commonly do this; a wrong guess only fails the rung) — reading the real
-  default route is a documented follow-up.
+  client inside a private network.
+- **Rung 1 is composed: the IPv6 pinhole, the real default route, and mapping renewal (2026-09-20,
+  ADR-016 M14.8b).** The first rung of this ADR's ladder is "IPv6 direct + PCP pinhole", and the publish
+  side had only the "direct" half. Four things close it:
+  - **A pinhole is an identity mapping.** `portmap::open_ipv6_pinhole` sends a PCP MAP whose client
+    address, suggested external port and suggested external address are all the node's *own* — RFC 6887
+    §13.1: a PCP server in front of a firewall translates nothing, so what comes back is the same port on
+    the same address, now reachable through the stateful filter. There is no NAT-PMP fallback (RFC 6886 is
+    IPv4-only), a zero-lifetime SUCCESS is not a pinhole (the delete-confirmation form, as on the IPv4
+    path), and a gateway that answers with a **v4-mapped** external address is refused: it answered a
+    question this rung did not ask. `Method::PcpV6Pinhole` records which rung granted a mapping, and
+    `PortMapping::external_ip` widened to `IpAddr` to hold it.
+  - **Finding the PCP server without asking a C library.** A PCP request needs a server address, and the
+    routing table is where it lives. Linux: `/proc/net/ipv6_route` is parsed for the lowest-metric `::/0`
+    next hop (network-order hex, unlike the little-endian IPv4 table), and because a router normally
+    advertises a **link-local** next hop — which cannot be sent to without a scope — the interface name
+    from the same row is resolved to a kernel interface index by reading
+    `/sys/class/net/<iface>/ifindex` (a name that is not a plain interface name is refused rather than
+    escaped). Everywhere else there is no portable file interface to the routing table, and this is
+    exactly what **RFC 7723** exists for: `192.0.0.9` and `2001:1::1` are the registered PCP *anycast*
+    addresses, answered by the on-path PCP server whether or not it is the default router. So
+    `gateway::server_candidates_v4/v6` return an ordered candidate list — real default route, then the
+    IPv4 `.1` convention (RFC 6886 §3.2.1), then the anycast address — and no platform is left with no
+    way to ask. This retires the "guess the gateway" follow-up from M14.8a.
+  - **Candidates are raced, and so are the families.** An address that is not a PCP server simply never
+    answers, so trying candidates in turn would pay the full ~3.75 s retransmission schedule for each
+    before asking the next. `advertise_endpoints` races the candidates within a rung (first grant wins,
+    the rest are abandoned; an unused grant expires on its own lifetime) and runs the IPv6 and IPv4 work
+    concurrently, so the whole publish side costs one schedule rather than five. `local_route_ips` now
+    returns **both** families' routable addresses (IPv6 first) instead of whichever was probed first, so a
+    dual-stack node advertises — and pinholes or maps — both; `compose_endpoints` is the pure ordering
+    step, testable without a gateway.
+  - **A two-hour mapping outlives nothing by itself.** The node re-runs the publish side at half the
+    shortest granted lifetime (`renew_at`, the interval RFC 6887 §11.2.1 recommends) on the actor's tick,
+    on its own task, landing back as `AddressesDiscovered` — which republishes the address records too,
+    because a renewal that came back with a different external port must be advertised.
 - **Reachability ladder (`nat::reachability`).** `connect_direct` races a peer's direct candidates Happy-Eyeballs-style (RFC 8305, 250 ms staggered start) over the M9 QUIC endpoint via a tokio `JoinSet`, returning the first attempt that authenticates as the expected composite identity; ladder exhaustion is `Error::Unreachable` (the honest ADR-012 limit), never a false success.
 - **Hole-punch (`nat::holepunch`).** The DCUtR Connect/Sync coordination is a pure, deterministic state machine + message codec; the initiator fires RTT/2 after `Sync`, the responder fires on receiving `Sync`, so the simultaneous opens coincide. The synchronized dial reuses `reachability::connect_direct` on the shared endpoint (same local port the peer observed).
 - **Relay data-plane boundary.** M10 expresses relay *hints* (`Multiaddr::Relay`) and the bootstrap/relay node set (`nat::bootstrap`), and can reach a relay node over M9. The actual **byte-forwarding** a relay performs is the tunnel mechanism of ADR-013/M11 (a relay is a special tunnel); this is a layering decision, not a deferral of the rendezvous/signaling work, which is complete here.
@@ -159,6 +192,16 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `BootstrapSet` is pure configuration. PCP is IPv4-only (no IPv6 pinhole) and default-gateway
   discovery is Linux-only. All of this is the node-runtime capability (ADR-016), which this ADR's
   primitives were built to be composed by.
+- **Known gaps, revised (2026-09-20).** The rendezvous board now has its wire protocol and a consumer
+  (`nat::service`, M14.2), and rungs 1 and 2 are composed on both the publish and dial sides
+  (M14.8a/M14.8b above): what a node advertises is what the ladder can actually make reachable, and
+  granted mappings are renewed. **Rungs 3 and 4 remain uncomposed**: hole-punch is still a state machine
+  with no observed-address discovery, no `coord` channel carrying `CoordMessage` through an online
+  member, and nothing executing a `PunchPlan`; relay-of-last-resort is still a `Multiaddr::Relay` hint
+  with no data plane. There is still no DHT (`channel_rendezvous`/`truncate` has no caller, the key width
+  is unchosen), `BootstrapSet` is still pure configuration with no node wiring, and UPnP-IGD remains a
+  deliberate omission (see the port-mapping note). IPv6 route discovery is Linux-only for the *real*
+  route; elsewhere the rung depends on the RFC 7723 anycast address being answered.
 
 ## Links
 **Depends on**: ADR-005, ADR-011.

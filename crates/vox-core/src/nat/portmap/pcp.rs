@@ -112,6 +112,38 @@ pub fn encode_map_request(
     out
 }
 
+/// Encode a PCP MAP request for an **IPv6 firewall pinhole** — an *identity*
+/// mapping (RFC 6887 §11.1; ADR-012 rung 1: "on IPv6 there is no translation — only
+/// a stateful firewall; open an inbound pinhole via PCP, identity mapping").
+///
+/// It differs from the IPv4 form in three ways, all of them the point: the client
+/// address is the host's own IPv6, the suggested external **port equals the internal
+/// port**, and the suggested external **address is the client's own address** rather
+/// than "no preference". A PCP server in front of a stateful firewall grants that by
+/// opening a pinhole and translating nothing, so the address a peer dials is the
+/// node's real IPv6.
+#[must_use]
+pub fn encode_map_request_pinhole(
+    nonce: &[u8; NONCE_LEN],
+    protocol: Protocol,
+    client_ip: Ipv6Addr,
+    port: u16,
+    lifetime_secs: u32,
+) -> [u8; MAP_MESSAGE_LEN] {
+    let mut out = [0u8; MAP_MESSAGE_LEN];
+    out[0] = PCP_VERSION;
+    out[1] = OP_MAP;
+    out[4..8].copy_from_slice(&lifetime_secs.to_be_bytes());
+    out[8..24].copy_from_slice(&client_ip.octets());
+    out[24..36].copy_from_slice(nonce);
+    out[36] = protocol.pcp_iana();
+    out[40..42].copy_from_slice(&port.to_be_bytes());
+    // Identity mapping: same port, and our own address as the suggested external.
+    out[42..44].copy_from_slice(&port.to_be_bytes());
+    out[44..60].copy_from_slice(&client_ip.octets());
+    out
+}
+
 /// Parse a PCP MAP response (RFC 6887 §11.2).
 ///
 /// Validates the version, the MAP response opcode, the result code, the echoed
@@ -208,6 +240,26 @@ mod tests {
         assert_eq!(&req[24..36], &nonce());
         assert_eq!(req[36], 17); // UDP IANA
         assert_eq!(&req[40..42], &[0x12, 0x34]);
+    }
+
+    #[test]
+    fn pinhole_request_asks_for_an_identity_mapping() {
+        let me: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let req = encode_map_request_pinhole(&nonce(), Protocol::Udp, me, 4433, 7200);
+        assert_eq!(req.len(), 60);
+        assert_eq!(req[0], 2); // version
+        assert_eq!(req[1], 1); // R=0 | MAP
+        assert_eq!(&req[4..8], &7200u32.to_be_bytes());
+        // The client address is the node's own IPv6, not a v4-mapped one.
+        assert_eq!(&req[8..24], &me.octets());
+        assert_eq!(&req[24..36], &nonce());
+        assert_eq!(req[36], 17); // UDP IANA
+                                 // Identity: internal port, suggested external port and suggested external
+                                 // address all name the node itself (RFC 6887 §13.1 — a firewall pinhole
+                                 // translates nothing).
+        assert_eq!(&req[40..42], &4433u16.to_be_bytes());
+        assert_eq!(&req[42..44], &4433u16.to_be_bytes());
+        assert_eq!(&req[44..60], &me.octets());
     }
 
     #[test]
