@@ -1,6 +1,6 @@
 # ADR-012: NAT Traversal, Bootstrap, and Reachability
 
-**Status**: implemented and composed — all four rungs of the reachability ladder run in the node (`crates/vox-core/src/nat/`, `crates/vox-core/src/node/{network,coordstream,circuitstream}.rs`, `crates/vox-core/src/transport/mux.rs`), proved against simulated RFC 4787 NATs; UPnP-IGD deliberately omitted, DHT not started (see Known gaps)
+**Status**: implemented and composed — all four rungs of the reachability ladder run in the node (`crates/vox-core/src/nat/`, `crates/vox-core/src/node/{network,coordstream,circuitstream}.rs`, `crates/vox-core/src/transport/mux.rs`), proved against simulated RFC 4787 NATs; rung 2 complete including UPnP-IGD (proved against a specification-faithful in-process gateway, real-router validation pending); DHT not started (see Known gaps)
 **Date**: 2026-06-19
 **Updated**: 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -99,7 +99,8 @@ the user's own node.
 ### Negative
 - Strict zero-infrastructure is impossible; some bootstrap/coordinator always exists.
 - The pure 2-member, both-CGNAT, no-IPv6, no-own-node case is unsupported (documented limit).
-- IPv6/PCP availability is uneven; UPnP carries security baggage.
+- IPv6/PCP availability is uneven; UPnP carries security baggage (mitigated in the client, see
+  Implementation notes — the baggage is the router's, and the client follows nothing off the responder).
 
 ### Neutral
 - Reachability improves over time as IPv6 deployment grows (~41–50% single-endpoint and climbing).
@@ -129,7 +130,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `MAX_GENESIS_CHANNELS`.
 - **The rendezvous service (`nat::service`, ADR-016 M14.2).** The board becomes reachable: `RendezvousService` (a `RendezvousStore` behind a lock, a `MembershipOracle` — the channel's authenticated membership, `member_key(channel, epoch, author)` — and a `Clock`) serves a bi-stream typed `StreamKind::Rendezvous` (ADR-011 notes) as a request/response protocol of canonical-CBOR frames: `PUT <record>` (any of `0x0007`/`0x0008`/`0x0012`, identified by the record's own struct tag) answered `ACCEPTED` or `REJECTED <reason>` with a closed reason set (`NotMember`, `Malformed`, `Policy`, `Capacity`, `UnknownKind`), and `GET <channelID, epoch, kinds>` answered by `RECORD <wire>` frames then `END`. Every PUT goes through the store's existing policy, so member-only admission is enforced by the same code the M10 tests pin; the record is self-authenticating, so the connection's peer need not be its author (a member may re-publish a peer's current record to a second anchor). **Reading is open to any authenticated peer that knows the channelID** — the rendezvous half of the ADR-005 link is the read capability; the passphrase gates the join — and records come back parsed but **unverified**: a member verifies against its membership view, a joiner against the out-of-band fingerprint (a forged endpoint simply fails the pinned QUIC handshake). Caps: frames at `MAX_RENDEZVOUS_FRAME = 48 KiB` (measured 2026-09-20: a member bundle record with a full one-time prekey is 18 084 B, a pre-join record with eight IPv6 endpoints 20 211 B, an address record 3 634 B; the hard bundle cap is 32 KiB + ~3.5 KiB of signature and fields), a GET reply at `MAX_GET_RECORDS = 2304` frames. A frame that is not a request resets the stream with the ADR-008 coded close (a loopback test observes `0x05` at the peer); a record the server can parse but must refuse is answered, not reset. `RendezvousClient::{put, get, finish}` is the client; the store lock is never held across an `await`.
 - **Open board reads survive the connection manager (M14.4).** ADR-016's Decision would accept inbound connections with `Admission::Callback` over the union of channel memberships, which would also reject the peers this ADR requires a rendezvous server to serve — reads are open to any authenticated peer that knows the channelID, and a joiner must publish its pre-join record before anyone knows it. `node::net::ConnectionManager` reconciles this by accepting any authenticated identity when it serves rendezvous (ADR-011's open-swarm default) and moving the membership rule to the **stream kind**: `PeerPolicy` classifies the peer (member / anchor / pending joiner / unknown) and an unknown peer may open the `rendezvous` stream and nothing else, a pending joiner `join` and `rendezvous` only, an anchor `rendezvous`/`sync`/`coord` but never `join` or `pairwise`. A refused stream is reset with the same coded rejection an unauthenticated peer gets, so probing kinds is not an oracle. A node that does *not* serve rendezvous can still close the transport with `PeerPolicy::closed_admission`.
-- **Port-mapping ladder (`nat::portmap`).** PCP (RFC 6887, nonce-authenticated) → NAT-PMP (RFC 6886) implemented as real UDP clients with RFC exponential-backoff retransmission; any PCP failure falls through to NAT-PMP; a total failure is hard (`Error::PortMappingFailed`), never a phantom mapping. A SUCCESS response carrying a **zero lifetime** (the delete-confirmation form) is treated as no live mapping on the create path — PCP falls through, NAT-PMP errors — so a zero-lifetime reply can never masquerade as an established mapping. **UPnP-IGD is intentionally not implemented**: ADR-012 itself flags its security baggage (CallStranger, CVE-2020-12695) and low reliability ("many routers ship UPnP disabled"); SSDP+SOAP is a large, fraught surface for marginal gain over PCP/NAT-PMP, so the shipped ladder is PCP+NAT-PMP and is *complete as shipped* (a deliberate scoping decision, not an unfinished rung — UPnP would be its own ADR if a deployment proved it necessary). Default-gateway discovery is provided for Linux via `/proc/net/route` and `/proc/net/ipv6_route` (pure parses, no `unsafe`/shell, link-local next hops paired with the sysfs interface index); on other platforms the deployment supplies the gateway, which `map_port` takes explicitly, **or the RFC 7723 PCP anycast address carries the request** (see the rung-1 note below).
+- **Port-mapping ladder (`nat::portmap`).** PCP (RFC 6887, nonce-authenticated) → NAT-PMP (RFC 6886) implemented as real UDP clients with RFC exponential-backoff retransmission; any PCP failure falls through to NAT-PMP; a total failure is hard (`Error::PortMappingFailed`), never a phantom mapping. A SUCCESS response carrying a **zero lifetime** (the delete-confirmation form) is treated as no live mapping on the create path — PCP falls through, NAT-PMP errors — so a zero-lifetime reply can never masquerade as an established mapping. **UPnP-IGD was at first intentionally not implemented** — this note recorded CallStranger (CVE-2020-12695), "many routers ship UPnP disabled" and SSDP+SOAP as a large surface for marginal gain — and **that decision was reversed on 2026-09-20 (ADR-016 M15.1c)**, see the UPnP note below: the gain is not marginal, the Decision above had always listed it as rung 2's third fallback, and the surface is small when the XML is scanned for a handful of elements rather than parsed. Default-gateway discovery is provided for Linux via `/proc/net/route` and `/proc/net/ipv6_route` (pure parses, no `unsafe`/shell, link-local next hops paired with the sysfs interface index); on other platforms the deployment supplies the gateway, which `map_port` takes explicitly, **or the RFC 7723 PCP anycast address carries the request** (see the rung-1 note below).
 - **The ladder's publish side is composed (2026-09-20, ADR-016 M14.8a).** A node no longer advertises its
   bound socket. `local_route_ip` finds the address the OS would use to reach the internet **without sending
   a packet** — a UDP socket is "connected" to TEST-NET-1 (RFC 5737, never routed) purely so the kernel picks
@@ -267,6 +268,29 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     in order — direct, then a punch through each helper, then a circuit — so a peer behind a symmetric
     NAT cost a 10 s dial timeout and a 10 s punch timeout before the relay was tried. That ordering was
     replaced the same day; see the next note.
+- **UPnP-IGD, the reversal (2026-09-20, ADR-016 M15.1c).** Rung 2's third fallback exists now
+  (`nat::portmap::upnp`, `Method::UpnpIgd`, tried after the PCP/NAT-PMP race comes back empty). Why the
+  omission was reversed: on home routers UPnP is the *common* one of the three protocols, PCP is rare and
+  NAT-PMP mostly Apple-era; it is what lets the user's own **anchor** forward its port without the router
+  being configured by hand, and what lets two peers with no anchor at all find a direct path when one of
+  them has a cooperative router — the two-party cold start ADR-016 is built for. Why the security
+  reasoning still holds: CallStranger is a vulnerability *of routers* exploited from the WAN, not of a LAN
+  client; nothing a router says is trusted for anything but a mapping that can only waste a dial; and the
+  client is hardened where it listens — the `LOCATION` an SSDP responder hands out is followed **only on
+  the responder's own address**, every read is bounded and timed, hosts must be literal IPv4 addresses
+  (nothing to resolve, nothing to be lied to about), and the XML is *scanned* for `serviceType`,
+  `controlURL`, `URLBase`, `errorCode` and `NewExternalIPAddress` — there is no XML parser. Three plain
+  exchanges, no dependencies: SSDP `M-SEARCH` for `InternetGatewayDevice:1` (an IGD:2 router answers a
+  version-1 search, UDA §1.3.2), an HTTP `GET` of the description, SOAP `POST`s to the
+  `WANIPConnection` (preferred) or `WANPPPConnection` control URL — absolute, or relative to `URLBase`, or
+  to `LOCATION`. `AddPortMapping` asks for `PORT_MAP_LIFETIME_SECS`; a router that answers
+  `725 OnlyPermanentLeasesSupported` is asked again with lease 0, the mapping is then reported with
+  lifetime 0, never renewed, and **deleted when the node locks or shuts down**. Handled real-router quirks,
+  each tested: HTTP/1.0 replies, `Transfer-Encoding: chunked`, `URLBase` with relative control URLs, PPP-only
+  routers, permanent-only leases. **The spike found no router to test against**: the LAN this was built on
+  answers no SSDP search at all, so the proof is an in-process gateway that follows UDA 1.1 and
+  WANIPConnection:1 exactly with the quirks switchable, and validation against real hardware is recorded
+  in Known gaps as pending — the client will be watched on the first real router it meets.
 - **Relay-first, upgrade later (2026-09-20, ADR-016 M15.1b).** The sequential ladder made the anchor-based
   cold start ~25 s. The rungs are now **raced**: `reach` starts the direct dial and a circuit through every
   connected helper at once and returns whichever lands first — through the user's own anchor, about one
@@ -341,7 +365,9 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   query and no DHT; `BootstrapSet` is still unwired, so the helpers a node has are whichever peers it
   happens to hold. A relayed circuit is torn down by its idle timeout, not the instant the inner
   connection closes. A hostile helper can deny (never read or alter) what it was asked to carry. IPv6
-  route discovery is Linux-only for the real route, and UPnP-IGD remains a deliberate omission.
+  route discovery is Linux-only for the real route. (`BootstrapSet` was wired the same day, M15.1;
+  UPnP-IGD was built the same day, M15.1c — its validation against real router hardware is pending,
+  the network it was built on having no UPnP device to answer.)
 
 ## Links
 **Depends on**: ADR-005, ADR-011.

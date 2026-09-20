@@ -238,25 +238,31 @@ async fn pinhole_any(client_ip: Ipv6Addr, port: u16) -> Option<PortMapping> {
 }
 
 /// Ask each candidate gateway to forward `port`, stopping at the first that grants a
-/// mapping. Each candidate runs the full PCP-then-NAT-PMP ladder of
-/// [`map_port`](crate::nat::portmap::map_port).
+/// mapping. Each candidate runs the PCP-then-NAT-PMP ladder of
+/// [`map_port`](crate::nat::portmap::map_port); if none grants one, **UPnP-IGD** is
+/// tried last (ADR-012 rung 2's full order) — it finds the router by SSDP rather
+/// than by address, which is why it is not one of the raced candidates.
 async fn map_port_any(client_ip: Ipv4Addr, port: u16) -> Option<PortMapping> {
-    first_success(
-        gateway::server_candidates_v4(client_ip)
-            .into_iter()
-            .map(|server| async move {
-                map_port(
-                    gateway_addr(IpAddr::V4(server)),
-                    Protocol::Udp,
-                    port,
-                    port,
-                    PORT_MAP_LIFETIME_SECS,
-                )
-                .await
-                .ok()
-            }),
-    )
-    .await
+    let raced = first_success(gateway::server_candidates_v4(client_ip).into_iter().map(
+        |server| async move {
+            map_port(
+                gateway_addr(IpAddr::V4(server)),
+                Protocol::Udp,
+                port,
+                port,
+                PORT_MAP_LIFETIME_SECS,
+            )
+            .await
+            .ok()
+        },
+    ))
+    .await;
+    if raced.is_some() {
+        return raced;
+    }
+    crate::nat::portmap::map_port_upnp(Protocol::Udp, port, client_ip, PORT_MAP_LIFETIME_SECS)
+        .await
+        .ok()
 }
 
 /// Run every future at once and return the first `Some`, abandoning the rest.
