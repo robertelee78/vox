@@ -224,6 +224,64 @@ enum ServiceCmd {
     List(RoomArgs),
 }
 
+/// `vox room` — the agent-comms verbs, over a running node.
+#[derive(Subcommand, Debug, Clone)]
+enum RoomCmd {
+    /// Append a message to a room.
+    ///
+    /// With no text, or `-`, the message is read from stdin — which is the form to
+    /// use for an agent-comms envelope, because JSON on a command line is where
+    /// quoting goes wrong.
+    Post(RoomPostArgs),
+    /// Print a room's messages. The first column is the entry hash, which is the
+    /// cursor: pass the last one back as `--since` to read only what is new.
+    Read(RoomReadArgs),
+    /// Print new messages as they arrive, until interrupted.
+    Tail(RoomRefArgs),
+    /// Print the fingerprints of the room's members.
+    Roster(RoomRefArgs),
+    /// List the rooms this node holds.
+    List(ProfileArgs),
+}
+
+/// Naming a room on a running node. No passphrase: the node is already unlocked.
+#[derive(Args, Debug, Clone)]
+pub struct RoomRefArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+}
+
+/// `vox room post`
+#[derive(Args, Debug, Clone)]
+pub struct RoomPostArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The message. Omit it, or pass `-`, to read from stdin.
+    pub text: Option<String>,
+}
+
+/// `vox room read`
+#[derive(Args, Debug, Clone)]
+pub struct RoomReadArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// Return only what follows this entry hash — the full 64 characters, as the
+    /// first column prints it. Not prefix-matched: a cursor comes from previous
+    /// output, and a prefix that matched the wrong entry would silently skip or
+    /// repeat messages.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// At most this many messages. 0 means no limit.
+    #[arg(long, default_value_t = 0)]
+    pub limit: u64,
+}
+
 /// Selecting a room, by the prefix of its channelID as `vox` prints it.
 #[derive(Args, Debug, Clone)]
 pub struct RoomArgs {
@@ -383,6 +441,14 @@ enum Cmd {
     /// only once they hold `dial:<tag>`, which `vox grant` puts on the room's log.
     #[command(subcommand)]
     Service(ServiceCmd),
+    /// Speak in a room over a **running** node (ADR-020) — the agent-comms verbs.
+    ///
+    /// Unlike every other verb, these do not start a node: they attach to the
+    /// control socket of one that is already running and already unlocked, which
+    /// is how several agent sessions share one identity per machine. Nothing here
+    /// takes a passphrase, and nothing here creates, joins or leaves a room.
+    #[command(subcommand)]
+    Room(RoomCmd),
     /// Bring up the local entry point for a room's services: a SOCKS5 proxy that resolves
     /// the room's `.vox` name (ADR-017).
     ///
@@ -523,6 +589,54 @@ pub fn run() -> ExitCode {
                     crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp).await
                 },
             )
+        }
+        Cmd::Room(sub) => {
+            // These attach to a running node rather than starting one, so they need
+            // only a tokio runtime and the profile's paths — no identity unlock and
+            // no network of their own.
+            let profile = match &sub {
+                RoomCmd::Post(a) => &a.profile,
+                RoomCmd::Read(a) => &a.profile,
+                RoomCmd::Tail(a) | RoomCmd::Roster(a) => &a.profile,
+                RoomCmd::List(p) => p,
+            };
+            let paths = match profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let outcome = rt.block_on(async {
+                match &sub {
+                    RoomCmd::Post(a) => {
+                        crate::room_cli::post(&paths, &a.room, a.text.as_deref()).await
+                    }
+                    RoomCmd::Read(a) => {
+                        crate::room_cli::read(&paths, &a.room, a.since.as_deref(), a.limit).await
+                    }
+                    RoomCmd::Tail(a) => crate::room_cli::tail(&paths, &a.room).await,
+                    RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
+                    RoomCmd::List(_) => crate::room_cli::list(&paths).await,
+                }
+            });
+            match outcome {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
             let sub = sub.clone();

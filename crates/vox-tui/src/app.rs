@@ -320,7 +320,22 @@ pub fn run_live(
     let cfg = vox_core::node::actor::NodeConfig::new()
         .bind(vox_core::node::actor::Bind::Addr(listen))
         .anchors(anchors);
-    let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
+    let node = rt.block_on(async { Node::spawn_config(paths.clone(), cfg) })?;
+    // The ADR-020 control socket, so agent sessions on this machine can attach to
+    // this node rather than each running one of their own. Held for the life of
+    // the client: dropping it stops accepting and unlinks the path.
+    //
+    // A failure here is reported and not fatal. The socket is an extra surface,
+    // and a client that cannot offer it should still be a client — refusing to
+    // start the TUI because another feature could not bind would be the wrong
+    // trade.
+    let _ipc = match rt.block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) }) {
+        Ok(server) => Some(server),
+        Err(e) => {
+            eprintln!("vox: control socket unavailable ({e}); `vox room` will not attach");
+            None
+        }
+    };
     let cancel = CancellationToken::new();
     #[cfg(unix)]
     {
