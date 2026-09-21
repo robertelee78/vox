@@ -2,7 +2,7 @@
 
 **Status**: accepted (2026-09-19) — **M13 (single-device node), M14 (two machines chat), M15 (anchors: symmetric-NAT swarm formation *and* convergence between members never online together) and M16.1 (a TCP service reached across the overlay) are all gated in `crates/vox-core/tests/` and run in CI's release step**; the person-facing service surface moves to ADR-017
 **Date**: 2026-09-19
-**Updated**: 2026-09-21 — M18.1: the node enforces ADR-006's rotation bound and carries ADR-007's
+**Updated**: 2026-09-21 — the M15 "sessions to members we have not met" gap is **half closed**: members now open ADR-004 sessions from one another's bundle records (`PairwiseFrame::Hello`, `NodeNet::board_bundle`, `Actor::ensure_session`), so consent and re-key reach a member admitted through somebody else; the restart half stays open because the board is in-memory too. 2026-09-21 — M18.1: the node enforces ADR-006's rotation bound and carries ADR-007's
 per-member revocation end to end (`vox revoke`), with two new sealed segments and a re-key retry on the
 tick; gated by `node_m18_revocation_gate`. 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -202,13 +202,25 @@ cross-process checks.
   log catches up with the author's and he can open none of it, while the member who kept consent reads
   the whole conversation across the rotation boundary (`node_m18_revocation_gate`).
 
-  **Reach, stated exactly.** A re-key travels over an ADR-004 pairwise session, and this node creates
-  those only on the join path — so a re-key reaches precisely the peers a *first* consent could reach,
-  and no fewer. Where it does not reach (the author restarted, so the in-memory session is gone, and the
-  member joined in an earlier process lifetime) the re-key stays owed and the tick keeps offering it;
-  what unblocks it is the same M15 gap that blocks consenting to a member never met — opening a session
-  from that member's bundle record. The security half is unaffected either way: the rotation is what
-  excludes the revoked member, and it takes effect with no delivery at all.
+  **Reach, stated exactly (updated 2026-09-21).** A re-key travels over an ADR-004 pairwise session.
+  The node now opens one **from the member's bundle record** when the join path never made one, which is
+  what this ADR always specified above and what the runtime previously did not do — so consenting to,
+  and re-keying, a member admitted through somebody else works. Gated by
+  `node_m15_session_from_bundle_gate`, where Carol joins *Bob* and Alice — who shares no join, no CPace
+  and no PQXDH with her — consents and is read.
+
+  **What remains open is the restart half, and only that.** A restarted node has no session *and no
+  board*: `nat::store::RendezvousStore` is in-memory and nothing refetches it at startup, so there is no
+  bundle record to open a session from. Closing it means pulling the board from an anchor on start
+  (the anchor already persists one, M15.2b). Until then a re-key owed to a member this process has not
+  learned of stays owed and the tick keeps offering it. The security half is unaffected either way: the
+  rotation is what excludes the revoked member, and it takes effect with no delivery at all.
+
+  **Wire.** The initiator's PQXDH opening message has no join stream to travel on, so it rides the
+  `pairwise` stream itself as `PairwiseFrame::Hello` (op `2`), immediately before the SKDM it enables.
+  This is an **addition**: `v0.1.0` peers do not know op `2` and reject the frame, so a `v0.1.1` node
+  consenting to a never-met member across such a peer degrades to the old `Unreachable` rather than
+  failing in any new way. No existing frame changed.
 - **M15 — the anchor and the tunnel surface.** `vox node` headless (store, rendezvous, sync peer,
   hole-punch signaling), range-mode sync over transport, and the ADR-013 CLI (`vox service add`,
   `vox forward`) over the tunnel module. **Gate:** two nodes that are never simultaneously online

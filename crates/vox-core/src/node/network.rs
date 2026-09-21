@@ -852,6 +852,28 @@ impl NodeNet {
         out
     }
 
+    /// The live bundle record this node's board holds for one member of `(channel,
+    /// epoch)`, if any.
+    ///
+    /// This is what lets a member open an ADR-004 session to another member it never
+    /// met on the join path — which is what ADR-016 §"the rendezvous service and the
+    /// member bundle record" says members do, and what the runtime previously could
+    /// not. The record is signed by that member's composite root and was verified when
+    /// it was stored, so the prekey bundle inside it is as trustworthy as the join
+    /// path's was.
+    #[must_use]
+    pub fn board_bundle(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+        member: &Digest32,
+    ) -> Option<MemberBundleRecord> {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.bundle(channel_id, epoch, member, now).cloned()
+    }
+
     /// Every *other* member's live records this node's board holds for `(channel,
     /// epoch)` — bundles first, then address records — as wire frames, ready to be
     /// mirrored to an anchor.

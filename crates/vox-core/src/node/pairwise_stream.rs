@@ -37,6 +37,7 @@ use quinn::{RecvStream, SendStream};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::group::skdm::Skdm;
+use crate::pairwise::init_message::InitialMessage;
 use crate::pairwise::message::Message;
 use crate::pairwise::session::Session;
 use crate::transport::framing::{read_frame, write_frame};
@@ -50,6 +51,8 @@ use crate::transport::streams::{open_typed, StreamKind};
 pub const MAX_PAIRWISE_FRAME: usize = 64 * 1024;
 
 const OP_SKDM: u64 = 1;
+/// The PQXDH opening a session that no join created. See [`PairwiseFrame::Hello`].
+const OP_HELLO: u64 = 2;
 
 /// One frame on a `pairwise` stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,16 +65,42 @@ pub enum PairwiseFrame {
         /// `Message::to_wire` bytes.
         sealed: Vec<u8>,
     },
+    /// The ADR-004 [`crate::pairwise::init_message::InitialMessage`] that opens a
+    /// session the join path never created.
+    ///
+    /// ADR-016 says members open sessions to one another **from their bundle
+    /// records**, not only through a join. An initiator doing that has nowhere to put
+    /// its PQXDH opening message: the join stream that normally carries one is not in
+    /// play. So it rides here, as the first frame on the same stream that then carries
+    /// the SKDM — one round of bytes, no extra stream, and the responder is holding the
+    /// session by the time it reads the second frame.
+    ///
+    /// The responder authenticates it exactly as the join responder does: the message
+    /// names a signed prekey and optionally a one-time prekey from that node's own
+    /// ring, so a party with no prekey of ours cannot open a session at all, and a
+    /// replayed one-time prekey is graded last-resort rather than silently accepted.
+    Hello {
+        /// The channel this session is bound to.
+        channel_id: crate::hash::Digest32,
+        /// `InitialMessage::to_wire` bytes.
+        initial: Vec<u8>,
+    },
 }
 
 impl PairwiseFrame {
-    /// Canonical frame bytes: `[1, sealed]`.
+    /// Canonical frame bytes: `[op, channel_id, payload]`.
     #[must_use]
     pub fn to_frame(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
             Self::Skdm { channel_id, sealed } => {
                 e.array(3).uint(OP_SKDM).bytes(channel_id).bytes(sealed);
+            }
+            Self::Hello {
+                channel_id,
+                initial,
+            } => {
+                e.array(3).uint(OP_HELLO).bytes(channel_id).bytes(initial);
             }
         }
         e.finish()
@@ -89,6 +118,13 @@ impl PairwiseFrame {
                     .try_into()
                     .map_err(|_| Error::MalformedBundle("pairwise channel_id length"))?,
                 sealed: d.bytes()?.to_vec(),
+            },
+            (OP_HELLO, 3) => Self::Hello {
+                channel_id: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedBundle("pairwise channel_id length"))?,
+                initial: d.bytes()?.to_vec(),
             },
             _ => return Err(Error::MalformedBundle("pairwise frame op")),
         };
@@ -114,32 +150,41 @@ pub async fn send_skdm(
 
 /// Open a `pairwise` stream on `conn`, deliver one SKDM, and half-close. The
 /// stream's lifetime is the delivery: nothing is expected back.
+///
+/// `hello` is `Some` exactly when this node has just opened the session from the
+/// peer's bundle record and the peer therefore does not hold it yet. It goes first,
+/// on the same stream, so the peer has accepted the session before it reads the SKDM.
 pub async fn deliver_skdm(
     conn: &VoxConnection,
     channel_id: &crate::hash::Digest32,
     session: &mut Session,
     skdm: &Skdm,
+    hello: Option<&InitialMessage>,
 ) -> Result<()> {
     let (mut send, _recv) = open_typed(conn, StreamKind::Pairwise).await?;
+    if let Some(initial) = hello {
+        let frame = PairwiseFrame::Hello {
+            channel_id: *channel_id,
+            initial: initial.to_wire(),
+        };
+        write_frame(&mut send, &frame.to_frame()).await?;
+    }
     send_skdm(&mut send, channel_id, session, skdm).await?;
     let _ = send.finish();
     Ok(())
 }
 
 /// Read the next frame from an already-accepted, already-authorized `pairwise`
-/// stream, returning which channel it is for and the still-sealed bytes.
+/// stream.
 ///
-/// Opening it needs the session for `(channel, peer)`, which only the actor knows,
-/// so the two steps are separate: this reads, [`open_skdm`] decrypts. `Ok(None)` on
-/// a clean half-close with no further frames.
-pub async fn recv_pairwise(
-    recv: &mut RecvStream,
-) -> Result<Option<(crate::hash::Digest32, Vec<u8>)>> {
+/// Acting on either frame needs state only the actor holds — the session for
+/// `(channel, peer)`, or the prekey ring — so this only reads; [`open_skdm`]
+/// decrypts. `Ok(None)` on a clean half-close with no further frames.
+pub async fn recv_pairwise(recv: &mut RecvStream) -> Result<Option<PairwiseFrame>> {
     let Some(bytes) = read_frame(recv, MAX_PAIRWISE_FRAME).await? else {
         return Ok(None);
     };
-    let PairwiseFrame::Skdm { channel_id, sealed } = PairwiseFrame::from_frame(&bytes)?;
-    Ok(Some((channel_id, sealed)))
+    Ok(Some(PairwiseFrame::from_frame(&bytes)?))
 }
 
 /// Open sealed bytes from [`recv_pairwise`] into an SKDM (still unverified — the
