@@ -1598,6 +1598,20 @@ impl ChannelState {
         self.persist_delivered(store)
     }
 
+    /// Whether this identity has consented to `target` reading it here.
+    ///
+    /// Read off the log through the evaluator, never a cached flag: a revocation
+    /// changes the answer because the log says so. This is what tells a keyring
+    /// removal which rooms it actually has to change the lock in (ADR-020 §3) —
+    /// rotating in a room where nothing was ever granted would be noise.
+    #[must_use]
+    pub fn has_consented(&self, target: &Digest32) -> bool {
+        let me = self.me();
+        MembershipView::new(&self.evaluator)
+            .readers_of(&me)
+            .contains(target)
+    }
+
     /// The admitted authors in `trusted` this identity has **not yet consented
     /// to** — who auto-consent still owes a first key release (ADR-020 §3).
     ///

@@ -2061,12 +2061,50 @@ impl Node {
         if !next.untrust(fingerprint) {
             return Outcome::Failed(Fault::NotConsented);
         }
+        // The ring is written FIRST and unconditionally, exactly as a revocation's
+        // log fact lands before its re-keys: if the rotations below cannot all be
+        // delivered, the decision must still have been taken. A removal that were
+        // undone by an unreachable peer would be a removal in name only.
         if let Err(e) = next.save(profile.store(), signer) {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        self.change_the_lock_against(fingerprint).await;
         self.publish().await;
         Outcome::Done
+    }
+
+    /// Rotate this identity's sender key and re-key everyone still in the ring, in
+    /// **every** room shared with `removed` (ADR-020 §3, "removing a key from the
+    /// ring MUST change the lock").
+    ///
+    /// Read access is a sender key already handed over, so removal cannot take it
+    /// back — it can only stop the removed party reading what comes *next*. That is
+    /// what rotation buys, and it is the honest limit: the history they already
+    /// hold stays theirs, which no protocol can change (ADR-007 enforcement
+    /// honesty).
+    ///
+    /// Only rooms where consent was actually granted are touched. Rotating in a
+    /// room that never granted anything would burn a generation and re-key
+    /// everyone to no effect.
+    ///
+    /// Bounded honestly: the rotation and its log fact land unconditionally, and
+    /// the re-keys are best-effort and retried on the tick for whoever is offline —
+    /// exactly as `revoke` does, because this reuses that machinery rather than
+    /// inventing a second kind of revocation.
+    async fn change_the_lock_against(&mut self, removed: &Digest32) {
+        let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+        for channel_id in channels {
+            let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+                continue;
+            };
+            if !shared.lock().await.has_consented(removed) {
+                continue;
+            }
+            // `revoke` is the whole act: rotate, record the log fact, re-key the
+            // members who keep consent, and emit `Revoked`.
+            let _ = self.revoke(&channel_id, *removed).await;
+        }
     }
 
     /// Issue consent to every trusted, admitted author that does not hold it yet,

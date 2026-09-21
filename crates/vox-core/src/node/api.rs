@@ -226,10 +226,17 @@ pub enum NodeCommand {
         /// What this node will call it. Local; nothing is registered.
         petname: String,
     },
-    /// Stop trusting an identity node-wide (ADR-020 §3).
+    /// Stop trusting an identity node-wide, and **change the lock** (ADR-020 §3).
     ///
-    /// Forward-looking: it stops future auto-consent and does **not** recall
-    /// consent already granted, which is [`NodeCommand::Revoke`], per room.
+    /// Removes the ring entry, then rotates this identity's sender key and re-keys
+    /// everyone still in the ring, in **every** room shared with the removed party
+    /// — reusing ADR-007's revocation machinery (M18.1). The removed party keeps
+    /// the history it already holds, which is unavoidable, and reads nothing
+    /// published afterwards.
+    ///
+    /// The ring edit lands unconditionally; the re-keys are best-effort and
+    /// retried on the tick for whoever is offline, so removal is a network act
+    /// rather than a local flag.
     Untrust {
         /// The identity to stop trusting.
         fingerprint: Digest32,
