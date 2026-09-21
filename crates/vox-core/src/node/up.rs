@@ -34,6 +34,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 
@@ -101,6 +102,44 @@ where
     }
 }
 
+/// How long one request waits for the host to become reachable before refusing.
+///
+/// The proxy binds before it can reach anybody, deliberately (see [`HostDialer`]), so the
+/// first request can arrive before this node has read the board and learned where the host
+/// is. Refusing immediately made that visible as a product defect: the automated rehearsal
+/// (`service_rehearsal_proof`) sees **two** refusals over about four seconds before a
+/// CONNECT succeeds, which for a person is `ssh` failing and then working if they try
+/// again.
+///
+/// Waiting *inside one request* does not bring back the problem the eager dial had. That
+/// one blocked **binding**, so a proxy which came up could refuse everything for ever;
+/// this blocks only the request that is waiting, on its own task, while every other
+/// request and the accept loop keep running.
+const HOST_PATIENCE: Duration = Duration::from_secs(20);
+
+/// Poll interval while waiting. Short enough that a ready host costs a person nothing.
+const HOST_POLL: Duration = Duration::from_millis(250);
+
+/// A connection to `host`, waiting up to [`HOST_PATIENCE`] for one to become possible.
+///
+/// `None` means it stayed unreachable for the whole window, which is a refusal a person
+/// should see — the room's host may genuinely be offline.
+async fn reach_host_with_patience<D: HostDialer>(
+    dialer: &D,
+    host: &Digest32,
+) -> Option<Arc<VoxConnection>> {
+    let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
+    loop {
+        if let Some(conn) = dialer.connection(host).await {
+            return Some(conn);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(HOST_POLL).await;
+    }
+}
+
 /// The bound address reported back to a SOCKS client. The proxy does not bind a per-
 /// connection address, and RFC 1928 lets a server report all-zeroes for that.
 const UNSPECIFIED: SocketAddr =
@@ -131,7 +170,7 @@ async fn handle<D: HostDialer>(
         socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
         return Err(Error::MalformedTunnel("no such .vox name on this machine"));
     };
-    let Some(conn) = dialer.connection(&room.host).await else {
+    let Some(conn) = reach_host_with_patience(dialer, &room.host).await else {
         socks::write_reply(&mut stream, Reply::GeneralFailure, UNSPECIFIED).await?;
         return Err(Error::Unreachable("no connection to that room's host"));
     };

@@ -886,6 +886,69 @@ an earlier claim that it was:** M17.4.
   (`vox-tui/src/cli.rs:332`, `node/actor.rs:2763`). **The M17.3 gate (`node_m17_up_gate`) asserts the
   vulnerability**: it supplies a member set and zero governance entries, then proves successful traffic
   (`tests/node_m17_up_gate.rs:118`). It must be rewritten, not extended.
+  - **Rehearsed end to end, 2026-09-21.** Four real commands on one machine, two profiles and a
+    headless anchor: `vox node` → `vox serve 22` → `vox connect <address>` → `vox up <room>` →
+    `ssh user@<52-char>.vox`. The host's own `sshd` answered through the overlay — remote software
+    version `OpenSSH_10.3`, a completed SSH transport handshake, and authentication failing only for
+    want of a key. **Three defects the gates could not have caught**, all of them in the composition
+    rather than the mechanism, are recorded here because they are the argument for rehearsing at all:
+    1. **The generated passphrase did not match itself.** `vox serve` handed the node the hyphenated
+       form while `vox connect` stripped the hyphens, so every join was refused with no indication
+       why. The release gate could not see it: it drove the node API directly and used one passphrase
+       value for both sides.
+       The first fix was wrong and is worth recording. It canonicalized — strip hyphens — at "the
+       node's boundary", making a hyphen never part of a room passphrase. That broke an existing test
+       immediately, for the right reason: a joiner calling `NodeNet::start_join` directly bypasses that
+       boundary, so a room created through the node and joined through the library derived two
+       different secrets. A rule any direct caller can violate silently is worse than no rule.
+       **The fix is symmetry, not canonicalization:** the hyphens are part of the secret, nothing
+       strips them, and there is deliberately no function that could. What is printed is what both
+       sides use, byte for byte. The cost — a listener who drops the dashes gets it wrong — is real and
+       accepted: this string is copied beside a 277-character address, not retyped.
+    2. **`vox node` printed an anchor spec nobody could dial.** A wildcard bind advertises `0.0.0.0`,
+       which names every interface to the kernel and nothing to a peer; it was printed as something to
+       paste into `--anchor`. Undialable addresses are now filtered out of that line.
+    3. **`vox up` refused to start on a race.** It dialled the host *before* binding, so a node that
+       had only just joined — and therefore had not yet read the board — could not find the host and
+       the command failed intermittently. Retrying inside the actor would have made it worse, because
+       the actor is what reads the board. The dial is now **per request**: the proxy binds at once and
+       asks the node to reach the host when a connection arrives.
+  - **Automated as a real-binary proof. *Done 2026-09-21* (M17.15).**
+    `crates/vox-tui/tests/service_rehearsal_proof.rs` runs the same four commands as **real
+    child processes** over three separate profiles: `vox node` (whose printed `--anchor` spec
+    the proof parses and uses, so an undialable spec fails there), `vox serve <port>` (whose
+    room id, `vox://` address and **generated passphrase** are taken from its stdout and used
+    verbatim, so a passphrase that does not match itself fails there), `vox connect`, and
+    `vox up`. A **real SOCKS5 client** in the proof then sends the `.vox` **name** — not an
+    address, which is the `socks5h` behaviour the design requires — and real bytes through a
+    real TCP echo service, which must come back byte-identical. Nothing reaches into
+    `vox_core`: if a person could not do it from a shell, the proof does not do it.
+
+    **It found a product defect on its first run, which is the argument for it.** The proxy
+    refused the first two CONNECTs over about four seconds — `Reply::GeneralFailure`, because
+    `vox up` binds before it can reach the host (deliberately) and the first request can
+    arrive before this node has read the board. For a person that is `ssh` failing and then
+    working if they try again. Fixed by `node::up::reach_host_with_patience`: one request now
+    waits up to 20s for the host, polling every 250ms, *inside that request's own task*. That
+    does not reinstate the problem the eager dial had — that one blocked **binding**, so a
+    proxy which came up could refuse everything for ever; this blocks only the request that
+    is waiting. The proof asserts **one CONNECT, first try, no retry loop**, and is
+    mutation-checked: reverting the patience makes it fail with the user-visible symptom.
+
+    Two further observations recorded rather than fixed: `vox up` requires the **room
+    passphrase** even though the join is durable, because the room's store is sealed under it
+    (ADR-010) — so a guest keeps the passphrase for as long as it wants the service, not
+    merely to join once; and the host's own stdout is the only place client attribution can
+    come from, since the service sees every Vox client as `127.0.0.1` (decision 6), which the
+    proof asserts.
+
+  - **Superseded by the above (was: being automated).** The rehearsal above was run by hand, which is
+    why its findings are recorded as prose rather than as a gate that would catch a regression. It is
+    becoming `crates/vox-tui/tests/service_rehearsal_proof.rs`: the same four commands as **real child
+    processes**, asserting real bytes through a real TCP service. The decider's rule is that a test counts
+    only if it drives the shipped binary — *"if we have cargo tests at all they have to be real or they're
+    just noise"* — and this is the one that proves the service feature works. It lands **before** M17.7, so
+    that changing the authorization cannot silently break the product.
 - **M17.4 — *not built.*** Anchors as configuration. `vox node` prints a spec to paste; `<config_dir>/anchors`
   does not exist.
 - **M17.5 — *superseded by M17.10.*** `0x000F` advertisements become decision 9's content descriptor.
