@@ -1,14 +1,27 @@
 # ADR-020: Agent comms — a room-based messaging app on the Vox layer
 
-**Status**: **partly implemented** (2026-09-21). **Decision 3's trust keyring is built and merged**
-(M19.2: `node::trust::Keyring`, `NodeCommand::{Trust,Untrust}`, `NodeView::trusted`,
-`ChannelState::owed_consents`, auto-consent retried on the tick), and **decision 1's crate now exists**
-(M19.3, the envelope + claim rules). The rest — decisions 2 and 4–9 — remains proposed. An earlier status
-line said "nothing in this ADR is implemented. The crate it names does not exist yet" after both had
-landed; corrected here.
+**Status**: **partly implemented** — 2026-09-21. Twelve decisions; the plan below marks each
+milestone `DONE` with the commit that landed it, or leaves it unmarked. Nothing here is marked done
+that has not passed a gate.
 
-**Decision 3 was also generalised the same day** and is no longer an agent-comms mechanism: the keyring is
-Vox's **only** way to grant read access, for people as much as for agents. See decision 3.
+**Built and merged**: §1 (the app tier — `crates/vox-agentcomms` exists), §3 (the trust keyring),
+§4 (the envelope), §5 (the claim model — *as a library; see §5's note on reachability*), §6 (the
+drain hook, for Claude Code and Codex), §7 (the event fan-out and the control socket), §8 (the `vox
+room` verbs).
+
+**Decided but unbuilt**: §10 (no delegated trust — a rejection, so nothing to build), §11 (file
+exchange over a room-bound service), §12 (a node that runs without a terminal).
+
+**Two corrections worth a reviewer's attention**, both recorded in place rather than quietly
+dropped:
+
+1. **§3 was generalised the same day it landed** and is no longer an agent-comms mechanism at all:
+   the keyring is Vox's **only** way to grant read access, for people as much as for agents.
+2. **§6 shipped proving less than it appeared to.** `agent_hook_proof` proves the hook emits the
+   shape each harness documents; it could not prove a harness *shows the model* what it injects,
+   because the machine's API key returned 401 and no model ran. That is stated in the proof's own
+   header and M19.5b exists to close it.
+
 **Date**: 2026-09-21
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, app-tier, node, ipc, consent, keyring, harness-integration
@@ -316,6 +329,30 @@ Resolution rules, which every node **MUST** apply identically so the answer conv
 This is deliberately a *convention over the open tail* of §4, not new protocol: the log already
 provides the total order and the deterministic tie-break key.
 
+**Reachability — a gap found 2026-09-21 and not yet closed.** Everything above has existed in
+`crates/vox-agentcomms` since M19.3 and **nothing in the shipped binary called any of it**:
+`ClaimOp::{Claim, Release, Handoff}` and the `resolve`/`resolve_with` fold were exercised only by
+their own gate. An agent could speak, and could not take a piece of work, give it up, hand it over,
+or ask what was already taken. The decider's requirement is agents that "communicate **and split
+work loads**", and only the first half was reachable.
+
+Three further requirements follow from trying to use it, and are recorded here because each was
+invisible until the model met a command line:
+
+- A claim **MUST** report whether it was **won**. A claim is a message, not a lock, so posting one
+  is not taking the resource — an earlier claim beats it. An agent that cannot tell the difference
+  starts work somebody else is already doing, which is the exact failure claims exist to prevent.
+  The process exit status is the machine-readable half of that answer.
+- A board **MUST** distinguish the reader's own claims from everyone else's, which requires a client
+  to know its own fingerprint. The control socket did not tell it; `Frame::Hello` now carries it
+  (protocol 2).
+- A `handoff` **MUST NOT** be shown as a completed transfer until the recipient's petname can be
+  resolved to a fingerprint. A petname is local to whoever typed it. Resolution needs the trust
+  keyring, which has no control-socket request yet, so a handoff is displayed as the intent it is
+  and marked unresolved rather than guessed at.
+
+M19.9 is that work.
+
 ### 6. Delivery: queue always, interrupt only when addressed and urgent — and the drain is a hook
 
 A message **MUST** always land in the recipient's durable inbox, which is the room's log read from
@@ -409,6 +446,103 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
 - `status` **SHOULD** supersede the previous `status` from the same `(author, session, thread)` in a
   rendered view rather than appending a new line.
 
+### 10. Trust is not delegated, inherited or transitive
+
+**Considered and rejected 2026-09-21.** A recurring design in this space lets one identity vouch for
+others: node-1 trusts node-2; node-2 stands for node-3 and node-4; therefore 3 and 4 are trusted as
+agents of 2. It is attractive because it collapses N enrolments into one. It is rejected, and the
+decider's reason is the short one — **the explicit model is cleaner**. The long ones:
+
+- **It contradicts decision 3.** The keyring is Vox's *only* way to grant read access, and every
+  consent grant must be **caused by** a ring entry. Inherited access produces consented readers with
+  no ring entry, and "removing a key changes the lock" stops being true — the property that decision
+  exists to guarantee.
+- **The revocable set becomes coarser than intent.** Trusting node-2 admits 3 and 4 together.
+  Dropping 3 alone is inexpressible; the only lever also drops 4. An operator can no longer say what
+  they mean.
+- **The security boundary becomes remotely editable.** Node-2 admits node-5 tomorrow and node-1's
+  readable set grows with no act by node-1 and no notice to it. This is the vouching escalation the
+  keyring was adopted to close, re-entering by another door.
+- **It requires an ownership primitive that does not exist here.** Identity is per (host, harness),
+  §2 — peers, with no hierarchy. Ownership demands answers for who owns an owner, what a key
+  rotation does to the owned, and whether an agent outlives its owner. Each is new state, and none
+  buys a capability the explicit model lacks.
+
+**Labelling does not justify it either.** One might keep attestation only to answer "is this
+participant a machine?" while refusing it for authorization. That is also rejected: an identity
+admitted **by fingerprint, deliberately, one at a time** is already known to the operator who
+admitted it, and the petname recorded at that moment says what it is more reliably than a credential
+does. Attestation solves the problem of admitting agents nobody individually approved — a problem
+this design does not have, because §3 chose not to create it.
+
+The cost is N enrolments, once per agent and never per room. §3 already accepted that, and it buys a
+trusted set that is finite, local and wholly the operator's.
+
+### 11. A file is exchanged over a room-bound service, not through the log
+
+**Decided 2026-09-21 by the decider, against an earlier draft of this section.** Agent comms needs
+file exchange — a patch, a log, a test artefact, a tarball. The draft proposed carrying bytes as
+chunked log payloads per ADR-014, with `StructTag::ChunkManifest` (`0x000A`,
+`vox/chunk-manifest/v1`) finally implemented. That is withdrawn. The mechanism already exists one
+layer down:
+
+> "nc over vox over room bound service is the answer for files."
+
+A room-bound service (ADR-013/017) already carries arbitrary TCP between members, end-to-end
+encrypted and consent-bound, through NAT on both sides. The decider's own idiom — `nc -l -p 9999`
+on the receiving side, `cat foo.bar | nc <host> 9999` on the sending side — **is** a file transfer,
+and over Vox the address becomes a `.vox` name. So:
+
+- File exchange **MUST** use a room-bound service. The **push** direction — receiver listens, sender
+  connects — is the default, because it is the idiom in use. Sender-serves is the variant, for an
+  artefact several agents want or one an absent agent should collect on waking.
+- The sender **MUST** post an envelope announcing the transfer, carrying the `.vox` host, the port,
+  the file name, the size and the **SHA-256**, in the envelope's existing `data` field.
+- A receiver **MUST** verify the stream against that hash before using the file. This is the one
+  thing the `nc` idiom never gave anyone: `cat | nc` **truncates silently** — the connection drops,
+  the receiver gets a partial file and `nc` exits 0. The hash turns that into a loud failure.
+- `StructTag::ChunkManifest` **remains reserved and unimplemented**. ADR-014's in-log chunking is
+  chat's concern, not agent comms'.
+- **No new wire format.** No struct tag, no codec, nothing added to the CBOR field checklist.
+
+Two properties follow and are stated rather than discovered later. The **announcement is durable** —
+it is a log entry, so an agent asleep when it was sent still sees it on waking. The **bytes are
+live** — the sender must still be serving, so a late collector may find the transfer gone. It can
+then say so, which is better than a reference that silently resolves to nothing.
+
+What this replaces, and why: the draft's reasoning was that a reference is unsafe without something
+always-on to serve it, which is true of a URL pointing at someone's laptop. It does not apply here,
+because the name resolves inside our own overlay with consent-bound reach and the sender's signature
+covers the hash. The draft also proposed a size cap with a refusal above it; that is withdrawn too,
+since the service path has no reason to care how large the file is.
+
+Confidentiality needs no step of its own. The decider's habit of `gpg`-encrypting a file before
+sending it is unnecessary here: the overlay supplies confidentiality and the peer is a pinned key
+with consent-bound reach.
+
+### 12. Agents attach to a node that can run without a terminal
+
+**A gap found 2026-09-21 while building M19.5, not yet closed.** §7 and the `vox room` verbs assume
+"a node that is already running and already unlocked". Nothing that can run unattended satisfies
+that today:
+
+- `run_live` (the TUI) is the **only** caller of `node::ipc::bind`. It needs a TTY, prompts
+  interactively to unlock, and per ADR-015 **locks the node on SIGHUP** — so detaching it from a
+  terminal defeats it by design.
+- `run_node` (`vox node`) is an **anchor**: it serves the board, coordinates punches and carries
+  circuits, but it is `headless(signer)` with no identity unlocked, holds no room and can read
+  nothing. It never binds the control socket.
+
+So an agent session on a server with no attended terminal has no node to attach to, and agent comms
+does not work there. That contradicts this ADR's premise — sessions "on the same host, or n-count
+remote hosts" — and **blocks M19.7**, which cannot rehearse two machines if each needs a human
+watching a TUI.
+
+Therefore a headless, room-holding, unlocked node **MUST** exist: it takes the passphrase once at
+start, holds the profile's rooms, binds the ADR-020 control socket, and runs until stopped. It
+**MUST NOT** lock on SIGHUP, which is the whole point. It is the node `vox room` and `vox agent
+hook` attach to.
+
 ## Non-goals
 
 - **A mirror of agent activity.** Tool calls, progress traces and per-turn chatter do not belong in
@@ -422,6 +556,7 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
   moderator and the log is the arbiter.
 - **IP-level anonymity**, per ADR-017. Confidentiality is the goal.
 - **An MCP delivery path**, per §6.
+- **Carrying file bytes through the log.** Withdrawn in §11 — a room-bound service already does it.
 
 ## Consequences
 
@@ -458,7 +593,7 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
 - Golden wire-byte vectors remain UNMET by deliberate decision (ADR-018), revisited when there is a
   second user or a second implementation.
 
-## Implementation plan (proposed — not started)
+## Implementation plan
 
 Both unknowns are already spiked; neither remains open.
 
@@ -545,10 +680,66 @@ Both unknowns are already spiked; neither remains open.
   alternative is a clock nobody has. Claims schedule cooperating agents; they are not a defence
   against one that lies.
 - **M19.4 — CLI and skill.** `vox room post|read|tail|wait|roster|say`, plus the skill.
-- **M19.5 — the harness drain hook.** `UserPromptSubmit` for Claude Code and Codex; the OpenCode
-  plugin. *Gate*: a message posted by one agent appears in another agent's context at its next turn
-  with no human action.
+- **M19.5 — the harness drain hook. DONE 2026-09-21** (Claude Code and Codex only; merged as
+  `6ca6575`). `vox agent hook` reads the harness's hook JSON on stdin and writes injected context on
+  stdout, exiting 0 whatever happens. `Format::{Auto,Claude,Text}` decides the output shape from the
+  input alone, so one installed command serves both harnesses. The cursor is per `session_id` and is
+  written **after** emitting, so a crash re-delivers rather than skips; a quiet room emits nothing at
+  all. Proved by `agent_hook_proof.rs` driving the real binary.
+
+  **Proved for the shape, not for the reading.** That proof states in its own header that it could
+  not confirm a harness actually *shows the model* what it injects: the spike's API key returned 401,
+  so no model ran. M19.5b closes that.
+
+- **M19.5b — OpenCode, and a live-model proof for all three harnesses.** OpenCode has no hook
+  command; it loads JavaScript plugins into its own process, so the integration must be a file.
+  `vox agent plugin opencode` is to print one — a shim that runs `vox agent hook --format text` and
+  injects what comes back, so there is exactly **one** implementation of what an agent has not read.
+
+  Measured against OpenCode 1.18.31 rather than taken from documentation, because the plugin API is
+  not publicly documented:
+
+  - `chat.message(input, output)` fires per user message; `output.parts` is what the model is about
+    to be shown.
+  - **A part id MUST start with `prt`.** Anything else fails the whole turn with
+    `SchemaError: Expected a string starting with "prt"`, surfacing as an `UnknownError` that names
+    nothing useful.
+  - Plugins load from `.opencode/plugin/`, `.opencode/plugins/` and
+    `$XDG_CONFIG_HOME/opencode/plugins/` — and `XDG_CONFIG_HOME` isolates a test from the operator's
+    real configuration.
+  - Touching the OpenCode client inside plugin init deadlocks the TUI, so the plugin never does.
+
+  *Gate*: a **real model turn**, against a real room, reproduces a token that was posted to that room
+  and appears nowhere in the prompt. `opencode run --pure` disables external plugins and is therefore
+  the mutation check — same prompt, plugin off, the token must vanish. All three harnesses are
+  installed here (Claude Code 2.1.278, Codex 0.155.1, OpenCode 1.18.31); `pi` is not, and is out of
+  scope until it is.
+
+- **M19.5c — a node that runs without a terminal** (§12). Required before M19.7 and required for the
+  ADR's premise that sessions may be on "n-count remote hosts". Today the TUI is the only caller of
+  `node::ipc::bind`, and it locks on SIGHUP.
+
+- **M19.9 — the work board: claims reachable from the product.** *The highest-priority gap, ahead of
+  M19.7 and M19.8.* The decider's requirement is that agents "communicate **and split work loads**",
+  and today only the first half is reachable. `vox-agentcomms` has the whole model — the §5
+  vocabulary, `ClaimOp::{Claim{resource, ttl_secs}, Release, Handoff{to}}`, and `resolve`/
+  `resolve_with` folding a room's claims into an `Ownership` map with a deterministic tie-break —
+  and **nothing in the shipped binary calls any of it**. `resolve` is exercised only by its own
+  gate. An agent can post and read; it cannot take a piece of work, give it up, hand it over, or ask
+  what is already taken.
+
+  So: verbs to claim, release and hand off, and — the one that makes the others worth having — a
+  **board** that answers *what is taken, by whom, and what is free*. Without it two agents split work
+  by convention and politeness, which is what the claim model exists to replace. *Gate*: two agents
+  contend for one resource, exactly one holds it, the loser is told so, and a claim with a `ttl_secs`
+  that lapses returns the resource without either agent acting.
+
 - **M19.6 — the interrupt path**, per harness.
+
+- **M19.8 — file exchange** (§11). A verb that offers a file over a room-bound service and posts the
+  signed announcement carrying `.vox` host, port, name, size and SHA-256; and one that collects and
+  **verifies against the hash before use**. No wire change. *Gate*: a file crosses between two agents
+  and a deliberately truncated transfer is refused rather than accepted silently.
 - **M19.7 — rehearsal.** Two real agent sessions on two machines exchanging an `assign` and a
   `result`, with the operator joining and addressing one of them by petname. Following M17's lesson,
   this rehearsal is **REQUIRED** before the feature is described as working: every CLI-composition
