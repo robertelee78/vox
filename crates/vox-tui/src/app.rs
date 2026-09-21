@@ -274,6 +274,8 @@ pub fn run_node(
         .anchors(anchors)
         .headless(signer)
         .anchor_logs(true);
+    // Kept for the anchors file the loop below writes (M17.4); the node takes its own clone.
+    let anchors_paths = paths.clone();
     let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
     let fp = vox_core::node::link::b32_encode(&fingerprint);
     println!("vox node: identity {fp}");
@@ -290,7 +292,18 @@ pub fn run_node(
                     // the operator a string guaranteed not to work.
                     let listening = dialable(node.view().listening);
                     if listening != printed && !listening.is_empty() {
-                        println!("vox node: give clients --anchor with one of:");
+                        // Written, not only printed (ADR-017 decision 7, M17.4). A client
+                        // on this machine then needs no `--anchor` at all, which was the
+                        // point: pasting a 52-character fingerprint and a multiaddr into
+                        // every command was the second-worst step in the flow.
+                        match write_anchors_file(&anchors_paths, &fp, &listening) {
+                            Ok(path) => println!("vox node: wrote {}", path.display()),
+                            // Not fatal. An anchor that serves but could not write a
+                            // convenience file is still an anchor, and the operator can
+                            // paste the specs below.
+                            Err(e) => eprintln!("vox node: could not write the anchors file ({e})"),
+                        }
+                        println!("vox node: clients on this machine need no --anchor. Elsewhere:");
                         for addr in &listening {
                             println!("  {fp}@{addr}");
                         }
@@ -549,6 +562,39 @@ pub fn run_daemon(
         let _ = node.apply(NodeCommand::Shutdown).await;
     });
     Ok(())
+}
+
+/// Write this anchor's own specs into the profile's anchors file (ADR-017 decision 7, M17.4),
+/// returning the path written.
+///
+/// Rewritten whole on every change rather than appended to, so a restart on a new port does not
+/// leave a stale line behind that a client would waste a dial on. Written to a temporary file and
+/// renamed, so a reader never sees a half-written file.
+///
+/// The file carries no secret — an anchor spec is a public identity and a public address — so it is
+/// ordinary configuration, and a person may edit it to add anchors on other machines.
+fn write_anchors_file(
+    paths: &Paths,
+    fp: &str,
+    listening: &[String],
+) -> std::io::Result<std::path::PathBuf> {
+    use std::fmt::Write as _;
+    let path = paths.anchors_file();
+    let mut body = String::from(
+        "# Written by `vox node`. Anchors this profile publishes to, reads from and reaches\n\
+         # peers through: one <fingerprint>@<multiaddr> per line. Add anchors on other\n\
+         # machines here; `--anchor` on a command merges with this file rather than\n\
+         # replacing it. Rewritten whole whenever this node's addresses change.\n",
+    );
+    // `listening` is already multiaddr text, filtered by `dialable` so a wildcard bind's
+    // `0.0.0.0` — a bind address no peer can dial — never reaches the file.
+    for addr in listening {
+        let _ = writeln!(body, "{fp}@{addr}");
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
 }
 
 pub fn run_live(

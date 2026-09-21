@@ -1,10 +1,9 @@
 # ADR-017 — Room-Bound Services (the Tor-hidden-service equivalent)
 
-**Status**: **revised — the authorization model of decision 3 is withdrawn.** Decisions 5 and 6 are built
-and shipped in v0.1.0 (`node::up`, `node::resolver`). **Decision 7 is NOT built**: `vox node` prints an
-`--anchor` spec for the operator to paste (`vox-tui/src/app.rs:293`) and every command still takes the flag
-(`vox-tui/src/cli.rs:49`); `<config_dir>/anchors` does not exist, so M17.4 is outstanding. An earlier
-draft of this line claimed decision 7 shipped — corrected here, found by review. Decisions 1, 3, 4, 8, 9,
+**Status**: **revised — the authorization model of decision 3 is withdrawn.** Decisions 5, 6 and 7 are
+built (`node::up`, `node::resolver`, and M17.4's `<config_dir>/anchors` as of 2026-09-22). An earlier
+draft of this line claimed decision 7 shipped when it did not; it was corrected to "not built" by review
+and is now genuinely built, with a real-binary proof. Decisions 1, 3, 4, 8, 9,
 10 and 11 are **proposed and not built**; what ships today implements the withdrawn model and is a live
 vulnerability until M17.6–M17.13 land.
 **Date**: 2026-09-21
@@ -573,10 +572,29 @@ is where padding belongs if it is ever wanted.
 
 ### 7. The anchor is configuration, not an argument
 
-> **Not built (review, 2026-09-21).** `vox node` *prints* an `--anchor` spec for the operator to paste
-> (`vox-tui/src/app.rs:293`) and every command still requires the flag (`vox-tui/src/cli.rs:49`).
-> `<config_dir>/anchors` does not exist. An earlier draft of this revision listed this decision as shipped
-> in v0.1.0; it is M17.4 and outstanding.
+> **Built 2026-09-22 (M17.4).** `vox node` writes the file and every command reads it; `--anchor`
+> still works and **merges** rather than replaces, because anchors are additive and a person adding one
+> on the command line rarely means "forget the configured one". An earlier draft of this revision listed
+> the decision as shipped in v0.1.0 when it was not; it was then recorded as outstanding, and now it is
+> done.
+>
+> **The file is machine-wide, which is what makes the decision work.** `Paths::resolve` puts
+> `profile_dir` under the data root but takes `config_dir` from the config root, so
+> `<config_dir>/anchors` is shared by every profile on the machine — one file written by `vox node`,
+> read by every client. Building the proof is what surfaced this: the first version shared a *data*
+> directory between two processes and failed with `Failed(Storage)`, because redb is single-writer. Two
+> `vox` processes cannot share a profile; they share a machine.
+>
+> Details: one `<fingerprint>@<multiaddr>` per line, `#` comments and blank lines skipped so the file
+> explains itself, rewritten whole on every address change (so a restart on a new port leaves no stale
+> line to waste a dial on), written to a temporary file and renamed so a reader never sees it half
+> written, and a malformed line is an error rather than silently skipped. It carries no secret — an
+> anchor spec is a public identity and a public address.
+>
+> Gate: `crates/vox-tui/tests/anchors_config_proof.rs`, real binaries. `vox node` writes the file; a
+> **different profile** on the same machine runs `vox serve` with no `--anchor` and its invite carries
+> the anchor it learned from the file; a third profile runs `vox connect` with no `--anchor` and joins.
+> Mutation-checked: stop reading the file and it fails.
 
 `--anchor <fp>@<addr>` on every command is the second-worst step. Anchors become **configuration**:
 
@@ -949,8 +967,10 @@ an earlier claim that it was:** M17.4.
     only if it drives the shipped binary — *"if we have cargo tests at all they have to be real or they're
     just noise"* — and this is the one that proves the service feature works. It lands **before** M17.7, so
     that changing the authorization cannot silently break the product.
-- **M17.4 — *not built.*** Anchors as configuration. `vox node` prints a spec to paste; `<config_dir>/anchors`
-  does not exist.
+- **M17.4 — anchors as configuration. *Done 2026-09-22.*** `<config_dir>/anchors`, written by
+  `vox node`, read by every command, merged under `--anchor` rather than replaced. Machine-wide, because
+  `config_dir` is not per-profile. Gate: `anchors_config_proof.rs` drives real binaries and a client in
+  its own profile joins with no flag; mutation-checked.
 - **M17.5 — *superseded by M17.10.*** `0x000F` advertisements become decision 9's content descriptor.
 
 New work, in dependency order:
