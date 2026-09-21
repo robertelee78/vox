@@ -651,8 +651,11 @@ fn m16_a_tcp_service_is_reached_across_the_overlay_between_two_nated_clients() {
         })
         .await;
 
-        // Before any grant the service is dark, even to a member: Bob's forward binds
-        // (that is local) but carries nothing.
+        // **Before Alice trusts him the service is dark to Bob, and he is already a full
+        // member of the room** — admitted, syncing, reading her messages. That is the whole
+        // point of M17.7 and the strongest single assertion in this file: membership is not
+        // authorization. Bob's forward binds, because binding is local and needs nobody's
+        // permission, and it carries nothing.
         let out = bob
             .apply(NodeCommand::Forward {
                 channel_id: cid,
@@ -670,12 +673,12 @@ fn m16_a_tcp_service_is_reached_across_the_overlay_between_two_nated_clients() {
         {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut app = tokio::net::TcpStream::connect(dark).await.unwrap();
-            let _ = app.write_all(b"before the grant").await;
+            let _ = app.write_all(b"a member, not yet trusted").await;
             let mut buf = [0u8; 1];
             let read = tokio::time::timeout(Duration::from_secs(20), app.read(&mut buf)).await;
             assert!(
                 matches!(read, Ok(Ok(0)) | Ok(Err(_))),
-                "a service with no capability granted is dark: {read:?}"
+                "a member the host has not trusted reached the service: {read:?}"
             );
         }
         assert!(bob
@@ -683,19 +686,26 @@ fn m16_a_tcp_service_is_reached_across_the_overlay_between_two_nated_clients() {
             .await
             .is_done());
 
-        // Alice grants Bob dial:ssh — a fact on the room's log.
+        // Alice decides she trusts Bob. **This, and nothing else, is what opens the
+        // service** (ADR-017 decision 3, M17.7).
+        //
+        // This leg used to be `GrantTunnel` — `dial:ssh` as a fact on the room's log,
+        // reaching Bob by sync. That model is withdrawn: the capability came from a genesis
+        // grant conferred on every admitted member, so *joining* was the authorization, and
+        // anyone holding the address and passphrase could reach every service in the room.
+        // A gate asserting it would assert the vulnerability. Reach is now the host's own
+        // keyring intersected with the room's author set, so the act is local to Alice and
+        // names a person, not a port.
         let out = alice
-            .apply(NodeCommand::GrantTunnel {
-                channel_id: cid,
-                target: bob_fp,
-                service_tag: "ssh".into(),
-                may_bind: false,
-                expiry: 2_000_000_000,
+            .apply(NodeCommand::Trust {
+                fingerprint: bob_fp,
+                petname: "bob".into(),
             })
             .await;
-        assert!(out.is_done(), "Alice grants Bob dial:ssh: {out:?}");
+        assert!(out.is_done(), "Alice trusts Bob: {out:?}");
 
-        // It reaches Bob by ordinary sync — nobody tells him.
+        // Nothing has to sync for this: the decision is Alice's and it is already made. The
+        // loop below is for the relayed circuit coming up, not for a grant propagating.
         let forwarded = tokio::time::timeout(TIMEOUT, async {
             loop {
                 let out = bob
@@ -732,7 +742,7 @@ fn m16_a_tcp_service_is_reached_across_the_overlay_between_two_nated_clients() {
             }
         })
         .await
-        .expect("the grant synced and the tunnel carried real bytes");
+        .expect("a trusted member reached the service and the tunnel carried real bytes");
 
         // The path was a relayed circuit: both clients are behind symmetric NATs, so
         // no punch was possible, and the anchor carried the packets it cannot read.

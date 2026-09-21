@@ -386,42 +386,51 @@ fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Send
 /// yet. A pre-authentication denial of service, and worst against the node most likely to be
 /// always-on and public, which is an anchor. The loop's own comment claimed a slow peer could
 /// not stall the others; that was true only of the stream loop, after the handshake.
+/// The node's inbound accept loop.
+///
+/// **This performs each handshake inline, and that is a known denial-of-service gap**
+/// (finding #3): one peer that opens a connection and then stalls its TLS handshake blocks
+/// every other inbound connection, with no credential of any kind, because authentication
+/// has not happened yet. It matters most for an always-on node, which is what an anchor is.
+///
+/// The two-phase API that fixes it exists and is tested — [`ConnectionManager::accept_incoming`]
+/// and [`ConnectionManager::finish_incoming`], the handshake bounded at 30 seconds — but it is
+/// **deliberately not wired in here yet.** Spawning phase two per attempt makes
+/// `m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor` and
+/// `m16_a_tcp_service_is_reached_across_the_overlay_between_two_nated_clients` time out, while
+/// `m15_members_never_online_together_converge_through_the_anchor` keeps passing. Measured, not
+/// suspected: serialising this loop again and changing nothing else turns both back green, and
+/// clean upstream passes all three in 40s.
+///
+/// The two that break both carry a **relayed circuit** between peers behind symmetric NATs,
+/// where no punch is possible; the one that survives converges through the anchor without a
+/// live circuit. So something in circuit establishment depends on the ordering this loop
+/// currently imposes, and the mechanism is not yet understood.
+///
+/// Shipping the split would trade a pre-authentication DoS for an overlay that cannot form a
+/// swarm through an anchor, which is a worse product. The ordering is deliberate: an
+/// authorization bypass outranks a DoS, and a DoS outranks not working. Those two NAT gates are
+/// now the acceptance test for the real fix.
 fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     tokio::spawn(async move {
         loop {
-            // Phase one: take the attempt and come straight back for the next one.
-            let Some(incoming) = net.manager().accept_incoming().await else {
-                // The endpoint closed. Tell the actor, exactly as the serialised loop did —
-                // it acts on `Stopped`, and dropping that send was a real regression I
-                // introduced while splitting this loop, caught by a dead-code warning on the
-                // variant rather than by any test.
-                let _ = tx.send(NetEvent::Stopped).await;
-                break;
-            };
-            // Phase two, on its own task and bounded by `HANDSHAKE_TIMEOUT`.
-            let net2 = Arc::clone(&net);
-            let tx2 = tx.clone();
-            tokio::spawn(async move {
-                // Open-swarm default: any authenticated identity may connect, because a
-                // node that serves the board must accept peers it does not know yet
-                // (ADR-011/ADR-012). What a peer may *open* is the stream-kind gate.
-                let finished = net2
-                    .manager()
-                    .finish_incoming(
-                        incoming,
-                        crate::transport::quic::Admission::AcceptAnyAuthenticated,
-                    )
-                    .await;
-                // A failed or abandoned handshake needs no handling: there is nothing to
-                // report and nothing to stop, because the loop that matters is already back
-                // at `accept_incoming`.
-                if let Ok(conn) = finished {
+            let accepted = net
+                .manager()
+                .accept(crate::transport::quic::Admission::AcceptAnyAuthenticated)
+                .await;
+            match accepted {
+                Ok(Some(conn)) => {
                     let peer = conn.peer_id();
-                    spawn_stream_loop(Arc::clone(&net2), conn, tx2.clone());
-                    let _ = tx2.send(NetEvent::Connected { peer }).await;
+                    spawn_stream_loop(Arc::clone(&net), conn, tx.clone());
+                    if tx.send(NetEvent::Connected { peer }).await.is_err() {
+                        break;
+                    }
                 }
-            });
+                Ok(None) => break,
+                Err(_) => continue,
+            }
         }
+        let _ = tx.send(NetEvent::Stopped).await;
     });
 }
 
