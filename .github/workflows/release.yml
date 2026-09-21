@@ -82,6 +82,9 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          # A tag is a release, and a release MUST be signed (ADR-015). Only a manual dispatch,
+          # a fork or a pull request may fall back to ad-hoc signing; a tag never can.
+          VOX_ALLOW_UNSIGNED: ${{ startsWith(github.ref, 'refs/tags/') && '' || '1' }}
         run: scripts/sign-macos.sh target/release/vox
 
       - name: Package release assets
@@ -119,6 +122,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          # See the arm64 job: a tag never falls back.
+          VOX_ALLOW_UNSIGNED: ${{ startsWith(github.ref, 'refs/tags/') && '' || '1' }}
         run: scripts/sign-macos.sh target/x86_64-apple-darwin/release/vox
 
       - name: Package release assets

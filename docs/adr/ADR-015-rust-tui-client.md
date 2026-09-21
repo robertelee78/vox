@@ -2,7 +2,7 @@
 
 **Status**: implemented (M12 + M13.5, `crates/vox-tui/`) — live client over the embedded node; the network verbs landed with ADR-016 M14–M15 and the room-bound-service CLI with ADR-017 M17
 **Date**: 2026-06-20
-**Updated**: 2026-09-21 — `vox update`, `install.sh`, `scripts/package-release.sh`, `scripts/sign-macos.sh` and `.github/workflows/release.yml` implement §Distribution's install/update model, and the marker now **names the channel** (with a `proof` channel that exists so the digest-mismatch refusal can be proved); the absence of an independent release signature is recorded as a known gap. 2026-09-21 — the **install and update model** is specified (GitHub Releases only, a per-target release record fetched through `latest/download`, fail-closed transport, origin-confined redirects, atomic publish with rollback, `vox shell-setup`, signed+notarized macOS artifacts); see §Distribution. 2026-09-20 — the network verbs are wired (join from a link, invite, consent) and the binary listens (`--listen`); ADR-016 M14.7g. 2026-09-19 — status reconciled; test count corrected; Known gaps recorded. 2026-09-19 (M13.5): live `CoreHandle`, tokio runtime, masked onboarding prompts, composer, idle/SIGHUP lock, primary-buffer + lock gates met; `tui-textarea` dropped.
+**Updated**: 2026-09-21 — macOS signing is now **enforced** (`scripts/sign-macos.sh` fails without the secrets; a tag cannot use the ad-hoc fallback), and the decision to hold `v0.1.0` until a Developer ID Application certificate exists is recorded in §Distribution. 2026-09-21 — `vox update`, `install.sh`, `scripts/package-release.sh`, `scripts/sign-macos.sh` and `.github/workflows/release.yml` implement §Distribution's install/update model, and the marker now **names the channel** (with a `proof` channel that exists so the digest-mismatch refusal can be proved); the absence of an independent release signature is recorded as a known gap. 2026-09-21 — the **install and update model** is specified (GitHub Releases only, a per-target release record fetched through `latest/download`, fail-closed transport, origin-confined redirects, atomic publish with rollback, `vox shell-setup`, signed+notarized macOS artifacts); see §Distribution. 2026-09-20 — the network verbs are wired (join from a link, invite, consent) and the binary listens (`--listen`); ADR-016 M14.7g. 2026-09-19 — status reconciled; test count corrected; Known gaps recorded. 2026-09-19 (M13.5): live `CoreHandle`, tokio runtime, masked onboarding prompts, composer, idle/SIGHUP lock, primary-buffer + lock gates met; `tui-textarea` dropped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: client, tui, rust, terminal, ratatui, verification, consent-ui
 
@@ -281,10 +281,26 @@ the binary, and it MUST be skippable (`VOX_NO_SHELL_SETUP=1`) and exactly remova
 (`--remove`). Its proof is the standard ADR-018 cites.
 
 **Targets** are `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. macOS
-artifacts MUST be signed and notarized with a Developer ID: an unsigned download is quarantined by
-Gatekeeper, and "clear the quarantine flag by hand" is not an acceptable first run for a tool whose
-purpose is confidentiality. Signing MUST happen **after** `strip`, which rewrites the Mach-O and
-invalidates any earlier signature.
+artifacts MUST be signed and notarized with a **Developer ID Application** certificate: an unsigned
+download is quarantined by Gatekeeper, and "clear the quarantine flag by hand" is not an acceptable
+first run for a tool whose purpose is confidentiality. Signing MUST happen **after** `strip`, which
+rewrites the Mach-O and invalidates any earlier signature.
+
+That obligation is **enforced, not merely stated**: `scripts/sign-macos.sh` fails when the signing
+secrets are absent, and the release workflow permits its ad-hoc fallback only on a non-tag run
+(`VOX_ALLOW_UNSIGNED=1`, set for a manual dispatch, a fork or a pull request). A tag never sets it, so
+an unsigned release cannot be published.
+
+**Decision, 2026-09-21 — `v0.1.0` is not tagged yet, and that is deliberate.** The machinery above is
+implemented and proved, but no Developer ID Application certificate exists: vox's repository has no
+`APPLE_*` secrets, and the development machine holds only an *Apple Development* certificate, which
+notarytool rejects. The options were weighed and the decision was **to wait for the certificate rather
+than publish an unsigned macOS artifact** — a curl-installed ad-hoc-signed binary does in fact run
+(`curl` sets `com.apple.provenance`, not `com.apple.quarantine`, verified 2026-09-21), so the
+temptation to ship anyway was real; it was declined because the asset downloaded from the release page
+in a browser *is* quarantined, and telling a confidentiality tool's users to wave Gatekeeper through
+teaches the wrong reflex. The tag is blocked on: a Developer ID Application certificate exported as a
+`.p12`, and the six repository secrets `scripts/sign-macos.sh` names.
 
 ## Consequences
 
