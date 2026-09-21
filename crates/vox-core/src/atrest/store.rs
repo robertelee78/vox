@@ -61,6 +61,10 @@ pub fn content_id(object: &[u8]) -> Cid {
 pub enum SegmentKind {
     /// A page of the log database (skeletons + retained payloads).
     LogDb,
+    /// The node-wide trust keyring (ADR-020 §3): which identities this node has
+    /// decided to trust, and the petname it calls each of them. Sealed because it
+    /// records *who you talk to*, which a stolen disk should not yield.
+    Trust,
     /// A decrypted **plaintext** cache page — must only ever exist inside a sealed
     /// segment (ADR-010 forbids unencrypted plaintext caches at rest).
     PlaintextCache,
@@ -95,6 +99,7 @@ impl SegmentKind {
             SegmentKind::PrekeyRing => b"vox/seg/prekey-ring/v1",
             SegmentKind::AnchorLog => b"vox/seg/anchor-log/v1",
             SegmentKind::AnchorMeta => b"vox/seg/anchor-meta/v1",
+            SegmentKind::Trust => b"vox/seg/trust-keyring/v1",
         }
     }
 }

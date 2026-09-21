@@ -95,6 +95,9 @@ pub struct NodeView {
     pub open_channels: Vec<ChannelDetail>,
     /// The live forwards, in bound-address order (ADR-013 Dial).
     pub forwards: Vec<ForwardInfo>,
+    /// The trust keyring: `(fingerprint, petname)` in fingerprint order, empty
+    /// while locked because the keyring is sealed under the identity (ADR-020 §3).
+    pub trusted: Vec<(Digest32, String)>,
     /// Every channel this node's **board** holds a genesis for — the channels it
     /// anchors, whether or not it is a member — in channelID order. What an anchor
     /// can say about itself: which rooms it serves and how many members it knows of
@@ -210,6 +213,26 @@ pub enum NodeCommand {
         channel_id: Digest32,
         /// The member whose consent is withdrawn.
         target: Digest32,
+    },
+    /// Trust an identity node-wide, under a local petname (ADR-020 §3).
+    ///
+    /// The decision is per **identity**, not per room: from here on, every room
+    /// this node shares with `fingerprint` auto-consents to it, including rooms
+    /// created later. That is what makes an agent's first contact a one-time act
+    /// instead of an act per room.
+    Trust {
+        /// The identity to trust.
+        fingerprint: Digest32,
+        /// What this node will call it. Local; nothing is registered.
+        petname: String,
+    },
+    /// Stop trusting an identity node-wide (ADR-020 §3).
+    ///
+    /// Forward-looking: it stops future auto-consent and does **not** recall
+    /// consent already granted, which is [`NodeCommand::Revoke`], per room.
+    Untrust {
+        /// The identity to stop trusting.
+        fingerprint: Digest32,
     },
     /// Create a **service room** and offer one local TCP service in it, in one act
     /// (ADR-017 decisions 3 and 4) — what `vox serve <port>` does.

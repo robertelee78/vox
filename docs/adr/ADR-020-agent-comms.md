@@ -401,10 +401,32 @@ Both unknowns are already spiked; neither remains open.
   `chmod` is required; a leftover socket file makes `bind` fail with `AddrInUse`, so a stale file is
   unlinked deliberately; a dead client reads as clean EOF and writes to it fail `BrokenPipe`, both
   isolated to that connection.
-- **M19.2 — the trust keyring (`vox-core`).** `vox trust add|list|remove`, persistence, the bulk
-  import wrapper, and auto-consent on an admitted author whose fingerprint is trusted. *Gate*: a
-  member in the keyring is read without a manual consent act; a **vouched** author absent from the
-  keyring is admitted as a log author and reads **nothing**. Mutation-checked by trusting it.
+- **M19.2 — the trust keyring (`vox-core`). DONE 2026-09-21.** `node::trust::Keyring` (fingerprint →
+  petname), `NodeCommand::{Trust, Untrust}`, `NodeView::trusted`, `ChannelState::owed_consents`, and
+  auto-consent retried on the tick beside `deliver_owed_rekeys` — consent *is* a network act (the
+  SKDM rides a pairwise session), so a trusted member that is offline is skipped and picked up when
+  it returns, exactly as a re-key is.
+  **At rest**: sealed under a key derived from the identity (`vox/trust-keyring-sek/v1`, the same
+  shape as an anchor's log key), kept as a ciphertext blob in the store's public `meta` table — which
+  stays honest, since ciphertext *is* a public fact. Two intended consequences: a stolen disk yields
+  no trust graph without the identity, and **trust operations require an unlocked identity**, which
+  is right, because deciding whom to trust is an identity-level act.
+  **`Untrust` is forward-looking only.** It stops future auto-consent and recalls nothing already
+  granted; recalling that is `Revoke`, per room. ADR-007's enforcement honesty applies and this must
+  not paper over it.
+  *Gate* `node_m19_trust_gate` (release): three nodes in one room, **no `Consent` command issued
+  anywhere**. Bob is in Alice's keyring and reads her; Carol is a full member and an admitted log
+  author, receives every byte by ordinary sync (her entry count matches Alice's), and renders
+  nothing. Plus a lock/unlock test proving trust — and untrust — survive, since "trust once, covers
+  every future room" is false if it does not.
+  Mutation-checked two ways: a companion test trusting Carol as well (she then reads all three
+  messages, so the gate is measuring the keyring and not a timing accident), and a code mutation
+  removing the keyring filter from `owed_consents` — which is *precisely* the rejected genesis
+  flag's behaviour — caught with "carol is NOT in the keyring and must read nothing, but rendered
+  [...]".
+  The bulk provision-time import wrapper is **not** here: it is a CLI convenience over
+  `NodeCommand::Trust`, so it lands with the CLI in M19.4 rather than adding a second trust path to
+  the library.
 - **M19.3 — `crates/vox-agentcomms`.** The envelope, the reserved core, the claim rules of §5, the
   `hops` and reply-only-when-addressed rules of §9.
 - **M19.4 — CLI and skill.** `vox room post|read|tail|wait|roster|say`, plus the skill.
