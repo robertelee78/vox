@@ -288,8 +288,9 @@ installed.
 
 `install.sh` cannot use continuity — a first install has nothing to compare against — so it MUST pin
 the expected team and identifier in the script itself and make the same signature and notarization
-checks against them. That pin and the workflow's `APPLE_CODESIGN_IDENTIFIER` / `APPLE_TEAM_ID` MUST
-agree; they are deliberately two statements of the same fact, one asserting what a release must be
+checks against them. The identifier is `us.vox.cli`, following the `us.<name>.cli` convention this
+account's other releases use (`us.hf2q.cli`, `us.ctm.cli`). That pin and the workflow's
+`APPLE_CODESIGN_IDENTIFIER` / `APPLE_TEAM_ID` MUST agree; they are deliberately two statements of the same fact, one asserting what a release must be
 and one producing it, so a change to either without the other fails the installer loudly rather than
 shipping something the installer will reject. Neither client reads its trust expectations out of the release record: the
 record is served by the same origin as the binary, so trusting it to describe its own signer would

@@ -21,7 +21,7 @@ REPO="robertelee78/vox"
 # compare against, so the expectation has to live in the installer. (`vox update` does not need
 # this — it requires the candidate to carry the same Developer ID as the binary it replaces.)
 APPLE_TEAM_ID="3T2D2YNTVW"
-APPLE_IDENTIFIER="us.agidreams.vox"
+APPLE_IDENTIFIER="us.vox.cli"
 # VOX_RELEASE_BASE exists for the installer's own end-to-end test against a local
 # stand-in server; the origin check below still applies to redirects from it.
 BASE="${VOX_RELEASE_BASE:-https://github.com/${REPO}/releases}"
