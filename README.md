@@ -7,13 +7,14 @@ accounts, no phone numbers — and for anyone who wants `ssh` into a machine wit
 
 A channel ID and passphrase get a newcomer *into* a room and nothing further: each member decides
 independently whose messages that newcomer may read, so an unapproved joiner decrypts none of them.
-Vox generates your identity on first run — an Ed25519 key paired with an ML-DSA-65 post-quantum
-co-key — and exports the Ed25519 half in OpenPGP format, so a peer can compare fingerprints with
+Vox generates your identity on first run — an Ed25519 key paired with an ML-DSA-65 one — and
+exports the Ed25519 half in OpenPGP format, so a peer can compare fingerprints with
 tooling they already trust. Beyond chat, the overlay carries arbitrary TCP between members.
 
-Key agreement is X25519 with ML-KEM-768; signatures are Ed25519 with ML-DSA-65. The halves are
-concatenated, so both must be broken to read or forge anything — a quantum computer that breaks the
-classical half opens no traffic recorded today.
+Key agreement is X25519 with ML-KEM-768; signatures are Ed25519 with ML-DSA-65 — each a classical
+algorithm concatenated with a lattice one, so breaking either alone is not enough. The point of
+building it that way is that nobody, including us, can tell you the lattice halves are sound: they
+are young, and hybrids exist because neither half is trusted on its own.
 
 ---
 
@@ -49,17 +50,16 @@ Mainstream secure messengers force trade-offs Vox refuses to make:
   Messages you cannot decrypt replicate but are not rendered. *(ADR-006, ADR-008)*
 - **Self-sovereign identity.** Vox generates the root itself — an Ed25519 key plus an ML-DSA-65
   co-key, 1984 bytes of public key — and the fingerprint peers compare is SHA-256 over *both* halves,
-  so the post-quantum co-key cannot be swapped without changing it. The Ed25519 half carries a
+  so the second key cannot be swapped without changing it. The Ed25519 half carries a
   standard OpenPGP v4 fingerprint, checkable with PGP tooling. No accounts, no phone numbers, no
   directory; per-channel pseudonymous identities are your choice. Adopting an *existing* GPG key as
   the root is specified but not built. *(ADR-002)*
-- **Hybrid post-quantum key agreement and signatures.** Key agreement combines X25519 with
-  ML-KEM-768 and signatures combine Ed25519 with ML-DSA-65, concatenated so an attacker must break
-  both a classical and a post-quantum algorithm to read or forge anything — a quantum computer that
-  breaks the classical half opens no traffic recorded today. The QUIC
-  handshake is restricted to the single hybrid group `X25519MLKEM768`, so there is no classical
-  group to downgrade to. What this does *not* claim: the post-quantum algorithms are young, and
-  hybrids exist precisely because neither half is trusted alone. *(ADR-003, ADR-011)*
+- **Hybrid key agreement and signatures.** X25519 with ML-KEM-768, and Ed25519 with ML-DSA-65,
+  concatenated — so breaking one algorithm of a pair is not enough. **If** the lattice halves hold,
+  traffic recorded now stays closed to an adversary who later breaks the classical ones; nobody can
+  tell you they hold, and that conditional is the whole reason for the hybrid. The QUIC handshake is
+  pinned to the single group `X25519MLKEM768`, so there is no classical group to downgrade to.
+  *(ADR-003, ADR-011)*
 - **Per-channel deniability — specified and built, not yet enabled.** ADR-009 designs message
   content that carries no transferable proof of authorship to outsiders while membership and
   governance stay verifiable, and `vox-core/src/deniable/` implements it. **No release turns it on**:
@@ -76,7 +76,7 @@ Each layer is a decision record in `docs/adr/`, built in dependency order:
 1. **Identity & keys** *(ADR-002)* — a generated Ed25519 + ML-DSA-65 root, OpenPGP-representable;
    role-separated keys (governance vs message
    vs key-agreement), per-channel identity selection, hybrid PQ co-keys.
-2. **Post-quantum policy** *(ADR-003)* — hybrid everywhere (X25519+ML-KEM, Ed25519+ML-DSA),
+2. **Crypto-agility policy** *(ADR-003)* — hybrid everywhere (X25519+ML-KEM, Ed25519+ML-DSA),
    versioned/negotiable ciphersuites, two normative PQXDH hardening rules.
 3. **Pairwise secure channel** *(ADR-004)* — PQXDH key agreement + Double Ratchet, forward secrecy.
 4. **Channel addressing & join** *(ADR-005)* — channelID (rendezvous) + passphrase (CPace PAKE,
@@ -104,11 +104,12 @@ Each layer is a decision record in `docs/adr/`, built in dependency order:
 
 ## Threat model
 
-Vox claims exactly what its controls deliver — **post-quantum content confidentiality, content
-authenticity, and unforgeable membership** — and is explicit about what it does not.
+Vox claims exactly what its controls deliver — **content confidentiality, content authenticity, and
+unforgeable membership** — and is explicit about what it does not. Where a control rests on a lattice
+algorithm, the claim rests on that algorithm being sound, which is an assumption and not a result.
 
 **Defended:** an **on-path network adversary** (including a resourced ISP) — content is end-to-end,
-post-quantum-hybrid encrypted and authenticated, and channel membership cannot be forged;
+hybrid-encrypted and authenticated, and channel membership cannot be forged;
 **platform / server operators** — there is none to trust or be deplatformed by; a **wrongly-added
 participant / passphrase holder** (the "Signalgate" case) — per-sender consent gates readability per
 author; and **device seizure at rest** (a powered-off or locked device) — double-lock at-rest
