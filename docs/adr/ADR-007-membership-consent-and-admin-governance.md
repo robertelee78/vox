@@ -2,7 +2,7 @@
 
 **Status**: implemented (M6, `crates/vox-core/src/governance/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-21 — the genesis body gains a **service grant** (ADR-017 decision 3: capabilities conferred on every admitted member, no certificate issued to anyone) and a new **`service-grant-exclusion`** (`0x0013`) takes it back per member, which is what keeps a capability-bearing room from being a one-way door. **Per-member consent revocation is live** (M18.1): `vox`'s `revoke` verb rotates the
+**Updated**: 2026-09-21 (later the same day) — **per-sender consent now carries service authorization.** A room-bound service is reachable by exactly the members its host has consented to for reading (ADR-017 decision 3, revised), so the outbound-consent machinery below is load-bearing for reach as well as readability, and a consent revocation withdraws both. The **genesis service grant and its `service-grant-exclusion` (`0x0013`) are withdrawn**; `0x0013` is retired and not reused. Earlier the same day — the genesis body gains a **service grant** (ADR-017 decision 3: capabilities conferred on every admitted member, no certificate issued to anyone) and a new **`service-grant-exclusion`** (`0x0013`) takes it back per member, which is what keeps a capability-bearing room from being a one-way door. **Per-member consent revocation is live** (M18.1): `vox`'s `revoke` verb rotates the
 sender key, records the `consent-revocation` fact and re-keys the remaining consenters; it needs no
 network, and a release gate proves the revoked member reads nothing afterwards while the others lose
 nothing. 2026-09-20 — the join/consent flow now has a runtime: joiner-side channel state, author admission as a log fact, and consent grants appended and evaluated (`node::channel`, ADR-016 M14.5). 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin"; genesis policy and policy-update carry the ADR-003 `min_suite` floor.
@@ -107,9 +107,12 @@ above, each governance struct has this canonical body (ADR-008 tags in parenthes
   over ADR-004), history_mode_at_grant }` — the SKDM itself travels in the pairwise session, not inline;
   the entry carries only its hash.
 - **consent-revocation** (`0x0005`): `{ target_id(composite fpr), new_chain_id }`.
-- **service-grant-exclusion** (`0x0013`, added 2026-09-21): `{ target_id(composite fpr) }` — withdraws
-  the genesis **service grant** from one member. Issued by a `delegate` holder, authorized from the
-  entry's strict causal past exactly as an admin-delegation-revocation is.
+- ~~**service-grant-exclusion** (`0x0013`)~~ — **added and withdrawn 2026-09-21.** It withdrew the genesis
+  **service grant** from one member. Both it and the grant are withdrawn by ADR-017 decision 3 as revised:
+  authorization for a room-bound service is the host's **per-sender consent**, so there is no
+  membership-conferred capability left to exclude anyone from. **The wire tag `0x0013` is retired and must
+  not be reused**, so that a node holding an old log cannot have a retired entry reinterpreted as something
+  else.
 - **policy-update** (`0x0006`): `{ history_mode?, ttl? }` (never `deniability_mode`).
 
 ### Invite modes (how a joiner's identity is known — no admin "admit" step)
@@ -165,7 +168,10 @@ Four properties make it safe, and all four are normative:
    feeds is local too: a host serving its own service consults the keys it verified itself, and refuses
    anyone it has not (fail closed). An evaluator built without a member set confers nothing, which is the
    safe default for any caller that does not know who the members are.
-4. **It is revocable per member, by a `service-grant-exclusion` (`0x0013`).** This is not a convenience.
+4. **~~It is revocable per member, by a `service-grant-exclusion` (`0x0013`).~~ Withdrawn with the grant
+   itself (ADR-017 decision 3, revised 2026-09-21); the reasoning is kept because it is the record of why
+   the mechanism existed, and its last sentence is the statement of verified finding #5.** This is not a
+   convenience.
    ADR-007's admin-delegation-revocation names *the entry hash of a delegation*, and a genesis grant
    issues no delegation — so without a fact that names the **identity**, adding a genesis grant would
    *remove* the per-member control the channel already had, since an explicit certificate can always be
