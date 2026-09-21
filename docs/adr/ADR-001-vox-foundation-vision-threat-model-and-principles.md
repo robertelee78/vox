@@ -55,7 +55,11 @@ the same overlay carries arbitrary byte streams (e.g. `ssh` over Vox), not just 
    grants nothing readable; each member individually consents to a newcomer. (ADR-007)
 5. **Conventional, well-reviewed cryptography.** Novelty lives in the *trust model*, not the
    primitives. Prefer standardized, analyzed constructions.
-6. **Post-quantum from the start.** Hybrid (classical + PQ) throughout. (ADR-003)
+6. **Hybrid cryptography from the start.** Every key agreement and every signature pairs a classical
+   algorithm with a lattice one, from the first release rather than retrofitted. Stated as the
+   construction, not as an outcome: whether the lattice halves hold is an assumption, and the hybrid
+   exists because it is one. *(Reworded 2026-09-22 — this read "Post-quantum from the start", which
+   names a property nobody can demonstrate rather than a decision we made.)* (ADR-003)
 7. **Chat and tunneling are both first-class.** (ADR-011, ADR-013)
 8. **MIT licensed.** Maximally permissive; open source is a requirement, not a preference.
 9. **Capability-driven development.** Each capability is researched, specified, and defined
@@ -76,8 +80,9 @@ authenticity, and unforgeable membership**; that is a real, bounded property, no
 Defended adversaries:
 
 - **On-path network adversary (passive or active), including a resourced ISP.** Message *content* is
-  end-to-end encrypted with post-quantum-hybrid confidentiality (harvest-now-decrypt-later resistant,
-  ADR-003/004) and authenticated, and channel *membership* cannot be forged (ADR-005/007). Such an
+  end-to-end encrypted under a hybrid construction and authenticated — so recorded ciphertext stays
+  closed to an adversary who later breaks only the classical half, which is the harvest-now-decrypt-later
+  case **conditional on the lattice half holding** (ADR-003/004), and channel *membership* cannot be forged (ADR-005/007). Such an
   adversary cannot read or tamper with content, or inject itself into a channel. It *can* still
   observe communication metadata (see non-goals).
 - **Platform / server operator.** Eliminated by construction: there is no Vox server, account, or
