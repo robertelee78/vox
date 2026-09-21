@@ -20,8 +20,15 @@ The motivating problems with existing secure messengers:
   real-world identity.
 - **Room-level admission ("Signalgate," March 2025).** In Signal/Megolm/Sender-Keys, admission
   is a room-level property: one wrong add instantly exposes *all new* traffic from *everyone*,
-  because group membership is not cryptographically authenticated (Albrecht et al., IEEE S&P
-  2023; eprint 2023/485, 2023/1300).
+  because group membership is not cryptographically authenticated. The cryptographic case is
+  Albrecht, Celi, Dowling and Jones, *Practically-exploitable Cryptographic Vulnerabilities in
+  Matrix*, **IEEE S&P 2023** (eprint 2023/485); the follow-on work on device-oriented group
+  messaging is eprint 2023/1300, which is a **different paper and a later venue**. Signalgate
+  itself was human error — a contact mix-up — and is cited because the room-level model is what
+  made a single misclick sufficient, not because a protocol was broken.
+
+  *Citation corrected 2026-09-21 (review): this pinned both eprints to "IEEE S&P 2023", which is
+  wrong for 2023/1300. A reader who chases a reference should find what the text claims.*
 
 The author distrusts implementations with central servers or closed source, and requires full
 control and customization. This ADR fixes the vision, threat model, and cross-cutting

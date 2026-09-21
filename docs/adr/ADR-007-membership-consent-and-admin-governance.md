@@ -23,8 +23,10 @@ Signal/Matrix/WhatsApp, group membership is not cryptographically authenticated,
 exposes all future traffic. Vox makes admission a *per-member, per-sender* cryptographic decision
 with no central authority, while providing workable, verifiable admin and policy in a serverless
 setting. It is built on identity (ADR-002), channel join (ADR-005), Sender Keys (ADR-006), and the
-causal log (ADR-008), and is validated against the Megolm membership-control attacks (Albrecht et
-al., IEEE S&P 2023; eprint 2023/1300). This ADR specifies the complete governance protocol: the
+causal log (ADR-008), and is validated against the Megolm membership-control attacks (Albrecht,
+Celi, Dowling and Jones, *Practically-exploitable Cryptographic Vulnerabilities in Matrix*, IEEE
+S&P 2023, eprint 2023/485). *Citation corrected 2026-09-21 (review): this cited eprint 2023/1300,
+which is a different, later paper — the Megolm membership result is in 2023/485.* This ADR specifies the complete governance protocol: the
 trust anchor, the certificate/grant schema, the consent and revocation flows, and conflict
 resolution under partition.
 
