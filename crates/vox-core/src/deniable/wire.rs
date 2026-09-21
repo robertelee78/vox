@@ -17,8 +17,18 @@
 //! |---|---|---|
 //! | 1 `COMMIT` | `[1, author_id, commit]` | 3 |
 //! | 2 `REVEAL` | `[2, author_id, author_pubkey, epk, share, nonce, reveal_sig]` | 7 |
-//! | 3 `CONFIRM` | `[3, author_id, round2, bind_sig, confirm_mac]` | 5 |
-//! | 4 `REKEY` | `[4, author_id, epk, share, round2, bind_sig, confirm_mac]` | 7 |
+//! | 3 `ROUND2` | `[3, author_id, x]` | 3 |
+//! | 4 `CONFIRM` | `[4, author_id, round2, bind_sig, confirm_mac]` | 5 |
+//! | 5 `REKEY` | `[5, author_id, epk, share, round2, bind_sig, confirm_mac]` | 7 |
+//!
+//! ## Why `ROUND2` is its own message
+//! It was not, and the omission made the codec undriveable — found by independent review on
+//! 2026-09-21, not by these tests. `DgkaMember::finalize` needs the **complete** `X_*` map
+//! before it can produce a `Confirm`, so if `Confirm` were the only carrier of `X_i` then no
+//! member could confirm until every member had confirmed. A deadlock, invisible to a test that
+//! gathers `own_round2()` in process — which is exactly the shortcut this codec exists to
+//! remove. `X_i` therefore broadcasts on its own, and `CONFIRM` still carries it so the value a
+//! member confirms under is bound to the value it published.
 //!
 //! ## What this codec does and does not do
 //! It moves bytes and rejects malformed ones. It does **not** verify a commitment
@@ -46,8 +56,9 @@ use crate::deniable::share::SHARE_LEN;
 
 const ROUND_COMMIT: u64 = 1;
 const ROUND_REVEAL: u64 = 2;
-const ROUND_CONFIRM: u64 = 3;
-const ROUND_REKEY: u64 = 4;
+const ROUND_X: u64 = 3;
+const ROUND_CONFIRM: u64 = 4;
+const ROUND_REKEY: u64 = 5;
 
 /// One `dgka-setup` log entry: a single round's broadcast from a single member.
 #[derive(Debug, Clone)]
@@ -63,6 +74,15 @@ pub enum DgkaMessage {
     },
     /// Round 2: the values the commitment covered, with the member's static signature.
     Reveal(Reveal),
+    /// Round 3: the member's Burmester–Desmedt round-2 value `X_i`, broadcast on its own so
+    /// every member can assemble the full `X_*` map that deriving `K` requires. Without this
+    /// the protocol cannot run over a log at all.
+    Round2 {
+        /// The broadcasting member's static identity fingerprint.
+        author_id: Digest32,
+        /// `X_i = x_i·(z_{i+1} − z_{i−1})` over the canonical ring.
+        x: [u8; SHARE_LEN],
+    },
     /// Rounds 3–4: the Burmester–Desmedt value `X_i`, the DSKE bind, and the key
     /// confirmation MAC.
     Confirm(Confirm),
@@ -107,6 +127,7 @@ impl DgkaMessage {
         match self {
             Self::Commit { author_id, .. } => *author_id,
             Self::Reveal(r) => r.author_id,
+            Self::Round2 { author_id, .. } => *author_id,
             Self::Confirm(c) => c.author_id,
             Self::ReKey(r) => r.author_id,
         }
@@ -132,6 +153,12 @@ impl DgkaMessage {
                     .bytes(&r.share[..])
                     .bytes(&r.nonce[..])
                     .bytes(&r.reveal_sig.to_bytes());
+            }
+            Self::Round2 { author_id, x } => {
+                e.array(3)
+                    .uint(ROUND_X)
+                    .bytes(author_id.as_slice())
+                    .bytes(&x[..]);
             }
             Self::Confirm(c) => {
                 e.array(5)
@@ -209,6 +236,10 @@ impl DgkaMessage {
                     reveal_sig,
                 })
             }
+            (ROUND_X, 3) => Self::Round2 {
+                author_id: digest(&mut d, "dgka-setup round2 author_id length")?,
+                x: share_of(&mut d, "dgka-setup round2 value length")?,
+            },
             (ROUND_CONFIRM, 5) => Self::Confirm(Confirm {
                 author_id: digest(&mut d, "dgka-setup confirm author_id length")?,
                 round2: share_of(&mut d, "dgka-setup confirm round2 length")?,
