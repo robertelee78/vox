@@ -11,20 +11,57 @@
 # tool whose purpose is confidentiality. On a cross-built x86_64 binary `strip` removes the
 # ad-hoc signature entirely, so signing is what makes the Intel package runnable at all.
 #
-# Gated on the secrets being present, so forks and pull requests still build: without them the
-# binary is ad-hoc signed and the job warns loudly rather than failing.
+# **Signing is mandatory for a release.** If the secrets are absent this script FAILS, so a tagged
+# release cannot be published unsigned. Decided 2026-09-21: an unsigned macOS artifact is not
+# shipped at all, rather than shipped with a footnote — a confidentiality tool that teaches its
+# users to wave Gatekeeper through has already lost the argument.
+#
+# `VOX_ALLOW_UNSIGNED=1` permits the ad-hoc fallback, and the release workflow sets it **only**
+# for non-tag runs (a manual dispatch, a fork, a pull request) so those still build. A tag never
+# sets it.
 #
 # Required secrets: APPLE_CERT_P12_BASE64, APPLE_CERT_PASSWORD, APPLE_SIGNING_IDENTITY,
-# APPLE_ID, APPLE_TEAM_ID, APPLE_NOTARY_PASSWORD.
+# APPLE_ID, APPLE_TEAM_ID, APPLE_NOTARY_PASSWORD. The certificate MUST be a **Developer ID
+# Application** certificate; an "Apple Development" certificate is for local development and
+# notarytool rejects it.
+#
+# To set them up (needs a paid Apple Developer Program membership — a free personal team cannot
+# issue a Developer ID):
+#
+#   1. Create the certificate. Xcode → Settings → Accounts → your Apple ID → Manage
+#      Certificates → + → "Developer ID Application". It lands in the login keychain.
+#      Confirm with:  security find-identity -v -p codesigning
+#      The name it prints, in full, is APPLE_SIGNING_IDENTITY, e.g.
+#      "Developer ID Application: YOUR NAME (TEAMID)". The parenthesised part is APPLE_TEAM_ID.
+#   2. Export it. Keychain Access → My Certificates → right-click that identity → Export …
+#      → .p12, with a password (that password is APPLE_CERT_PASSWORD).
+#   3. Create an app-specific password for notarytool at appleid.apple.com → Sign-In and
+#      Security → App-Specific Passwords. That is APPLE_NOTARY_PASSWORD; APPLE_ID is the Apple
+#      ID's email address.
+#   4. Set them on the repository:
+#        base64 -i cert.p12 | tr -d "\n" | gh secret set APPLE_CERT_P12_BASE64 -R robertelee78/vox
+#        gh secret set APPLE_CERT_PASSWORD   -R robertelee78/vox
+#        gh secret set APPLE_SIGNING_IDENTITY -R robertelee78/vox
+#        gh secret set APPLE_ID              -R robertelee78/vox
+#        gh secret set APPLE_TEAM_ID         -R robertelee78/vox
+#        gh secret set APPLE_NOTARY_PASSWORD -R robertelee78/vox
+#        rm -f cert.p12
+#   5. Tag the release:  git tag -a v0.1.0 -m "vox v0.1.0" && git push origin v0.1.0
 set -eu
 
 BIN="${1:?usage: sign-macos.sh <binary>}"
 
 if [ -z "${APPLE_SIGNING_IDENTITY:-}" ] || [ -z "${APPLE_CERT_P12_BASE64:-}" ]; then
-  printf '::warning::Apple signing secrets are not set — shipping an ad-hoc-signed binary that Gatekeeper will quarantine. Set the APPLE_* secrets to notarize.\n'
-  codesign --force --sign - --timestamp=none "$BIN" || true
-  codesign -dvvv "$BIN" 2>&1 || true
-  exit 0
+  if [ "${VOX_ALLOW_UNSIGNED:-}" = 1 ]; then
+    printf '::warning::Apple signing secrets are not set — ad-hoc signing this build. It MUST NOT be published as a release (ADR-015).\n'
+    codesign --force --sign - --timestamp=none "$BIN" || true
+    codesign -dvvv "$BIN" 2>&1 || true
+    exit 0
+  fi
+  printf '::error::Apple signing secrets are not set, so this macOS binary cannot be signed and notarized, and ADR-015 forbids publishing an unsigned one.\n' >&2
+  printf 'Set APPLE_CERT_P12_BASE64, APPLE_CERT_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_TEAM_ID and APPLE_NOTARY_PASSWORD\n' >&2
+  printf 'on the repository (a Developer ID Application certificate, not an Apple Development one), then re-run this tag.\n' >&2
+  exit 1
 fi
 
 KEYCHAIN="${RUNNER_TEMP:-/tmp}/vox-signing.keychain-db"
