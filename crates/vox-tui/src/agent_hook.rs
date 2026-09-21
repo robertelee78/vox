@@ -252,6 +252,12 @@ async fn drain(
     let room_key = b32_encode(&channel_id);
     let label: String = room_key.chars().take(12).collect();
 
+    // Record how this session can be woken, while we are here and know both the
+    // session id and what the harness put in our environment (ADR-020 §6). It is a
+    // side effect of the drain rather than a step an operator configures, and the
+    // next turn rewrites it, so a stale entry corrects itself.
+    crate::wake::register(paths, &input.session_id, &room_key);
+
     let since = load_cursor(paths, &room_key, &input.session_id);
     let rows = match client
         .request(&Request::Read {
@@ -311,3 +317,12 @@ async fn drain(
 /// `vox agent hook`, reading `--format text`, so there is exactly one
 /// implementation of what an agent has not yet read.
 pub const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode-plugin.js");
+
+/// The agent-facing skill (ADR-020 §8), shipped in the binary so `vox agent skill`
+/// can print it.
+///
+/// A skill is **on-demand only** — it cannot guarantee an action every turn, which
+/// is why the drain is a hook and not an instruction. What it carries instead is
+/// the part a hook cannot: the conventions, the vocabulary, and the manners a room
+/// full of agents needs to stay readable by the person in it.
+pub const AGENT_SKILL: &str = include_str!("../assets/agent-skill.md");
