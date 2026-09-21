@@ -71,6 +71,8 @@ const MAX_RECORD_BYTES: usize = 4 * 1024;
 const MAX_MARKER_BYTES: usize = 4 * 1024;
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
+/// Only the macOS trust path reads a signature report, so this bound is macOS-only too.
+#[cfg(target_os = "macos")]
 const MAX_SIGNING_INFO_BYTES: usize = 64 * 1024;
 const MAX_VERSION_OUTPUT_BYTES: usize = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
