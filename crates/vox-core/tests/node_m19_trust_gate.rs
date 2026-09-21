@@ -149,8 +149,18 @@ async fn run(trust_carol: bool) -> (Vec<String>, Vec<String>, u64, u64) {
         .await;
     }
     // Alice has admitted both as log authors — membership, which is NOT read access.
+    //
+    // **Corrected 2026-09-21 (M17.6).** This asserted `entries(v, cid) > 0` under the
+    // label "both members admitted", which is a different claim: the entry it waited for
+    // was the consent grant each joiner appended when joining released its sender key
+    // automatically. With that release gone there is no entry to wait for, and the check
+    // could never pass — while the property it names was true all along. It now asserts
+    // membership directly, which is what it says and what the rest of the gate needs.
     until(&alice, "both members admitted", |v| {
-        v.channels.iter().any(|c| c.channel_id == cid) && entries(v, cid) > 0
+        v.open_channels
+            .iter()
+            .find(|c| c.channel_id == cid)
+            .is_some_and(|c| c.members.contains(&bob_fp) && c.members.contains(&carol_fp))
     })
     .await;
 

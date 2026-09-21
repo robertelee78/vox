@@ -69,6 +69,7 @@ use crate::join::cpace::{fresh_sid, CPACE_SHARE_LEN};
 use crate::join::pop::JoinPeerIdentity;
 use crate::join::pow::{Difficulty, PowToken, ResponderNonce};
 use crate::join::session::{join_accept, join_initiate, JoinContext};
+use crate::nat::record::JoinWitness;
 use crate::node::prekeys::{self, OneTimeUse, PrekeyRing};
 use crate::node::store::Store;
 use crate::pairwise::session::Session;
@@ -94,6 +95,8 @@ const OP_SHARE: u64 = 3;
 const OP_PROOF: u64 = 4;
 const OP_INIT: u64 = 5;
 const OP_ACCEPTED: u64 = 6;
+/// `8` — the joiner's ratchet message that opens the responder's sending direction.
+const OP_OPEN: u64 = 8;
 const OP_REJECTED: u64 = 7;
 
 /// Why a responder refused a join (see the module docs: deliberately coarse).
@@ -183,10 +186,38 @@ pub enum JoinFrame {
         /// `InitialMessage::to_wire` bytes.
         message: Vec<u8>,
     },
-    /// The join succeeded.
-    Accepted,
+    /// The join succeeded, and the responder's **witness** to it (M17.6).
+    ///
+    /// The responder is the only party that saw the joiner's ADR-005 proof, so it is
+    /// the only one that can honestly attest to it. The joiner keeps this and
+    /// publishes it with every bundle record it ever puts on a board: it is the
+    /// evidence that turns "here is my key" into "this key joined".
+    Accepted {
+        /// `JoinWitness::body_bytes` — the witness, signed by the responder.
+        witness: Vec<u8>,
+    },
     /// The join was refused.
     Rejected(JoinReject),
+    /// **Step 8, joiner → responder:** one ratchet message with an empty plaintext,
+    /// whose only job is to open the responder's sending direction (M17.6).
+    ///
+    /// A PQXDH responder begins with no chains — `Ratchet::init_responder`: *"with no
+    /// chains yet — they are established when the first inbound message triggers a DH
+    /// ratchet step"*. Step 6's `InitialMessage` creates the session but delivers no
+    /// ratchet message, so without this the responder cannot send at all and its first
+    /// `Consent` fails with "no sending chain".
+    ///
+    /// Joining used to meet that need by releasing the joiner's **sender key**, which
+    /// made a consent decision nobody took, to whichever member answered the join. This
+    /// meets it with nothing: an empty plaintext grants no key and no reach.
+    ///
+    /// It rides the **join stream** rather than a later pairwise stream so the responder
+    /// has processed it before the join returns. On a separate stream it was a race, and
+    /// a `Consent` issued straight after a join would fail or not depending on timing.
+    Open {
+        /// `Message::to_wire` bytes of a sealed, empty-plaintext ratchet message.
+        sealed: Vec<u8>,
+    },
 }
 
 impl JoinFrame {
@@ -239,8 +270,11 @@ impl JoinFrame {
             Self::Init { message } => {
                 e.array(2).uint(OP_INIT).bytes(message);
             }
-            Self::Accepted => {
-                e.array(1).uint(OP_ACCEPTED);
+            Self::Accepted { witness } => {
+                e.array(2).uint(OP_ACCEPTED).bytes(witness);
+            }
+            Self::Open { sealed } => {
+                e.array(2).uint(OP_OPEN).bytes(sealed);
             }
             Self::Rejected(r) => {
                 e.array(2).uint(OP_REJECTED).uint(u64::from(*r as u8));
@@ -297,7 +331,12 @@ impl JoinFrame {
             (OP_INIT, 2) => Self::Init {
                 message: d.bytes()?.to_vec(),
             },
-            (OP_ACCEPTED, 1) => Self::Accepted,
+            (OP_ACCEPTED, 2) => Self::Accepted {
+                witness: d.bytes()?.to_vec(),
+            },
+            (OP_OPEN, 2) => Self::Open {
+                sealed: d.bytes()?.to_vec(),
+            },
             (OP_REJECTED, 2) => {
                 let v = u8::try_from(d.uint()?)
                     .map_err(|_| Error::MalformedJoin("reject reason range"))?;
@@ -336,6 +375,10 @@ pub struct JoinOutcome {
     pub session: Session,
     /// The peer identity the ADR-005 proof-of-possession bound.
     pub peer: JoinPeerIdentity,
+    /// The witness to this join (M17.6). On the **joiner** side this is the
+    /// responder's attestation, kept and republished with every bundle record. On the
+    /// **responder** side it is the one this node just signed.
+    pub witness: JoinWitness,
     /// `true` when the one-time prekey had already been consumed (the session's
     /// forward-secrecy bonus is downgraded, never its confidentiality).
     pub last_resort_grade: bool,
@@ -470,16 +513,32 @@ pub async fn run_initiator(
     )
     .await?;
 
-    // 7. ACCEPTED.
-    match recv_frame(&mut recv).await? {
-        JoinFrame::Accepted => {}
+    // 7. ACCEPTED, carrying the responder's witness to this join (M17.6).
+    let witness = match recv_frame(&mut recv).await? {
+        JoinFrame::Accepted { witness } => JoinWitness::from_body(&witness)?,
         JoinFrame::Rejected(r) => return Err(Error::JoinRefused(r.as_str())),
         _ => return Err(Error::MalformedJoin("expected accepted")),
-    }
+    };
+    // Checked here, against the identity the handshake pinned, so a responder cannot
+    // hand back a witness for some other key or some other room and have it kept.
+    witness.verify(
+        &responder_pub,
+        &ctx.channel_id,
+        ctx.epoch,
+        &root.fingerprint(),
+    )?;
+
+    // 8. OPEN — one ratchet message, empty plaintext, so the responder can send at all.
+    //    On this stream rather than a later one, so it is processed before the join
+    //    returns (see `JoinFrame::Open`).
+    let mut session = session;
+    let sealed = session.encrypt(&[])?.to_wire();
+    send_frame(&mut send, &JoinFrame::Open { sealed }).await?;
     let _ = send.finish();
     Ok(JoinOutcome {
         session,
         peer,
+        witness,
         last_resort_grade: false,
     })
 }
@@ -533,10 +592,34 @@ pub async fn run_responder(
     store: &Store,
     ring: &mut PrekeyRing,
 ) -> Result<JoinOutcome> {
-    let result = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring).await;
-    match &result {
-        Ok(_) => {
-            send_frame(&mut send, &JoinFrame::Accepted).await?;
+    let mut result = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring).await;
+    match &mut result {
+        Ok(outcome) => {
+            // The witness `responder_exchange` minted beside the verification that
+            // justifies it. The joiner keeps it: it is what makes that key admissible
+            // to anyone else (M17.6).
+            send_frame(
+                &mut send,
+                &JoinFrame::Accepted {
+                    witness: outcome.witness.body_bytes(),
+                },
+            )
+            .await?;
+            // Step 8: the joiner's ratchet message, read **before returning**, so the
+            // session handed to the caller can already send. Without it this node holds
+            // a session it can receive on and never speak on, and its first `Consent`
+            // fails with "no sending chain" (see `JoinFrame::Open`).
+            // A joiner that says nothing here leaves this node unable to answer it.
+            // That is the joiner's loss and not a reason to refuse a join that is
+            // already complete and already witnessed, so anything else is tolerated:
+            // the session still receives, and a later `Hello`/`Open` on a pairwise
+            // stream can open the sending direction.
+            if let Ok(JoinFrame::Open { sealed }) = recv_frame(&mut recv).await {
+                let message = crate::pairwise::message::Message::from_wire(&sealed)?;
+                // An empty plaintext is the whole payload; what matters is that
+                // decrypting it steps the ratchet and yields a sending chain.
+                let _ = outcome.session.decrypt(&message, cfg.now_secs)?;
+            }
             let _ = send.finish();
         }
         Err(e) => {
@@ -658,9 +741,21 @@ async fn responder_exchange(
     };
     let session = bootstrap.bootstrap(&init, &prekeys, &mut reuse)?;
     debug_assert_eq!(session.is_last_resort_grade(), last_resort_grade);
+    // This node verified the joiner's ADR-005 proof of possession above, so it is the
+    // only party that can honestly attest to this join. The witness is minted here,
+    // beside the verification that justifies it, and `run_responder` sends it with the
+    // acceptance (M17.6).
+    let witness = JoinWitness::build(
+        cfg.root,
+        &cfg.ctx.channel_id,
+        cfg.ctx.epoch,
+        &peer.fingerprint,
+        cfg.now_secs,
+    )?;
     Ok(JoinOutcome {
         session,
         peer,
+        witness,
         last_resort_grade,
     })
 }

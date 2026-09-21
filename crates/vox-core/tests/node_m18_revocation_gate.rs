@@ -173,13 +173,19 @@ fn m18_revoking_one_member_keeps_the_others_whole() {
             })
             .await;
         }
-        // Alice must hold both joiners' keys before she serves anything: an ADR-004
-        // responder has no sending chain until it has received.
+        // **Rewritten 2026-09-21 (M17.6).** This waited for both joiners' sender keys to
+        // reach Alice before she consented to anybody, on the stated grounds that "an
+        // ADR-004 responder has no sending chain until it has received". The premise is
+        // true and the conclusion was the defect: what Alice needs is *a ratchet
+        // message*, not a *sender key*, and joining supplied the key — a consent grant
+        // to whichever member answered the join, decided by nobody. `JoinFrame::Open`
+        // now supplies the ratchet message with an empty plaintext, so Alice can send
+        // without having been given anything. Waiting for the key here asserted the
+        // defect, which is why this gate went green against it.
         drain_until(&alice, |evs| {
-            [bob_fp, carol_fp].iter().all(|who| {
-                evs.iter().any(|e| is_peer_joined(e, cid, *who))
-                    && evs.iter().any(|e| is_key_from(e, cid, *who))
-            })
+            [bob_fp, carol_fp]
+                .iter()
+                .all(|who| evs.iter().any(|e| is_peer_joined(e, cid, *who)))
         })
         .await;
 

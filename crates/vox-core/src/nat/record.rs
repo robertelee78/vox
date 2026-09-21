@@ -439,6 +439,288 @@ impl PreJoinRecord {
 // Member prekey-bundle record (0x0012) — ADR-016 M14
 // ===========================================================================
 
+/// **How a key earned its place on a board** (ADR-016 M17.6).
+///
+/// Every member bundle record carries one. There are exactly two ways to be a member
+/// and they are not interchangeable, so they are distinct variants rather than an
+/// `Option` — "the creator" and "malformed" must never look alike on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// This key created the channel. The genesis names its creator and the genesis
+    /// hash **is** the channelID, so any node holding the room can check this against
+    /// data it already has, with nothing relayed and nobody to trust.
+    Creator,
+    /// A member verified this key's ADR-005 passphrase proof and signed that it did.
+    ///
+    /// Boxed: a witness carries a composite signature, which dwarfs the other variant,
+    /// and this enum is held inside every member bundle record.
+    Witnessed(Box<JoinWitness>),
+}
+
+impl Admission {
+    /// The CBOR body: `[0]` for a creator, `[1, witness]` for a witnessed join.
+    #[must_use]
+    pub fn body_bytes(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        match self {
+            Admission::Creator => {
+                e.array(1).uint(0);
+            }
+            Admission::Witnessed(w) => {
+                e.array(2).uint(1).bytes(&w.body_bytes());
+            }
+        }
+        e.finish()
+    }
+
+    /// Parse from a bare CBOR body.
+    pub fn from_body(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        let n = d.array()?;
+        let kind = d.uint()?;
+        let out = match (n, kind) {
+            (1, 0) => Admission::Creator,
+            (2, 1) => Admission::Witnessed(Box::new(JoinWitness::from_body(d.bytes()?)?)),
+            _ => return Err(Error::MalformedRendezvous("admission wire shape")),
+        };
+        d.finish()?;
+        Ok(out)
+    }
+
+    /// The witness, if this key was admitted by one.
+    #[must_use]
+    pub fn witness(&self) -> Option<&JoinWitness> {
+        match self {
+            Admission::Creator => None,
+            Admission::Witnessed(w) => Some(w),
+        }
+    }
+}
+
+/// **A join witness** (ADR-016 M17.6, `0x0014`): the member that actually verified a
+/// joiner's ADR-005 passphrase proof, signing that it did.
+///
+/// ## Why this exists
+///
+/// A member bundle record is **self-signed**: it says "here is my key" and proves only
+/// that its publisher holds that key. Anyone can mint one for a key they hold. Before
+/// this, a node admitted such a record as an author on the strength of *who relayed it*
+/// — trust-on-first-use, which ADR-020 decision 3 forbids in as many words, and which
+/// let one compromised member inject arbitrary identities into every other member's
+/// author table.
+///
+/// Admission is not a privilege: an admitted key still reads nothing (that needs its
+/// holder's sender key) and reaches no service (that needs the host's trust keyring).
+/// What it grants is that entries signed by that key are **accepted and stored**, and
+/// that the key occupies one of [`MAX_AUTHORS`](crate::node::channel::MAX_AUTHORS)
+/// slots — so injection is a durable denial of new membership that outlives the
+/// attacker, repairable only by a passphrase rotation.
+///
+/// A witness is therefore evidence, not an introduction. Only a node that ran the
+/// CPace exchange can honestly produce one, because only it saw the proof.
+///
+/// ## What it does not do
+///
+/// **It does not make injection impossible.** A malicious member can sign a witness for
+/// a key that never joined — nothing forces a witness to correspond to a real exchange.
+/// What it does is make every admission **attributable** to the member that vouched for
+/// it, and stop any *other* member's board from being a vector. The exhaustion attack is
+/// bounded separately, by a per-source quota on admissions.
+///
+/// ## The chain is rooted in the genesis
+///
+/// The channel's creator needs no witness: the genesis names it, and the genesis hash is
+/// the channelID, so the creator is self-evident to anyone holding the room. The creator
+/// witnesses the first joiner, that joiner may witness the next, and so on. There is no
+/// point at which a node must trust a key it has no path to.
+///
+/// Witnesses are **epoch-bound**: a passphrase rotation starts a new epoch, and ADR-007
+/// already specifies that a rotation resets the room, so witnesses do not carry across.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinWitness {
+    /// The channel the join was to (ADR-005 channelID).
+    pub channel_id: Digest32,
+    /// The membership epoch the join was under (ADR-007).
+    pub epoch: u64,
+    /// The joiner whose passphrase proof was verified.
+    pub joiner_id: Digest32,
+    /// The member that verified it and is signing this statement.
+    pub witness_id: Digest32,
+    /// Wall-clock time of the join (epoch-seconds).
+    pub timestamp: u64,
+    /// The witness's composite signature over [`JoinWitness::signing_input`].
+    pub signature: CompositeSignature,
+}
+
+impl JoinWitness {
+    /// The canonical signed body (arity 6): `[channel_id, epoch, joiner_id, witness_id,
+    /// timestamp, [sign_algo]]`.
+    fn canonical_body(
+        channel_id: &Digest32,
+        epoch: u64,
+        joiner_id: &Digest32,
+        witness_id: &Digest32,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(6)
+            .bytes(channel_id)
+            .uint(epoch)
+            .bytes(joiner_id)
+            .bytes(witness_id)
+            .uint(timestamp)
+            .array(1)
+            .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
+        e.finish()
+    }
+
+    /// The signing input: `vox/join-witness/v1 ‖ canonical_body`.
+    #[must_use]
+    pub fn signing_input(&self) -> Vec<u8> {
+        signing_input(
+            StructTag::JoinWitness,
+            &Self::canonical_body(
+                &self.channel_id,
+                self.epoch,
+                &self.joiner_id,
+                &self.witness_id,
+                self.timestamp,
+            ),
+        )
+    }
+
+    /// Sign a witness for `joiner_id`. The caller MUST have verified the joiner's
+    /// ADR-005 proof of possession first — this type carries the claim, it cannot
+    /// check it.
+    ///
+    /// A witness for oneself is refused: the creator's self-evidence comes from the
+    /// genesis (see the type docs), never from a key asserting its own admission.
+    pub fn build(
+        signer: &dyn RootSigner,
+        channel_id: &Digest32,
+        epoch: u64,
+        joiner_id: &Digest32,
+        timestamp: u64,
+    ) -> Result<Self> {
+        let witness_id = signer.fingerprint();
+        if witness_id == *joiner_id {
+            return Err(Error::MalformedRendezvous(
+                "join-witness cannot witness itself",
+            ));
+        }
+        let body = Self::canonical_body(channel_id, epoch, joiner_id, &witness_id, timestamp);
+        let signature = signer.sign(&signing_input(StructTag::JoinWitness, &body))?;
+        Ok(Self {
+            channel_id: *channel_id,
+            epoch,
+            joiner_id: *joiner_id,
+            witness_id,
+            timestamp,
+            signature,
+        })
+    }
+
+    /// Encode as a framed wire record (arity 7).
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        frame(StructTag::JoinWitness, &self.body_bytes())
+    }
+
+    /// The CBOR body, without the frame — used both by [`JoinWitness::to_wire`] and
+    /// when a witness is carried inside another record's signed body.
+    #[must_use]
+    pub fn body_bytes(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(7)
+            .bytes(&self.channel_id)
+            .uint(self.epoch)
+            .bytes(&self.joiner_id)
+            .bytes(&self.witness_id)
+            .uint(self.timestamp)
+            .array(1)
+            .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65))
+            .bytes(&self.signature.to_bytes());
+        e.finish()
+    }
+
+    /// Parse a witness from a bare CBOR body (no frame).
+    pub fn from_body(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 7 {
+            return Err(Error::MalformedRendezvous("join-witness wire arity"));
+        }
+        let channel_id = take_digest(&mut d, "join-witness channel_id length")?;
+        let epoch = d.uint()?;
+        let joiner_id = take_digest(&mut d, "join-witness joiner_id length")?;
+        let witness_id = take_digest(&mut d, "join-witness witness_id length")?;
+        let timestamp = d.uint()?;
+        take_and_check_algo(&mut d, "join-witness algo arity")?;
+        let sig_bytes: [u8; COMPOSITE_SIG_LEN] = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedRendezvous("join-witness signature length"))?;
+        d.finish()?;
+        Ok(Self {
+            channel_id,
+            epoch,
+            joiner_id,
+            witness_id,
+            timestamp,
+            signature: CompositeSignature::from_bytes(&sig_bytes)?,
+        })
+    }
+
+    /// Parse a framed witness (does **not** verify — call [`JoinWitness::verify`]).
+    pub fn from_wire(bytes: &[u8]) -> Result<Self> {
+        let parsed = parse_frame(bytes)?;
+        if parsed.tag != StructTag::JoinWitness {
+            return Err(Error::MalformedRendezvous("join-witness wrong struct tag"));
+        }
+        Self::from_body(parsed.body)
+    }
+
+    /// Verify the witness's signature under `witness_pubkey`, and that it binds the
+    /// channel, epoch and joiner the caller expects.
+    ///
+    /// The caller supplies `witness_pubkey` from its **own** admitted membership — that
+    /// is the whole point: a witness is only evidence if the key that signed it is one
+    /// this node already accepts, which roots the chain in the genesis creator.
+    pub fn verify(
+        &self,
+        witness_pubkey: &CompositePublicKey,
+        channel_id: &Digest32,
+        epoch: u64,
+        joiner_id: &Digest32,
+    ) -> Result<()> {
+        if witness_pubkey.fingerprint() != self.witness_id {
+            return Err(Error::MalformedRendezvous(
+                "join-witness witness_id != signer fingerprint",
+            ));
+        }
+        if self.channel_id != *channel_id {
+            return Err(Error::MalformedRendezvous(
+                "join-witness binds another channel",
+            ));
+        }
+        if self.epoch != epoch {
+            return Err(Error::MalformedRendezvous(
+                "join-witness binds another epoch",
+            ));
+        }
+        if self.joiner_id != *joiner_id {
+            return Err(Error::MalformedRendezvous(
+                "join-witness binds another joiner",
+            ));
+        }
+        if self.witness_id == self.joiner_id {
+            return Err(Error::MalformedRendezvous(
+                "join-witness cannot witness itself",
+            ));
+        }
+        witness_pubkey.verify(&self.signing_input(), &self.signature)
+    }
+}
+
 /// A channel member's root-signed **prekey bundle** on the rendezvous board
 /// (ADR-016 §"The rendezvous service and the member bundle record").
 ///
@@ -470,13 +752,27 @@ pub struct MemberBundleRecord {
     /// Requested time-to-live in seconds; the store caps it at
     /// [`crate::nat::store::BUNDLE_MAX_TTL_SECS`].
     pub ttl_secs: u64,
+    /// How this key earned its place on the board: it created the channel, or a member
+    /// verified its ADR-005 passphrase proof and signed that it did (ADR-016 M17.6).
+    ///
+    /// **Required**, and inside the signed body. A record without one is malformed —
+    /// there is no legitimate way to be on a board without having joined or created.
+    pub admission: Admission,
     /// The author's composite signature over [`MemberBundleRecord::signing_input`].
     pub signature: CompositeSignature,
 }
 
 impl MemberBundleRecord {
-    /// The canonical signed body (arity 8): `[author_id, channelID, epoch,
-    /// prekey_bundle, seq, timestamp, ttl_secs, [sign_algo]]`.
+    /// The canonical signed body (arity 9): `[author_id, channelID, epoch,
+    /// prekey_bundle, seq, timestamp, ttl_secs, admission, [sign_algo]]`.
+    ///
+    /// The admission is **inside** the signed body so the publisher cannot be given one
+    /// witness and publish under another, and so a witness cannot be lifted off one
+    /// record and stapled to a different key's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per signed field; grouping them would hide what is signed"
+    )]
     fn canonical_body(
         author_id: &Digest32,
         channel_id: &Digest32,
@@ -485,9 +781,10 @@ impl MemberBundleRecord {
         seq: u64,
         timestamp: u64,
         ttl_secs: u64,
+        admission_bytes: &[u8],
     ) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(8)
+        e.array(9)
             .bytes(author_id)
             .bytes(channel_id)
             .uint(epoch)
@@ -495,6 +792,7 @@ impl MemberBundleRecord {
             .uint(seq)
             .uint(timestamp)
             .uint(ttl_secs)
+            .bytes(admission_bytes)
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
         e.finish()
@@ -513,6 +811,7 @@ impl MemberBundleRecord {
                 self.seq,
                 self.timestamp,
                 self.ttl_secs,
+                &self.admission.body_bytes(),
             ),
         )
     }
@@ -521,6 +820,10 @@ impl MemberBundleRecord {
     /// fingerprint, and the bundle's root MUST be the signer's key (else
     /// [`Error::MalformedRendezvous`] — a member cannot publish someone else's
     /// bundle under its own name).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per signed field; grouping them would hide what is signed"
+    )]
     pub fn build(
         signer: &dyn RootSigner,
         channel_id: &Digest32,
@@ -529,6 +832,7 @@ impl MemberBundleRecord {
         seq: u64,
         timestamp: u64,
         ttl_secs: u64,
+        admission: Admission,
     ) -> Result<Self> {
         if prekey_bundle.root_pub != signer.public_key().to_bytes() {
             return Err(Error::MalformedRendezvous(
@@ -536,6 +840,17 @@ impl MemberBundleRecord {
             ));
         }
         let author_id = signer.fingerprint();
+        // A witness must be *this* key's, for *this* room and epoch. Checked at build
+        // as well as at verify, so a caller cannot publish a record it knows is junk.
+        // `Creator` carries nothing to check here; the genesis is what checks it, at
+        // admission, where the verifier holds it.
+        if let Some(w) = admission.witness() {
+            if w.joiner_id != author_id || w.channel_id != *channel_id || w.epoch != epoch {
+                return Err(Error::MalformedRendezvous(
+                    "member-bundle witness does not bind this author, channel and epoch",
+                ));
+            }
+        }
         let bundle_bytes = prekey_bundle.encode_canonical();
         if bundle_bytes.len() > MAX_PREKEY_BUNDLE_BYTES {
             return Err(Error::SizeLimitExceeded("member-bundle prekey bundle"));
@@ -548,6 +863,7 @@ impl MemberBundleRecord {
             seq,
             timestamp,
             ttl_secs,
+            &admission.body_bytes(),
         );
         let signature = signer.sign(&signing_input(StructTag::MemberBundleRecord, &body))?;
         Ok(Self {
@@ -558,16 +874,17 @@ impl MemberBundleRecord {
             seq,
             timestamp,
             ttl_secs,
+            admission,
             signature,
         })
     }
 
-    /// Frame for the wire (tag `0x0012`): the 7 signed fields, the algo array,
-    /// then the composite signature (arity 9).
+    /// Frame for the wire (tag `0x0012`): the 8 signed fields, the algo array,
+    /// then the composite signature (arity 10).
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(9)
+        e.array(10)
             .bytes(&self.author_id)
             .bytes(&self.channel_id)
             .uint(self.epoch)
@@ -575,6 +892,7 @@ impl MemberBundleRecord {
             .uint(self.seq)
             .uint(self.timestamp)
             .uint(self.ttl_secs)
+            .bytes(&self.admission.body_bytes())
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65))
             .bytes(&self.signature.to_bytes());
@@ -589,7 +907,7 @@ impl MemberBundleRecord {
             return Err(Error::MalformedRendezvous("member-bundle wrong struct tag"));
         }
         let mut d = Decoder::new(parsed.body);
-        if d.array()? != 9 {
+        if d.array()? != 10 {
             return Err(Error::MalformedRendezvous("member-bundle wire arity"));
         }
         let author_id = take_digest(&mut d, "member-bundle author_id length")?;
@@ -603,6 +921,7 @@ impl MemberBundleRecord {
         let seq = d.uint()?;
         let timestamp = d.uint()?;
         let ttl_secs = d.uint()?;
+        let admission = Admission::from_body(d.bytes()?)?;
         take_and_check_algo(&mut d, "member-bundle algo arity")?;
         let sig_bytes: [u8; COMPOSITE_SIG_LEN] = d
             .bytes()?
@@ -618,6 +937,7 @@ impl MemberBundleRecord {
             seq,
             timestamp,
             ttl_secs,
+            admission,
             signature,
         })
     }

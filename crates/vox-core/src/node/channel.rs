@@ -69,6 +69,7 @@ use crate::log::entry::{Entry, EntryKind, EntrySkeleton, ZERO_HASH};
 use crate::log::feed::lipmaa;
 use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
 use crate::nat::bootstrap::BootstrapSet;
+use crate::nat::record::Admission;
 use crate::node::content::Content;
 use crate::node::profile::Profile;
 use crate::node::store::Store;
@@ -107,6 +108,16 @@ const SEG_ORIGINS: u64 = 6;
 /// (M18.1): target → the highest generation this identity has delivered to it. What
 /// is *owed* is derived from this and the consent set, so it cannot go stale.
 const SEG_DELIVERED: u64 = 7;
+
+/// This node's **own admission** to the channel, within [`SegmentKind::KeyMaterial`]
+/// (M17.6): whether it created the channel, or the [`JoinWitness`] a member signed
+/// when it verified this node's ADR-005 passphrase proof.
+///
+/// Persisted because it is republished with every member bundle record, for as long
+/// as this node is a member. A node that forgot it after a restart could publish no
+/// bundle at all, and would fall off every board — the same reason `SEG_ANCHORS`
+/// exists.
+const SEG_ADMISSION: u64 = 8;
 
 /// At-rest version of the delivery-ledger segment.
 const DELIVERED_VERSION: u64 = 1;
@@ -269,6 +280,12 @@ pub struct ChannelState {
     /// The services this node offers in this channel (ADR-013 Bind config, M16.1),
     /// persisted in `SEG_SERVICES`.
     services: BTreeMap<String, SocketAddr>,
+    /// How **this node** came to be a member here (M17.6), persisted in
+    /// `SEG_ADMISSION`: it created the channel, or a member witnessed its join. Needed
+    /// whenever this node publishes its own bundle record, which is every time it
+    /// refreshes its board presence. Distinct from `admission`, which is the ADR-007
+    /// policy governing *other* authors' entries.
+    own_admission: Option<Admission>,
     /// The iteration-0 chain key of every sender-key generation this identity has
     /// minted here (M18.1), persisted in `SEG_ORIGINS`. Held so a rotation can
     /// re-key the members who keep consent *at the new generation's origin* — which
@@ -751,6 +768,9 @@ impl ChannelState {
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
+            // This node made the channel, so the genesis names it and nothing else needs
+            // to (M17.6).
+            own_admission: Some(Admission::Creator),
             origins,
             delivered: BTreeMap::new(),
             poisoned: false,
@@ -881,6 +901,18 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
+        // How this node came to be a member here (M17.6). `None` for a channel that
+        // predates the segment; such a node cannot publish a bundle record until it
+        // has one, which is correct — its membership is exactly as unevidenced as any
+        // other unwitnessed key's.
+        let own_admission =
+            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ADMISSION)? {
+                Some(seg) => {
+                    let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_ADMISSION, &seg)?;
+                    Some(Admission::from_body(&bytes)?)
+                }
+                None => None,
+            };
         // The origins of this identity's own generations (M18.1). A channel from
         // before the segment existed retains none, and cannot: the live chain has
         // already ratcheted past iteration 0, so that generation is releasable only
@@ -926,6 +958,7 @@ impl ChannelState {
             receivers,
             anchors,
             services,
+            own_admission,
             origins,
             delivered,
             poisoned: false,
@@ -1094,10 +1127,80 @@ impl ChannelState {
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
+            // Set by the caller from the join witness the responder signed (M17.6).
+            own_admission: None,
             origins,
             delivered: BTreeMap::new(),
             poisoned: false,
         })
+    }
+
+    /// The most authors one peer's board may contribute in a single sweep (M17.6).
+    ///
+    /// A witness makes an admission **attributable**; it does not make it impossible.
+    /// A member can sign witnesses for keys that never joined — nothing forces a
+    /// signature to correspond to a real exchange — so without a bound, one compromised
+    /// member could still mint [`MAX_AUTHORS`] of them and exhaust admission for every
+    /// legitimate member thereafter, a denial of new membership that outlives the
+    /// attacker and is repairable only by a passphrase rotation.
+    ///
+    /// The quota is per sweep rather than cumulative on purpose: it bounds the damage
+    /// of any one exchange without keeping per-peer state that would itself need
+    /// bounding, and a peer with genuinely more members to share will deliver them over
+    /// several syncs, which is what the anti-entropy loop does anyway.
+    pub const MAX_ADMISSIONS_PER_SWEEP: usize = 8;
+
+    /// Admit a key **from a board**, on the ADR-016 M17.6 evidence that it belongs
+    /// there — and on nothing else.
+    ///
+    /// A board record is self-signed: it proves its publisher holds that key and
+    /// nothing more, so anyone can mint one for a key they hold. Admitting on the
+    /// strength of *who relayed it* is trust-on-first-use, which ADR-020 decision 3
+    /// forbids in as many words, and it let one compromised member inject arbitrary
+    /// identities into every other member's author table.
+    ///
+    /// The two admissible answers to "why is this key here":
+    ///
+    /// - [`Admission::Creator`] — the genesis names it as the channel's creator, and
+    ///   the genesis hash **is** the channelID, so this node checks it against data it
+    ///   already holds, with nothing relayed and nobody to trust.
+    /// - [`Admission::Witnessed`] — a member verified this key's ADR-005 passphrase
+    ///   proof and signed that it did. The witness is accepted only if **this node
+    ///   already admits the signer**, which roots every chain in the creator.
+    ///
+    /// Returns `Ok(true)` when the key was newly admitted, `Ok(false)` when it was
+    /// already known, and an error when the evidence does not hold up.
+    pub fn admit_from_board(
+        &mut self,
+        store: &Store,
+        key: &CompositePublicKey,
+        admission: &Admission,
+        now_secs: u64,
+    ) -> Result<bool> {
+        let fingerprint = key.fingerprint();
+        match admission {
+            Admission::Creator => {
+                if self.genesis.creator_pubkey().fingerprint() != fingerprint {
+                    return Err(Error::MalformedGovernance(
+                        "board record claims to be the creator and is not",
+                    ));
+                }
+            }
+            Admission::Witnessed(w) => {
+                // The signer must already be an author *here*. That is the whole
+                // mechanism: a stranger's signature convinces nobody, so a chain can
+                // only start at the creator, whom the genesis names.
+                let witness_key =
+                    self.authors
+                        .get(&w.witness_id)
+                        .cloned()
+                        .ok_or(Error::MalformedGovernance(
+                            "join witness signed by an unadmitted key",
+                        ))?;
+                w.verify(&witness_key, &self.channel_id, self.epoch, &fingerprint)?;
+            }
+        }
+        self.admit_author(store, key, now_secs)
     }
 
     /// Admit `key` as a log author for this channel: its entries are accepted into
@@ -1109,6 +1212,17 @@ impl ChannelState {
     /// verified genesis, admin certificates, or the board's records, each of which
     /// carries the full composite key). Idempotent: re-admitting the same key is a
     /// no-op that still succeeds.
+    ///
+    /// **This is the raw operation and it checks no evidence.** Admitting a key is what
+    /// turns "entry from an unadmitted author" into "entry stored" (see
+    /// [`ChannelState::accept_entry`]), and it occupies one of [`MAX_AUTHORS`] slots
+    /// permanently within the epoch — so a caller that admits on no evidence hands any
+    /// key the ability to write to this node's log, and enough of them exhaust
+    /// admission for every legitimate member thereafter. Callers taking keys from a
+    /// **board** MUST go through [`ChannelState::admit_from_board`], which requires the
+    /// ADR-016 M17.6 evidence. This one is for keys whose right to be here this node
+    /// established itself: the genesis creator, and a joiner whose proof it just
+    /// verified.
     pub fn admit_author(
         &mut self,
         store: &Store,
@@ -1248,6 +1362,37 @@ impl ChannelState {
         }
         self.persist_services(store)?;
         Ok(true)
+    }
+
+    /// How this node came to be a member here (M17.6) — `None` only for a channel
+    /// opened from a store written before the segment existed.
+    #[must_use]
+    pub fn own_admission(&self) -> Option<&Admission> {
+        self.own_admission.as_ref()
+    }
+
+    /// Record how this node came to be a member here, and persist it.
+    ///
+    /// Called once, by the join path, with the witness the responder signed. The
+    /// creator sets it at creation and never calls this.
+    pub fn set_own_admission(&mut self, store: &Store, admission: Admission) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_ADMISSION,
+            &admission.body_bytes(),
+        )?;
+        if let Err(e) = store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_ADMISSION,
+            &seg,
+        ) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.own_admission = Some(admission);
+        Ok(())
     }
 
     fn persist_services(&mut self, store: &Store) -> Result<()> {

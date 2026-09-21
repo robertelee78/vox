@@ -3,7 +3,7 @@
 **Status**: accepted (2026-09-21) — the policy is in force from this change; the harness lands with it
 and grows per capability
 **Date**: 2026-09-21
-**Updated**: 2026-09-21 — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
+**Updated**: 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
 work, and the two obligations they cannot yet meet are recorded in §3's accepted-gaps table rather
 than skipped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -184,7 +184,49 @@ therefore be recorded as **still latent**, not fixed. What this change buys is t
 occurrence is a loud failure with thread stacks rather than a silent process burning a core until
 someone happens to run `ps`.
 
-### 7. The six gates remain
+### 7. A green gate is not evidence: a gate can assert the bug
+
+**Added 2026-09-21**, from ADR-017 M17.6, where removing one defect broke **six gates that were all
+green.** The number is the point: green is what made them invisible. Numbered here rather than inserted
+earlier so the existing `ADR-018 §N` references in the tree keep pointing where they did.
+
+Two failure modes; the second is the dangerous one.
+
+**(a) The gate asserts the defect.** The removed behaviour was that joining a room released the joiner's
+sender key to whichever member answered the join — a consent grant nobody decided. Four gates
+(`node_m14_gate`, both in `node_m15_anchor_gate`, `node_m18_revocation_gate`) *waited for that key to
+arrive* as their setup, so each was a standing assertion that the defect was present, and each went red
+when it was fixed.
+
+The instructive one is `node_m18_revocation_gate`, whose comment read *"Alice must hold both joiners'
+keys before she serves anything: an ADR-004 responder has no sending chain until it has received."* The
+**premise is true** — a PQXDH responder genuinely cannot send until it receives a ratchet message. The
+conclusion was the defect: what it needs is a *ratchet message*, not a *sender key*. A gate can be wrong
+while every word of its reasoning is right.
+
+**(b) The label has drifted from the assertion.** Worse, because nobody ever chose wrongly: it rots as
+the code moves and stays green throughout. `node_m15_anchor_gate` asserted `entries >= 3` and called them
+"genesis, consent and the message" — the genesis is never a DAG entry (`entry_count()` is `dag.len()`),
+so the third was another node's automatic consent, synced in. Both gates in `node_m19_trust_gate`
+labelled a check *"both members admitted"* while asserting `entries > 0`, that entry being the same
+automatic consent; once it was gone the check could never pass, while the property in the label had been
+true all along.
+
+Therefore:
+
+- When a gate fails after a behaviour is **removed**, the first question is whether the gate was
+  *asserting that behaviour*. If it was, **rewrite it** — do not extend it, and never restore the
+  behaviour to make it pass. Record in the governing ADR what changed and whether the property under test
+  is unchanged or weakened. Precedent: ADR-017 records M17.3's gate the same way.
+- **Read every gate's comment against its assertion.** Where they disagree the comment is usually the
+  intended property and the assertion is the accident. It is a cheap audit: it found one instance in a
+  suite whose author then checked the other five and found them sound.
+- **Expect more than one.** Six surfaced over four full release runs, one at a time, because a run stops
+  at the first failing binary. The first green run after a fix is not the end of it.
+- **Instrumentation can be load-bearing.** A debug round that logged a frame send *sent it twice*, masking
+  a real race so the failing gate passed. Remove instrumentation and re-run before believing a green.
+
+### 8. The six gates remain
 
 `fmt`, `clippy -D warnings`, `test`, `rustdoc -D warnings`, and the release-only `--ignored` run remain
 REQUIRED for every change. This ADR changes what `test` *contains*, not whether it must pass.
