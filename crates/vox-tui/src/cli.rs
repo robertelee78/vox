@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use vox_core::nat::bootstrap::BootstrapSet;
-use vox_core::node::link::merge_anchor_spec;
+use vox_core::node::link::{merge_anchor_spec, merge_anchors_file};
 use vox_core::node::paths::{Paths, DEFAULT_PROFILE};
 
 use crate::app::{run_live, run_node};
@@ -62,6 +62,13 @@ impl ProfileArgs {
     /// The configured anchors, parsed and merged by identity.
     pub fn anchor_set(&self) -> vox_core::error::Result<BootstrapSet> {
         let mut set = BootstrapSet::new();
+        // The profile's anchors file first, then `--anchor` on top (ADR-017 decision 7,
+        // M17.4). Both merge into one set rather than one replacing the other: an anchor
+        // is additive — more introducers is strictly better reachability — and a person
+        // who adds one on the command line almost never means "and forget the one I
+        // configured". `vox node` writes its own spec into that file, so a client on the
+        // same machine as its anchor needs no flag at all, which was the whole point.
+        merge_anchors_file(&mut set, &self.paths()?.anchors_file())?;
         for spec in &self.anchors {
             if spec.trim().is_empty() {
                 continue;

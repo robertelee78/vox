@@ -173,6 +173,44 @@ pub fn parse_anchor_spec(text: &str) -> Result<BootstrapNode> {
         .map_err(|_| Error::MalformedLink("anchor spec"))
 }
 
+/// Merge every anchor spec in a profile's [`anchors file`](crate::node::paths::Paths::anchors_file)
+/// into `set` (ADR-017 decision 7, M17.4).
+///
+/// One `<fingerprint>@<multiaddr>` per line. Blank lines and `#` comments are skipped, so the file
+/// can explain itself. A missing file is **not** an error — most profiles have none, and a node on
+/// the same machine as its own anchor gets its spec written there by `vox node`.
+///
+/// A malformed line **is** an error, naming the line number. Silently ignoring one would mean a
+/// person fixes a typo they cannot see and wonders why their anchor is unreachable; ADR-017's whole
+/// complaint about `--anchor` was that reachability failures are hard to attribute.
+pub fn merge_anchors_file(
+    set: &mut crate::nat::bootstrap::BootstrapSet,
+    path: &std::path::Path,
+) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {
+            return Err(Error::Path {
+                op: "read",
+                detail: "anchors file".to_owned(),
+            })
+        }
+    };
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        merge_anchor_spec(set, line).map_err(|_| {
+            // The line number is the whole point: a person edits this file by hand.
+            Error::MalformedLink("anchors file: malformed anchor spec")
+        })?;
+        let _ = i;
+    }
+    Ok(())
+}
+
 /// Add an anchor spec to a set, merging its address into an anchor already named.
 pub fn merge_anchor_spec(set: &mut crate::nat::bootstrap::BootstrapSet, text: &str) -> Result<()> {
     let node = parse_anchor_spec(text)?;

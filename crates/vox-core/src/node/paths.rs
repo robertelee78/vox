@@ -20,6 +20,13 @@ pub const VAULT_FILE: &str = "vault.cbor";
 pub const STORE_FILE: &str = "store.redb";
 /// The ADR-020 §7 local control socket, inside the profile directory.
 pub const SOCKET_FILE: &str = "node.sock";
+/// The anchors file inside a profile's **config** directory (ADR-017 decision 7, M17.4):
+/// one `<fingerprint>@<multiaddr>` per line, `#` comments and blank lines ignored.
+///
+/// It lives in the config directory rather than the data directory because it is
+/// configuration a person edits, not state the node owns — and it carries no secret: an
+/// anchor spec is a public identity and a public address.
+pub const ANCHORS_FILE: &str = "anchors";
 /// Directory of per-session read cursors inside a profile.
 pub const CURSOR_DIR: &str = "cursors";
 /// The default profile name.
@@ -93,6 +100,12 @@ impl Paths {
     #[must_use]
     pub fn socket_file(&self) -> PathBuf {
         self.profile_dir.join(SOCKET_FILE)
+    }
+
+    /// The anchors file for this profile ([`ANCHORS_FILE`]).
+    #[must_use]
+    pub fn anchors_file(&self) -> PathBuf {
+        self.config_dir.join(ANCHORS_FILE)
     }
 
     /// Where an agent session's read cursor for one room is kept
