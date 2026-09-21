@@ -16,12 +16,18 @@
 set -eu
 
 REPO="robertelee78/vox"
+# ADR-015: every macOS release is signed by this team under this identifier, and notarized.
+# Pinned HERE rather than read from the record: a first install has no previously-trusted vox to
+# compare against, so the expectation has to live in the installer. (`vox update` does not need
+# this — it requires the candidate to carry the same Developer ID as the binary it replaces.)
+APPLE_TEAM_ID="3T2D2YNTVW"
+APPLE_IDENTIFIER="us.agidreams.vox"
 # VOX_RELEASE_BASE exists for the installer's own end-to-end test against a local
 # stand-in server; the origin check below still applies to redirects from it.
 BASE="${VOX_RELEASE_BASE:-https://github.com/${REPO}/releases}"
 INSTALL_DIR="${VOX_INSTALL_DIR:-$HOME/.local/bin}"
 CHANNEL="${VOX_CHANNEL:-stable}"
-MARKER=".vox-channel"
+MARKER=".vox-standalone.json"
 # TLS is mandatory except against an explicit loopback test base.
 case "$BASE" in
   https://*) CURL_PROTO="--proto =https --proto-redir =https --tlsv1.2" ;;
@@ -104,6 +110,37 @@ got_sha=$(sha "$tmp/$ASSET")
 [ "$got_sha" = "$sha256" ] || fail "sha256 mismatch: expected $sha256, got $got_sha"
 chmod 0755 "$tmp/$ASSET"
 
+# --- Apple Developer ID + notarization (macOS) -------------------------------------------
+# The bytes must carry a valid Developer ID signature from our team, under our identifier, with
+# the hardened runtime — and Apple must confirm the notarization ticket online. None of this is
+# optional, and none of it is read from the release record: the record is served by the same
+# origin as the binary, so trusting it to describe its own signer would be circular.
+# Against the loopback test base the bytes are a fixture, not a release, so the gate is
+# meaningless there and is skipped. `VOX_PROOF_APPLE_VERIFY=1` turns it back on, which is how
+# the proof measures that it refuses unsigned bytes — an override that can only ever *enable* a
+# check is safe by construction.
+apple_verify=0
+[ "$os" = Darwin ] && case "$BASE" in https://*) apple_verify=1 ;; esac
+[ "$os" = Darwin ] && [ -n "${VOX_PROOF_APPLE_VERIFY:-}" ] && apple_verify=1
+
+if [ "$apple_verify" = 1 ]; then
+  /usr/bin/codesign --verify --strict --all-architectures "$tmp/$ASSET" 2>/dev/null \
+    || fail "Apple code-signature verification failed"
+  info=$(/usr/bin/codesign --display --verbose=4 "$tmp/$ASSET" 2>&1)
+  printf '%s\n' "$info" | grep -qx "TeamIdentifier=$APPLE_TEAM_ID" \
+    || fail "binary is not signed by team $APPLE_TEAM_ID"
+  printf '%s\n' "$info" | grep -qx "Identifier=$APPLE_IDENTIFIER" \
+    || fail "binary is not signed as $APPLE_IDENTIFIER"
+  printf '%s\n' "$info" | grep -q "^Authority=Developer ID Application: .* ($APPLE_TEAM_ID)$" \
+    || fail "binary is not signed with a Developer ID Application certificate"
+  printf '%s\n' "$info" | grep -q '^CodeDirectory .*flags=0x[0-9a-f]*(runtime' \
+    || fail "binary signature lacks the hardened runtime"
+  /usr/bin/codesign --verify --strict --all-architectures --check-notarization \
+    --test-requirement '=notarized' "$tmp/$ASSET" 2>/dev/null \
+    || fail "Apple did not confirm the notarization ticket (is this machine online?)"
+  say "verified: Developer ID $APPLE_TEAM_ID as $APPLE_IDENTIFIER, notarized"
+fi
+
 # --- install (atomic) ------------------------------------------------------------------
 mkdir -p "$INSTALL_DIR"
 if [ -e "$INSTALL_DIR/vox" ] && [ ! -e "$INSTALL_DIR/$MARKER" ]; then
@@ -115,9 +152,10 @@ chmod 0755 "$INSTALL_DIR/.vox-candidate.partial"
 if [ -e "$INSTALL_DIR/vox" ]; then
   cp -p "$INSTALL_DIR/vox" "$INSTALL_DIR/.vox-previous"
 fi
-# The marker says "this install is ours", and its first line names the channel `vox update`
-# will look the next release up on.
-printf '%s\n' "$CHANNEL" >"$INSTALL_DIR/$MARKER"
+# The marker says "this install is ours" and names the channel `vox update` resolves the next
+# release on. Strict schema-1 JSON, the same shape the binary parses with deny_unknown_fields.
+printf '{"kind":"vox.install-channel","schema_version":1,"package":"vox","channel":"%s"}\n' \
+  "$CHANNEL" >"$INSTALL_DIR/$MARKER"
 mv -f "$INSTALL_DIR/.vox-candidate.partial" "$INSTALL_DIR/vox"
 
 installed=$("$INSTALL_DIR/vox" --version 2>/dev/null || true)

@@ -80,8 +80,16 @@ fn install_dir(root: &Path, channel: &str) -> PathBuf {
     let dir = root.join("bin");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(VOX, dir.join("vox")).unwrap();
-    std::fs::write(dir.join(".vox-channel"), format!("{channel}\n")).unwrap();
+    std::fs::write(dir.join(".vox-standalone.json"), marker_json(channel)).unwrap();
     dir
+}
+
+/// The install marker `install.sh` writes: strict schema-1 JSON naming the channel.
+fn marker_json(channel: &str) -> String {
+    format!(
+        "{{\"kind\":\"vox.install-channel\",\"schema_version\":1,\"package\":\"vox\",\
+         \"channel\":\"{channel}\"}}\n"
+    )
 }
 
 /// A stand-in for "the vox you had before the update": an executable that answers `--version`
@@ -240,13 +248,18 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
         let text = said(&out);
         claims.push(claim(
             "refuse.unmanaged_copy",
-            !out.status.success() && text.contains(".vox-channel") && text.contains("install.sh"),
+            !out.status.success()
+                && text.contains(".vox-standalone.json")
+                && text.contains("install.sh"),
             format!("a bare copy said {text:?}"),
         ));
         receipts.insert("refuse.unmanaged_copy".into(), text);
     }
 
-    // ---- the live-world premise the design rests on: curl must fail closed --------------
+    // ---- the live-world premise `install.sh` rests on: curl must fail closed ------------
+    // `vox update` no longer shells out — it decides the status in Rust through reqwest — but
+    // `install.sh` still uses curl, so this premise is load-bearing there and is measured
+    // against the live endpoint rather than assumed.
     {
         let tmp = tempfile::tempdir().unwrap();
         let nonce = std::process::id();
@@ -266,7 +279,7 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
             ));
         } else {
             claims.push(claim(
-                "curl.fail_closed_on_404",
+                "install_sh.curl_fails_closed_on_404",
                 !ok_with && code_with == "404" && !wrote_with,
                 format!(
                     "with --fail: exit_ok={ok_with} http={code_with} wrote_file={wrote_with} \
@@ -277,7 +290,7 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
             // reason, and this is the exact behaviour that would have written `Not Found`
             // into a release record.
             claims.push(claim(
-                "curl.without_fail_writes_the_error_body",
+                "install_sh.curl_without_fail_writes_the_error_body",
                 ok_without && code_without == "404" && wrote_without && body.contains("Not Found"),
                 format!(
                     "without --fail: exit_ok={ok_without} http={code_without} \
@@ -444,7 +457,7 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
                 let mut p = std::fs::metadata(dir.join("vox")).unwrap().permissions();
                 std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o755);
                 std::fs::set_permissions(dir.join("vox"), p).unwrap();
-                std::fs::write(dir.join(".vox-channel"), "stable\n").unwrap();
+                std::fs::write(dir.join(".vox-standalone.json"), marker_json("stable")).unwrap();
 
                 let out = vox(&dir.join("vox"), home, &["update"], &[]);
                 let text = said(&out);
@@ -463,7 +476,7 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
                 // The same older binary, pointed at the `proof` channel, whose record names
                 // the real asset with a deliberately wrong digest. Nothing on `stable` can
                 // express this, which is why the channel exists.
-                std::fs::write(dir.join(".vox-channel"), "proof\n").unwrap();
+                std::fs::write(dir.join(".vox-standalone.json"), marker_json("proof")).unwrap();
                 let tampered = home.join("bin2");
                 std::fs::create_dir_all(&tampered).unwrap();
                 let (ok2, code2, _) = curl_probe(&url, &tampered.join("vox"), true);
@@ -478,7 +491,8 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
                         .permissions();
                     std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o755);
                     std::fs::set_permissions(tampered.join("vox"), p).unwrap();
-                    std::fs::write(tampered.join(".vox-channel"), "proof\n").unwrap();
+                    std::fs::write(tampered.join(".vox-standalone.json"), marker_json("proof"))
+                        .unwrap();
                     let out = vox(&tampered.join("vox"), home, &["update"], &[]);
                     let text = said(&out);
                     let still = Command::new(tampered.join("vox"))

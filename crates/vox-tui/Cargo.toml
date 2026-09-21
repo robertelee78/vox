@@ -41,6 +41,12 @@ sha2.workspace = true
 # The release record is fetched into a private temporary directory, so `vox update --check`
 # needs no write access to the install directory. Promoted from a dev-dependency for that.
 tempfile.workspace = true
+# `vox update` (ADR-015). See the workspace manifest for why each of these is here.
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+rustix.workspace = true
 
 # No `[dev-dependencies]`: `tempfile` is a normal dependency above and is in scope for the
 # integration proofs too.
