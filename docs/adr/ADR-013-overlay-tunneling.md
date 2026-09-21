@@ -216,9 +216,13 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     into the actor. A channel absent from the snapshot resolves to `None` and is refused exactly as an
     unauthorized request is, because telling the two apart would leak which channels this node is in.
   - **Bind configuration.** A channel persists `service_tag → local address` in its own sealed segment
-    (`SEG_SERVICES`, `MAX_SERVICES = 64`), so a restart still offers what it offered. `add_service` checks
+    (`SEG_SERVICES`, `MAX_SERVICES = 64`), so a restart still offers what it offered. ~~`add_service` checks
     `bind:<tag>` against the channel's own evaluator: a node cannot offer what the log does not let it
-    offer. This is configuration, never authorization — what a peer may *reach* is whether this host has
+    offer.~~ **The `bind:` check is withdrawn (2026-09-21, ADR-017 decision 3 as revised, M17.7):** offering
+    a port of one's own machine is not the room's business, and the capability had exactly two sources —
+    the genesis grant and `vox grant --may-bind` — both of which are withdrawn, so keeping the check would
+    have left `vox serve` working only for a room's creator. Still in the tree
+    (`governance/channel.rs:1232`); recorded as required work, not as done. This is configuration, never authorization — what a peer may *reach* is whether this host has
     approved that peer's key in this room (ADR-017 decision 3, revised 2026-09-21).
   - **Dial side.** `node::tunnel::Forward` binds a local TCP port and gives every accepted connection its
     own tunnel stream (ADR-013's one-stream-per-connection), so a forward carries as many connections as
@@ -246,17 +250,22 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     without the passphrase), does its work and leaves; `forward` serves until interrupted and prints the
     `ssh -p <port>` line. Ids are given as unique prefixes of the base32 rendering, refused with a count
     rather than a guess when ambiguous. Passphrases are prompted for unechoed (crossterm raw mode) and
-    read from a pipe when stdin is not a terminal, so nothing lands in shell history. **`vox grant` is
-    withdrawn** (2026-09-21) with the per-member capability model it served — there is nothing left for it
-    to grant, because approving a reader is the grant (ADR-017 decision 3, revised).
+    read from a pipe when stdin is not a terminal, so nothing lands in shell history. **`vox grant` is to be
+    withdrawn** under M17.7 with the per-member capability model it served — there will be nothing left for
+    it to grant, because approving a reader is the grant (ADR-017 decision 3, revised). It is **still in the
+    tree** (`vox-tui/src/cli.rs:397`); recorded as required work, not as done.
   - **Gate** (`node_m15_anchor_gate.rs`, release): Alice offers a localhost TCP service in a room, Bob
-    joins through the anchor, and **before Alice has approved him his forward binds but carries nothing** —
-    the service is dark to a member. Alice approves Bob's key for reading; that approval reaches Bob by
-    ordinary sync, with nobody telling him, and his application connects to his own machine and gets
-    byte-exact replies from Alice's service. **Rewritten 2026-09-21** (ADR-017 decision 3, revised): the
-    gate previously drove `Alice grants dial:ssh`, which no longer exists. The property under test is
-    unchanged and the proof is stronger — the transition is now a single human act, and the negative half
-    holds against a member who has joined, holds the passphrase and paid the proof of work. Both clients are behind symmetric NATs, so the path is a relayed circuit and the anchor
+    joins through the anchor, and **before any grant his forward binds but carries nothing** — the service
+    is dark to a member. Alice grants `dial:ssh`; the grant reaches Bob by ordinary sync, with nobody
+    telling him, and his application connects to his own machine and gets byte-exact replies from Alice's
+    service.
+    **This gate still drives the withdrawn model** (`NodeCommand::GrantTunnel`, `node_m15_anchor_gate.rs:660`)
+    and **must be rewritten** under M17.7 so its transition is Alice approving Bob's key rather than Alice
+    granting `dial:ssh`. Recorded as required work, not as done: an earlier draft of this bullet stated the
+    rewrite in the past tense before it had happened, which is the failure mode ADR-018 exists to prevent
+    and is corrected here. The property under test does not change and the proof gets stronger — the
+    transition becomes a single human act, and the negative half will hold against a member who has joined,
+    holds the passphrase and paid the proof of work. Both clients are behind symmetric NATs, so the path is a relayed circuit and the anchor
     carried packets it cannot read. A second connection over the same forward works too. `ssh` over Vox is
     this test with `sshd` in place of the echo, which is why the echo is enough.
 - **The SSH CA is narrowed to optional (decider, 2026-09-21).** The Decision above offers "`ssh` over Vox"

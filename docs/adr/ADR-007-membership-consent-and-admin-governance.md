@@ -61,10 +61,20 @@ capabilities at or below its own; unknown capability types are a verification fa
 - `invite` — may issue identity-bound invites (ADR-005).
 - `policy` — may author policy-update entries (history / deniability / TTL).
 - `passphrase-rotate` — may author passphrase-rotation (epoch) entries.
-- **Tunnel capabilities, registered by ADR-013 into *this* lattice:** `bind:<service-tag>` (advertise/
-  host) and `dial:<service-tag>` (consume), plus attenuable **role-tag attributes** (e.g. `#ops`,
-  `#ssh-hosts`). ADR-013's ABAC policies (“`#ops` may Dial `#ssh-hosts`”) are evaluated by this same
-  evaluator over these grants — ADR-013 adds **no** parallel authorization engine.
+- **~~Tunnel capabilities, registered by ADR-013 into *this* lattice~~ — withdrawn 2026-09-21.**
+  `bind:<service-tag>` (advertise/host) and `dial:<service-tag>` (consume), plus attenuable **role-tag
+  attributes** (e.g. `#ops`, `#ssh-hosts`), are **no longer the authorization for a room-bound service**;
+  ADR-017 decision 3 makes that the host's explicit per-sender consent. `dial:` goes because consent
+  replaces it. **`bind:` goes because offering a port of one's own machine is not the room's business** —
+  `add_service`'s `can_bind` check had exactly two sources of the capability, the genesis grant and
+  `vox grant --may-bind`, and withdrawing both while keeping the check would have left `vox serve` working
+  only for a room's creator. Independent review found that on all three reads; it was an accident rather
+  than a decision, and the decision is that there is no such capability.
+
+  Both tags **remain decodable** so that existing logs and genesis bodies still parse and keep their
+  channelIDs (ADR-017 decision 11); neither is consulted. ADR-013's ABAC role-tag policies go with them,
+  unbuilt and now unneeded — ADR-013 still adds **no** parallel authorization engine, and after this there
+  is one authorization input rather than two.
 New capability types are added only here (versioned), preserving the single-evaluator guarantee.
 
 - **Admin delegation cert** — issued by an admin, names a delegate identity key and the granted
@@ -134,15 +144,41 @@ The passphrase gates the swarm; per-sender consent gates reading. There is no ad
 1. `N` joins via CPace (ADR-005) and establishes pairwise PQXDH sessions (ADR-004) with members it
    meets. Holding channel credentials yields **no** sender keys — `N` can read nothing yet (and shows
    as an unverified identity until members verify it).
-2. `N` broadcasts its own SKDM to members (it has nothing to consent over; whether others can read
-   `N` is each member's own decision, symmetric to the rule below).
+2. **`N` independently decides which members may read `N`** and issues a consent grant to each — sending
+   `N`'s SKDM to exactly those. Until `N` does so for `A`, `N`'s messages are undecryptable to `A`,
+   forever if `N` never chooses `A`. This is **fully symmetric to step 3** and is a deliberate human act,
+   not a side effect of joining.
+
+   **Revised 2026-09-21**, in two places. This step previously read *"`N` broadcasts its own SKDM to
+   members (it has nothing to consent over; whether others can read `N` is each member's own decision)"* —
+   whose parenthetical has the direction backwards: whether others may read `N` is **`N`'s** decision, and
+   the only thing that is each member's own decision is whether `N` may read *them* (step 3). And the
+   implementation was narrower and worse than either reading: `join` released `N`'s sender key to **the
+   single member that answered the join** and recorded it as an ordinary consent grant
+   (`node/actor.rs:1764` → `:1835`), with the recipient chosen from the board (`:1603`) and therefore
+   influenceable by whoever supplied the link. ADR-017 decision 3 makes that consent load-bearing for
+   *service reach*, so an automatic grant there would have handed a service to a party no human approved.
+   The automatic release is removed (ADR-017 M17.6). The decider's statement of the rule:
+
+   > *"A new node joins. They will need to approve who they want to share with of the people that are
+   > already in the room. Once they do that, when this new node writes something to the room then the
+   > people that they approved should be able to read messages from the new node. However, of the people
+   > already in the room, anything that they write will not be readable by the new node until the new node
+   > has been approved by the existing node."*
+
 3. Each existing member `A` independently decides whether to consent. On consent, `A` issues a
    **consent grant** (sends `A`'s SKDM to `N`). Until `A` does so, `A`'s messages remain undecryptable
    to `N` — forever if `A` never consents. `N`'s readable view fills in **monotonically, per sender**.
 
-Because possession of credentials releases no keys, and readability is granted only by each member's
-own consent grant (no admin admission, no central roster), there is no server-controlled member list
-to forge — the Signalgate / Megolm membership-injection class is structurally absent.
+Because possession of credentials releases no keys, and readability is granted only by each party's own
+consent grant (no admin admission, no central roster), there is no server-controlled member list to forge
+— the Signalgate / Megolm membership-injection class is structurally absent. *Until 2026-09-21 the first
+clause was not true of the implementation: joining released one sender key automatically (step 2).*
+
+**Consent now carries service reach.** Under ADR-017 decision 3 a consent grant also authorizes the
+grantee to reach every service its grantor has bound to that room. Two consequences are binding here:
+the consent UI must say so at the moment of granting, and **only consent issued by an explicit human act
+qualifies** — which is why step 2's automatic release had to go rather than be marked.
 
 ### The genesis service grant, and taking it back (ADR-017 decision 3)
 
