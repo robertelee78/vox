@@ -53,6 +53,8 @@ pub const MAX_PAIRWISE_FRAME: usize = 64 * 1024;
 const OP_SKDM: u64 = 1;
 /// The PQXDH opening a session that no join created. See [`PairwiseFrame::Hello`].
 const OP_HELLO: u64 = 2;
+/// `3` — an [`PairwiseFrame::Open`]: one ratchet message carrying nothing.
+const OP_OPEN: u64 = 3;
 
 /// One frame on a `pairwise` stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +87,27 @@ pub enum PairwiseFrame {
         /// `InitialMessage::to_wire` bytes.
         initial: Vec<u8>,
     },
+    /// One ratchet message with an **empty** plaintext, whose only job is to open the
+    /// responder's sending direction (M17.6).
+    ///
+    /// A PQXDH responder starts with no chains: `Ratchet::init_responder` says so in
+    /// as many words — *"with no chains yet — they are established when the first
+    /// inbound message triggers a DH ratchet step"*. The join's `InitialMessage`
+    /// creates the session but delivers no ratchet message, so until the initiator
+    /// sends one the responder cannot send at all.
+    ///
+    /// Joining used to satisfy that by releasing the joiner's **sender key** — which
+    /// made a consent decision nobody took, to whichever member answered the join
+    /// (M17.6, ADR-007 step 2 as revised). The session's need is real; meeting it with
+    /// a grant was the defect. This frame meets it with nothing: it is a sealed message
+    /// whose plaintext is empty, so the responder ratchets and gains a sending chain,
+    /// and learns no key and receives no grant.
+    Open {
+        /// The channel this session is bound to.
+        channel_id: crate::hash::Digest32,
+        /// `Message::to_wire` bytes of a sealed, empty-plaintext ratchet message.
+        sealed: Vec<u8>,
+    },
 }
 
 impl PairwiseFrame {
@@ -102,6 +125,9 @@ impl PairwiseFrame {
             } => {
                 e.array(3).uint(OP_HELLO).bytes(channel_id).bytes(initial);
             }
+            Self::Open { channel_id, sealed } => {
+                e.array(3).uint(OP_OPEN).bytes(channel_id).bytes(sealed);
+            }
         }
         e.finish()
     }
@@ -112,6 +138,13 @@ impl PairwiseFrame {
         let n = d.array()?;
         let op = d.uint()?;
         let frame = match (op, n) {
+            (OP_OPEN, 3) => Self::Open {
+                channel_id: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedBundle("pairwise channel_id length"))?,
+                sealed: d.bytes()?.to_vec(),
+            },
             (OP_SKDM, 3) => Self::Skdm {
                 channel_id: d
                     .bytes()?
@@ -170,6 +203,35 @@ pub async fn deliver_skdm(
         write_frame(&mut send, &frame.to_frame()).await?;
     }
     send_skdm(&mut send, channel_id, session, skdm).await?;
+    let _ = send.finish();
+    Ok(())
+}
+
+/// Open a `pairwise` stream, give the far side the ratchet message its sending
+/// direction needs, and half-close (M17.6).
+///
+/// This grants nothing. See [`PairwiseFrame::Open`] for why the session needs it and
+/// why meeting that need with a sender key was the defect.
+pub async fn open_sending_direction(
+    conn: &VoxConnection,
+    channel_id: &crate::hash::Digest32,
+    session: &mut Session,
+    hello: Option<&InitialMessage>,
+) -> Result<()> {
+    let (mut send, _recv) = open_typed(conn, StreamKind::Pairwise).await?;
+    if let Some(initial) = hello {
+        let frame = PairwiseFrame::Hello {
+            channel_id: *channel_id,
+            initial: initial.to_wire(),
+        };
+        write_frame(&mut send, &frame.to_frame()).await?;
+    }
+    let sealed = session.encrypt(&[])?.to_wire();
+    let frame = PairwiseFrame::Open {
+        channel_id: *channel_id,
+        sealed,
+    };
+    write_frame(&mut send, &frame.to_frame()).await?;
     let _ = send.finish();
     Ok(())
 }

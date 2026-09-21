@@ -70,11 +70,16 @@ pub enum StructTag {
     /// service grant from one member, which is the only way to take back a
     /// capability nobody was ever issued a certificate for.
     ServiceGrantExclusion = 0x0013,
+    /// `0x0014` — join witness (ADR-016 M17.6): the member that actually verified a
+    /// joiner's ADR-005 passphrase proof signs that it did so. A key becomes an author
+    /// only on such evidence, which is what makes "no member can add another member"
+    /// enforceable rather than merely intended.
+    JoinWitness = 0x0014,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 19] = [
+    pub const ALL: [StructTag; 20] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -94,6 +99,7 @@ impl StructTag {
         StructTag::SessionEstablishment,
         StructTag::MemberBundleRecord,
         StructTag::ServiceGrantExclusion,
+        StructTag::JoinWitness,
     ];
 
     /// The 2-byte tag value.
@@ -104,7 +110,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 19-element table: trivial and avoids an
+        // Linear scan over a 20-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -137,6 +143,7 @@ impl StructTag {
             StructTag::EskPublication => "vox/esk-publication/v1",
             StructTag::SessionEstablishment => "vox/session-establishment/v1",
             StructTag::MemberBundleRecord => "vox/member-bundle-record/v1",
+            StructTag::JoinWitness => "vox/join-witness/v1",
         }
     }
 }

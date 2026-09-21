@@ -34,7 +34,13 @@ use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
 use vox_core::node::link::InviteLink;
 use vox_core::node::paths::Paths;
 
-const TIMEOUT: Duration = Duration::from_secs(120);
+/// Raised from 120s 2026-09-21 (M17.6). Consent is now two explicit acts per pair
+/// rather than one act plus the join's automatic release, so a pair costs two extra
+/// round trips and two extra log entries — and here those cross a **relayed** circuit
+/// between two symmetric NATs, which is the slowest path the ladder has. Observed
+/// 32-40s of syncing against a 120s bound, which is too close to be reliable. The
+/// extra cost is real and is paid once per pair; it is not a regression to hide.
+const TIMEOUT: Duration = Duration::from_secs(240);
 
 fn secret(s: &str) -> Secret {
     Secret::new(s.as_bytes().to_vec())
@@ -232,13 +238,13 @@ fn m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor() {
             _ => None,
         })
         .await;
-        let _ = wait_for(&alice, |e| match e {
-            NodeEvent::SenderKeyReceived {
-                channel_id, peer, ..
-            } if channel_id == cid && peer == bob_fp => Some(()),
-            _ => None,
-        })
-        .await;
+        // **Rewritten 2026-09-21 (M17.6).** This gate waited here for Bob's sender key
+        // to arrive at Alice *before* anybody consented — the automatic release that
+        // joining used to perform, which granted reading (and, under ADR-017 decision
+        // 3, service reach) to whichever member answered the join, with no human
+        // deciding. Waiting for it asserted the defect. Each party now grants
+        // explicitly, and the property under test — two symmetric-NAT clients forming a
+        // swarm through their own anchor — is unchanged.
         let out = alice
             .apply(NodeCommand::Consent {
                 channel_id: cid,
@@ -246,10 +252,24 @@ fn m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor() {
             })
             .await;
         assert!(out.is_done(), "Alice consents to Bob: {out:?}");
+        let out = bob
+            .apply(NodeCommand::Consent {
+                channel_id: cid,
+                target: alice_fp,
+            })
+            .await;
+        assert!(out.is_done(), "Bob consents to Alice: {out:?}");
         let _ = wait_for(&bob, |e| match e {
             NodeEvent::SenderKeyReceived {
                 channel_id, peer, ..
             } if channel_id == cid && peer == alice_fp => Some(()),
+            _ => None,
+        })
+        .await;
+        let _ = wait_for(&alice, |e| match e {
+            NodeEvent::SenderKeyReceived {
+                channel_id, peer, ..
+            } if channel_id == cid && peer == bob_fp => Some(()),
             _ => None,
         })
         .await;
@@ -392,13 +412,11 @@ fn m15_members_never_online_together_converge_through_the_anchor() {
             _ => None,
         })
         .await;
-        let _ = wait_for(&alice, |e| match e {
-            NodeEvent::SenderKeyReceived {
-                channel_id, peer, ..
-            } if channel_id == cid && peer == bob_fp => Some(()),
-            _ => None,
-        })
-        .await;
+        // Rewritten 2026-09-21 (M17.6): joining releases no sender key, so Alice grants
+        // explicitly. Only her direction is needed here — this gate's property is that
+        // **Bob** reads what Alice said while he was away, so Bob consenting to Alice
+        // would be reach nothing in the test depends on. See the note in the first gate,
+        // which exercises both directions because both nodes speak there.
         assert!(alice
             .apply(NodeCommand::Consent {
                 channel_id: cid,
@@ -445,7 +463,15 @@ fn m15_members_never_online_together_converge_through_the_anchor() {
                 .unwrap_or(0)
         };
         let wanted = alice_entries(&alice);
-        assert!(wanted >= 3, "genesis, consent and the message: {wanted}");
+        // Alice's own consent grant, and the message. **Corrected 2026-09-21 (M17.6).**
+        // This read `>= 3` and called them "genesis, consent and the message", which was
+        // wrong on both counts: the genesis is a record of its own and never a DAG entry
+        // (`entry_count` is `dag.len()`), and the third entry was Bob's *automatic*
+        // consent, synced from him — the release that joining used to perform and no
+        // longer does. What the bound is actually for is stated below: at least one
+        // governance entry **plus** the content entry, so the wait cannot be satisfied
+        // before the message exists.
+        assert!(wanted >= 2, "alice's consent and the message: {wanted}");
         tokio::time::timeout(TIMEOUT, async {
             while anchor_holds(&carol) < wanted {
                 tokio::time::sleep(Duration::from_millis(100)).await;

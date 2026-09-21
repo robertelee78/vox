@@ -1052,10 +1052,15 @@ impl Node {
             *entry = entry.saturating_add(1);
             *entry
         };
-        let (genesis_wire, epoch) = match self.channels.get(channel_id) {
+        // The admission goes out with the bundle: a node that cannot say how it became
+        // a member publishes nothing, rather than publishing an unevidenced key (M17.6).
+        let (genesis_wire, epoch, admission) = match self.channels.get(channel_id) {
             Some(shared) => {
                 let c = shared.lock().await;
-                (c.genesis().to_wire(), c.epoch())
+                let Some(admission) = c.own_admission().cloned() else {
+                    return;
+                };
+                (c.genesis().to_wire(), c.epoch(), admission)
             }
             None => return,
         };
@@ -1067,7 +1072,7 @@ impl Node {
             let Some(ring) = self.prekeys.as_ref() else {
                 return;
             };
-            net.own_records(signer, channel_id, epoch, ring, seq)
+            net.own_records(signer, channel_id, epoch, ring, seq, admission)
         };
         let Ok((address, bundle)) = records else {
             return;
@@ -1311,8 +1316,11 @@ impl Node {
             return;
         };
         let _ = net.publish_local(&channel.genesis().to_wire());
+        let Some(admission) = channel.own_admission().cloned() else {
+            return;
+        };
         if let Ok((address, bundle)) =
-            net.own_records(signer, channel_id, channel.epoch(), ring, seq)
+            net.own_records(signer, channel_id, channel.epoch(), ring, seq, admission)
         {
             let _ = net.publish_local(&address.to_wire());
             let _ = net.publish_local(&bundle.to_wire());
@@ -1833,24 +1841,46 @@ impl Node {
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
         );
-        // Every member whose bundle is on the board is an admitted author: the record
-        // carries its full composite key and is verified against it (ADR-016). Sync
-        // hard-fails on an entry from an author we never admitted, so this is what
-        // makes the log reconcilable at all.
+        // Keep the responder's witness to this join (M17.6). It is republished with
+        // every bundle record this node ever puts on a board for this room, so it is
+        // persisted rather than held: a node that lost it could publish nothing and
+        // would fall off every board. The joiner already verified it binds its own key,
+        // this room and this epoch, in `run_initiator`.
         if let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
             self.channels.get(&parsed.channel_id).map(Arc::clone),
         ) {
-            let mut channel = shared.lock().await;
-            for record in &set.bundles {
-                if let Ok(key) = crate::identity::composite::CompositePublicKey::from_bytes(
-                    &record.prekey_bundle.root_pub,
-                ) {
-                    if record.verify(&key).is_ok() {
-                        let _ = channel.admit_author(profile.store(), &key, now);
-                    }
-                }
+            let admission =
+                crate::nat::record::Admission::Witnessed(Box::new(joined.witness.clone()));
+            if let Err(e) = shared
+                .lock()
+                .await
+                .set_own_admission(profile.store(), admission)
+            {
+                return Outcome::Failed(fault_of(&e));
             }
+        }
+        // Every member whose bundle is on the board is an admitted author **on the
+        // M17.6 evidence its record carries** — a self-signed record proves possession
+        // of a key and nothing else. Sync hard-fails on an entry from an author we
+        // never admitted, so this is what makes the log reconcilable at all.
+        if let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(&parsed.channel_id).map(Arc::clone),
+        ) {
+            // Same rule as `learn_members`: evidence, not relay (M17.6). The
+            // responder's own board is no more trustworthy than any other — it is
+            // where a joiner first looks, which makes it the *first* place a
+            // compromised member would seed keys.
+            let mut channel = shared.lock().await;
+            let _ = admit_board_records(
+                &mut channel,
+                profile.store(),
+                &set.bundles,
+                ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+                now,
+            )
+            .await;
         }
         self.sessions
             .insert((parsed.channel_id, responder), joined.session);
@@ -1872,16 +1902,36 @@ impl Node {
             self.publish_channel_to_anchor(&parsed.channel_id, &conn)
                 .await;
         }
-        // ADR-007 step 2: the newcomer announces its **own** sender key. This is part
-        // of joining rather than a separate consent decision — "it has nothing to
-        // consent over" — and it must happen here for a second reason: the ADR-004
-        // responder has no sending chain until it receives the initiator's first
-        // message, so until the joiner speaks no member can answer at all. Step 3
-        // (members consenting to the newcomer) stays human-initiated, via `Consent`.
-        let released = self.release_key_to(&parsed.channel_id, responder).await;
-        if !released.is_done() {
-            return released;
-        }
+        // **Joining releases no sender key** (M17.6). This is the correction to
+        // ADR-007 step 2, which read "the newcomer announces its own sender key … it
+        // has nothing to consent over". It does: it decides which members may read it,
+        // per member, exactly as they each decide about it. Releasing automatically
+        // made that decision for it, and made it in favour of whichever member happened
+        // to answer the join — a member chosen from the board, so influenceable by
+        // whoever supplied the link. Under ADR-017 decision 3 that consent also carries
+        // service reach, so an automatic grant here handed a service to a party no
+        // human approved.
+        //
+        // The stated reason for releasing here does not require it: the ADR-004
+        // responder needs the initiator's first message, which is the PQXDH
+        // `InitialMessage` the join already sent, not the SKDM. `ensure_session` builds
+        // a session from a board bundle record alone, and the SKDM rides over it.
+        //
+        // What *is* still required is one ratchet message, and it carries nothing. A
+        // PQXDH responder starts with no chains — `Ratchet::init_responder`: "with no
+        // chains yet — they are established when the first inbound message triggers a
+        // DH ratchet step" — and the join's `InitialMessage` creates the session
+        // without delivering a message, so until the joiner speaks over it the
+        // responder cannot send at all. That need is real and is what the old comment
+        // was pointing at; meeting it with a *sender key* is what made it a grant.
+        // `PairwiseFrame::Open` meets it with an empty plaintext.
+        // The ratchet message that opens the responder's sending direction rides the
+        // **join stream itself** (`JoinFrame::Open`), so the responder has processed it
+        // before the join returns. Sending it afterwards on a separate stream was a
+        // race: `Consent` immediately after a join would find no sending chain and fail,
+        // and only luck decided whether it did.
+        // Nothing else replaces the release. A joiner becomes readable when it trusts
+        // someone, which is a human act, and `deliver_owed_consents` issues the grant.
         let _ = self.event_tx.send(NodeEvent::Joined {
             channel_id: parsed.channel_id,
             responder,
@@ -2289,20 +2339,14 @@ impl Node {
             self.channels.get(channel_id).map(Arc::clone),
         ) {
             let mut channel = shared.lock().await;
-            for record in &set.bundles {
-                let Ok(key) = crate::identity::composite::CompositePublicKey::from_bytes(
-                    &record.prekey_bundle.root_pub,
-                ) else {
-                    continue;
-                };
-                // The board is availability only: the record must verify under the key
-                // it carries before that key becomes an author.
-                if record.verify(&key).is_ok()
-                    && matches!(channel.admit_author(profile.store(), &key, now), Ok(true))
-                {
-                    learned += 1;
-                }
-            }
+            learned = admit_board_records(
+                &mut channel,
+                profile.store(),
+                &set.bundles,
+                ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+                now,
+            )
+            .await;
         }
         if learned > 0 {
             self.refresh_network_view().await;
@@ -2635,6 +2679,18 @@ impl Node {
         // the SKDM it precedes.
         let (channel_id, sealed) = match first {
             PairwiseFrame::Skdm { channel_id, sealed } => (channel_id, sealed),
+            // One ratchet message with an empty plaintext, sent to give *this* node a
+            // sending chain (M17.6). Decrypt it so the ratchet steps, then stop: there
+            // is nothing behind it and nothing is granted by it.
+            PairwiseFrame::Open { channel_id, sealed } => {
+                let now = self.now();
+                if let Some(session) = self.sessions.get_mut(&(channel_id, peer)) {
+                    if let Ok(message) = crate::pairwise::message::Message::from_wire(&sealed) {
+                        let _ = session.decrypt(&message, now);
+                    }
+                }
+                return;
+            }
             PairwiseFrame::Hello {
                 channel_id,
                 initial,
@@ -2642,14 +2698,25 @@ impl Node {
                 if !self.accept_hello(channel_id, peer, &initial).await {
                     return;
                 }
-                let Ok(Some(PairwiseFrame::Skdm { channel_id, sealed })) =
-                    recv_pairwise(&mut recv).await
-                else {
-                    // A session with nothing behind it is still progress: the peer may
-                    // deliver over it later.
-                    return;
-                };
-                (channel_id, sealed)
+                match recv_pairwise(&mut recv).await {
+                    Ok(Some(PairwiseFrame::Skdm { channel_id, sealed })) => (channel_id, sealed),
+                    Ok(Some(PairwiseFrame::Open { channel_id, sealed })) => {
+                        let now = self.now();
+                        if let Some(session) = self.sessions.get_mut(&(channel_id, peer)) {
+                            if let Ok(message) =
+                                crate::pairwise::message::Message::from_wire(&sealed)
+                            {
+                                let _ = session.decrypt(&message, now);
+                            }
+                        }
+                        return;
+                    }
+                    _ => {
+                        // A session with nothing behind it is still progress: the peer
+                        // may deliver over it later.
+                        return;
+                    }
+                }
             }
         };
         let now = self.now();
@@ -3274,6 +3341,65 @@ impl crate::node::up::HostDialer for NodeDialer {
         let endpoints = self.net.board_endpoints(&self.channel_id, host);
         self.net.reach(*host, &endpoints).await.ok()
     }
+}
+
+/// Admit as many board records as their M17.6 evidence allows, to a fixpoint.
+///
+/// A witness is only evidence if its signer is **already** admitted, which roots every
+/// chain in the genesis creator — and means order matters. A board hands records over
+/// in whatever order it holds them, so a single pass drops a record whose witness was
+/// signed by a member that appears later in the same batch. Repeating until a pass
+/// admits nothing resolves a chain of any length, in any order, and terminates because
+/// each pass either admits somebody or is the last.
+///
+/// `quota` bounds the whole call, not a pass: a witness makes an admission attributable
+/// but not impossible, so without it one compromised member could still exhaust this
+/// node's author table and deny admission to every legitimate member thereafter.
+async fn admit_board_records(
+    channel: &mut ChannelState,
+    store: &crate::node::store::Store,
+    records: &[crate::nat::record::MemberBundleRecord],
+    quota: usize,
+    now: u64,
+) -> usize {
+    let mut admitted = 0usize;
+    let mut pending: Vec<&crate::nat::record::MemberBundleRecord> = records.iter().collect();
+    while admitted < quota {
+        let before = admitted;
+        pending.retain(|record| {
+            if admitted >= quota {
+                return true;
+            }
+            let Ok(key) = crate::identity::composite::CompositePublicKey::from_bytes(
+                &record.prekey_bundle.root_pub,
+            ) else {
+                return false;
+            };
+            // The board is availability only. The record must verify under the key it
+            // carries, *and* carry the evidence that the key belongs here — a
+            // self-signed record proves possession of a key and nothing else, and
+            // admitting on who relayed it is the trust-on-first-use ADR-020 decision 3
+            // forbids.
+            if record.verify(&key).is_err() {
+                return false;
+            }
+            match channel.admit_from_board(store, &key, &record.admission, now) {
+                Ok(true) => {
+                    admitted += 1;
+                    false
+                }
+                // Already admitted: nothing to do and nothing to retry.
+                Ok(false) => false,
+                // The evidence does not hold up *yet* — its witness may be admitted by
+                // a later pass. Kept for the next one; dropped when a pass adds nobody.
+                Err(_) => true,
+            }
+        });
+        if admitted == before {
+            break;
+        }
+    }
+    admitted
 }
 
 fn fault_of(e: &Error) -> Fault {

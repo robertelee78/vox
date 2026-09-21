@@ -44,7 +44,7 @@ use crate::join::pow::Difficulty;
 use crate::join::session::JoinContext;
 use crate::nat::multiaddr::{EndpointList, Multiaddr};
 use crate::nat::reachability::{connect_direct, direct_candidates};
-use crate::nat::record::{MemberBundleRecord, RendezvousRecord};
+use crate::nat::record::{Admission, MemberBundleRecord, RendezvousRecord};
 use crate::nat::service::{
     MembershipOracle, RecordKinds, RecordSet, RendezvousClient, RendezvousService,
 };
@@ -928,6 +928,10 @@ impl NodeNet {
     /// Build this node's own address record and prekey bundle for
     /// `(channel_id, epoch)` (the records [`NodeNet::publish_channel_records`] sends
     /// to an anchor, and [`NodeNet::publish_local`] files locally).
+    /// `admission` is how this node came to be a member (M17.6) — it created the
+    /// channel, or a member signed a witness for its join. A bundle record cannot be
+    /// built without one, which is the point: a key with no evidence behind it has no
+    /// business on a board.
     pub fn own_records(
         &self,
         signer: &dyn RootSigner,
@@ -935,6 +939,7 @@ impl NodeNet {
         epoch: u64,
         ring: &PrekeyRing,
         seq: u64,
+        admission: Admission,
     ) -> Result<(RendezvousRecord, MemberBundleRecord)> {
         let now = self.now();
         let endpoints = self.local_endpoints()?;
@@ -955,6 +960,7 @@ impl NodeNet {
             seq,
             now,
             crate::nat::store::BUNDLE_MAX_TTL_SECS,
+            admission,
         )?;
         Ok((address, bundle))
     }
@@ -973,6 +979,10 @@ impl NodeNet {
     ///
     /// `seq` must strictly increase per `(author, channel, epoch)` and refreshes are
     /// rate-floored by the board, so the caller keeps the counter.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per published field; grouping them would hide what is sent"
+    )]
     pub async fn publish_channel_records(
         &self,
         conn: &VoxConnection,
@@ -981,8 +991,10 @@ impl NodeNet {
         epoch: u64,
         ring: &PrekeyRing,
         seq: u64,
+        admission: Admission,
     ) -> Result<()> {
-        let (address, bundle) = self.own_records(signer, channel_id, epoch, ring, seq)?;
+        let (address, bundle) =
+            self.own_records(signer, channel_id, epoch, ring, seq, admission)?;
         let mut client = RendezvousClient::open(conn).await?;
         let res = async {
             client.put(&address.to_wire()).await?;

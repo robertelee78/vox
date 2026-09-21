@@ -690,6 +690,17 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   unlock), serves the board, coordinates and relays, and prints the `<fingerprint>@<multiaddr>` a client
   gives as `--anchor`. Ctrl-C shuts it down. `NodeView::anchoring` is what it can say about itself: the
   rooms it serves and how many members it knows of each, never what any of them said.
+  **Superseded on the member side, 2026-09-21 (M17.6).** Vouching is trust-on-first-use — the key comes
+  from the record itself, which is only self-signed, and the sole evidence is *who relayed it*. ADR-020
+  decision 3 forbids TOFU in as many words, and `accept_entry` admits an entry from any admitted author
+  **without requiring the author to hold the room passphrase**, so admission is what turns "entry
+  rejected" into "entry stored" for an arbitrary key. A **member** now admits a board key only on an
+  `Admission` the record carries: `Creator`, checked against the genesis it already holds, or a
+  `JoinWitness` signed by a member it already admits. The **anchor** keeps vouching — it is not a member,
+  holds no passphrase and can never produce a join proof, so it has no other way to learn a channel's
+  membership; it reads nothing either way, and a member rejects entries from authors *it* has not
+  admitted, so an anchor's looser view does not propagate. The original text follows.
+
   **Membership is a board fact**, not a log fact — a member learns new members from the boards of
   members who witnessed the join — and the anchor now learns it the same way, by **vouching**: a bundle
   record from an author the anchor does not know, published over an authenticated connection by a peer

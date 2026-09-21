@@ -154,7 +154,16 @@ The passphrase gates the swarm; per-sender consent gates reading. There is no ad
 2. **`N` independently decides which members may read `N`** and issues a consent grant to each — sending
    `N`'s SKDM to exactly those. Until `N` does so for `A`, `N`'s messages are undecryptable to `A`,
    forever if `N` never chooses `A`. This is **fully symmetric to step 3** and is a deliberate human act,
-   not a side effect of joining.
+   not a side effect of joining. **Built 2026-09-21** (ADR-017 M17.6).
+
+   **What joining *does* still do, and why it is not a grant.** A PQXDH responder begins with no ratchet
+   chains — [`Ratchet::init_responder`] is explicit: *"with no chains yet — they are established when the
+   first inbound message triggers a DH ratchet step"*. The join's `InitialMessage` creates the session but
+   delivers no ratchet message, so until the joiner speaks *over* the session the responder cannot send at
+   all. That is a transport fact and it is real; it is what the superseded text was reaching for. Meeting
+   it with the joiner's **sender key** is what made it a consent decision nobody took. It is now met with
+   `PairwiseFrame::Open`: one sealed message whose plaintext is empty. The responder ratchets, gains a
+   sending chain, and learns no key and receives no grant.
 
    **The decision is an identity-level one, taken once (decider, 2026-09-21).** `N` decides about `A`'s
    *key*, not about `A`-in-this-room, and the decision is recorded in `N`'s **trust keyring** (ADR-020
