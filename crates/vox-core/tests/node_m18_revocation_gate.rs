@@ -17,6 +17,9 @@
 //! join make this slow: `#[ignore]`d in the debug suite, run by CI's release step
 //! with the other real-parameter gates.
 
+#[path = "support/watchdog.rs"]
+mod watchdog;
+
 use std::time::Duration;
 
 use vox_core::node::actor::{Node, NodeHandle};
@@ -123,6 +126,7 @@ async fn until(h: &NodeHandle, what: &str, mut ok: impl FnMut(&NodeView) -> bool
 #[test]
 #[ignore = "production Argon2id + (200,9) Equihash: slow in release, minutes unoptimized; CI runs it in release"]
 fn m18_revoking_one_member_keeps_the_others_whole() {
+    watchdog::arm();
     let rt = runtime();
     let tmp = tempfile::tempdir().unwrap();
     rt.block_on(async {

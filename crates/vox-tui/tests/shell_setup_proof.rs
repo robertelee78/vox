@@ -20,6 +20,9 @@
 //! `VOX_PROOF_ALLOW_UNPROVEN=fish[,bash,...]` to accept a named gap, which makes the gap a
 //! deliberate, visible decision instead of a silent one.
 
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -118,6 +121,7 @@ fn allow_unproven() -> Vec<String> {
 
 #[test]
 fn shell_setup_gives_a_new_shell_vox_on_path_and_working_completion() {
+    watchdog::arm();
     let mut claims: Vec<Claim> = Vec::new();
     let mut receipts: BTreeMap<String, String> = BTreeMap::new();
     let allowed = allow_unproven();
