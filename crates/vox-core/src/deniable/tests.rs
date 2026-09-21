@@ -12,6 +12,7 @@ use crate::deniable::key::EpochKey;
 use crate::deniable::rounds::{Confirm, Reveal};
 use crate::deniable::share::SHARE_LEN;
 use crate::deniable::verifier::{build_deniable_content, EpochVerifier};
+use crate::deniable::wire::DgkaMessage;
 use crate::hash::{sha256, Digest32};
 use crate::identity::composite::{RootSigner, SoftwareRootSigner};
 use crate::log::dag::{AdmissionPolicy, Dag, ForkOutcome, Rejected};
@@ -21,6 +22,21 @@ use crate::suite::algo;
 
 const CHANNEL: Digest32 = [0xC1; 32];
 const EPOCH: u64 = 7;
+
+/// Encode a setup message, decode it back, and return what came out — the round trip
+/// a log entry actually makes. Asserts the framing is stable under re-encoding, which
+/// is what ADR-008 canonical CBOR promises and what a signature over the body needs.
+fn on_the_wire(msg: &DgkaMessage) -> DgkaMessage {
+    let bytes = msg.to_wire();
+    let back = DgkaMessage::from_wire(&bytes).expect("a message we encoded decodes");
+    assert_eq!(
+        back.to_wire(),
+        bytes,
+        "re-encoding a decoded message must give the same bytes"
+    );
+    assert_eq!(back.author_id(), msg.author_id());
+    back
+}
 
 /// The outcome of a completed DGKA for one member: the canonical context, the
 /// member's run handle (holding its fresh signing key), its agreed key, and its
@@ -54,9 +70,23 @@ fn run_full_dgka(n: usize) -> (Vec<Completed>, BTreeMap<Digest32, [u8; SHARE_LEN
         .collect();
 
     // Round 1: broadcast commits; everyone records everyone's commit.
+    //
+    // Every round below is carried through the `dgka-setup` (0x000B) codec rather
+    // than handed over in-process, because that is how it travels on a log: a member
+    // never receives a `Reveal`, it receives bytes. Routing the whole suite through
+    // the codec means any field it drops, reorders or re-lengths fails these tests
+    // rather than a separate round-trip test that could agree with a broken encoder.
     let commits: Vec<(Digest32, Digest32)> = members
         .iter()
-        .map(|m| (m.author_id(), m.commit()))
+        .map(|m| {
+            match on_the_wire(&DgkaMessage::Commit {
+                author_id: m.author_id(),
+                commit: m.commit(),
+            }) {
+                DgkaMessage::Commit { author_id, commit } => (author_id, commit),
+                other => panic!("commit decoded as {other:?}"),
+            }
+        })
         .collect();
     for m in &mut members {
         for (author, commit) in &commits {
@@ -66,7 +96,13 @@ fn run_full_dgka(n: usize) -> (Vec<Completed>, BTreeMap<Digest32, [u8; SHARE_LEN
 
     // Round 2: broadcast reveals; everyone records everyone's reveal (checked
     // against the stored commit).
-    let reveals: Vec<Reveal> = members.iter().map(DgkaMember::reveal).collect();
+    let reveals: Vec<Reveal> = members
+        .iter()
+        .map(|m| match on_the_wire(&DgkaMessage::Reveal(m.reveal())) {
+            DgkaMessage::Reveal(r) => r,
+            other => panic!("reveal decoded as {other:?}"),
+        })
+        .collect();
     for m in &mut members {
         for r in &reveals {
             m.recv_reveal(r.clone()).unwrap();
@@ -92,6 +128,10 @@ fn run_full_dgka(n: usize) -> (Vec<Completed>, BTreeMap<Digest32, [u8; SHARE_LEN
     let mut keys: Vec<EpochKey> = Vec::new();
     for (i, m) in members.iter().enumerate() {
         let (c, k) = m.finalize(&ctxs[i], &x_map).unwrap();
+        let c = match on_the_wire(&DgkaMessage::Confirm(c)) {
+            DgkaMessage::Confirm(c) => c,
+            other => panic!("confirm decoded as {other:?}"),
+        };
         confirms.push(c);
         keys.push(k);
     }
@@ -360,4 +400,83 @@ fn dgka_setup_envelope_is_attributable_static_signed() {
     let mut dag = Dag::new();
     dag.accept(entry, EntryKind::Governance, &signer.public_key(), &adm, 0)
         .unwrap();
+}
+
+/// The re-key path had **no caller and no test anywhere in the workspace** before this
+/// — `begin_rekey` and `ReKeyParticipant` were reachable only from their own module.
+/// This drives it for real so the `dgka-setup` re-key body is exercised rather than
+/// merely written, and so the path itself runs at least once.
+///
+/// What it proves: three members re-key to fresh `epk'`/`z'`, agree on `K'`, and each
+/// verifies the others' `ReKey` **after it has been through the 0x000B codec**.
+///
+/// What it does NOT prove, and ADR-009 gap (3) says so: re-key skips the commitment
+/// round, so shares are not protected against adaptive choice, and it carries no
+/// static reveal signature on the wire. Exercising the path does not harden it; it
+/// makes the weakness reproducible instead of theoretical.
+#[test]
+fn rekey_round_trips_through_the_dgka_setup_codec_and_every_member_agrees() {
+    use crate::deniable::rekey::{begin_rekey, finalize_rekey, rekey_context, verify_rekey};
+
+    let static_ids: Vec<SoftwareRootSigner> = (0..3)
+        .map(|k| {
+            SoftwareRootSigner::from_component_seeds(&[k as u8 + 9; 32], &[k as u8 + 200; 32])
+                .unwrap()
+        })
+        .collect();
+    let participants: Vec<_> = static_ids
+        .iter()
+        .map(|s| begin_rekey(CHANNEL, EPOCH + 1, s).unwrap())
+        .collect();
+
+    let ctx = rekey_context(
+        CHANNEL,
+        EPOCH + 1,
+        participants.iter().map(|p| p.descriptor()).collect(),
+    )
+    .unwrap();
+
+    // Every participant's X'_i must be gathered before any of them derives K'.
+    let mut x_map: BTreeMap<Digest32, [u8; SHARE_LEN]> = BTreeMap::new();
+    for p in &participants {
+        x_map.insert(p.author_id(), p.round2(&ctx).expect("X' for the new ring"));
+    }
+
+    let mut rekeys = Vec::new();
+    let mut keys = Vec::new();
+    for p in &participants {
+        let (rk, k) = finalize_rekey(p, &ctx, &x_map).unwrap();
+        // Through the wire, exactly as a log entry would travel.
+        let rk = match on_the_wire(&DgkaMessage::ReKey(rk)) {
+            DgkaMessage::ReKey(rk) => rk,
+            other => panic!("rekey decoded as {other:?}"),
+        };
+        rekeys.push(rk);
+        keys.push(k);
+    }
+
+    // Each member verifies every peer's decoded ReKey under its own K'.
+    for (i, p) in participants.iter().enumerate() {
+        let me = p.descriptor().author_id;
+        for rk in &rekeys {
+            if rk.author_id == me {
+                continue;
+            }
+            let epk = verify_rekey(&ctx, &keys[i], &x_map, rk)
+                .expect("a peer's re-key verifies after a wire round trip");
+            assert_eq!(epk.author_id, rk.author_id);
+        }
+    }
+
+    // Everyone derived the same K': a MAC one member computed verifies under
+    // another's key, which is what "agree" means here.
+    let t_bind = crate::deniable::dgka::bind_transcript(&ctx, &x_map).unwrap();
+    let first = keys[0].confirm_mac_over(&ctx, &t_bind).unwrap();
+    for k in &keys[1..] {
+        assert_eq!(
+            k.confirm_mac_over(&ctx, &t_bind).unwrap(),
+            first,
+            "every member re-derived the same K'"
+        );
+    }
 }

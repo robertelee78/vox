@@ -1,8 +1,8 @@
 # ADR-009: Deniability Mode (per-channel)
 
-**Status**: implemented (M7 core, `crates/vox-core/src/deniable/`) — **not enabled for shipping**: formal analysis and the `dgka-setup` wire codec are outstanding (see Implementation notes)
+**Status**: implemented (M7 core + the `dgka-setup` codec, `crates/vox-core/src/deniable/`) — **still not enabled for shipping**: the formal analysis is outstanding, and so is the re-key hardening of gap (3) (see Implementation notes)
 **Date**: 2026-06-20
-**Updated**: 2026-09-19 — status reconciled; Implementation notes (M7) added recording formula drift (code normative) and the shipping blockers.
+**Updated**: 2026-09-21 — shipping blocker (2) closed: `deniable::wire::DgkaMessage` frames all four rounds as `0x000B` entries and the whole M7 suite now runs through it, so deniable mode can travel on a log for the first time. Closing it surfaced that the re-key path had never executed anywhere; it does now, which makes gap (3)'s weakness reproducible rather than theoretical. The formal analysis remains the blocker to enabling the mode. 2026-09-19 — status reconciled; Implementation notes (M7) added recording formula drift (code normative) and the shipping blockers.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: deniability, mpenc, deniable-gka, content-authorship, post-quantum
 
@@ -191,16 +191,28 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
 - **Verifier.** `EpochVerifier` implements the ADR-008 `DeniableVerifier` seam and keys on the exact
   `(channel_id, epoch, author_id)` triple — it never scans other epochs. Epoch-end `esk` publication
   (tag `0x0010`) is refused unless `publishing_epoch < current_epoch`, on build and on receive.
-- **Known gaps / shipping blockers (recorded 2026-09-19).** (1) **The formal analysis of the DGKA+DSKE
-  construction the Decision requires before shipping is not on file** — deniable mode must not be
-  enabled in a shipped build until it is (the module docs say the same). (2) `Reveal`, `Confirm` and
-  `ReKey` have **no wire codec** and nothing frames them into `dgka-setup` (`0x000B`) log entries — the
-  round-3 `X_i` broadcast has no message type at all; the setup rounds can be driven in-process only,
-  so deniable mode cannot yet run over the log. (3) Re-key regenerates all shares and always
+- **Known gaps / shipping blockers (recorded 2026-09-19; (2) closed 2026-09-21).** (1) **The formal
+  analysis of the DGKA+DSKE construction the Decision requires before shipping is not on file** —
+  deniable mode must not be enabled in a shipped build until it is (the module docs say the same).
+  (2) **Closed 2026-09-21.** `deniable::wire::DgkaMessage` is the `dgka-setup` (`0x000B`) codec: one
+  struct tag, four rounds told apart by a leading discriminant, each a fixed-arity canonical CBOR body
+  (`COMMIT` 3, `REVEAL` 7, `CONFIRM` 5, `REKEY` 7). The round-3 `X_i` broadcast travels in `CONFIRM`
+  alongside the DSKE bind and the confirmation MAC. The codec decides nothing — it does not check a
+  commitment against a reveal, verify a signature, or order rounds; that stays with `DgkaMember`,
+  which holds the state a decision needs. The reveal's static signature covers the `dgka-setup`
+  *signing input*, not the frame, so re-framing cannot change what was signed and a reveal lifted into
+  another channel or epoch does not verify. **Every** DGKA round in the M7 suite is now carried through
+  this codec rather than handed over in-process, so a field it drops or reorders fails those tests —
+  mutation-checked on both a `REVEAL` field and a `REKEY` field swap. (3) Re-key regenerates all shares and always
   re-derives `K'`, skips the commitment round (its shares are not protected against adaptive
   choice), carries no static reveal signature on the wire, and uses the unverified context
   constructor — identity binding on re-key rests on the caller sourcing descriptors from root-signed
-  entries. (4) Epoch-closed gating relies on a caller-supplied `current_epoch`, not log state. (5) The
+  entries. **Found 2026-09-21 while closing (2): `begin_rekey` and `ReKeyParticipant` had no caller
+  and no test anywhere in the workspace — the re-key path had never executed.** It now runs in
+  `rekey_round_trips_through_the_dgka_setup_codec_and_every_member_agrees`: three members re-key,
+  agree on `K'`, and verify one another's `ReKey` after a wire round trip. That exercises the path; it
+  does **not** harden it, and this gap stays open until the commitment round and the static reveal
+  signature are there. (4) Epoch-closed gating relies on a caller-supplied `current_epoch`, not log state. (5) The
   optional GOTR-style deferred consistency checks are not present. Test-vector obligation: no pinned
   K / T / T_bind / commit / MAC vectors exist yet.
 

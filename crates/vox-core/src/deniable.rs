@@ -77,6 +77,7 @@ pub mod rekey;
 pub mod rounds;
 pub mod share;
 pub mod verifier;
+pub mod wire;
 
 pub use dgka::{DgkaMember, DgkaSession};
 pub use epoch::{EphemeralSigningKey, EpochContext, MemberDescriptor, MemberEpk};
