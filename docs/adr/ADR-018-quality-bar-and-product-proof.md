@@ -138,6 +138,7 @@ that stops being true MUST be either replaced by an external proof or deleted.
 | `join/cpace.rs` | the CFRG Appendix-B CPace vectors | conformance to a published standard is interoperability with *other* implementations, which no local run can demonstrate |
 | `cbor.rs` | the RFC 8949 canonical-encoding vectors | as above; these bytes are the contract between versions |
 | `nat/portmap/upnp.rs::mock` + its tests | port mapping against a spec-faithful IGD, including real-router quirks | **the only UPnP evidence that exists** — no router on the development LAN answers SSDP, and there are zero integration gates (real-hardware validation remains pending, ADR-012) |
+| `deniable/tests.rs` | the full 4-round DGKA among m≥3 members, and the `0x000B` codec every round is carried through | a multi-party key agreement cannot be exhibited by one node, and deniable mode is **not enabled**, so it has no external surface at all — the same reason as the evaluator's convergence suite. Recorded 2026-09-21: it survived the M18.2 purge without being listed here, which this row corrects |
 | `atrest/sek.rs::production_timing_spike` | the production Argon2id profile actually costs what ADR-010 requires | a measured cost, not an assertion; nothing outside the process can observe it |
 
 ### 6. A hung proof is a failing proof
