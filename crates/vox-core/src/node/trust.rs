@@ -135,11 +135,17 @@ impl Keyring {
 
     /// Stop trusting `fingerprint`. Returns whether it was trusted.
     ///
-    /// Forward-looking only, and deliberately so: this stops *future* rooms from
-    /// auto-consenting, and does not recall consent already granted. Recalling
-    /// that is [`ChannelState::revoke_consent`](crate::node::channel::ChannelState::revoke_consent),
-    /// a per-room governance act — ADR-007's "enforcement honesty" applies, and
-    /// nothing here can say otherwise.
+    /// **This is the ring edit only.** Removal must also *change the lock* —
+    /// rotate this identity's sender key and re-key everyone still in the ring, in
+    /// every room shared with the removed party — which the node does around this
+    /// call (`Node::change_the_lock_against`). The two are separate because the
+    /// ring is local and the rotation is a network act: the ring edit lands
+    /// unconditionally, the re-keys are best-effort and retried on the tick.
+    ///
+    /// What rotation can and cannot buy, stated plainly: read access is a sender
+    /// key already handed over, so removal cannot take back what the removed party
+    /// has. It stops them reading what comes *next*. ADR-007's enforcement honesty
+    /// applies and nothing here can say otherwise.
     pub fn untrust(&mut self, fingerprint: &Digest32) -> bool {
         self.entries.remove(fingerprint).is_some()
     }

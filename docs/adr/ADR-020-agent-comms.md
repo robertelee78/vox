@@ -166,6 +166,22 @@ A genesis "open room" flag was designed and **rejected**. Instead:
   the history it already had, which is unavoidable, and reads nothing published afterwards. Bounded
   honestly: the re-keys are delivered best-effort and retried on the tick for whoever is offline, exactly
   as a revocation's are, so removal is a network act rather than a local flag.
+  > **Built 2026-09-21 (ADR-017 M17.14).** `NodeCommand::Untrust` now removes the ring entry and then calls
+  > `Node::change_the_lock_against`, which rotates and re-keys through `revoke` in every room where
+  > consent was actually granted — `ChannelState::has_consented` reads that off the log, so a room
+  > that never granted anything is not touched and no generation is burned for nothing. The ring edit
+  > lands unconditionally before the rotations, exactly as a revocation's log fact lands before its
+  > re-keys: a removal undone by an unreachable peer would be a removal in name only.
+  > *Gate* `node_m19_untrust_lock_gate` (release, ≈36 s): **two** rooms shared with Bob, because one
+  > would pass even if removal only ever changed the lock in whichever room came first. Bob and Carol
+  > both trusted and both reading in both; Alice untrusts Bob once, node-wide; Carol reads past the
+  > rotation in both with **no gap**; Bob receives the ciphertext (asserted by his entry count keeping
+  > up, so a pass cannot be him merely being behind) and can open **none** of it in either; and Bob
+  > **keeps the history he already held**, which the gate asserts rather than glosses, because
+  > claiming otherwise would be a lie. Mutation-checked by removing the lock change — i.e. restoring
+  > the M19.2 behaviour this replaces — caught with "the lock did not change in team-one".
+  > The doc comments that this ADR quoted as the defect (`node/trust.rs`, `NodeCommand::Untrust`) are
+  > corrected in the same change.
 
 This is the decider's design, and it is better than the genesis flag on three counts. It requires **no
 wire change, no immutable genesis decision and no channelID change**; it is reversible; and it closes
