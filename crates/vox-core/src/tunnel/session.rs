@@ -194,7 +194,7 @@ pub struct HostService {
     /// from epoch 0 still appears after an authorized rotation to epoch 1. Keying on the
     /// ring — which is local, current, and the host's own decision — means the epoch
     /// question never reaches this gate at all. Found by review before any code.
-    pub reachers: Arc<std::collections::BTreeSet<Digest32>>,
+    pub reachers: crate::node::tunnel::Reachers,
 }
 
 /// Host side: accept a tunnel on a fresh inbound stream pair, **enforcing the Dial
@@ -271,10 +271,17 @@ where
     // the withdrawn model and the vulnerability. `service_tag` is therefore no longer an
     // authorization input at all — reach is per (host, room), so every service a host
     // bound to a room goes to the same set.
-    let decision = resolve(&req.channel_id, &req.service_tag)
-        .filter(|h| h.reachers.contains(client_id))
-        .map(|h| h.endpoint);
-    let Some(target) = decision else {
+    // Read **after** the request, from the live set, so a stream parked open across a
+    // withdrawal of trust is judged by the decision that holds now, not by one taken when
+    // the stream opened (M17.11).
+    let host = resolve(&req.channel_id, &req.service_tag)
+        .filter(|h| h.reachers.borrow().contains(client_id));
+    let Some(HostService {
+        endpoint: target,
+        reachers,
+        ..
+    }) = host
+    else {
         // Finish the stream so the status reaches the dialer before we drop it.
         write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
         let _ = send.finish();
@@ -293,7 +300,58 @@ where
         }
     };
     write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
-    splice(send, recv, tcp).await
+    splice_until_withdrawn(send, recv, tcp, &reachers, client_id).await
+}
+
+/// The QUIC application error code a host resets a tunnel stream with when it withdraws
+/// the dialer's reach mid-session (ADR-017 M17.11).
+///
+/// A code rather than an in-band message: once splicing starts the stream carries the
+/// carried protocol's own bytes, so anything Vox wrote into it would corrupt them. QUIC's
+/// reset code is the one channel that stays ours.
+pub const REACH_WITHDRAWN_CODE: u32 = 0x1711;
+
+/// Splice, but stop the moment `client_id` leaves `reachers`.
+///
+/// Withdrawing reach has to reach sessions that are **already running** — an `ssh` login
+/// opened an hour ago is precisely what the operator means to cut — and the serving task
+/// cannot ask the actor, so it watches the same live set the dial gate read.
+async fn splice_until_withdrawn(
+    send: SendStream,
+    recv: RecvStream,
+    tcp: TcpStream,
+    reachers: &crate::node::tunnel::Reachers,
+    client_id: &Digest32,
+) -> Result<()> {
+    let mut changed = reachers.subscribe();
+    let mut quic = tokio::io::join(recv, send);
+    let mut tcp = tcp;
+    let outcome = {
+        let copying = tokio::io::copy_bidirectional(&mut tcp, &mut quic);
+        tokio::pin!(copying);
+        loop {
+            tokio::select! {
+                done = &mut copying => break done
+                    .map(|_| ())
+                    .map_err(|_| Error::MalformedTunnel("tunnel splice")),
+                res = changed.changed() => {
+                    // The sender lives in the actor's map. If it is gone the channel is
+                    // gone, and a channel this node no longer holds reaches nothing.
+                    let still = res.is_ok() && reachers.borrow().contains(client_id);
+                    if !still {
+                        break Err(Error::TunnelRevoked("withdrawn mid-session"));
+                    }
+                }
+            }
+        }
+    };
+    if matches!(outcome, Err(Error::TunnelRevoked(_))) {
+        // Reset rather than finish: a clean close is indistinguishable from the carried
+        // service hanging up, and the dialer deserves to know this was a decision.
+        let (_recv, mut send) = quic.into_inner();
+        let _ = send.reset(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
+    }
+    outcome
 }
 
 /// Splice bytes bidirectionally between a QUIC stream pair and a TCP socket until
@@ -306,8 +364,26 @@ where
 /// one-way close nor an idle reverse path leaks the tunnel.
 async fn splice(send: SendStream, recv: RecvStream, mut tcp: TcpStream) -> Result<()> {
     let mut quic = tokio::io::join(recv, send);
-    tokio::io::copy_bidirectional(&mut tcp, &mut quic)
-        .await
-        .map_err(|_| Error::MalformedTunnel("tunnel splice"))?;
-    Ok(())
+    match tokio::io::copy_bidirectional(&mut tcp, &mut quic).await {
+        Ok(_) => Ok(()),
+        Err(e) if reset_reason(&e) == Some(REACH_WITHDRAWN_CODE) => {
+            Err(Error::TunnelRevoked("the host withdrew access to this service"))
+        }
+        Err(_) => Err(Error::MalformedTunnel("tunnel splice")),
+    }
+}
+
+/// The QUIC application error code a peer reset this stream with, if that is why the read
+/// failed.
+///
+/// quinn reports a reset by wrapping [`quinn::ReadError`] in an [`std::io::Error`], so the
+/// code survives the `AsyncRead` adapter but only behind a downcast. Any other failure —
+/// a lost connection, a closed socket — returns `None` and stays a generic splice error,
+/// which is the honest reading: those are not decisions anybody took.
+fn reset_reason(e: &std::io::Error) -> Option<u32> {
+    let read = e.get_ref()?.downcast_ref::<quinn::ReadError>()?;
+    match read {
+        quinn::ReadError::Reset(code) => u32::try_from(code.into_inner()).ok(),
+        _ => None,
+    }
 }

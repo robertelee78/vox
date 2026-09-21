@@ -247,6 +247,16 @@ pub enum Error {
     #[error("tunnel denied: {0}")]
     TunnelDenied(&'static str),
 
+    /// A live tunnel was torn down because the host withdrew the dialer's reach
+    /// (ADR-017 M17.11): the identity left the host's trust keyring, or the room's
+    /// author set, while bytes were still flowing. Distinct from
+    /// [`Error::TunnelDenied`] on purpose — a refusal at dial time must stay
+    /// indistinguishable from "no such service", but a peer whose *established*
+    /// session is cut already knows it had one, so telling it why leaks nothing and
+    /// saves it from retrying against a decision that will not change.
+    #[error("tunnel reach withdrawn: {0}")]
+    TunnelRevoked(&'static str),
+
     /// A tunnel control message (service request, stream-setup handshake) or an
     /// SSH-CA certificate was structurally malformed on parse, exceeded a size
     /// bound, or carried an out-of-domain value (ADR-013). Carries a static reason.

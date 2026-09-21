@@ -171,7 +171,9 @@ async fn m17_a_service_is_reached_by_name_through_vox_up() {
                                         // authorization. `reachers` is the host's own
                                         // decision about an identity, and the evaluator no
                                         // longer decides reach at all.
-                                        reachers: Arc::new([client].into_iter().collect()),
+                                        reachers: Arc::new(tokio::sync::watch::Sender::new(
+                                            [client].into_iter().collect(),
+                                        )),
                                     },
                                 )
                             })

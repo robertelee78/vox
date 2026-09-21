@@ -106,7 +106,9 @@ async fn host() {
         (*cid == channel_id && tag == "echo").then_some(session::HostService {
             evaluator: std::sync::Arc::clone(&evaluator),
             endpoint: echo_addr,
-            reachers: std::sync::Arc::new([client_id].into_iter().collect()),
+            reachers: std::sync::Arc::new(tokio::sync::watch::Sender::new(
+                [client_id].into_iter().collect(),
+            )),
         })
     })
     .await

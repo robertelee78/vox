@@ -736,12 +736,20 @@ Un-approving a reader:
    it could once open must not be reachable on the strength of that cache;
 5. **fails pending requests**, which is the part the first draft missed.
 
-Point 5 is a real hole review found. The actor captures its authorization snapshot **before reading the
-tunnel request** (`node/actor.rs:1315`), so an approved attacker can open a tunnel stream, withhold its
-request, wait for revocation, and then complete it against the stale snapshot. Closing already-spliced
-connections does not help. Revocation must therefore cover (a) streams open but not yet carrying a request,
-and (b) the interval between the permission check and the local connect. M17.11's gate exercises exactly
-that sequence.
+Point 5 was a real hole review found, and it is now **closed** (M17.11, below). The actor captured its
+authorization snapshot when the tunnel *stream* opened — before reading the request — and took a *copy* of
+the reacher set, so an approved attacker could open a stream, withhold its request, wait for the withdrawal,
+and complete against the stale copy. No timing skill: patience was the whole attack.
+
+The fix is that the reacher set is a **live handle** rather than a copy — a `tokio::sync::watch` channel the
+actor writes in place (`node::tunnel::Reachers`). The snapshot is still taken at stream-open, because only
+the actor may read channel state and a tunnel outlives the actor's attention; but what it carries is a view
+of the current set, not a photograph of a past one. The dial gate reads it *after* parsing the request, so
+a parked stream is judged by the decision that holds when it finally speaks.
+
+A watch rather than a lock because the serving tasks need two things and a watch gives both: the value now,
+for the gate, and a wake-up on change, for point 1 — cutting a session that is **already carrying bytes**.
+A lock would have served the first and forced polling for the second.
 
 Points 1, 4 and 5 are the enforcement; 3 is hygiene. Point 2 is a deliberate choice to hand the revoked
 party a clear signal rather than an ambiguous failure: a silent close indistinguishable from a network drop
@@ -1114,11 +1122,37 @@ New work, in dependency order:
   (the trigger `chain_id` misses); an unapproved member of the same room cannot determine the name, the
   ports, or that the entry is a descriptor rather than a message; a reader whose consent is withdrawn cannot
   open the next version; and a retraction is published rather than the entry merely ceasing.
-- **M17.11 — immediate teardown, including pending requests.** Withdrawing approval closes live streams,
-  reports the reason to the far end, **and fails a stream that was opened before the revocation and presents
-  its request after it** (`node/actor.rs:1315`). Gate: a live `ssh` session dies on the withdrawal and the
-  client prints why; and separately, a stream opened while approved, held silent across the revocation, and
-  completed afterwards is refused.
+- **M17.11 — immediate teardown, including pending requests. DONE** (2026-09-22), and it ships with M17.7
+  because a parked stream defeats a withdrawal with no timing skill at all.
+  - The reacher set is a live `tokio::sync::watch` the actor writes in place (`node::tunnel::Reachers`),
+    refreshed by `NodeActor::refresh_reachers` whenever either input moves — the keyring (`Trust`,
+    `Untrust`) or a room's author set (any board admission) — and once per accept as a backstop. The write
+    is `send_replace`, which both updates the value the gate reads and wakes every serving task.
+  - **A pending request** is judged after it is parsed, from that live set
+    (`tunnel::session::accept_reporting`), so a stream parked across the withdrawal is refused.
+  - **A live session** is cut: `splice_until_withdrawn` selects between the byte copy and the watch, and
+    leaves the moment the client is no longer in the set. The QUIC stream is **reset** with
+    `REACH_WITHDRAWN_CODE` (`0x1711`), not finished, because a clean close is indistinguishable from the
+    carried service hanging up.
+  - **The reason reaches the far end.** The dialer maps that reset code to `Error::TunnelRevoked`; the proxy
+    reports it through `up::serve_reporting`; the node turns it into `NodeEvent::ReachWithdrawn`; and
+    `vox up` prints that the host withdrew access and that there is nothing to retry. A *refused dial* still
+    says nothing (dark services), and that asymmetry is deliberate: a peer whose established session is cut
+    already knows it had reach, so naming the reason leaks nothing and saves it retrying against a decision
+    that will not change.
+  - Proof: `crates/vox-core/tests/m17_11_parked_stream_proof.rs`, two tests over real QUIC with a real TCP
+    service. The first opens a real tunnel stream, waits until the host has served it, withdraws reach, and
+    *then* sends the request — asserting both that it is refused **and that the service was never dialled**.
+    The second proves a round trip through the service, withdraws reach mid-flight, and asserts the dialer
+    gets `TunnelRevoked` rather than a generic failure. The client is hostile by construction (it writes the
+    request frame itself so it can choose when), which is the only way to produce a parked stream: no honest
+    client ever delays.
+  - Each half has its own mutation: snapshot the set again and the parked request is accepted and the echo
+    logs a hit; drop the `changed()` arm and the live session flows on; `finish()` instead of `reset()` and
+    the dialer cannot tell a withdrawal from a normal close.
+  - **Not covered:** a *room-level* `Revoke` of a **trusted** identity, because M17.14 makes that refuse
+    outright (`Fault::StillTrusted`) — "revoked here but still trusted" is not a state the model has, so
+    there is no path by which it could remove a reacher. `Untrust` is the act that means it.
 - **M17.12 — the validation contract.** The descriptor binds name, host, room, ports and version; the client
   authenticates the transport peer as that named host before carrying a byte; the resolver holds
   `name → (channel, host, port)` and the tunnel request carries the port as its tag. Gate: a descriptor
@@ -1146,7 +1180,7 @@ New work, in dependency order:
 
 M17.6 must land first and alone: it closes both the admission hole and the auto-consent hole, and M17.7's
 gate is meaningless until it has. M17.7 and M17.13 ship together. M17.9 blocks M17.10 and M17.12. M17.11
-depends on M17.7. M17.8 is independent of all of it.
+depended on M17.7 and shipped with it. M17.8 is independent of all of it.
 
 ## Open proof gap: the stalled-handshake fix is unproven
 

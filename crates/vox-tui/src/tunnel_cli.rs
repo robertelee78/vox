@@ -493,7 +493,23 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     println!("then:  ssh user@{hostname}");
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     println!("Ctrl-C to stop");
-    let _ = tokio::signal::ctrl_c().await;
+    // Wait on Ctrl-C, but keep reading events so a session cut by the host withdrawing our
+    // reach says so (ADR-017 M17.11). Without this the proxy stays up and silent and the
+    // person sees only `ssh` dying, which reads as a network fault and invites a retry that
+    // cannot succeed.
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            ev = node.next_event() => match ev {
+                Some(NodeEvent::ReachWithdrawn { port, .. }) => {
+                    println!("vox: the host withdrew access to port {port} — that session was cut");
+                    println!("     nothing to retry: ask them to trust this identity again");
+                }
+                Some(_) => {}
+                None => break,
+            },
+        }
+    }
     println!("vox: stopping the proxy");
     let _ = node.apply(NodeCommand::Shutdown).await;
     Ok(())
