@@ -1,7 +1,14 @@
 # ADR-020: Agent comms — a room-based messaging app on the Vox layer
 
-**Status**: **proposed** (2026-09-21) — decided in a product Q&A and grounded in two spikes, but
-**nothing in this ADR is implemented**. The crate it names does not exist yet.
+**Status**: **partly implemented** (2026-09-21). **Decision 3's trust keyring is built and merged**
+(M19.2: `node::trust::Keyring`, `NodeCommand::{Trust,Untrust}`, `NodeView::trusted`,
+`ChannelState::owed_consents`, auto-consent retried on the tick), and **decision 1's crate now exists**
+(M19.3, the envelope + claim rules). The rest — decisions 2 and 4–9 — remains proposed. An earlier status
+line said "nothing in this ADR is implemented. The crate it names does not exist yet" after both had
+landed; corrected here.
+
+**Decision 3 was also generalised the same day** and is no longer an agent-comms mechanism: the keyring is
+Vox's **only** way to grant read access, for people as much as for agents. See decision 3.
 **Date**: 2026-09-21
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, app-tier, node, ipc, consent, keyring, harness-integration
@@ -120,8 +127,19 @@ session is a local act by its harness, not a log fact.
 
 ### 3. Read access is granted by a local trust keyring, not by a genesis flag
 
+> **Generalised 2026-09-21, after this decision shipped.** The keyring was designed here to relieve an
+> agent-comms pain — five agents is twenty manual approvals with nobody at the keyboard. The decider then
+> established that it is **not an agent mechanism at all**: it is how Vox grants read access, full stop,
+> and the human case is the same case. *"If I start up a room and I invite my son to it and I trust my son
+> and my son trusts me, if later on we're in a different room together I shouldn't have to go through that
+> trust relationship again. It really is akin to a PGP key-signing party."* The keyring is therefore the
+> **only** way read access is granted, and ADR-007's per-room consent act is one of its two entry points
+> rather than a parallel mechanism. Consequences are specified below and in ADR-007; the services
+> consequence is ADR-017 decision 3.
+
 Under ADR-007, reading a member requires a per-sender consent act. Five agents is twenty manual
-approvals with nobody at the keyboard, which is what made this use case impossible.
+approvals with nobody at the keyboard, which is what made this use case impossible — and the same act
+repeated per room is friction for people too, for the same reason.
 
 A genesis "open room" flag was designed and **rejected**. Instead:
 
@@ -132,6 +150,22 @@ A genesis "open room" flag was designed and **rejected**. Instead:
 - Consent is still *delivered* per room — the SKDM is a sender key for that room's log and there is no
   way around that — but the **decision** is per identity. Trusting an agent once therefore covers
   every room shared with it, now and in future.
+- **Every consent grant MUST be caused by a keyring entry.** There is no other path. This is the
+  invariant the whole model rests on, and it is what makes the rule provable rather than merely intended:
+  a consent grant with no corresponding ring entry is a bug by definition. It is also what closes the
+  join-time auto-consent defect (ADR-017 decision 3, M17.6) **by construction** rather than by a special
+  case — `join` released a sender key to whichever member answered it, which no keyring entry caused.
+- **Trust is one-sided, and the client MUST show when it is not returned.** My ring decides who reads me;
+  whether they let me read them is their decision, made in their ring. This is ADR-007's per-direction
+  rule unchanged. The asymmetry MUST be visible — a lopsided relationship is a thing the operator needs to
+  see, not a thing the system silently fixes or silently enforces.
+- **Removing a key from the ring MUST change the lock.** Read access is a sender key already handed over,
+  so removal cannot take it back — it can only stop the removed party reading what comes *next*. Removal
+  therefore rotates this identity's sender key and re-keys everyone still in the ring, in **every** room
+  shared with the removed party, reusing ADR-007's revocation machinery (M18.1). The removed party keeps
+  the history it already had, which is unavoidable, and reads nothing published afterwards. Bounded
+  honestly: the re-keys are delivered best-effort and retried on the tick for whoever is offline, exactly
+  as a revocation's are, so removal is a network act rather than a local flag.
 
 This is the decider's design, and it is better than the genesis flag on three counts. It requires **no
 wire change, no immutable genesis decision and no channelID change**; it is reversible; and it closes
@@ -150,14 +184,39 @@ auto-consent is keyed on "admitted author", which the rejected genesis flag woul
 compromised agent could vouch a stranger onto the board and hand it the room. Keyed on the keyring
 instead, a vouched stranger is not in the keyring and reads nothing, however it was admitted.
 
-A key enters the keyring by exactly one primitive, `vox trust add <fingerprint> --name <petname>`. A
-provision-time export/import file **MAY** be provided as a bulk wrapper over that primitive; it
-**MUST NOT** be a second trust mechanism. Trust-on-first-use **MUST NOT** be implemented: it would
+A key enters the keyring by **two entry points, one ring** (decider, 2026-09-21):
+
+1. `vox trust add <fingerprint> --name <petname>` — a direct add, for an identity this node shares no
+   room with yet;
+2. **approving a member in a room.** *"If I'm in a room and somebody joins and I approve them, that
+   approval means I'm adding them to the ring."* The per-room approval **is** the ring add; it does not
+   create a room-scoped grant alongside it.
+
+These are two ways to reach the same decision, not two mechanisms — which is what keeps this ADR's
+original requirement intact. A provision-time export/import file **MAY** be provided as a bulk wrapper
+over entry point 1; it **MUST NOT** be a third path.
+
+Because entry point 2 confers a **standing** relationship covering rooms that do not exist yet, the
+approval surface **MUST** say so at the moment of approval, naming what it grants (ADR-017 decision 4's
+disclosure rule). The decider accepted the scope deliberately — *"I decided that person is trustworthy;
+the room I happened to be in when I decided is incidental"* — on the condition that it is visible. Trust-on-first-use **MUST NOT** be implemented: it would
 re-open precisely the hole this closes. Transitive introduction (web-of-trust) **MUST NOT** be
 implemented for the same reason.
 
 The petname is also where `@name` addressing gets its meaning: local, self-certifying, no registry, no
 DNS.
+
+**Two client indicators are REQUIRED** by the decider for the trust model to be operable, and are recorded
+here rather than designed (they belong to the client ADRs, ADR-014/ADR-015):
+
+- **a room roster showing, per member, whether this node has trusted them** — so the operator can see at a
+  glance who can read them and who cannot;
+- **per-message read metadata: which nodes have read a message I sent.**
+
+Their purpose is stated plainly by the decider: *"both of these will give me indicators that would let me
+know if I need to change my trust relationship with an entity."* The second is a read-receipt feature with
+its own privacy questions (a receipt tells the sender when you read, which not every user wants to emit);
+those are the client ADRs' to settle, not this one's.
 
 ### 4. The envelope: a tiny reserved core, an open tail, and urgency as its own field
 
