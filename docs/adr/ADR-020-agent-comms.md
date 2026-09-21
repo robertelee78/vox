@@ -4,23 +4,23 @@
 milestone `DONE` with the commit that landed it, or leaves it unmarked. Nothing here is marked done
 that has not passed a gate.
 
-**Built and merged**: §1 (the app tier — `crates/vox-agentcomms` exists), §3 (the trust keyring),
-§4 (the envelope), §5 (the claim model — *as a library; see §5's note on reachability*), §6 (the
-drain hook, for Claude Code and Codex), §7 (the event fan-out and the control socket), §8 (the `vox
-room` verbs).
+**Built**: §1 (the app tier — `crates/vox-agentcomms`), §3 (the trust keyring), §4 (the envelope),
+§5 (the claim model, now reachable from the product as `vox room claim|release|handoff|board`),
+§6 (the drain hook, **proven against a live model in all three harnesses**), §7 (the event fan-out
+and the control socket), §8 (the `vox room` verbs), §12 (`vox daemon`).
 
-**Decided but unbuilt**: §10 (no delegated trust — a rejection, so nothing to build), §11 (file
-exchange over a room-bound service), §12 (a node that runs without a terminal).
+**Decided but unbuilt**: §10 (no delegated trust — a rejection, so nothing to build) and §11 (file
+exchange over a room-bound service). §12 landed as `vox daemon`.
 
 **Two corrections worth a reviewer's attention**, both recorded in place rather than quietly
 dropped:
 
 1. **§3 was generalised the same day it landed** and is no longer an agent-comms mechanism at all:
    the keyring is Vox's **only** way to grant read access, for people as much as for agents.
-2. **§6 shipped proving less than it appeared to.** `agent_hook_proof` proves the hook emits the
-   shape each harness documents; it could not prove a harness *shows the model* what it injects,
-   because the machine's API key returned 401 and no model ran. That is stated in the proof's own
-   header and M19.5b exists to close it.
+2. **§6 shipped proving less than it appeared to, and that is now closed.** `agent_hook_proof`
+   proved the hook emits the shape each harness documents, but not that a harness *shows the model*
+   what it injects — the machine's API key returned 401 and no model ran. M19.5b closes it: a real
+   model now reproduces a codeword only the room knew, with `--pure` as the mutation control.
 
 **Date**: 2026-09-21
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -352,6 +352,22 @@ invisible until the model met a command line:
   and marked unresolved rather than guessed at.
 
 M19.9 is that work.
+
+**Resolution is deterministic but not causal within one second.** `created_secs` has one-second
+resolution, so a losing `claim` and the `release` that follows it can carry the same timestamp, and
+rule 2's entry-hash tie-break then decides their order. Every node computes the **same** answer —
+that is exactly what the tie-break is for, and it is why this is not the flaw that a client-supplied
+timestamp with no tie-break would be — but the answer need not match the order things happened in.
+
+The observable consequence, found by running M19.9's proof rather than by reasoning: an agent
+correctly told "you did not get it" may hold the resource once the current owner releases it,
+because its earlier claim sorts after the release. Neither statement is false — "you did not get it"
+was true when it was said, and the board is the log's converged answer afterwards — so this is
+recorded as a property, not a defect.
+
+What a `release` therefore guarantees is that **the releaser no longer holds the resource**, not that
+the resource is unowned. Anything needing the stronger guarantee must re-read the board, which is
+what `vox room claim` does before reporting.
 
 ### 6. Delivery: queue always, interrupt only when addressed and urgent — and the drain is a hook
 
@@ -691,7 +707,7 @@ Both unknowns are already spiked; neither remains open.
   not confirm a harness actually *shows the model* what it injects: the spike's API key returned 401,
   so no model ran. M19.5b closes that.
 
-- **M19.5b — OpenCode, and a live-model proof for all three harnesses.** OpenCode has no hook
+- **M19.5b — OpenCode, and a live-model proof for all three harnesses. DONE 2026-09-22.** OpenCode has no hook
   command; it loads JavaScript plugins into its own process, so the integration must be a file.
   `vox agent plugin opencode` is to print one — a shim that runs `vox agent hook --format text` and
   injects what comes back, so there is exactly **one** implementation of what an agent has not read.
@@ -709,18 +725,29 @@ Both unknowns are already spiked; neither remains open.
     real configuration.
   - Touching the OpenCode client inside plugin init deadlocks the TUI, so the plugin never does.
 
-  *Gate*: a **real model turn**, against a real room, reproduces a token that was posted to that room
-  and appears nowhere in the prompt. `opencode run --pure` disables external plugins and is therefore
-  the mutation check — same prompt, plugin off, the token must vanish. All three harnesses are
-  installed here (Claude Code 2.1.278, Codex 0.155.1, OpenCode 1.18.31); `pi` is not, and is out of
-  scope until it is.
+  *Gate, met*: a **real model turn** against a real room reproduced a codeword posted to that room
+  and appearing nowhere in the prompt; `opencode run --pure` disables external plugins and is the
+  mutation control — same prompt, plugin off, the codeword vanishes. Reproduced twice.
 
-- **M19.5c — a node that runs without a terminal** (§12). Required before M19.7 and required for the
+  **This also closes the gap M19.5 shipped with.** That milestone could prove the hook emitted each
+  harness's documented shape but not that a harness *shows the model* what it injects. It does.
+
+  One more measured fact, which cost most of the time this milestone took: **a spawned OpenCode
+  inherits an environment that disables plugin hooks**. Run from a shell the plugin works; run from
+  `cargo test` with the same directory, arguments and stdin, it loads and `chat.message` never
+  fires. The proof therefore clears the environment and passes only `PATH`, `HOME`, `SHELL`, `LANG`,
+  `TMPDIR`, `USER`. Four other hypotheses were wrong and are recorded so nobody re-tries them:
+  importing `node:child_process`, overriding `XDG_DATA_HOME`, a `/dev/null` stdin, and "the first
+  run in a fresh directory".
+
+  All three harnesses are installed here (Claude Code 2.1.278, Codex 0.155.1, OpenCode 1.18.31);
+  `pi` is not, and is out of scope until it is.
+
+- **M19.5c — a node that runs without a terminal. DONE 2026-09-22** (§12). `vox daemon`. Required before M19.7 and required for the
   ADR's premise that sessions may be on "n-count remote hosts". Today the TUI is the only caller of
   `node::ipc::bind`, and it locks on SIGHUP.
 
-- **M19.9 — the work board: claims reachable from the product.** *The highest-priority gap, ahead of
-  M19.7 and M19.8.* The decider's requirement is that agents "communicate **and split work loads**",
+- **M19.9 — the work board: claims reachable from the product. DONE 2026-09-22.** The decider's requirement is that agents "communicate **and split work loads**",
   and today only the first half is reachable. `vox-agentcomms` has the whole model — the §5
   vocabulary, `ClaimOp::{Claim{resource, ttl_secs}, Release, Handoff{to}}`, and `resolve`/
   `resolve_with` folding a room's claims into an `Ownership` map with a deterministic tie-break —

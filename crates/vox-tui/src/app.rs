@@ -36,7 +36,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::{Frame, Terminal};
 use tokio_util::sync::CancellationToken;
 use vox_core::node::actor::Node;
-use vox_core::node::api::NodeCommand;
+use vox_core::node::api::{NodeCommand, Secret};
 use vox_core::node::paths::Paths;
 
 use crate::live::LiveCore;
@@ -304,6 +304,201 @@ pub fn run_node(
                 }
             }
         }
+    });
+    Ok(())
+}
+
+/// Run this profile's node **without a terminal**, so agent sessions can attach
+/// (ADR-020 §12).
+///
+/// This exists because neither of the other two ways to run a node can serve an
+/// unattended host:
+///
+/// - [`run_live`] is the TUI. It is the only other caller of `node::ipc::bind`, it
+///   needs a TTY to prompt for the passphrase, and per ADR-015 it **locks the node
+///   on SIGHUP** — so detaching it from a terminal defeats it by design.
+/// - [`run_node`] is an anchor. It serves the board and carries circuits, but it is
+///   headless in the other sense: no identity is unlocked, it holds no room and it
+///   can read nothing.
+///
+/// So an agent on a server had no node to attach to, which contradicted this ADR's
+/// own premise that sessions may be on "n-count remote hosts".
+///
+/// ## Passphrases
+///
+/// Read from **stdin**, not from the environment: an environment variable is
+/// visible in `/proc/<pid>/environ` to anything running as the same user, and in
+/// `ps -E` on some systems. Not from argv either, for the same reason.
+///
+/// The format is one passphrase per line, because a room needs **two** keys, not
+/// one — ADR-010's double lock means unlocking the identity does not open a room:
+///
+/// ```text
+/// <identity passphrase>
+/// <room id or unique prefix> <that room's passphrase>
+/// <room id or unique prefix> <that room's passphrase>
+/// ```
+///
+/// A room line splits at its **first space**, so a room passphrase may contain
+/// spaces — which the generated ones do. With no room lines the daemon unlocks the
+/// identity and holds no open room, which is enough to serve `vox room list` and
+/// nothing else.
+///
+/// `--passphrase-file` reads the same format from a file, for a service manager
+/// that prefers one.
+///
+/// # Errors
+/// If the runtime cannot start, the node cannot spawn, the passphrase is unreadable
+/// or wrong, a named room is unknown or its passphrase is refused, or the control
+/// socket cannot be bound — the last of which **is** fatal here, unlike in the TUI,
+/// because serving that socket is this command's entire purpose.
+pub fn run_daemon(
+    paths: Paths,
+    listen: std::net::SocketAddr,
+    anchors: vox_core::nat::bootstrap::BootstrapSet,
+    passphrase_file: Option<std::path::PathBuf>,
+) -> Result<(), AppError> {
+    use std::io::Read as _;
+
+    let raw = match &passphrase_file {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?,
+        None => {
+            let mut buf = String::new();
+            io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| AppError::Usage(format!("reading passphrases on stdin: {e}")))?;
+            buf
+        }
+    };
+    let mut lines = raw.lines();
+    // Only the line ending is stripped. A passphrase may legitimately begin or end
+    // with a space, so nothing else is trimmed.
+    let identity = lines.next().unwrap_or_default().trim_end_matches('\r');
+    if identity.is_empty() {
+        return Err(AppError::Usage(
+            "no identity passphrase. Pipe it in (`echo … | vox daemon`), or pass \
+             --passphrase-file."
+                .into(),
+        ));
+    }
+    let rooms: Vec<(String, String)> = lines
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.is_empty())
+        .map(|l| match l.split_once(' ') {
+            Some((room, pass)) => (room.to_owned(), pass.to_owned()),
+            None => (l.to_owned(), String::new()),
+        })
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let cfg = vox_core::node::actor::NodeConfig::new()
+        .bind(vox_core::node::actor::Bind::Addr(listen))
+        .anchors(anchors);
+    let node = rt.block_on(async { Node::spawn_config(paths.clone(), cfg) })?;
+
+    rt.block_on(async {
+        let outcome = node
+            .apply(NodeCommand::Unlock {
+                passphrase: Secret::new(identity.as_bytes().to_vec()),
+            })
+            .await;
+        if !outcome.is_done() {
+            return Err(AppError::Usage(format!(
+                "could not unlock this profile's identity: {outcome:?}"
+            )));
+        }
+        // Then the second lock. `vox room post|read|board` all need the room OPEN,
+        // not merely known — a daemon that unlocked the identity and stopped there
+        // would answer `room list` and refuse everything else, which is the defect
+        // this proof found the first time it ran.
+        for (prefix, pass) in &rooms {
+            let ids: Vec<_> = node.view().channels.iter().map(|c| c.channel_id).collect();
+            let channel_id = crate::tunnel_cli::resolve_prefix(prefix, &ids)?;
+            let outcome = node
+                .apply(NodeCommand::OpenChannel {
+                    channel_id,
+                    passphrase: Secret::new(pass.as_bytes().to_vec()),
+                })
+                .await;
+            if !outcome.is_done() {
+                return Err(AppError::Usage(format!(
+                    "could not open room {prefix}: {outcome:?}"
+                )));
+            }
+        }
+        Ok(())
+    })?;
+
+    // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
+    let _ipc = rt
+        .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
+        .map_err(|e| AppError::Usage(format!("control socket: {e}")))?;
+
+    let fp = node
+        .view()
+        .identity
+        .map(|i| vox_core::node::link::b32_encode(&i.fingerprint))
+        .unwrap_or_default();
+    println!("vox daemon: identity {fp}");
+    println!(
+        "vox daemon: control socket {}",
+        paths.socket_file().display()
+    );
+    for room in node.view().open_channels {
+        println!(
+            "vox daemon: holding room {} open",
+            vox_core::node::link::b32_encode(&room.channel_id)
+        );
+    }
+
+    rt.block_on(async {
+        // **SIGHUP must be explicitly ignored, not merely left unhandled.** Its
+        // default disposition is to terminate the process, so "we do not handle it"
+        // means "it kills us" — which the proof caught on its first run. The TUI
+        // locks on SIGHUP because a terminal going away means the operator walked
+        // off. A daemon has no terminal to lose, and SIGHUP is what a service
+        // manager sends to ask for a reload, so dying on it would make this
+        // unusable. Registering a stream for it replaces the default action; the
+        // task then drains it forever and does nothing.
+        #[cfg(unix)]
+        {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(mut hup) => {
+                    tokio::spawn(async move {
+                        while hup.recv().await.is_some() {
+                            // Deliberately nothing. See above.
+                        }
+                    });
+                }
+                // Worth saying out loud rather than panicking: the daemon still
+                // works, but it will now die if anything sends it a SIGHUP.
+                Err(e) => eprintln!(
+                    "vox daemon: could not take over SIGHUP ({e}); a hangup will stop this daemon"
+                ),
+            }
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = term.recv() => {}
+                    }
+                }
+                Err(e) => {
+                    eprintln!("vox daemon: no SIGTERM handler ({e}); stop it with Ctrl-C");
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        println!("vox daemon: shutting down");
+        let _ = node.apply(NodeCommand::Shutdown).await;
     });
     Ok(())
 }
