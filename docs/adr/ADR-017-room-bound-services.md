@@ -56,11 +56,13 @@ shipped. The material ones, and what changed:
   without filtering on the head epoch (`governance/evaluator.rs:519`, `:797`), so the ADR comment cited as
   evidence was not proof. Finding #5 is downgraded to **unverified** pending a test that exhibits it.
 
-**One open question added 2026-09-21** after M19.2 merged: its trust keyring auto-consents through the same
-`consent()` path an explicit approval uses (`node/actor.rs:2045`), so the two are indistinguishable in the
-store. Services and the keyring are **separate use cases** by the decider's direction, so keyring consent
-must not by itself confer service reach — and making that true needs something the consent record does not
-carry. Left open against M17.7 rather than guessed at. See decision 3.
+**The keyring question raised and settled 2026-09-21.** It was first recorded here as an open question —
+how should the gate tell keyring-driven consent from a hand approval, given both call the same
+`consent()` (`node/actor.rs:2045`)? It dissolves: the decider established that **approving a member in a
+room *is* adding them to the ring**, so the ring is where every approval is recorded rather than a second
+source to screen out. The gate is a conjunction — **in the host's ring AND in the room the service is bound
+to** — and "explicitly approved readers" and "identities in the host's ring" name the same set. Node kinds
+and a chat-versus-agent-comms context were both considered and rejected. See decision 3.
 
 Descriptor freshness is keyed to the host's ADR-006 `chain_id` **and** to explicit publication triggers —
 `chain_id` alone is insufficient because approving a reader does not advance it (`governance/channel.rs:1311`),
@@ -153,8 +155,8 @@ Three facts shape the rest of the design:
 ### 1. The name is a host-committed random label
 
 The capability is a **room-bound service**: a TCP service offered by a host *into a room*, reachable by
-exactly those members of that room whom the host has explicitly approved to read its messages. What a
-person types at a tool is the service's **`.vox` name**:
+exactly those members of that room that are in its host's trust keyring. What a person types at a tool is
+the service's **`.vox` name**:
 
 ```text
 <52-char-base32>.vox   where the 32 bytes are  H("vox service name v1" ‖ host_composite_pk ‖ nonce)
@@ -209,7 +211,7 @@ room-bound service is the thing a person offers; a tunnel is how a byte gets the
 
 Every service is **explicitly declared** before it can be reached, and declaration is separate from
 authorization. A local port becomes reachable only when a human names it, and only to identities that human
-has explicitly approved. The overlay carries arbitrary TCP, so a node that exposed a local port as a side
+has trusted. The overlay carries arbitrary TCP, so a node that exposed a local port as a side
 effect of any other action would be a foot-gun of the first order.
 
 The previous revision carried the clause "and only to identities a human *(or rule 3)* authorized". That
@@ -218,13 +220,19 @@ having approved the specific identity reaching it. Review established that the f
 still had one — joining a room issued consent to the responder with no human act at all — which is why
 decision 3 now states the requirement in both directions rather than assuming it.
 
-### 3. Consent is the authorization, and consent is always explicit
+### 3. The trust keyring is the authorization
 
-**A service bound to a room is reachable by exactly the members of that room whose keys its host has
-explicitly approved for reading, and by nobody else.** One decision, made once per person, covering
-messages and services together.
+**A service bound to a room is reachable by exactly those members of that room that are in its host's trust
+keyring, and by nobody else.** One decision, made once per *identity* — not once per identity per room —
+covering messages and services together.
 
-#### Consent is per pair, per direction, and never automatic
+#### Consent is per pair, per direction, and the *decision* is never automatic
+
+The distinction that matters, because the delivery genuinely is automatic: **a consent grant may be
+delivered by machinery, but it must always be *caused* by a human decision about that identity** — a ring
+entry (ADR-007's invariant). The keyring's auto-consent is fine and necessary: the operator decided about
+the key, and the node then delivers per room as rooms come and go. `join`'s release to the responder was
+not, because nobody decided anything.
 
 The decider's model, stated directly: *"Imagine there is already a room and there are four people in it and
 they've all trusted each other. A new node joins. They will need to approve who they want to share with of
@@ -237,8 +245,8 @@ So there are two independent decisions per pair, each made by the party giving s
 
 | Decision | Who makes it | What it grants |
 |---|---|---|
-| "X may read **my** messages" | me | X can read my entries — **and reach the services I bound to this room** |
-| "I may read **X's** messages" | X | nothing of mine; it is X's grant to make |
+| "X may read **my** messages" — X enters **my** ring | me | X reads my entries in **every** room we share, now and later — **and reaches the services I bind to any of those rooms** |
+| "I may read **X's** messages" — I enter **X's** ring | X | nothing of mine; it is X's grant to make, in X's ring |
 
 Neither is implied by joining, by holding the passphrase, by paying the proof of work, or by being admitted
 as an author on any peer's board. **A joiner who approves nobody is readable by nobody**, which is correct
@@ -258,9 +266,9 @@ no member can answer at all"* — which is satisfied by the pairwise session, no
 
 #### The rest of the rule
 
-- The gate is the host's **explicitly granted** ADR-007 consent set **within the bound room**. Not the
+- The gate is **(in the host's trust keyring) AND (in the bound room)**, checked at dial time. Not the
   room's author set, not its member count, nothing derived from the passphrase or the proof of work, and
-  not consent issued by the join path.
+  nothing consent-shaped that no ring entry caused — which is what the join path produced.
 - Approving a reader takes effect **immediately** and needs no second act. A host with five approved
   readers who then binds a service has, in that moment, given all five reach.
 - Withdrawing approval takes effect immediately and tears down live connections (decision 10).
@@ -287,7 +295,7 @@ no member can answer at all"* — which is satisfied by the pairwise session, no
 
 #### What the decider gives up, stated plainly
 
-Reach can no longer be narrowed below "my explicitly approved readers in this room", and three capabilities
+Reach can no longer be narrowed below "the members of this room that are in my ring", and three capabilities
 of `vox grant` go with it: **time-bounded** access (`--days`), **reach without read**, and authority over
 who may *host*. Reach to a non-member was **not** among them — `vox grant` already required an admitted
 author (`node/actor.rs:2735`), and the first draft of this revision overstated that loss.
@@ -300,31 +308,66 @@ left to be discovered.
 An infosec reviewer will ask whether a host can share `:22` with two of its five approved readers. The
 answer is *no, use a second room*, and that is a design position rather than an omission.
 
-#### Open question: the M19.2 trust keyring writes the same consent store
+#### Settled: the keyring *is* the approval, so there is one gate
 
-**Raised 2026-09-21, not decided here.** M19.2 landed a **trust keyring** (`node::trust::Keyring`,
-`NodeCommand::{Trust,Untrust}`) for the agent-comms use case: an operator trusts an agent *identity* once
-and the node auto-consents to it in every room it shares with it, because agent rooms are ephemeral — a
-repo, a task, the operator's choice — and the trust dance being per-room-per-agent is the pain that made
-agent comms impractical.
+**Decided 2026-09-21, after the open question this section previously held.** That question asked how the
+services gate should distinguish keyring-driven consent from a hand approval, since both call the same
+`consent(channel_id, target)` (`node/actor.rs:2045`). **The question dissolves**, because the decider
+established that they are not two things:
 
-**The decider's position is that these are completely separate use cases.** A service is bound to a room and
-is reachable only by the members of that room *its owner has approved*; that approved subset is the access
-control list, and it is a per-room, per-member decision by the host. The keyring is an operator convenience
-for establishing readability between agents. Neither is a special case of the other, and this ADR must not
-fold them together.
+> *"If I'm in a room and somebody joins and I approve them, that approval means I'm adding them to the
+> ring."*
 
-**The constraint that follows, which the implementation cannot avoid deciding:** keyring auto-consent is
-delivered by `deliver_owed_consents`, which calls the *same* `consent(channel_id, target)` an explicit
-approval calls (`node/actor.rs:2045`). The two are therefore indistinguishable in the consent store and on
-the log. So a services gate phrased as "a consent exists from this host to this member in this room" is
-satisfied by keyring consent, and the two use cases fuse **by accident rather than by decision** — the
-opposite of what was directed.
+So the ring is not a second source of consent to be screened out — **it is where every approval is
+recorded**. Two entry points reach it (a direct `vox trust add`, or approving a member in a room) and they
+are two ways to make one decision (ADR-020 decision 3). Every entry in the ring got there by a human act,
+so "the host's explicitly approved readers" and "the identities in the host's ring" name the same set.
 
-Keeping them separate therefore requires the dial gate to see something the consent record does not carry
-today. The shape of that — a provenance marker on the record, a separate services-approval set, or something
-else — is **M17.7's to settle with the decider**, and is deliberately left open rather than guessed at here.
-What is settled is the requirement: **keyring consent must not, by itself, confer service reach.**
+**The gate is therefore a conjunction of two conditions, both checked at dial time:**
+
+```text
+reach(member, service)  ⟺  member ∈ host's trust keyring
+                        ∧  member is in the room the service is bound to
+```
+
+The decider's own cases, which this must satisfy exactly:
+
+| Situation | Reach |
+|---|---|
+| node-1 trusts node-2; node-1 serves service-1 in room-13; **node-2 joins room-13** | **yes, immediately**, with no further action by node-1 |
+| node-3 joins room-13; node-1 has **not** trusted node-3 | **no** — and node-3 cannot learn service-1 exists (decision 9) |
+| node-1 serves service-2 in room-8; node-2 is **not** in room-8 | **no** — trust is not enough; the room condition fails |
+| node-1 trusts node-2; later both are in room-2; node-1 serves there | **yes** — no repeat of the trust dance, which is the point |
+
+**Why the ring alone is not the gate.** Trust is room-independent, but a service is bound to a room, so
+membership of that room remains a necessary condition. This keeps the per-room scoping that
+`tunnel::session` already enforces (`tunnel/session.rs:245` names a channel and scopes lookup to it before
+authorizing) and prevents the union-across-rooms reading that would break it.
+
+**Why room membership alone is not the gate** is the whole of this revision: membership is a passphrase and
+a proof of work, not a decision about a person.
+
+**What keeps Signalgate closed**, in the decider's words: *"a random New York Times reporter joining a room
+only grants them access if I know and trust that person too."* Joining is not an authorization event in
+either direction.
+
+**Not socially transitive.** A host never inherits identities from another ring. The decider drew this line
+explicitly — *"I trust my son so much that anyone he has in his ring I also trust — I don't want to go that
+far"* — and ADR-020 decision 3 already forbids transitive introduction and trust-on-first-use for the same
+reason.
+
+**Withdrawal.** Removing an identity from the ring cuts its service reach **immediately**, because the gate
+reads the ring at connect time; live streams are torn down per decision 10. Its effect on *message*
+readability is ADR-007's and requires changing the lock, which `Untrust` as built does not yet do.
+
+#### No node kinds, and no chat-versus-agent-comms distinction
+
+Both were considered on the way to the rule above and both are rejected. A node kind — human versus agent —
+would hard-code a policy into an identity attribute rather than leaving it to the host's decision, and
+nothing about a self-signed bundle record could make a claimed kind trustworthy anyway. A per-room context
+(this is a chat room, that is an agent-comms room) was the decider's own first instinct and was withdrawn on
+reflection: *"not a real distinction after all."* The same rule serves both, because in both the question is
+only ever whether this host decided about this identity.
 
 #### What it does not change
 
@@ -349,13 +392,15 @@ $ vox serve a3f9c2 22
 name   h4xm2qp7vk3nw8rtzc5jf9gd6bslyu2ae4mhq7pxv3nk8dwrt5cq.vox
 room   a3f9c2… (design-review)
 
-serving 127.0.0.1:22 — reachable by the 3 members you have approved:
+serving 127.0.0.1:22 — reachable by the 3 members in your trust keyring:
   bob      k7m2q…x4
   carol    p9wnf…a1
   dave     z3hty…8c
-not reachable by 2 members you have not approved:
+not reachable by 2 members you have not trusted:
   erin     m4ksd…7j
   frank    q8xpl…2v   (they will not learn this service exists)
+
+anyone you trust later, or who joins this room later, gains reach with no further action here.
 ^C to stop.
 ```
 
@@ -582,11 +627,11 @@ The common home-router case is therefore at parity with Tor on both sides. Only 
 makes the anchor load-bearing for carried traffic, and Tor has thousands of volunteer relays to draw on
 where Vox deliberately has none but yours (ADR-012: no Vox-operated infrastructure).
 
-### 9. The descriptor is content, sealed to the host's approved readers
+### 9. The descriptor is content, sealed to the host's ring
 
 A host publishes a **service descriptor** to the room: an entry carrying the service's nonce (and so its
-name), its ports and how to reach it, readable by **exactly the host's explicitly approved readers in that
-room**.
+name), its ports and how to reach it, readable by **exactly those members of that room that are in the
+host's ring**.
 
 It is published as **ordinary content**, not as a governance frame. This is the change review forced, and
 the reason is concrete: framed payload kinds are publicly classifiable to every holder of the log
@@ -678,7 +723,7 @@ the one string the unapproved must not have.
 Discovery is **convenience, never authorization**. Holding a descriptor never grants reach; the consent check
 in `tunnel::session::accept` remains the only gate.
 
-### 10. Withdrawing approval is immediate, and says so
+### 10. Withdrawing trust is immediate, and says so
 
 Un-approving a reader:
 
@@ -798,7 +843,7 @@ M17.13 covers this, and it is the one item that must ship in the same release as
 - **A joiner is readable by nobody until it approves someone.** The cost of making every direction explicit.
   It is a change to what joining a chat room does, and it is the deliberate price of closing the
   auto-consent hole.
-- **Reach cannot be narrowed below "my explicitly approved readers in this room"**, and three `vox grant`
+- **Reach cannot be narrowed below "the members of this room that are in my ring"**, and three `vox grant`
   capabilities go: time-bounded access, reach-without-read, and authority over who may host. Reach to a
   non-member was never among them (`node/actor.rs:2735`).
 - **Only the host can cut a reader's reach.** A room admin has no lever over another member's services short
@@ -847,25 +892,29 @@ an earlier claim that it was:** M17.4.
 
 New work, in dependency order:
 
-- **M17.6 — no authorization without an explicit act.** Two halves, both required before anything else:
-  `learn_members` / `admit_author` stop creating members from a peer's board record on a self-signed record
-  alone; and `join` stops calling `release_key_to(responder)` (`node/actor.rs:1764`). Gate: a bundle record
-  synced from a peer's board does not make its subject a member, **and** a node that joins a room through a
-  member has issued that member no consent — verified by the responder being unable to read the joiner's
-  first message until the joiner explicitly approves it. The RED test
-  `sec_vouched_key_gets_no_service_grant.rs` goes green. Closes finding #1's admission half and the hole
-  review found in this revision's first draft.
+- **M17.6 — every consent grant is caused by a keyring entry.** The invariant from ADR-007, stated as
+  executable work. Two halves, both required before anything else: `learn_members` / `admit_author` stop
+  creating members from a peer's board record on a self-signed record alone; and `join` stops calling
+  `release_key_to(responder)` (`node/actor.rs:1764`), which issued consent that no ring entry caused.
+  Gate: a bundle record synced from a peer's board does not make its subject a member; a node that joins a
+  room through a member has issued that member **no** consent, verified by the responder being unable to
+  read the joiner's first message until the joiner trusts it; and **no consent grant exists anywhere on the
+  log without a corresponding ring entry on its issuer** — the invariant itself, asserted over a run that
+  joins, syncs and vouches. The RED test `sec_vouched_key_gets_no_service_grant.rs` goes green.
 - **M17.7 — consent is the authorization.** `build_evaluator` stops passing `authors.keys()`
-  (`governance/channel.rs:935`); the dial check keys off the host's explicitly granted consent set in the
-  bound room. `vox grant`, `GenesisBody::service_grant`'s authorization role and the `bind:` class with
+  (`governance/channel.rs:935`); the dial check keys off **(in the host's trust keyring) AND (in the bound
+  room)**. `vox grant`, `GenesisBody::service_grant`'s authorization role and the `bind:` class with
   `add_service`'s `can_bind` check (`governance/channel.rs:1232`) are removed. `vox serve` takes a room,
   creates none, and names its audience and non-audience. The consent prompt states that approval confers
   service reach. Gate: an unapproved member is refused, an approved one reaches the service, the transition
   happens on the approval alone with no second command, and a member who is not the room's creator can
-  serve — which fails today. **Plus the keyring case:** a member consented to only by M19.2's trust keyring
-  (`deliver_owed_consents`, `node/actor.rs:2045`) reads messages and **does not** reach the service, per the
-  open question in decision 3. How the gate distinguishes the two is settled with the decider as part of
-  this item, not assumed.
+  serve — which fails today. **Plus the keyring cases, which are the gate's real shape** (decision 3, and
+  the corrected reading: an earlier draft of this item had it backwards, requiring keyring-consented members
+  to be *refused*): a member trusted only through `vox trust add` and never approved in the room **does**
+  reach the service once it is in the room; a member of the room that is not in the ring does not, and
+  cannot learn the service exists; a trusted identity that is **not** in the room reaches nothing bound to
+  it; and a trusted identity that joins **after** the service was bound gains reach on joining, with no act
+  by the host at that moment.
 - **M17.8 — the evaluator's head-epoch filtering.** The open question behind the downgraded finding #5:
   whether exclusion and consent folding should filter on the head epoch (`governance/evaluator.rs:519`,
   `:797`). Gate: a test that either exhibits the resurrection or shows it cannot happen. **Blocks nothing
@@ -897,6 +946,15 @@ New work, in dependency order:
   channelID under the new code, and its genesis grant authorizes nobody. Release notes state that a
   mixed-version peer still applies the old rules **to its own services**, bounded there because every host
   enforces its own consent set locally.
+
+- **M17.14 — withdrawing trust changes the lock.** `Untrust` is forward-looking only as built in M19.2
+  (its own docs: *"recalls nothing already granted; recalling that is Revoke, per room"*), so a withdrawn
+  identity keeps reading the withdrawer's **new** messages in every shared room. Removal must instead
+  perform ADR-007's revocation — rotate the sender key, record the fact, re-key everyone still in the ring —
+  in every room shared with the removed identity, best-effort with the tick retrying whoever is offline.
+  Gate: a key trusted, used to read, then removed **cannot read a message published after the removal**, in
+  every shared room, while a third identity that stays trusted reads it throughout. Independent of the
+  service work; service reach is already cut at the dial gate.
 
 M17.6 must land first and alone: it closes both the admission hole and the auto-consent hole, and M17.7's
 gate is meaningless until it has. M17.7 and M17.13 ship together. M17.9 blocks M17.10 and M17.12. M17.11

@@ -2,7 +2,14 @@
 
 **Status**: implemented (M6, `crates/vox-core/src/governance/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-21 (later the same day) — **per-sender consent now carries service authorization.** A room-bound service is reachable by exactly the members its host has consented to for reading (ADR-017 decision 3, revised), so the outbound-consent machinery below is load-bearing for reach as well as readability, and a consent revocation withdraws both. The **genesis service grant and its `service-grant-exclusion` (`0x0013`) are withdrawn**; `0x0013` is retired and not reused. Earlier the same day — the genesis body gains a **service grant** (ADR-017 decision 3: capabilities conferred on every admitted member, no certificate issued to anyone) and a new **`service-grant-exclusion`** (`0x0013`) takes it back per member, which is what keeps a capability-bearing room from being a one-way door. **Per-member consent revocation is live** (M18.1): `vox`'s `revoke` verb rotates the
+**Updated**: 2026-09-21 (third note that day) — **consent is keyring-caused.** The per-sender decision of
+step 2/3 is an *identity-level* one recorded in the trust keyring (ADR-020 decision 3, built M19.2), not a
+per-room one: approving a member in a room **is** adding them to the ring, and from then on they read the
+grantor in every shared room including future ones. **Every consent grant must be caused by a ring entry**
+— an invariant, which is what removes the join path's automatic release rather than annotating it. Trust is
+one-sided and its asymmetry must be visible. **Withdrawing trust must change the lock** (rotate and re-key
+in every shared room), which `Untrust` as built does not do. Earlier the same day — **per-sender consent now
+carries service authorization.** A room-bound service is reachable by exactly the members its host has consented to for reading (ADR-017 decision 3, revised), so the outbound-consent machinery below is load-bearing for reach as well as readability, and a consent revocation withdraws both. The **genesis service grant and its `service-grant-exclusion` (`0x0013`) are withdrawn**; `0x0013` is retired and not reused. Earlier the same day — the genesis body gains a **service grant** (ADR-017 decision 3: capabilities conferred on every admitted member, no certificate issued to anyone) and a new **`service-grant-exclusion`** (`0x0013`) takes it back per member, which is what keeps a capability-bearing room from being a one-way door. **Per-member consent revocation is live** (M18.1): `vox`'s `revoke` verb rotates the
 sender key, records the `consent-revocation` fact and re-keys the remaining consenters; it needs no
 network, and a release gate proves the revoked member reads nothing afterwards while the others lose
 nothing. 2026-09-20 — the join/consent flow now has a runtime: joiner-side channel state, author admission as a log fact, and consent grants appended and evaluated (`node::channel`, ADR-016 M14.5). 2026-09-19 — Implementation notes (M6) added; denied verdicts now carry the classified reason (expired / revoked / over-attenuated) instead of collapsing to "not admin"; genesis policy and policy-update carry the ADR-003 `min_suite` floor.
@@ -149,6 +156,13 @@ The passphrase gates the swarm; per-sender consent gates reading. There is no ad
    forever if `N` never chooses `A`. This is **fully symmetric to step 3** and is a deliberate human act,
    not a side effect of joining.
 
+   **The decision is an identity-level one, taken once (decider, 2026-09-21).** `N` decides about `A`'s
+   *key*, not about `A`-in-this-room, and the decision is recorded in `N`'s **trust keyring** (ADR-020
+   decision 3, built in M19.2). So the act here and the keyring are the same thing: approving `A` in this
+   room **is** adding `A` to `N`'s ring, and from then on `A` reads `N` in **every** room they share — this
+   one, and rooms that do not exist yet. The decider's framing is a PGP key-signing party: *"if later on
+   we're in a different room together I shouldn't have to go through that trust relationship again."*
+
    **Revised 2026-09-21**, in two places. This step previously read *"`N` broadcasts its own SKDM to
    members (it has nothing to consent over; whether others can read `N` is each member's own decision)"* —
    whose parenthetical has the direction backwards: whether others may read `N` is **`N`'s** decision, and
@@ -175,10 +189,48 @@ consent grant (no admin admission, no central roster), there is no server-contro
 — the Signalgate / Megolm membership-injection class is structurally absent. *Until 2026-09-21 the first
 clause was not true of the implementation: joining released one sender key automatically (step 2).*
 
-**Consent now carries service reach.** Under ADR-017 decision 3 a consent grant also authorizes the
-grantee to reach every service its grantor has bound to that room. Two consequences are binding here:
-the consent UI must say so at the moment of granting, and **only consent issued by an explicit human act
-qualifies** — which is why step 2's automatic release had to go rather than be marked.
+### Consent is keyring-caused, and that is an invariant
+
+**Every consent grant MUST be caused by an entry in the granting identity's trust keyring.** There is no
+other path, and a consent grant with no corresponding ring entry is a bug by definition. Two entry points
+reach the ring — a direct `vox trust add`, or approving a member in a room — and they are two ways to make
+one decision rather than two mechanisms (ADR-020 decision 3).
+
+This is what makes the rule **provable rather than intended**, and it is why the join path's automatic
+release had to be removed rather than annotated: `join` sent `N`'s sender key to whichever member answered
+the join (`node/actor.rs:1764`), and no ring entry caused it. Under the invariant that is not a policy
+question, it is a violation.
+
+**Consent carries service reach.** Under ADR-017 decision 3, a member reaches a service when it is **in the
+host's ring and in the room the service is bound to** — both conditions, checked at dial time. So:
+
+- approving someone, or trusting them directly, grants reach to every service that host has bound to every
+  room they share, immediately and with no second act;
+- a member of the room the host has **not** trusted reaches nothing and, per ADR-017 decision 9, cannot
+  learn the service exists;
+- a trusted identity that is **not** in the room reaches nothing bound to that room;
+- a trusted identity that **later joins** a room where the host already serves gains reach **on joining**,
+  with no act by the host at that moment. The decider accepted this as symmetric with the other ordering.
+
+The consent surface **MUST** state the scope at the moment of granting, and `vox serve` **MUST** name who
+can and cannot reach the service (ADR-017 decision 4). The blast radius is deliberate, and the condition
+for accepting it was that it is visible.
+
+### Withdrawing trust changes the lock
+
+Read access is a sender key already delivered, so withdrawal cannot recall it — it can only stop the
+withdrawn party reading what comes **next**. Removing a key from the ring therefore performs the
+`Revocation` below (rotate this identity's sender key, record the fact, re-key everyone who keeps consent)
+in **every** room shared with that identity, rather than only stopping future grants.
+
+The decider settled this on the concrete case: a key handed out on Monday, removed on Friday, and a message
+posted on Saturday — the removed party **must not read Saturday's message**. It keeps Monday to Friday,
+which is unavoidable, because a message already read cannot be unread.
+
+`Untrust` as built in M19.2 is **forward-looking only** and does not do this; its own documentation says so
+(*"stops future auto-consent and recalls nothing already granted; recalling that is Revoke, per room"*).
+Closing the gap is required work, not a property of the current tree. Service reach is unaffected by the
+distinction — it is cut immediately either way, because the dial gate reads the ring at connect time.
 
 ### The genesis service grant, and taking it back (ADR-017 decision 3)
 
