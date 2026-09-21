@@ -892,7 +892,7 @@ an earlier claim that it was:** M17.4.
 
 New work, in dependency order:
 
-- **M17.6 — every consent grant is caused by a keyring entry.** The invariant from ADR-007, stated as
+- **M17.6 — every consent grant is caused by a keyring entry. *Done 2026-09-21.*** The invariant from ADR-007, stated as
   executable work. Two halves, both required before anything else: `learn_members` / `admit_author` stop
   creating members from a peer's board record on a self-signed record alone; and `join` stops calling
   `release_key_to(responder)` (`node/actor.rs:1764`), which issued consent that no ring entry caused.
@@ -900,7 +900,69 @@ New work, in dependency order:
   room through a member has issued that member **no** consent, verified by the responder being unable to
   read the joiner's first message until the joiner trusts it; and **no consent grant exists anywhere on the
   log without a corresponding ring entry on its issuer** — the invariant itself, asserted over a run that
-  joins, syncs and vouches. The RED test `sec_vouched_key_gets_no_service_grant.rs` goes green.
+  joins, syncs and vouches.
+
+  **What landed**, `sec_no_consent_without_a_ring_entry.rs`:
+
+  - A member bundle record carries a required `Admission` — `Creator` (the genesis names it, and the
+    genesis hash *is* the channelID, so it is self-evident to anyone holding the room) or
+    `Witnessed(JoinWitness)`. Two variants rather than an `Option`, so "the creator" and "malformed" never
+    look alike on the wire. New struct tag `0x0014`; the admission is inside the record's **signed body**,
+    so a witness cannot be lifted off one record and stapled to another key's.
+  - The witness is minted in `responder_exchange`, beside the verification that justifies it, and returned
+    on `JoinFrame::Accepted`. The joiner checks it binds its own key, this room and this epoch before
+    keeping it, and persists it (`SEG_ADMISSION`) because it republishes it with every bundle record.
+  - `ChannelState::admit_from_board` is now the only way a board key becomes an author. A witness counts
+    only if **this node already admits its signer**, which roots every chain in the creator.
+  - Admission runs to a **fixpoint**: a board returns records in arbitrary order, so a single pass drops
+    a record whose witness was signed by a member appearing later in the same batch. Found by the M14 gate,
+    not by inspection.
+  - `MAX_ADMISSIONS_PER_SWEEP = 8` bounds it. **A witness does not make injection impossible** — a member
+    can sign one for a key that never joined, since nothing forces a signature to correspond to a real
+    exchange. It makes injection *attributable*; the quota is what stops one compromised member exhausting
+    `MAX_AUTHORS` and denying admission to every legitimate member thereafter.
+  - `join` no longer calls `release_key_to(responder)`.
+
+  **One correction to this ADR's own reasoning, found by building it.** Decision 3 argued that removing the
+  join's release "costs nothing functionally" because the pairwise session is built by `ensure_session` and
+  the SKDM merely rides over it. That is wrong: a PQXDH responder starts with **no chains at all** —
+  `Ratchet::init_responder` says *"with no chains yet — they are established when the first inbound message
+  triggers a DH ratchet step"* — so the join's `InitialMessage` creates the session without giving the
+  responder a sending chain, and until the joiner speaks *over* the session no member can answer it. The
+  old comment was pointing at something real. What was wrong was meeting that need with a **sender key**,
+  which made a consent decision nobody took. `PairwiseFrame::Open` meets it with a sealed message whose
+  plaintext is empty: the responder ratchets and gains a sending chain, and learns no key and receives no
+  grant.
+
+  **Mutation-checked**, twice: restoring `release_key_to(responder)` fails the gate on the sender key
+  reaching the responder, and removing the witness-signer check fails it on an unadmitted signer admitting
+  somebody.
+
+  **Six existing gates needed correcting, in two distinct failure modes, and every one of them was
+  green.** This is the clearest measure of how load-bearing the removed behaviour had become, and it is
+  recorded at length because the second mode is the dangerous one.
+
+  *Mode 1 — the gate asserted the defect.* Rewritten rather than extended, on the M17.3 precedent:
+  `node_m14_gate`, both gates in `node_m15_anchor_gate`, and `node_m18_revocation_gate` each waited for a
+  sender key to arrive **before anyone consented**, which is the automatic release. Each now has the
+  relevant parties grant explicitly, and the properties under test are unchanged — two nodes chat and an
+  unconsented third reads nothing; two symmetric-NAT clients form a swarm through their own anchor;
+  members never online together converge; revoking one member keeps the others whole.
+
+  `node_m18_revocation_gate` is the instructive one. Its comment read *"Alice must hold both joiners' keys
+  before she serves anything: an ADR-004 responder has no sending chain until it has received."* The
+  premise is **true** — it is the same fact that broke `Consent` and forced `JoinFrame::Open`. The
+  conclusion was the defect: what a responder needs is a *ratchet message*, not a *sender key*.
+
+  *Mode 2 — the label had drifted from the assertion*, so the gate was green, passing, and testing
+  something nobody intended. `node_m15_anchor_gate` asserted `entries >= 3` as "genesis, consent and the
+  message", but the genesis is never a DAG entry (`entry_count()` is `dag.len()`), so the third was
+  another node's *automatic* consent, synced in. Both gates in `node_m19_trust_gate` labelled a check
+  "both members admitted" while asserting `entries > 0` — and the entry they waited for was that same
+  auto-consent, so the check could never pass once it was gone, while the property they named had been
+  true all along. Both now assert membership directly.
+
+  `node_m14_gate` is also what caught the ordering bug above.
 - **M17.7 — consent is the authorization.** `build_evaluator` stops passing `authors.keys()`
   (`governance/channel.rs:935`); the dial check keys off **(in the host's trust keyring) AND (in the bound
   room)**. `vox grant`, `GenesisBody::service_grant`'s authorization role and the `bind:` class with
@@ -947,7 +1009,11 @@ New work, in dependency order:
   mixed-version peer still applies the old rules **to its own services**, bounded there because every host
   enforces its own consent set locally.
 
-- **M17.14 — withdrawing trust changes the lock.** `Untrust` is forward-looking only as built in M19.2
+- **M17.14 — withdrawing trust changes the lock. *Done 2026-09-21* (`5fefcbb`).** `NodeCommand::Untrust`
+  removes the ring entry and then walks every channel where consent was actually granted, reusing M18.1's
+  revocation rather than adding a second kind. The gate stands up **two** rooms shared with the removed
+  party and asserts the property in both — a single-room gate passes against an implementation that only
+  ever changes the lock in whichever room comes first. Original statement of the work follows. `Untrust` is forward-looking only as built in M19.2
   (its own docs: *"recalls nothing already granted; recalling that is Revoke, per room"*), so a withdrawn
   identity keeps reading the withdrawer's **new** messages in every shared room. Removal must instead
   perform ADR-007's revocation — rotate the sender key, record the fact, re-key everyone still in the ring —

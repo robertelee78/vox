@@ -199,19 +199,32 @@ fn m14_two_nodes_chat_and_an_unconsented_third_reads_nothing() {
             _ => None,
         })
         .await;
-        // Alice saw both joins, admitted both as log authors, and took the sender key
-        // each newcomer released as part of joining (ADR-007 step 2). She needs Bob's
-        // before she can answer on that session at all: the ADR-004 responder has no
-        // sending chain until it has received.
+        // Alice saw both joins and admitted both as log authors — and received **no
+        // sender key from either**, because joining grants nothing (M17.6).
+        //
+        // **Rewritten 2026-09-21.** This gate previously waited for a key from Bob
+        // "released as part of joining (ADR-007 step 2)" and would have kept passing
+        // against the defect M17.6 removes: `join` issued an ordinary consent grant to
+        // whichever member answered it, with no human deciding and the recipient
+        // influenceable by whoever supplied the link. The property under test is
+        // unchanged — two nodes chat, an unconsented third reads nothing — and the
+        // proof is stronger, because the reading now follows an explicit act by each
+        // party rather than a side effect of the protocol.
         let seen = drain_until(&alice, |evs| {
             evs.iter().any(|e| is_peer_joined(e, cid, bob_fp))
                 && evs.iter().any(|e| is_peer_joined(e, cid, carol_fp))
-                && evs.iter().any(|e| is_key_from(e, cid, bob_fp))
         })
         .await;
-        assert!(seen.iter().any(|e| is_key_from(e, cid, bob_fp)));
+        assert!(
+            !seen.iter().any(|e| is_key_from(e, cid, bob_fp)),
+            "joining must release no sender key"
+        );
 
-        // ---- consent: Alice ↔ Bob only ----
+        // ---- consent: Alice ↔ Bob only, and in BOTH directions ----
+        //
+        // Each party decides about the other. Alice consenting lets Bob read Alice;
+        // Bob must consent for Alice to read Bob. Neither is implied by the other and
+        // neither is implied by joining.
         let out = alice
             .apply(NodeCommand::Consent {
                 channel_id: cid,
@@ -219,10 +232,19 @@ fn m14_two_nodes_chat_and_an_unconsented_third_reads_nothing() {
             })
             .await;
         assert!(out.is_done(), "Alice consents to Bob: {out:?}");
-        // Bob takes Alice's key. He already released his own when he joined, so
-        // nothing further is needed from him for Alice to read him.
+        let out = bob
+            .apply(NodeCommand::Consent {
+                channel_id: cid,
+                target: alice_fp,
+            })
+            .await;
+        assert!(out.is_done(), "Bob consents to Alice: {out:?}");
         let _ = drain_until(&bob, |evs| {
             evs.iter().any(|e| is_key_from(e, cid, alice_fp))
+        })
+        .await;
+        let _ = drain_until(&alice, |evs| {
+            evs.iter().any(|e| is_key_from(e, cid, bob_fp))
         })
         .await;
 
