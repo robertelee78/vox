@@ -377,34 +377,51 @@ fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Send
 }
 
 /// Accept connections and their streams forever, forwarding to the actor the ones
-/// that need channel state. Each connection gets its own task, so a slow peer
-/// cannot stall the others; the board is served inside `accept_stream`.
+/// that need channel state. The board is served inside `accept_stream`.
+///
+/// **Each connection's handshake runs on its own task** (M17.17). This loop used to call
+/// `accept`, which performs the TLS handshake inline, so the loop serialised on handshakes:
+/// one peer that opened a connection and then stalled its handshake blocked **every** other
+/// inbound connection — with no credential at all, because authentication had not happened
+/// yet. A pre-authentication denial of service, and worst against the node most likely to be
+/// always-on and public, which is an anchor. The loop's own comment claimed a slow peer could
+/// not stall the others; that was true only of the stream loop, after the handshake.
 fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     tokio::spawn(async move {
         loop {
-            // Open-swarm default: any authenticated identity may connect, because a
-            // node that serves the board must accept peers it does not know yet
-            // (ADR-011/ADR-012). What a peer may *open* is the stream-kind gate.
-            let accepted = net
-                .manager()
-                .accept(crate::transport::quic::Admission::AcceptAnyAuthenticated)
-                .await;
-            match accepted {
-                Ok(Some(conn)) => {
+            // Phase one: take the attempt and come straight back for the next one.
+            let Some(incoming) = net.manager().accept_incoming().await else {
+                // The endpoint closed. Tell the actor, exactly as the serialised loop did —
+                // it acts on `Stopped`, and dropping that send was a real regression I
+                // introduced while splitting this loop, caught by a dead-code warning on the
+                // variant rather than by any test.
+                let _ = tx.send(NetEvent::Stopped).await;
+                break;
+            };
+            // Phase two, on its own task and bounded by `HANDSHAKE_TIMEOUT`.
+            let net2 = Arc::clone(&net);
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                // Open-swarm default: any authenticated identity may connect, because a
+                // node that serves the board must accept peers it does not know yet
+                // (ADR-011/ADR-012). What a peer may *open* is the stream-kind gate.
+                let finished = net2
+                    .manager()
+                    .finish_incoming(
+                        incoming,
+                        crate::transport::quic::Admission::AcceptAnyAuthenticated,
+                    )
+                    .await;
+                // A failed or abandoned handshake needs no handling: there is nothing to
+                // report and nothing to stop, because the loop that matters is already back
+                // at `accept_incoming`.
+                if let Ok(conn) = finished {
                     let peer = conn.peer_id();
-                    spawn_stream_loop(Arc::clone(&net), conn, tx.clone());
-                    if tx.send(NetEvent::Connected { peer }).await.is_err() {
-                        break; // the actor is gone
-                    }
+                    spawn_stream_loop(Arc::clone(&net2), conn, tx2.clone());
+                    let _ = tx2.send(NetEvent::Connected { peer }).await;
                 }
-                // The endpoint closed, or a handshake failed. `accept` returns `Err`
-                // on a single failed handshake (ADR-011 known gap), so keep going on
-                // an error and stop only when the endpoint is closed.
-                Ok(None) => break,
-                Err(_) => continue,
-            }
+            });
         }
-        let _ = tx.send(NetEvent::Stopped).await;
     });
 }
 

@@ -309,6 +309,11 @@ impl ConnectionManager {
 
     /// Accept the next inbound connection under `admission` and file it under the
     /// authenticated peer identity. `Ok(None)` when the endpoint is closed.
+    ///
+    /// **Performs the handshake inline**, so this is for a caller that wants exactly one
+    /// connection. An accept *loop* must use [`NodeNet::accept_incoming`] and
+    /// [`NodeNet::finish_incoming`] instead, or it serialises on handshakes and one stalled
+    /// unauthenticated peer blocks every other inbound connection.
     pub async fn accept(&self, admission: Admission) -> Result<Option<Arc<VoxConnection>>> {
         let Some(conn) = self
             .endpoint
@@ -318,6 +323,25 @@ impl ConnectionManager {
             return Ok(None);
         };
         Ok(Some(self.file(conn)))
+    }
+
+    /// Phase one for an accept loop: the next inbound attempt, with no handshake.
+    /// `None` when the endpoint is closed.
+    pub async fn accept_incoming(&self) -> Option<quinn::Incoming> {
+        self.endpoint.accept_incoming().await
+    }
+
+    /// Phase two: complete one attempt's handshake and admission, then file it. Spawn this.
+    pub async fn finish_incoming(
+        &self,
+        incoming: quinn::Incoming,
+        admission: Admission,
+    ) -> Result<Arc<VoxConnection>> {
+        let conn = self
+            .endpoint
+            .finish_incoming(incoming, (self.clock)(), admission)
+            .await?;
+        Ok(self.file(conn))
     }
 
     /// Take ownership of a connection this manager did not dial — one a hole punch

@@ -1148,6 +1148,41 @@ M17.6 must land first and alone: it closes both the admission hole and the auto-
 gate is meaningless until it has. M17.7 and M17.13 ship together. M17.9 blocks M17.10 and M17.12. M17.11
 depends on M17.7. M17.8 is independent of all of it.
 
+## Open proof gap: the stalled-handshake fix is unproven
+
+**M17.17 (verified finding #3) is fixed in code and NOT proved.** Recorded here rather than left
+implied, because ADR-018 §4 is explicit that absent evidence must not read as success — and because a
+green test that does not discriminate is worse than no test.
+
+**The defect.** `spawn_accept_loop` called `NodeNet::accept`, which awaits the TLS handshake inline, so
+the loop could not take the next attempt until the current one finished. One peer that opened a
+connection and then stopped talking blocked **every** other inbound connection, with no credential of
+any kind — authentication happens inside the handshake, so at the moment of the stall there is nothing
+to hold the peer to. Worst against an always-on, publicly addressable node, which is what an anchor is.
+The loop's own comment claimed a slow peer could not stall the others; that was true of the *stream*
+loop, which runs after the handshake, and is why the defect survived review.
+
+**The fix.** `VoxEndpoint::accept_incoming` takes the attempt and returns; `finish_incoming` completes
+the handshake and admission on its own task, bounded by a 30s `HANDSHAKE_TIMEOUT` so an abandoned
+attempt is finite. `spawn_accept_loop` is now two-phase.
+
+**Why it is unproven.** A test was written and **deleted**, because its mutation check did not
+discriminate: with the old serialised loop restored it still passed. The reason is instructive — the
+synthetic "stalling peer" was a raw UDP socket sending one long-header datagram, which quinn discards
+without ever creating an `Incoming`. Nothing was pending, so nothing was blocked, and the test was
+measuring an empty accept loop. A real loopback handshake completes in about 1.6ms, so a serialised loop
+handling eight *valid* peers is also fast enough to pass any budget — the property only bites when a
+handshake is genuinely slow, and synthesising that needs a peer that sends a **valid** QUIC Initial and
+then stops, which this suite cannot currently construct.
+
+**What would close it**, in order of preference: a cooperating slow client built on a raw quinn endpoint
+that completes the Initial and then stops polling; or a two-machine rehearsal where one side is
+suspended mid-handshake (`SIGSTOP` on a real `vox` process after its first datagram), which is the
+`service_rehearsal_proof` style and the more likely to be honest.
+
+Until then the fix rests on the shape of the code and on the defect being legible in the diff, which is
+weaker evidence than this repository's bar, and is stated as such.
+
 ## Links
 **Depends on**: ADR-005 (the invite and its passphrase separation), ADR-006 (the sender-key sealing the
 descriptor rides as content), ADR-007 (per-sender consent — now the authorization basis — and revocation),
