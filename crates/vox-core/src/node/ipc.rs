@@ -86,15 +86,54 @@ const T_TUNNEL_SERVED: u64 = 22;
 const T_PROXY_UP: u64 = 23;
 const T_SYNCED: u64 = 24;
 const T_SHUTDOWN: u64 = 25;
+const T_OK: u64 = 3;
+const T_ERROR: u64 = 4;
+const T_ROWS: u64 = 5;
+const T_MEMBERS: u64 = 6;
+const T_ROOMS: u64 = 7;
 // Client → node.
 const T_SUBSCRIBE: u64 = 1;
+const T_POST: u64 = 2;
+const T_READ: u64 = 3;
+const T_ROSTER: u64 = 4;
+const T_ROOMS_REQ: u64 = 5;
 
 /// What a client sends.
+///
+/// Deliberately narrow (ADR-020 §7): an app client posts, reads and looks at the
+/// roster. It cannot create an identity, unlock, revoke, or edit the trust
+/// keyring — those carry passphrases or are operator decisions, and an agent
+/// session runs model-authored code. The file mode is the actual boundary; this
+/// is accident prevention on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     /// Begin streaming events. Everything emitted from this point reaches this
-    /// client; nothing before it does.
+    /// client; nothing before it does. **Terminal** — the connection becomes a
+    /// stream and serves no further requests.
     Subscribe,
+    /// Append a message to a room.
+    Post {
+        /// The room.
+        channel_id: Digest32,
+        /// The message text (an agent-comms envelope is JSON in here).
+        text: String,
+    },
+    /// Read a room's rendered timeline, optionally only what follows a cursor.
+    Read {
+        /// The room.
+        channel_id: Digest32,
+        /// Return only entries **after** this one. Absent reads from the start.
+        since: Option<Digest32>,
+        /// Cap on rows returned; 0 means no cap.
+        limit: u64,
+    },
+    /// The members of a room.
+    Roster {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Every room this node holds.
+    Rooms,
 }
 
 impl Request {
@@ -105,6 +144,28 @@ impl Request {
         match self {
             Request::Subscribe => {
                 e.array(1).uint(T_SUBSCRIBE);
+            }
+            Request::Post { channel_id, text } => {
+                e.array(3).uint(T_POST).bytes(channel_id).text(text);
+            }
+            Request::Read {
+                channel_id,
+                since,
+                limit,
+            } => {
+                e.array(4)
+                    .uint(T_READ)
+                    .bytes(channel_id)
+                    // An absent cursor is the empty byte string, so the arity is
+                    // fixed — ADR-008's canonical encoding has no optionals.
+                    .bytes(since.as_ref().map_or(&[][..], |d| &d[..]))
+                    .uint(*limit);
+            }
+            Request::Roster { channel_id } => {
+                e.array(2).uint(T_ROSTER).bytes(channel_id);
+            }
+            Request::Rooms => {
+                e.array(1).uint(T_ROOMS_REQ);
             }
         }
         e.finish()
@@ -124,6 +185,49 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Subscribe)
+            }
+            (T_POST, 3) => {
+                let channel_id = digest(&mut d)?;
+                let text = d
+                    .text()
+                    .map_err(|_| Error::MalformedBundle("ipc post text"))?
+                    .to_owned();
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Post { channel_id, text })
+            }
+            (T_READ, 4) => {
+                let channel_id = digest(&mut d)?;
+                let cursor = d
+                    .bytes()
+                    .map_err(|_| Error::MalformedBundle("ipc cursor"))?;
+                let since = if cursor.is_empty() {
+                    None
+                } else {
+                    Some(
+                        Digest32::try_from(cursor)
+                            .map_err(|_| Error::MalformedBundle("ipc cursor length"))?,
+                    )
+                };
+                let limit = d.uint().map_err(|_| Error::MalformedBundle("ipc limit"))?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Read {
+                    channel_id,
+                    since,
+                    limit,
+                })
+            }
+            (T_ROSTER, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Roster { channel_id })
+            }
+            (T_ROOMS_REQ, 1) => {
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Rooms)
             }
             _ => Err(Error::MalformedBundle("ipc request unknown tag")),
         }
@@ -152,6 +256,28 @@ pub enum Frame {
     },
     /// A node event.
     Event(NodeEvent),
+    /// A request succeeded and carries nothing further.
+    Ok,
+    /// A request failed. The reason is for a person to read, not to branch on.
+    Error {
+        /// Why it failed.
+        reason: String,
+    },
+    /// The rows a [`Request::Read`] asked for, oldest first.
+    Rows {
+        /// The rendered entries.
+        rows: Vec<MessageRow>,
+    },
+    /// The members a [`Request::Roster`] asked for.
+    Members {
+        /// Member fingerprints, in the order the node holds them.
+        members: Vec<Digest32>,
+    },
+    /// The rooms a [`Request::Rooms`] asked for.
+    Rooms {
+        /// `(channel_id, local name, open)` per room.
+        rooms: Vec<(Digest32, String, bool)>,
+    },
 }
 
 impl Frame {
@@ -167,6 +293,34 @@ impl Frame {
                 e.array(2).uint(T_LAGGED).uint(*missed);
             }
             Frame::Event(ev) => encode_event(&mut e, ev),
+            Frame::Ok => {
+                e.array(1).uint(T_OK);
+            }
+            Frame::Error { reason } => {
+                e.array(2).uint(T_ERROR).text(reason);
+            }
+            Frame::Rows { rows } => {
+                e.array(2).uint(T_ROWS).array(rows.len());
+                for r in rows {
+                    e.array(4)
+                        .bytes(&r.entry_hash)
+                        .bytes(&r.author)
+                        .uint(r.created_secs)
+                        .text(&r.text);
+                }
+            }
+            Frame::Members { members } => {
+                e.array(2).uint(T_MEMBERS).array(members.len());
+                for m in members {
+                    e.bytes(m);
+                }
+            }
+            Frame::Rooms { rooms } => {
+                e.array(2).uint(T_ROOMS).array(rooms.len());
+                for (id, name, open) in rooms {
+                    e.array(3).bytes(id).text(name).uint(u64::from(*open));
+                }
+            }
         }
         e.finish()
     }
@@ -329,6 +483,66 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             return Ok(Frame::Lagged {
                 missed: d.uint().map_err(|_| Error::MalformedBundle("ipc lagged"))?,
             })
+        }
+        (T_OK, 1) => return Ok(Frame::Ok),
+        (T_ERROR, 2) => {
+            return Ok(Frame::Error {
+                reason: d
+                    .text()
+                    .map_err(|_| Error::MalformedBundle("ipc error reason"))?
+                    .to_owned(),
+            })
+        }
+        (T_ROWS, 2) => {
+            let n = d.array().map_err(|_| Error::MalformedBundle("ipc rows"))?;
+            let mut rows = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                let arity = d.array().map_err(|_| Error::MalformedBundle("ipc row"))?;
+                if arity != 4 {
+                    return Err(Error::MalformedBundle("ipc row arity"));
+                }
+                rows.push(MessageRow {
+                    entry_hash: digest(d)?,
+                    author: digest(d)?,
+                    created_secs: d.uint().map_err(|_| Error::MalformedBundle("ipc secs"))?,
+                    text: d
+                        .text()
+                        .map_err(|_| Error::MalformedBundle("ipc text"))?
+                        .to_owned(),
+                });
+            }
+            return Ok(Frame::Rows { rows });
+        }
+        (T_MEMBERS, 2) => {
+            let n = d
+                .array()
+                .map_err(|_| Error::MalformedBundle("ipc members"))?;
+            let mut members = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                members.push(digest(d)?);
+            }
+            return Ok(Frame::Members { members });
+        }
+        (T_ROOMS, 2) => {
+            let n = d.array().map_err(|_| Error::MalformedBundle("ipc rooms"))?;
+            let mut rooms = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                let arity = d.array().map_err(|_| Error::MalformedBundle("ipc room"))?;
+                if arity != 3 {
+                    return Err(Error::MalformedBundle("ipc room arity"));
+                }
+                let id = digest(d)?;
+                let name = d
+                    .text()
+                    .map_err(|_| Error::MalformedBundle("ipc room name"))?
+                    .to_owned();
+                let open = d
+                    .uint()
+                    .map_err(|_| Error::MalformedBundle("ipc room open"))?
+                    != 0;
+                rooms.push((id, name, open));
+            }
+            return Ok(Frame::Rooms { rooms });
         }
         (T_NEW_ENTRY, 6) => {
             let channel_id = digest(d)?;
@@ -554,16 +768,130 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
     )
     .await?;
 
-    // Subscribe BEFORE answering, so nothing emitted between the request and the
-    // first read is missed.
-    let Some(body) = read_frame(&mut stream).await? else {
-        return Ok(());
-    };
-    match Request::from_bytes(&body)? {
-        Request::Subscribe => {}
+    // Serve requests until the client hangs up, or until it subscribes — which is
+    // terminal, because from then on the connection is a one-way stream.
+    loop {
+        let Some(body) = read_frame(&mut stream).await? else {
+            return Ok(());
+        };
+        let request = match Request::from_bytes(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                // A request this build does not understand ends the connection
+                // rather than being skipped: a client that cannot be understood
+                // must not be left believing it was served.
+                let _ = write_frame(
+                    &mut stream,
+                    &Frame::Error {
+                        reason: e.to_string(),
+                    }
+                    .to_bytes(),
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        if matches!(request, Request::Subscribe) {
+            // Subscribe BEFORE acknowledging, so nothing emitted between the
+            // request and the first read is missed.
+            let events = handle.subscribe();
+            write_frame(&mut stream, &Frame::Ok.to_bytes()).await?;
+            return pump(stream, events).await;
+        }
+        let reply = serve_request(&handle, request).await;
+        write_frame(&mut stream, &reply.to_bytes()).await?;
     }
-    let events = handle.subscribe();
-    pump(stream, events).await
+}
+
+/// Answer one request against the node.
+///
+/// Every failure comes back as [`Frame::Error`] rather than ending the
+/// connection: a client that asked for a room it does not have should be told so
+/// and be able to ask something else.
+async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
+    match request {
+        // Handled by the caller; the connection becomes a stream.
+        Request::Subscribe => Frame::Ok,
+        Request::Post { channel_id, text } => {
+            match handle
+                .apply(crate::node::api::NodeCommand::SendText { channel_id, text })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: format!("{other:?}"),
+                },
+            }
+        }
+        Request::Read {
+            channel_id,
+            since,
+            limit,
+        } => {
+            let view = handle.view();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            else {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            };
+            // The cursor is an entry hash the client already has; everything
+            // after it is what it has not seen. A cursor this node does not hold
+            // is an error rather than "from the start", which would silently
+            // re-deliver the whole room.
+            let start = match since {
+                None => 0,
+                Some(cursor) => match detail.timeline.iter().position(|r| r.entry_hash == cursor) {
+                    Some(i) => i + 1,
+                    None => {
+                        return Frame::Error {
+                            reason: "cursor not in this room's timeline".into(),
+                        }
+                    }
+                },
+            };
+            let mut rows: Vec<MessageRow> =
+                detail.timeline[start.min(detail.timeline.len())..].to_vec();
+            if limit > 0 {
+                rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            }
+            Frame::Rows { rows }
+        }
+        Request::Roster { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Members {
+                    members: detail.members.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
+        Request::Rooms => {
+            let view = handle.view();
+            Frame::Rooms {
+                rooms: view
+                    .channels
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.channel_id,
+                            c.local_name.clone().unwrap_or_default(),
+                            c.open,
+                        )
+                    })
+                    .collect(),
+            }
+        }
+    }
 }
 
 /// Forward a subscription to a client until the client goes away or the node
@@ -591,8 +919,12 @@ pub struct IpcClient {
 }
 
 impl IpcClient {
-    /// Connect, check the protocol version, and subscribe.
-    pub async fn connect(path: &Path) -> Result<Self> {
+    /// Connect and check the protocol version, without subscribing.
+    ///
+    /// Use this for a client that issues requests. [`IpcClient::subscribe`] turns
+    /// the connection into an event stream, after which no further request can be
+    /// sent on it.
+    pub async fn open(path: &Path) -> Result<Self> {
         let mut stream = UnixStream::connect(path).await.map_err(|e| Error::Path {
             op: "connect control socket",
             detail: format!("{}: {e}", path.display()),
@@ -602,15 +934,45 @@ impl IpcClient {
         };
         match Frame::from_bytes(&hello)? {
             Frame::Hello { protocol } if protocol == PROTOCOL_VERSION => {}
-            Frame::Hello { .. } => {
-                // A version we do not know: disconnect rather than guess at the
-                // shape of the frames that would follow.
-                return Err(Error::MalformedBundle("ipc protocol version"));
-            }
+            Frame::Hello { .. } => return Err(Error::MalformedBundle("ipc protocol version")),
             _ => return Err(Error::MalformedBundle("ipc expected hello")),
         }
-        write_frame(&mut stream, &Request::Subscribe.to_bytes()).await?;
         Ok(Self { stream })
+    }
+
+    /// Send one request and read its answer.
+    ///
+    /// A [`Frame::Error`] is returned as `Ok(Frame::Error { .. })`, not as an
+    /// `Err`: "this room is not open" is an answer, and the connection stays
+    /// usable for the next question.
+    pub async fn request(&mut self, req: &Request) -> Result<Frame> {
+        write_frame(&mut self.stream, &req.to_bytes()).await?;
+        let Some(body) = read_frame(&mut self.stream).await? else {
+            return Err(Error::MalformedBundle("ipc closed before reply"));
+        };
+        Frame::from_bytes(&body)
+    }
+
+    /// Turn this connection into an event stream. Terminal: no further request
+    /// may be sent on it.
+    pub async fn subscribe(&mut self) -> Result<()> {
+        match self.request(&Request::Subscribe).await? {
+            Frame::Ok => Ok(()),
+            Frame::Error { reason } => {
+                let _ = reason;
+                Err(Error::MalformedBundle("ipc subscribe refused"))
+            }
+            _ => Err(Error::MalformedBundle("ipc unexpected subscribe reply")),
+        }
+    }
+
+    /// Connect, check the protocol version, and subscribe — [`open`](Self::open)
+    /// followed by [`subscribe`](Self::subscribe), for a client that only wants
+    /// the event stream.
+    pub async fn connect(path: &Path) -> Result<Self> {
+        let mut client = Self::open(path).await?;
+        client.subscribe().await?;
+        Ok(client)
     }
 
     /// The next frame, or `None` once the node has gone.
