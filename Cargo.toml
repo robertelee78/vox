@@ -4,7 +4,7 @@
 # Rust clients over it. Crates are added to `members` as milestones land.
 [workspace]
 resolver = "2"
-members = ["crates/vox-core", "crates/vox-tui"]
+members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms"]
 
 [workspace.package]
 version = "0.1.0"

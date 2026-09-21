@@ -1,0 +1,29 @@
+# Vox Lux — agent comms (ADR-020, M19.3).
+#
+# The first crate of the **app tier**: an application riding the Vox layer, as
+# chat and room-bound services do. It owns the envelope, the message vocabulary
+# and the room conventions, and nothing else — the layer beneath it (rooms, the
+# log, identity, the local control socket, the trust keyring) is `vox-core`'s.
+#
+# Deliberately small, and deliberately not a dependent of `vox-core`: an
+# agent-comms message is JSON inside the ordinary text content of an ADR-008 log
+# entry, so this crate never touches the core's types and adds no wire format.
+# That is the seam working — if this crate needed the core's internals, the layer
+# would not be a layer.
+[package]
+name = "vox-agentcomms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Vox Lux agent comms — the envelope, vocabulary and claim rules agents share in a room"
+
+[lib]
+name = "vox_agentcomms"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
