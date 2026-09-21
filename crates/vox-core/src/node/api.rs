@@ -348,6 +348,11 @@ pub enum Fault {
     /// consent has already been revoked (ADR-007 — consent is single-writer, so this
     /// is a settled fact, not a race).
     NotConsented,
+    /// The requested local bind address is not a loopback address. A forward carries
+    /// traffic into a room *this* machine is a member of, so binding it anywhere the
+    /// network can reach would hand that membership to whoever reaches the port
+    /// (ADR-013; the same rule `vox up` enforces).
+    NotLoopback,
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }

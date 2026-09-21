@@ -2816,6 +2816,17 @@ impl Node {
         if !self.channels.contains_key(channel_id) {
             return Outcome::Failed(Fault::ChannelNotOpen);
         }
+        // Loopback only, and refused **before anything is dialled**: a forward hands
+        // whoever reaches its local port this node's own membership of the room, so a
+        // forward bound where the network can reach it exposes a room-bound service to
+        // everyone on that network. `vox up` has enforced this since it was written
+        // (`node::up::serve`); a forward is the same exposure with the target already
+        // chosen, so it needs no name to be guessed and is strictly easier to abuse.
+        // Checked here rather than only at the bind so that a refused request costs no
+        // dial, leaks no traffic and tells the caller what is actually wrong.
+        if !local.ip().is_loopback() {
+            return Outcome::Failed(Fault::NotLoopback);
+        }
         // The member's advertised endpoints, from this node's board — the same hints
         // any dial uses; the ladder does the rest.
         let endpoints = self

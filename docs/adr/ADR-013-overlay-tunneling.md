@@ -214,6 +214,22 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     the application makes and a dead one takes nothing else with it. Binding happens eagerly, so a port
     already in use is an error the person sees rather than a task that dies quietly; dropping the forward
     stops the listener and leaves spliced connections to finish.
+  - **A forward binds loopback only, and it is enforced (fixed 2026-09-21).** The listener hands whoever
+    reaches it this node's own membership of the room, so a forward bound where the network can reach it
+    exposes a room-bound service to everyone on that network — with no room, no passphrase, no key and no
+    consent of their own. `vox up` had enforced this from the start (`node::up::serve` refuses a
+    non-loopback bind and drops a non-loopback peer); `Forward::bind` did not, and it is the easier of the
+    two to abuse, because `vox up` makes the caller supply a `.vox` name while a forward has its target
+    already chosen. The check is in the node actor **before anything is dialled** (so a refused request
+    costs no dial and leaks no traffic, and reports `Fault::NotLoopback` rather than a reachability
+    failure) and again in `Forward::bind`, which creates the only socket and is therefore the structural
+    backstop no caller can bypass. There is deliberately **no flag to override it**: a person wanting to
+    re-export a room-bound service to a local network can run their own proxy in front of the loopback
+    port and own that decision explicitly. Gate:
+    `crates/vox-core/tests/sec_forward_binds_loopback_only.rs` — a non-loopback forward is refused, is
+    refused *before* any dial (mutation-checked: removing the actor guard makes the node dial first and
+    report `Unreachable`), leaves no listener on the port it asked for, and the same request on loopback
+    passes the address check and fails only on reachability.
   - **The verbs.** `vox service add|remove|list`, `vox grant`, `vox forward` — each opens the room (a
     room's services and governance live inside the SEK-sealed store, so there is no offering or granting
     without the passphrase), does its work and leaves; `forward` serves until interrupted and prints the
