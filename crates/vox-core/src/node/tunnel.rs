@@ -152,12 +152,21 @@ impl Forward {
     /// Binding happens here, so a port already in use is an error the caller sees
     /// rather than a task that dies silently. Each accepted connection gets its own
     /// tunnel stream on its own task.
+    ///
+    /// `local` must be a loopback address. This is the structural backstop for the rule
+    /// the node actor enforces on the way in: the socket is created here and nowhere
+    /// else, so no caller can bind a forward where the network can reach it. Reaching
+    /// this refusal means a caller bypassed the actor, which is a bug rather than user
+    /// input — hence a fault rather than a message about what to type.
     pub async fn bind(
         conn: Arc<VoxConnection>,
         channel_id: Digest32,
         service_tag: String,
         local: SocketAddr,
     ) -> Result<Self> {
+        if !local.ip().is_loopback() {
+            return Err(Error::MalformedTunnel("a forward binds loopback only"));
+        }
         let listener = TcpListener::bind(local)
             .await
             .map_err(|_| Error::TunnelDenied("forward: cannot bind the local port"))?;
