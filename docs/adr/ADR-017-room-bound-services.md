@@ -1,25 +1,72 @@
 # ADR-017 — Room-Bound Services (the Tor-hidden-service equivalent)
 
-**Status**: proposed — not started (ADR-013 supplies the data path this builds on; the two-command
-surface, the `.vox` name, capability-bearing rooms and audience-encrypted advertisements are specified
-here)
+**Status**: **revised — the authorization model of decision 3 is withdrawn.** Decisions 5 and 6 are built
+and shipped in v0.1.0 (`node::up`, `node::resolver`). **Decision 7 is NOT built**: `vox node` prints an
+`--anchor` spec for the operator to paste (`vox-tui/src/app.rs:293`) and every command still takes the flag
+(`vox-tui/src/cli.rs:49`); `<config_dir>/anchors` does not exist, so M17.4 is outstanding. An earlier
+draft of this line claimed decision 7 shipped — corrected here, found by review. Decisions 1, 3, 4, 8, 9,
+10 and 11 are **proposed and not built**; what ships today implements the withdrawn model and is a live
+vulnerability until M17.6–M17.13 land.
 **Date**: 2026-09-21
-**Updated**: 2026-09-21 — the local entry point is a **SOCKS5 proxy** (`vox up`), which is what Tor does
-and for Tor's stated reasons (decision 5, evidenced from `/opt/tor`); the Vox *network interface* an
-earlier revision specified was built, gated and **removed** as heavier than anything the thing being
-replaced requires. Decision 6: **the carried session has no IP addresses of its own** (ULA-to-ULA
-on the connecting machine, loopback-to-loopback on the serving one, so no packet anywhere pairs a real
-address with the service's port — and the service sees every Vox client as `127.0.0.1`, which makes its
-own IP-based controls inert and redundant — Vox gates on the client's key and the room, one layer up).
-**IP-level anonymity is recorded as a non-goal**: an earlier revision of
-this ADR specified a relay-mandatory "location-hidden" room, reverted for buying a guarantee Vox does not
-make at the cost of relaying every byte forever. The person-facing address is a **`.vox`
-hostname** and the local entry point is
-a **Vox network interface** (`vox up`) — *since reverted; see the entry above.* The service is named by its
-**port**, which is a Vox-layer identifier, not a bound port on either machine.
-**Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: services, tunneling, ux, capability, discovery, hidden-service
+**Updated**: 2026-09-21 (third revision, then revised again the same day after independent review) —
+**capability-bearing rooms are withdrawn.** Decision 3 held that *"'may this member dial it' and 'is this
+person a member' are the same question, asked once."* That is refuted: admission to a room is passphrase +
+proof-of-work, so under it any party who obtains an address and a passphrase — or, via the vouching path,
+any party a single member syncs — is authorized to dial every service bound to that room. Authorization is
+now **per-sender consent**, and consent is **per pair, per direction, and always an explicit human act**
+(decision 3). The genesis service grant, its `service-grant-exclusion` (`0x0013`), the `vox grant` verb and
+the `bind:` capability class are all withdrawn with it.
 
+**Independent review round, 2026-09-21.** The first draft of this revision was reviewed by three models
+before any code was written (`docs/adr/ADR-017-reviews/`). All three returned **REVISE**; all three agreed
+the core direction is sound and verified it against the tree; all three found defects that would have
+shipped. The material ones, and what changed:
+
+- **Joining a room auto-consented to the responder.** `join` called `release_key_to(responder)` →
+  `issue_consent` unconditionally (`node/actor.rs:1764`, `:1835`), and the responder is whichever member
+  the board offers first (`:1603`) — influenceable by the link-giver and by a malicious anchor's ordering.
+  So a host that joined through Mallory had consented to Mallory, and under `readers_of(host)` Mallory
+  would have reached every service that host later bound. **This reintroduced the very hole the revision
+  exists to close, through another door**, and no amount of fixing `learn_members` touches it. Found
+  independently by two reviewers. Decision 3 now requires explicit consent in both directions and the
+  automatic release is removed.
+- **`bind:` was orphaned.** `add_service` checks `can_bind` (`governance/channel.rs:1232`) and the only two
+  sources of `bind:` were the genesis grant and `vox grant --may-bind` — both withdrawn, so `vox serve`
+  would have worked for a room's creator and silently failed for everyone else. Found by all three.
+  Resolved by deleting the capability: offering a local port of one's own machine is not the room's
+  business (decision 3).
+- **The name did not need a keypair.** Two reviewers independently proposed a host-committed random label,
+  which blocks the same impersonation attack with nothing new to store or lose. It also removes a
+  post-quantum inconsistency: 52 base32 characters carry 32 bytes, so a raw ed25519 service identity would
+  have made the *name's* authentication classical in a system whose composite key is 1,984 bytes
+  (`hash.rs:42`). Decision 1 changed.
+- **A governance frame would have leaked the descriptor's existence.** Framed payload kinds are publicly
+  classifiable to every log holder (`governance/channel.rs:546`), so a dedicated entry kind announces "a
+  service descriptor is here" even with its body sealed — defeating the rule that an unapproved member must
+  not learn a service exists. Decision 9 now publishes the descriptor as **content**.
+- **Three claims about the tree were false** and are corrected in place rather than quietly dropped:
+  decision 7's anchors-as-configuration (above); ADR-013's note that its m15 gate "was rewritten" when it
+  still drives `NodeCommand::GrantTunnel`; and ADR-013's note that `vox grant` "is withdrawn" when it is
+  still in `cli.rs:397`. Stating planned work in the past tense is the failure mode ADR-018 exists to
+  prevent, and it happened three times in one change.
+- **Two claims were corrections in my favour being refused.** `vox grant` could *not* reach a non-member
+  (`node/actor.rs:2735` requires an admitted author), so the cost of deleting it was overstated — what is
+  actually lost is time-bounded grants (`--days`) and reach-without-read. And verified finding #5 does not
+  follow from the evaluator as claimed: exclusion resolution accumulates qualifying historical exclusions
+  without filtering on the head epoch (`governance/evaluator.rs:519`, `:797`), so the ADR comment cited as
+  evidence was not proof. Finding #5 is downgraded to **unverified** pending a test that exhibits it.
+
+Descriptor freshness is keyed to the host's ADR-006 `chain_id` **and** to explicit publication triggers —
+`chain_id` alone is insufficient because approving a reader does not advance it (`governance/channel.rs:1311`),
+which would have left a newly approved reader unable to open the standing descriptor. See decision 9, which
+records why the decision as first taken was on a wrong premise.
+
+Decision 5's SOCKS5 entry point and decision 6's addressless carried session stand as built, with one
+correction noted in decision 5: `vox up` takes a single room and builds an immutable per-room resolver
+(`vox-tui/src/cli.rs:332`, `node/actor.rs:2763`), which cannot resolve names that are now per-service and
+cross-room. Calling decision 5 unaffected was wrong.
+**Deciders**: Robert E. Lee <robert@agidreams.us>
+**Tags**: services, tunneling, ux, capability, consent, discovery, hidden-service
 ## Context
 
 ADR-013 makes the overlay carry arbitrary TCP between members, and ADR-016 M16.1 proved it end to end:
@@ -36,179 +83,319 @@ behind symmetric NATs, through the user's own anchor. The mechanism works.
 6. grant the guest the `dial:<tag>` capability once they have joined.
 
 A Tor hidden service takes two on the host side: add two lines to `torrc`, read the `.onion` address
-(decision 7 counts both sides carefully). The author's stated intent for Vox is to *replace* a Tor
+(decision 8 counts both sides carefully). The author's stated intent for Vox is to *replace* a Tor
 private service, so six steps against two is a product failure, not a rough edge. This ADR specifies
 the surface that closes the gap, and names the thing being offered so the rest of the documentation can
 stop calling it "a tunnel".
 
-Two facts shape the design:
+### Three ways to remove step six, and why the third is the right one
 
-- **The room is already the unit of access control.** Membership is emergent (join + consent, ADR-007);
-  capabilities live in the room's log. There is no separate identity system to bolt a service onto, and
-  there must not be one (see Non-goals).
-- **Tor's address *is* its authorization.** Knowing a `.onion` is sufficient to connect; the service
-  decides what to do with you afterwards. Vox can be strictly better — the passphrase is a second
-  factor, and a host can revoke one guest without disturbing others — without being harder to use.
+Step six — the host waiting for a guest to appear and then granting them something — is the round trip
+Tor does not have. There are exactly three ways to be rid of it, and the history of this ADR is the
+history of choosing among them.
+
+1. **Make the address the authorization.** Tor's answer: knowing a `.onion` is sufficient to connect.
+   Rejected for Vox, because a leaked string would then be a leaked service with no second factor and
+   nothing to revoke.
+2. **Make membership the authorization.** This ADR's first answer (the withdrawn decision 3): the
+   genesis confers `dial:` on every admitted member, so joining *is* being granted. Withdrawn, because
+   admission is not a human decision — it is a passphrase and a proof of work, and a member who merely
+   syncs another peer's board admits its authors without any human approving anything. The step was not
+   removed, it was **delegated to an adversary**.
+3. **Notice that the human decision already happened.** The host already approves, per member, who may
+   read its messages (ADR-007 per-sender consent): joining a room grants nothing readable until each
+   existing member independently approves the joiner's key. That approval is a deliberate, human,
+   per-person act that the host performs anyway. **Binding services to it removes step six without
+   adding any mechanism at all** — there is no new credential, no new log entry kind for authorization,
+   and no new decision for a human to make. This is the decision taken.
+
+   It came with a trap, which review caught before any code: "the human decision already happened" is only
+   true of consent a human *made*. The first draft of this revision keyed on the whole consent set, and the
+   join path issues consent to the responder automatically — so the design would have inherited an
+   authorization that no human ever granted. Decision 3 therefore states the requirement as **explicit**
+   consent, in both directions, and M17.6 removes the automatic release.
+
+The decider stated the rule directly: *"When I am approving someone to read my messages in a room I am
+also approving them to use any service that I have granted to that room."* And its converse, which is
+the part that matters for security: *"if somebody joins the room and I don't know them and I haven't
+approved them, then by definition even if I've shared a service in that room, that new person should not
+know about that service."* Not merely be refused by it — **not know it exists.**
+
+Three facts shape the rest of the design:
+
+- **The host's consent set — not the room — is the unit of access control.** Membership is emergent
+  (join + consent, ADR-007), and the two halves are not equivalent: the join half is a secret and a
+  proof of work, the consent half is a person deciding. Only the second is a basis for authorization.
+  An earlier revision of this section asserted that "the room is already the unit of access control";
+  that is the error decision 3 was built on.
+- **Tor's address is its authorization; a `.vox` name is deliberately not.** Knowing a `.onion` is
+  sufficient to connect. A `.vox` service name is only ever learned from inside a sealed envelope that only
+  approved readers can open, and **holding it confers no reach**. It is not, however, *without consequence*
+  — an earlier draft said so and review refused it: publishing a name discloses that the service exists and
+  lets anyone who has seen it elsewhere correlate. "Not a bearer capability" is the claim; "harmless to
+  leak" is not.
+- **Tor already solved "the unauthorized must not learn the service exists", and its answer transfers.**
+  Client authorization in a v3 onion descriptor encrypts the introduction points to a set of client
+  keys, one `auth-client` wrapper each (`/opt/tor` `hs_descriptor.c:9-52`, `:712`, `:1425`). An
+  unauthorized client can fetch the descriptor and still learn nothing about how to reach the service.
+  Vox reaches the same end by a different means (decision 9): the descriptor is published as **content**,
+  sealed to the host's consented readers by machinery that already exists, because a dedicated entry kind
+  would itself announce that a descriptor is there (`governance/channel.rs:546`).
 
 ## Decision
 
-### 1. The name
+### 1. The name is a host-committed random label
 
-The capability is a **room-bound service**: a TCP service offered *inside a room*, reachable only by
-members of that room who hold its `dial:` capability. The artifact a host hands out is a **service
-invite** (a `vox://` link; the room passphrase travels separately, as always). What a person *types at
-a tool* is the room's **`.vox` hostname** (decision 4). "Tunnel" remains the name of the ADR-013
-*mechanism* — one QUIC stream splicing one TCP connection. A room-bound service is the thing a person
-offers; a tunnel is how a byte gets there.
+The capability is a **room-bound service**: a TCP service offered by a host *into a room*, reachable by
+exactly those members of that room whom the host has explicitly approved to read its messages. What a
+person types at a tool is the service's **`.vox` name**:
+
+```text
+<52-char-base32>.vox   where the 32 bytes are  H("vox service name v1" ‖ host_composite_pk ‖ nonce)
+```
+
+`nonce` is 32 random bytes minted when the service is first offered and kept in the profile directory
+beside it. It travels **inside the sealed descriptor** (decision 9) and nowhere else, so only the host's
+approved readers ever learn it — and therefore only they can recompute the name.
+
+**Why a commitment rather than a keypair.** The attack to close is impersonation: if a name were an
+unconstrained random label and any host could publish "I serve N", an approved reader who legitimately
+learned N could claim it under its own identity in another room, and a third party in both rooms would see
+two hosts for one name. Binding the host's own composite public key into the name closes that — a reader
+cannot substitute its own key and preserve N — and an unapproved member cannot guess the nonce. This is
+what two independent reviewers proposed in place of the keypair the first draft specified, and it is
+strictly better here for three reasons: there is no new private key to persist, back up or leak; the
+construction reuses the composite signer that already exists; and it stays **post-quantum**, where a raw
+ed25519 service identity in 32 bytes would have made the name's authentication classical in a system whose
+composite public key is 1,984 bytes (`hash.rs:42`).
+
+What the commitment gives up, recorded because it is a real loss: the name is bound to the host's identity,
+so it cannot move to a different host and cannot outlive that identity. A service that must be portable
+between machines would need the keypair form. No such requirement exists today.
+
+**The descriptor must bind more than the name.** A commitment stops a reader minting a *new* claim on N; it
+does not stop one **copying a genuine descriptor** into another room. So the signed descriptor body binds
+name, host identity, room, ports and version together, and the client authenticates the transport peer as
+that named host before carrying a byte — the check Tor makes explicitly when it verifies a descriptor's
+signing-key chain against the key derived from the requested address (`/opt/tor` `hs_client.c:2198`). The
+first draft left this validation contract implicit; it is decision 9's, and M17.12's gate.
+
+**Rejected: the channelID.** The previous revision named the service by its room (`<channelID>.vox`),
+justified on the grounds that `(channel, port)` is what `TunnelRequest` already carries. That coupling is
+what left a service added to a chat room **unnameable** — `node::resolver` resolves a name to the room's
+*genesis creator*, which is only the host for a room `vox serve` created, so it deliberately refuses to name
+any other room (`node/resolver.rs:27-30`). The good name and the sound authorization ended up in different
+commands. A per-service name decouples them: every service gets a name, in any room, under one model.
+
+**Rejected: deriving the name from room + host key + port**, with no nonce. Reproducible and needing no
+stored state — but then anyone holding the room computes the name by guessing the port, which discards the
+property that a name is only ever learned from someone who was told it. The nonce is what makes the
+commitment unguessable; without it the construction is a name, not a secret one.
+
+**No checksum.** Tor spends two bytes on one because a mistyped address is looked up remotely. Here a typo
+decodes to 32 different bytes, which match no descriptor this client holds, so it fails locally and at once
+and cannot be misdirected.
+
+"Tunnel" remains the name of the ADR-013 *mechanism* — one QUIC stream splicing one TCP connection. A
+room-bound service is the thing a person offers; a tunnel is how a byte gets there.
 
 ### 2. Nothing is ever exposed implicitly
 
 Every service is **explicitly declared** before it can be reached, and declaration is separate from
-authorization. This is already the behaviour (`vox service add`, then `vox grant`) and it is hereby a
-decision, not an accident: the overlay carries arbitrary TCP, so a node that exposed a local port as a
-side effect of any other action would be a foot-gun of the first order. A local port becomes reachable
-only when a human names it, and only to identities a human (or rule 3) authorized.
+authorization. A local port becomes reachable only when a human names it, and only to identities that human
+has explicitly approved. The overlay carries arbitrary TCP, so a node that exposed a local port as a side
+effect of any other action would be a foot-gun of the first order.
 
-### 3. A room may *be* an access list — capability-bearing rooms
+The previous revision carried the clause "and only to identities a human *(or rule 3)* authorized". That
+parenthesis is withdrawn: there is no longer any path by which a service becomes reachable without a human
+having approved the specific identity reaching it. Review established that the first draft of this revision
+still had one — joining a room issued consent to the responder with no human act at all — which is why
+decision 3 now states the requirement in both directions rather than assuming it.
 
-The six-step flow's worst step is the sixth: the host must wait for the guest to appear and then grant
-them something. That round trip is what Tor does not have.
+### 3. Consent is the authorization, and consent is always explicit
 
-A room's genesis may therefore carry a **service grant**: a set of capabilities conferred on *every*
-identity admitted to that room, **with no certificate issued to anyone**.
+**A service bound to a room is reachable by exactly the members of that room whose keys its host has
+explicitly approved for reading, and by nobody else.** One decision, made once per person, covering
+messages and services together.
 
-An earlier draft of this ADR had the responder issue an ordinary admin certificate at admission. That is
-wrong and is not what was built: the responder to a join is whichever member answered it, who in general
-holds no `delegate` and therefore cannot issue anything — so the flow would work for the room's creator and
-silently fail for every guest who admitted the next guest. Instead the grant is evaluated directly: the
-ADR-007 evaluator reads it from the genesis and confers it on the identities this node has admitted as
-authors. One engine, no new credential, and it converges from the genesis alone — an anchor that is not a
-member reaches the same conclusion with no governance history fetched.
+#### Consent is per pair, per direction, and never automatic
 
-**It is revocable per member, and that part is not optional.** Because no certificate exists, ADR-007's
-admin-delegation-revocation has nothing to name — it points at a delegation's entry hash. So ADR-007 gains
-a `service-grant-exclusion` (`0x0013`) naming the *identity*. Without it, adding a genesis grant would
-*remove* the per-member control the channel already had, since an explicit `vox grant` can always be
-revoked; a capability-bearing room must not be a one-way door. An exclusion suppresses only the
-genesis-conferred capabilities — a certificate issued to the same identity is governed by its own
-revocation, so an admin who excludes a member and then deliberately certifies them again has done exactly
-that.
+The decider's model, stated directly: *"Imagine there is already a room and there are four people in it and
+they've all trusted each other. A new node joins. They will need to approve who they want to share with of
+the people that are already in the room. Once they do that, when this new node writes something to the room
+then the people that they approved should be able to read messages from the new node. However, of the people
+already in the room, anything that they write will not be readable by the new node until the new node has
+been approved by the existing node."*
 
-The authorization basis is exactly the basis on which the joiner became a member at all: they held the
-room passphrase and paid the ADR-005 proof of work. The room's purpose *is* the service, so "may this
-member dial it" and "is this person a member" are the same question, asked once.
+So there are two independent decisions per pair, each made by the party giving something away:
 
-This yields two shapes, and both are wanted:
-
-| Shape | How it is made | Who may dial |
+| Decision | Who makes it | What it grants |
 |---|---|---|
-| **Service room** | `vox serve` — purpose-built for one service | every member, by the genesis |
-| **Service in an existing room** | `vox service add` in a chat room, then `vox grant` | only members granted individually |
+| "X may read **my** messages" | me | X can read my entries — **and reach the services I bound to this room** |
+| "I may read **X's** messages" | X | nothing of mine; it is X's grant to make |
 
-The genesis is the right home for the rule: it is immutable, self-validating (its hash is the
-channelID), and every node that holds the room — including an anchor that is not a member — converges
-on it from the genesis alone, with no governance history to fetch first.
+Neither is implied by joining, by holding the passphrase, by paying the proof of work, or by being admitted
+as an author on any peer's board. **A joiner who approves nobody is readable by nobody**, which is correct
+rather than a defect: the joiner chooses, per person, and may well choose everyone.
 
-Two limits keep it from being a foot-gun. **Only `dial:`/`bind:` may be conferred** (at most 16),
-validated at creation and on decode: a genesis granting `admin`, `delegate`, `policy`,
-`passphrase-rotate` or a `#role` to every member would make membership permanently equal to control of a
-room nothing could govern back. And **"member" is the node's own admitted-author set** — membership is
-emergent with no roster (ADR-007), so it is local state, which is sound because the decision it feeds is
-local too: a host serving its own service consults the keys it verified itself and refuses anyone it has
-not.
+**This required removing an automatic consent that shipped in v0.1.0.** `join` called
+`release_key_to(&channel_id, responder)` unconditionally (`node/actor.rs:1764`), which calls `issue_consent`
+— the same mechanism as explicit approval (`:1835`) — and the responder is *"the pinned responder, else any
+member the board has an address record for"* (`:1603`). A host that joined through a member therefore
+consented to that member with no human act, so under this decision's gate that member would have reached
+every service the host later bound. The code's stated reason for the release was that *"the ADR-004
+responder has no sending chain until it receives the initiator's first message, so until the joiner speaks
+no member can answer at all"* — which is satisfied by the pairwise session, not by the sender key:
+`ensure_session` builds the session from the board bundle record alone
+(`Session::initiate(ring.identity_dh(), &record.prekey_bundle, …)`, `node/actor.rs:2509`) and the SKDM rides
+*over* it. Removing the release therefore costs nothing functionally. M17.6.
 
-### 4. Two commands, and a `.vox` hostname
+#### The rest of the rule
 
-**Host.** One command creates the room, offers the service, sets the service grant, and mints the
-invite:
+- The gate is the host's **explicitly granted** ADR-007 consent set **within the bound room**. Not the
+  room's author set, not its member count, nothing derived from the passphrase or the proof of work, and
+  not consent issued by the join path.
+- Approving a reader takes effect **immediately** and needs no second act. A host with five approved
+  readers who then binds a service has, in that moment, given all five reach.
+- Withdrawing approval takes effect immediately and tears down live connections (decision 10).
+- **A service bound to two rooms** is reachable by the union of the host's approved readers in each. The
+  name is stable across them; one descriptor is published per (service, room), each sealed to that room's
+  approved readers. Scoping stays **per room** at the dial gate — `tunnel::session` already names a channel
+  and scopes endpoint lookup to it before authorizing (`tunnel/session.rs:245`), and that property must be
+  preserved: a global host-wide reader union would break it.
+- **The consent UI must say what it grants.** Approving a reader confers reach to every service that host
+  has bound to that room, so the prompt says so. It is the one decision this entire design reuses, and a
+  person making it must know its second effect. M17.7.
+
+#### What this withdraws
+
+| Withdrawn | Was | Why it goes |
+|---|---|---|
+| **Genesis service grant** (`GenesisBody::service_grant`) | capabilities conferred on every admitted member, no certificate issued | admission is a secret + a proof of work, not a human decision; this made every syncing peer's author set into an access list |
+| **`service-grant-exclusion` (`0x0013`)** | per-member revocation of the above | it exists only to revoke a grant that will not exist. The wire tag is retired and not reused |
+| **`vox grant <room> <member> <tag>`** | an explicit per-member, per-service capability on the log | redundant under consent, and a second authorization surface that can drift out of step with the first |
+| **The `bind:` capability class** and `add_service`'s `can_bind` check (`governance/channel.rs:1232`) | authority to *offer* a service, from the genesis grant or `vox grant --may-bind` | **binding a port of one's own machine is not the room's business.** Reach is what the room governs. Keeping `bind:` after withdrawing both its sources would have left `vox serve` working only for a room's creator — which review found, and which was an accident rather than a decision |
+| **`vox serve` creating a room** | one command created a room, set the grant and minted an invite | a service now binds to a room that already exists |
+| **`Evaluator::build_with_members(authors.keys())`** | the genesis grant evaluated over every admitted author (`governance/channel.rs:935`) | this is finding #1's proximate cause |
+| **Automatic consent on join** (`release_key_to(responder)`) | the joiner's sender key released to whoever answered the join | it is a reach grant issued with no human act, and the choice of recipient is influenceable |
+
+#### What the decider gives up, stated plainly
+
+Reach can no longer be narrowed below "my explicitly approved readers in this room", and three capabilities
+of `vox grant` go with it: **time-bounded** access (`--days`), **reach without read**, and authority over
+who may *host*. Reach to a non-member was **not** among them — `vox grant` already required an admitted
+author (`node/actor.rs:2735`), and the first draft of this revision overstated that loss.
+
+Further, **only the host can cut a reader's reach.** With the genesis grant and `bind:` gone, a room admin
+has no lever over another member's services; the room's only blunt instrument is a passphrase rotation
+(decision 11). This is intended — a service belongs to the machine offering it — and is stated rather than
+left to be discovered.
+
+An infosec reviewer will ask whether a host can share `:22` with two of its five approved readers. The
+answer is *no, use a second room*, and that is a design position rather than an omission.
+
+#### What it does not change
+
+Vouching remains a bug in its own right, independently of services: there is no capability by which one
+member adds another, and `learn_members` / `admit_author` must stop creating members from a peer's board
+record on a self-signed record alone (M17.6). Review confirmed that an ordinary vouching peer **cannot**
+insert itself into an existing host's consent set — consent verification binds the author fingerprint to the
+signing key and resolution touches only that author's edges (`governance/consent.rs:184`,
+`governance/evaluator.rs:754`) — so consent-bound services make vouching non-escalating. They do not make it
+acceptable.
+
+Nor is it a bypass that different nodes hold different views of a consent set. The serving host enforces its
+own current state; a client's stale belief grants nothing.
+
+### 4. Two commands, and the service name
+
+**Host.** The room already exists — a chat room, an agent room, any room the host is in. One command binds a
+local port into it:
 
 ```
-$ vox serve 22
-room       f6wxkoxq36ofp5zxvmtlx6mg6gr2t2tfcr66aq3l5w5cctqmxg3q
-address    vox://f6wxkoxq36ofp5zxvmtlx6mg6gr2t2tfcr66aq3l5w5cctqmxg3q?a=…&b=…
-passphrase trombone-harbour-ninety-cinder
-           ^ send this by a different channel than the address
+$ vox serve a3f9c2 22
+name   h4xm2qp7vk3nw8rtzc5jf9gd6bslyu2ae4mhq7pxv3nk8dwrt5cq.vox
+room   a3f9c2… (design-review)
 
-serving 127.0.0.1:22. anyone who joins with both may reach it. ^C to stop.
+serving 127.0.0.1:22 — reachable by the 3 members you have approved:
+  bob      k7m2q…x4
+  carol    p9wnf…a1
+  dave     z3hty…8c
+not reachable by 2 members you have not approved:
+  erin     m4ksd…7j
+  frank    q8xpl…2v   (they will not learn this service exists)
+^C to stop.
 ```
 
-**Guest.** One command joins and receives the capability; from then on the service is reached by its
-name, at its own port, by any ordinary tool:
+**Audiences are named, not counted.** The host sees *who*, on both sides. A count tells a person a number
+when the thing they need to know is a list — and the whole model rests on the host understanding exactly
+whom it has approved. Review flagged the first draft's `3 of 5 members` as insufficient and it is.
+
+The host hands the guest nothing: an approved reader's client already holds the descriptor and lists the
+service by name. There is no invite to mint and no passphrase to generate, because the guest is already a
+member.
+
+**Guest.** Nothing to join. The service is reached by its name, at its port, by any ordinary tool:
 
 ```
-$ vox connect vox://f6wxkoxq36ofp5zxvmtlx6mg6gr2t2tfcr66aq3l5w5cctqmxg3q
-passphrase: ************
-joined. reachable as f6wxkoxq36ofp5zxvmtlx6mg6gr2t2tfcr66aq3l5w5cctqmxg3q.vox
+$ vox service list a3f9c2
+h4xm2qp7vk3nw8rtzc5jf9gd6bslyu2ae4mhq7pxv3nk8dwrt5cq.vox  :22   alice
 
-$ ssh user@f6wxkoxq36ofp5zxvmtlx6mg6gr2t2tfcr66aq3l5w5cctqmxg3q.vox
+$ ssh user@h4xm2qp7vk3nw8rtzc5jf9gd6bslyu2ae4mhq7pxv3nk8dwrt5cq.vox
 ```
 
-`vox up` (decision 5) is what makes the third line work, together with one `ProxyCommand` line in
+`vox up` (decision 5) is what makes the last line work, together with one `ProxyCommand` line in
 `~/.ssh/config` that `vox up` prints — written once for every room there will ever be.
 
-#### The port names the service
+#### The port names the service within the name
 
-There is no tag for a person to invent, share or remember. `vox serve 22` offers the serving machine's
-own `127.0.0.1:22`, and the connecting machine reaches it on **port 22 of the `.vox` name** — the port the
-tool would have used anyway. The two are the same number by default and need not be: the port in a `.vox`
-address is a Vox-layer identifier that the serving machine translates to whatever local endpoint it
-chose, so it collides with nothing (decision 5). ADR-013's `TunnelRequest` already
-carries a free-form `service_tag: String`, so the tag of a port-named service is simply its port in
-decimal; this is a UX decision with **no wire change**. `vox serve 22 --at 10.0.0.5:2222` covers the
-case where the local endpoint is not `127.0.0.1:<same port>`, and `vox service add <tag> <endpoint>`
-remains for the service-in-an-existing-room shape, where a name is more useful than a number.
+There is no tag for a person to invent, share or remember. `vox serve <room> 22` offers the serving
+machine's own `127.0.0.1:22`, and the connecting machine reaches it on **port 22 of the `.vox` name** — the
+port the tool would have used anyway. `vox serve <room> 22 --at 10.0.0.5:2222` covers the case where the
+local endpoint differs.
 
-Declaring the room and declaring the service are **one command and one act**: a room whose genesis grants
-`dial:22` while nothing is offered on 22 hands out an address for nothing, so if the service cannot be
-offered the room is not kept.
+**One name, many ports.** Tor's shape (`HiddenServicePort`, several lines under one service key), for the
+same reason: the name identifies the service, the port selects an endpoint inside it. `vox serve <room> 22`
+followed by `vox serve <room> 8080` **reuses the same nonce** and so the same name, adding a port to one
+descriptor. Everything under one name therefore shares one consent set, which is the intended semantics
+since the consent set is the host's approved readers either way.
 
-#### The hostname is the channelID
+**Nonce lifecycle, because "one name, many ports" depends on it.** A nonce is minted on the *first* `vox
+serve` for a given (host, room) and reused for every later `vox serve` into that room. `vox service remove`
+of the last port retires the nonce, and the next `vox serve` mints a new one — so a withdrawn service's name
+does not silently come back to life pointing at something else. A host serving into two rooms has two
+nonces and therefore two names, which keeps the per-room scoping of decision 3 visible in the address.
 
-```text
-<52-char-base32-of-channelID>.vox
-```
+#### Two hosts, one port, is not a collision
 
-The channelID is the genesis hash (ADR-008), and `b32_encode` — lowercase unpadded RFC 4648, already
-the CLI's rendering of every fingerprint (`node::link`) — makes it 52 characters. That is *the same 52
-characters that already begin the invite link*, so the guest's client derives the hostname from the link
-it just pasted, with no additional field anywhere. With `.vox` the whole name is 56 characters, inside
-DNS's 63-octet label limit and shorter than a Tor v3 `.onion` (56 + `.onion`).
+Distinct hosts have distinct names, because the name commits to the host's key. But **`TunnelRequest`
+carries `(channel, service_tag)` and not the name** (`tunnel/session.rs`), so the requested name must stay
+bound to the tuple it is resolved into: the resolver records `name → (channel, host, port)` from the
+descriptor it opened, the dial pins that host's identity in the ADR-011 handshake, and the tunnel request
+carries the port as its tag. Nothing on the wire changes; the binding is the client's and is checked before
+a byte moves. M17.12's gate covers rebinding and two hosts serving `:22` in one room.
 
-Chosen over the host's identity fingerprint because `(channel, port)` is precisely what the tunnel
-request already carries, so a host serving port 22 in two different rooms is unambiguous — where
-`(host, port)` would not be.
-
-**The name is self-certifying, and there is no registry.** Resolution never leaves the machine:
-
-1. the 52 characters decode to the 32-byte channelID — nothing is looked up to learn it;
-2. the client holds that room, so it reads the host's identity from the room's own signed log;
-3. the dial pins that identity in the ADR-011 handshake.
-
-So the name commits to the room by hash, the room commits to the host by signature, and the handshake
-commits to the key. There is no DNS query, no directory, no trust-on-first-use, and no global namespace
-in which two people could contend for a name (see Non-goals). A name the client has not joined does not
-resolve *at all* — resolution is private to the joiner, which is strictly more than Tor offers, where
-any `.onion` is resolvable by anyone.
-
-**No checksum.** Tor v3 spends two bytes on one because a typo in an address that is looked up must be
-caught early. Here a typo decodes to a different 256-bit channelID, which names a room the client has
-not joined, so it fails locally and immediately with "not joined" — it cannot be misdirected. Spending
-characters to detect what already fails safely is not worth the length.
+**Naming a service is not creating a room.** `vox serve` no longer mints rooms, passphrases or invites. A
+room whose only purpose is one service is made explicitly (`vox room new`, then `vox serve`), so the
+combined form's foot-gun — an address plus a passphrase being sufficient for reach — has nothing to stand
+on.
 
 Rules the surface must honour:
 
-- **The passphrase is never in the address.** ADR-005's separation is load-bearing (ADR-016 M14): a
-  leaked address is a leaked rendezvous, not a leaked room. `vox serve` prints the two on separate
-  lines and says plainly that they must travel separately. A single combined blob is **not** offered,
-  because a convenience that halves the security of the primary use case is not a convenience.
-- **The passphrase is generated, not chosen.** A service room's passphrase is machine-generated with
-  enough entropy to stand alone against the ADR-005 online-guessing bound; a human-chosen one is the
-  weak link in an otherwise strong chain, and nobody needs to remember this one.
-- **`vox connect` prompts for the passphrase unechoed**, or reads it from a pipe. Never a flag.
+- **`vox serve` names its audience and its non-audience**, as above.
 - **`vox serve` refuses to start rather than appear to work.** If the host cannot be reached and has no
-  anchor configured, it says so and says what to do, instead of minting an address nobody can use.
-
+  anchor configured, it says so and says what to do, instead of naming a service nobody can reach.
+- **The nonce is persisted** in the profile directory, so the name survives a restart. Losing it loses the
+  name; there is no recovery path, because any recovery path implies a derivable — and therefore guessable
+  — name.
 ### 5. One local entry point: a SOCKS5 proxy (`vox up`)
+
+> **Correction, 2026-09-21 (review).** The proxy and its datapath stand as built, but `vox up` takes a
+> single room and builds an immutable resolver from that room's genesis (`vox-tui/src/cli.rs:332`,
+> `node/actor.rs:2763`). Names are now per-service and cross-room, and this decision promises one
+> `ProxyCommand` "written once for every room there will ever be" — which a per-room proxy cannot honour.
+> `vox up` must take **no room argument** and its resolver must span every descriptor this client can open
+> (M17.3). An earlier draft of this revision called decision 5 unaffected; that was wrong.
 
 > **`vox up` runs a SOCKS5 proxy on `127.0.0.1:1080`.** It resolves `.vox` names itself — the client
 > sends the name, not an address (`socks5h`) — and carries the connection to the room's host as a tunnel,
@@ -276,20 +463,21 @@ anywhere pairs a real address with the service's port.**
 
 **Vox knows exactly who is calling — the service is simply not told by an address.** Identity at the Vox
 layer is at *key* level and is per room: `tunnel::session::accept` holds the client's composite
-fingerprint, pinned by the ADR-011 handshake, together with the channelID it claimed, and checks
-`dial:<port>` against that room's evaluator **before any local connect** (ADR-013). That is strictly
-better evidence than an address — unspoofable, not shared by a NAT, and revocable per member.
+fingerprint, pinned by the ADR-011 handshake, together with the channelID it claimed, and checks it
+against the host's approved-reader set for that room (decision 3) **before any local connect**
+(ADR-013). That is strictly better evidence than an address — unspoofable, not shared by a NAT, and
+withdrawable per member.
 
 What does not reach the carried service is that identity, because every Vox client arrives at it from
 `127.0.0.1`. Two consequences follow, and both are recorded rather than discovered later:
 
 - **IP-based controls on the service are inert** for Vox clients (`sshd` host patterns, `hosts.allow`,
   `fail2ban`, anything reading a peer address). They are also redundant: an address was always a weak
-  stand-in for identity, and the room's `dial:` capability plus ADR-007 per-member revocation is the
-  strong form of the same control.
+  stand-in for identity, and the host's ADR-007 per-sender consent set — which it maintains anyway and
+  can withdraw at any moment (decision 10) — is the strong form of the same control.
 - **Attribution is Vox's job, not the service's logs.** The node holds `(room, client fingerprint)` at the
-  gate, so it can say who reached what; surfacing that — as an event and in the client — is part of M17.2,
-  because a capability that cannot be audited is half a capability. Nothing is prepended to the byte
+  gate, so it can say who reached what; surfacing that — as an event and in the client — is part of M17.7,
+  because an authorization that cannot be audited is half an authorization. Nothing is prepended to the byte
   stream and no credential is minted for the carried protocol: this ADR's Non-goals forbid both, and the
   reason stands — a second auth scheme per service is overhead for a weaker outcome.
 
@@ -308,12 +496,18 @@ is where padding belongs if it is ever wanted.
 
 ### 7. The anchor is configuration, not an argument
 
+> **Not built (review, 2026-09-21).** `vox node` *prints* an `--anchor` spec for the operator to paste
+> (`vox-tui/src/app.rs:293`) and every command still requires the flag (`vox-tui/src/cli.rs:49`).
+> `<config_dir>/anchors` does not exist. An earlier draft of this revision listed this decision as shipped
+> in v0.1.0; it is M17.4 and outstanding.
+
 `--anchor <fp>@<addr>` on every command is the second-worst step. Anchors become **configuration**:
 
 - `vox node` writes its own anchor spec to `<config_dir>/anchors` when it starts, so a client on the
   same machine needs no flag at all;
 - a remote anchor is one line in that file, written once;
 - `--anchor` remains, for overriding and for scripts.
+
 
 ### 8. How many steps this actually is
 
@@ -322,204 +516,376 @@ Stated honestly, side by side with the thing being replaced, and counting the gu
 
 | | Tor private service | Vox room-bound service |
 |---|---|---|
-| **host, once** | two `torrc` lines, restart, read the `.onion` | `vox serve 22`, read the address and the passphrase |
-| **host, per guest** | — | — (the service grant is in the genesis, decision 3) |
+| **host, once** | two `torrc` lines, restart, read the `.onion` | `vox serve <room> 22`, read the name |
+| **host, per guest** | — | — (the host already approved them to read; decision 3) |
 | **guest, once per machine** | `ProxyCommand` for `*.onion`, or `torsocks` | `vox up`, plus a `ProxyCommand` for `*.vox` that `vox up` prints |
-| **guest, once per room** | — | `vox connect <address>` + passphrase |
+| **guest, once per room** | — | already a member — nothing for the service; but see below |
 | **guest, per use** | `torsocks ssh user@<id>.onion` | `ssh user@<id>.vox` |
 
-The per-use line and the one-time setup are **identical in kind and in effort** to Tor's, because they are
-the same mechanism for the same reason (decision 5). Vox's guest does two things Tor's does not: **join the room** and
-**hold a passphrase**. Neither is overhead to be apologised for — they are the second factor and the
-revocability that Tor has no equivalent of (decision 3's trade, and `Consequences`).
+The per-use line and the one-time setup are **identical in kind and in effort** to Tor's, because they
+are the same mechanism for the same reason (decision 5). The guest's "once per room" line is now empty,
+where the previous revision had `vox connect` plus a passphrase: binding a service to a room the guest is
+already in removes the join from the service flow entirely. What Vox's guest has that Tor's does not is
+that the host approved them individually — and that is the second factor and the revocability Tor has no
+equivalent of, obtained at zero additional steps because the host made that decision already.
+
+One honest addition, from decision 3's requirement that every direction be explicit: a guest who has only
+just joined the room has an act of its own to perform — approving which members may read *it*. That is not
+part of the service flow and grants the guest nothing, but it is work that the withdrawn model did
+automatically, and a step count that omitted it would be the same kind of dishonesty this section exists to
+avoid.
+
+For the case where host and guest share no room, there is no service flow: they make a room first. That
+is one more step than Tor and it is where Tor's model is genuinely cheaper. The trade is decision 3's.
 
 The host side varies with reachability, because the ADR-012 ladder is not uniform:
 
 | The host is | Extra host step | Why |
 |---|---|---|
-| publicly reachable, or behind a router that granted a port map (UPnP/PCP/NAT-PMP, ADR-012 rungs 1–2) | none | the invite carries the host's own address; no anchor involved |
-| behind a NAT that granted nothing | one anchor line in the config file, once | a relay must exist somewhere and be named |
+| publicly reachable, or behind a router that granted a port map (UPnP/PCP/NAT-PMP, ADR-012 rungs 1–2) | none | peers reach the host's own address; no anchor involved |
+| behind a cone NAT | none | rung 3 hole-punches, proved against real NAT behaviour (ADR-016 M14.9) |
+| behind a symmetric NAT at **both** ends | one anchor line in the config file, once | rung 4 relays, and a relay must exist somewhere and be named |
 
-The common home-router case is therefore at parity with Tor on both sides. When a relay is genuinely
-required there is one extra step, and Tor has thousands of volunteer relays to draw on where Vox
-deliberately has none but yours (ADR-012: no Vox-operated infrastructure).
+The common home-router case is therefore at parity with Tor on both sides. Only symmetric-NAT-on-both-ends
+makes the anchor load-bearing for carried traffic, and Tor has thousands of volunteer relays to draw on
+where Vox deliberately has none but yours (ADR-012: no Vox-operated infrastructure).
 
-### 9. Discovery: advertisements encrypted to the audience
+### 9. The descriptor is content, sealed to the host's approved readers
 
-A member who holds `dial:<tag>` should not have to be *told the tag* out of band. A host may therefore
-publish a **service advertisement** to the room: a signed entry naming its service tags, sealed so that
-only the members holding the matching `dial:` capability can open it (ADR-013's audience-encrypted
-advertisement, struct tag `0x000F`).
+A host publishes a **service descriptor** to the room: an entry carrying the service's nonce (and so its
+name), its ports and how to reach it, readable by **exactly the host's explicitly approved readers in that
+room**.
 
-The rejected alternative was a room-wide plaintext announcement. It was rejected because it tells
-members who *cannot* reach a service that the service exists — which is a standing inventory of what
-each member runs, published to everyone, for no benefit to anyone who can use it. An advertisement
-readable exactly by those who could already connect leaks nothing they did not already have.
+It is published as **ordinary content**, not as a governance frame. This is the change review forced, and
+the reason is concrete: framed payload kinds are publicly classifiable to every holder of the log
+(`governance/channel.rs:546`), so a dedicated descriptor kind announces *"a service descriptor is here"* even
+with its body sealed — and an opaque payload is rejected by the classifier rather than carried. A governance
+frame therefore cannot satisfy the rule that an unapproved member must not learn a service exists. Content
+can: it is already sealed to the author's consented readers, so an unapproved member sees an ordinary entry
+it cannot read and **cannot tell a service descriptor from a chat message**.
 
-Consequences of choosing the encrypted form: a host that adds a member to the audience later must
-re-publish, and the audience size is visible even when its contents are not. Both are acceptable; the
-second is inherent to any per-recipient sealing (as ADR-006's SKDM already is).
+Publishing as content also settles three things the first draft got wrong or left open:
 
-Discovery is **convenience, never authorization**. Seeing an advertisement never grants reach; the
-`dial:` check in `tunnel::session::accept` remains the only gate.
+- **The sealing is existing machinery after all.** The first draft claimed the per-reader wrapper "is the
+  SKDM distribution that already happens"; review correctly refused that, because ADR-006's sealing is
+  live-session based and a log-published, open-later `auth-client`-style wrapper would have been new crypto.
+  As content the point is moot — the descriptor rides the author's sender key, which is precisely the
+  mechanism consent already governs. No new crypto.
+- **The audience follows consent automatically**, including later approvals, because that is what content
+  already does.
+- **Freshness follows the same path as every other entry**, so a revoked reader cannot open what is
+  published after its revocation.
 
+#### What is still Tor's design, and what is not
+
+| Tor | Vox |
+|---|---|
+| HSDir hash ring — third parties holding a blob they cannot read | the room's log. **Not members-only:** an anchor holds room logs with no membership, passphrase or sender keys (`node/anchor.rs`), so the first draft's "only members sync" was false |
+| superencrypted layer, keyed off the blinded pubkey | **not reproduced.** The name lives *inside* the sealed body, so there is no party who holds the descriptor and knows the name without approval — except a revoked reader, who kept both |
+| inner encrypted layer holding the introduction points | the content entry's body: nonce, ports, host identity, room, version |
+| one `auth-client` wrapper per authorized client (`hs_descriptor.c:712`) | the author's sender key, which only consented readers hold |
+| `descriptor-lifetime 180` (`hs_descriptor.c:14`) | not reproduced — Tor's descriptors live on strangers' disks with no revocation channel, and Vox has one |
+
+**One layer, and the honest reason.** The first draft justified it with "there is no party who holds the
+descriptor, lacks approval, and knows the name", and review demolished that: every revoked reader is such a
+party, and a non-member anchor operator becomes one the moment a name is published anywhere. The correct
+justification is different and does hold — **the enforcement is the dial-time consent check, and the name
+being inside the seal is a second-order privacy benefit rather than a layer of access control.** Two layers
+would add nothing, because a party excluded by the sealing is already excluded whether or not it knows the
+name.
+
+**What is still visible.** Recorded rather than glossed:
+
+- **The audience size**, inherent to per-recipient sealing as ADR-006's SKDM already is. Tor pads its
+  `auth-client` entries with fakes for this reason (`hs_service.c:1889`); Vox does not pad today, and
+  whether to is left open as an ADR-006-level question rather than decided here, because it affects every
+  entry and not only descriptors.
+- **That the host published something**, and its size. Content entries are already like this.
+- **Correlation across rooms.** A name is stable for a (host, room), so an approved reader in one room that
+  recognises a name published elsewhere can correlate. And an approved party who publishes a name discloses
+  the service's existence — no encryption scheme survives that. See the correction to decision 1's
+  "without consequence" claim in Consequences.
+
+#### Publication triggers
+
+`chain_id` alone is **not** a sufficient version, which review established. The descriptor carries a
+monotonic `version` per (service, room) and is republished on **every** change to what it says or who may
+read it:
+
+| Trigger | Why `chain_id` misses it |
+|---|---|
+| consent **revoked** | `chain_id` advances (`governance/channel.rs:1508`; `SenderChain::rotated`, `group/state.rs:269`) — this one it catches |
+| consent **granted** | `issue_consent` records the *current* generation and does not rotate (`governance/channel.rs:1311`), so a newly approved reader would never see the standing descriptor. **This would have broken decision 3's "immediately"** |
+| a port added or removed | no consent change at all |
+| the local endpoint replaced (`--at`) | ditto |
+| the service withdrawn | ditto — and a retraction must be published, not merely omitted |
+| scheduled sender rotation | advances `chain_id` with no audience change (`node/actor.rs:2887`), and fires on send, so a quiet host would not republish |
+
+So: **republish on any of these, ordered by `version`, and a client accepts only the highest version it can
+open.** `chain_id` remains the revocation signal — ADR-007 specifies that revoking outbound consent advances
+*"`A`'s own `chain_id`* … **not** the channel `epoch`"*, which review verified against the code — but it is
+not the descriptor's version counter.
+
+*Recorded because the decision was taken on a wrong premise and corrected before any code:* the decider
+chose "tie it to the room epoch" from options that asserted revocation triggers an epoch bump. It does not.
+A channel epoch advances only on a passphrase rotation (decision 11), a far rarer and heavier event, and
+hanging descriptor freshness on it would leave a revoked reader's descriptor valid until someone rotated the
+room's passphrase. Decision 10's third point said "on the epoch bump" and was wrong for the same reason; it
+is corrected there.
+
+**Finding #5 is downgraded to unverified.** The first draft treated "a new epoch clears every exclusion" as
+established and made it a blocking prerequisite. Review showed the ADR comment cited was not proof and that
+exclusion resolution accumulates qualifying historical exclusions without filtering on the head epoch
+(`governance/evaluator.rs:519`, `:797`). Since `0x0013` is withdrawn entirely, the question is moot for
+services; it remains an open question about the evaluator and is M17.8, which now blocks nothing.
+
+The rejected alternative remains rejected, with a second reason: a room-wide plaintext announcement tells
+members who cannot reach a service that it exists, and under decision 1 it would leak the *name*, which is
+the one string the unapproved must not have.
+
+Discovery is **convenience, never authorization**. Holding a descriptor never grants reach; the consent check
+in `tunnel::session::accept` remains the only gate.
+
+### 10. Withdrawing approval is immediate, and says so
+
+Un-approving a reader:
+
+1. **tears down that reader's live connections at once** — an `ssh` session dies mid-keystroke;
+2. **tells the other end why**: the client reports *access withdrawn by \<host\>*, rather than closing as
+   though the network had dropped;
+3. republishes the descriptor at a new `version`, without that reader (decision 9's triggers — **not** "on
+   the epoch bump", which the first draft said here and which contradicted decision 9's own correction);
+4. refuses every subsequent dial at the consent check, independently of 3 — a reader who cached a descriptor
+   it could once open must not be reachable on the strength of that cache;
+5. **fails pending requests**, which is the part the first draft missed.
+
+Point 5 is a real hole review found. The actor captures its authorization snapshot **before reading the
+tunnel request** (`node/actor.rs:1315`), so an approved attacker can open a tunnel stream, withhold its
+request, wait for revocation, and then complete it against the stale snapshot. Closing already-spliced
+connections does not help. Revocation must therefore cover (a) streams open but not yet carrying a request,
+and (b) the interval between the permission check and the local connect. M17.11's gate exercises exactly
+that sequence.
+
+Points 1, 4 and 5 are the enforcement; 3 is hygiene. Point 2 is a deliberate choice to hand the revoked
+party a clear signal rather than an ambiguous failure: a silent close indistinguishable from a network drop
+was considered and rejected by the decider. It leaks the fact of revocation to someone who can infer it
+anyway, and an ambiguous failure invites the revoked party to keep retrying, which is worse for both sides.
+
+A host that withdraws approval and later restores it has restored service reach as well, in the same act.
+There is no separate service state to remember, because there is no separate service authorization.
+
+### 11. Lifecycle: departure, rotation, and the rooms that already exist
+
+Review found this section missing entirely. Each item below is a rule the implementation needs and did not
+have.
+
+**A host that leaves, or is removed.** ADR-007 has no single-member eviction; the room's blunt instrument is
+a passphrase rotation and rejoin. So while a host is a member its services are its own to offer, and when it
+is no longer one:
+
+- its descriptors stop being acceptable at the epoch its membership ended, which means **the descriptor
+  carries the epoch it was published under** and a client refuses one from an epoch it no longer recognises;
+- its bindings are local state and simply stop mattering, because nobody can open its descriptors;
+- existing streams are torn down on the same path as decision 10, since the host's own consent set is gone.
+
+**Leaving one room does not disturb a service bound to another.** Bindings are per (service, room); the
+nonce, and therefore the name, is per (host, room) by decision 4.
+
+**A passphrase rotation is a total wipe at the channel layer** (`governance/channel.rs:2025`): every
+certificate and every exclusion goes, and consent must be re-issued. For services that means, explicitly:
+every audience empties, every descriptor becomes unopenable, and **every host must re-approve its readers and
+republish**. No service survives a rotation silently, and none is silently re-granted either — which is the
+property the withdrawn `0x0013` failed to have. `vox serve` reports this when it detects a rotation it has
+not republished for.
+
+**Rooms that already exist cannot simply lose a genesis field.** `GenesisBody::service_grant` participates in
+the genesis signature **and** in the channelID hash (`governance/genesis.rs:245`), so deleting the field would
+change the identity of every room created with one, or make their genesis unreadable. Review called this the
+most dangerous omission in the first draft, and it is. The rule:
+
+- the genesis field is **retained on the wire and in the decoder**, so every existing room still parses,
+  verifies and keeps its channelID;
+- it is **no longer consulted for authorization** — `build_evaluator` stops passing it, and a room carrying
+  one is treated exactly like a room without;
+- **creating** a genesis with the field is refused, so no new room acquires one;
+- `0x0013` entries already on a log **decode and are ignored**, and the tag is never reused;
+- a node that still honours the old model is a **mixed-version peer** serving its own services under its own
+  rules. It cannot grant reach to anyone else's service, because every host enforces its own consent set
+  locally — so the exposure is bounded to that node's own services, and the release notes must say that
+  plainly rather than implying an upgrade closes the hole for everyone.
+
+M17.13 covers this, and it is the one item that must ship in the same release as M17.7 rather than after it.
 ## Non-goals
 
-- **No new authentication scheme for the service being carried.** Vox routes and authorizes *reach*;
-  the service authenticates its own users exactly as it always did. `ssh` keeps its keys, HTTP keeps
-  its cookies, Postgres keeps its passwords. Adding a Vox-issued credential for every carried protocol
-  would be large surface for weak gain, and a second trust root in a system whose whole point is one.
-  ADR-013's SSH certificate authority is narrowed accordingly (see Links).
+- **No new authentication scheme for the service being carried.** Vox routes and authorizes *reach*; the
+  service authenticates its own users exactly as it always did. `ssh` keeps its keys, HTTP keeps its cookies,
+  Postgres keeps its passwords. ADR-013's SSH certificate authority is narrowed accordingly (see Links).
 - **No implicit exposure.** See decision 2.
-- **No room-wide plaintext service announcements.** See decision 7.
-- **No service reachable by a non-member.** There is no anonymous access tier and no "public" service:
-  the room is the boundary. A host who wants the world to reach something should use a web server.
-- **No IP-level anonymity, and no relay-mandatory mode to buy it.** See decision 6. The ladder's
-  preference for a direct path stands, because a room that relayed every byte forever would spend the
-  operator's bandwidth on a guarantee Vox does not make.
-- **No global namespace, and no name resolution off the machine.** A `.vox` name is the channelID in
-  base32; it resolves only inside a client that has joined that room, from data it already holds. There
-  is no directory, no registration, no DNS suffix to own, nothing to squat and nothing to enumerate.
-  Vox will not publish a `.vox` resolver and will not ask for the TLD to be delegated (decision 4).
-- **No privilege, anywhere, ever.** `vox up` is an unprivileged loopback proxy: no device, no route, no
-  firewall rule, no port below 1024, no resolver entry (decision 5). Anything needing privilege is an
-  optional addition on the Tor ladder — automap plus a transparent proxy, or an interface — never the
-  primary path, and not in scope here.
+- **No authorization derived from membership, and none from joining.** See decision 3. Joining a room,
+  holding its passphrase, paying its proof of work, being admitted as an author on any peer's board, or
+  answering someone's join confers **no reach**.
+- **No authority over who may host.** See decision 3. Binding a port of one's own machine is not the room's
+  business, so there is no `bind:` capability and nothing issues one.
+- **No room-wide plaintext service announcements.** See decision 9.
+- **No service reachable by a non-member.** There is no anonymous access tier and no "public" service.
+- **No name that is a capability.** See decisions 1 and 9. Vox deliberately does not reproduce Tor's property
+  that holding an address is sufficient to connect.
+- **No IP-level anonymity, and no relay-mandatory mode to buy it.** See decision 6.
+- **No global namespace, and no name resolution off the machine.** A `.vox` name is a commitment to a host
+  key and a nonce; it resolves only inside a client holding a descriptor it could open. There is no
+  directory, no registration, no DNS suffix to own, nothing to squat and nothing to enumerate.
+- **No privilege, anywhere, ever.** `vox up` is an unprivileged loopback proxy (decision 5).
+- **No padding of per-recipient audiences, yet.** Audience size is visible; whether to pad is an ADR-006
+  question because it affects every sealed entry, not a decision taken here (decision 9).
 
 ## Consequences
 
 ### Positive
-- The primary use case is two commands, which is the standard the author set.
-- The service grant is an ordinary log fact, so it converges by sync, survives restart, is visible to
-  every member, and is revocable per member with the machinery ADR-007 already specifies.
-- Non-members remain unable to reach anything, and members without the capability cannot even learn a
-  service exists.
+- **One authorization surface, and one kind of act.** Reading and reaching are the same decision, and every
+  such decision is an explicit human one. The class of bug behind findings #1 and #2 — a second surface
+  drifting from the first — has nowhere to occur, and the class review found in the first draft — an
+  *automatic* grant on a surface meant to be deliberate — is closed by construction.
+- **Step six is gone without a new mechanism.** No credential, no genesis field, no log entry kind for
+  authorization, and no additional human decision. The approval already existed.
+- **The descriptor needs no new crypto.** Publishing it as content inherits the audience, the hiding and the
+  freshness from machinery consent already governs (decision 9).
+- Every service gets a real name, in any room — the coupling that left chat-room services unnameable
+  (`node/resolver.rs:27-30`) is dissolved.
+- A member the host has not approved cannot learn that a service exists, and cannot distinguish its
+  descriptor from an ordinary message.
+- **No new key material.** The name commits to the composite key that already exists, so nothing new can be
+  lost or leaked, and the construction stays post-quantum.
 - Nothing about the carried protocol changes, so any TCP service works on day one.
-- The address a person types is the string they were already given, at the port the tool already uses,
-  and it certifies itself: there is no moment in the flow where a user must compare two fingerprints or
-  trust a first sighting.
-- The entry point needs no privilege of any kind, so Vox is usable on a machine the user does not
-  administer — which is the case a Tor-private-service replacement has to serve.
-- The carried session has no IP addresses of its own: it runs ULA-to-ULA on the connecting machine and
-  loopback-to-loopback on the serving one, so no packet anywhere pairs a real address with the service's
-  port, and no observer on either machine learns which service or which room a connection is for
-  (decision 6).
+- The entry point needs no privilege of any kind (decision 5). The carried session has no IP addresses of its
+  own (decision 6).
 
 ### Negative
-- A leaked address **and** passphrase together yield service access with no further human step. This is
-  the deliberate trade for removing step six; the mitigations are that both must leak, that the
-  passphrase is high-entropy and machine-generated, that a service room contains nothing but the
-  service, and that revocation is per member.
-- The service grant is in the genesis, so it cannot be changed for an existing room — a room created
-  without one needs explicit grants forever. That is the correct direction of immutability (a room
-  cannot silently become an access list), but it means `vox serve` and "add a service to my chat room"
-  are genuinely different flows.
-- A host that is unreachable still needs an anchor, and that is one step Tor does not have.
-- A tool has to be told about the proxy once: a `ProxyCommand` line for `ssh`, `ALL_PROXY` for most
-  others. This is the same thing a Tor user does, and it is the cost of refusing to require privilege.
-- A tool with no proxy support at all (`psql` is the honest example) cannot use a `.vox` name; it uses
-  `vox forward` and a local port. A minority of tools, and the same minority `torsocks` cannot help.
-- Naming the service by its port means a host offering two services on one port in one room must fall
-  back to `vox service add <tag>`. The port-named form is for the single-service room `vox serve`
-  creates, which is the case being optimised.
+- **Host and guest must already share a room.** Handing a service to someone you have no room with is two
+  flows: make a room, then serve. This is the step Tor genuinely does not have, and the previous revision's
+  one-command answer to it is what proved unsound.
+- **A joiner is readable by nobody until it approves someone.** The cost of making every direction explicit.
+  It is a change to what joining a chat room does, and it is the deliberate price of closing the
+  auto-consent hole.
+- **Reach cannot be narrowed below "my explicitly approved readers in this room"**, and three `vox grant`
+  capabilities go: time-bounded access, reach-without-read, and authority over who may host. Reach to a
+  non-member was never among them (`node/actor.rs:2735`).
+- **Only the host can cut a reader's reach.** A room admin has no lever over another member's services short
+  of a passphrase rotation (decision 11). Intended, and stated.
+- **A stable name is a correlation identifier.** The first draft claimed a name could be pasted into a bug
+  report "without consequence". That is wrong and is corrected: leaking the string confers no *reach*, but it
+  discloses that the service exists and lets anyone who has seen the name elsewhere correlate. The accurate
+  claim is *not a bearer capability*, not *without consequence*.
+- **Audience size is visible** even when its contents are not — inherent to per-recipient sealing.
+- **Immediate teardown means the service layer watches consent**, and must reach pending requests as well as
+  spliced streams (decision 10 point 5).
+- **A rotation wipes every audience and descriptor** and requires re-approval and republication (decision 11).
+- **Existing rooms keep a dead genesis field for ever.** The compatibility cost of never breaking a channelID
+  (decision 11).
+- A tool has to be told about the proxy once (`ProxyCommand`, `ALL_PROXY`). Same as a Tor user. A tool with
+  no proxy support (`psql`) uses `vox forward` and a local port.
 
 ### Neutral
 - "Tunnel" narrows to mean the mechanism; existing ADR-013 text stays correct under that reading.
+- `vox serve` keeps its name while changing its meaning, because the verb is right and the shape was not.
 
 ## Implementation plan
 
-Each item is one branch, red→green, with the ADR updated in the same change (house rule).
+Each item is one branch, red→green, with the ADR updated in the same change (house rule). **No item here is
+built.** Three independent reviews returned REVISE on the first draft of this plan; what follows is the
+revised one.
 
-- **M17.1 — the service grant. *Done 2026-09-21.*** `GenesisBody::service_grant` (beside the policy, not
-  inside it — the policy is what a policy-update may change and this is immutable), validated to
-  `dial:`/`bind:` only; the evaluator confers it on this node's admitted authors
-  (`Evaluator::build_with_members`, fail-closed without them) and honours a new
-  `service-grant-exclusion` (`0x0013`) resolved from its issuer's strict causal past, exactly as an
-  admin-delegation revocation is. `ChannelState::{create_with_grant, exclude_from_service_grant}`.
-  **Gate met:** seven golden vectors (a member with no certificate dials; it confers nothing it did not
-  name and no authority; a non-member is refused; a room without a grant is unchanged; an authorized
-  exclusion removes one member only; an unauthorized one is inert; an explicit certificate survives an
-  exclusion; a genesis cannot confer authority on every member) plus a channel-level test where a joiner
-  dials having received no certificate of any kind, and both the grant and the exclusion survive a reopen.
-- **M17.2 — `vox serve` and `vox connect`.** The two commands, the port-named service, the generated
-  passphrase, the unechoed prompt, the refusal-to-start when unreachable with no anchor, and the
-  attribution the host needs: `(room, client fingerprint)` surfaced as an event when a tunnel is served,
-  since the service's own logs can only ever say `127.0.0.1` (decision 6). Gate: two
-  commands, two machines, real bytes — the M16.1 gate re-expressed as the two-command flow.
-- **M17.3 — `vox up`: the `.vox` name and the SOCKS entry point.**
-  - **The resolver. *Done 2026-09-21.*** `node::resolver`: the name decodes to a channelID, the room's
-    **genesis creator** is its host, and that is who to dial — so the chain is self-certifying with nothing
-    looked up and no advertisement to wait for (the creator is the one fact about a room that is immutable,
-    self-validating and known to every member). A room **without** a genesis service grant is deliberately
-    unnameable: its host is not determined by the genesis, so guessing at the creator would be inventing a
-    fact, and that shape is reached with `vox forward <member>/<tag>`.
-  - **The proxy. *Done 2026-09-21.*** `node::up`: SOCKS5 on loopback, CONNECT only, `.vox` names only, one
-    uniform refusal for "not a name" and "a room this machine has not joined", a literal-address CONNECT
-    refused rather than proxied. `NodeCommand::Up` establishes the connection to the host **before**
-    binding, so a proxy that came up could never refuse every request. `vox up` prints the `ProxyCommand`
-    line rather than writing it: that file is the user's.
-  - **Gate met** (`node_m17_up_gate`): a real SOCKS5 client sends a `.vox` **name**, the proxy resolves it
-    from the room's genesis, the port becomes the service tag, a real ADR-007 evaluator authorizes it
-    against the genesis service grant with no certificate issued to anybody, and the bytes reach a real TCP
-    service on the host's loopback and come back — with **no device, no route, no firewall rule, no port
-    below 1024 and no `sudo`**. Mutation-checked by dialling with the wrong tag. Plus the negative: a name
-    for a room this machine has not joined is refused at the proxy, so nothing is dialled.
-  - **Rehearsed end to end, 2026-09-21.** Four real commands on one machine, two profiles and a
-    headless anchor: `vox node` → `vox serve 22` → `vox connect <address>` → `vox up <room>` →
-    `ssh user@<52-char>.vox`. The host's own `sshd` answered through the overlay — remote software
-    version `OpenSSH_10.3`, a completed SSH transport handshake, and authentication failing only for
-    want of a key. **Three defects the gates could not have caught**, all of them in the composition
-    rather than the mechanism, are recorded here because they are the argument for rehearsing at all:
-    1. **The generated passphrase did not match itself.** `vox serve` handed the node the hyphenated
-       form while `vox connect` stripped the hyphens, so every join was refused with no indication
-       why. The release gate could not see it: it drove the node API directly and used one passphrase
-       value for both sides.
-       The first fix was wrong and is worth recording. It canonicalized — strip hyphens — at "the
-       node's boundary", making a hyphen never part of a room passphrase. That broke an existing test
-       immediately, for the right reason: a joiner calling `NodeNet::start_join` directly bypasses that
-       boundary, so a room created through the node and joined through the library derived two
-       different secrets. A rule any direct caller can violate silently is worse than no rule.
-       **The fix is symmetry, not canonicalization:** the hyphens are part of the secret, nothing
-       strips them, and there is deliberately no function that could. What is printed is what both
-       sides use, byte for byte. The cost — a listener who drops the dashes gets it wrong — is real and
-       accepted: this string is copied beside a 277-character address, not retyped.
-    2. **`vox node` printed an anchor spec nobody could dial.** A wildcard bind advertises `0.0.0.0`,
-       which names every interface to the kernel and nothing to a peer; it was printed as something to
-       paste into `--anchor`. Undialable addresses are now filtered out of that line.
-    3. **`vox up` refused to start on a race.** It dialled the host *before* binding, so a node that
-       had only just joined — and therefore had not yet read the board — could not find the host and
-       the command failed intermittently. Retrying inside the actor would have made it worse, because
-       the actor is what reads the board. The dial is now **per request**: the proxy binds at once and
-       asks the node to reach the host when a connection arrives.
-  - **Removed, deliberately:** the Vox network interface (a `smoltcp` userspace TCP stack behind a `tun`
-    device) and the `.vox` DNS responder. Both were built and gated; both were heavier than anything Tor
-    requires, and the DNS responder is only needed by the automap variant this ADR does not take. See
-    decision 5's recorded reversal.
-- **M17.4 — anchors as configuration.** `<config_dir>/anchors`, written by `vox node`, read by every
-  client; `--anchor` still overrides. Gate: a client on the anchor's machine needs no flag.
-- **M17.5 — service advertisements (`0x000F`).** Audience-encrypted, published to the room, surfaced
-  in the client. Gate: a member with the capability sees the tag without being told it; a member
-  without it sees nothing and learns nothing.
+**M17.1–M17.5 as previously written are superseded in part.** Built and standing: the resolver's and proxy's
+transport work (M17.3). Built and to be **removed**: the genesis service grant and `0x0013` (M17.1, but see
+M17.13 — the field is retained on the wire), and `vox serve`'s room creation (M17.2). **Not built despite
+an earlier claim that it was:** M17.4.
 
-M17.1 depends on nothing outstanding. M17.2 depends on M17.1 and on ADR-012's port mapping (done,
-M15.1c) for the case where the host is directly reachable. M17.3's resolver and proxy were built and gated
-independently of M17.2. M17.5 is independent of the rest.
+- **M17.1 — *superseded.*** The genesis service grant and `0x0013` are withdrawn from *authorization* by
+  decision 3; their seven golden vectors go with them. The wire field and tag are retained for compatibility
+  (M17.13) and the tag is never reused.
+- **M17.2 — *partly superseded.*** `vox connect` stands. `vox serve` is reshaped by M17.7.
+- **M17.3 — *stands, with two corrections.*** `node::up`'s SOCKS5 datapath is unaffected. `node::resolver`
+  must resolve a **name to a descriptor** rather than a channelID to a genesis creator, and must span **every
+  descriptor this client can open** rather than one room — so `vox up` takes no room argument
+  (`vox-tui/src/cli.rs:332`, `node/actor.rs:2763`). **The M17.3 gate (`node_m17_up_gate`) asserts the
+  vulnerability**: it supplies a member set and zero governance entries, then proves successful traffic
+  (`tests/node_m17_up_gate.rs:118`). It must be rewritten, not extended.
+- **M17.4 — *not built.*** Anchors as configuration. `vox node` prints a spec to paste; `<config_dir>/anchors`
+  does not exist.
+- **M17.5 — *superseded by M17.10.*** `0x000F` advertisements become decision 9's content descriptor.
+
+New work, in dependency order:
+
+- **M17.6 — no authorization without an explicit act.** Two halves, both required before anything else:
+  `learn_members` / `admit_author` stop creating members from a peer's board record on a self-signed record
+  alone; and `join` stops calling `release_key_to(responder)` (`node/actor.rs:1764`). Gate: a bundle record
+  synced from a peer's board does not make its subject a member, **and** a node that joins a room through a
+  member has issued that member no consent — verified by the responder being unable to read the joiner's
+  first message until the joiner explicitly approves it. The RED test
+  `sec_vouched_key_gets_no_service_grant.rs` goes green. Closes finding #1's admission half and the hole
+  review found in this revision's first draft.
+- **M17.7 — consent is the authorization.** `build_evaluator` stops passing `authors.keys()`
+  (`governance/channel.rs:935`); the dial check keys off the host's explicitly granted consent set in the
+  bound room. `vox grant`, `GenesisBody::service_grant`'s authorization role and the `bind:` class with
+  `add_service`'s `can_bind` check (`governance/channel.rs:1232`) are removed. `vox serve` takes a room,
+  creates none, and names its audience and non-audience. The consent prompt states that approval confers
+  service reach. Gate: an unapproved member is refused, an approved one reaches the service, the transition
+  happens on the approval alone with no second command, and a member who is not the room's creator can
+  serve — which fails today.
+- **M17.8 — the evaluator's head-epoch filtering.** The open question behind the downgraded finding #5:
+  whether exclusion and consent folding should filter on the head epoch (`governance/evaluator.rs:519`,
+  `:797`). Gate: a test that either exhibits the resurrection or shows it cannot happen. **Blocks nothing
+  here.**
+- **M17.9 — the name.** `H("vox service name v1" ‖ host_composite_pk ‖ nonce)` in base32; nonce minted per
+  (host, room) on first serve, reused for further ports, retired with the last one; persisted in the profile.
+  `node::resolver` resolves name → descriptor across rooms. Gate: a name survives a restart, two ports share
+  one name, a second room yields a different name, a retired-then-reserved service gets a *new* name, and a
+  name for a service this client holds no openable descriptor for does not resolve at all.
+- **M17.10 — the descriptor.** A content entry per (service, room) carrying nonce, ports, host identity, room
+  and a monotonic `version`, republished on every trigger in decision 9. Gate: an approved reader lists the
+  service by name without being told it; a **newly** approved reader does too, without waiting for anything
+  (the trigger `chain_id` misses); an unapproved member of the same room cannot determine the name, the
+  ports, or that the entry is a descriptor rather than a message; a reader whose consent is withdrawn cannot
+  open the next version; and a retraction is published rather than the entry merely ceasing.
+- **M17.11 — immediate teardown, including pending requests.** Withdrawing approval closes live streams,
+  reports the reason to the far end, **and fails a stream that was opened before the revocation and presents
+  its request after it** (`node/actor.rs:1315`). Gate: a live `ssh` session dies on the withdrawal and the
+  client prints why; and separately, a stream opened while approved, held silent across the revocation, and
+  completed afterwards is refused.
+- **M17.12 — the validation contract.** The descriptor binds name, host, room, ports and version; the client
+  authenticates the transport peer as that named host before carrying a byte; the resolver holds
+  `name → (channel, host, port)` and the tunnel request carries the port as its tag. Gate: a descriptor
+  copied verbatim into another room does not resolve there; two hosts serving `:22` in one room are reached
+  by their own names and never each other's; and a rebound port does not answer on a stale name.
+- **M17.13 — compatibility, and it ships with M17.7.** The genesis field and `0x0013` keep parsing so every
+  existing room keeps its channelID (`governance/genesis.rs:245`); neither is consulted for authorization;
+  creating a genesis with the field is refused. Gate: a room created by v0.1.0 opens, verifies and keeps its
+  channelID under the new code, and its genesis grant authorizes nobody. Release notes state that a
+  mixed-version peer still applies the old rules **to its own services**, bounded there because every host
+  enforces its own consent set locally.
+
+M17.6 must land first and alone: it closes both the admission hole and the auto-consent hole, and M17.7's
+gate is meaningless until it has. M17.7 and M17.13 ship together. M17.9 blocks M17.10 and M17.12. M17.11
+depends on M17.7. M17.8 is independent of all of it.
 
 ## Links
-**Depends on**: ADR-005 (the invite and its passphrase separation), ADR-007 (capabilities, consent,
-revocation), ADR-012 (reachability, anchors), ADR-013 (the tunnel data path), ADR-016 (the node that
-runs it).
-- Amends ADR-013, in three places: the SSH CA is narrowed to an optional later capability; the
-  port-forward model is the specified one for a *tool-facing* forward; and **the SOCKS5 front-end is
-  completed and is the person-facing entry point** (`node::up`), which is what ADR-013 listed as primary all
-  along. The TUN model stays optional there, and unbuilt. It
-  qualifies ADR-013's invariant that *"tunnel capabilities are never inherited from membership"*: they
-  still never are, **except** where a room's immutable genesis says so at creation (decision 3). A room
-  made without a service grant can never acquire one, so the path ADR-013 was guarding against — "join
-  my chat" silently becoming "you are on my LAN" — remains closed.
+**Depends on**: ADR-005 (the invite and its passphrase separation), ADR-006 (the sender-key sealing the
+descriptor rides as content), ADR-007 (per-sender consent — now the authorization basis — and revocation),
+ADR-012 (reachability, anchors), ADR-013 (the tunnel data path), ADR-016 (the node that runs it).
+- **Restores an ADR-013 invariant this ADR had qualified.** ADR-013 holds that *"tunnel capabilities are
+  never inherited from membership."* The previous revision carved out an exception for a room's immutable
+  genesis; decision 3 **withdraws the carve-out**, so the invariant stands unqualified again.
+- **Reverses ADR-013's orthogonality claim.** It held that revoking message consent does not touch tunnel
+  access and vice versa. They are now one axis.
+- **Removes ADR-007's `bind:`/`dial:` capability pair from the service path** and `0x0013` with it, while
+  keeping both decodable for compatibility (decision 11).
+- Amends ADR-013 further: the SSH CA is narrowed to an optional later capability; `vox forward` remains the
+  path for tools with no proxy support, under the same consent check; the SOCKS5 front-end is the
+  person-facing entry point and must become room-agnostic (M17.3).
 - Leaves ADR-014 as it was: its privileged helper / `NetworkExtension` stays **conditional on a TUN
-  interface that is not on this path**. `ssh user@<id>.vox` works with no privileged component at all.
+  interface that is not on this path**.
 - Depended on by: ADR-014, ADR-015 (the clients surface these verbs).
+- **Reviews on file**: `docs/adr/ADR-017-reviews/` — three independent REVISE verdicts on the first draft of
+  this revision, and the evidence for every correction recorded above.
 
 ## Engineering Mantra
 
@@ -528,7 +894,3 @@ These principles are binding on all work under this ADR:
 - **Do not be lazy.** Plenty of time to do it right.
 - **No shortcuts.** Every component is built to production quality from day one.
 - **Never make assumptions.** Dive deep before writing a single line of code.
-- **Measure three times, cut once.** Verify designs, implementations, and outputs.
-- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
-- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
-- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.

@@ -1,0 +1,75 @@
+You are reviewing a PLAN, before it is implemented. It is the third revision of an
+architecture decision record for a post-quantum E2EE overlay network (Vox Lux, Rust).
+It was written by the same process that wrote the code and the two previous revisions,
+both of which it now says were wrong. Treat it with suspicion.
+
+READ, in this order:
+  1. /opt/vox/docs/adr/ADR-017-room-bound-services.md   (the revision under review)
+  2. /opt/vox/docs/adr/ADR-013-overlay-tunneling.md     (amended in the same change)
+  3. /opt/vox/docs/adr/ADR-007-membership-consent-and-admin-governance.md  (ditto)
+
+The code the plan governs, which you MUST read rather than trust the plan about:
+  /opt/vox/crates/vox-core/src/governance/{channel.rs,servicegrant.rs,genesis.rs,evaluator.rs}
+  /opt/vox/crates/vox-core/src/node/{resolver.rs,up.rs,actor.rs,link.rs}
+  /opt/vox/crates/vox-core/src/tunnel/
+  /opt/vox/crates/vox-tui/src/cli.rs
+
+Reference implementation the plan claims to follow (read it, do not assume):
+  /opt/tor/src/feature/hs/{hs_descriptor.c,hs_common.c,hs_service.c,hs_client.c}
+
+WHAT CHANGED. The withdrawn model: a room's genesis conferred `dial:` on every admitted
+member, so joining a room WAS being authorized ("'may this member dial it' and 'is this
+person a member' are the same question"). The new model: a service bound to a room is
+reachable by exactly the members whose keys its host approved for READING its messages
+(ADR-007 per-sender consent), and by nobody else. The `.vox` name changes from the
+channelID to the service's own keypair. Discovery becomes a Tor-style client-authorized
+descriptor on the room's log, sealed per approved reader.
+
+YOUR JOB IS TO FIND WHAT IS WRONG WITH THE PLAN. Specifically:
+
+1. Is the new authorization model actually sound, or does it move the vulnerability
+   rather than remove it? Construct the best attack you can against "reach == the
+   host's approved-reader set in this room". Consider: a member approved for reading
+   who should not have reach; consent state that is per-author local and may diverge
+   between nodes; the interaction with the vouching/`learn_members` path the plan says
+   is a separate bug; and whether the host's own view of its consent set can be
+   influenced by a peer.
+
+2. Decision 9 claims ONE encryption layer suffices where Tor uses two, because "there
+   is no party who holds the descriptor, lacks approval, and knows the name." Is that
+   true? Name such a party if one exists. Check the anchor/relay node specifically —
+   it is a non-member that serves the board and carries circuits.
+
+3. Decision 9 keys descriptor freshness to the host's ADR-006 `chain_id`. Verify from
+   ADR-007 and the code that a consent revocation actually advances it and that the
+   channel epoch is genuinely the wrong counter. If the plan is wrong about this, say so.
+
+4. Decision 1 claims a per-service keypair is needed because an approved reader who
+   learns name N could otherwise republish N in another room. Is that attack real, and
+   does the keypair actually stop it? Is there a cheaper construction that also stops it?
+
+5. The plan says a `.vox` name "is not a bearer capability" and can be pasted into a bug
+   report without consequence. Is that true under the plan as written, including for
+   someone who is an approved reader in some OTHER room with the same host?
+
+6. Does the plan's own account of what ships today match the code? It claims v0.1.0
+   implements the withdrawn model and that the M17.3 gate (`node_m17_up_gate`) asserts
+   the vulnerability. Verify both against the tree.
+
+7. What is MISSING from the plan entirely? Look hard at: what happens to a service when
+   its host is removed from the room; two hosts binding the same port in one room;
+   a host serving into a room it later leaves; and whether `vox forward`/`vox up` still
+   have a coherent role.
+
+8. The plan deletes `vox grant` and states that reach cannot be narrowed below "my
+   approved readers in this room" nor extended to a non-member. Is deleting it the
+   right call, or is there a use that plan does not consider?
+
+Be blunt and specific. Cite file:line. Where the plan is right, say so plainly rather
+than inventing objections — a review that manufactures findings is worse than useless.
+Do not propose rewrites of prose; find defects in the design.
+
+End with a section headed VERDICT containing exactly one of:
+  BLOCK (the model is unsound — say what breaks it)
+  REVISE (implementable once named issues are fixed — list them in priority order)
+  ACCEPT (sound as written; proceed to implementation)

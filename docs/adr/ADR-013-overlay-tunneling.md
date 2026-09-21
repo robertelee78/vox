@@ -2,7 +2,7 @@
 
 **Status**: implemented and **reachable** — the per-stream port-forward model runs end to end through the node (`crates/vox-core/src/{tunnel,node/tunnel}.rs`, `crates/vox-tui` `service`/`grant`/`forward`), gated by a release test that reaches a TCP service between two symmetric-NAT clients through an anchor; SOCKS front-end, signed session events, the SSH-CA binding and the TUN datapath remain (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-21 — the **SOCKS5 front-end is built and is the person-facing entry point** (`node::up`, ADR-017 decision 5 / M17.3): it resolves `.vox` names and needs no privilege, which is what this ADR listed as primary from the start. The TUN model stays optional and unbuilt. (A brief revision promoting TUN to the primary path was reverted the same day — see ADR-017 decision 5.) 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
+**Updated**: 2026-09-21 (later the same day) — **tunnel authorization is per-sender consent, not a per-member capability.** ADR-017's third revision withdraws the genesis service grant, `0x0013` and `vox grant`; this ADR's invariant that *"tunnel capabilities are never inherited from membership"* is restored **unqualified**, and its claim that message consent and tunnel access are *orthogonal* is **reversed** — they are one axis. See the Authorization model bullets and the `node_m15_anchor_gate` note. 2026-09-21 — the **SOCKS5 front-end is built and is the person-facing entry point** (`node::up`, ADR-017 decision 5 / M17.3): it resolves `.vox` names and needs no privilege, which is what this ADR listed as primary from the start. The TUN model stays optional and unbuilt. (A brief revision promoting TUN to the primary path was reverted the same day — see ADR-017 decision 5.) 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: tunneling, tcp, ssh, tun, socks, authorization, zero-trust
 
@@ -59,32 +59,42 @@ established substrate and marked as such. This ADR specifies the complete tunnel
   ADR-006). A member can thus enumerate only the services it is authorized to consume; an
   unauthorized member sees at most opaque ciphertext and cannot even learn a service exists. This
   resolves the otherwise-contradiction between discovery-gating and the replicate-all log.
-- **Membership grants tunnel reach only where an immutable genesis says so (qualified 2026-09-21).**
-  ADR-017 decision 3 adds a genesis **service grant**: a room may declare that every member holds
-  `dial:`/`bind:` for named services, which is how a room created *for* a service stops needing a separate
-  authorization step. The invariant below still holds for every room that does not declare one — and a room
-  cannot acquire one later, because the grant is part of the channelID. So the path this invariant guards
-  against, "join my chat" silently becoming "you are on my LAN", remains closed: a chat room created
-  without a grant can never confer reach, and a service room is a different room whose stated purpose is
-  that reach. The grant may confer only `dial:`/`bind:`, never authority, and is revocable per member by a
-  `service-grant-exclusion` (ADR-007 `0x0013`).
+- **~~Membership grants tunnel reach only where an immutable genesis says so.~~ Withdrawn 2026-09-21.**
+  The qualification added earlier that day — ADR-017 decision 3's genesis **service grant**, conferring
+  `dial:`/`bind:` on every admitted member of a room that declared one — is **withdrawn in full**, along
+  with its `service-grant-exclusion` (`0x0013`). Admission to a room is a passphrase and a proof of work,
+  not a human decision, so a grant keyed to membership made every syncing peer's admitted-author set into
+  an access control decision nobody took. The invariant below therefore stands **unqualified** again, which
+  is how it was written. Authorization is instead the host's per-sender consent (next bullet but one, and
+  ADR-017 decision 3 as revised).
 - **Chat membership grants NO tunnel reach — this is a hard invariant (but the two coexist freely in one
   swarm).** Joining a channel, holding the passphrase, or being consented-to for *messages* conveys
   **zero** tunnel reachability *by itself*. Tunnel capabilities are **never inherited from membership** —
-  they are **explicitly granted per member** (`bind:`/`dial:`). A **single swarm can absolutely carry
-  both comms and tunnels at once** (the compute-node case: the admin grants `dial:`/`bind:` to the
-  members that need them, in the same channel that also carries chat); what is forbidden is *automatic*
-  tunnel access falling out of chat membership. So the "here, join my chat" → "now I'm on your LAN" path
-  is structurally impossible: a chat invitee with no explicit `dial:` grant cannot enumerate or reach any
-  service (dark services, default-deny, above), even with full message consent and a valid ULA address —
-  while a teammate you *do* grant `dial:#ssh-hosts` reaches exactly that service and nothing more.
-- **Tunnel authorization is capability-gated and epoch-bound — orthogonal to message consent.** A tunnel
-  is reachable only by a member holding a valid, unrevoked `dial:<service>` capability (ADR-007 lattice)
-  for the current epoch. Revoking a tunnel = revoking that **capability** (admin-delegation-revocation,
-  ADR-007) or rotating the passphrase (epoch). **Revoking per-sender *message* consent / Block (ADR-007)
-  does NOT touch tunnel access, and vice-versa** — the two axes are independent (chat readability vs
-  service capability); a member can be blocked in chat yet retain a granted tunnel, or have a tunnel
-  revoked while remaining a full chat participant.
+  reach follows the **host's own per-sender approval of that member's key**, which is a deliberate human
+  act and is not membership (ADR-017 decision 3, revised 2026-09-21). A **single swarm can absolutely
+  carry both comms and tunnels at once** (the compute-node case: one channel carries chat and services,
+  and each host serves the members it has approved); what is forbidden is *automatic* tunnel access
+  falling out of chat membership. So the "here, join my chat" → "now I'm on your LAN" path is
+  structurally impossible: a joiner the host has not approved cannot enumerate or reach any service
+  (dark services, default-deny, above) and cannot learn one exists, even holding the passphrase and a
+  valid ULA address — while a teammate the host *has* approved reaches the services that host bound to
+  that room, and nothing more.
+- **Tunnel authorization *is* message consent — one axis, not two (revised 2026-09-21).** This bullet
+  previously held the opposite, and the reversal is the substance of ADR-017's third revision, so the old
+  text is quoted rather than deleted: *"Revoking per-sender message consent / Block (ADR-007) does NOT
+  touch tunnel access, and vice-versa — the two axes are independent."* **That is withdrawn.** A service a
+  host bound to a room is reachable by exactly the members of that room whose keys that host has approved
+  for reading, so:
+  - approving a reader confers reach on every service that host has bound to that room, **immediately and
+    with no second act**;
+  - withdrawing consent / Block withdraws reach in the same instant, tears down that member's live streams
+    and reports the reason to the far end (ADR-017 decision 10);
+  - there is no state in which a member is blocked in chat yet retains a tunnel, and none in which a
+    tunnel is revoked while chat readability continues.
+
+  Two surfaces that could disagree with each other were the bug class behind two verified findings; one
+  surface cannot. The cost is that reach can no longer be narrowed below "this host's approved readers in
+  this room", nor extended to a non-member at all — both stated and accepted in ADR-017 decision 3.
 - **SSH-CA mapping (concrete).** "ssh over Vox" uses the member's verified Vox identity (ADR-002) as
   the authority. Vox issues a standard **OpenSSH certificate** with this field mapping: `key_id` = the
   Vox identity fingerprint; `valid_principals` = the granted role/service tags used **verbatim** as principals (the `#`-prefixed
@@ -206,9 +216,14 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     into the actor. A channel absent from the snapshot resolves to `None` and is refused exactly as an
     unauthorized request is, because telling the two apart would leak which channels this node is in.
   - **Bind configuration.** A channel persists `service_tag → local address` in its own sealed segment
-    (`SEG_SERVICES`, `MAX_SERVICES = 64`), so a restart still offers what it offered. `add_service` checks
+    (`SEG_SERVICES`, `MAX_SERVICES = 64`), so a restart still offers what it offered. ~~`add_service` checks
     `bind:<tag>` against the channel's own evaluator: a node cannot offer what the log does not let it
-    offer. This is configuration, never authorization — what a peer may *reach* is its `dial:` grant.
+    offer.~~ **The `bind:` check is withdrawn (2026-09-21, ADR-017 decision 3 as revised, M17.7):** offering
+    a port of one's own machine is not the room's business, and the capability had exactly two sources —
+    the genesis grant and `vox grant --may-bind` — both of which are withdrawn, so keeping the check would
+    have left `vox serve` working only for a room's creator. Still in the tree
+    (`governance/channel.rs:1232`); recorded as required work, not as done. This is configuration, never authorization — what a peer may *reach* is whether this host has
+    approved that peer's key in this room (ADR-017 decision 3, revised 2026-09-21).
   - **Dial side.** `node::tunnel::Forward` binds a local TCP port and gives every accepted connection its
     own tunnel stream (ADR-013's one-stream-per-connection), so a forward carries as many connections as
     the application makes and a dead one takes nothing else with it. Binding happens eagerly, so a port
@@ -230,17 +245,27 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     refused *before* any dial (mutation-checked: removing the actor guard makes the node dial first and
     report `Unreachable`), leaves no listener on the port it asked for, and the same request on loopback
     passes the address check and fails only on reachability.
-  - **The verbs.** `vox service add|remove|list`, `vox grant`, `vox forward` — each opens the room (a
-    room's services and governance live inside the SEK-sealed store, so there is no offering or granting
+  - **The verbs.** `vox service add|remove|list`, `vox serve`, `vox forward` — each opens the room (a
+    room's services and governance live inside the SEK-sealed store, so there is no offering or reaching
     without the passphrase), does its work and leaves; `forward` serves until interrupted and prints the
     `ssh -p <port>` line. Ids are given as unique prefixes of the base32 rendering, refused with a count
     rather than a guess when ambiguous. Passphrases are prompted for unechoed (crossterm raw mode) and
-    read from a pipe when stdin is not a terminal, so nothing lands in shell history.
+    read from a pipe when stdin is not a terminal, so nothing lands in shell history. **`vox grant` is to be
+    withdrawn** under M17.7 with the per-member capability model it served — there will be nothing left for
+    it to grant, because approving a reader is the grant (ADR-017 decision 3, revised). It is **still in the
+    tree** (`vox-tui/src/cli.rs:397`); recorded as required work, not as done.
   - **Gate** (`node_m15_anchor_gate.rs`, release): Alice offers a localhost TCP service in a room, Bob
     joins through the anchor, and **before any grant his forward binds but carries nothing** — the service
     is dark to a member. Alice grants `dial:ssh`; the grant reaches Bob by ordinary sync, with nobody
     telling him, and his application connects to his own machine and gets byte-exact replies from Alice's
-    service. Both clients are behind symmetric NATs, so the path is a relayed circuit and the anchor
+    service.
+    **This gate still drives the withdrawn model** (`NodeCommand::GrantTunnel`, `node_m15_anchor_gate.rs:660`)
+    and **must be rewritten** under M17.7 so its transition is Alice approving Bob's key rather than Alice
+    granting `dial:ssh`. Recorded as required work, not as done: an earlier draft of this bullet stated the
+    rewrite in the past tense before it had happened, which is the failure mode ADR-018 exists to prevent
+    and is corrected here. The property under test does not change and the proof gets stronger — the
+    transition becomes a single human act, and the negative half will hold against a member who has joined,
+    holds the passphrase and paid the proof of work. Both clients are behind symmetric NATs, so the path is a relayed circuit and the anchor
     carried packets it cannot read. A second connection over the same forward works too. `ssh` over Vox is
     this test with `sshd` in place of the echo, which is why the echo is enough.
 - **The SSH CA is narrowed to optional (decider, 2026-09-21).** The Decision above offers "`ssh` over Vox"
