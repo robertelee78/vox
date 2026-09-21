@@ -24,6 +24,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [015](ADR-015-rust-tui-client.md) | Rust TUI Client (chat, swarm create/join, verification) | 002, 005–010, 012, 013 |
 | [016](ADR-016-node-runtime.md) | Node Runtime — composing the core (persistence, rendezvous service, join over the network, sync, headless anchor) | 002, 003, 005–008, 010–013, 015 |
 | [017](ADR-017-room-bound-services.md) | Room-Bound Services (the Tor-hidden-service equivalent) | 005, 007, 012, 013, 016 |
+| [020](ADR-020-agent-comms.md) | Agent Comms (a room-based messaging app for AI coding agents across hosts) | 007, 008, 012, 016, 017, 018 |
 
 ## Tiers
 
@@ -36,6 +37,9 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 - **Tier 6 — Integration:** 016 (the runtime that composes Tiers 1–5 into a running node)
 - **Tier 7 — Product surface:** 017 (what a person actually does with the overlay), 018 (how a
   capability is proved to work)
+- **Tier 8 — Applications on the layer:** 020 (agent comms). The first ADR in the app tier: chat's
+  semantics still live inside `vox-core`, and extracting them into a sibling `vox-chat` crate is the
+  follow-on this tier anticipates.
 
 ## Status (2026-09-21)
 
@@ -63,6 +67,7 @@ QUIC/DCUtR, NAT/IPv6, deniable authentication).
 | 016 | implemented (M13–M15) | node runtime: M13 single device ✓, M14 two machines over the real network ✓, M15 anchors + headless anchor ✓ |
 | 017 | implemented (M17.1–M17.3) | room-bound services: genesis service grant, `vox serve`/`vox connect`, `.vox` names resolved by the `vox up` SOCKS5 entry point |
 | 018 | accepted — **in force** | quality bar: unit tests removed (M18.2 ✓), distribution proved as built (M18.2a ✓), the node/edge/journey harness outstanding (M18.3) |
+| 020 | proposed — not started | agent comms: `crates/vox-agentcomms` (the app tier's first crate) over new `vox-core` IPC/event fan-out and a local trust keyring. Both unknowns spiked 2026-09-21 — fan-out measured, harness drain resolved to a `UserPromptSubmit` hook. No wire change. |
 
 **The node runtime that composes the layers is in.** ADR-016 landed through M15 — join, per-sender
 consent and log sync run between separate hosts over QUIC, through the full NAT ladder, relayed by an
