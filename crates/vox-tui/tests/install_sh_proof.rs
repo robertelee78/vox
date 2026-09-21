@@ -166,6 +166,16 @@ fn release_tree(root: &Path, channel: &str, mangle: &dyn Fn(&mut BTreeMap<&str, 
 
 /// Run the real `install.sh` against `server`, installing into `home/bin`.
 fn run_installer(server: &Server, home: &Path, channel: &str) -> (bool, String) {
+    run_installer_env(server, home, channel, &[])
+}
+
+/// As `run_installer`, with extra environment.
+fn run_installer_env(
+    server: &Server,
+    home: &Path,
+    channel: &str,
+    extra: &[(&str, &str)],
+) -> (bool, String) {
     std::fs::create_dir_all(home).unwrap();
     let mut f = std::fs::File::create(home.join(".zshrc")).unwrap();
     f.write_all(b"export VOX_PROOF_USER_LINE=kept\n").unwrap();
@@ -179,6 +189,7 @@ fn run_installer(server: &Server, home: &Path, channel: &str) -> (bool, String) 
         .env("VOX_RELEASE_BASE", &server.base)
         .env("VOX_INSTALL_DIR", home.join("bin"))
         .env("VOX_CHANNEL", channel)
+        .envs(extra.iter().copied())
         .output()
         .expect("sh ran install.sh");
     (
@@ -223,7 +234,8 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
             .unwrap_or_default();
-        let marker = std::fs::read_to_string(home.join("bin/.vox-channel")).unwrap_or_default();
+        let marker =
+            std::fs::read_to_string(home.join("bin/.vox-standalone.json")).unwrap_or_default();
         let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap_or_default();
         claims.push(claim(
             "install.places_a_runnable_binary",
@@ -232,8 +244,9 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         ));
         claims.push(claim(
             "install.marker_names_the_channel",
-            marker.trim() == "stable",
-            format!(".vox-channel holds {marker:?}"),
+            marker.contains("\"kind\":\"vox.install-channel\"")
+                && marker.contains("\"channel\":\"stable\""),
+            format!(".vox-standalone.json holds {marker:?}"),
         ));
         claims.push(claim(
             "install.runs_shell_setup",
@@ -283,6 +296,28 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
             id,
             !ok && !installed,
             format!("exit_ok={ok}, vox installed={installed}, said {text:?}"),
+        ));
+    }
+
+    // ---- the Apple gate refuses bytes Apple did not vouch for (macOS) ----------------
+    // The fixture is a cargo build, so it carries at most an ad-hoc signature. Forcing the gate
+    // on is the only way to measure it locally: a genuinely notarized binary exists only as
+    // output of the release workflow.
+    if cfg!(target_os = "macos") {
+        release_tree(tree.path(), "stable", &|_| {});
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let (ok, text) =
+            run_installer_env(&server, home, "stable", &[("VOX_PROOF_APPLE_VERIFY", "1")]);
+        claims.push(claim(
+            "install.apple_gate_refuses_unsigned_bytes",
+            !ok && !home.join("bin/vox").exists() && text.contains("3T2D2YNTVW"),
+            format!("with the Apple gate forced on, the installer said {text:?}"),
+        ));
+    } else {
+        claims.push(blocked(
+            "install.apple_gate_refuses_unsigned_bytes",
+            "the Apple gate is macOS-only and this is not macOS",
         ));
     }
 

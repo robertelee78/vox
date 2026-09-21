@@ -2,7 +2,7 @@
 
 **Status**: implemented (M12 + M13.5, `crates/vox-tui/`) — live client over the embedded node; the network verbs landed with ADR-016 M14–M15 and the room-bound-service CLI with ADR-017 M17
 **Date**: 2026-06-20
-**Updated**: 2026-09-21 — the macOS release path is now a port of `hf2q`'s signer (ephemeral keychain, sign by fingerprint, App Store Connect notary key, `apple-proof-<triple>.json` receipts verified at publish, credentials in an `apple-release` environment, **no unsigned fallback**); `v0.1.0` is held until that environment exists. The first attempt modelled this on `ctm`, whose Apple secrets were never configured — corrected. 2026-09-21 — `vox update`, `install.sh`, `scripts/package-release.sh`, `scripts/sign-macos.sh` and `.github/workflows/release.yml` implement §Distribution's install/update model, and the marker now **names the channel** (with a `proof` channel that exists so the digest-mismatch refusal can be proved); the absence of an independent release signature is recorded as a known gap. 2026-09-21 — the **install and update model** is specified (GitHub Releases only, a per-target release record fetched through `latest/download`, fail-closed transport, origin-confined redirects, atomic publish with rollback, `vox shell-setup`, signed+notarized macOS artifacts); see §Distribution. 2026-09-20 — the network verbs are wired (join from a link, invite, consent) and the binary listens (`--listen`); ADR-016 M14.7g. 2026-09-19 — status reconciled; test count corrected; Known gaps recorded. 2026-09-19 (M13.5): live `CoreHandle`, tokio runtime, masked onboarding prompts, composer, idle/SIGHUP lock, primary-buffer + lock gates met; `tui-textarea` dropped.
+**Updated**: 2026-09-21 — `vox update` is rebuilt on `hf2q`'s standalone updater: reqwest with a bounded GitHub-only redirect policy, strict schema-1 `serde` records, SemVer comparison, a streaming digest that enforces the size bound during transfer, **Apple trust with Developer-ID continuity** before publication, an install lock, and a JSON marker. Linux has no equivalent and that gap is stated. 2026-09-21 — the macOS release path is now a port of `hf2q`'s signer (ephemeral keychain, sign by fingerprint, App Store Connect notary key, `apple-proof-<triple>.json` receipts verified at publish, credentials in an `apple-release` environment, **no unsigned fallback**); `v0.1.0` is held until that environment exists. The first attempt modelled this on `ctm`, whose Apple secrets were never configured — corrected. 2026-09-21 — `vox update`, `install.sh`, `scripts/package-release.sh`, `scripts/sign-macos.sh` and `.github/workflows/release.yml` implement §Distribution's install/update model, and the marker now **names the channel** (with a `proof` channel that exists so the digest-mismatch refusal can be proved); the absence of an independent release signature is recorded as a known gap. 2026-09-21 — the **install and update model** is specified (GitHub Releases only, a per-target release record fetched through `latest/download`, fail-closed transport, origin-confined redirects, atomic publish with rollback, `vox shell-setup`, signed+notarized macOS artifacts); see §Distribution. 2026-09-20 — the network verbs are wired (join from a link, invite, consent) and the binary listens (`--listen`); ADR-016 M14.7g. 2026-09-19 — status reconciled; test count corrected; Known gaps recorded. 2026-09-19 (M13.5): live `CoreHandle`, tokio runtime, masked onboarding prompts, composer, idle/SIGHUP lock, primary-buffer + lock gates met; `tui-textarea` dropped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: client, tui, rust, terminal, ratatui, verification, consent-ui
 
@@ -230,13 +230,21 @@ That record is the **only** "what is current" lookup. It is fetched through GitH
 `200`). Its `kind`, `schema_version`, `package`, `channel` and `target` MUST all be checked against what was
 asked for before any other field of it is used.
 
-**Fetching MUST fail closed.** `--fail` is REQUIRED on every request, and the HTTP status MUST be
-checked independently of the transport's exit status. Spike-verified 2026-09-21, and the reason this is
-normative rather than stylistic: *without* `--fail`, a `404` returns **exit 0** and writes the response
-body — `Not Found` — into the output file, which would then be parsed as the release record. Worse,
-curl's exit `56` is overloaded: it means both "404 under `--fail`" and "body exceeded
-`--max-filesize`", so the status MUST be read from `%{http_code}` and never inferred from the exit
-code.
+**Fetching MUST fail closed, and the two clients do it differently.**
+
+`vox update` MUST decide status, redirects, length and digest **in Rust**. It uses `reqwest` with
+an explicit redirect policy bounded to GitHub's origins, rejects any response carrying
+`Content-Encoding`, requires `Content-Length` to equal the size the record promised, and streams the
+body through SHA-256 while enforcing that bound **during** the transfer — a server that keeps sending
+is cut off at the first byte past the promised length rather than being allowed to fill the disk and
+fail a comparison afterwards. The record MUST parse as strict schema-1 JSON with unknown fields
+rejected, and versions MUST be compared as SemVer, not as text.
+
+`install.sh` is POSIX sh and MUST use `curl -f`. That is not stylistic: spike-verified 2026-09-21,
+*without* `-f` a `404` returns **exit 0** and writes the response body — `Not Found` — into the
+output file, which would then be read as the release record. That premise is measured against the
+live endpoint by `update_proof`'s `install_sh.curl_*` claims, with a negative control, rather than
+assumed.
 
 **The binary MUST be pinned to the tag the record named**, and MUST NOT be re-fetched through `latest`,
 which can move between the two requests.
@@ -254,31 +262,44 @@ the active binary as a `.previous` copy, then `rename`. `--rollback` MUST put th
 **Only an install this installer made MAY be updated in place**, identified by a marker file beside the
 binary. A build from source MUST be refused with guidance rather than silently overwritten.
 
-**The marker names the channel.** Its first line is the channel the install follows, so the record it
-resolves is `<channel>-<triple>.json`; `install.sh` writes `stable`. A marker that names nothing usable
-MUST fall back to `stable` rather than refuse — the marker's job is to say "this install is ours", and
-an install that cannot state a channel still follows the default one. The record's own `channel` field
-MUST equal the channel that was asked for.
+**The marker is strict JSON and names the channel.** `.vox-standalone.json` holds
+`{"kind":"vox.install-channel","schema_version":1,"package":"vox","channel":"<channel>"}`, parsed
+with unknown fields rejected. Its presence says the install is ours; its `channel` decides which
+record is resolved (`<channel>-<triple>.json`), and the record's own `channel` MUST equal it. A
+marker that is present but not canonical MUST be reported as a broken install, not treated as an
+unmanaged binary.
 
 A second channel is REQUIRED for one reason: a refusal cannot be proved against a record that is
 correct. Every release therefore also publishes `proof-<triple>.json` — the real version, the real
-size, and a **deliberately wrong** `sha256` — so that the updater's "this download does not match the
-release record" path is exercised end to end by ADR-018's proof instead of being assumed. Nothing
-selects that channel by default, so no install can resolve it by accident.
+size, and a **deliberately wrong** `sha256` — so that the updater's mismatch refusal is exercised
+end to end by ADR-018's proof instead of being assumed. Nothing selects that channel by default.
 
-**There is no independent release signature.** The record carries the digest the binary is checked
-against, so the record is the trust anchor, and its integrity rests on TLS to `github.com` plus GitHub
-itself — the same posture as every `curl | sh` installer. On macOS the Developer ID signature is a
-second, independent check; on Linux there is none. A detached signature over the record, verified
-against a key compiled into the binary, is the way to close that, and is deliberately NOT in this
-change: it needs a release key with its own custody story. Recorded here so it is a known gap rather
-than an unexamined assumption.
+**On macOS the update MUST be authenticated through Apple before it is published**, and the
+load-bearing check is **continuity**: the candidate MUST carry the *same Developer ID* as the binary
+it would replace. `vox update` MUST verify `codesign --verify --strict --all-architectures` on both
+the installed binary and the candidate, parse `codesign --display --verbose=4` for each and require
+a complete `Developer ID Application → Developer ID Certification Authority → Apple Root CA` chain,
+a hardened runtime, a secure timestamp and a canonical team and identifier; require the two
+identities to be equal; confirm the candidate's notarization ticket **online**
+(`--check-notarization --test-requirement '=notarized'`); and require the candidate's `--version`
+output to be exactly the bytes the record's version implies. A correct record digest only proves the
+bytes are the ones GitHub is serving; this proves they were signed by whoever signed the vox already
+installed.
 
-**Shell integration is `vox shell-setup`** — completions into each shell's own autoload directory and
-one marked block at the *end* of the rc, so it wins the `PATH` race against version managers that
-prepend their shims earlier in the same file. `install.sh` and `vox update` MUST run it after placing
-the binary, and it MUST be skippable (`VOX_NO_SHELL_SETUP=1`) and exactly removable
-(`--remove`). Its proof is the standard ADR-018 cites.
+`install.sh` cannot use continuity — a first install has nothing to compare against — so it MUST pin
+the expected team and identifier in the script itself and make the same signature and notarization
+checks against them. That pin and the workflow's `APPLE_CODESIGN_IDENTIFIER` / `APPLE_TEAM_ID` MUST
+agree; they are deliberately two statements of the same fact, one asserting what a release must be
+and one producing it, so a change to either without the other fails the installer loudly rather than
+shipping something the installer will reject. Neither client reads its trust expectations out of the release record: the
+record is served by the same origin as the binary, so trusting it to describe its own signer would
+be circular.
+
+**On Linux there is no equivalent**, and this MUST NOT be papered over. A Linux update rests on TLS
+to GitHub and the record's digest alone. A detached release signature verified against a key
+compiled into the binary is what would close that, and is deliberately not in this change: it needs
+a release key with its own custody story. Recorded as a known gap rather than an unexamined
+assumption.
 
 **Targets** are `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. macOS
 artifacts MUST be signed with a **Developer ID Application** certificate and notarized: an unsigned
