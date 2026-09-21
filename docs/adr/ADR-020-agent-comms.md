@@ -379,10 +379,28 @@ Both unknowns are already spiked; neither remains open.
   all succeed and the node still answers afterwards; a second client draining concurrently sees the
   whole burst; the wedged client is told it lagged and then resumes; the log holds every entry.
   Mutation-checked twice — swallowing the lag report, and a 100 000-event buffer — both caught.
-- **M19.1b — the IPC socket (`vox-core`).** The `0600` Unix socket, its framing, per-client
-  authentication and per-client cursor storage, carrying the stream of M19.1a to out-of-process
-  clients. *Gate*: two separate processes attached to one node both receive every event; killing one
-  disturbs neither the node nor the other.
+- **M19.1b — the IPC socket (`vox-core`). DONE 2026-09-21.** `node::ipc`: a `0600` Unix socket at
+  `<profile_dir>/node.sock`, length-delimited frames (4-byte BE, as `transport::framing` does on
+  QUIC) carrying canonical fixed-arity CBOR, and one task plus one `EventStream` per connection.
+  The node knows nothing about it — whoever spawned the node binds the socket and holds the server —
+  so the actor is untouched.
+  *Gate* `node_m19_ipc_gate` (release, ≈1 s): the socket is `0600`; two genuinely separate **child
+  processes** each receive every event; one is killed mid-stream and the survivor still receives
+  every message sent afterwards, including the sentinel, while the node keeps answering commands.
+  Mutation-checked twice — dropping the `chmod` (caught: mode 0755) and serving clients sequentially
+  instead of per-task (caught: the second client never gets served).
+  **Authentication is the file mode, and nothing more.** `0600` means only this uid may connect, and
+  that uid can already read `vault.cbor` beside the socket — so the socket adds no boundary and must
+  not be described as one. Consequently the protocol deliberately carries **events only**: it is not
+  a mirror of `NodeCommand`, which bears `Secret` and reaches `CreateIdentity`, `Revoke` and
+  `PassphraseRotate`. Narrowing it is accident prevention for model-authored code, not security.
+  Per-client **cursor** storage is *not* here: a cursor belongs to the agent-comms protocol (§4)
+  that reads the log, not to an event transport, and putting it here would have invented state the
+  transport does not own.
+  Three lifecycle facts were measured rather than assumed: `bind` yields `0755` from the umask so the
+  `chmod` is required; a leftover socket file makes `bind` fail with `AddrInUse`, so a stale file is
+  unlinked deliberately; a dead client reads as clean EOF and writes to it fail `BrokenPipe`, both
+  isolated to that connection.
 - **M19.2 — the trust keyring (`vox-core`).** `vox trust add|list|remove`, persistence, the bulk
   import wrapper, and auto-consent on an admitted author whose fingerprint is trusted. *Gate*: a
   member in the keyring is read without a manual consent act; a **vouched** author absent from the

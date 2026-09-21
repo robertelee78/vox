@@ -18,6 +18,8 @@ use crate::error::{Error, Result};
 pub const VAULT_FILE: &str = "vault.cbor";
 /// The store file name inside a profile directory.
 pub const STORE_FILE: &str = "store.redb";
+/// The ADR-020 §7 local control socket, inside the profile directory.
+pub const SOCKET_FILE: &str = "node.sock";
 /// The default profile name.
 pub const DEFAULT_PROFILE: &str = "default";
 
@@ -79,6 +81,16 @@ impl Paths {
     #[must_use]
     pub fn store_file(&self) -> PathBuf {
         self.profile_dir.join(STORE_FILE)
+    }
+
+    /// `<profile_dir>/node.sock` — the ADR-020 §7 local control socket.
+    ///
+    /// Per profile, so several nodes on one machine never contend for it, and
+    /// inside the profile directory because that is already the trust boundary:
+    /// whoever can open the socket can already read `vault.cbor` beside it.
+    #[must_use]
+    pub fn socket_file(&self) -> PathBuf {
+        self.profile_dir.join(SOCKET_FILE)
     }
 }
 
