@@ -20,6 +20,9 @@
 //! reduced, because what is under test is the flow and the M14 gate already runs the
 //! production solve. `#[ignore]`d in the debug suite, run by CI's release step.
 
+#[path = "support/watchdog.rs"]
+mod watchdog;
+
 #[path = "support/vnet.rs"]
 mod vnet;
 
@@ -95,6 +98,7 @@ async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) 
 #[test]
 #[ignore = "production Argon2id, a relayed join and a tunneled TCP round trip: ~15 s in release"]
 fn m17_a_service_room_is_reached_with_no_grant_step() {
+    watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

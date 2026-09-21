@@ -12,6 +12,9 @@
 //! `#[ignore]`d in the debug suite; CI runs it in release with the other
 //! real-parameter gates.
 
+#[path = "support/watchdog.rs"]
+mod watchdog;
+
 use std::sync::Arc;
 
 use vox_core::identity::composite::RootSigner;
@@ -49,6 +52,7 @@ fn spawn(rt: &tokio::runtime::Runtime, paths: &Paths, t: u64) -> NodeHandle {
 #[test]
 #[ignore = "production Argon2id (≈2 s release / ≈30 s debug); CI runs it in release"]
 fn m13_single_device_node_survives_a_restart() {
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths::resolve("gate", Some(tmp.path()), Some(&tmp.path().join("cfg"))).unwrap();
 

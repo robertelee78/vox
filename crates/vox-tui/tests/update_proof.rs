@@ -14,6 +14,9 @@
 //! ADR-018 records carries exactly the gaps that are accepted today, and removing one MUST make
 //! this proof fail until it is closed.
 
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -215,6 +218,7 @@ fn earlier_release(newest: &str) -> Result<String, String> {
 
 #[test]
 fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
+    watchdog::arm();
     let mut claims: Vec<Claim> = Vec::new();
     let mut receipts: BTreeMap<String, String> = BTreeMap::new();
     let allowed: Vec<String> = std::env::var("VOX_PROOF_ALLOW_UNPROVEN")

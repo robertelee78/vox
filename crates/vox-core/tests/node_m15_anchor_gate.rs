@@ -14,6 +14,9 @@
 //! to keep the gate to seconds. `#[ignore]`d in the debug suite, run by CI's release
 //! step.
 
+#[path = "support/watchdog.rs"]
+mod watchdog;
+
 #[path = "support/vnet.rs"]
 mod vnet;
 
@@ -101,6 +104,7 @@ fn sees(h: &NodeHandle, cid: [u8; 32], text: &str) -> bool {
 #[test]
 #[ignore = "production Argon2id and a relayed join: ~10 s in release; CI runs it there"]
 fn m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor() {
+    watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -316,6 +320,7 @@ fn m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor() {
 #[test]
 #[ignore = "production Argon2id, three node lifetimes and a relayed join: ~20 s in release; CI runs it there"]
 fn m15_members_never_online_together_converge_through_the_anchor() {
+    watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -514,6 +519,7 @@ fn m15_members_never_online_together_converge_through_the_anchor() {
 #[test]
 #[ignore = "production Argon2id, a relayed join and a tunneled TCP round trip: ~15 s in release"]
 fn m16_a_tcp_service_is_reached_across_the_overlay_between_two_nated_clients() {
+    watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

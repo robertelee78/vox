@@ -17,6 +17,9 @@
 //!
 //! This lives in `vox-tui`'s tests because it needs `vox` itself as the release payload.
 
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
+
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::net::TcpListener;
@@ -204,6 +207,7 @@ fn run_installer_env(
 
 #[test]
 fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
+    watchdog::arm();
     let mut claims: Vec<Claim> = Vec::new();
     let mut receipts: BTreeMap<String, String> = BTreeMap::new();
     let allowed: Vec<String> = std::env::var("VOX_PROOF_ALLOW_UNPROVEN")

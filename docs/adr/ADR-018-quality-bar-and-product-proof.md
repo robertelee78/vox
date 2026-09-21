@@ -3,7 +3,7 @@
 **Status**: accepted (2026-09-21) — the policy is in force from this change; the harness lands with it
 and grows per capability
 **Date**: 2026-09-21
-**Updated**: 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
+**Updated**: 2026-09-21 — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
 work, and the two obligations they cannot yet meet are recorded in §3's accepted-gaps table rather
 than skipped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -127,7 +127,50 @@ that stops being true MUST be either replaced by an external proof or deleted.
 | `nat/portmap/upnp.rs::mock` + its tests | port mapping against a spec-faithful IGD, including real-router quirks | **the only UPnP evidence that exists** — no router on the development LAN answers SSDP, and there are zero integration gates (real-hardware validation remains pending, ADR-012) |
 | `atrest/sek.rs::production_timing_spike` | the production Argon2id profile actually costs what ADR-010 requires | a measured cost, not an assertion; nothing outside the process can observe it |
 
-### 6. The six gates remain
+### 6. A hung proof is a failing proof
+
+Every gate and proof process MUST carry a **wall-clock bound that ends the process**, and CI jobs
+MUST carry one too. This is not the same obligation as §3, and it is not met by the in-test
+timeouts the gates already have.
+
+**What happened.** On 2026-09-20 two `node_m15_anchor_gate` processes were found still running
+**21 hours** after they started, each consuming about 1.5 cores, alongside a stuck `cargo test`
+parent. Rebuilding this repository at `92a79f8` (the M15.1 merge) reproduces their binary hash
+exactly, so they were that milestone's code; they started seven minutes before that merge, and are
+almost certainly the abandoned runs of the debugging session that found and fixed a `connect_direct`
+hot-spin in the same window. Nothing reaped them, and **nobody noticed for a day**.
+
+**Why no gate caught it.** A hung test emits nothing — no failure, no output, no exit status. It is
+indistinguishable from a test that is still running. Every one of the six gates reports on results;
+none of them can observe the absence of a result.
+
+**Why `tokio::time::timeout` was not enough.** Every wait in those gates is already wrapped in a
+120-second timeout, and the poll loops sleep between iterations. That bounds *one await inside a
+runtime that is still working*. It cannot bound a task spinning without yielding — which starves the
+timer that would have to fire — nor a blocking call on a runtime thread, nor anything after
+`block_on` returns, nor the process once libtest believes the test is over. The observed ~150% CPU
+says spinning, which is precisely the case an in-runtime timeout cannot see.
+
+**The bound MUST therefore be outside the runtime, on the wall clock, and MUST end the process.**
+`crates/vox-core/tests/support/watchdog.rs` does this and MUST be armed by every gate and proof.
+It MUST abort rather than exit, so the operating system records every thread's stack — a hang's
+whole difficulty is that it leaves nothing to look at, and this incident left nothing. The budget is
+generous by design (600 s against a ~53 s worst case): it is not a performance assertion, it is the
+line past which "slow" stops being a credible explanation. `VOX_TEST_WATCHDOG_SECS` overrides it and
+`=0` disables it, for attaching a debugger.
+
+Its own proof is `watchdog_proof.rs`, which re-executes the test binary with a test that spins
+forever on purpose and requires the child to die, by `SIGABRT`, inside its budget, having said why.
+Mutation-checked: disabling `arm()` makes it fail with "the watchdog did not kill a deliberately
+hung test within 60s".
+
+**The underlying hang was not reproduced** — 12 sequential and 12 concurrent runs of that exact
+binary, none hung — and no sample or crash report from the original window was retained. It MUST
+therefore be recorded as **still latent**, not fixed. What this change buys is that the next
+occurrence is a loud failure with thread stacks rather than a silent process burning a core until
+someone happens to run `ps`.
+
+### 7. The six gates remain
 
 `fmt`, `clippy -D warnings`, `test`, `rustdoc -D warnings`, and the release-only `--ignored` run remain
 REQUIRED for every change. This ADR changes what `test` *contains*, not whether it must pass.

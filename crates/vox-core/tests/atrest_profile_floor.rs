@@ -7,6 +7,9 @@
 //!
 //! No KDF is executed: the assertions are on the resolved parameters only.
 
+#[path = "support/watchdog.rs"]
+mod watchdog;
+
 use vox_core::atrest::sek::Argon2Profile;
 
 /// ADR-010 floor, restated here independently of the crate's own constants so
@@ -16,6 +19,7 @@ const ADR_MIN_T_COST: u32 = 3;
 
 #[test]
 fn production_build_resolves_only_profiles_at_or_above_the_adr_floor() {
+    watchdog::arm();
     // Every id a production build is willing to resolve must meet the floor.
     let mut resolved = 0;
     for id in 0..=u8::MAX {
@@ -38,6 +42,7 @@ fn production_build_resolves_only_profiles_at_or_above_the_adr_floor() {
 
 #[test]
 fn reduced_test_profile_id_is_unknown_in_a_production_build() {
+    watchdog::arm();
     // Id 2 is the test-only reduced profile (8 KiB / 1 pass). A wrap naming it
     // must be un-openable outside the crate's own unit tests.
     assert!(Argon2Profile::from_id(2).is_err());
@@ -45,6 +50,7 @@ fn reduced_test_profile_id_is_unknown_in_a_production_build() {
 
 #[test]
 fn default_profile_is_production_and_meets_the_floor() {
+    watchdog::arm();
     let p = Argon2Profile::default();
     assert_eq!(p.id(), Argon2Profile::PRODUCTION_ID);
     assert!(p.m_cost_kib() >= ADR_MIN_M_COST_KIB);

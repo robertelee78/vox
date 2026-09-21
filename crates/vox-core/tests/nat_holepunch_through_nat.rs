@@ -16,6 +16,9 @@
 //! Every case runs on its own [`VirtualNet`] so no earlier dial has opened a filter the
 //! case under test depends on.
 
+#[path = "support/watchdog.rs"]
+mod watchdog;
+
 #[path = "support/vnet.rs"]
 mod vnet;
 
@@ -152,6 +155,7 @@ impl Scene {
 
 #[test]
 fn an_unsolicited_dial_is_dropped_by_the_peers_nat() {
+    watchdog::arm();
     rt().block_on(async {
         let s = Scene::build(1, NatKind::PortRestrictedCone).await;
         let filtered_before = s.net.filtered();
@@ -173,6 +177,7 @@ fn an_unsolicited_dial_is_dropped_by_the_peers_nat() {
 
 #[test]
 fn a_simultaneous_open_traverses_port_restricted_nats() {
+    watchdog::arm();
     rt().block_on(async {
         let s = Scene::build(4, NatKind::PortRestrictedCone).await;
         assert!(
@@ -196,6 +201,7 @@ fn a_simultaneous_open_traverses_port_restricted_nats() {
 
 #[test]
 fn the_punch_tolerates_skew_because_quic_retransmits() {
+    watchdog::arm();
     rt().block_on(async {
         // Sizing datum for the RTT/2 synchronization: a late second dial still lands,
         // because the early side's QUIC Initial is retransmitted after the peer's dial
@@ -211,6 +217,7 @@ fn the_punch_tolerates_skew_because_quic_retransmits() {
 
 #[test]
 fn a_symmetric_nat_defeats_the_punch() {
+    watchdog::arm();
     rt().block_on(async {
         let s = Scene::build(10, NatKind::Symmetric).await;
         // A dials the address C observed for B; B's symmetric NAT allocated that port
@@ -426,6 +433,7 @@ async fn swarm_behind(seed: u8, nat: NatKind) -> Swarm {
 
 #[test]
 fn two_nated_nodes_reach_each_other_through_a_coordinator_then_upgrade_to_a_punch() {
+    watchdog::arm();
     rt().block_on(async {
         let s = swarm(20).await;
         let (a_id, b_id) = (s.ids[&'a'], s.ids[&'b']);
@@ -534,6 +542,7 @@ fn two_nated_nodes_reach_each_other_through_a_coordinator_then_upgrade_to_a_punc
 
 #[test]
 fn a_private_address_is_tried_and_dropped_while_the_circuit_carries_the_day() {
+    watchdog::arm();
     rt().block_on(async {
         let s = swarm(30).await;
         let b_id = s.ids[&'b'];
@@ -573,6 +582,7 @@ use vox_core::transport::streams::{open_typed, StreamKind};
 
 #[test]
 fn two_nodes_behind_symmetric_nats_reach_each_other_through_a_relay() {
+    watchdog::arm();
     rt().block_on(async {
         // Symmetric NATs on both sides: every earlier rung is defeated — the private
         // addresses are unroutable, and the address the coordinator observed is not
@@ -661,6 +671,7 @@ fn two_nodes_behind_symmetric_nats_reach_each_other_through_a_relay() {
 
 #[test]
 fn a_relay_refuses_a_circuit_for_a_peer_it_does_not_know() {
+    watchdog::arm();
     rt().block_on(async {
         let s = swarm_behind(50, NatKind::Symmetric).await;
         let (b_id, c_id) = (s.ids[&'b'], s.ids[&'c']);

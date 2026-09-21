@@ -12,6 +12,9 @@
 //! solve per join make this ≈ 20 s in release and minutes unoptimized: `#[ignore]`d
 //! in the debug suite, run by CI's release step with the other real-parameter gates.
 
+#[path = "support/watchdog.rs"]
+mod watchdog;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -108,6 +111,7 @@ fn is_key_from(e: &NodeEvent, cid: [u8; 32], who: [u8; 32]) -> bool {
 #[test]
 #[ignore = "production Argon2id + (200,9) Equihash: ~20 s in release, minutes unoptimized; CI runs it in release"]
 fn m14_two_nodes_chat_and_an_unconsented_third_reads_nothing() {
+    watchdog::arm();
     let rt = runtime();
     let tmp = tempfile::tempdir().unwrap();
     rt.block_on(async {

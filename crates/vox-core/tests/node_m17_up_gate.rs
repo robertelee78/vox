@@ -22,6 +22,9 @@
 //! **No device, no route, no firewall rule, no port below 1024, no `sudo`.** That is the
 //! whole reason this is the primary path.
 
+#[path = "support/watchdog.rs"]
+mod watchdog;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,6 +98,7 @@ async fn socks_connect(stream: &mut TcpStream, name: &str, port: u16) -> u8 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn m17_a_service_is_reached_by_name_through_vox_up() {
+    watchdog::arm();
     // ---- the host: a real service, a real service room, a real tunnel server ----
     let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
