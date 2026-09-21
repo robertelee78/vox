@@ -2651,16 +2651,27 @@ impl Node {
     /// which is not a membership property — it made delivery depend on connection
     /// history rather than on the room.
     async fn reach_member(
-        &self,
+        &mut self,
         channel_id: &Digest32,
         target: Digest32,
     ) -> Option<Arc<crate::transport::quic::VoxConnection>> {
-        let net = self.net.as_ref()?;
+        let net = self.net.as_ref().map(Arc::clone)?;
         if let Some(conn) = net.manager().existing(&target) {
             return Some(conn);
         }
         let endpoints = net.board_endpoints(channel_id, &target);
-        net.reach(target, &endpoints).await.ok()
+        // **Through `dial`, not `net.reach`.** This called `net.reach` directly and so
+        // produced a connection the actor had never adopted: no receive loop
+        // (`spawn_stream_loop`), no sync schedule, and no upgrade attempt behind a
+        // relayed path. A QUIC connection is bidirectional, so the peer uses that same
+        // connection to reach *back* — and nothing on this side was reading it. The
+        // outbound half worked, which is why the M15 bundle-record gate passed, and the
+        // inbound half silently did not: this node could deliver an SKDM to a member and
+        // then never see a word that member said.
+        //
+        // Delegating removes the divergence rather than patching it, so the two paths
+        // cannot drift again.
+        self.dial(target, &endpoints).await.ok()
     }
 
     /// The pairwise session for `(channel, target)`, opening one from that member's
