@@ -135,6 +135,14 @@ impl Admission {
     }
 }
 
+/// How long one inbound handshake may take before it is abandoned.
+///
+/// This bounds a **pre-authentication** cost: until the handshake completes there is no
+/// identity to hold anybody to, so the only defence is that an unfinished attempt is cheap
+/// and finite. Generous enough for a slow or relayed path — the ADR-012 ladder's rung 4 is a
+/// circuit through an anchor — and short enough that abandoned attempts do not accumulate.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl VoxEndpoint {
     /// Bind a Vox endpoint to `addr`, authenticating as `signer`'s identity.
     ///
@@ -315,11 +323,44 @@ impl VoxEndpoint {
     pub async fn accept_with_admission(
         &self,
         now_secs: u64,
-        mut admission: Admission,
+        admission: Admission,
     ) -> Result<Option<VoxConnection>> {
-        let Some(incoming) = self.endpoint.accept().await else {
+        let Some(incoming) = self.accept_incoming().await else {
             return Ok(None);
         };
+        self.finish_incoming(incoming, now_secs, admission)
+            .await
+            .map(Some)
+    }
+
+    /// **Phase one of accepting: wait for an inbound connection attempt and return
+    /// immediately, doing no handshake.**
+    ///
+    /// The handshake belongs in [`VoxEndpoint::finish_incoming`], on its own task. Doing
+    /// both in one call — which is what [`VoxEndpoint::accept_with_admission`] still does,
+    /// for callers that want one connection — means an accept *loop* performs every
+    /// handshake inline and therefore serialises on them: one peer that opens a connection
+    /// and then stalls its TLS handshake blocks **every** other inbound connection, with no
+    /// credential of any kind, because authentication has not happened yet. That is a
+    /// pre-authentication denial of service against an always-on node, which is exactly what
+    /// an anchor is.
+    ///
+    /// `None` when the endpoint is closed.
+    pub async fn accept_incoming(&self) -> Option<quinn::Incoming> {
+        self.endpoint.accept().await
+    }
+
+    /// **Phase two: complete one connection's handshake and admission.**
+    ///
+    /// Bounded by [`HANDSHAKE_TIMEOUT`], so a peer that opens a connection and then says
+    /// nothing costs one task for that long and not for ever. Spawn this; do not await it in
+    /// an accept loop.
+    pub async fn finish_incoming(
+        &self,
+        incoming: quinn::Incoming,
+        now_secs: u64,
+        mut admission: Admission,
+    ) -> Result<VoxConnection> {
         // A fresh slot for THIS connection's verifier output. We install a
         // per-connection server config so the verifier writes into our slot.
         let verified = VerifiedPeer::new();
@@ -332,10 +373,14 @@ impl VoxEndpoint {
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(s_cfg)
             .map_err(|_| Error::MalformedBundle("quic server config (accept)"))?;
         let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
-        let connection = incoming
+        // Bounded: an unauthenticated peer must not be able to hold a task open for ever by
+        // beginning a handshake and never finishing it.
+        let connecting = incoming
             .accept_with(Arc::new(server_cfg))
-            .map_err(|_| Error::SignatureInvalid)?
+            .map_err(|_| Error::SignatureInvalid)?;
+        let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
             .await
+            .map_err(|_| Error::SignatureInvalid)?
             .map_err(|_| Error::SignatureInvalid)?;
         let conn = finish_connection(connection, &verified, now_secs)?;
 
@@ -346,7 +391,7 @@ impl VoxEndpoint {
             conn.close(WireError::AuthenticatorInvalid);
             return Err(Error::SignatureInvalid);
         }
-        Ok(Some(conn))
+        Ok(conn)
     }
 
     /// Gracefully close the endpoint (all connections).

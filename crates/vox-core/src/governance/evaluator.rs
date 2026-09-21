@@ -158,6 +158,9 @@ pub struct Evaluator {
     consent: BTreeMap<Digest32, BTreeSet<Digest32>>,
     /// The genesis **service grant** (ADR-017 decision 3): capabilities every member
     /// holds with no certificate. Empty for every channel that does not use one.
+    /// Retained so the genesis still parses and hashes identically (M17.13) and so
+    /// `service_grant()` can report what a room was created with. **Confers nothing** — see
+    /// `service_grant_verdict`.
     service_grant: CapabilitySet,
     /// The identities this node has admitted as authors of the channel — its view of
     /// *who is a member*, which is what the service grant is conferred on.
@@ -167,6 +170,13 @@ pub struct Evaluator {
     /// local state. That is not a weakness here, because the decision it feeds is
     /// local too — a host deciding whether to serve *its own* service consults the
     /// keys it verified itself, and refuses anyone it has not (fail closed).
+    /// The admitted-author set this evaluator was built with. No longer consulted for
+    /// authorization — that was `service_grant_verdict`, which now confers nothing (M17.7) —
+    /// and kept because callers ask an evaluator what membership it was built over.
+    #[allow(
+        dead_code,
+        reason = "read by callers via accessors; no longer an authorization input"
+    )]
     members: BTreeSet<Digest32>,
     /// Members whose genesis-conferred capabilities have been withdrawn by an
     /// authorized [`ServiceGrantExclusion`](crate::governance::servicegrant::ServiceGrantExclusion).
@@ -383,19 +393,30 @@ impl Evaluator {
     /// `None` rather than a denial on purpose: a channel with no service grant, or a
     /// capability outside it, must produce exactly the [`DenyReason`] the certificate
     /// path would have produced, so this term can never blur why something was denied.
+    /// **Always `None` since 2026-09-22 (ADR-017 decision 3 as revised, M17.7/M17.13).**
+    ///
+    /// This conferred the genesis service grant's capabilities on every admitted member,
+    /// which made *joining* a room the authorization to reach its services. Admission is a
+    /// passphrase and a proof of work, not a decision about a person, so any party holding
+    /// an address and a passphrase — or, through the vouching path, any party a single
+    /// member synced — was authorized to dial every service bound to that room. That is
+    /// verified finding #1 and it is what shipped in v0.1.0.
+    ///
+    /// Authorization is now the host's own decision about an identity, enforced at the dial
+    /// gate from its trust keyring and the room's current author set
+    /// ([`crate::tunnel::session::accept`]). Nothing in the lattice grants reach.
+    ///
+    /// The **field and its wire bytes stay** (M17.13): `GenesisBody::service_grant` is inside
+    /// the genesis signature and the channelID hash, so removing it would change the identity
+    /// of every room created with one. It parses, it hashes, and it decides nothing — which is
+    /// exactly the shape M17.13 specifies. `0x0013` exclusions likewise still decode and are
+    /// ignored.
+    ///
+    /// Kept as a function returning `None`, rather than deleted, so that the call sites read
+    /// as "the genesis confers nothing" at every point a reader might wonder.
     fn service_grant_verdict(&self, key: &Digest32, cap: &Capability) -> Option<Verdict> {
-        if !self.service_grant.grants(cap) || !self.members.contains(key) {
-            return None;
-        }
-        if self.excluded.contains(key) {
-            // Withdrawn deliberately: `Revoked` is the honest reason, and it
-            // outranks the passive ones for the same purpose it does elsewhere.
-            return Some(Verdict::Denied(DenyReason::Revoked));
-        }
-        Some(Verdict::Granted {
-            governing: cap.clone(),
-            effective_set: self.service_grant.clone(),
-        })
+        let _ = (key, cap);
+        None
     }
 
     /// The genesis service grant this channel confers on its members (ADR-017).

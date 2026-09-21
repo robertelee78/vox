@@ -86,6 +86,11 @@ const T_TUNNEL_SERVED: u64 = 22;
 const T_PROXY_UP: u64 = 23;
 const T_SYNCED: u64 = 24;
 const T_SHUTDOWN: u64 = 25;
+/// Deliberately **not** the next number in the sequence: 1711 is the milestone this event
+/// belongs to (ADR-017 M17.11), and taking a number far from the sequential range keeps
+/// this additive tag from colliding with one a concurrently-developed branch assigns. The
+/// tag space is sparse and `u64`; there is nothing to save by packing it.
+const T_REACH_WITHDRAWN: u64 = 1711;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -608,6 +613,12 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .text(service_tag)
                 .text(&local.to_string());
         }
+        NodeEvent::ReachWithdrawn { channel_id, port } => {
+            e.array(3)
+                .uint(T_REACH_WITHDRAWN)
+                .bytes(channel_id)
+                .uint(u64::from(*port));
+        }
         NodeEvent::InviteLink { channel_id, url } => {
             e.array(3).uint(T_INVITE_LINK).bytes(channel_id).text(url);
         }
@@ -806,6 +817,11 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .map_err(|_| Error::MalformedBundle("ipc tag"))?
                 .to_owned(),
             local: addr(d)?,
+        },
+        (T_REACH_WITHDRAWN, 3) => NodeEvent::ReachWithdrawn {
+            channel_id: digest(d)?,
+            port: u16::try_from(d.uint().map_err(|_| Error::MalformedBundle("ipc port"))?)
+                .map_err(|_| Error::MalformedBundle("ipc port range"))?,
         },
         (T_INVITE_LINK, 3) => NodeEvent::InviteLink {
             channel_id: digest(d)?,

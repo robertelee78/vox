@@ -377,34 +377,51 @@ fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Send
 }
 
 /// Accept connections and their streams forever, forwarding to the actor the ones
-/// that need channel state. Each connection gets its own task, so a slow peer
-/// cannot stall the others; the board is served inside `accept_stream`.
+/// that need channel state. The board is served inside `accept_stream`.
+///
+/// **Each connection's handshake runs on its own task** (M17.17). This loop used to call
+/// `accept`, which performs the TLS handshake inline, so the loop serialised on handshakes:
+/// one peer that opened a connection and then stalled its handshake blocked **every** other
+/// inbound connection — with no credential at all, because authentication had not happened
+/// yet. A pre-authentication denial of service, and worst against the node most likely to be
+/// always-on and public, which is an anchor. The loop's own comment claimed a slow peer could
+/// not stall the others; that was true only of the stream loop, after the handshake.
 fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     tokio::spawn(async move {
         loop {
-            // Open-swarm default: any authenticated identity may connect, because a
-            // node that serves the board must accept peers it does not know yet
-            // (ADR-011/ADR-012). What a peer may *open* is the stream-kind gate.
-            let accepted = net
-                .manager()
-                .accept(crate::transport::quic::Admission::AcceptAnyAuthenticated)
-                .await;
-            match accepted {
-                Ok(Some(conn)) => {
+            // Phase one: take the attempt and come straight back for the next one.
+            let Some(incoming) = net.manager().accept_incoming().await else {
+                // The endpoint closed. Tell the actor, exactly as the serialised loop did —
+                // it acts on `Stopped`, and dropping that send was a real regression I
+                // introduced while splitting this loop, caught by a dead-code warning on the
+                // variant rather than by any test.
+                let _ = tx.send(NetEvent::Stopped).await;
+                break;
+            };
+            // Phase two, on its own task and bounded by `HANDSHAKE_TIMEOUT`.
+            let net2 = Arc::clone(&net);
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                // Open-swarm default: any authenticated identity may connect, because a
+                // node that serves the board must accept peers it does not know yet
+                // (ADR-011/ADR-012). What a peer may *open* is the stream-kind gate.
+                let finished = net2
+                    .manager()
+                    .finish_incoming(
+                        incoming,
+                        crate::transport::quic::Admission::AcceptAnyAuthenticated,
+                    )
+                    .await;
+                // A failed or abandoned handshake needs no handling: there is nothing to
+                // report and nothing to stop, because the loop that matters is already back
+                // at `accept_incoming`.
+                if let Ok(conn) = finished {
                     let peer = conn.peer_id();
-                    spawn_stream_loop(Arc::clone(&net), conn, tx.clone());
-                    if tx.send(NetEvent::Connected { peer }).await.is_err() {
-                        break; // the actor is gone
-                    }
+                    spawn_stream_loop(Arc::clone(&net2), conn, tx2.clone());
+                    let _ = tx2.send(NetEvent::Connected { peer }).await;
                 }
-                // The endpoint closed, or a handshake failed. `accept` returns `Err`
-                // on a single failed handshake (ADR-011 known gap), so keep going on
-                // an error and stop only when the endpoint is closed.
-                Ok(None) => break,
-                Err(_) => continue,
-            }
+            });
         }
-        let _ = tx.send(NetEvent::Stopped).await;
     });
 }
 
@@ -619,6 +636,10 @@ pub struct Node {
     /// The ADR-020 §3 trust keyring, loaded on unlock and empty while locked
     /// (it is sealed under the identity, so there is nothing to hold locked).
     trust: crate::node::trust::Keyring,
+    /// The live reacher set per channel (M17.11), written here and read by serving tasks.
+    /// Kept out of `Channel` because it is a *join* of channel state with the node-wide
+    /// keyring, and the keyring is not a property of any one room.
+    reachers: std::collections::BTreeMap<Digest32, crate::node::tunnel::Reachers>,
 }
 
 impl Node {
@@ -726,6 +747,7 @@ impl Node {
             view_tx: watch::Sender::new(NodeView::default()),
             event_tx,
             trust: crate::node::trust::Keyring::new(),
+            reachers: std::collections::BTreeMap::new(),
         };
         let view_rx = node.view_tx.subscribe();
         // A headless node has nothing to unlock: it is on the network from the start.
@@ -1897,6 +1919,8 @@ impl Node {
             )
             .await;
         }
+        // An admission changes a room's author set, the other half of the reacher join.
+        self.refresh_reachers().await;
         self.sessions
             .insert((parsed.channel_id, responder), joined.session);
         // The link's anchors are this channel's anchors from now on (persisted, so a
@@ -2054,6 +2078,10 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        // The reacher sets are a join of the ring with each room's author set, so both
+        // inputs must push. Immediately, not on the tick: a stream parked open across
+        // this instant is judged by the set as it stands when its request lands (M17.11).
+        self.refresh_reachers().await;
         self.deliver_owed_consents().await;
         self.publish().await;
         Outcome::Done
@@ -2084,6 +2112,9 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        // Before the rotation, not after: rotation talks to the network and may be slow,
+        // and the removal must bite the moment it is decided (M17.11).
+        self.refresh_reachers().await;
         self.change_the_lock_against(fingerprint).await;
         self.publish().await;
         Outcome::Done
@@ -2402,6 +2433,7 @@ impl Node {
             .await;
         }
         if learned > 0 {
+            self.refresh_reachers().await;
             self.refresh_network_view().await;
         }
         // What the peer's board holds is filed on this node's own, so its board
@@ -3113,7 +3145,21 @@ impl Node {
             net,
             channel_id: *channel_id,
         });
-        tokio::spawn(crate::node::up::serve(listener, resolver, dialer));
+        // The proxy is a library and cannot print, so a session cut by a withdrawal of
+        // reach comes back as an event (M17.11). A broadcast send never blocks and drops
+        // when nobody is listening, which is the right trade for a notice.
+        let events = self.event_tx.clone();
+        tokio::spawn(crate::node::up::serve_reporting(
+            listener,
+            resolver,
+            dialer,
+            move |room: &Digest32, port: u16| {
+                let _ = events.send(NodeEvent::ReachWithdrawn {
+                    channel_id: *room,
+                    port,
+                });
+            },
+        ));
         let _ = self.event_tx.send(NodeEvent::ProxyUp {
             channel_id: *channel_id,
             hostname,
@@ -3173,26 +3219,69 @@ impl Node {
         }
     }
 
-    /// The host-side snapshot for serving tunnels: every open channel's evaluator and
-    /// offered services (ADR-013, M16.1). Taken by the actor because only the actor
-    /// reads channel state; handed to the serving task whole, so a tunnel that lives
-    /// for hours never reaches back in.
-    async fn host_snapshot(&self) -> crate::node::tunnel::HostSnapshot {
+    /// The host-side snapshot for serving tunnels: every open channel's evaluator, the
+    /// services this node offers there, and **who may reach them** (ADR-013 M16.1,
+    /// ADR-017 decision 3 / M17.7). Taken by the actor because only the actor holds both
+    /// the node-wide trust keyring and each channel's author set; handed to the serving
+    /// task whole, so a tunnel that lives for hours never reaches back in.
+    async fn host_snapshot(&mut self) -> crate::node::tunnel::HostSnapshot {
+        self.refresh_reachers().await;
         let mut out = crate::node::tunnel::HostSnapshot::new();
         for (cid, shared) in &self.channels {
             let ch = shared.lock().await;
             if ch.services().is_empty() {
                 continue;
             }
+            let Some(reachers) = self.reachers.get(cid) else {
+                continue;
+            };
             out.insert(
                 *cid,
                 crate::node::tunnel::ChannelServices {
                     evaluator: ch.evaluator_handle(),
                     services: ch.services().clone(),
+                    reachers: Arc::clone(reachers),
                 },
             );
         }
         out
+    }
+
+    /// Recompute every channel's live reacher set in place.
+    ///
+    /// In place is the point (M17.11): the handles are already held by serving tasks, some
+    /// of which are parked on a stream whose request has not arrived yet. Replacing the
+    /// contents of the set they hold is what makes a withdrawal of trust reach them;
+    /// handing out a fresh set would leave them reading the old one forever.
+    ///
+    /// Called whenever either input moves — the keyring (`Trust`/`Revoke`) or a channel's
+    /// author set (any board admission) — and once per accept as a backstop.
+    async fn refresh_reachers(&mut self) {
+        let trusted = self.trust.trusted();
+        for (cid, shared) in &self.channels {
+            let ch = shared.lock().await;
+            // (in this node's ring) AND (a current author of this room). Neither alone:
+            // trust is room-independent so it cannot name the room, and membership is a
+            // passphrase and a proof of work rather than a decision about a person.
+            let next: std::collections::BTreeSet<Digest32> =
+                trusted.iter().copied().filter(|fp| ch.is_author(fp)).collect();
+            let slot = self
+                .reachers
+                .entry(*cid)
+                .or_insert_with(crate::node::tunnel::empty_reachers);
+            // `send_replace` wakes every serving task subscribed to this set, which is how
+            // a withdrawal reaches a session that is already carrying bytes (M17.11).
+            slot.send_replace(next);
+        }
+        // A channel this node no longer holds must deny, including to tasks still holding
+        // the handle: empty it before letting go, or they would read the last value forever.
+        self.reachers.retain(|cid, slot| {
+            let held = self.channels.contains_key(cid);
+            if !held {
+                slot.send_replace(std::collections::BTreeSet::new());
+            }
+            held
+        });
     }
 
     async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {

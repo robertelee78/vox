@@ -99,11 +99,16 @@ async fn host() {
     let client_id = conn.peer_id();
     eprintln!("host: peer AUTHENTICATED as {}", hex(client_id));
     let (send, recv) = conn.accept_stream().await.unwrap();
-    // accept() ENFORCES dial:echo for client_id before connecting the echo service.
+    // accept() enforces the host's own decision about client_id — is it in this host's
+    // reacher set — before connecting the echo service (ADR-017 decision 3, M17.7). It used
+    // to enforce `dial:echo` from the capability lattice; that model is withdrawn.
     match session::accept(send, recv, &client_id, |cid, tag| {
         (*cid == channel_id && tag == "echo").then_some(session::HostService {
             evaluator: std::sync::Arc::clone(&evaluator),
             endpoint: echo_addr,
+            reachers: std::sync::Arc::new(tokio::sync::watch::Sender::new(
+                [client_id].into_iter().collect(),
+            )),
         })
     })
     .await

@@ -17,7 +17,7 @@
 //! accepted TCP connection closes. `TunnelStatus::Denied` distinguishes none of them,
 //! and neither does this.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -32,6 +32,22 @@ use crate::transport::quic::VoxConnection;
 use crate::transport::streams::{open_typed, StreamKind};
 use crate::tunnel::session::{self, HostService};
 
+/// The set of identities that may reach a host's services in one channel, shared live
+/// between the actor (which writes) and the serving tasks (which read).
+///
+/// A watch channel rather than a lock, because the serving tasks need two different
+/// things from it and a watch gives both: the current value at any instant
+/// (`borrow()`, for the dial gate) and a wake-up when it changes (`subscribe()`, for
+/// tearing down a session whose reach has just been withdrawn). A lock would serve the
+/// first and force polling for the second.
+pub type Reachers = Arc<tokio::sync::watch::Sender<BTreeSet<Digest32>>>;
+
+/// A fresh, empty reacher set: the state that denies everyone.
+#[must_use]
+pub fn empty_reachers() -> Reachers {
+    Arc::new(tokio::sync::watch::Sender::new(BTreeSet::new()))
+}
+
 /// One channel's host-side facts, as the actor snapshots them for the serving task:
 /// the authority that decides, and the services this node offers there.
 #[derive(Clone)]
@@ -40,6 +56,20 @@ pub struct ChannelServices {
     pub evaluator: Arc<Evaluator>,
     /// `service_tag → local address` (this node's Bind configuration).
     pub services: BTreeMap<String, SocketAddr>,
+    /// The identities that may reach this node's services **in this channel** (ADR-017
+    /// decision 3, M17.7): the intersection of this node's trust keyring with this
+    /// channel's current author set.
+    ///
+    /// A **live** handle, not a copy (M17.11). The actor owns the write side and keeps it
+    /// current; serving tasks only read, so the rule that a serving task never reaches back
+    /// into the actor still holds.
+    ///
+    /// It must be live because the authorization snapshot is taken when a tunnel *stream*
+    /// opens, which is before its request is read. With a copied set, a peer could open a
+    /// stream while authorized, hold it open saying nothing, wait for the host to withdraw
+    /// trust, and only then send its request — and be authorized against a set captured
+    /// before the withdrawal. No timing skill required; just patience.
+    pub reachers: Reachers,
 }
 
 impl std::fmt::Debug for ChannelServices {
@@ -98,6 +128,7 @@ pub async fn serve_reporting(
             Some(HostService {
                 evaluator: Arc::clone(&channel.evaluator),
                 endpoint,
+                reachers: Arc::clone(&channel.reachers),
             })
         },
         |channel_id, tag| {

@@ -163,6 +163,17 @@ async fn m17_a_service_is_reached_by_name_through_vox_up() {
                                     HostService {
                                         evaluator,
                                         endpoint: echo_addr,
+                                        // **The host trusted this client**, which is the
+                                        // whole authorization (ADR-017 decision 3, M17.7).
+                                        // This gate previously supplied only an evaluator
+                                        // carrying a genesis service grant and so asserted
+                                        // the withdrawn model: joining WAS the
+                                        // authorization. `reachers` is the host's own
+                                        // decision about an identity, and the evaluator no
+                                        // longer decides reach at all.
+                                        reachers: Arc::new(tokio::sync::watch::Sender::new(
+                                            [client].into_iter().collect(),
+                                        )),
                                     },
                                 )
                             })
@@ -229,7 +240,13 @@ async fn m17_a_service_is_reached_by_name_through_vox_up() {
         "the bytes went out over the overlay and came back from a real TCP service"
     );
 
-    // ---- and the negative: an unheld room is refused at the proxy ----
+    // The negative that matters now — an identity the host never decided about is refused —
+    // belongs in a proof with real nodes, not here: `service_tag` stopped being an
+    // authorization input in M17.7, so this gate's old mutation ("dial with the wrong tag")
+    // no longer discriminates, and an in-file substitute would only assert that an empty set
+    // is empty. It is M17.7's own gate, with two real identities.
+
+    // ---- and: an unheld room is refused at the proxy ----
     let other = Genesis::create_with_nonce_and_grant(
         &signer(3),
         NOW,

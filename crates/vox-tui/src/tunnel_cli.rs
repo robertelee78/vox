@@ -17,7 +17,7 @@ use vox_core::nat::multiaddr::Multiaddr;
 use vox_core::nat::reachability::is_routable;
 use vox_core::node::actor::{Bind, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
-use vox_core::node::link::{b32_encode, vox_hostname};
+use vox_core::node::link::{b32_decode, b32_encode, vox_hostname};
 use vox_core::node::paths::Paths;
 
 use crate::app::AppError;
@@ -166,7 +166,11 @@ pub async fn service_add(
         "vox: offering {tag:?} at {local} in room {}",
         short(&channel_id)
     );
-    println!("     it is dark until you `vox grant` someone dial:{tag}");
+    // Not `vox grant` — there is nothing to grant under the ring-keyed gate (ADR-017
+    // decision 3 as revised, M17.7). Printing an instruction that cannot be carried out is
+    // the same class of error as `vox serve`'s "anyone who joins with both may reach it".
+    // Found by the agent-comms session reading its own strings against the new model.
+    println!("     it is dark until you `vox trust add` someone — and they join this room");
     Ok(())
 }
 
@@ -382,8 +386,20 @@ pub async fn serve(
     println!("passphrase {}", passphrase.as_str());
     println!("           ^ send this by a different channel than the address");
     println!();
-    println!("serving {endpoint}. anyone who joins with both may reach it, at");
-    println!("port {port} of {}", vox_hostname(&channel_id));
+    println!(
+        "serving {endpoint} at port {port} of {}",
+        vox_hostname(&channel_id)
+    );
+    // **Not "anyone who joins with both".** That was true of the withdrawn model, where a
+    // room's genesis authorized every admitted member and joining WAS the authorization
+    // (ADR-017 decision 3 as revised, M17.7). Printing it now would tell a person the
+    // opposite of what the binary does, which is the class of error this whole revision is
+    // about.
+    println!();
+    println!("who can reach it: the identities you have trusted, once they join.");
+    println!("  a joiner with the address and the passphrase reaches NOTHING until then");
+    println!("  ask them for `vox id`, then run `vox trust add <fingerprint>`");
+    println!("  `vox trust list` shows who you have decided about");
     println!("Ctrl-C to stop");
 
     // Until interrupted: report who reaches the service. The service itself cannot say
@@ -477,7 +493,23 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     println!("then:  ssh user@{hostname}");
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     println!("Ctrl-C to stop");
-    let _ = tokio::signal::ctrl_c().await;
+    // Wait on Ctrl-C, but keep reading events so a session cut by the host withdrawing our
+    // reach says so (ADR-017 M17.11). Without this the proxy stays up and silent and the
+    // person sees only `ssh` dying, which reads as a network fault and invites a retry that
+    // cannot succeed.
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            ev = node.next_event() => match ev {
+                Some(NodeEvent::ReachWithdrawn { port, .. }) => {
+                    println!("vox: the host withdrew access to port {port} — that session was cut");
+                    println!("     nothing to retry: ask them to trust this identity again");
+                }
+                Some(_) => {}
+                None => break,
+            },
+        }
+    }
     println!("vox: stopping the proxy");
     let _ = node.apply(NodeCommand::Shutdown).await;
     Ok(())
@@ -575,4 +607,83 @@ pub fn passphrase_or_prompt(given: Option<&String>, what: &str) -> Result<String
         Some(p) => Ok(p.clone()),
         None => prompt_passphrase(what),
     }
+}
+
+/// `vox trust add` — decide that an identity may read this node, and reach its services.
+///
+/// The decision is per **identity** and node-wide: every room this node shares with that
+/// key auto-consents to it from here on, including rooms made later, and that key may reach
+/// every service this node binds to a room they are both in (ADR-020 §3, ADR-017 decision
+/// 3). It is deliberately one act rather than one per room — which is what makes it usable
+/// for a person with five agents, and what a person must understand before running it, so
+/// the output says what was granted rather than only that something was.
+///
+/// `fingerprint` is the whole base32 fingerprint, or a unique prefix of one this node
+/// already knows as a member somewhere. A prefix that matches nothing is refused rather than
+/// guessed at: trusting the wrong key is precisely the mistake this model exists to prevent.
+pub async fn trust_add(
+    node: &NodeHandle,
+    fingerprint: &str,
+    petname: &str,
+) -> Result<(), AppError> {
+    let target = resolve_trust_target(node, fingerprint)?;
+    let out = node
+        .apply(NodeCommand::Trust {
+            fingerprint: target,
+            petname: petname.to_owned(),
+        })
+        .await;
+    if !out.is_done() {
+        return Err(AppError::Usage(format!(
+            "cannot trust that identity: {out:?}"
+        )));
+    }
+    println!("vox: trusting {} as {petname:?}", short(&target));
+    println!("     it may now read what you write in every room you share — now and later");
+    println!("     and reach every service you bind to a room you are both in");
+    println!("     `vox trust remove` undoes it and changes the lock everywhere");
+    Ok(())
+}
+
+/// `vox trust remove` — stop trusting an identity, and change the lock.
+///
+/// Removes the ring entry, then rotates this identity's sender key and re-keys everyone
+/// still trusted, in every room shared with the removed key (ADR-017 M17.14). It keeps what
+/// it already read — that cannot be recalled, and saying so is more useful than implying
+/// otherwise.
+pub async fn trust_remove(node: &NodeHandle, fingerprint: &str) -> Result<(), AppError> {
+    let target = resolve_trust_target(node, fingerprint)?;
+    let out = node
+        .apply(NodeCommand::Untrust {
+            fingerprint: target,
+        })
+        .await;
+    if !out.is_done() {
+        return Err(AppError::Usage(format!(
+            "cannot stop trusting that identity: {out:?}"
+        )));
+    }
+    println!("vox: no longer trusting {}", short(&target));
+    println!("     it reads nothing you write from now on, in any room you share");
+    println!("     what it already read stays read — that cannot be taken back");
+    Ok(())
+}
+
+/// Resolve a fingerprint argument: a full base32 fingerprint, or a unique prefix of one this
+/// node already knows — a member of some room it holds, or an identity it already trusts.
+///
+/// A full fingerprint is accepted even when unknown, because that is the normal case: a
+/// person pastes what `vox id` printed on someone else's machine, before any room is shared.
+fn resolve_trust_target(node: &NodeHandle, fingerprint: &str) -> Result<Digest32, AppError> {
+    if let Ok(full) = b32_decode(fingerprint, "trust fingerprint") {
+        return Ok(full);
+    }
+    let view = node.view();
+    let mut known: Vec<Digest32> = view.trusted.iter().map(|(fp, _)| *fp).collect();
+    for ch in &view.open_channels {
+        known.extend(ch.members.iter().copied());
+    }
+    known.sort_unstable();
+    known.dedup();
+    resolve_prefix(fingerprint, &known)
 }

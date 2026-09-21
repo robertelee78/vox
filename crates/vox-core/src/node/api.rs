@@ -458,6 +458,20 @@ pub enum NodeEvent {
         /// How many already-stored messages became readable.
         backfilled: u64,
     },
+    /// A tunnel this node was **carrying** was cut because the host withdrew our reach
+    /// (ADR-017 M17.11).
+    ///
+    /// Distinct from an ordinary disconnect on purpose. A dial that is refused says
+    /// nothing about why — a refusal must stay indistinguishable from "no such service"
+    /// — but a session that was *established* and is then cut already tells the peer it
+    /// had reach, so naming the reason leaks nothing and stops the tool retrying against
+    /// a decision that will not change.
+    ReachWithdrawn {
+        /// The room the service was bound to.
+        channel_id: Digest32,
+        /// The port that was being carried, which is the service tag.
+        port: u16,
+    },
     /// A forward is live: the local port is accepting connections for a member's
     /// service (ADR-013).
     Forwarding {

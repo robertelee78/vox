@@ -84,6 +84,30 @@ pub async fn serve<D>(
 where
     D: HostDialer + 'static,
 {
+    serve_reporting(listener, resolver, dialer, |_, _| {}).await
+}
+
+/// [`serve`], reporting each carried tunnel that was **cut by a withdrawal of reach**
+/// (ADR-017 M17.11) as `(room, port)`.
+///
+/// A library cannot print, and one connection's failure is its own — the proxy keeps
+/// serving either way — so the reason would otherwise die in a dropped `Result`. The node
+/// turns these into [`crate::node::api::NodeEvent::ReachWithdrawn`], which is what puts
+/// the sentence in front of the person whose `ssh` just died.
+///
+/// Only a withdrawal is reported. An ordinary disconnect, an unreachable host and a
+/// refused dial are all silent here, because none of them is a decision anybody took.
+pub async fn serve_reporting<D, R>(
+    listener: TcpListener,
+    resolver: Arc<VoxResolver>,
+    dialer: Arc<D>,
+    withdrawn: R,
+) -> Result<()>
+where
+    D: HostDialer + 'static,
+    R: Fn(&Digest32, u16) + Send + Sync + 'static,
+{
+    let withdrawn = Arc::new(withdrawn);
     // The caller binds and hands the live listener over, rather than passing an address
     // for this function to bind (M17.16). Binding here meant the caller had to bind once
     // to learn the port, **drop it**, and let this re-bind — which announced an address
@@ -107,9 +131,10 @@ where
         }
         let resolver = Arc::clone(&resolver);
         let dialer = Arc::clone(&dialer);
+        let withdrawn = Arc::clone(&withdrawn);
         tokio::spawn(async move {
             // One connection's failure is its own; the proxy keeps serving.
-            let _ = handle(stream, &resolver, dialer.as_ref()).await;
+            let _ = handle(stream, &resolver, dialer.as_ref(), withdrawn.as_ref()).await;
         });
     }
 }
@@ -127,7 +152,18 @@ where
 /// one blocked **binding**, so a proxy which came up could refuse everything for ever;
 /// this blocks only the request that is waiting, on its own task, while every other
 /// request and the accept loop keep running.
-const HOST_PATIENCE: Duration = Duration::from_secs(90);
+///
+/// **Why it is minutes rather than seconds.** The bound was 20s, then 90s, and both were
+/// calibrated on an idle machine. The measured first-connect wait on a quiet box has been
+/// 7.7s and 88s across runs — an order of magnitude apart for the same code — because what
+/// the wait covers is a cold node connecting to an anchor, syncing a board and dialling a
+/// peer through the ADR-012 ladder, possibly relayed. Under a loaded machine the 90s bound
+/// expired and the *original* defect reappeared: the proxy refused a real request that would
+/// have succeeded shortly after. A bound that turns into the bug it fixed whenever the
+/// machine is busy is not a fix, so this is generous on purpose. A host that is genuinely
+/// gone still refuses — it just takes a few minutes to say so, which is the right way round
+/// for a wait a person only pays on their first connection.
+const HOST_PATIENCE: Duration = Duration::from_secs(300);
 
 /// Poll interval while waiting. Short enough that a ready host costs a person nothing.
 const HOST_POLL: Duration = Duration::from_millis(250);
@@ -158,10 +194,11 @@ const UNSPECIFIED: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// Negotiate, resolve, and carry one SOCKS5 connection.
-async fn handle<D: HostDialer>(
+async fn handle<D: HostDialer, R: Fn(&Digest32, u16)>(
     mut stream: TcpStream,
     resolver: &VoxResolver,
     dialer: &D,
+    withdrawn: &R,
 ) -> Result<()> {
     socks::negotiate(&mut stream).await?;
     let target = socks::read_connect(&mut stream).await?;
@@ -192,15 +229,26 @@ async fn handle<D: HostDialer>(
     // version banner, so a dial that waits for bytes would deadlock against a client that
     // waits for this.
     socks::write_reply(&mut stream, Reply::Succeeded, UNSPECIFIED).await?;
-    carry(&conn, &room, port, stream).await
+    match carry(&conn, &room, port, stream).await {
+        // The session was established and then cut by a decision. Report it; every other
+        // ending is silent (M17.11).
+        Err(Error::TunnelRevoked(why)) => {
+            withdrawn(&room.channel_id, port);
+            Err(Error::TunnelRevoked(why))
+        }
+        other => other,
+    }
 }
 
 /// Open a tunnel stream to the room's host and splice `local` into it.
 ///
 /// **The port is the service tag** (ADR-017 decision 4), so nothing here invents a name,
-/// and the host's evaluator decides whether the dial is allowed — this side claims
-/// nothing. A refusal closes the local connection, which the tool sees as the peer hanging
-/// up, and says nothing about why (dark services, ADR-013).
+/// and the **host** decides whether the dial is allowed — this side claims nothing. Since
+/// M17.7 that decision is the host's trust keyring intersected with the room's author set,
+/// not a capability this side could hold or present. A refusal closes the local connection,
+/// which the tool sees as the peer hanging up, and says nothing about why (dark services,
+/// ADR-013); a *withdrawal mid-session* is the one ending that names itself, because a peer
+/// whose established session is cut already knows it had one.
 async fn carry(
     conn: &Arc<VoxConnection>,
     room: &ServiceRoom,

@@ -1342,10 +1342,17 @@ impl ChannelState {
         {
             return Err(Error::MalformedTunnel("service tag length"));
         }
-        let me = profile.signer()?.fingerprint();
-        if !self.can_bind(&me, service_tag) {
-            return Err(Error::TunnelDenied("no bind capability for this service"));
-        }
+        // **No `bind:` check.** Withdrawn with the capability model it belonged to (ADR-017
+        // decision 3 as revised, M17.7): offering a port of *this* machine is not the room's
+        // business. What the room governs is *reach*, and that is the dial gate's job.
+        //
+        // Keeping it would have left the two halves gated by different models, only one of
+        // which moved: reach became the host's own decision while offering still needed a
+        // capability whose only sources were the genesis grant and `vox grant --may-bind`,
+        // both withdrawn — so a plain member could be reachable and still unable to offer
+        // anything. A non-creator simply could not serve. Found by the agent-comms session
+        // hitting it from the file-exchange side, which is where it bit first.
+        let _ = profile;
         let fresh = !self.services.contains_key(service_tag);
         if fresh && self.services.len() >= MAX_SERVICES {
             return Err(Error::SizeLimitExceeded("channel services"));
