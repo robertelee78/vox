@@ -106,15 +106,21 @@ async fn invite(h: &NodeHandle, cid: [u8; 32]) -> String {
 }
 
 async fn join(h: &NodeHandle, url: &str, cid: [u8; 32], name: &str) {
-    assert!(
-        h.apply(NodeCommand::JoinChannel {
+    // The outcome is printed, not hidden behind `is_done()`. A bare "carol joins"
+    // says nothing about *why*, and this gate has failed that way more than once —
+    // `Unreachable` (nothing answered the dial) and a semantic refusal need
+    // completely different responses, and the assertion could not tell them apart.
+    let out = h
+        .apply(NodeCommand::JoinChannel {
             link: url.to_owned(),
             local_name: "team".into(),
             passphrase: secret("channel passphrase"),
         })
-        .await
-        .is_done(),
-        "{name} joins"
+        .await;
+    assert!(
+        out.is_done(),
+        "{name} joins: {out:?}\n  link given: {url}\n  {name} listening: {:?}",
+        h.view().listening
     );
     let _ = wait_for(h, |e| match e {
         NodeEvent::Joined { channel_id, .. } if channel_id == cid => Some(()),
