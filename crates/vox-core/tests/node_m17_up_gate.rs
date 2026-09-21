@@ -191,23 +191,24 @@ async fn m17_a_service_is_reached_by_name_through_vox_up() {
     let guest_ep = VoxEndpoint::bind(&guest_signer, "127.0.0.1:0".parse().unwrap()).unwrap();
     let conn = Arc::new(guest_ep.connect(host_addr, host_id, NOW).await.unwrap());
 
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = probe.local_addr().unwrap();
-    drop(probe);
+    // Bind once and hand the live listener over (M17.16). This used to bind a probe, read
+    // its port, drop it and let `up::serve` re-bind — and then **poll up to 200 times**
+    // waiting for the address to become connectable. That polling loop was this gate
+    // accommodating a product defect: the address was announced over a window where
+    // nothing was listening, and the port was stealable in between. A bound socket accepts
+    // into the kernel's backlog from the moment of bind, so there is nothing to wait for
+    // and the loop is gone. `service_rehearsal_proof` is what caught it, by connecting
+    // once, as a person would.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
     tokio::spawn(up::serve(
-        proxy_addr,
+        listener,
         Arc::new(resolver),
         Arc::new(OneConnection {
             host: room.host,
             conn,
         }),
     ));
-    for _ in 0..200 {
-        if TcpStream::connect(proxy_addr).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
 
     // ---- the client: exactly what `ssh` does through a ProxyCommand ----
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();

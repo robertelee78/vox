@@ -197,7 +197,9 @@ fn echo_service() -> u16 {
 /// a resolver.
 fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> std::io::Result<TcpStream> {
     let mut s = TcpStream::connect(proxy)?;
-    s.set_read_timeout(Some(Duration::from_secs(60)))?;
+    // Longer than `node::up::HOST_PATIENCE`, or this times out on the proxy's own wait
+    // and reports EAGAIN instead of what the proxy decided.
+    s.set_read_timeout(Some(Duration::from_secs(150)))?;
     // Greeting: one method, "no authentication".
     s.write_all(&[0x05, 0x01, 0x00])?;
     let mut hello = [0u8; 2];
@@ -367,9 +369,15 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     // failing and then working if they try again. `node::up::reach_host_with_patience` now
     // waits inside the request instead, so a single CONNECT succeeds. If that regresses,
     // this line goes red rather than quietly costing every user their first attempt.
+    let t0 = Instant::now();
     let mut stream = socks5_connect(bound, &hostname, service_port).unwrap_or_else(|e| {
         panic!("the FIRST SOCKS5 CONNECT to {hostname}:{service_port} must succeed: {e}")
     });
+    eprintln!(
+        "[test] first CONNECT succeeded after {:?} — this is what a person waits for \
+         between `vox up` and their first `ssh`",
+        t0.elapsed()
+    );
     stream
         .write_all(payload)
         .expect("write through the overlay");

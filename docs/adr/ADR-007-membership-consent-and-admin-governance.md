@@ -200,8 +200,19 @@ clause was not true of the implementation: joining released one sender key autom
 
 ### Consent is keyring-caused, and that is an invariant
 
-**Every consent grant MUST be caused by an entry in the granting identity's trust keyring.** There is no
-other path, and a consent grant with no corresponding ring entry is a bug by definition. Two entry points
+**Every consent grant MUST be caused by an entry in the granting identity's trust keyring.** A consent
+grant with no corresponding ring entry is a bug by definition.
+
+> **This is a requirement, and it is NOT yet true of the tree. Corrected 2026-09-21 after review.**
+> An earlier version of this paragraph said "there is no other path", which was false when written:
+> `NodeCommand::Consent` calls `release_key_to` directly and never touches the ring
+> (`node/actor.rs::consent`), so the human-facing approval path creates exactly the grant this invariant
+> forbids. M17.6 removed the *join* path's automatic release and its gate proves that; the gate never
+> exercises `NodeCommand::Consent`, so it does not prove the invariant, and the ADR should not have
+> claimed it. All three reviewers of ADR-017 M17.7 made this their first finding.
+>
+> Making it true is M17.7's first item: `NodeCommand::Consent` becomes ring entry point 2 (ADR-020
+> decision 3), so the approval *is* the ring add and `deliver_owed_consents` issues the grant. Two entry points
 reach the ring — a direct `vox trust add`, or approving a member in a room — and they are two ways to make
 one decision rather than two mechanisms (ADR-020 decision 3).
 
