@@ -75,16 +75,18 @@ pub async fn serve(
 /// from loopback, so `sshd` records `127.0.0.1` for all of them (ADR-017 decision 6).
 /// The identity is known here, so this is where it is surfaced.
 ///
-/// `try_send`, not `send`: this runs inside the accept path, between authorization and
-/// the local connect, and a client that has stopped draining its event queue must not
-/// be able to stall a tunnel. The event is therefore best-effort for a live client and
-/// is **not** an audit record — ADR-013's signed session events remain its own item.
+/// This runs inside the accept path, between authorization and the local connect, so a
+/// client that has stopped draining events must not be able to stall a tunnel. Since
+/// M19.1 that is the property of *every* node event, not a local workaround here:
+/// emission is a non-blocking broadcast (ADR-020 §7), so the plain `send` below cannot
+/// wait on anybody. The event remains best-effort for a live client and is **not** an
+/// audit record — ADR-013's signed session events remain its own item.
 pub async fn serve_reporting(
     client: Digest32,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     snapshot: HostSnapshot,
-    events: Option<tokio::sync::mpsc::Sender<NodeEvent>>,
+    events: Option<tokio::sync::broadcast::Sender<NodeEvent>>,
 ) -> Result<()> {
     session::accept_reporting(
         send,
@@ -100,7 +102,7 @@ pub async fn serve_reporting(
         },
         |channel_id, tag| {
             if let Some(tx) = events {
-                let _ = tx.try_send(NodeEvent::TunnelServed {
+                let _ = tx.send(NodeEvent::TunnelServed {
                     channel_id: *channel_id,
                     client,
                     service_tag: tag.to_owned(),

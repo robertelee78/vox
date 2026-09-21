@@ -27,7 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 
 use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
@@ -52,8 +52,22 @@ use crate::transport::quic::VoxConnection;
 
 /// Command queue depth (commands beyond it apply backpressure to the client).
 const COMMAND_QUEUE: usize = 64;
-/// Event queue depth. A client that stops draining events eventually blocks the
-/// actor's event emission; the TUI drains continuously (ADR-015).
+/// Event buffer depth, per subscriber (ADR-020 §7).
+///
+/// This is a **broadcast** buffer, not a queue: emission never blocks and never
+/// applies backpressure, however many clients are attached and whatever they do.
+/// A subscriber that falls more than `EVENT_QUEUE` events behind is *told* it
+/// lagged (`EventStreamItem::Lagged`) and resumes at the oldest retained event.
+///
+/// Dropping events is safe **by construction, and only because of it**: an event
+/// is a wake, never the delivery mechanism. Durable state is the ADR-008 log and
+/// the [`NodeView`] watch, so a lagging client re-reads instead of missing
+/// anything. Before M19.1 this was an `mpsc` queue and one client that stopped
+/// draining blocked the actor after exactly this many events — stalling sync and
+/// every command with it.
+///
+/// A burst larger than this buffer drops for **every** subscriber, not merely the
+/// slow one, so no client may treat the stream as complete.
 const EVENT_QUEUE: usize = 256;
 
 /// A channel's state, shared so a long-running ADR-008 session can hold it without
@@ -395,11 +409,19 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
 }
 
 /// A client's handle to a running node.
+///
+/// Several clients may hold clones of one handle and each take its own event
+/// stream with [`subscribe`](Self::subscribe); none of them can stall the actor,
+/// and none of them can starve another (ADR-020 §7).
 #[derive(Debug, Clone)]
 pub struct NodeHandle {
     cmd_tx: mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
     view_rx: watch::Receiver<NodeView>,
-    events: Arc<Mutex<mpsc::Receiver<NodeEvent>>>,
+    /// Kept so a client may subscribe at any time after the node started.
+    event_tx: broadcast::Sender<NodeEvent>,
+    /// The handle's own stream, backing [`NodeHandle::next_event`] — the
+    /// single-consumer convenience the TUI and the gates use.
+    events: Arc<Mutex<broadcast::Receiver<NodeEvent>>>,
 }
 
 impl NodeHandle {
@@ -425,14 +447,99 @@ impl NodeHandle {
         rx.await.unwrap_or(Outcome::Failed(Fault::ShuttingDown))
     }
 
+    /// An independent event stream for this client.
+    ///
+    /// Every subscriber receives every event emitted after it subscribed, and a
+    /// subscriber that falls behind is told so rather than silently skipped — see
+    /// [`EventStreamItem`]. Taking a stream costs the actor nothing and no
+    /// subscriber can slow it down or starve another (ADR-020 §7).
+    #[must_use]
+    pub fn subscribe(&self) -> EventStream {
+        EventStream {
+            rx: self.event_tx.subscribe(),
+        }
+    }
+
     /// The next ordered event, or `None` once the actor has stopped.
+    ///
+    /// The single-consumer convenience over this handle's own stream: it **drops
+    /// a lag report and keeps going**, so a caller that falls behind silently
+    /// misses events. That is right for the TUI, whose events drive unread counts
+    /// and notices while the durable state comes from [`NodeHandle::view`] — but
+    /// a client that must not miss anything wants [`subscribe`](Self::subscribe)
+    /// instead, so it can see the lag and re-read the log from its cursor.
     pub async fn next_event(&self) -> Option<NodeEvent> {
-        self.events.lock().await.recv().await
+        let mut rx = self.events.lock().await;
+        loop {
+            match rx.recv().await {
+                Ok(ev) => return Some(ev),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
     }
 
     /// Non-blocking event poll (for a synchronous UI loop).
+    ///
+    /// Lossy on lag for the same reason as [`next_event`](Self::next_event).
     pub fn try_next_event(&self) -> Option<NodeEvent> {
-        self.events.try_lock().ok()?.try_recv().ok()
+        let mut rx = self.events.try_lock().ok()?;
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => return Some(ev),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+/// One item from a [`NodeHandle::subscribe`] stream.
+///
+/// Deliberately **not** `#[non_exhaustive]`, unlike [`NodeEvent`]: this is a
+/// closed algebra — a subscriber either received an event or missed some — and a
+/// catch-all arm is precisely how a lag report would come to be silently
+/// swallowed, which ADR-020 §7 forbids. If a third case is ever needed, every
+/// consumer should be made to look at it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventStreamItem {
+    /// An event from the node.
+    Event(NodeEvent),
+    /// This subscriber fell behind and `missed` events were dropped for it.
+    ///
+    /// **Not an error, and nothing is lost that matters**: an event is a wake,
+    /// not the delivery mechanism. The durable record is the ADR-008 log, so the
+    /// correct response is to re-read from this client's cursor (ADR-020 §7).
+    /// Emission is never slowed by a slow subscriber, which is what makes this
+    /// possible — and what stops one wedged client stalling the node.
+    Lagged(u64),
+}
+
+/// An independent per-client event stream (see [`NodeHandle::subscribe`]).
+#[derive(Debug)]
+pub struct EventStream {
+    rx: broadcast::Receiver<NodeEvent>,
+}
+
+impl EventStream {
+    /// The next item, or `None` once the actor has stopped and the buffer is
+    /// drained.
+    pub async fn next(&mut self) -> Option<EventStreamItem> {
+        match self.rx.recv().await {
+            Ok(ev) => Some(EventStreamItem::Event(ev)),
+            Err(broadcast::error::RecvError::Lagged(n)) => Some(EventStreamItem::Lagged(n)),
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    }
+
+    /// Non-blocking poll. `None` means "nothing right now", which is **not** the
+    /// same as the stream having ended.
+    pub fn try_next(&mut self) -> Option<EventStreamItem> {
+        match self.rx.try_recv() {
+            Ok(ev) => Some(EventStreamItem::Event(ev)),
+            Err(broadcast::error::TryRecvError::Lagged(n)) => Some(EventStreamItem::Lagged(n)),
+            Err(_) => None,
+        }
     }
 }
 
@@ -508,7 +615,7 @@ pub struct Node {
     clock: Clock,
     argon2: Argon2Profile,
     view_tx: watch::Sender<NodeView>,
-    event_tx: mpsc::Sender<NodeEvent>,
+    event_tx: broadcast::Sender<NodeEvent>,
 }
 
 impl Node {
@@ -582,7 +689,10 @@ impl Node {
             None
         };
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
-        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
+        let (event_tx, event_rx) = broadcast::channel(EVENT_QUEUE);
+        // The handle keeps the sender so any number of clients may subscribe
+        // later (ADR-020 §7); the actor keeps its own clone to emit with.
+        let handle_event_tx = event_tx.clone();
         let (net_tx, net_rx) = mpsc::channel(NET_QUEUE);
         let node = Self {
             paths,
@@ -630,6 +740,7 @@ impl Node {
         Ok(NodeHandle {
             cmd_tx,
             view_rx,
+            event_tx: handle_event_tx,
             events: Arc::new(Mutex::new(event_rx)),
         })
     }
@@ -685,7 +796,7 @@ impl Node {
         self.stop_network();
         self.lock_all().await;
         self.publish().await;
-        let _ = self.event_tx.send(NodeEvent::Shutdown).await;
+        let _ = self.event_tx.send(NodeEvent::Shutdown);
     }
 
     async fn handle(&mut self, command: NodeCommand) -> Outcome {
@@ -810,7 +921,7 @@ impl Node {
                     self.lock_all().await;
                     return Outcome::Failed(fault_of(&e));
                 }
-                let _ = self.event_tx.send(NodeEvent::Unlocked).await;
+                let _ = self.event_tx.send(NodeEvent::Unlocked);
                 Outcome::Done
             }
             Err(e) => Outcome::Failed(fault_of(&e)),
@@ -1279,14 +1390,11 @@ impl Node {
                 self.refresh_network_view().await;
                 if let Ok(o) = outcome {
                     if o.rendered > 0 || o.governance > 0 {
-                        let _ = self
-                            .event_tx
-                            .send(NodeEvent::Synced {
-                                channel_id,
-                                applied: o.applied as u64,
-                                rendered: o.rendered as u64,
-                            })
-                            .await;
+                        let _ = self.event_tx.send(NodeEvent::Synced {
+                            channel_id,
+                            applied: o.applied as u64,
+                            rendered: o.rendered as u64,
+                        });
                     }
                 }
             }
@@ -1438,8 +1546,7 @@ impl Node {
         }
         let _ = self
             .event_tx
-            .send(NodeEvent::PeerJoined { channel_id, peer })
-            .await;
+            .send(NodeEvent::PeerJoined { channel_id, peer });
     }
 
     /// Dial `peer`, reusing a live connection, and make sure a stream loop is serving
@@ -1546,13 +1653,10 @@ impl Node {
                 Ok(l) => l,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             };
-        let _ = self
-            .event_tx
-            .send(NodeEvent::InviteLink {
-                channel_id: *channel_id,
-                url: link.to_url(),
-            })
-            .await;
+        let _ = self.event_tx.send(NodeEvent::InviteLink {
+            channel_id: *channel_id,
+            url: link.to_url(),
+        });
         Outcome::Done
     }
 
@@ -1765,13 +1869,10 @@ impl Node {
         if !released.is_done() {
             return released;
         }
-        let _ = self
-            .event_tx
-            .send(NodeEvent::Joined {
-                channel_id: parsed.channel_id,
-                responder,
-            })
-            .await;
+        let _ = self.event_tx.send(NodeEvent::Joined {
+            channel_id: parsed.channel_id,
+            responder,
+        });
         Outcome::Done
     }
 
@@ -1847,13 +1948,10 @@ impl Node {
     async fn consent(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
         let outcome = self.release_key_to(channel_id, target).await;
         if outcome.is_done() {
-            let _ = self
-                .event_tx
-                .send(NodeEvent::Consented {
-                    channel_id: *channel_id,
-                    target,
-                })
-                .await;
+            let _ = self.event_tx.send(NodeEvent::Consented {
+                channel_id: *channel_id,
+                target,
+            });
         }
         outcome
     }
@@ -1884,15 +1982,12 @@ impl Node {
         // The revocation is a log fact the whole channel converges on.
         self.note_local_append(channel_id);
         let rekeyed = self.deliver_rekeys_for(channel_id).await;
-        let _ = self
-            .event_tx
-            .send(NodeEvent::Revoked {
-                channel_id: *channel_id,
-                target,
-                generation,
-                rekeyed,
-            })
-            .await;
+        let _ = self.event_tx.send(NodeEvent::Revoked {
+            channel_id: *channel_id,
+            target,
+            generation,
+            rekeyed,
+        });
         Outcome::Done
     }
 
@@ -2487,14 +2582,11 @@ impl Node {
             _ => None,
         };
         if let Some(n) = backfilled {
-            let _ = self
-                .event_tx
-                .send(NodeEvent::SenderKeyReceived {
-                    channel_id,
-                    peer,
-                    backfilled: n as u64,
-                })
-                .await;
+            let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
+                channel_id,
+                peer,
+                backfilled: n as u64,
+            });
         }
     }
 
@@ -2533,7 +2625,7 @@ impl Node {
             p.lock();
         }
         if was_unlocked {
-            let _ = self.event_tx.send(NodeEvent::Locked).await;
+            let _ = self.event_tx.send(NodeEvent::Locked);
         }
     }
 
@@ -2553,8 +2645,7 @@ impl Node {
                 self.publish_channel_to_anchors(&id).await;
                 let _ = self
                     .event_tx
-                    .send(NodeEvent::ChannelOpened { channel_id: id })
-                    .await;
+                    .send(NodeEvent::ChannelOpened { channel_id: id });
                 Outcome::Done
             }
             Err(e) => Outcome::Failed(fault_of(&e)),
@@ -2607,8 +2698,7 @@ impl Node {
         self.publish_channel_to_anchors(&id).await;
         let _ = self
             .event_tx
-            .send(NodeEvent::ChannelOpened { channel_id: id })
-            .await;
+            .send(NodeEvent::ChannelOpened { channel_id: id });
         Outcome::Done
     }
 
@@ -2628,12 +2718,9 @@ impl Node {
                 self.refresh_network_view().await;
                 self.publish_channel_locally(channel_id).await;
                 self.publish_channel_to_anchors(channel_id).await;
-                let _ = self
-                    .event_tx
-                    .send(NodeEvent::ChannelOpened {
-                        channel_id: *channel_id,
-                    })
-                    .await;
+                let _ = self.event_tx.send(NodeEvent::ChannelOpened {
+                    channel_id: *channel_id,
+                });
                 Outcome::Done
             }
             Err(e) => Outcome::Failed(fault_of(&e)),
@@ -2651,12 +2738,9 @@ impl Node {
                     net.membership().clear_channel(channel_id);
                 }
                 self.refresh_network_view().await;
-                let _ = self
-                    .event_tx
-                    .send(NodeEvent::ChannelClosed {
-                        channel_id: *channel_id,
-                    })
-                    .await;
+                let _ = self.event_tx.send(NodeEvent::ChannelClosed {
+                    channel_id: *channel_id,
+                });
                 Outcome::Done
             }
             None => Outcome::Failed(Fault::ChannelNotOpen),
@@ -2795,14 +2879,11 @@ impl Node {
             channel_id: *channel_id,
         });
         tokio::spawn(crate::node::up::serve(bound, resolver, dialer));
-        let _ = self
-            .event_tx
-            .send(NodeEvent::ProxyUp {
-                channel_id: *channel_id,
-                hostname,
-                bind: bound,
-            })
-            .await;
+        let _ = self.event_tx.send(NodeEvent::ProxyUp {
+            channel_id: *channel_id,
+            hostname,
+            bind: bound,
+        });
         Outcome::Done
     }
 
@@ -2834,15 +2915,12 @@ impl Node {
                 let (channel_id, host, service_tag, bound) =
                     (fwd.channel_id, fwd.host, fwd.service_tag.clone(), fwd.local);
                 self.forwards.insert(bound, fwd);
-                let _ = self
-                    .event_tx
-                    .send(NodeEvent::Forwarding {
-                        channel_id,
-                        host,
-                        service_tag,
-                        local: bound,
-                    })
-                    .await;
+                let _ = self.event_tx.send(NodeEvent::Forwarding {
+                    channel_id,
+                    host,
+                    service_tag,
+                    local: bound,
+                });
                 Outcome::Done
             }
             Err(e) => Outcome::Failed(fault_of(&e)),
@@ -2896,13 +2974,10 @@ impl Node {
             ch.should_rotate_sender(now) && ch.rotate_sender(profile.store(), now).is_ok();
         drop(ch);
         let channel_id = *channel_id;
-        let _ = self
-            .event_tx
-            .send(NodeEvent::NewEntry {
-                channel_id,
-                row: appended,
-            })
-            .await;
+        let _ = self.event_tx.send(NodeEvent::NewEntry {
+            channel_id,
+            row: appended,
+        });
         // ADR-016: push immediately after a local append. Marking it here and
         // letting the tick do the work keeps authoring off the network path.
         self.note_local_append(&channel_id);
