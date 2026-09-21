@@ -193,7 +193,23 @@ A key enters the keyring by **two entry points, one ring** (decider, 2026-09-21)
    create a room-scoped grant alongside it.
 
 These are two ways to reach the same decision, not two mechanisms — which is what keeps this ADR's
-original requirement intact. A provision-time export/import file **MAY** be provided as a bulk wrapper
+original requirement intact.
+
+> **Named drift, 2026-09-21: the tree currently has two mechanisms, not one.** Recorded here rather than in
+> a commit message because another session is working in this area and should not build on the split.
+>
+> | Command | What it does today | What the model requires |
+> |---|---|---|
+> | `NodeCommand::Trust { fingerprint, petname }` (`node/actor.rs:843` → `:1974`) | adds to the ring, persists, then auto-consents in every shared room at once | correct — this is entry point 1 |
+> | `NodeCommand::Consent { channel_id, target }` (`node/actor.rs:841` → `:1961`) | calls `release_key_to` directly and **never touches the ring**, producing a room-scoped read grant that the ring does not know about | must **become** entry point 2: approving a member in a room adds them to the ring, and the room is context for the prompt rather than the scope of the grant |
+>
+> Until that lands (ADR-017 M17.7), a `Consent` in one room grants nothing in any other, which is the
+> behaviour the decider replaced. Two further notes for whoever implements it:
+>
+> - `consent()` and the join path **share** `release_key_to` (`node/actor.rs:1786`). M17.6 removes the
+>   *join's call to it*, not the function — it remains the legitimate delivery mechanism for a ring entry.
+> - `Untrust` (`:847`) is forward-looking only and must come to change the lock (M17.14). A node that
+>   untrusts today keeps being read. A provision-time export/import file **MAY** be provided as a bulk wrapper
 over entry point 1; it **MUST NOT** be a third path.
 
 Because entry point 2 confers a **standing** relationship covering rooms that do not exist yet, the
