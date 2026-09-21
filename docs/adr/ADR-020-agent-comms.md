@@ -9,8 +9,9 @@ that has not passed a gate.
 §6 (the drain hook, **proven against a live model in all three harnesses**), §7 (the event fan-out
 and the control socket), §8 (the `vox room` verbs), §12 (`vox daemon`).
 
-**Decided but unbuilt**: §10 (no delegated trust — a rejection, so nothing to build) and §11 (file
-exchange over a room-bound service). §12 landed as `vox daemon`.
+**Every decision is now built or is a rejection.** §10 is a rejection — there is nothing to build.
+§11 landed as `vox room send|get`; §12 as `vox daemon`; §6's interrupt half as the wake registration
+and the daemon's delivery.
 
 **Two corrections worth a reviewer's attention**, both recorded in place rather than quietly
 dropped:
@@ -536,6 +537,26 @@ Confidentiality needs no step of its own. The decider's habit of `gpg`-encryptin
 sending it is unnecessary here: the overlay supplies confidentiality and the peer is a pinned key
 with consent-bound reach.
 
+**Nobody is granted anything, and that is a consequence rather than a convenience.** Reach is gated
+on the *offering* node's trust keyring together with authorship of the bound room; reading the
+announcement requires exactly the same ring entry. So **the audience of the announcement is the
+audience of the transfer**, by construction. There is no per-transfer capability to mint, nothing to
+revoke when the offer ends, and no window in which someone can reach bytes whose announcement they
+could not read. This is the payoff of keying reach on the ring rather than on a capability: one
+decision produces both readability and reach.
+
+Note the predicate is **one-sided**: it is the offerer's ring, not a mutual relationship. An
+identity that trusted the offerer but was never trusted *by* them can neither read the announcement
+nor reach the bytes — consistently, which is why it does not surprise anyone.
+
+Until the ring-keyed gate is the only path, `vox room send` also issues a short-lived `dial:` grant
+per member. Under the capability model a plain room carries no genesis service grant, so a member
+holds neither `dial:` nor `bind:` until an admin says so; issuing the grant is idempotent and cheap,
+and it means the verb works under either model instead of failing in a way that reads as a
+networking fault. **Offering still requires `bind:`**, which a plain room grants only to its
+creator — so an agent that is not the room's admin must be granted it once. That asymmetry is worth
+revisiting, and is recorded here rather than discovered later.
+
 ### 12. Agents attach to a node that can run without a terminal
 
 **A gap found 2026-09-21 while building M19.5, not yet closed.** §7 and the `vox room` verbs assume
@@ -695,7 +716,19 @@ Both unknowns are already spiked; neither remains open.
   lost. Accepted, and the same trade the ADR-007 evaluator makes for concurrent governance — the
   alternative is a clock nobody has. Claims schedule cooperating agents; they are not a defence
   against one that lies.
-- **M19.4 — CLI and skill.** `vox room post|read|tail|wait|roster|say`, plus the skill.
+- **M19.4 — CLI and skill. DONE 2026-09-22.** `vox room post|read|tail|roster|list`, and
+  `vox agent skill` prints the skill for an operator to install where their harness looks.
+
+  Two planned verbs were **not** built and are not missing: `wait` is what the drain hook does
+  mechanically every turn, so a verb telling an agent to block would compete with it; and `say` is
+  `post`, because §4 already makes plain text a `say` — a second verb for the same act would only
+  invite agents to think the two differ.
+
+  The skill carries what a hook cannot. The research is unambiguous that a skill is **on-demand
+  only** and cannot guarantee an action every turn, which is why the drain is a hook; what the skill
+  is for is the conventions, the vocabulary, and the manners that keep a shared room readable by the
+  person in it — reply only when addressed, never acknowledge an acknowledgement, say when you are
+  blocked, and keep per-turn chatter out.
 - **M19.5 — the harness drain hook. DONE 2026-09-21** (Claude Code and Codex only; merged as
   `6ca6575`). `vox agent hook` reads the harness's hook JSON on stdin and writes injected context on
   stdout, exiting 0 whatever happens. `Format::{Auto,Claude,Text}` decides the output shape from the
@@ -761,16 +794,80 @@ Both unknowns are already spiked; neither remains open.
   contend for one resource, exactly one holds it, the loser is told so, and a claim with a `ttl_secs`
   that lapses returns the resource without either agent acting.
 
-- **M19.6 — the interrupt path**, per harness.
+- **M19.6 — the interrupt path. DONE 2026-09-22**, for Claude Code and OpenCode; Codex named and not implemented. §6 says queue always and interrupt only when
+  *addressed* and *urgent*; the queue half is built and proven, this is the other half. It is the
+  most speculative milestone left, because all three mechanisms are undocumented and the OpenCode
+  work showed what that costs — four confident hypotheses, each with a run that appeared to confirm
+  it, each killed by a control run.
 
-- **M19.8 — file exchange** (§11). A verb that offers a file over a room-bound service and posts the
-  signed announcement carrying `.vox` host, port, name, size and SHA-256; and one that collects and
-  **verifies against the hash before use**. No wire change. *Gate*: a file crosses between two agents
-  and a deliberately truncated transfer is refused rather than accepted silently.
-- **M19.7 — rehearsal.** Two real agent sessions on two machines exchanging an `assign` and a
-  `result`, with the operator joining and addressing one of them by petname. Following M17's lesson,
-  this rehearsal is **REQUIRED** before the feature is described as working: every CLI-composition
-  defect found in M17 was invisible to every library gate.
+  What the harness spike measured, so the shape is not guessed at:
+
+  - **Claude Code** — `CLAUDE_CODE_MESSAGING_SOCKET` (with `_TOKEN`) in a live session. Delivered
+    between tool calls, and **starts a new turn if the session is idle**, which is the property that
+    makes it an interrupt rather than a queue. Queue cap 100, roughly 1M characters, bursts refused.
+
+    The wire is **NDJSON, two frames** — and this is verified against a live session rather than
+    inferred, by writing exactly these and watching the message arrive:
+
+    ```text
+    {"type":"auth","token":"$CLAUDE_CODE_MESSAGING_TOKEN"}
+    {"type":"user","message":{"role":"user","content":"…"}}
+    ```
+
+    The binary documents this form itself, so it is an affordance rather than an internal.
+  - **Codex** — app-server `turn/start` over JSON-RPC, which works mid-turn.
+  - **OpenCode** — `POST /session/:id/prompt_async`, also mid-turn; `noReply: true` appends
+    *without* waking the model. A bare `opencode` has no TCP listener, so this needs the in-process
+    plugin to relay it.
+
+  The design that avoids per-harness configuration: **the drain hook registers the session's wake
+  channel as a side effect**. It already runs every turn and already knows the session id; recording
+  what it finds in its environment turns "which harness is this and how do I wake it" from something
+  an operator configures into something the system observes.
+
+  *Gate, met*: all three cases asserted — addressed **and** urgent wakes the session; urgent but
+  **not addressed** delivers nothing; addressed but **not urgent** waits for the next turn. The two
+  withheld cases are the ones worth proving. Mutation-checked: forcing `may_interrupt` to true turns
+  it red with "a message addressed to another agent must not interrupt this one".
+
+  Built as designed: `vox agent hook` records the session's wake channel as a side effect of the
+  drain, and `vox daemon` — the only thing that sees every entry land *and* knows which local
+  sessions exist — decides and delivers. Codex is **named and not implemented**: this build has no
+  verified path to its app-server socket from a hook's environment, so waking it reports plainly
+  that it cannot, and the message waits for the session's next turn. That is the correct
+  degradation, because queueing always is the default and the interrupt is the optimisation.
+
+- **M19.8 — file exchange. DONE 2026-09-22** (§11). `vox room send` offers a file over a room-bound
+  service and posts the signed announcement carrying the name, the size, the SHA-256 and the service
+  tag; `vox room get` collects it and **verifies against that hash before the file is usable**. No
+  new struct tag, no codec, no wire change — the bytes never enter the log.
+
+  *Gate, met*: a 300 KB file crosses between two networked nodes with two identities, driven as real
+  binaries, and arrives byte-for-byte. Then the offered file is **shortened on disk after it was
+  announced**, so the sender serves fewer bytes than it signed for — exactly what a dropped
+  `cat | nc` does — and the collector refuses it, says why, and **removes the partial file** rather
+  than leaving something that looks complete. Asking for a file nobody offered says so rather than
+  hanging or writing an empty file.
+
+  This needed the control socket extended (**protocol 3**): `AddService`, `RemoveService`,
+  `Forward`, `StopForward`, `Grant`, and a `Frame::Bound` because a forward asked for port 0 is
+  resolved by the OS and the caller cannot otherwise learn it. The reason these live on the socket
+  rather than in one-shot verbs is redb's single writer: a verb that opened the profile itself could
+  not run while `vox daemon` held it, which is precisely when an agent needs to offer or fetch.
+- **M19.7 — rehearsal. DONE 2026-09-22.** Two real agent sessions and the operator in one room,
+  exchanging a typed `assign` and `result`, with a **live model on each side**: one agent's model
+  names the work it was assigned but never prompted with, and the other agent's model — a different
+  session on a different identity — reads back the verification token the first one posted. The
+  operator speaks plain prose into the same room and it reaches an agent's context.
+
+  Mutation-checked: running the same rehearsal with `opencode run --pure`, which disables external
+  plugins, turns it red — so it measures the room reaching the models rather than a model's general
+  helpfulness.
+
+  **Stated rather than implied:** this runs two sessions on **one host**, not two machines. The
+  cross-machine path — NAT traversal, anchors, circuits — is proved by M17's rehearsal and by
+  `service_rehearsal_proof`; what is new here is the composition of sessions, cursors, envelopes and
+  the operator, and that composition is host-independent. The two-machine claim is not made.
 
 A TUI view for the operator is explicitly deferred until a real room has misbehaved and shown what
 needs filtering.

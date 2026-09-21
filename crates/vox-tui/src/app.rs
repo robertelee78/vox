@@ -455,6 +455,54 @@ pub fn run_daemon(
         );
     }
 
+    // **The interrupt path (ADR-020 §6).** The daemon is the only thing that sees
+    // every entry as it lands and also knows which local sessions exist, so it is
+    // where "addressed and urgent" turns into a wake. The rule is deliberately
+    // narrow: a message interrupts only if it names this agent *and* is marked
+    // urgent. Everything else waits for the next turn, because an interrupt that
+    // fires on everything is a queue with worse manners.
+    {
+        let node = node.clone();
+        let paths = paths.clone();
+        rt.spawn(async move {
+            let mut events = node.subscribe();
+            while let Some(item) = events.next().await {
+                let vox_core::node::actor::EventStreamItem::Event(
+                    vox_core::node::api::NodeEvent::NewEntry { channel_id, row },
+                ) = item
+                else {
+                    continue;
+                };
+                let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
+                    continue;
+                };
+                let room = vox_core::node::link::b32_encode(&channel_id);
+                for session in crate::wake::registered(&paths) {
+                    if session.room != room || session.name.is_empty() {
+                        continue;
+                    }
+                    if !envelope.may_interrupt(&session.name) {
+                        continue;
+                    }
+                    let text = format!(
+                        "Urgent message for you in Vox room {}:\n\n{}",
+                        &room[..12.min(room.len())],
+                        envelope.body.trim()
+                    );
+                    if let Err(e) = crate::wake::wake(&session, &text).await {
+                        // Reported, never fatal: an agent that cannot be interrupted
+                        // still reads the message on its next turn, which is the
+                        // whole point of queueing always.
+                        eprintln!(
+                            "vox daemon: could not interrupt session {}: {e}",
+                            session.session
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     rt.block_on(async {
         // **SIGHUP must be explicitly ignored, not merely left unhandled.** Its
         // default disposition is to terminate the process, so "we do not handle it"

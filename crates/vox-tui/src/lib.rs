@@ -32,3 +32,4 @@ pub mod ui;
 pub mod update;
 pub mod verify;
 pub mod viewmodel;
+pub mod wake;

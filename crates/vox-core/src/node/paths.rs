@@ -22,6 +22,8 @@ pub const STORE_FILE: &str = "store.redb";
 pub const SOCKET_FILE: &str = "node.sock";
 /// Directory of per-session read cursors inside a profile.
 pub const CURSOR_DIR: &str = "cursors";
+/// Where a harness session records how it can be woken (ADR-020 §6).
+pub const SESSION_DIR: &str = "sessions";
 /// The default profile name.
 pub const DEFAULT_PROFILE: &str = "default";
 
@@ -116,6 +118,20 @@ impl Paths {
     #[must_use]
     pub fn cursor_dir(&self) -> PathBuf {
         self.profile_dir.join(CURSOR_DIR)
+    }
+
+    /// Where a session records its wake channel.
+    #[must_use]
+    pub fn session_file(&self, session: &str) -> PathBuf {
+        self.profile_dir
+            .join(SESSION_DIR)
+            .join(format!("{}.json", sanitize(session)))
+    }
+
+    /// The directory holding every session's wake channel.
+    #[must_use]
+    pub fn session_dir(&self) -> PathBuf {
+        self.profile_dir.join(SESSION_DIR)
     }
 }
 

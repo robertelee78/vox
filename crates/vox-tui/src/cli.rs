@@ -255,6 +255,48 @@ enum RoomCmd {
     Handoff(HandoffArgs),
     /// Show what is taken, by whom, and until when.
     Board(RoomRefArgs),
+    /// Offer a file to the room and announce it (ADR-020 §11).
+    ///
+    /// The bytes never enter the log: they ride a room-bound service, and what
+    /// goes on the log is a signed announcement carrying the name, the size and
+    /// the **SHA-256**. Runs until interrupted, because the bytes are served
+    /// live — the announcement outlives the offer, so an agent that wakes late
+    /// sees what was sent and is told plainly if it can no longer be collected.
+    ///
+    /// Nobody is granted anything: whoever can read the announcement can reach
+    /// the bytes, because both are gated on this node's trust keyring.
+    Send(SendFileArgs),
+    /// Collect a file offered in this room, verifying it against the announced
+    /// SHA-256 before it is usable.
+    ///
+    /// A mismatch removes the partial file rather than leaving something that
+    /// looks complete — a truncated `nc` transfer is the classic way this bites.
+    Get(GetFileArgs),
+}
+
+/// `vox room send`
+#[derive(Args, Debug, Clone)]
+pub struct SendFileArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The file to offer.
+    pub path: PathBuf,
+}
+
+/// `vox room get`
+#[derive(Args, Debug, Clone)]
+pub struct GetFileArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The file's name, or a prefix of its SHA-256, or its service tag.
+    pub file: String,
+    /// Where to write it. Defaults to the announced name in the current directory.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 /// `vox daemon`
@@ -335,6 +377,16 @@ enum AgentCmd {
     ///
     /// The plugin is a shim over `vox agent hook`, not a second implementation.
     Plugin(AgentPluginArgs),
+    /// Print the agent-facing skill: the conventions, vocabulary and manners of a
+    /// shared room (ADR-020 §8).
+    ///
+    /// A skill is on-demand only, so it cannot be what guarantees an agent reads
+    /// its room — that is `vox agent hook`'s job. This carries what a hook cannot.
+    ///
+    /// ```text
+    /// vox agent skill > .claude/skills/vox-agent-comms/SKILL.md
+    /// ```
+    Skill,
 }
 
 /// `vox agent plugin`
@@ -757,6 +809,8 @@ pub fn run() -> ExitCode {
                 RoomCmd::Claim(a) => &a.profile,
                 RoomCmd::Release(a) => &a.profile,
                 RoomCmd::Handoff(a) => &a.profile,
+                RoomCmd::Send(a) => &a.profile,
+                RoomCmd::Get(a) => &a.profile,
             };
             let paths = match profile.paths() {
                 Ok(p) => p,
@@ -796,6 +850,10 @@ pub fn run() -> ExitCode {
                         crate::room_cli::handoff_resource(&paths, &a.room, &a.resource, &a.to).await
                     }
                     RoomCmd::Board(a) => crate::room_cli::board(&paths, &a.room).await,
+                    RoomCmd::Send(a) => crate::room_cli::send_file(&paths, &a.room, &a.path).await,
+                    RoomCmd::Get(a) => {
+                        crate::room_cli::get_file(&paths, &a.room, &a.file, a.out.as_deref()).await
+                    }
                 }
             });
             match outcome {
@@ -864,6 +922,10 @@ pub fn run() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Cmd::Agent(AgentCmd::Skill) => {
+            print!("{}", crate::agent_hook::AGENT_SKILL);
+            ExitCode::SUCCESS
         }
         Cmd::Agent(AgentCmd::Plugin(args)) => match args.harness.to_ascii_lowercase().as_str() {
             "opencode" => {
