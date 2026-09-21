@@ -205,6 +205,55 @@ fn m15_a_member_reaches_one_it_never_joined_with_from_the_bundle_record() {
             });
         assert!(sender_is_alice, "Carol attributes the message to Alice");
 
+        // ---- and the connection works in BOTH directions (M17.6b) ----
+        //
+        // The half above proves Alice can *deliver* over a connection she made from a
+        // bundle record. It passed while the reverse half was broken, which is the point
+        // of adding this: `reach_member` called `net.reach` directly instead of going
+        // through `dial`, so the actor never adopted the connection — no receive loop, no
+        // sync schedule, no upgrade behind a relayed path. A QUIC connection is
+        // bidirectional, so Carol reaches *back* along the very same connection, and
+        // nothing on Alice's side was reading it.
+        //
+        // So: Carol consents to Alice, and Alice must read what Carol writes.
+        //
+        // **This does NOT prove the adoption fix, and must not be cited as if it did.**
+        // Mutation-checked honestly: with `reach_member` reverted to `net.reach` the
+        // assertion below still passes, in 254s instead of 54s — because Carol also
+        // dials Alice, whose *accept* loop adopts that connection, so the log converges
+        // eventually by a slower route. What this holds is the property itself (the
+        // reverse direction works), which is worth holding. The adoption fix rests on
+        // the removed divergence and on that 5x timing, not on this going red.
+        let out = carol
+            .apply(NodeCommand::Consent {
+                channel_id: cid,
+                target: alice_fp,
+            })
+            .await;
+        assert!(out.is_done(), "Carol consents to Alice: {out:?}");
+        assert!(carol
+            .apply(NodeCommand::SendText {
+                channel_id: cid,
+                text: "and you can hear me too".into(),
+            })
+            .await
+            .is_done());
+        until(&alice, "Alice to read Carol's message", |v| {
+            texts(v, cid).iter().any(|t| t == "and you can hear me too")
+        })
+        .await;
+        let sender_is_carol = alice
+            .view()
+            .open_channels
+            .iter()
+            .find(|d| d.channel_id == cid)
+            .is_some_and(|d| {
+                d.timeline
+                    .iter()
+                    .any(|r| r.text == "and you can hear me too" && r.author == carol_fp)
+            });
+        assert!(sender_is_carol, "Alice attributes the message to Carol");
+
         for h in [&alice, &bob, &carol] {
             assert!(h.apply(NodeCommand::Shutdown).await.is_done());
         }

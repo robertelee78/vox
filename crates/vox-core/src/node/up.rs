@@ -34,6 +34,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 
@@ -75,16 +76,28 @@ pub trait HostDialer: Send + Sync {
 /// Loopback only, and enforced: this proxy carries traffic into rooms this machine is a
 /// member of, so exposing it to the network would hand that membership to anyone who can
 /// reach the port.
-pub async fn serve<D>(bind: SocketAddr, resolver: Arc<VoxResolver>, dialer: Arc<D>) -> Result<()>
+pub async fn serve<D>(
+    listener: TcpListener,
+    resolver: Arc<VoxResolver>,
+    dialer: Arc<D>,
+) -> Result<()>
 where
     D: HostDialer + 'static,
 {
+    // The caller binds and hands the live listener over, rather than passing an address
+    // for this function to bind (M17.16). Binding here meant the caller had to bind once
+    // to learn the port, **drop it**, and let this re-bind — which announced an address
+    // twice over a window where nothing was listening, and let any other process steal the
+    // port in between, with the failure invisible because this task's `Result` is dropped.
+    //
+    // Handing over a bound listener closes both: the kernel accepts into its backlog from
+    // the moment of bind, so the address is connectable the instant the caller can name it.
+    let bind = listener
+        .local_addr()
+        .map_err(|_| Error::Unreachable("the vox proxy listener has no address"))?;
     if !bind.ip().is_loopback() {
         return Err(Error::MalformedTunnel("vox up binds loopback only"));
     }
-    let listener = TcpListener::bind(bind)
-        .await
-        .map_err(|_| Error::Unreachable("cannot bind the vox proxy"))?;
     loop {
         let Ok((stream, from)) = listener.accept().await else {
             continue;
@@ -98,6 +111,44 @@ where
             // One connection's failure is its own; the proxy keeps serving.
             let _ = handle(stream, &resolver, dialer.as_ref()).await;
         });
+    }
+}
+
+/// How long one request waits for the host to become reachable before refusing.
+///
+/// The proxy binds before it can reach anybody, deliberately (see [`HostDialer`]), so the
+/// first request can arrive before this node has read the board and learned where the host
+/// is. Refusing immediately made that visible as a product defect: the automated rehearsal
+/// (`service_rehearsal_proof`) sees **two** refusals over about four seconds before a
+/// CONNECT succeeds, which for a person is `ssh` failing and then working if they try
+/// again.
+///
+/// Waiting *inside one request* does not bring back the problem the eager dial had. That
+/// one blocked **binding**, so a proxy which came up could refuse everything for ever;
+/// this blocks only the request that is waiting, on its own task, while every other
+/// request and the accept loop keep running.
+const HOST_PATIENCE: Duration = Duration::from_secs(90);
+
+/// Poll interval while waiting. Short enough that a ready host costs a person nothing.
+const HOST_POLL: Duration = Duration::from_millis(250);
+
+/// A connection to `host`, waiting up to [`HOST_PATIENCE`] for one to become possible.
+///
+/// `None` means it stayed unreachable for the whole window, which is a refusal a person
+/// should see — the room's host may genuinely be offline.
+async fn reach_host_with_patience<D: HostDialer>(
+    dialer: &D,
+    host: &Digest32,
+) -> Option<Arc<VoxConnection>> {
+    let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
+    loop {
+        if let Some(conn) = dialer.connection(host).await {
+            return Some(conn);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(HOST_POLL).await;
     }
 }
 
@@ -131,7 +182,7 @@ async fn handle<D: HostDialer>(
         socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
         return Err(Error::MalformedTunnel("no such .vox name on this machine"));
     };
-    let Some(conn) = dialer.connection(&room.host).await else {
+    let Some(conn) = reach_host_with_patience(dialer, &room.host).await else {
         socks::write_reply(&mut stream, Reply::GeneralFailure, UNSPECIFIED).await?;
         return Err(Error::Unreachable("no connection to that room's host"));
     };

@@ -378,6 +378,16 @@ pub enum Fault {
     /// consent has already been revoked (ADR-007 — consent is single-writer, so this
     /// is a settled fact, not a race).
     NotConsented,
+    /// The target is in this node's trust keyring, so a **per-room** revocation of it
+    /// would not hold: `deliver_owed_consents` re-issues consent to every trusted
+    /// admitted author on the next tick, so the revocation would heal itself within
+    /// seconds and silently (found by review, 2026-09-21).
+    ///
+    /// It is also incoherent with the model: trust is an identity-level, room-independent
+    /// decision (ADR-020 decision 3), so there is no such thing as trusting someone
+    /// except in one room. Withdraw the trust instead — `Untrust` removes the entry and
+    /// changes the lock in **every** shared room (ADR-017 M17.14).
+    StillTrusted,
     /// The requested local bind address is not a loopback address. A forward carries
     /// traffic into a room *this* machine is a member of, so binding it anywhere the
     /// network can reach would hand that membership to whoever reaches the port

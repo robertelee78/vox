@@ -31,7 +31,7 @@ mod watchdog;
 use std::time::Duration;
 
 use vox_core::node::actor::{Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, NodeView, Secret};
+use vox_core::node::api::{Fault, NodeCommand, NodeEvent, NodeView, Outcome, Secret};
 use vox_core::node::paths::Paths;
 
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -347,4 +347,127 @@ fn m19_trusting_carol_too_lets_her_read() {
         "with Carol trusted the keyring must let her read, but she rendered {carol_texts:?} \
          — if this fails the gate above proves nothing about the keyring"
     );
+}
+
+/// **A per-room `Revoke` of a trusted identity must not heal itself** (found by the
+/// three-model review of ADR-017 M17.7, 2026-09-21).
+///
+/// The fail-open, exactly: `owed_consents` is *trusted admitted authors this identity has
+/// not consented to yet*. A `Revoke` removes the target from the consent set on the log —
+/// and leaves it in the ring. So on the next tick it is "owed" again, and
+/// `deliver_owed_consents` re-issues the grant. Revocation undid itself, silently, within
+/// seconds, and nothing said so.
+///
+/// It is refused rather than special-cased, because "revoked here but still trusted" is
+/// not a state the model has: trust is an identity-level, room-independent decision
+/// (ADR-020 decision 3). `Untrust` is the act that means it, and it changes the lock in
+/// every shared room (ADR-017 M17.14).
+///
+/// This drives the node, so it holds the behaviour a person meets. The stronger form —
+/// the real binary — is `service_rehearsal_proof`'s shape and is not yet built for trust.
+#[test]
+#[ignore = "production Argon2id; CI runs it in release with the other gates"]
+fn m19_revoking_a_trusted_identity_is_refused_rather_than_undone() {
+    watchdog::arm();
+    let rt = runtime();
+    let tmp = tempfile::tempdir().unwrap();
+
+    rt.block_on(async {
+        let alice = node(&tmp, "alice").await;
+        let bob = node(&tmp, "bob").await;
+        let bob_fp = bob.view().identity.unwrap().fingerprint;
+
+        assert!(alice
+            .apply(NodeCommand::CreateChannel {
+                local_name: "room".into(),
+                passphrase: secret("channel passphrase"),
+            })
+            .await
+            .is_done());
+        let cid = alice.view().channels[0].channel_id;
+        assert!(alice
+            .apply(NodeCommand::Invite { channel_id: cid })
+            .await
+            .is_done());
+        let url = wait_for(&alice, |e| match e {
+            NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
+            _ => None,
+        })
+        .await;
+        assert!(bob
+            .apply(NodeCommand::JoinChannel {
+                link: url,
+                local_name: "room".into(),
+                passphrase: secret("channel passphrase"),
+            })
+            .await
+            .is_done());
+        let _ = wait_for(&bob, |e| match e {
+            NodeEvent::Joined { channel_id, .. } if channel_id == cid => Some(()),
+            _ => None,
+        })
+        .await;
+        until(&alice, "bob admitted", |v| {
+            v.open_channels
+                .iter()
+                .find(|c| c.channel_id == cid)
+                .is_some_and(|c| c.members.contains(&bob_fp))
+        })
+        .await;
+
+        // Alice trusts Bob, which is what makes him readable, via the tick.
+        assert!(alice
+            .apply(NodeCommand::Trust {
+                fingerprint: bob_fp,
+                petname: "bob".into(),
+            })
+            .await
+            .is_done());
+        until(&alice, "alice to have consented to bob", |v| {
+            v.trusted.iter().any(|(fp, _)| *fp == bob_fp)
+        })
+        .await;
+        let _ = wait_for(&bob, |e| match e {
+            NodeEvent::SenderKeyReceived { channel_id, .. } if channel_id == cid => Some(()),
+            _ => None,
+        })
+        .await;
+
+        // The refusal. Before this, `Revoke` succeeded and the tick quietly undid it.
+        let out = alice
+            .apply(NodeCommand::Revoke {
+                channel_id: cid,
+                target: bob_fp,
+            })
+            .await;
+        assert_eq!(
+            out,
+            Outcome::Failed(Fault::StillTrusted),
+            "a per-room Revoke of a trusted identity must be refused — it cannot hold \
+             while the ring still names the target, because the tick re-consents. Got {out:?}"
+        );
+
+        // And the refusal changed nothing: Bob is still trusted and still a reader, so the
+        // node did not half-apply a revocation it then declined to finish.
+        assert!(
+            alice.view().trusted.iter().any(|(fp, _)| *fp == bob_fp),
+            "a refused Revoke must leave the ring untouched"
+        );
+
+        // Untrust is the act that means it, and it is accepted.
+        assert!(alice
+            .apply(NodeCommand::Untrust {
+                fingerprint: bob_fp
+            })
+            .await
+            .is_done());
+        assert!(
+            !alice.view().trusted.iter().any(|(fp, _)| *fp == bob_fp),
+            "untrust removes the ring entry"
+        );
+
+        for h in [&alice, &bob] {
+            assert!(h.apply(NodeCommand::Shutdown).await.is_done());
+        }
+    });
 }

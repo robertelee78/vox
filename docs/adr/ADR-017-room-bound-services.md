@@ -30,7 +30,7 @@ shipped. The material ones, and what changed:
   exists to close, through another door**, and no amount of fixing `learn_members` touches it. Found
   independently by two reviewers. Decision 3 now requires explicit consent in both directions and the
   automatic release is removed.
-- **`bind:` was orphaned.** `add_service` checks `can_bind` (`governance/channel.rs:1232`) and the only two
+- **`bind:` was orphaned.** `add_service` checks `can_bind` (`node/channel.rs`'s `add_service`) and the only two
   sources of `bind:` were the genesis grant and `vox grant --may-bind` — both withdrawn, so `vox serve`
   would have worked for a room's creator and silently failed for everyone else. Found by all three.
   Resolved by deleting the capability: offering a local port of one's own machine is not the room's
@@ -41,7 +41,7 @@ shipped. The material ones, and what changed:
   have made the *name's* authentication classical in a system whose composite key is 1,984 bytes
   (`hash.rs:42`). Decision 1 changed.
 - **A governance frame would have leaked the descriptor's existence.** Framed payload kinds are publicly
-  classifiable to every log holder (`governance/channel.rs:546`), so a dedicated entry kind announces "a
+  classifiable to every log holder (`node/channel.rs`'s `classify_payload`), so a dedicated entry kind announces "a
   service descriptor is here" even with its body sealed — defeating the rule that an unapproved member must
   not learn a service exists. Decision 9 now publishes the descriptor as **content**.
 - **Three claims about the tree were false** and are corrected in place rather than quietly dropped:
@@ -65,7 +65,7 @@ to** — and "explicitly approved readers" and "identities in the host's ring" n
 and a chat-versus-agent-comms context were both considered and rejected. See decision 3.
 
 Descriptor freshness is keyed to the host's ADR-006 `chain_id` **and** to explicit publication triggers —
-`chain_id` alone is insufficient because approving a reader does not advance it (`governance/channel.rs:1311`),
+`chain_id` alone is insufficient because approving a reader does not advance it (`node/channel.rs`'s `issue_consent`),
 which would have left a newly approved reader unable to open the standing descriptor. See decision 9, which
 records why the decision as first taken was on a wrong premise.
 
@@ -148,7 +148,7 @@ Three facts shape the rest of the design:
   unauthorized client can fetch the descriptor and still learn nothing about how to reach the service.
   Vox reaches the same end by a different means (decision 9): the descriptor is published as **content**,
   sealed to the host's consented readers by machinery that already exists, because a dedicated entry kind
-  would itself announce that a descriptor is there (`governance/channel.rs:546`).
+  would itself announce that a descriptor is there (`node/channel.rs`'s `classify_payload`).
 
 ## Decision
 
@@ -288,9 +288,9 @@ no member can answer at all"* — which is satisfied by the pairwise session, no
 | **Genesis service grant** (`GenesisBody::service_grant`) | capabilities conferred on every admitted member, no certificate issued | admission is a secret + a proof of work, not a human decision; this made every syncing peer's author set into an access list |
 | **`service-grant-exclusion` (`0x0013`)** | per-member revocation of the above | it exists only to revoke a grant that will not exist. The wire tag is retired and not reused |
 | **`vox grant <room> <member> <tag>`** | an explicit per-member, per-service capability on the log | redundant under consent, and a second authorization surface that can drift out of step with the first |
-| **The `bind:` capability class** and `add_service`'s `can_bind` check (`governance/channel.rs:1232`) | authority to *offer* a service, from the genesis grant or `vox grant --may-bind` | **binding a port of one's own machine is not the room's business.** Reach is what the room governs. Keeping `bind:` after withdrawing both its sources would have left `vox serve` working only for a room's creator — which review found, and which was an accident rather than a decision |
+| **The `bind:` capability class** and `add_service`'s `can_bind` check (`node/channel.rs`'s `add_service`) | authority to *offer* a service, from the genesis grant or `vox grant --may-bind` | **binding a port of one's own machine is not the room's business.** Reach is what the room governs. Keeping `bind:` after withdrawing both its sources would have left `vox serve` working only for a room's creator — which review found, and which was an accident rather than a decision |
 | **`vox serve` creating a room** | one command created a room, set the grant and minted an invite | a service now binds to a room that already exists |
-| **`Evaluator::build_with_members(authors.keys())`** | the genesis grant evaluated over every admitted author (`governance/channel.rs:935`) | this is finding #1's proximate cause |
+| **`Evaluator::build_with_members(authors.keys())`** | the genesis grant evaluated over every admitted author (`node/channel.rs`'s `build_evaluator`) | this is finding #1's proximate cause |
 | **Automatic consent on join** (`release_key_to(responder)`) | the joiner's sender key released to whoever answered the join | it is a reach grant issued with no human act, and the choice of recipient is influenceable |
 
 #### What the decider gives up, stated plainly
@@ -635,7 +635,7 @@ host's ring**.
 
 It is published as **ordinary content**, not as a governance frame. This is the change review forced, and
 the reason is concrete: framed payload kinds are publicly classifiable to every holder of the log
-(`governance/channel.rs:546`), so a dedicated descriptor kind announces *"a service descriptor is here"* even
+(`node/channel.rs`'s `classify_payload`), so a dedicated descriptor kind announces *"a service descriptor is here"* even
 with its body sealed — and an opaque payload is rejected by the classifier rather than carried. A governance
 frame therefore cannot satisfy the rule that an unapproved member must not learn a service exists. Content
 can: it is already sealed to the author's consented readers, so an unapproved member sees an ordinary entry
@@ -691,8 +691,8 @@ read it:
 
 | Trigger | Why `chain_id` misses it |
 |---|---|
-| consent **revoked** | `chain_id` advances (`governance/channel.rs:1508`; `SenderChain::rotated`, `group/state.rs:269`) — this one it catches |
-| consent **granted** | `issue_consent` records the *current* generation and does not rotate (`governance/channel.rs:1311`), so a newly approved reader would never see the standing descriptor. **This would have broken decision 3's "immediately"** |
+| consent **revoked** | `chain_id` advances (`node/channel.rs`'s `revoke_consent`; `SenderChain::rotated`, `group/state.rs:269`) — this one it catches |
+| consent **granted** | `issue_consent` records the *current* generation and does not rotate (`node/channel.rs`'s `issue_consent`), so a newly approved reader would never see the standing descriptor. **This would have broken decision 3's "immediately"** |
 | a port added or removed | no consent change at all |
 | the local endpoint replaced (`--at`) | ditto |
 | the service withdrawn | ditto — and a retraction must be published, not merely omitted |
@@ -768,7 +768,7 @@ is no longer one:
 **Leaving one room does not disturb a service bound to another.** Bindings are per (service, room); the
 nonce, and therefore the name, is per (host, room) by decision 4.
 
-**A passphrase rotation is a total wipe at the channel layer** (`governance/channel.rs:2025`): every
+**A passphrase rotation is a total wipe at the channel layer** (`node/channel.rs`'s passphrase rotation): every
 certificate and every exclusion goes, and consent must be re-issued. For services that means, explicitly:
 every audience empties, every descriptor becomes unopenable, and **every host must re-approve its readers and
 republish**. No service survives a rotation silently, and none is silently re-granted either — which is the
@@ -776,7 +776,7 @@ property the withdrawn `0x0013` failed to have. `vox serve` reports this when it
 not republished for.
 
 **Rooms that already exist cannot simply lose a genesis field.** `GenesisBody::service_grant` participates in
-the genesis signature **and** in the channelID hash (`governance/genesis.rs:245`), so deleting the field would
+the genesis signature **and** in the channelID hash (`governance/genesis.rs`'s `GenesisBody`), so deleting the field would
 change the identity of every room created with one, or make their genesis unreadable. Review called this the
 most dangerous omission in the first draft, and it is. The rule:
 
@@ -886,6 +886,69 @@ an earlier claim that it was:** M17.4.
   (`vox-tui/src/cli.rs:332`, `node/actor.rs:2763`). **The M17.3 gate (`node_m17_up_gate`) asserts the
   vulnerability**: it supplies a member set and zero governance entries, then proves successful traffic
   (`tests/node_m17_up_gate.rs:118`). It must be rewritten, not extended.
+  - **Rehearsed end to end, 2026-09-21.** Four real commands on one machine, two profiles and a
+    headless anchor: `vox node` → `vox serve 22` → `vox connect <address>` → `vox up <room>` →
+    `ssh user@<52-char>.vox`. The host's own `sshd` answered through the overlay — remote software
+    version `OpenSSH_10.3`, a completed SSH transport handshake, and authentication failing only for
+    want of a key. **Three defects the gates could not have caught**, all of them in the composition
+    rather than the mechanism, are recorded here because they are the argument for rehearsing at all:
+    1. **The generated passphrase did not match itself.** `vox serve` handed the node the hyphenated
+       form while `vox connect` stripped the hyphens, so every join was refused with no indication
+       why. The release gate could not see it: it drove the node API directly and used one passphrase
+       value for both sides.
+       The first fix was wrong and is worth recording. It canonicalized — strip hyphens — at "the
+       node's boundary", making a hyphen never part of a room passphrase. That broke an existing test
+       immediately, for the right reason: a joiner calling `NodeNet::start_join` directly bypasses that
+       boundary, so a room created through the node and joined through the library derived two
+       different secrets. A rule any direct caller can violate silently is worse than no rule.
+       **The fix is symmetry, not canonicalization:** the hyphens are part of the secret, nothing
+       strips them, and there is deliberately no function that could. What is printed is what both
+       sides use, byte for byte. The cost — a listener who drops the dashes gets it wrong — is real and
+       accepted: this string is copied beside a 277-character address, not retyped.
+    2. **`vox node` printed an anchor spec nobody could dial.** A wildcard bind advertises `0.0.0.0`,
+       which names every interface to the kernel and nothing to a peer; it was printed as something to
+       paste into `--anchor`. Undialable addresses are now filtered out of that line.
+    3. **`vox up` refused to start on a race.** It dialled the host *before* binding, so a node that
+       had only just joined — and therefore had not yet read the board — could not find the host and
+       the command failed intermittently. Retrying inside the actor would have made it worse, because
+       the actor is what reads the board. The dial is now **per request**: the proxy binds at once and
+       asks the node to reach the host when a connection arrives.
+  - **Automated as a real-binary proof. *Done 2026-09-21* (M17.15).**
+    `crates/vox-tui/tests/service_rehearsal_proof.rs` runs the same four commands as **real
+    child processes** over three separate profiles: `vox node` (whose printed `--anchor` spec
+    the proof parses and uses, so an undialable spec fails there), `vox serve <port>` (whose
+    room id, `vox://` address and **generated passphrase** are taken from its stdout and used
+    verbatim, so a passphrase that does not match itself fails there), `vox connect`, and
+    `vox up`. A **real SOCKS5 client** in the proof then sends the `.vox` **name** — not an
+    address, which is the `socks5h` behaviour the design requires — and real bytes through a
+    real TCP echo service, which must come back byte-identical. Nothing reaches into
+    `vox_core`: if a person could not do it from a shell, the proof does not do it.
+
+    **It found a product defect on its first run, which is the argument for it.** The proxy
+    refused the first two CONNECTs over about four seconds — `Reply::GeneralFailure`, because
+    `vox up` binds before it can reach the host (deliberately) and the first request can
+    arrive before this node has read the board. For a person that is `ssh` failing and then
+    working if they try again. Fixed by `node::up::reach_host_with_patience`: one request now
+    waits up to 20s for the host, polling every 250ms, *inside that request's own task*. That
+    does not reinstate the problem the eager dial had — that one blocked **binding**, so a
+    proxy which came up could refuse everything for ever; this blocks only the request that
+    is waiting. The proof asserts **one CONNECT, first try, no retry loop**, and is
+    mutation-checked: reverting the patience makes it fail with the user-visible symptom.
+
+    Two further observations recorded rather than fixed: `vox up` requires the **room
+    passphrase** even though the join is durable, because the room's store is sealed under it
+    (ADR-010) — so a guest keeps the passphrase for as long as it wants the service, not
+    merely to join once; and the host's own stdout is the only place client attribution can
+    come from, since the service sees every Vox client as `127.0.0.1` (decision 6), which the
+    proof asserts.
+
+  - **Superseded by the above (was: being automated).** The rehearsal above was run by hand, which is
+    why its findings are recorded as prose rather than as a gate that would catch a regression. It is
+    becoming `crates/vox-tui/tests/service_rehearsal_proof.rs`: the same four commands as **real child
+    processes**, asserting real bytes through a real TCP service. The decider's rule is that a test counts
+    only if it drives the shipped binary — *"if we have cargo tests at all they have to be real or they're
+    just noise"* — and this is the one that proves the service feature works. It lands **before** M17.7, so
+    that changing the authorization cannot silently break the product.
 - **M17.4 — *not built.*** Anchors as configuration. `vox node` prints a spec to paste; `<config_dir>/anchors`
   does not exist.
 - **M17.5 — *superseded by M17.10.*** `0x000F` advertisements become decision 9's content descriptor.
@@ -898,9 +961,14 @@ New work, in dependency order:
   `release_key_to(responder)` (`node/actor.rs:1764`), which issued consent that no ring entry caused.
   Gate: a bundle record synced from a peer's board does not make its subject a member; a node that joins a
   room through a member has issued that member **no** consent, verified by the responder being unable to
-  read the joiner's first message until the joiner trusts it; and **no consent grant exists anywhere on the
-  log without a corresponding ring entry on its issuer** — the invariant itself, asserted over a run that
-  joins, syncs and vouches.
+  read the joiner's first message until the joiner trusts it.
+
+  **What this gate does NOT prove, corrected after review.** An earlier version of this item claimed it
+  asserted "no consent grant exists anywhere on the log without a corresponding ring entry on its issuer"
+  — the ADR-007 invariant. It does not: the gate never calls `NodeCommand::Consent`, and that path writes
+  a grant without touching the ring, so the invariant is **false in the tree and untested**. All three
+  reviewers made it their first finding. It becomes true in M17.7, whose gate must exercise the approval
+  path, and the claim is withdrawn here rather than left standing.
 
   **What landed**, `sec_no_consent_without_a_ring_entry.rs`:
 
@@ -964,9 +1032,9 @@ New work, in dependency order:
 
   `node_m14_gate` is also what caught the ordering bug above.
 - **M17.7 — consent is the authorization.** `build_evaluator` stops passing `authors.keys()`
-  (`governance/channel.rs:935`); the dial check keys off **(in the host's trust keyring) AND (in the bound
+  (`node/channel.rs`'s `build_evaluator`); the dial check keys off **(in the host's trust keyring) AND (in the bound
   room)**. `vox grant`, `GenesisBody::service_grant`'s authorization role and the `bind:` class with
-  `add_service`'s `can_bind` check (`governance/channel.rs:1232`) are removed. `vox serve` takes a room,
+  `add_service`'s `can_bind` check (`node/channel.rs`'s `add_service`) are removed. `vox serve` takes a room,
   creates none, and names its audience and non-audience. The consent prompt states that approval confers
   service reach. Gate: an unapproved member is refused, an approved one reaches the service, the transition
   happens on the approval alone with no second command, and a member who is not the room's creator can
@@ -1003,7 +1071,7 @@ New work, in dependency order:
   copied verbatim into another room does not resolve there; two hosts serving `:22` in one room are reached
   by their own names and never each other's; and a rebound port does not answer on a stale name.
 - **M17.13 — compatibility, and it ships with M17.7.** The genesis field and `0x0013` keep parsing so every
-  existing room keeps its channelID (`governance/genesis.rs:245`); neither is consulted for authorization;
+  existing room keeps its channelID (`governance/genesis.rs`'s `GenesisBody`); neither is consulted for authorization;
   creating a genesis with the field is refused. Gate: a room created by v0.1.0 opens, verifies and keeps its
   channelID under the new code, and its genesis grant authorizes nobody. Release notes state that a
   mixed-version peer still applies the old rules **to its own services**, bounded there because every host

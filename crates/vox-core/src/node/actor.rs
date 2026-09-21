@@ -839,7 +839,22 @@ impl Node {
                 passphrase,
             } => self.join_channel(&link, &local_name, &passphrase).await,
             NodeCommand::Consent { channel_id, target } => self.consent(&channel_id, target).await,
-            NodeCommand::Revoke { channel_id, target } => self.revoke(&channel_id, target).await,
+            NodeCommand::Revoke { channel_id, target } => {
+                // A per-room revocation of a **trusted** identity does not hold: the ring
+                // still names it, so `deliver_owed_consents` re-issues consent on the next
+                // tick and the revocation heals itself, silently, within seconds. Found by
+                // review 2026-09-21; it was a fail-open at the centre of the gate.
+                //
+                // Refusing rather than special-casing, because the alternative is
+                // incoherent: trust is room-independent (ADR-020 decision 3), so "revoked
+                // here but still trusted" is not a state the model has. `Untrust` is the
+                // act that means it, and it changes the lock everywhere (M17.14).
+                if self.trust.is_trusted(&target) {
+                    Outcome::Failed(Fault::StillTrusted)
+                } else {
+                    self.revoke(&channel_id, target).await
+                }
+            }
             NodeCommand::Trust {
                 fingerprint,
                 petname,
@@ -2651,16 +2666,27 @@ impl Node {
     /// which is not a membership property — it made delivery depend on connection
     /// history rather than on the room.
     async fn reach_member(
-        &self,
+        &mut self,
         channel_id: &Digest32,
         target: Digest32,
     ) -> Option<Arc<crate::transport::quic::VoxConnection>> {
-        let net = self.net.as_ref()?;
+        let net = self.net.as_ref().map(Arc::clone)?;
         if let Some(conn) = net.manager().existing(&target) {
             return Some(conn);
         }
         let endpoints = net.board_endpoints(channel_id, &target);
-        net.reach(target, &endpoints).await.ok()
+        // **Through `dial`, not `net.reach`.** This called `net.reach` directly and so
+        // produced a connection the actor had never adopted: no receive loop
+        // (`spawn_stream_loop`), no sync schedule, and no upgrade attempt behind a
+        // relayed path. A QUIC connection is bidirectional, so the peer uses that same
+        // connection to reach *back* — and nothing on this side was reading it. The
+        // outbound half worked, which is why the M15 bundle-record gate passed, and the
+        // inbound half silently did not: this node could deliver an SKDM to a member and
+        // then never see a word that member said.
+        //
+        // Delegating removes the divergence rather than patching it, so the two paths
+        // cannot drift again.
+        self.dial(target, &endpoints).await.ok()
     }
 
     /// The pairwise session for `(channel, target)`, opening one from that member's
@@ -3064,15 +3090,20 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return Outcome::Failed(Fault::NotNetworked);
         };
-        let bound = match tokio::net::TcpListener::bind(bind).await {
-            Ok(l) => match l.local_addr() {
-                Ok(a) => {
-                    drop(l);
-                    a
-                }
-                Err(_) => return Outcome::Failed(Fault::Internal),
-            },
+        // Bound **once**, and the live listener is handed to `up::serve` (M17.16). This
+        // used to bind, read the port, drop the listener and let `serve` re-bind it, which
+        // announced an address over a window where nothing was listening — a person who
+        // scripted `vox up & ssh …` got "connection refused" — and left the port stealable
+        // in between, with `serve`'s failure invisible because its task's `Result` is
+        // dropped. A bound socket accepts into the kernel's backlog immediately, so
+        // handing it over makes the announcement truthful the moment it is made.
+        let listener = match tokio::net::TcpListener::bind(bind).await {
+            Ok(l) => l,
             Err(_) => return Outcome::Failed(Fault::Unreachable),
+        };
+        let bound = match listener.local_addr() {
+            Ok(a) => a,
+            Err(_) => return Outcome::Failed(Fault::Internal),
         };
         let resolver = Arc::new(resolver);
         // No dial here: the host is reached per request (see `up::HostDialer`). Dialling
@@ -3082,7 +3113,7 @@ impl Node {
             net,
             channel_id: *channel_id,
         });
-        tokio::spawn(crate::node::up::serve(bound, resolver, dialer));
+        tokio::spawn(crate::node::up::serve(listener, resolver, dialer));
         let _ = self.event_tx.send(NodeEvent::ProxyUp {
             channel_id: *channel_id,
             hostname,
