@@ -1,8 +1,10 @@
 //! The `vox` command-line surface (ADR-015 §"Distribution").
 //!
 //! The interactive TUI is the default (`vox` or `vox tui`); `vox node` runs the
-//! headless anchor (ADR-016 M15.2a); `vox completions <shell>` and `vox man` emit
-//! shell completions and a man page (built from the same clap model, so they never
+//! headless anchor (ADR-016 M15.2a); `vox update` replaces the binary from GitHub
+//! Releases and `vox shell-setup` puts it on `PATH` with completion (ADR-015
+//! §"Install and update"); `vox completions <shell>` and `vox man` emit shell
+//! completions and a man page (built from the same clap model, so they never
 //! drift from the real flags). [`run`] is the single entry the binary calls. The TUI always runs an embedded node over a
 //! profile (ADR-016 M13): `--profile`, `--data-dir`, `--config-dir` select it
 //! (ADR-015 precedence: flags > env > defaults; env `VOX_DATA_DIR` /
@@ -407,6 +409,20 @@ enum Cmd {
         #[arg(long)]
         remove: bool,
     },
+    /// Replace this `vox` with the latest GitHub release (ADR-015).
+    ///
+    /// Fetches the per-target release record, verifies the download's size and SHA-256 against
+    /// it before anything is renamed, keeps the binary it replaced as `.vox-previous`, and
+    /// refreshes your shell completions. Only an install `install.sh` or a previous `vox
+    /// update` made is replaced in place; a build from source is refused, not overwritten.
+    Update {
+        /// Report whether a newer release exists, and change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Put the binary this replaced back, and swap the two, so it is reversible again.
+        #[arg(long, conflicts_with = "check")]
+        rollback: bool,
+    },
     /// Print shell completions for SHELL to stdout.
     Completions {
         /// The shell to generate completions for (bash, zsh, fish, …).
@@ -549,6 +565,13 @@ pub fn run() -> ExitCode {
             })
         }
         Cmd::ShellSetup { remove } => crate::shell::run(remove),
+        Cmd::Update { check, rollback } => match crate::update::run(check, rollback) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "vox", &mut io::stdout());

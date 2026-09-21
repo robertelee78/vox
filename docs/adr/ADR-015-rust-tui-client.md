@@ -1,8 +1,8 @@
 # ADR-015: Rust TUI Client
 
-**Status**: implemented (M12 + M13.5, `crates/vox-tui/`) — live single-device client over the embedded node; network features arrive with M14
+**Status**: implemented (M12 + M13.5, `crates/vox-tui/`) — live client over the embedded node; the network verbs landed with ADR-016 M14–M15 and the room-bound-service CLI with ADR-017 M17
 **Date**: 2026-06-20
-**Updated**: 2026-09-20 — the network verbs are wired (join from a link, invite, consent) and the binary listens (`--listen`); ADR-016 M14.7g. 2026-09-19 — status reconciled; test count corrected; Known gaps recorded. 2026-09-19 (M13.5): live `CoreHandle`, tokio runtime, masked onboarding prompts, composer, idle/SIGHUP lock, primary-buffer + lock gates met; `tui-textarea` dropped.
+**Updated**: 2026-09-21 — `vox update`, `install.sh`, `scripts/package-release.sh`, `scripts/sign-macos.sh` and `.github/workflows/release.yml` implement §Distribution's install/update model, and the marker now **names the channel** (with a `proof` channel that exists so the digest-mismatch refusal can be proved); the absence of an independent release signature is recorded as a known gap. 2026-09-21 — the **install and update model** is specified (GitHub Releases only, a per-target release record fetched through `latest/download`, fail-closed transport, origin-confined redirects, atomic publish with rollback, `vox shell-setup`, signed+notarized macOS artifacts); see §Distribution. 2026-09-20 — the network verbs are wired (join from a link, invite, consent) and the binary listens (`--listen`); ADR-016 M14.7g. 2026-09-19 — status reconciled; test count corrected; Known gaps recorded. 2026-09-19 (M13.5): live `CoreHandle`, tokio runtime, masked onboarding prompts, composer, idle/SIGHUP lock, primary-buffer + lock gates met; `tui-textarea` dropped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: client, tui, rust, terminal, ratatui, verification, consent-ui
 
@@ -207,6 +207,84 @@ A terminal has no camera, so the strong scan path is **relocated to the peer's d
   ADR-013). **Targets macOS and Linux only** — every at-rest/identity mechanism here is POSIX (`mlock`,
   `gpg-agent`, XDG). Windows is **not a target**; supporting it would need its own ADR (DPAPI/`VirtualLock`/
   `%APPDATA%` mappings) only if it is ever wanted — it is not planned.
+
+### Install and update (added 2026-09-21)
+
+The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD** and **MAY** in this section are to be
+interpreted as described in BCP 14 (RFC 2119 and RFC 8174).
+
+`vox` MUST be installable and updatable from **GitHub Releases only** — no vanity domain, no
+third-party host, no account, no package manager.
+
+**The release record.** Every release MUST publish, per target triple, a small JSON record
+`stable-<triple>.json` beside the binary `vox-<triple>` and its `.sha256`:
+
+```json
+{"kind":"vox.standalone-release","schema_version":1,"package":"vox","channel":"stable",
+ "target":"aarch64-apple-darwin","version":"0.1.0","size":12345678,"sha256":"…"}
+```
+
+That record is the **only** "what is current" lookup. It is fetched through GitHub's
+`releases/latest/download/<name>` redirect, which needs no API, no auth and no token
+(spike-verified 2026-09-21: `302` to the newest tag, `302` to `release-assets.githubusercontent.com`,
+`200`). Its `kind`, `schema_version`, `package`, `channel` and `target` MUST all be checked against what was
+asked for before any other field of it is used.
+
+**Fetching MUST fail closed.** `--fail` is REQUIRED on every request, and the HTTP status MUST be
+checked independently of the transport's exit status. Spike-verified 2026-09-21, and the reason this is
+normative rather than stylistic: *without* `--fail`, a `404` returns **exit 0** and writes the response
+body — `Not Found` — into the output file, which would then be parsed as the release record. Worse,
+curl's exit `56` is overloaded: it means both "404 under `--fail`" and "body exceeded
+`--max-filesize`", so the status MUST be read from `%{http_code}` and never inferred from the exit
+code.
+
+**The binary MUST be pinned to the tag the record named**, and MUST NOT be re-fetched through `latest`,
+which can move between the two requests.
+
+**Redirects MUST be confined to GitHub origins** — `github.com`,
+`release-assets.githubusercontent.com`, `objects.githubusercontent.com` — verified from the effective
+URL *after* the transfer. A redirect anywhere else MUST abort the update.
+
+**Size and SHA-256 MUST both be verified** before anything is renamed into place, and the transfer MUST
+be bounded by the record's `size`.
+
+**Publishing MUST be atomic**: write a candidate beside the destination on the same filesystem, retain
+the active binary as a `.previous` copy, then `rename`. `--rollback` MUST put the previous one back.
+
+**Only an install this installer made MAY be updated in place**, identified by a marker file beside the
+binary. A build from source MUST be refused with guidance rather than silently overwritten.
+
+**The marker names the channel.** Its first line is the channel the install follows, so the record it
+resolves is `<channel>-<triple>.json`; `install.sh` writes `stable`. A marker that names nothing usable
+MUST fall back to `stable` rather than refuse — the marker's job is to say "this install is ours", and
+an install that cannot state a channel still follows the default one. The record's own `channel` field
+MUST equal the channel that was asked for.
+
+A second channel is REQUIRED for one reason: a refusal cannot be proved against a record that is
+correct. Every release therefore also publishes `proof-<triple>.json` — the real version, the real
+size, and a **deliberately wrong** `sha256` — so that the updater's "this download does not match the
+release record" path is exercised end to end by ADR-018's proof instead of being assumed. Nothing
+selects that channel by default, so no install can resolve it by accident.
+
+**There is no independent release signature.** The record carries the digest the binary is checked
+against, so the record is the trust anchor, and its integrity rests on TLS to `github.com` plus GitHub
+itself — the same posture as every `curl | sh` installer. On macOS the Developer ID signature is a
+second, independent check; on Linux there is none. A detached signature over the record, verified
+against a key compiled into the binary, is the way to close that, and is deliberately NOT in this
+change: it needs a release key with its own custody story. Recorded here so it is a known gap rather
+than an unexamined assumption.
+
+**Shell integration is `vox shell-setup`** — completions into each shell's own autoload directory and
+one marked block at the *end* of the rc, so it wins the `PATH` race against version managers that
+prepend their shims earlier in the same file. `install.sh` and `vox update` MUST run it after placing
+the binary, and it MUST be skippable (`VOX_NO_SHELL_SETUP=1`) and exactly removable
+(`--remove`). Its proof is the standard ADR-018 cites.
+
+**Targets** are `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. macOS
+artifacts MUST be signed and notarized with a Developer ID: an unsigned download is quarantined by
+Gatekeeper, and "clear the quarantine flag by hand" is not an acceptable first run for a tool whose
+purpose is confidentiality. Signing MUST happen **after** `strip`, which rewrites the Mach-O and
+invalidates any earlier signature.
 
 ## Consequences
 

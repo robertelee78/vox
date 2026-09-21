@@ -7,12 +7,12 @@ resolver = "2"
 members = ["crates/vox-core", "crates/vox-tui"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.94"
 license = "MIT"
 authors = ["Robert E. Lee <robert@agidreams.us>"]
-repository = "https://github.com/agidreams/vox"
+repository = "https://github.com/robertelee78/vox"
 
 # Dependencies shared across crates are pinned here so every crate signs/verifies
 # with the exact same primitive versions (ADR-003: deterministic, agile crypto).

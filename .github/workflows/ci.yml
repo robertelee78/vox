@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # The gaps ADR-018 §3 accepts today, named so that accepting them is a visible decision.
+  # Removing one MUST make the proofs fail until it is closed.
+  VOX_PROOF_ALLOW_UNPROVEN: "fish,journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused"
 
 jobs:
   build-test:
@@ -30,6 +33,9 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test (default, pure-Rust)
         run: cargo test --workspace
+        env:
+          # `update_proof` asks GitHub which releases exist, to find one to update *from*.
+          GH_TOKEN: ${{ github.token }}
       - name: Docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
       # Real-parameter gates that are too slow unoptimized and therefore

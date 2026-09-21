@@ -3,6 +3,9 @@
 **Status**: accepted (2026-09-21) — the policy is in force from this change; the harness lands with it
 and grows per capability
 **Date**: 2026-09-21
+**Updated**: 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
+work, and the two obligations they cannot yet meet are recorded in §3's accepted-gaps table rather
+than skipped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: quality, tests, proof, receipts, gates, methodology
 
@@ -84,9 +87,23 @@ or blocked obligation MUST be recorded as failing or blocked, never as waived-gr
 | Gap | Accepted because | What would close it |
 |---|---|---|
 | `fish` in `shell_setup_proof` | `fish` is not installed on the development machine and is not in CI's default image. `zsh` and `bash` are proved against real shells, including the `compinit`-already-ran case. | installing `fish` on the runner; the proof then covers it with no code change |
+| `journey.update_replaces_an_older_install` in `update_proof` | there is no earlier release to update *from*. The version the binary reports is compiled in, so an older `vox` cannot be fabricated locally. | publishing a second release. The proof already asks GitHub for the newest release other than the current one, fetches it, and drives *its* `vox update`; it starts measuring at `v0.1.1` with no code change |
+| `verify.digest_mismatch_is_refused` in `update_proof` | reaching the updater's digest check needs a release *newer* than the running binary whose record does not describe it, so it is gated behind the same missing earlier release. The equivalent refusals in `install.sh` **are** proved today, against a loopback release server. | the same second release. The `proof-<triple>.json` record ADR-015 requires is published from `v0.1.0` onwards, so this too starts measuring at `v0.1.1` |
 
-The gates therefore run as `VOX_PROOF_ALLOW_UNPROVEN=fish cargo test --workspace`. Removing that
-variable MUST make the proof fail until the gap is closed — that is the point of it.
+The gates therefore run as:
+
+```
+VOX_PROOF_ALLOW_UNPROVEN=fish,journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused \
+  cargo test --workspace
+```
+
+Removing an entry MUST make the proof fail until that gap is closed — that is the point of it. The
+value is set once in `.github/workflows/ci.yml` and `.github/workflows/release.yml`, so the accepted
+gaps are visible in the gate itself and not only here.
+
+An allow-list entry matches either a whole claim id or its first segment, so a gap MAY be accepted
+precisely (`verify.digest_mismatch_is_refused`) rather than by area (`verify`). Accepting by area
+would silently absorb claims added later, which is the failure this section exists to prevent.
 
 ### 4. The in-source unit tests are removed
 
@@ -148,6 +165,13 @@ Each item is one branch, red→green, with this ADR updated in the same change (
 - **M18.2 — remove the unit tests.** Delete the in-source test modules and the `cfg(test)`-only
   scaffolding, retaining exactly the suites in §5. Gate: the nine integration proofs and the six gates
   stay green, and the retained suites still run.
+- **M18.2a — distribution, proved as it was built (done 2026-09-21).** `vox update` and `install.sh`
+  landed with `update_proof` (11 claims: the ownership refusals, the marker→record channel lookup, the
+  live `--fail`/404 premise with its negative control, `--check` changing nothing, and rollback
+  including the `update → shell-setup` edge) and `install_sh_proof` (8 claims, driving the real
+  `install.sh` against a loopback release server: the happy path, and every refusal — wrong digest,
+  wrong size, foreign target, foreign kind, and a `vox` the installer did not install). Both report
+  their blocked claims as failures, which is how the two gaps above came to be written down.
 - **M18.3 — the proof harness.** The node/edge/journey matrix above, driving the shipped binary, with
   retained receipts. Its first obligations are the four edges the rehearsal exercised:
   `anchor → serve`, `serve → connect`, `connect → up`, `up → ssh`. Gate: each of the three known defects
