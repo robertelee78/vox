@@ -242,6 +242,112 @@ enum RoomCmd {
     Roster(RoomRefArgs),
     /// List the rooms this node holds.
     List(ProfileArgs),
+    /// Take a unit of work, so no other agent starts it (ADR-020 §5).
+    ///
+    /// A claim is a **message, not a lock**: nothing is reserved in the node.
+    /// Ownership is whatever the room's log resolves to, so every member computes
+    /// the same answer with nobody coordinating. `--ttl` is what makes an agent
+    /// that dies holding work release it without anyone noticing it died.
+    Claim(ClaimArgs),
+    /// Give a unit of work up. Only the current owner's release counts.
+    Release(ResourceArgs),
+    /// Pass a unit of work to another agent by petname.
+    Handoff(HandoffArgs),
+    /// Show what is taken, by whom, and until when.
+    Board(RoomRefArgs),
+    /// Offer a file to the room and announce it (ADR-020 §11).
+    ///
+    /// The bytes never enter the log: they ride a room-bound service, and what
+    /// goes on the log is a signed announcement carrying the name, the size and
+    /// the **SHA-256**. Runs until interrupted, because the bytes are served
+    /// live — the announcement outlives the offer, so an agent that wakes late
+    /// sees what was sent and is told plainly if it can no longer be collected.
+    ///
+    /// Nobody is granted anything: whoever can read the announcement can reach
+    /// the bytes, because both are gated on this node's trust keyring.
+    Send(SendFileArgs),
+    /// Collect a file offered in this room, verifying it against the announced
+    /// SHA-256 before it is usable.
+    ///
+    /// A mismatch removes the partial file rather than leaving something that
+    /// looks complete — a truncated `nc` transfer is the classic way this bites.
+    Get(GetFileArgs),
+}
+
+/// `vox room send`
+#[derive(Args, Debug, Clone)]
+pub struct SendFileArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The file to offer.
+    pub path: PathBuf,
+}
+
+/// `vox room get`
+#[derive(Args, Debug, Clone)]
+pub struct GetFileArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The file's name, or a prefix of its SHA-256, or its service tag.
+    pub file: String,
+    /// Where to write it. Defaults to the announced name in the current directory.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+/// `vox daemon`
+#[derive(Args, Debug, Clone)]
+pub struct DaemonArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// Read the passphrase from this file instead of stdin, for a service manager
+    /// that prefers one. The file should contain the passphrase and nothing else.
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
+}
+
+/// `vox room claim`
+#[derive(Args, Debug, Clone)]
+pub struct ClaimArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// What is being claimed — a file, a milestone, a crate, whatever the room
+    /// has agreed to name.
+    pub resource: String,
+    /// Seconds after which the claim lapses on its own.
+    #[arg(long)]
+    pub ttl: Option<u64>,
+}
+
+/// `vox room release`
+#[derive(Args, Debug, Clone)]
+pub struct ResourceArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// What is being released.
+    pub resource: String,
+}
+
+/// `vox room handoff`
+#[derive(Args, Debug, Clone)]
+pub struct HandoffArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// What is being handed off.
+    pub resource: String,
+    /// The recipient's petname, as you know them.
+    #[arg(long)]
+    pub to: String,
 }
 
 /// `vox agent` — wiring an agent session into a room.
@@ -258,6 +364,37 @@ enum AgentCmd {
     /// and Codex — and for Codex register it with `async: false`, or the output is
     /// observed and discarded.
     Hook(AgentHookArgs),
+    /// Print the integration a harness needs to run `vox agent hook` every turn.
+    ///
+    /// Claude Code and Codex take a hook command in their own settings, so what
+    /// they need is a JSON snippet. OpenCode has no hook command — it loads
+    /// JavaScript plugins — so what it needs is a plugin file, which this writes
+    /// to stdout:
+    ///
+    /// ```text
+    /// vox agent plugin opencode > ~/.config/opencode/plugin/vox.js
+    /// ```
+    ///
+    /// The plugin is a shim over `vox agent hook`, not a second implementation.
+    Plugin(AgentPluginArgs),
+    /// Print the agent-facing skill: the conventions, vocabulary and manners of a
+    /// shared room (ADR-020 §8).
+    ///
+    /// A skill is on-demand only, so it cannot be what guarantees an agent reads
+    /// its room — that is `vox agent hook`'s job. This carries what a hook cannot.
+    ///
+    /// ```text
+    /// vox agent skill > .claude/skills/vox-agent-comms/SKILL.md
+    /// ```
+    Skill,
+}
+
+/// `vox agent plugin`
+#[derive(Args, Debug, Clone)]
+pub struct AgentPluginArgs {
+    /// The harness to print an integration for. Only `opencode` needs one today;
+    /// Claude Code and Codex are configured with a hook command instead.
+    pub harness: String,
 }
 
 /// `vox agent hook`
@@ -278,6 +415,18 @@ pub struct AgentHookArgs {
     /// wanted the other.
     #[arg(long, default_value = "auto")]
     pub format: String,
+    /// The harness session this drain is for, overriding the one on stdin.
+    ///
+    /// The session id is the cursor key: it is what stops two agent sessions on
+    /// one node being told the same thing, and what lets a second session still
+    /// receive a backlog the first has already read.
+    ///
+    /// Claude Code and Codex both put it in the hook JSON on stdin, so neither
+    /// needs this. OpenCode has no hook JSON — a plugin is called with the session
+    /// id as a value, and runs commands through Bun's shell, which carries no
+    /// stdin. So the id arrives as a flag instead.
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 /// Naming a room on a running node. No passphrase: the node is already unlocked.
@@ -519,6 +668,25 @@ enum Cmd {
     /// read nothing; its identity is a key file in the profile directory, created on
     /// first run. Prints the `<fingerprint>@<multiaddr>` to give clients as `--anchor`.
     Node(ProfileArgs),
+    /// Run this profile's node without a terminal, so agent sessions can attach
+    /// (ADR-020 §12).
+    ///
+    /// The TUI is the only other thing that serves the agent-comms control socket,
+    /// and it needs a terminal and locks the node when that terminal goes away. A
+    /// `vox node` is an anchor: it holds no room and can read nothing. This is the
+    /// third shape — an unlocked node holding this profile's rooms, serving the
+    /// socket, with nothing attached to a tty.
+    ///
+    /// The passphrase is read from **stdin**, deliberately not from the
+    /// environment, which is readable by anything running as the same user:
+    ///
+    /// ```text
+    /// echo 'my passphrase' | vox daemon
+    /// ```
+    ///
+    /// Unlike the TUI it does not lock on SIGHUP, which is the point. SIGINT and
+    /// SIGTERM stop it.
+    Daemon(DaemonArgs),
     /// Offer a local TCP port as a room-bound service, in one command (ADR-017).
     ///
     /// Creates a room whose genesis grants every member the right to reach that port —
@@ -709,8 +877,13 @@ pub fn run() -> ExitCode {
             let profile = match &sub {
                 RoomCmd::Post(a) => &a.profile,
                 RoomCmd::Read(a) => &a.profile,
-                RoomCmd::Tail(a) | RoomCmd::Roster(a) => &a.profile,
+                RoomCmd::Tail(a) | RoomCmd::Roster(a) | RoomCmd::Board(a) => &a.profile,
                 RoomCmd::List(p) => p,
+                RoomCmd::Claim(a) => &a.profile,
+                RoomCmd::Release(a) => &a.profile,
+                RoomCmd::Handoff(a) => &a.profile,
+                RoomCmd::Send(a) => &a.profile,
+                RoomCmd::Get(a) => &a.profile,
             };
             let paths = match profile.paths() {
                 Ok(p) => p,
@@ -740,6 +913,20 @@ pub fn run() -> ExitCode {
                     RoomCmd::Tail(a) => crate::room_cli::tail(&paths, &a.room).await,
                     RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
                     RoomCmd::List(_) => crate::room_cli::list(&paths).await,
+                    RoomCmd::Claim(a) => {
+                        crate::room_cli::claim_resource(&paths, &a.room, &a.resource, a.ttl).await
+                    }
+                    RoomCmd::Release(a) => {
+                        crate::room_cli::release_resource(&paths, &a.room, &a.resource).await
+                    }
+                    RoomCmd::Handoff(a) => {
+                        crate::room_cli::handoff_resource(&paths, &a.room, &a.resource, &a.to).await
+                    }
+                    RoomCmd::Board(a) => crate::room_cli::board(&paths, &a.room).await,
+                    RoomCmd::Send(a) => crate::room_cli::send_file(&paths, &a.room, &a.path).await,
+                    RoomCmd::Get(a) => {
+                        crate::room_cli::get_file(&paths, &a.room, &a.file, a.out.as_deref()).await
+                    }
                 }
             });
             match outcome {
@@ -772,10 +959,69 @@ pub fn run() -> ExitCode {
                 // Even this is not worth failing a turn over.
                 return ExitCode::SUCCESS;
             };
-            let _ = rt.block_on(crate::agent_hook::run(&paths, args.room.as_deref(), format));
+            let _ = rt.block_on(crate::agent_hook::run(
+                &paths,
+                args.room.as_deref(),
+                format,
+                args.session.as_deref(),
+            ));
             // Always success: a hook that fails must not break the turn.
             ExitCode::SUCCESS
         }
+        Cmd::Daemon(args) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let anchors = match args.profile.anchor_set() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("vox: --anchor: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match crate::app::run_daemon(
+                paths,
+                args.profile.listen,
+                anchors,
+                args.passphrase_file.clone(),
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Agent(AgentCmd::Skill) => {
+            print!("{}", crate::agent_hook::AGENT_SKILL);
+            ExitCode::SUCCESS
+        }
+        Cmd::Agent(AgentCmd::Plugin(args)) => match args.harness.to_ascii_lowercase().as_str() {
+            "opencode" => {
+                print!("{}", crate::agent_hook::OPENCODE_PLUGIN);
+                ExitCode::SUCCESS
+            }
+            // Naming a harness that needs no plugin is a question, not a failure —
+            // answer it rather than printing a usage error at someone who asked a
+            // reasonable thing.
+            "claude" | "claude-code" | "codex" => {
+                eprintln!(
+                    "vox: {} takes a hook command, not a plugin. Register `vox agent hook` on \
+                     UserPromptSubmit; for Codex set `async: false`, or the output is observed \
+                     and discarded.",
+                    args.harness
+                );
+                ExitCode::FAILURE
+            }
+            other => {
+                eprintln!("vox: no plugin for {other:?}; known harnesses: opencode");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
             let sub = sub.clone();
             async move {

@@ -20,6 +20,7 @@
 
 use std::io::Read as _;
 use std::io::Write as _;
+use std::path::Path;
 
 use vox_core::hash::Digest32;
 use vox_core::node::ipc::{Frame, IpcClient, Request};
@@ -274,4 +275,563 @@ fn parse_cursor(s: &str) -> Result<Digest32, AppError> {
              characters in the first column of `vox room read`"
         ))
     })
+}
+
+// ---------------------------------------------------------------------------
+// The work board (ADR-020 §5, M19.9)
+// ---------------------------------------------------------------------------
+//
+// The decider's requirement is that agents "communicate **and split work loads**".
+// `vox-agentcomms` has carried the whole model since M19.3 — the claim vocabulary,
+// the operations and a resolver that folds a room's claims into one owner per
+// resource — and until now nothing in the shipped binary called any of it. An agent
+// could speak but could not take a piece of work, give it up, hand it over, or ask
+// what was already taken. These four verbs are that model made reachable.
+//
+// Claims are **messages, not locks**. Nothing here reserves anything in the node:
+// ownership is whatever `resolve` computes from the room's log, so two agents that
+// both post a claim converge on the same answer without either asking a coordinator
+// — and an agent that dies holding a resource releases it by its claim's `--ttl`
+// lapsing, with nobody acting.
+
+use vox_agentcomms::claim::{self, Posted};
+use vox_agentcomms::envelope::Envelope;
+
+/// Read a room's claims and fold them into one owner per resource.
+///
+/// A pure function of the log, so every member computes the same board with nobody
+/// being authoritative — which is the property that lets agents split work without
+/// a coordinator.
+async fn read_board(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<std::collections::BTreeMap<String, claim::Ownership>, AppError> {
+    let rows = match client
+        .request(&Request::Read {
+            channel_id,
+            since: None,
+            limit: 0,
+        })
+        .await
+    {
+        Ok(Frame::Rows { rows }) => rows,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let posted: Vec<Posted> = rows
+        .iter()
+        .filter_map(|r| {
+            Envelope::parse(&r.text).ok().map(|envelope| Posted {
+                entry_hash: r.entry_hash,
+                author: r.author,
+                created_secs: r.created_secs,
+                envelope,
+            })
+        })
+        .collect();
+    Ok(claim::resolve(&posted, now_secs()))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Post a claim operation as an envelope.
+async fn post_claim_op(
+    paths: &Paths,
+    room: &str,
+    kind: &str,
+    data: serde_json::Value,
+    body: &str,
+) -> Result<(), AppError> {
+    let mut env = Envelope::new(kind, body);
+    env.data = data;
+    post(paths, room, Some(&env.to_text())).await
+}
+
+/// `vox room claim` — take a resource.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, or the post is refused.
+pub async fn claim_resource(
+    paths: &Paths,
+    room: &str,
+    resource: &str,
+    ttl_secs: Option<u64>,
+) -> Result<(), AppError> {
+    if resource.trim().is_empty() {
+        return Err(AppError::Usage("a claim needs a resource".into()));
+    }
+    let mut data = serde_json::json!({ "resource": resource });
+    if let Some(ttl) = ttl_secs {
+        data["ttl_secs"] = serde_json::json!(ttl);
+    }
+    post_claim_op(
+        paths,
+        room,
+        claim::CLAIM,
+        data,
+        &format!("claiming {resource}"),
+    )
+    .await?;
+
+    // **Then say whether it was won.** A claim is a message, not a lock, so posting
+    // one is not taking the resource — the log decides, and an earlier claim beats
+    // this one. An agent that cannot tell the difference would start work somebody
+    // else is already doing, which is the exact failure claims exist to prevent.
+    // The exit status is the machine-readable half: 0 means it is yours.
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    let board = read_board(&mut client, channel_id).await?;
+    let me = client.me();
+    match board.get(resource) {
+        Some(own) if Some(own.owner) == me => {
+            println!("you hold {resource}");
+            Ok(())
+        }
+        Some(own) => Err(AppError::Usage(format!(
+            "{resource} is held by {} since {} — you did not get it",
+            short(&own.owner),
+            own.since_secs
+        ))),
+        // Resolvable only if the post has not converged yet; treat it as not held
+        // rather than claiming success we cannot see.
+        None => Err(AppError::Usage(format!(
+            "{resource} is not held by anyone, including you — the claim has not \
+             converged yet; run `vox room board {room}` to check"
+        ))),
+    }
+}
+
+/// `vox room release` — give a resource up.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, or the post is refused.
+pub async fn release_resource(paths: &Paths, room: &str, resource: &str) -> Result<(), AppError> {
+    if resource.trim().is_empty() {
+        return Err(AppError::Usage("a release needs a resource".into()));
+    }
+    post_claim_op(
+        paths,
+        room,
+        claim::RELEASE,
+        serde_json::json!({ "resource": resource }),
+        &format!("releasing {resource}"),
+    )
+    .await
+}
+
+/// `vox room handoff` — pass a resource to someone by petname.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, or the post is refused.
+pub async fn handoff_resource(
+    paths: &Paths,
+    room: &str,
+    resource: &str,
+    to: &str,
+) -> Result<(), AppError> {
+    if resource.trim().is_empty() {
+        return Err(AppError::Usage("a handoff needs a resource".into()));
+    }
+    if to.trim().is_empty() {
+        return Err(AppError::Usage("a handoff needs a recipient".into()));
+    }
+    post_claim_op(
+        paths,
+        room,
+        claim::HANDOFF,
+        serde_json::json!({ "resource": resource, "to": to }),
+        &format!("handing {resource} to {to}"),
+    )
+    .await
+}
+
+/// `vox room board` — what is taken, by whom, and until when.
+///
+/// Reads the whole room and folds its claims. The result is a pure function of the
+/// log, so every member computes the same board without anyone being authoritative.
+///
+/// **Handoffs are shown by the name the sender used, not resolved to a
+/// fingerprint.** A petname is local to whoever typed it, and resolving one needs
+/// the trust keyring, which has no control-socket request yet — that arrives with
+/// `vox trust`. Until then a handoff is displayed as the intent it is, marked so,
+/// rather than guessed at.
+///
+/// # Errors
+/// If the node cannot be reached or the room is unknown.
+pub async fn board(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    let owned = read_board(&mut client, channel_id).await?;
+    let me = client.me();
+    let now = now_secs();
+
+    let mut out = std::io::stdout().lock();
+    if owned.is_empty() {
+        writeln!(out, "nothing is claimed").map_err(AppError::Io)?;
+        return Ok(());
+    }
+    for (resource, own) in &owned {
+        let expiry = match own.expires_secs {
+            // Seconds remaining, not an absolute time: "in 240s" is actionable and
+            // a Unix timestamp is not.
+            Some(e) if e > now => format!(" expires in {}s", e - now),
+            Some(_) => " expired".to_owned(),
+            None => String::new(),
+        };
+        let named = match &own.named {
+            Some(n) => format!(" (handed to {n}, unresolved)"),
+            None => String::new(),
+        };
+        let mine = if Some(own.owner) == me { " (you)" } else { "" };
+        writeln!(
+            out,
+            "{resource}\t{}{mine}{expiry}{named}",
+            short(&own.owner)
+        )
+        .map_err(AppError::Io)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// File exchange (ADR-020 §11, M19.8)
+// ---------------------------------------------------------------------------
+//
+// **The bytes never enter the log.** They ride a room-bound service — the same
+// ADR-013/017 machinery `vox serve` uses — and what goes on the log is a signed
+// announcement naming the file, its size and its **SHA-256**. That is the decider's
+// own idiom, `nc -l` one side and `cat file | nc` the other, with the address
+// become a `.vox` name: no routable address, no firewall hole, no VPN, and the
+// bytes end-to-end encrypted because the overlay already is.
+//
+// Two properties follow, and both are deliberate:
+//
+//   - the **announcement is durable** — it is a log entry, so an agent asleep when
+//     the file was offered still sees it on waking;
+//   - the **bytes are live** — the sender must still be serving, so a late
+//     collector may find the offer gone. It is then told so, which is better than a
+//     reference that silently resolves to nothing.
+//
+// **Nobody is granted anything.** Reach is gated on the offering node's trust
+// keyring plus room authorship, and reading the announcement requires exactly the
+// same ring entry — so the audience of the announcement *is* the audience of the
+// transfer, by construction rather than by coincidence.
+//
+// The hash earns its place for a reason unrelated to secrecy: `cat | nc` **truncates
+// silently**. The connection drops, the receiver gets a partial file, and `nc` exits
+// 0. Verifying against a hash the sender signed turns that into a loud failure.
+
+/// The envelope type an offer is announced with.
+const FILE: &str = "file";
+
+/// Read a file and return its SHA-256 and length.
+fn digest_file(path: &std::path::Path) -> Result<(String, u64), AppError> {
+    use sha2::{Digest as _, Sha256};
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| AppError::Usage(format!("opening {}: {e}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = std::io::Read::read(&mut f, &mut buf)
+            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((hex(&hasher.finalize()), total))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// `vox room send` — offer a file to a room and announce it.
+///
+/// Runs until interrupted: the bytes are served live, so stopping this stops the
+/// offer. Every member that collects it gets the same file.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, the file cannot be read, or
+/// the node refuses to offer the service.
+pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Result<(), AppError> {
+    let (sha256, size) = digest_file(path)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_owned());
+    // The tag is derived from the content, so two offers of the same bytes collide
+    // harmlessly and two different files never do.
+    let tag = format!("file-{}", &sha256[..16]);
+
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+
+    // A listener that hands the file to whoever connects, for as long as we run.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|e| AppError::Usage(format!("cannot listen locally: {e}")))?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| AppError::Usage(format!("cannot read the local address: {e}")))?;
+
+    match client
+        .request(&Request::AddService {
+            channel_id,
+            service_tag: tag.clone(),
+            local: local.to_string(),
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {}
+        Ok(Frame::Error { reason }) => {
+            return Err(AppError::Usage(format!(
+                "cannot offer {tag:?}: {reason} — offering a service needs bind:{tag} in this \
+                 room, which the room's admin grants"
+            )))
+        }
+        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    }
+
+    // **A dial grant per member, and why it is here even though it should not be
+    // needed.** Under the ring-keyed reach gate, whoever can read the announcement
+    // can already reach the bytes, and this loop is redundant. Under the capability
+    // model it is required: a plain room carries no genesis service grant, so a
+    // member holds neither `dial:` nor `bind:` until an admin says so. Issuing it
+    // is idempotent and cheap, and it means this verb works under either model
+    // rather than failing in a way that looks like a networking fault.
+    if let Ok(Frame::Members { members }) = client.request(&Request::Roster { channel_id }).await {
+        let me = client.me();
+        let expiry = now_secs().saturating_add(86_400);
+        for target in members.into_iter().filter(|m| Some(*m) != me) {
+            let _ = client
+                .request(&Request::Grant {
+                    channel_id,
+                    target,
+                    service_tag: tag.clone(),
+                    may_bind: false,
+                    expiry,
+                })
+                .await;
+        }
+    }
+
+    let env = {
+        let mut e = Envelope::new(FILE, &format!("offering {name} ({size} bytes)"));
+        e.data = serde_json::json!({
+            "name": name,
+            "size": size,
+            "sha256": sha256,
+            "tag": tag,
+        });
+        e
+    };
+    post(paths, room, Some(&env.to_text())).await?;
+
+    println!("vox: offering {name} ({size} bytes) as {tag}");
+    println!("     sha256 {sha256}");
+    println!(
+        "     collect it with: vox room get {} {name}",
+        &room_of_label(channel_id)
+    );
+    println!("     Ctrl-C stops the offer; the announcement stays on the log");
+
+    let path = path.to_owned();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((mut sock, _)) = accepted else { continue };
+                let p = path.clone();
+                // `std::fs` because this workspace's tokio has no `fs` feature, and
+                // widening a dependency for one CLI verb is the wrong trade. The
+                // reads are chunked, so a large file is not held in memory.
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt as _;
+                    let Ok(mut f) = std::fs::File::open(&p) else { return };
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        match std::io::Read::read(&mut f, &mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = sock.flush().await;
+                });
+            }
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+    println!("vox: no longer offering {tag}");
+    let _ = client
+        .request(&Request::RemoveService {
+            channel_id,
+            service_tag: tag,
+        })
+        .await;
+    Ok(())
+}
+
+fn room_of_label(channel_id: Digest32) -> String {
+    b32_encode(&channel_id).chars().take(12).collect()
+}
+
+/// An offer read off the room's log.
+struct Offer {
+    author: Digest32,
+    name: String,
+    size: u64,
+    sha256: String,
+    tag: String,
+}
+
+/// `vox room get` — collect an offered file and verify it.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, no matching offer exists,
+/// the transfer cannot be established, or **the bytes do not match the announced
+/// hash**, in which case the partial file is removed.
+pub async fn get_file(
+    paths: &Paths,
+    room: &str,
+    selector: &str,
+    out: Option<&std::path::Path>,
+) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    let rows = match client
+        .request(&Request::Read {
+            channel_id,
+            since: None,
+            limit: 0,
+        })
+        .await
+    {
+        Ok(Frame::Rows { rows }) => rows,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+
+    // The most recent matching offer wins: re-offering a file supersedes.
+    let offer = rows
+        .iter()
+        .rev()
+        .filter_map(|r| {
+            let env = Envelope::parse(&r.text).ok()?;
+            if env.kind != FILE {
+                return None;
+            }
+            let d = &env.data;
+            let name = d.get("name")?.as_str()?.to_owned();
+            let sha256 = d.get("sha256")?.as_str()?.to_owned();
+            let tag = d.get("tag")?.as_str()?.to_owned();
+            let size = d.get("size")?.as_u64()?;
+            (name == selector || sha256.starts_with(selector) || tag == selector).then_some(Offer {
+                author: r.author,
+                name,
+                size,
+                sha256,
+                tag,
+            })
+        })
+        .next()
+        .ok_or_else(|| {
+            AppError::Usage(format!(
+                "no offer in this room matches {selector:?} — `vox room read` shows what was \
+                 announced"
+            ))
+        })?;
+
+    let dest = out.map_or_else(|| std::path::PathBuf::from(&offer.name), Path::to_owned);
+
+    let bound = match client
+        .request(&Request::Forward {
+            channel_id,
+            host: offer.author,
+            service_tag: offer.tag.clone(),
+            local: "127.0.0.1:0".into(),
+        })
+        .await
+    {
+        Ok(Frame::Bound { local }) => local,
+        Ok(Frame::Error { reason }) => {
+            return Err(AppError::Usage(format!(
+                "cannot reach the offer: {reason} — the sender may have stopped serving it, or \
+                 may not have trusted this identity"
+            )))
+        }
+        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+
+    let result = collect(&bound, &dest, &offer).await;
+    let _ = client
+        .request(&Request::StopForward {
+            local: bound.clone(),
+        })
+        .await;
+    result
+}
+
+/// Stream the offered bytes to `dest`, verifying as we go.
+async fn collect(bound: &str, dest: &std::path::Path, offer: &Offer) -> Result<(), AppError> {
+    use sha2::{Digest as _, Sha256};
+    use tokio::io::AsyncReadExt as _;
+
+    let mut sock = tokio::net::TcpStream::connect(bound)
+        .await
+        .map_err(|e| AppError::Usage(format!("connecting to the forward: {e}")))?;
+    let mut file = std::fs::File::create(dest)
+        .map_err(|e| AppError::Usage(format!("creating {}: {e}", dest.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = sock
+            .read(&mut buf)
+            .await
+            .map_err(|e| AppError::Usage(format!("reading the transfer: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        std::io::Write::write_all(&mut file, &buf[..n])
+            .map_err(|e| AppError::Usage(format!("writing {}: {e}", dest.display())))?;
+        total += n as u64;
+    }
+    std::io::Write::flush(&mut file)
+        .map_err(|e| AppError::Usage(format!("flushing {}: {e}", dest.display())))?;
+    drop(file);
+
+    let got = hex(&hasher.finalize());
+    if got != offer.sha256 {
+        // **The partial file is removed.** `cat | nc` truncating silently is the
+        // classic way this idiom bites; leaving a file that looks complete and is
+        // not would reproduce exactly that failure with extra steps.
+        let _ = std::fs::remove_file(dest);
+        return Err(AppError::Usage(format!(
+            "the transfer does not match what was announced — expected sha256 {} over {} bytes, \
+             got {got} over {total}. The partial file was removed.",
+            offer.sha256, offer.size
+        )));
+    }
+    println!("vox: {} ({total} bytes) verified", dest.display());
+    Ok(())
 }

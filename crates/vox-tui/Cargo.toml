@@ -23,6 +23,10 @@ path = "src/main.rs"
 
 [dependencies]
 vox-core = { path = "../vox-core" }
+# The app tier (ADR-020 §1). `vox room claim|release|handoff|board` are this crate's
+# vocabulary and claim resolver made reachable from the product; without this
+# dependency the model exists and nothing can use it.
+vox-agentcomms = { path = "../vox-agentcomms" }
 ratatui.workspace = true
 crossterm.workspace = true
 qrcode.workspace = true

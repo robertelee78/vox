@@ -57,7 +57,7 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// The protocol this build speaks. Bumped when a frame's shape changes in a way
 /// an older client would misread; a client that sees a version it does not know
 /// MUST disconnect rather than guess.
-pub const PROTOCOL_VERSION: u64 = 1;
+pub const PROTOCOL_VERSION: u64 = 3;
 
 /// Largest frame accepted in either direction.
 ///
@@ -96,12 +96,22 @@ const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
 const T_MEMBERS: u64 = 6;
 const T_ROOMS: u64 = 7;
+const T_BOUND: u64 = 8;
 // Client → node.
 const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
 const T_READ: u64 = 3;
 const T_ROSTER: u64 = 4;
 const T_ROOMS_REQ: u64 = 5;
+// Protocol 3 — the service verbs an agent needs for file exchange (ADR-020 §11).
+// They exist on this socket, rather than as one-shot verbs that open the profile,
+// because redb is single-writer: a verb that started its own node could not run
+// while `vox daemon` held the profile, which is exactly when an agent needs it.
+const T_ADD_SERVICE: u64 = 6;
+const T_REMOVE_SERVICE: u64 = 7;
+const T_FORWARD: u64 = 8;
+const T_STOP_FORWARD: u64 = 9;
+const T_GRANT: u64 = 10;
 
 /// What a client sends.
 ///
@@ -139,6 +149,54 @@ pub enum Request {
     },
     /// Every room this node holds.
     Rooms,
+    /// Offer a local TCP endpoint as a room-bound service (ADR-013).
+    AddService {
+        /// The room.
+        channel_id: Digest32,
+        /// The service's tag, which is also how members name it.
+        service_tag: String,
+        /// The local endpoint to carry connections to.
+        local: String,
+    },
+    /// Stop offering a service.
+    RemoveService {
+        /// The room.
+        channel_id: Digest32,
+        /// The service's tag.
+        service_tag: String,
+    },
+    /// Forward a local port to a member's service over the overlay.
+    ///
+    /// Answers [`Frame::Bound`] with the address actually bound, because a
+    /// request for port 0 is resolved by the OS and the caller cannot know it.
+    Forward {
+        /// The room.
+        channel_id: Digest32,
+        /// The member offering the service.
+        host: Digest32,
+        /// The service's tag.
+        service_tag: String,
+        /// The local address to bind; port 0 lets the OS choose.
+        local: String,
+    },
+    /// Stop a forward previously bound at this address.
+    StopForward {
+        /// The address [`Frame::Bound`] reported.
+        local: String,
+    },
+    /// Grant a member the capability to dial (and optionally offer) a service.
+    Grant {
+        /// The room.
+        channel_id: Digest32,
+        /// Who is being granted.
+        target: Digest32,
+        /// The service's tag.
+        service_tag: String,
+        /// Whether they may also offer it.
+        may_bind: bool,
+        /// When the grant lapses, in seconds since the Unix epoch.
+        expiry: u64,
+    },
 }
 
 impl Request {
@@ -171,6 +229,57 @@ impl Request {
             }
             Request::Rooms => {
                 e.array(1).uint(T_ROOMS_REQ);
+            }
+            Request::AddService {
+                channel_id,
+                service_tag,
+                local,
+            } => {
+                e.array(4)
+                    .uint(T_ADD_SERVICE)
+                    .bytes(channel_id)
+                    .text(service_tag)
+                    .text(local);
+            }
+            Request::RemoveService {
+                channel_id,
+                service_tag,
+            } => {
+                e.array(3)
+                    .uint(T_REMOVE_SERVICE)
+                    .bytes(channel_id)
+                    .text(service_tag);
+            }
+            Request::Forward {
+                channel_id,
+                host,
+                service_tag,
+                local,
+            } => {
+                e.array(5)
+                    .uint(T_FORWARD)
+                    .bytes(channel_id)
+                    .bytes(host)
+                    .text(service_tag)
+                    .text(local);
+            }
+            Request::StopForward { local } => {
+                e.array(2).uint(T_STOP_FORWARD).text(local);
+            }
+            Request::Grant {
+                channel_id,
+                target,
+                service_tag,
+                may_bind,
+                expiry,
+            } => {
+                e.array(6)
+                    .uint(T_GRANT)
+                    .bytes(channel_id)
+                    .bytes(target)
+                    .text(service_tag)
+                    .uint(u64::from(*may_bind))
+                    .uint(*expiry);
             }
         }
         e.finish()
@@ -234,6 +343,67 @@ impl Request {
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Rooms)
             }
+            (T_ADD_SERVICE, 4) => {
+                let channel_id = digest(&mut d)?;
+                let service_tag = text(&mut d, "ipc service tag")?;
+                let local = text(&mut d, "ipc local address")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::AddService {
+                    channel_id,
+                    service_tag,
+                    local,
+                })
+            }
+            (T_REMOVE_SERVICE, 3) => {
+                let channel_id = digest(&mut d)?;
+                let service_tag = text(&mut d, "ipc service tag")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::RemoveService {
+                    channel_id,
+                    service_tag,
+                })
+            }
+            (T_FORWARD, 5) => {
+                let channel_id = digest(&mut d)?;
+                let host = digest(&mut d)?;
+                let service_tag = text(&mut d, "ipc service tag")?;
+                let local = text(&mut d, "ipc local address")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Forward {
+                    channel_id,
+                    host,
+                    service_tag,
+                    local,
+                })
+            }
+            (T_STOP_FORWARD, 2) => {
+                let local = text(&mut d, "ipc local address")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::StopForward { local })
+            }
+            (T_GRANT, 6) => {
+                let channel_id = digest(&mut d)?;
+                let target = digest(&mut d)?;
+                let service_tag = text(&mut d, "ipc service tag")?;
+                let may_bind = d
+                    .uint()
+                    .map_err(|_| Error::MalformedBundle("ipc may_bind"))?
+                    != 0;
+                let expiry = d.uint().map_err(|_| Error::MalformedBundle("ipc expiry"))?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Grant {
+                    channel_id,
+                    target,
+                    service_tag,
+                    may_bind,
+                    expiry,
+                })
+            }
             _ => Err(Error::MalformedBundle("ipc request unknown tag")),
         }
     }
@@ -250,6 +420,15 @@ pub enum Frame {
     Hello {
         /// The [`PROTOCOL_VERSION`] this node speaks.
         protocol: u64,
+        /// **Who this client is**: the node's own identity fingerprint, or `None`
+        /// if no identity exists yet.
+        ///
+        /// Added in protocol 2 for the work board (ADR-020 §5). Without it a
+        /// client cannot answer "did my claim win?" — `resolve` returns an owner
+        /// fingerprint and the client had no way to tell whether that was itself.
+        /// A claim that cannot report whether it was won is useless for splitting
+        /// work, which is the whole point of claims.
+        me: Option<Digest32>,
     },
     /// This client fell behind and `missed` events were dropped **for it alone**.
     ///
@@ -278,6 +457,14 @@ pub enum Frame {
         /// Member fingerprints, in the order the node holds them.
         members: Vec<Digest32>,
     },
+    /// The address a [`Request::Forward`] actually bound.
+    ///
+    /// Its own frame rather than a reused `Ok`, because a forward asked for port
+    /// 0 is resolved by the OS and the caller has no other way to learn it.
+    Bound {
+        /// The bound local address.
+        local: String,
+    },
     /// The rooms a [`Request::Rooms`] asked for.
     Rooms {
         /// `(channel_id, local name, open)` per room.
@@ -291,8 +478,13 @@ impl Frame {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
-            Frame::Hello { protocol } => {
-                e.array(2).uint(T_HELLO).uint(*protocol);
+            Frame::Hello { protocol, me } => {
+                // An absent identity is the empty byte string, so the arity stays
+                // fixed — ADR-008's canonical encoding has no optionals.
+                e.array(3)
+                    .uint(T_HELLO)
+                    .uint(*protocol)
+                    .bytes(me.as_ref().map_or(&[][..], |d| &d[..]));
             }
             Frame::Lagged { missed } => {
                 e.array(2).uint(T_LAGGED).uint(*missed);
@@ -319,6 +511,9 @@ impl Frame {
                 for m in members {
                     e.bytes(m);
                 }
+            }
+            Frame::Bound { local } => {
+                e.array(2).uint(T_BOUND).text(local);
             }
             Frame::Rooms { rooms } => {
                 e.array(2).uint(T_ROOMS).array(rooms.len());
@@ -349,6 +544,13 @@ fn digest(d: &mut Decoder<'_>) -> Result<Digest32> {
         .bytes()
         .map_err(|_| Error::MalformedBundle("ipc digest"))?;
     Digest32::try_from(b).map_err(|_| Error::MalformedBundle("ipc digest length"))
+}
+
+/// A CBOR text string, named so a decode failure says which field it was.
+fn text(d: &mut Decoder<'_>, what: &'static str) -> Result<String> {
+    Ok(d.text()
+        .map_err(|_| Error::MalformedBundle(what))?
+        .to_owned())
 }
 
 fn addr(d: &mut Decoder<'_>) -> Result<std::net::SocketAddr> {
@@ -485,10 +687,20 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
 
 fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
     let ev = match (tag, n) {
-        (T_HELLO, 2) => {
-            return Ok(Frame::Hello {
-                protocol: d.uint().map_err(|_| Error::MalformedBundle("ipc hello"))?,
-            })
+        (T_HELLO, 3) => {
+            let protocol = d.uint().map_err(|_| Error::MalformedBundle("ipc hello"))?;
+            let fp = d
+                .bytes()
+                .map_err(|_| Error::MalformedBundle("ipc hello identity"))?;
+            let me = if fp.is_empty() {
+                None
+            } else {
+                Some(
+                    Digest32::try_from(fp)
+                        .map_err(|_| Error::MalformedBundle("ipc hello identity length"))?,
+                )
+            };
+            return Ok(Frame::Hello { protocol, me });
         }
         (T_LAGGED, 2) => {
             return Ok(Frame::Lagged {
@@ -533,6 +745,11 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 members.push(digest(d)?);
             }
             return Ok(Frame::Members { members });
+        }
+        (T_BOUND, 2) => {
+            return Ok(Frame::Bound {
+                local: text(d, "ipc bound address")?,
+            });
         }
         (T_ROOMS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedBundle("ipc rooms"))?;
@@ -779,6 +996,7 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         &mut stream,
         &Frame::Hello {
             protocol: PROTOCOL_VERSION,
+            me: handle.view().identity.map(|i| i.fingerprint),
         }
         .to_bytes(),
     )
@@ -891,6 +1109,137 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             }
         }
+        Request::AddService {
+            channel_id,
+            service_tag,
+            local,
+        } => {
+            let Ok(local) = local.parse() else {
+                return Frame::Error {
+                    reason: format!("not a local address: {local:?}"),
+                };
+            };
+            match handle
+                .apply(crate::node::api::NodeCommand::AddService {
+                    channel_id,
+                    service_tag,
+                    local,
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: format!("{other:?}"),
+                },
+            }
+        }
+        Request::RemoveService {
+            channel_id,
+            service_tag,
+        } => match handle
+            .apply(crate::node::api::NodeCommand::RemoveService {
+                channel_id,
+                service_tag,
+            })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: format!("{other:?}"),
+            },
+        },
+        Request::Forward {
+            channel_id,
+            host,
+            service_tag,
+            local,
+        } => {
+            let Ok(local) = local.parse() else {
+                return Frame::Error {
+                    reason: format!("not a local address: {local:?}"),
+                };
+            };
+            // Subscribe **before** asking, so the `Forwarding` event cannot be
+            // emitted and missed between the command and the wait.
+            let mut events = handle.subscribe();
+            match handle
+                .apply(crate::node::api::NodeCommand::Forward {
+                    channel_id,
+                    host,
+                    service_tag,
+                    local,
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => {}
+                other => {
+                    return Frame::Error {
+                        reason: format!("{other:?}"),
+                    }
+                }
+            }
+            let deadline = std::time::Duration::from_secs(10);
+            match tokio::time::timeout(deadline, async {
+                loop {
+                    match events.next().await {
+                        Some(EventStreamItem::Event(NodeEvent::Forwarding { local, .. })) => {
+                            return Some(local)
+                        }
+                        Some(_) => {}
+                        None => return None,
+                    }
+                }
+            })
+            .await
+            {
+                Ok(Some(bound)) => Frame::Bound {
+                    local: bound.to_string(),
+                },
+                Ok(None) => Frame::Error {
+                    reason: "the node stopped before the forward was bound".into(),
+                },
+                Err(_) => Frame::Error {
+                    reason: "the forward did not report a bound address".into(),
+                },
+            }
+        }
+        Request::StopForward { local } => {
+            let Ok(local) = local.parse() else {
+                return Frame::Error {
+                    reason: format!("not a local address: {local:?}"),
+                };
+            };
+            match handle
+                .apply(crate::node::api::NodeCommand::StopForward { local })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: format!("{other:?}"),
+                },
+            }
+        }
+        Request::Grant {
+            channel_id,
+            target,
+            service_tag,
+            may_bind,
+            expiry,
+        } => match handle
+            .apply(crate::node::api::NodeCommand::GrantTunnel {
+                channel_id,
+                target,
+                service_tag,
+                may_bind,
+                expiry,
+            })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: format!("{other:?}"),
+            },
+        },
         Request::Rooms => {
             let view = handle.view();
             Frame::Rooms {
@@ -932,9 +1281,19 @@ async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
 #[derive(Debug)]
 pub struct IpcClient {
     stream: UnixStream,
+    me: Option<Digest32>,
 }
 
 impl IpcClient {
+    /// This client's own identity fingerprint, as the node reported it at hello,
+    /// or `None` if the node has no identity yet.
+    ///
+    /// This is what lets a client tell its own claims from everyone else's.
+    #[must_use]
+    pub fn me(&self) -> Option<Digest32> {
+        self.me
+    }
+
     /// Connect and check the protocol version, without subscribing.
     ///
     /// Use this for a client that issues requests. [`IpcClient::subscribe`] turns
@@ -948,12 +1307,12 @@ impl IpcClient {
         let Some(hello) = read_frame(&mut stream).await? else {
             return Err(Error::MalformedBundle("ipc closed before hello"));
         };
-        match Frame::from_bytes(&hello)? {
-            Frame::Hello { protocol } if protocol == PROTOCOL_VERSION => {}
+        let me = match Frame::from_bytes(&hello)? {
+            Frame::Hello { protocol, me } if protocol == PROTOCOL_VERSION => me,
             Frame::Hello { .. } => return Err(Error::MalformedBundle("ipc protocol version")),
             _ => return Err(Error::MalformedBundle("ipc expected hello")),
-        }
-        Ok(Self { stream })
+        };
+        Ok(Self { stream, me })
     }
 
     /// Send one request and read its answer.

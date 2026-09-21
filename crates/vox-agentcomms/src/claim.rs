@@ -22,6 +22,47 @@
 //! accepted, and it is the same trade the ADR-007 evaluator makes for concurrent
 //! governance: the alternative is a clock nobody has. The claim system schedules
 //! cooperating agents; it is not a defence against one that lies.
+//!
+//! ## A claim is a message, not a lock
+//!
+//! Nothing here reserves anything. There is no lock table, no lease server and
+//! nothing to hold. Posting a claim is posting a message; **ownership is whatever
+//! [`resolve`] computes from the room's log**, and an agent that has not caught up
+//! computes it from a smaller set.
+//!
+//! That is what makes a stale view harmless rather than dangerous. An agent behind
+//! on the log can post a claim that loses — and because `resolve` is a pure
+//! function of the set of ops, it *will* lose on every node once the sets converge,
+//! including its own. Two agents can be **behind**; they cannot permanently
+//! **disagree**.
+//!
+//! So the guarantee this offers is not "everyone has the latest message", which no
+//! peer-to-peer system can promise. It is:
+//!
+//! - **convergence** — same set of ops, same owner, on every node, in any order;
+//! - **detectability** — a claimant can read the board back and see whether it won,
+//!   which is why `vox room claim` re-reads after posting and exits non-zero when
+//!   somebody else holds the resource. An agent is *told* it lost rather than
+//!   quietly starting work someone else is already doing;
+//! - **self-healing** — a claim with `ttl_secs` lapses on its own, so an agent that
+//!   is partitioned, wedged or dead stops holding work with nobody intervening and
+//!   nobody noticing it went. That is the answer to "what if a participant never
+//!   comes back", and it is the only honest one.
+//!
+//! ## What this deliberately does not promise
+//!
+//! **Causality within one second.** `created_secs` has one-second resolution, so a
+//! losing claim and the release that follows it can carry the same timestamp, and
+//! the entry-hash tie-break then decides their order. Every node computes the same
+//! answer — that is exactly what the tie-break is for — but the answer need not
+//! match the order things happened in. The observable consequence: an agent
+//! correctly told "you did not get it" may hold the resource once the current owner
+//! releases it. Neither statement was false. A `release` therefore guarantees that
+//! **the releaser no longer holds the resource**, not that the resource is unowned.
+//!
+//! **A global "latest".** There is no global clock and no coordinator, so "the most
+//! recent message" is not a thing any node can know it has. Nothing here depends on
+//! one.
 
 use std::collections::BTreeMap;
 
