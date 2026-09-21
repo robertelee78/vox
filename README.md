@@ -5,7 +5,9 @@
 Vox lets a small, trusted group hold a private channel by sharing a channel ID and passphrase —
 no central server, no accounts, no phone numbers. Identity is rooted in your own GPG/Ed25519 keys.
 Beyond messaging, Vox is an overlay *transport*: it carries arbitrary TCP/IP between members
-(e.g. `ssh` over Vox), not just chat. It is post-quantum from the first line of code.
+(e.g. `ssh` over Vox), not just chat. Key agreement and signatures are hybrid — a classical and a
+post-quantum algorithm side by side — so a recording made today is not opened by a later quantum
+computer unless *both* are broken.
 
 ---
 
@@ -28,17 +30,27 @@ Mainstream secure messengers force trade-offs Vox refuses to make:
   consents to a newcomer; until a member consents, their messages stay undecryptable to that
   newcomer, forever if they never consent. Visibility fills in monotonically, per sender. No single
   wrong add can expose the room. *(ADR-007)*
-- **Truly serverless.** No *privileged* central server. Discovery is magnet-link style over a P2P
-  swarm; any node can optionally act as a bootstrap/rendezvous point, and you run your own. *(ADR-012)*
+- **No privileged server.** There is no account system, no directory and no operator who can add a
+  member or read a room. There *is* infrastructure: reaching a peer behind symmetric NAT needs an
+  always-on **anchor**, which is a `vox node` you run yourself — it serves the rendezvous board and
+  relays encrypted packets, and by construction holds no room key and can read nothing. Discovery is
+  magnet-link style over a P2P swarm. *(ADR-012, ADR-016)*
 - **The channel is the unit.** Every message is broadcast to a channel's append-only, hash-linked
   log; a 1:1 chat is simply a two-member channel. Messages you cannot decrypt replicate but are not
   rendered. *(ADR-006, ADR-008)*
 - **Self-sovereign identity.** GPG/Ed25519 keys with manual fingerprint verification — no accounts,
   no phone numbers, no directory. Per-channel pseudonymous identities are your choice. *(ADR-002)*
-- **Post-quantum from the start.** Hybrid (classical + post-quantum) key agreement and signatures,
-  designed against "harvest now, decrypt later." *(ADR-003)*
-- **Per-channel deniability.** Optionally, message content is authored deniably (no transferable
-  proof of authorship to outsiders) while membership and governance stay verifiable. *(ADR-009)*
+- **Hybrid post-quantum key agreement and signatures.** Key agreement combines X25519 with
+  ML-KEM-768 and signatures combine Ed25519 with ML-DSA, so an attacker must break both to read or
+  forge — which is what makes recorded traffic no easier to open later than it is now. The QUIC
+  handshake is restricted to the single hybrid group `X25519MLKEM768`, so there is no classical
+  group to downgrade to. What this does *not* claim: the post-quantum algorithms are young, and
+  hybrids exist precisely because neither half is trusted alone. *(ADR-003, ADR-011)*
+- **Per-channel deniability — specified and built, not yet enabled.** ADR-009 designs message
+  content that carries no transferable proof of authorship to outsiders while membership and
+  governance stay verifiable, and `vox-core/src/deniable/` implements it. **No release turns it on**:
+  its formal analysis and its `0x000B` wire codec are outstanding. Treat it as a design commitment,
+  not a property you have today. *(ADR-009)*
 - **Chat *and* tunneling.** A first-class encrypted overlay for arbitrary byte streams — `ssh` over
   Vox and beyond — alongside messaging. *(ADR-011, ADR-013)*
 
@@ -130,30 +142,106 @@ GitHub Releases are the distribution — no vanity domain, no package manager, n
 curl -fsSL https://raw.githubusercontent.com/robertelee78/vox/main/install.sh | sh
 ```
 
-That fetches the release record for your machine's target, downloads the binary from the exact
-release the record names, verifies its size and SHA-256 **before** putting it in place, installs it
-atomically into `~/.local/bin` (override with `VOX_INSTALL_DIR`), and runs `vox shell-setup` so
-`vox` is on `PATH` with tab completion in your next shell. macOS builds are signed and notarized
-with a Developer ID, so Gatekeeper does not quarantine them.
+Targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin` (macOS 11+).
 
-> **No release is published yet.** The installer and updater are implemented and proved, but
-> `v0.1.0` is deliberately held until the `apple-release` credentials exist to sign and notarize
-> the macOS artifacts — an unsigned build of a confidentiality tool is not shipped with a
-> footnote telling you to wave Gatekeeper through ([ADR-015](docs/adr/ADR-015-rust-tui-client.md)
-> §Distribution). Until then, **build from source** as below. Running the line above today tells you
-> the release record is not published, and changes nothing.
+**What the installer does, and why each step is there.** It fetches the release record for your
+target, downloads the binary from the *exact release the record names* — not `latest`, which could
+move between the two requests — and verifies its size and SHA-256 **before** anything is put in
+place. On macOS it additionally requires a Developer ID signature from team `3T2D2YNTVW` under the
+identifier `us.vox.cli`, with the hardened runtime, and asks Apple to confirm the notarization
+ticket online; it refuses to install if any of that fails. Then it installs atomically into
+`~/.local/bin` and runs `vox shell-setup`. Nothing needs `sudo`.
 
-Afterwards:
+```
+VOX_INSTALL_DIR=/opt/bin   # install somewhere else
+VOX_NO_SHELL_SETUP=1       # skip PATH and completion
+```
+
+Verify it yourself — the release publishes the notarization receipt it was built with:
+
+```
+codesign --verify --strict --check-notarization --test-requirement '=notarized' ~/.local/bin/vox
+curl -fsSL https://github.com/robertelee78/vox/releases/latest/download/apple-proof-aarch64-apple-darwin.json
+```
+
+### Update
 
 ```
 vox update              # replace this binary with the next release
-vox update --check      # just say whether one exists
-vox update --rollback   # put the binary it replaced back
+vox update --check      # only say whether one exists
+vox update --rollback   # put back the binary it replaced
 ```
 
-A build from source is never overwritten by `vox update`; it says so and tells you to
-`git pull && cargo build --release` instead. The mechanism is specified in
-[ADR-015](docs/adr/ADR-015-rust-tui-client.md) §"Install and update".
+On macOS an update must carry the **same Developer ID as the vox it is replacing** — a correct
+digest only proves the bytes are what GitHub is serving, whereas this proves they were signed by
+whoever signed what you already trust. On Linux there is no equivalent; an update there rests on TLS
+to GitHub and the record's digest, which is stated plainly in
+[ADR-015](docs/adr/ADR-015-rust-tui-client.md) rather than glossed.
+
+A build from source is never overwritten: `vox update` says so and tells you to
+`git pull && cargo build --release` instead.
+
+### Shell integration and removal
+
+`vox shell-setup` puts `vox` on `PATH` and installs completion for zsh, bash and fish. It appends
+one marked block at the *end* of your rc — at the end, so it wins the `PATH` race against version
+managers that prepend their shims earlier in the same file — and it is exactly reversible:
+
+```
+vox shell-setup --remove    # undo the block and the completion files
+rm -rf ~/.local/bin/vox ~/.local/bin/.vox-*   # and the binary
+```
+
+Your rooms and identity live in `~/.local/share/vox/<profile>/` (macOS:
+`~/Library/Application Support/vox/`) and are **not** removed by the above — delete that directory
+too if you mean it, and note that nobody can recover a room for you.
+
+## Getting started
+
+### Chat
+
+```
+vox                                  # the interactive client; creates an identity on first run
+```
+
+Inside it, `:new` creates a room, `:invite` prints a `vox://…` address to hand to someone, `:join`
+takes one. A newcomer with the correct address and passphrase can read **nothing** until each
+member individually consents (`:grant`), which is the point of ADR-007.
+
+### Reach a machine's port from anywhere (`ssh` over Vox)
+
+Four commands, no port forwarding, no public IP, no privilege. On the machine with the service:
+
+```
+vox node --listen 0.0.0.0:0          # once, on a host that is always up: your anchor.
+                                      # prints <fingerprint>@<multiaddr> — that is its --anchor spec
+vox serve 22 --anchor <spec>          # offer local port 22 to a NEW room; prints the vox:// address
+                                      # and the room's <52-char>.vox hostname
+```
+
+On the machine that wants in:
+
+```
+vox connect <vox://…>                 # join the room (one-shot: joining is durable)
+vox up <room> --anchor <spec>         # a loopback SOCKS5 proxy that resolves the .vox name;
+                                      # prints the exact ProxyCommand line to use
+ssh -o "ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p" user@<52-char>.vox
+```
+
+The port you choose names the service; it does not have to be free on either machine, and nothing
+binds it. A service is **dark by default** — offering it grants nobody reach — and `vox grant` is
+what puts a member's `dial:` capability on the room's log. The whole shape is Tor's, deliberately:
+a SOCKS proxy is the only client mechanism that needs no privilege on any platform
+([ADR-017](docs/adr/ADR-017-room-bound-services.md)).
+
+For a tool with no proxy support, `vox forward` binds a local port instead.
+
+### Do you need an anchor?
+
+Only for reachability. Two peers that can already reach each other do not need one. If either is
+behind a symmetric NAT — most home and mobile networks — something stable must introduce them, and
+in Vox that is a `vox node` **you** run. It serves the rendezvous board, coordinates hole punching,
+and relays QUIC packets it cannot read: it holds no room key, and its own log is ciphertext.
 
 ## Building
 

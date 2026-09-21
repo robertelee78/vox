@@ -47,6 +47,7 @@ use crate::node::paths::Paths;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
 use crate::node::syncstream::{SyncSchedule, SyncTrigger};
+use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
 
 /// Command queue depth (commands beyond it apply backpressure to the client).
@@ -1783,9 +1784,9 @@ impl Node {
     /// Doing one without the other leaves a peer holding a key it must not use, or a
     /// grant it cannot act on.
     async fn release_key_to(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
-        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+        if self.net.is_none() {
             return Outcome::Failed(Fault::NotNetworked);
-        };
+        }
         let now = self.now();
         let skdm = {
             let (Some(profile), Some(shared)) = (
@@ -1805,17 +1806,23 @@ impl Node {
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
-        // A session must already exist with this member (from the join, or from their
-        // delivery to us); opening one from their bundle record is M15's "sessions to
-        // members we have not met".
-        let Some(conn) = net.manager().existing(&target) else {
+        // No session need exist yet: one is opened from this member's bundle record
+        // if the join path never made one (ADR-016).
+        let hello = self.ensure_session(channel_id, target).await;
+        let Some(conn) = self.reach_member(channel_id, target).await else {
             return Outcome::Failed(Fault::Unreachable);
         };
         let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
             return Outcome::Failed(Fault::Unreachable);
         };
-        if let Err(e) =
-            crate::node::pairwise_stream::deliver_skdm(&conn, channel_id, session, &skdm).await
+        if let Err(e) = crate::node::pairwise_stream::deliver_skdm(
+            &conn,
+            channel_id,
+            session,
+            &skdm,
+            hello.as_ref(),
+        )
+        .await
         {
             return Outcome::Failed(fault_of(&e));
         }
@@ -1902,9 +1909,9 @@ impl Node {
     /// returning how many were re-keyed. A member with no live pairwise session is
     /// skipped, not failed: the tick tries again once there is one.
     async fn deliver_rekeys_for(&mut self, channel_id: &Digest32) -> u64 {
-        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+        if self.net.is_none() {
             return 0;
-        };
+        }
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return 0;
         };
@@ -1924,15 +1931,27 @@ impl Node {
         };
         let mut delivered = 0u64;
         for target in owed {
-            let Some(conn) = net.manager().existing(&target) else {
+            // Open a session from the member's bundle record if none exists, and reach
+            // them through the ladder rather than requiring a live connection: a re-key
+            // that only reaches members this process happened to join with is the M15
+            // gap ADR-016 recorded, and it is what made revocation undeliverable after
+            // a restart.
+            let hello = self.ensure_session(channel_id, target).await;
+            let Some(conn) = self.reach_member(channel_id, target).await else {
                 continue;
             };
             let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
                 continue;
             };
-            if crate::node::pairwise_stream::deliver_skdm(&conn, channel_id, session, &skdm)
-                .await
-                .is_err()
+            if crate::node::pairwise_stream::deliver_skdm(
+                &conn,
+                channel_id,
+                session,
+                &skdm,
+                hello.as_ref(),
+            )
+            .await
+            .is_err()
             {
                 continue;
             }
@@ -2269,12 +2288,183 @@ impl Node {
         self.start_session(channel_id, transport);
     }
 
+    /// Accept an inbound [`PairwiseFrame::Hello`], establishing the responder half of
+    /// a session a peer opened from our bundle record. `true` if a session now exists.
+    ///
+    /// This is the join responder's PQXDH path minus the join: the message names a
+    /// signed prekey and optionally a one-time prekey **from our own ring**, so a party
+    /// holding no prekey of ours cannot open a session at all. The one-time prekey is
+    /// consumed and the consume persisted before the handshake completes, so a crash
+    /// here cannot leave it re-offerable; a replay is graded last-resort rather than
+    /// silently accepted, the same reconciliation `joinstream` performs.
+    ///
+    /// An existing session is never replaced: a peer cannot reset our ratchet by
+    /// sending a fresh `Hello`.
+    async fn accept_hello(&mut self, channel_id: Digest32, peer: Digest32, initial: &[u8]) -> bool {
+        if self.sessions.contains_key(&(channel_id, peer)) {
+            return true;
+        }
+        let Ok(init) = InitialMessage::from_wire(initial) else {
+            return false;
+        };
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            return false;
+        };
+        let ctx = {
+            let channel = shared.lock().await;
+            // Only a member we have admitted may open a session to us.
+            if !channel.is_author(&peer) {
+                return false;
+            }
+            match channel.join_context() {
+                Ok(c) => c,
+                Err(_) => return false,
+            }
+        };
+        let now = self.now();
+        let mut reuse = crate::pairwise::OtpReuseTracker::new();
+        let Some(profile) = self.profile.as_ref() else {
+            return false;
+        };
+        let store = profile.store();
+        let Ok(signer) = profile.signer() else {
+            return false;
+        };
+        // The ring is borrowed mutably below, so take what the save needs first.
+        let signer: &dyn crate::identity::composite::RootSigner = signer;
+        let Some(ring) = self.prekeys.as_mut() else {
+            return false;
+        };
+        if let Some(id) = init.one_time_prekey_id {
+            match ring.use_one_time(id, now) {
+                prekeys::OneTimeUse::Fresh => {}
+                prekeys::OneTimeUse::Reused => {
+                    // Seed the per-process tracker from the ring's persistent record so
+                    // the downgrade is graded even after a restart (ADR-004).
+                    reuse.observe(id);
+                }
+                prekeys::OneTimeUse::Unknown => return false,
+            }
+            // Persist the consume before the handshake completes: a crash here must not
+            // leave the prekey re-offerable.
+            if prekeys::save(store, signer, ring).is_err() {
+                return false;
+            }
+        }
+        let Some(signed_prekey) = ring.signed_prekey_for(init.signed_prekey_id) else {
+            return false;
+        };
+        let one_time_prekey = init
+            .one_time_prekey_id
+            .and_then(|id| ring.consumed_one_time(id));
+        let prekeys = crate::pairwise::ResponderPrekeys {
+            identity_dh_key: ring.identity_dh(),
+            signed_prekey,
+            one_time_prekey,
+        };
+        let Ok(session) = crate::pairwise::session::Session::accept(
+            &init,
+            &prekeys,
+            &ctx.channel_id,
+            ctx.epoch,
+            &mut reuse,
+            ctx.floor,
+        ) else {
+            return false;
+        };
+        self.sessions.insert((channel_id, peer), session);
+        true
+    }
+
+    /// A connection to `target`: the live one if there is one, otherwise dialled
+    /// through the ADR-012 ladder.
+    ///
+    /// `ConnectionManager::existing` alone means "whoever we happen to be talking to",
+    /// which is not a membership property — it made delivery depend on connection
+    /// history rather than on the room.
+    async fn reach_member(
+        &self,
+        channel_id: &Digest32,
+        target: Digest32,
+    ) -> Option<Arc<crate::transport::quic::VoxConnection>> {
+        let net = self.net.as_ref()?;
+        if let Some(conn) = net.manager().existing(&target) {
+            return Some(conn);
+        }
+        let endpoints = net.board_endpoints(channel_id, &target);
+        net.reach(target, &endpoints).await.ok()
+    }
+
+    /// The pairwise session for `(channel, target)`, opening one from that member's
+    /// **bundle record** if none exists.
+    ///
+    /// ADR-016 §"the rendezvous service and the member bundle record" always said
+    /// members open sessions to one another this way; until now the runtime only ever
+    /// created them on the join path, so a re-key or a consent release could not reach
+    /// a member this process never joined with — including every member, after a
+    /// restart, because sessions live only in memory.
+    ///
+    /// Returns the [`InitialMessage`] when the session is newly opened, because the
+    /// peer cannot decrypt anything until it has accepted that. `None` means a session
+    /// was already there and the peer already holds it.
+    ///
+    /// Sessions are deliberately **not** persisted: re-deriving one from the board is
+    /// safe, whereas restoring ratchet state risks reusing a chain key. This is what
+    /// makes the restart case work without an at-rest ratchet.
+    async fn ensure_session(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+    ) -> Option<InitialMessage> {
+        if self.sessions.contains_key(&(*channel_id, target)) {
+            return None;
+        }
+        let net = self.net.as_ref().map(Arc::clone)?;
+        let shared = self.channels.get(channel_id).map(Arc::clone)?;
+        let ctx = { shared.lock().await.join_context().ok()? };
+        let record = net.board_bundle(channel_id, ctx.epoch, &target)?;
+        let ring = self.prekeys.as_ref()?;
+        let (initial, session) = crate::pairwise::session::Session::initiate(
+            ring.identity_dh(),
+            &record.prekey_bundle,
+            &ctx.channel_id,
+            ctx.epoch,
+            ctx.suite_id,
+            ctx.floor,
+        )
+        .ok()?;
+        self.sessions.insert((*channel_id, target), session);
+        Some(initial)
+    }
+
     /// Take an inbound sealed control message: an ADR-006 SKDM, which makes that
     /// author's messages readable and backfills any already held as ciphertext.
     async fn take_inbound_skdm(&mut self, peer: Digest32, mut recv: quinn::RecvStream) {
-        use crate::node::pairwise_stream::{open_skdm, recv_pairwise};
-        let Ok(Some((channel_id, sealed))) = recv_pairwise(&mut recv).await else {
+        use crate::node::pairwise_stream::{open_skdm, recv_pairwise, PairwiseFrame};
+        let Ok(Some(first)) = recv_pairwise(&mut recv).await else {
             return;
+        };
+        // A `Hello` opens a session the join path never created (ADR-016): accept it
+        // against our own prekey ring, exactly as the join responder does, then read
+        // the SKDM it precedes.
+        let (channel_id, sealed) = match first {
+            PairwiseFrame::Skdm { channel_id, sealed } => (channel_id, sealed),
+            PairwiseFrame::Hello {
+                channel_id,
+                initial,
+            } => {
+                if !self.accept_hello(channel_id, peer, &initial).await {
+                    return;
+                }
+                let Ok(Some(PairwiseFrame::Skdm { channel_id, sealed })) =
+                    recv_pairwise(&mut recv).await
+                else {
+                    // A session with nothing behind it is still progress: the peer may
+                    // deliver over it later.
+                    return;
+                };
+                (channel_id, sealed)
+            }
         };
         let now = self.now();
         let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {

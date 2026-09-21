@@ -2,7 +2,7 @@
 
 **Status**: implemented (M2, `crates/vox-core/src/pairwise/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M2) added; uncommitted DH-ratchet secrets are wiped when a decrypt plan is dropped; nonce KDF error propagates instead of an all-zero nonce. 2026-09-20 — serverless one-time-prekey consume semantics implemented (`node::prekeys`, ADR-016 M14.3) and reconciled with the per-process reuse tracker at the point sessions are established (`node::joinstream`, M14.4).
+**Updated**: 2026-09-21 — a session may now be opened **outside a join**, from a member's ADR-016 bundle record; its `InitialMessage` travels as `PairwiseFrame::Hello` on the `pairwise` stream instead of the join stream. The responder path is unchanged and unchanged in strength: the message must name a signed prekey (and optionally a one-time prekey) from the responder's own ring, the one-time consume is persisted before the handshake completes, and a replay is graded last-resort exactly as `joinstream` grades it. **Updated**: 2026-09-19 — Implementation notes (M2) added; uncommitted DH-ratchet secrets are wiped when a decrypt plan is dropped; nonce KDF error propagates instead of an all-zero nonce. 2026-09-20 — serverless one-time-prekey consume semantics implemented (`node::prekeys`, ADR-016 M14.3) and reconciled with the per-process reuse tracker at the point sessions are established (`node::joinstream`, M14.4).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: crypto-core, pqxdh, double-ratchet, forward-secrecy, pcs
 
