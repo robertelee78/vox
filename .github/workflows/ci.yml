@@ -10,13 +10,18 @@ env:
   RUSTFLAGS: "-D warnings"
   # The gaps ADR-018 §3 accepts today, named so that accepting them is a visible decision.
   # Removing one MUST make the proofs fail until it is closed.
-  VOX_PROOF_ALLOW_UNPROVEN: "fish,journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused"
+  # The gaps ADR-018 §3 accepts, named so accepting them is a visible decision. `fish` is NOT
+  # here: the runners install it below, which is how that gap gets closed rather than excused.
+  VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes"
 
 jobs:
   build-test:
     name: build · clippy · fmt · test
     # ADR-015 scopes clients to macOS + Linux; the core is checked on both.
     strategy:
+      # Both platforms report. Without this, one failure cancels the other and the second
+      # platform's state is never learned — which is how a red ubuntu hid macOS for ten runs.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -24,6 +29,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
+      # `shell_setup_proof` measures real shells. A shell that is absent is reported unproven and
+      # FAILS (ADR-018 §3), so the runners install the ones it proves against rather than the
+      # proof being excused. ubuntu-latest ships neither zsh nor fish; macOS ships zsh only.
+      - name: Install the shells the proofs measure
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update && sudo apt-get install -y zsh fish
+          else
+            brew install fish
+          fi
+          zsh --version && fish --version && bash --version | head -1
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Format check

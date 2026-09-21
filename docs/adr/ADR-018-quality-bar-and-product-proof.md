@@ -79,23 +79,36 @@ A proof whose prover is unavailable — an uninstalled shell, absent hardware, a
 MUST be reported as **unproven** and MUST fail the proof. It MUST NOT be silently skipped.
 
 A gap MAY be accepted deliberately, and when it is, the acceptance MUST be explicit and visible at the
-point of running (for example `VOX_PROOF_ALLOW_UNPROVEN=fish`) and SHOULD be recorded here. A failing
+point of running (for example `VOX_PROOF_ALLOW_UNPROVEN=install.apple_gate_refuses_unsigned_bytes`)
+and SHOULD be recorded here. A failing
 or blocked obligation MUST be recorded as failing or blocked, never as waived-green.
 
 **Accepted gaps, as of 2026-09-21:**
 
 | Gap | Accepted because | What would close it |
 |---|---|---|
-| `fish` in `shell_setup_proof` | `fish` is not installed on the development machine and is not in CI's default image. `zsh` and `bash` are proved against real shells, including the `compinit`-already-ran case. | installing `fish` on the runner; the proof then covers it with no code change |
+| `install.apple_gate_refuses_unsigned_bytes` in `install_sh_proof` | the installer's Developer ID and notarization gate is macOS-only, so on Linux there is nothing to measure. On macOS it is proved, by forcing the gate on against an unsigned fixture. | nothing closes it on Linux; it is a property that does not exist there |
 | `journey.update_replaces_an_older_install` in `update_proof` | there is no earlier release to update *from*. The version the binary reports is compiled in, so an older `vox` cannot be fabricated locally. | publishing a second release. The proof already asks GitHub for the newest release other than the current one, fetches it, and drives *its* `vox update`; it starts measuring at `v0.1.1` with no code change |
 | `verify.digest_mismatch_is_refused` in `update_proof` | reaching the updater's digest check needs a release *newer* than the running binary whose record does not describe it, so it is gated behind the same missing earlier release. The equivalent refusals in `install.sh` **are** proved today, against a loopback release server. | the same second release. The `proof-<triple>.json` record ADR-015 requires is published from `v0.1.0` onwards, so this too starts measuring at `v0.1.1` |
 
-The gates therefore run as:
+**Closed in CI, 2026-09-21: `fish` in `shell_setup_proof`.** It was accepted because the shell was
+not on the runners, and the entry itself named what would close it — "installing `fish` on the
+runner". The workflows now install `zsh` and `fish` before running the proofs, so **CI does not
+excuse `fish`**. An accepted gap that states its own remedy SHOULD be closed rather than renewed.
+
+The allow-list is therefore per-environment, and CI's is the strict one:
 
 ```
-VOX_PROOF_ALLOW_UNPROVEN=fish,journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused \
-  cargo test --workspace
+# CI (ubuntu + macOS, both with zsh, bash and fish installed):
+VOX_PROOF_ALLOW_UNPROVEN=journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes
+
+# a developer machine that has no fish may additionally name it:
+VOX_PROOF_ALLOW_UNPROVEN=fish,journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes
 ```
+
+A local list MAY be longer than CI's; it MUST NOT be shorter, and CI's MUST NOT grow to match a
+developer's machine. The point of the mechanism is that the strict list is the one that gates the
+repository.
 
 Removing an entry MUST make the proof fail until that gap is closed — that is the point of it. The
 value is set once in `.github/workflows/ci.yml` and `.github/workflows/release.yml`, so the accepted

@@ -9,7 +9,8 @@ env:
   CARGO_TERM_COLOR: always
   # The gaps ADR-018 §3 accepts today. Removing one MUST make the proofs fail until it is
   # closed — that is what makes an accepted gap a decision rather than a silence.
-  VOX_PROOF_ALLOW_UNPROVEN: "fish,journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused"
+  # See ci.yml: `fish` is not excused here, the gates job installs it.
+  VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes"
 
 jobs:
   # ADR-018 §6: nothing is published from a tree the gates have not passed on. The tag is the
@@ -26,6 +27,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
+      # See ci.yml: the proofs measure real shells, so the runner installs them.
+      - run: sudo apt-get update && sudo apt-get install -y zsh fish
       - run: rustc --version && cargo --version
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
