@@ -1453,6 +1453,31 @@ impl ChannelState {
         self.persist_delivered(store)
     }
 
+    /// The admitted authors in `trusted` this identity has **not yet consented
+    /// to** — who auto-consent still owes a first key release (ADR-020 §3).
+    ///
+    /// Derived, never stored, exactly like [`owed_rekeys`](Self::owed_rekeys): the
+    /// consent set comes off the log, so a member drops out the moment the log says
+    /// it was consented to, and nothing has to be invalidated.
+    ///
+    /// `trusted` is the caller's keyring, and it is the whole point: membership of
+    /// this channel is *not* sufficient. An author admitted by vouching — a bundle
+    /// record published by a member, for an identity that never held the room
+    /// passphrase — is an author here and still gets nothing unless the operator
+    /// put its fingerprint in the keyring.
+    #[must_use]
+    pub fn owed_consents(&self, trusted: &BTreeSet<Digest32>) -> BTreeSet<Digest32> {
+        let me = self.me();
+        let already: BTreeSet<Digest32> = MembershipView::new(&self.evaluator).readers_of(&me);
+        self.authors
+            .keys()
+            .copied()
+            .filter(|a| *a != me)
+            .filter(|a| trusted.contains(a))
+            .filter(|a| !already.contains(a))
+            .collect()
+    }
+
     /// The members this identity has consented to that do not yet hold its current
     /// generation — who a rotation still owes a re-key.
     ///

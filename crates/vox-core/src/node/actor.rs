@@ -616,6 +616,9 @@ pub struct Node {
     argon2: Argon2Profile,
     view_tx: watch::Sender<NodeView>,
     event_tx: broadcast::Sender<NodeEvent>,
+    /// The ADR-020 §3 trust keyring, loaded on unlock and empty while locked
+    /// (it is sealed under the identity, so there is nothing to hold locked).
+    trust: crate::node::trust::Keyring,
 }
 
 impl Node {
@@ -722,6 +725,7 @@ impl Node {
             argon2,
             view_tx: watch::Sender::new(NodeView::default()),
             event_tx,
+            trust: crate::node::trust::Keyring::new(),
         };
         let view_rx = node.view_tx.subscribe();
         // A headless node has nothing to unlock: it is on the network from the start.
@@ -786,6 +790,10 @@ impl Node {
                     // reachable, which is why they are retried here and not only at
                     // the moment of rotation (M18.1).
                     self.deliver_owed_rekeys().await;
+                    // Auto-consent for trusted identities, retried here for the
+                    // same reason: a trusted member that was unreachable a moment
+                    // ago is picked up as soon as it can be reached (ADR-020 §3).
+                    self.deliver_owed_consents().await;
                     if self.run_due_syncs().await {
                         self.publish().await;
                     }
@@ -832,6 +840,11 @@ impl Node {
             } => self.join_channel(&link, &local_name, &passphrase).await,
             NodeCommand::Consent { channel_id, target } => self.consent(&channel_id, target).await,
             NodeCommand::Revoke { channel_id, target } => self.revoke(&channel_id, target).await,
+            NodeCommand::Trust {
+                fingerprint,
+                petname,
+            } => self.trust_identity(fingerprint, &petname).await,
+            NodeCommand::Untrust { fingerprint } => self.untrust_identity(&fingerprint).await,
             NodeCommand::Serve {
                 local_name,
                 passphrase,
@@ -1956,6 +1969,84 @@ impl Node {
         outcome
     }
 
+    /// Trust `fingerprint` node-wide under `petname` (ADR-020 §3), then act on it
+    /// at once so the operator does not wait a tick to see the effect.
+    async fn trust_identity(&mut self, fingerprint: Digest32, petname: &str) -> Outcome {
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let signer = match profile.signer() {
+            Ok(s) => s,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        let mut next = self.trust.clone();
+        if let Err(e) = next.trust(fingerprint, petname) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        // Persist BEFORE adopting it: a keyring that consented but did not survive
+        // a restart would silently re-consent on every boot.
+        if let Err(e) = next.save(profile.store(), signer) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.trust = next;
+        self.deliver_owed_consents().await;
+        self.publish().await;
+        Outcome::Done
+    }
+
+    /// Stop trusting `fingerprint` (ADR-020 §3).
+    ///
+    /// Forward-looking by construction: it changes who *future* consent is issued
+    /// to and recalls nothing already granted. Recalling that is `Revoke`, per
+    /// room — ADR-007's enforcement honesty, which this must not paper over.
+    async fn untrust_identity(&mut self, fingerprint: &Digest32) -> Outcome {
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let signer = match profile.signer() {
+            Ok(s) => s,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        let mut next = self.trust.clone();
+        if !next.untrust(fingerprint) {
+            return Outcome::Failed(Fault::NotConsented);
+        }
+        if let Err(e) = next.save(profile.store(), signer) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.trust = next;
+        self.publish().await;
+        Outcome::Done
+    }
+
+    /// Issue consent to every trusted, admitted author that does not hold it yet,
+    /// across every open channel (ADR-020 §3).
+    ///
+    /// Retried on the tick for the same reason a re-key is: consent *is* a network
+    /// act — the SKDM rides a pairwise session — so a trusted member that is
+    /// offline right now is skipped, not failed, and picked up when it returns.
+    async fn deliver_owed_consents(&mut self) {
+        if self.net.is_none() || self.trust.is_empty() {
+            return;
+        }
+        let trusted = self.trust.trusted();
+        let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+        for channel_id in channels {
+            let owed = {
+                let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+                    continue;
+                };
+                let owed = shared.lock().await.owed_consents(&trusted);
+                owed
+            };
+            for target in owed {
+                // `consent` emits `Consented` on success; a failure here is a peer
+                // that is not reachable yet, which the next tick retries.
+                let _ = self.consent(&channel_id, target).await;
+            }
+        }
+    }
+
     /// Revoke `target`'s consent (ADR-007 §Revocation, M18.1): rotate this
     /// identity's sender key, record the revocation, and re-key everyone who keeps
     /// consent.
@@ -2604,6 +2695,10 @@ impl Node {
         let dh_secret = *signer.x25519_identity_secret();
         let (ring, _created) = prekeys::load_or_create(profile.store(), signer, &dh_secret, now)?;
         self.prekeys = Some(ring);
+        // The keyring is sealed under this identity, so it can only be opened now
+        // (ADR-020 §3). Without this the node would hold an empty keyring and
+        // silently trust nobody after every restart.
+        self.trust = crate::node::trust::Keyring::load(profile.store(), signer)?;
         Ok(())
     }
 
@@ -2615,6 +2710,10 @@ impl Node {
         // Drop the prekey ring: its secrets zeroize on drop, so a locked node holds
         // no key-agreement material (ADR-015 lock/zeroize).
         self.prekeys = None;
+        // The keyring is not secret material, but it is sealed under the identity
+        // and says who this operator talks to. A locked node holds neither, and it
+        // is re-opened on the next unlock (ADR-020 §3).
+        self.trust = crate::node::trust::Keyring::new();
         // Pairwise sessions hold ratchet key material: drop them with everything else
         // (their secrets zeroize on drop).
         self.sessions.clear();
@@ -3038,6 +3137,7 @@ impl Node {
             channels,
             open_channels: Vec::new(),
             forwards: Vec::new(),
+            trusted: self.trust_rows(),
         });
     }
 
@@ -3129,7 +3229,17 @@ impl Node {
                     local: f.local,
                 })
                 .collect(),
+            trusted: self.trust_rows(),
         }
+    }
+
+    /// The keyring as the view carries it — empty while locked, because the
+    /// keyring is sealed under the identity and there is nothing to show.
+    fn trust_rows(&self) -> Vec<(Digest32, String)> {
+        self.trust
+            .iter()
+            .map(|(fp, name)| (*fp, name.to_owned()))
+            .collect()
     }
 }
 

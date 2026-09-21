@@ -44,5 +44,6 @@ pub mod profile;
 pub mod resolver;
 pub mod store;
 pub mod syncstream;
+pub mod trust;
 pub mod tunnel;
 pub mod up;

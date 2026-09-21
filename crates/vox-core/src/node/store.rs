@@ -56,6 +56,10 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::PrekeyRing => 5,
         SegmentKind::AnchorLog => 6,
         SegmentKind::AnchorMeta => 7,
+        // The keyring is not stored as a segment (it is a sealed blob in `meta`,
+        // because it belongs to no channel), but a kind must map to a stable code
+        // or this match stops being exhaustive.
+        SegmentKind::Trust => 8,
     }
 }
 
