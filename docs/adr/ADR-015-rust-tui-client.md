@@ -302,7 +302,15 @@ compiled into the binary is what would close that, and is deliberately not in th
 a release key with its own custody story. Recorded as a known gap rather than an unexamined
 assumption.
 
-**Targets** are `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. macOS
+**Targets** are `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. The
+macOS floor is **macOS 11.0**, pinned with `MACOSX_DEPLOYMENT_TARGET` and asserted by the signer.
+It MUST be pinned rather than inherited: rustc's *default* deployment target differs per Apple
+architecture — 10.12 for `x86_64-apple-darwin`, 11.0 for `aarch64-apple-darwin` — so an unpinned
+build ships two artifacts claiming two different floors, one of which nobody has ever tested. It
+also has a second-order effect that is easy to miss: below 10.14 the linker emits
+`LC_VERSION_MIN_MACOSX` rather than `LC_BUILD_VERSION`, so `vtool -show-build` reports no `minos`
+at all. 11.0 is the floor Apple Silicon cannot go below anyway, so claiming less on Intel buys
+support only for machines that could never run the other half of the release. macOS
 artifacts MUST be signed with a **Developer ID Application** certificate and notarized: an unsigned
 download is quarantined by Gatekeeper, and "clear the quarantine flag by hand" is not an acceptable
 first run for a tool whose purpose is confidentiality. Signing MUST happen **after** `strip`, which

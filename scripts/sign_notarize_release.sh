@@ -19,8 +19,8 @@
 #           APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD, APPLE_NOTARY_KEY_P8_BASE64
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: $0 INPUT_BINARY OUTPUT_DIRECTORY VERSION TARGET_TRIPLE IDENTIFIER" >&2
+if [[ $# -ne 6 ]]; then
+  echo "usage: $0 INPUT_BINARY OUTPUT_DIRECTORY VERSION TARGET_TRIPLE IDENTIFIER MIN_MACOS" >&2
   exit 2
 fi
 
@@ -29,6 +29,7 @@ output_directory=$2
 version=$3
 target=$4
 identifier=$5
+expected_min_macos=$6
 asset_name="vox-${target}"
 
 case "$target" in
@@ -55,11 +56,18 @@ fail() {
 [[ $(/usr/bin/lipo -archs "$input_binary" 2>/dev/null) == "$expected_arch" ]] || \
   fail "input is not an exact thin $expected_arch Mach-O"
 input_sha=$(sha256_file "$input_binary")
-# Recorded, not asserted: vox pins no deployment target, so the receipt states what the
-# toolchain produced rather than pretending to a floor nobody decided.
+# Asserted, not merely recorded. rustc's DEFAULT deployment target differs per Apple
+# architecture — 10.12 for x86_64-apple-darwin, 11.0 for aarch64-apple-darwin — so an
+# unpinned build ships two artifacts claiming two different floors, one of which
+# (10.12) nobody has ever tested. Worse, below 10.14 the linker emits
+# LC_VERSION_MIN_MACOSX instead of LC_BUILD_VERSION and `vtool -show-build` prints no
+# `minos` line at all, which is how this was found: the x86_64 job failed here while
+# arm64 passed. The workflow now pins MACOSX_DEPLOYMENT_TARGET and this checks it held.
+[[ "$expected_min_macos" =~ ^[0-9]+\.[0-9]+$ ]] || fail "expected minimum macOS is not canonical"
 minimum_macos=$(/usr/bin/vtool -show-build "$input_binary" 2>/dev/null | \
   awk '$1 == "minos" {print $2}')
-[[ "$minimum_macos" =~ ^[0-9]+\.[0-9]+$ ]] || fail "input declares no canonical minimum macOS"
+[[ "$minimum_macos" == "$expected_min_macos" ]] || \
+  fail "input declares minimum macOS '${minimum_macos:-none}', expected $expected_min_macos"
 
 signing_identity=${APPLE_DEVELOPER_ID_APPLICATION:?APPLE_DEVELOPER_ID_APPLICATION is required}
 team_id=${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}

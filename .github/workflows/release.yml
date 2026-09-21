@@ -73,10 +73,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
+        env:
+          # A decision, not a rustc default: see scripts/sign_notarize_release.sh. Both macOS
+          # artifacts must claim the same floor, and it must be one vox actually supports.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           cargo build --release --bin vox
           strip target/release/vox
           ls -lh target/release/vox
+          vtool -show-build target/release/vox | grep -E "platform|minos"
 
       # Signing happens AFTER `strip` — strip rewrites the Mach-O and invalidates any earlier
       # signature — and BEFORE packaging, so the release record's digest covers the signed
@@ -97,7 +102,7 @@ jobs:
           signed="$RUNNER_TEMP/vox-signed-aarch64-apple-darwin"
           scripts/sign_notarize_release.sh \
             target/release/vox "$signed" "$VERSION" aarch64-apple-darwin \
-            "$APPLE_CODESIGN_IDENTIFIER"
+            "$APPLE_CODESIGN_IDENTIFIER" 11.0
           echo "SIGNED_DIR=$signed" >>"$GITHUB_ENV"
 
       - name: Package release assets
@@ -124,10 +129,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
+        env:
+          # See the arm64 job. rustc would otherwise default this target to 10.12.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           cargo build --release --target x86_64-apple-darwin --bin vox
           strip target/x86_64-apple-darwin/release/vox
           ls -lh target/x86_64-apple-darwin/release/vox
+          vtool -show-build target/x86_64-apple-darwin/release/vox | grep -E "platform|minos"
 
       # See the arm64 job. Note additionally that `strip` on a cross-built x86_64 binary
       # removes its ad-hoc signature entirely, so signing is what makes the Intel package
@@ -148,7 +157,7 @@ jobs:
           signed="$RUNNER_TEMP/vox-signed-x86_64-apple-darwin"
           scripts/sign_notarize_release.sh \
             target/x86_64-apple-darwin/release/vox "$signed" "$VERSION" x86_64-apple-darwin \
-            "$APPLE_CODESIGN_IDENTIFIER"
+            "$APPLE_CODESIGN_IDENTIFIER" 11.0
           echo "SIGNED_DIR=$signed" >>"$GITHUB_ENV"
 
       - name: Package release assets
