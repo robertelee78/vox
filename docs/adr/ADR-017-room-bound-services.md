@@ -56,6 +56,12 @@ shipped. The material ones, and what changed:
   without filtering on the head epoch (`governance/evaluator.rs:519`, `:797`), so the ADR comment cited as
   evidence was not proof. Finding #5 is downgraded to **unverified** pending a test that exhibits it.
 
+**One open question added 2026-09-21** after M19.2 merged: its trust keyring auto-consents through the same
+`consent()` path an explicit approval uses (`node/actor.rs:2045`), so the two are indistinguishable in the
+store. Services and the keyring are **separate use cases** by the decider's direction, so keyring consent
+must not by itself confer service reach — and making that true needs something the consent record does not
+carry. Left open against M17.7 rather than guessed at. See decision 3.
+
 Descriptor freshness is keyed to the host's ADR-006 `chain_id` **and** to explicit publication triggers —
 `chain_id` alone is insufficient because approving a reader does not advance it (`governance/channel.rs:1311`),
 which would have left a newly approved reader unable to open the standing descriptor. See decision 9, which
@@ -293,6 +299,32 @@ left to be discovered.
 
 An infosec reviewer will ask whether a host can share `:22` with two of its five approved readers. The
 answer is *no, use a second room*, and that is a design position rather than an omission.
+
+#### Open question: the M19.2 trust keyring writes the same consent store
+
+**Raised 2026-09-21, not decided here.** M19.2 landed a **trust keyring** (`node::trust::Keyring`,
+`NodeCommand::{Trust,Untrust}`) for the agent-comms use case: an operator trusts an agent *identity* once
+and the node auto-consents to it in every room it shares with it, because agent rooms are ephemeral — a
+repo, a task, the operator's choice — and the trust dance being per-room-per-agent is the pain that made
+agent comms impractical.
+
+**The decider's position is that these are completely separate use cases.** A service is bound to a room and
+is reachable only by the members of that room *its owner has approved*; that approved subset is the access
+control list, and it is a per-room, per-member decision by the host. The keyring is an operator convenience
+for establishing readability between agents. Neither is a special case of the other, and this ADR must not
+fold them together.
+
+**The constraint that follows, which the implementation cannot avoid deciding:** keyring auto-consent is
+delivered by `deliver_owed_consents`, which calls the *same* `consent(channel_id, target)` an explicit
+approval calls (`node/actor.rs:2045`). The two are therefore indistinguishable in the consent store and on
+the log. So a services gate phrased as "a consent exists from this host to this member in this room" is
+satisfied by keyring consent, and the two use cases fuse **by accident rather than by decision** — the
+opposite of what was directed.
+
+Keeping them separate therefore requires the dial gate to see something the consent record does not carry
+today. The shape of that — a provenance marker on the record, a separate services-approval set, or something
+else — is **M17.7's to settle with the decider**, and is deliberately left open rather than guessed at here.
+What is settled is the requirement: **keyring consent must not, by itself, confer service reach.**
 
 #### What it does not change
 
@@ -830,7 +862,10 @@ New work, in dependency order:
   creates none, and names its audience and non-audience. The consent prompt states that approval confers
   service reach. Gate: an unapproved member is refused, an approved one reaches the service, the transition
   happens on the approval alone with no second command, and a member who is not the room's creator can
-  serve — which fails today.
+  serve — which fails today. **Plus the keyring case:** a member consented to only by M19.2's trust keyring
+  (`deliver_owed_consents`, `node/actor.rs:2045`) reads messages and **does not** reach the service, per the
+  open question in decision 3. How the gate distinguishes the two is settled with the decider as part of
+  this item, not assumed.
 - **M17.8 — the evaluator's head-epoch filtering.** The open question behind the downgraded finding #5:
   whether exclusion and consent folding should filter on the head epoch (`governance/evaluator.rs:519`,
   `:797`). Gate: a test that either exhibits the resurrection or shows it cannot happen. **Blocks nothing
