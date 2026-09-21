@@ -59,6 +59,9 @@ jobs:
   build-darwin-arm64:
     needs: [gates]
     runs-on: macos-latest
+    # Holds the Apple credentials. A fork or a pull request cannot reach them, so it cannot
+    # produce a release artifact — which is the point: there is no unsigned fallback.
+    environment: apple-release
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -70,25 +73,32 @@ jobs:
           ls -lh target/release/vox
 
       # Signing happens AFTER `strip` — strip rewrites the Mach-O and invalidates any earlier
-      # signature — and BEFORE packaging, so the record's digest covers the signed bytes.
-      # Without a Developer ID signature Gatekeeper quarantines the download, and "clear the
-      # quarantine flag by hand" is not an acceptable first run for a tool whose purpose is
-      # confidentiality (ADR-015).
-      - name: Sign and notarize (Developer ID)
+      # signature — and BEFORE packaging, so the release record's digest covers the signed
+      # bytes. The signer emits its own proof receipts (ADR-018).
+      - name: Developer ID sign and notarize
         env:
-          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
-          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
-          # A tag is a release, and a release MUST be signed (ADR-015). Only a manual dispatch,
-          # a fork or a pull request may fall back to ad-hoc signing; a tag never can.
-          VOX_ALLOW_UNSIGNED: ${{ startsWith(github.ref, 'refs/tags/') && '' || '1' }}
-        run: scripts/sign-macos.sh target/release/vox
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ vars.APPLE_DEVELOPER_ID_APPLICATION }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_CODESIGN_IDENTIFIER: ${{ vars.APPLE_CODESIGN_IDENTIFIER }}
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          signed="$RUNNER_TEMP/vox-signed-aarch64-apple-darwin"
+          scripts/sign_notarize_release.sh \
+            target/release/vox "$signed" "$VERSION" aarch64-apple-darwin \
+            "$APPLE_CODESIGN_IDENTIFIER"
+          echo "SIGNED_DIR=$signed" >>"$GITHUB_ENV"
 
       - name: Package release assets
-        run: scripts/package-release.sh target/release/vox aarch64-apple-darwin
+        run: |
+          set -euo pipefail
+          scripts/package-release.sh "$SIGNED_DIR/vox-aarch64-apple-darwin" aarch64-apple-darwin
+          cp "$SIGNED_DIR"/apple-proof-*.json dist/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -98,6 +108,7 @@ jobs:
   build-darwin-x64:
     needs: [gates]
     runs-on: macos-latest
+    environment: apple-release
     steps:
       - uses: actions/checkout@v4
         # rust-toolchain.toml pins the channel; the extra target is added explicitly because
@@ -114,20 +125,30 @@ jobs:
       # See the arm64 job. Note additionally that `strip` on a cross-built x86_64 binary
       # removes its ad-hoc signature entirely, so signing is what makes the Intel package
       # runnable at all.
-      - name: Sign and notarize (Developer ID)
+      - name: Developer ID sign and notarize
         env:
-          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
-          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
-          # See the arm64 job: a tag never falls back.
-          VOX_ALLOW_UNSIGNED: ${{ startsWith(github.ref, 'refs/tags/') && '' || '1' }}
-        run: scripts/sign-macos.sh target/x86_64-apple-darwin/release/vox
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ vars.APPLE_DEVELOPER_ID_APPLICATION }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_CODESIGN_IDENTIFIER: ${{ vars.APPLE_CODESIGN_IDENTIFIER }}
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          signed="$RUNNER_TEMP/vox-signed-x86_64-apple-darwin"
+          scripts/sign_notarize_release.sh \
+            target/x86_64-apple-darwin/release/vox "$signed" "$VERSION" x86_64-apple-darwin \
+            "$APPLE_CODESIGN_IDENTIFIER"
+          echo "SIGNED_DIR=$signed" >>"$GITHUB_ENV"
 
       - name: Package release assets
-        run: scripts/package-release.sh target/x86_64-apple-darwin/release/vox x86_64-apple-darwin
+        run: |
+          set -euo pipefail
+          scripts/package-release.sh "$SIGNED_DIR/vox-x86_64-apple-darwin" x86_64-apple-darwin
+          cp "$SIGNED_DIR"/apple-proof-*.json dist/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -156,6 +177,8 @@ jobs:
           # Plus install.sh itself, so a pinned copy travels with every release.
           mkdir -p release
           cp artifacts/*/vox-* artifacts/*/stable-*.json artifacts/*/proof-*.json release/
+          # ADR-018: the signing proof travels with the artifact it describes.
+          cp artifacts/*/apple-proof-*.json release/
           cp install.sh release/install.sh
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           TAG="${GITHUB_REF_NAME}"
@@ -170,6 +193,31 @@ jobs:
           for pat in 'release/vox-*' 'release/stable-*.json' 'release/proof-*.json'; do
             n=$(ls $pat | grep -cv '\.sha256$')
             [ "$n" = 3 ] || { echo "ERROR: expected 3 of $pat, found $n"; ls -l release; exit 1; }
+          done
+          # Two macOS targets, so two signing proofs — and each MUST say Accepted for the
+          # version being published. A missing proof is a macOS binary nobody can show was
+          # notarized, which is exactly the "absent evidence reads as success" failure
+          # ADR-018 §3 forbids.
+          n=$(ls release/apple-proof-*.json | wc -l | tr -d ' ')
+          [ "$n" = 2 ] || { echo "ERROR: expected 2 Apple signing proofs, found $n"; ls -l release; exit 1; }
+          for r in release/apple-proof-*.json; do
+            jq -e --arg v "${VERSION}" '
+              .kind == "vox.apple-release-proof"
+              and .version == $v
+              and .signing.authority == "Developer ID Application"
+              and .signing.hardened_runtime == true
+              and .signing.secure_timestamp == true
+              and .notarization.status == "Accepted"
+              and .verification.codesign == "accepted"
+              and .verification.online_notarization == "accepted"
+              and .verification.notary_ticket_cdhash_matches == true
+            ' "$r" >/dev/null || { echo "ERROR: $r does not attest a notarized ${VERSION}"; cat "$r"; exit 1; }
+          done
+          # The record's digest must describe the *signed* bytes that shipped.
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            want=$(jq -er .asset.sha256 "release/apple-proof-${t}.json")
+            got=$(jq -er .sha256 "release/stable-${t}.json")
+            [ "$want" = "$got" ] || { echo "ERROR: ${t}: release record digest ${got} is not the signed binary ${want}"; exit 1; }
           done
           ls -l release
 
