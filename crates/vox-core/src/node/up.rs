@@ -127,7 +127,18 @@ where
 /// one blocked **binding**, so a proxy which came up could refuse everything for ever;
 /// this blocks only the request that is waiting, on its own task, while every other
 /// request and the accept loop keep running.
-const HOST_PATIENCE: Duration = Duration::from_secs(90);
+///
+/// **Why it is minutes rather than seconds.** The bound was 20s, then 90s, and both were
+/// calibrated on an idle machine. The measured first-connect wait on a quiet box has been
+/// 7.7s and 88s across runs — an order of magnitude apart for the same code — because what
+/// the wait covers is a cold node connecting to an anchor, syncing a board and dialling a
+/// peer through the ADR-012 ladder, possibly relayed. Under a loaded machine the 90s bound
+/// expired and the *original* defect reappeared: the proxy refused a real request that would
+/// have succeeded shortly after. A bound that turns into the bug it fixed whenever the
+/// machine is busy is not a fix, so this is generous on purpose. A host that is genuinely
+/// gone still refuses — it just takes a few minutes to say so, which is the right way round
+/// for a wait a person only pays on their first connection.
+const HOST_PATIENCE: Duration = Duration::from_secs(300);
 
 /// Poll interval while waiting. Short enough that a ready host costs a person nothing.
 const HOST_POLL: Duration = Duration::from_millis(250);

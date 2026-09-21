@@ -17,7 +17,7 @@
 //! accepted TCP connection closes. `TunnelStatus::Denied` distinguishes none of them,
 //! and neither does this.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -40,6 +40,13 @@ pub struct ChannelServices {
     pub evaluator: Arc<Evaluator>,
     /// `service_tag → local address` (this node's Bind configuration).
     pub services: BTreeMap<String, SocketAddr>,
+    /// The identities that may reach this node's services **in this channel** (ADR-017
+    /// decision 3, M17.7): the intersection of this node's trust keyring with this
+    /// channel's current author set.
+    ///
+    /// Computed by the actor, which is the only place that holds both, and snapshotted
+    /// per accept so the decision is current rather than cached across one.
+    pub reachers: Arc<BTreeSet<Digest32>>,
 }
 
 impl std::fmt::Debug for ChannelServices {
@@ -98,6 +105,7 @@ pub async fn serve_reporting(
             Some(HostService {
                 evaluator: Arc::clone(&channel.evaluator),
                 endpoint,
+                reachers: Arc::clone(&channel.reachers),
             })
         },
         |channel_id, tag| {

@@ -29,8 +29,6 @@ use crate::governance::evaluator::Evaluator;
 use crate::hash::Digest32;
 use std::sync::Arc;
 
-use crate::tunnel::authz::authorize_dial;
-
 /// Maximum length of a service tag carried in a tunnel request (matches the
 /// capability-token bound; rejects an oversized field before allocation).
 pub const MAX_SERVICE_TAG_LEN: usize = 256;
@@ -183,6 +181,20 @@ pub struct HostService {
     pub evaluator: Arc<Evaluator>,
     /// The local address the service listens on.
     pub endpoint: SocketAddr,
+    /// The identities this host has decided may reach it: its **trust keyring** entries
+    /// that are also **current authors of this room** (ADR-017 decision 3, M17.7).
+    ///
+    /// A set rather than a predicate because the actor owns both inputs — the node-wide
+    /// ring and the channel's author table — and the serving task must not reach back
+    /// into the actor to ask. It is rebuilt per accept from the host snapshot, so it is
+    /// current rather than cached across a decision.
+    ///
+    /// Why not the log's consent set: `readers_of(host)` records signed consent *edges*
+    /// and checks neither current room membership nor current ring membership, so a grant
+    /// from epoch 0 still appears after an authorized rotation to epoch 1. Keying on the
+    /// ring — which is local, current, and the host's own decision — means the epoch
+    /// question never reaches this gate at all. Found by review before any code.
+    pub reachers: Arc<std::collections::BTreeSet<Digest32>>,
 }
 
 /// Host side: accept a tunnel on a fresh inbound stream pair, **enforcing the Dial
@@ -244,15 +256,24 @@ where
 {
     let req = TunnelRequest::from_bytes(&read_frame(&mut recv).await?)?;
 
-    // (2) Resolution is pure host config, asked about the channel the dialer named,
-    //     so a service offered in one channel is not reachable by a capability
-    //     granted in another. (3) Authorization is enforced here, against the
-    //     authenticated peer and that channel's authority. Both denials are uniform.
-    let decision = resolve(&req.channel_id, &req.service_tag).and_then(|h| {
-        authorize_dial(&h.evaluator, client_id, &req.service_tag)
-            .ok()
-            .map(|()| h.endpoint)
-    });
+    // (2) Resolution is pure host config, asked about the channel the dialer named, so a
+    //     service offered in one channel is not reachable through another. (3)
+    //     Authorization is enforced here, against the transport-authenticated peer.
+    //
+    // **The gate is the host's own decision about that identity** (ADR-017 decision 3,
+    // M17.7): is this client in the host's trust keyring, and a current author of the room
+    // the service is bound to. Both conditions, neither sufficient alone — trust is
+    // room-independent so it cannot name the room, and room membership is a passphrase and
+    // a proof of work so it is not a decision about a person.
+    //
+    // It is no longer the capability lattice. `dial:<tag>` came from a genesis grant
+    // conferred on every admitted member, which made joining the authorization; that is
+    // the withdrawn model and the vulnerability. `service_tag` is therefore no longer an
+    // authorization input at all — reach is per (host, room), so every service a host
+    // bound to a room goes to the same set.
+    let decision = resolve(&req.channel_id, &req.service_tag)
+        .filter(|h| h.reachers.contains(client_id))
+        .map(|h| h.endpoint);
     let Some(target) = decision else {
         // Finish the stream so the status reaches the dialer before we drop it.
         write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;

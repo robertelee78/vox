@@ -3173,10 +3173,11 @@ impl Node {
         }
     }
 
-    /// The host-side snapshot for serving tunnels: every open channel's evaluator and
-    /// offered services (ADR-013, M16.1). Taken by the actor because only the actor
-    /// reads channel state; handed to the serving task whole, so a tunnel that lives
-    /// for hours never reaches back in.
+    /// The host-side snapshot for serving tunnels: every open channel's evaluator, the
+    /// services this node offers there, and **who may reach them** (ADR-013 M16.1,
+    /// ADR-017 decision 3 / M17.7). Taken by the actor because only the actor holds both
+    /// the node-wide trust keyring and each channel's author set; handed to the serving
+    /// task whole, so a tunnel that lives for hours never reaches back in.
     async fn host_snapshot(&self) -> crate::node::tunnel::HostSnapshot {
         let mut out = crate::node::tunnel::HostSnapshot::new();
         for (cid, shared) in &self.channels {
@@ -3184,11 +3185,21 @@ impl Node {
             if ch.services().is_empty() {
                 continue;
             }
+            // (in this node's ring) AND (a current author of this room). Neither alone:
+            // trust is room-independent so it cannot name the room, and membership is a
+            // passphrase and a proof of work rather than a decision about a person.
+            let reachers: std::collections::BTreeSet<Digest32> = self
+                .trust
+                .trusted()
+                .into_iter()
+                .filter(|fp| ch.is_author(fp))
+                .collect();
             out.insert(
                 *cid,
                 crate::node::tunnel::ChannelServices {
                     evaluator: ch.evaluator_handle(),
                     services: ch.services().clone(),
+                    reachers: Arc::new(reachers),
                 },
             );
         }

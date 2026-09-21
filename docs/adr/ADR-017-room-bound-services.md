@@ -1031,6 +1031,60 @@ New work, in dependency order:
   true all along. Both now assert membership directly.
 
   `node_m14_gate` is also what caught the ordering bug above.
+- **M17.7 — the trust keyring is the authorization. *Done 2026-09-22.***
+
+  **The gate is not what this plan first said.** It was to key on `readers_of(host)`, the log's
+  consent set. All three reviewers refused that, and codex gave the counterexample: that set records
+  signed consent *edges* and checks neither current room membership nor current ring membership, so a
+  grant from epoch 0 still appears after an authorized rotation to epoch 1. Keying on the **ring** —
+  local, current, and the host's own decision — means the epoch question never reaches the gate:
+
+  ```text
+  reach(client, service) ⟺ client ∈ this host's trust keyring
+                         ∧ client ∈ the bound room's current author set
+  ```
+
+  Computed by the actor, the only place holding both the node-wide ring and the channel's author
+  table, and snapshotted per accept into `HostService::reachers` so the serving task never reaches
+  back in. **This removes M17.8 as a prerequisite** — a simplification the review produced, not a
+  corner cut. `service_tag` is no longer an authorization input at all: reach is per (host, room).
+
+  **What makes finding #1 dead:** `Evaluator::service_grant_verdict` returns `None`
+  unconditionally. The genesis service grant confers nothing, so joining is no longer
+  authorization. The field and its bytes stay (M17.13) — it is inside the genesis signature and the
+  channelID hash — and it decides nothing.
+
+  **`add_service`'s `bind:` check is gone too**, which this plan called for and the first cut missed.
+  Leaving it would have gated reach and offer by different models, only one of which moved: a plain
+  member could be reachable and still unable to serve. Found by the agent-comms session hitting it
+  from the file-exchange side.
+
+  **New CLI, because the feature is unusable without it.** M17.7 makes trust the authorization, and
+  there was no way to trust anybody from a command line — `vox trust` had been deferred to a later
+  milestone that was itself waiting on M17.7. `vox id` prints this profile's 52-character
+  fingerprint alone on a line; `vox trust add <fingerprint> --name <petname>`, `vox trust list` and
+  `vox trust remove` are the decision surface. They are one-shot verbs that open the profile, so they
+  cannot run while `vox serve` or `vox daemon` holds it (redb is single-writer) — trusting happens
+  before serving, or through the control socket.
+
+  **Proof** — `crates/vox-tui/tests/service_rehearsal_proof.rs`, real binaries throughout:
+  `vox id` on the guest → `vox trust add` on the host → `vox serve` → `vox connect` → `vox up` →
+  real bytes through a real SOCKS5 client. **And the control that makes it mean something:** a second
+  guest holding *both* the address and the passphrase, whom the host never decided about, joins
+  successfully and carries nothing. Under the withdrawn model those credentials were sufficient.
+
+  **Stale output swept.** `vox serve` printed "anyone who joins with both may reach it" and
+  `vox service add` printed "it is dark until you `vox grant` someone dial:" — both true of the
+  withdrawn model, both the opposite of what the binary does. Neither was caught by three ADR
+  reviews, because nobody re-read the `println!`s.
+
+  **Measured, and not flattering:** the first connect after `vox up` has been observed at 7.7s and
+  88s for identical code, because the wait covers a cold node connecting to an anchor, syncing a
+  board and dialling through the ladder. `HOST_PATIENCE` is 300s for that reason — a bound
+  calibrated on an idle machine expires under load and reinstates the very defect it fixed.
+
+  *Superseded plan text follows.*
+
 - **M17.7 — consent is the authorization.** `build_evaluator` stops passing `authors.keys()`
   (`node/channel.rs`'s `build_evaluator`); the dial check keys off **(in the host's trust keyring) AND (in the bound
   room)**. `vox grant`, `GenesisBody::service_grant`'s authorization role and the `bind:` class with

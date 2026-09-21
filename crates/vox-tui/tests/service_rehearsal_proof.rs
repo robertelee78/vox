@@ -269,7 +269,47 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         "an anchor spec must be dialable, not a wildcard bind: {anchor_spec}"
     );
 
-    // 3. `vox serve` — the host. Room id, address and the GENERATED passphrase are taken
+    // 3. The decision. `vox id` on the guest prints its fingerprint; the host runs
+    //    `vox trust add` with it. This is the whole authorization under ADR-017 decision 3
+    //    as revised — joining grants nothing, so without this step the guest reaches
+    //    nothing, which the control at the end of this proof asserts.
+    //
+    //    It happens before `vox serve` starts because redb is single-writer: a one-shot
+    //    verb cannot open a profile a running `vox serve` holds.
+    let (ok, guest_id, err) = vox_once(&guest_dir, &["id".into()]);
+    assert!(ok, "vox id must print the guest's fingerprint: {err}");
+    let guest_fp = guest_id.trim().to_owned();
+    assert_eq!(
+        guest_fp.len(),
+        52,
+        "a fingerprint is 52 base32 characters, alone on the line: {guest_fp:?}"
+    );
+    let (ok, out, err) = vox_once(
+        &host_dir,
+        &[
+            "trust".into(),
+            "add".into(),
+            guest_fp.clone(),
+            "--name".into(),
+            "the guest".into(),
+        ],
+    );
+    assert!(
+        ok,
+        "the host must be able to trust the guest.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(
+        out.contains("reach every service"),
+        "trusting must say plainly that it grants service reach, since that is the whole \
+         decision a person is making:\n{out}"
+    );
+    let (ok, listed, _) = vox_once(&host_dir, &["trust".into(), "list".into()]);
+    assert!(
+        ok && listed.contains(&guest_fp),
+        "the ring must show it:\n{listed}"
+    );
+
+    // 4. `vox serve` — the host. Room id, address and the GENERATED passphrase are taken
     //    from its own stdout and used verbatim; nothing is shared in-process.
     let mut host = VoxProc::spawn(
         "host",
@@ -295,12 +335,27 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         &host.expect_line("the generated passphrase", |l| l.starts_with("passphrase ")),
         "passphrase",
     );
-    let hostname_line = host.expect_line("the .vox hostname", |l| l.starts_with("port "));
+    // Parsed from `vox serve`'s own output, which is the point: this proof is coupled to the
+    // product's surface on purpose, so changing what a person sees means updating the proof.
+    // (It caught me doing exactly that — M17.7 moved the hostname onto the `serving` line and
+    // this timed out until it was brought back into step.)
+    let hostname_line = host.expect_line("the .vox hostname", |l| {
+        l.starts_with("serving ") && l.contains(".vox")
+    });
     let hostname = hostname_line
         .split_whitespace()
         .last()
-        .expect("a hostname on the port line")
+        .expect("a hostname on the serving line")
         .to_owned();
+    // And the line that tells a person who can actually reach it must no longer say
+    // "anyone who joins", which was true only of the withdrawn model.
+    let audience = host.expect_line("who can reach the service", |l| {
+        l.starts_with("who can reach it:")
+    });
+    assert!(
+        audience.contains("trusted"),
+        "serve must name trust as what governs reach, not joining: {audience}"
+    );
     assert!(address.starts_with("vox://"), "address: {address}");
     assert!(hostname.ends_with(".vox"), "hostname: {hostname}");
     assert!(
@@ -401,6 +456,82 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     );
 
     drop(up);
+
+    // ---- the control: an UNTRUSTED joiner reaches nothing (M17.7) ----
+    //
+    // This is the half that makes the rest mean something, and it is verified finding #1
+    // stated as a test. A second guest holds the same address and the same passphrase — the
+    // full credentials — and the host never decided about it. Under the withdrawn model that
+    // was sufficient: a room created by `vox serve` authorized every admitted member, so
+    // joining WAS the authorization. It must now reach nothing.
+    let stranger_dir = tmp.path().join("stranger");
+    std::fs::create_dir_all(stranger_dir.join("cfg")).unwrap();
+    let (ok, out, err) = vox_once(
+        &stranger_dir,
+        &[
+            "connect".into(),
+            address.clone(),
+            "--passphrase".into(),
+            passphrase.clone(),
+            "--anchor".into(),
+            anchor_spec.clone(),
+            "--listen".into(),
+            "127.0.0.1:0".into(),
+        ],
+    );
+    assert!(
+        ok,
+        "the stranger must still be able to JOIN — the passphrase is the join credential and \
+         always was; what changed is that joining grants no reach.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    let mut stranger_up = VoxProc::spawn(
+        "stranger-up",
+        &stranger_dir,
+        &[
+            "up".into(),
+            room.clone(),
+            "--passphrase".into(),
+            passphrase.clone(),
+            "--bind".into(),
+            "127.0.0.1:0".into(),
+            "--anchor".into(),
+            anchor_spec.clone(),
+            "--listen".into(),
+            "127.0.0.1:0".into(),
+        ],
+    );
+    let s_line = stranger_up.expect_line("the stranger's proxy address", |l| {
+        l.starts_with("vox up on ")
+    });
+    let s_bound: SocketAddr = s_line
+        .split_whitespace()
+        .nth(3)
+        .expect("an address")
+        .parse()
+        .expect("a socket address");
+    // The proxy waits up to `HOST_PATIENCE` for a *connection* and then the host refuses the
+    // dial, so this is allowed to take a while — what must not happen is a carried byte.
+    match socks5_connect(s_bound, &hostname, service_port) {
+        Err(e) => eprintln!("[test] the untrusted joiner was refused, as it must be: {e}"),
+        Ok(mut s) => {
+            // A SOCKS success is not yet a failure of the gate: the proxy replies before the
+            // tunnel is dialled, deliberately, so `ssh` does not deadlock. The gate's verdict
+            // shows as the stream carrying nothing.
+            use std::io::{Read as _, Write as _};
+            s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let _ = s.write_all(b"can I reach you");
+            let mut buf = [0u8; 16];
+            let got = s.read(&mut buf);
+            assert!(
+                matches!(&got, Err(_) | Ok(0)),
+                "an untrusted joiner holding the address AND the passphrase must carry no \
+                 bytes — this is verified finding #1. It read {got:?}"
+            );
+            eprintln!("[test] the untrusted joiner's tunnel carried nothing, as it must");
+        }
+    }
+
+    drop(stranger_up);
     drop(host);
     drop(anchor);
 }

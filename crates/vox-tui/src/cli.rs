@@ -354,6 +354,67 @@ pub struct ServiceRemoveArgs {
     pub tag: String,
 }
 
+/// A profile plus the identity passphrase, for the verbs that unlock an identity but open
+/// no room: `vox id`, `vox trust list`.
+#[derive(Args, Debug, Clone)]
+pub struct IdentityArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The identity passphrase. Prompted for when omitted.
+    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    pub identity_passphrase: Option<String>,
+}
+
+/// `vox trust`
+#[derive(Subcommand)]
+enum TrustCmd {
+    /// Trust an identity, node-wide.
+    ///
+    /// This is the decision the whole model rests on. It is per **identity**, not per
+    /// room: from here on every room this node shares with that key auto-consents to it,
+    /// including rooms made later, **and** that key may reach every service this node
+    /// binds to a room they are both in (ADR-017 decision 3). One act, not one per room.
+    Add(TrustAddArgs),
+    /// List the identities this node trusts, and what it calls them.
+    List(IdentityArgs),
+    /// Stop trusting an identity, and change the lock.
+    ///
+    /// Removes the ring entry, then rotates this identity's sender key and re-keys
+    /// everyone still trusted, in every room shared with the removed key — so it stops
+    /// reading what comes next, everywhere (ADR-017 M17.14). It keeps what it already
+    /// read; that cannot be taken back.
+    Remove(TrustRemoveArgs),
+}
+
+/// `vox trust add`
+#[derive(Args, Debug, Clone)]
+pub struct TrustAddArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The identity to trust, as `vox id` prints it (base32, or a unique prefix of one
+    /// this node already knows).
+    pub fingerprint: String,
+    /// What this node will call it. Local to this machine; nothing is registered and no
+    /// other node ever sees it.
+    #[arg(long, default_value = "peer")]
+    pub name: String,
+    /// The identity passphrase. Prompted for when omitted.
+    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    pub identity_passphrase: Option<String>,
+}
+
+/// `vox trust remove`
+#[derive(Args, Debug, Clone)]
+pub struct TrustRemoveArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The identity to stop trusting.
+    pub fingerprint: String,
+    /// The identity passphrase. Prompted for when omitted.
+    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    pub identity_passphrase: Option<String>,
+}
+
 /// `vox forward`
 #[derive(Args, Debug, Clone)]
 pub struct ForwardArgs {
@@ -474,7 +535,9 @@ enum Cmd {
     /// Offer a local TCP service to a room, or list what is offered (ADR-013).
     ///
     /// A service is dark by default: offering it grants nobody reach. Members reach it
-    /// only once they hold `dial:<tag>`, which `vox grant` puts on the room's log.
+    /// only once their host has trusted them (`vox trust add`) and they are a member of this
+    /// room — the ring-keyed gate of ADR-017 decision 3 as revised. `dial:` capabilities and
+    /// `vox grant` are withdrawn with the model that needed them (M17.7).
     #[command(subcommand)]
     Service(ServiceCmd),
     /// Speak in a room over a **running** node (ADR-020) — the agent-comms verbs.
@@ -502,6 +565,16 @@ enum Cmd {
     /// Grant a member the capability to dial one of your services, as a fact on the
     /// room's log (ADR-007/ADR-013).
     Grant(GrantArgs),
+    /// Print this profile's own identity fingerprint — what to send someone so they can
+    /// trust you (ADR-002).
+    ///
+    /// It is the whole 52-character base32 fingerprint, on its own line, so it can be
+    /// piped or pasted without editing. Verify it out of band, the way you would a PGP
+    /// fingerprint: nothing registers it and nothing looks it up.
+    Id(IdentityArgs),
+    /// Decide which identities this node trusts (ADR-020 §3, ADR-017 decision 3).
+    #[command(subcommand)]
+    Trust(TrustCmd),
     /// Put `vox` on PATH and install tab completion for your shell.
     ///
     /// `install.sh` and `vox update` run this for you. It writes the completion script into
@@ -720,6 +793,58 @@ pub fn run() -> ExitCode {
                 }
             }
         }),
+        Cmd::Id(args) => run_new_room_verb(
+            args.profile.clone(),
+            args.identity_passphrase.clone(),
+            move |node, _anchors| async move {
+                let Some(id) = node.view().identity else {
+                    return Err(crate::app::AppError::Usage(
+                        "this profile has no identity yet".into(),
+                    ));
+                };
+                // The whole fingerprint, alone on the line, so it pipes and pastes without
+                // editing. A person is about to send this to someone who will type it into
+                // `vox trust add`.
+                println!("{}", vox_core::node::link::b32_encode(&id.fingerprint));
+                Ok(())
+            },
+        ),
+        Cmd::Trust(TrustCmd::List(args)) => run_new_room_verb(
+            args.profile.clone(),
+            args.identity_passphrase.clone(),
+            move |node, _anchors| async move {
+                let trusted = node.view().trusted;
+                if trusted.is_empty() {
+                    println!("vox: this node trusts nobody yet.");
+                    println!("     ask them for `vox id` and run `vox trust add <fingerprint>`");
+                    return Ok(());
+                }
+                for (fp, petname) in trusted {
+                    println!("{}  {petname}", vox_core::node::link::b32_encode(&fp));
+                }
+                Ok(())
+            },
+        ),
+        Cmd::Trust(TrustCmd::Add(args)) => {
+            let a = args.clone();
+            run_new_room_verb(
+                args.profile.clone(),
+                args.identity_passphrase.clone(),
+                move |node, _anchors| async move {
+                    crate::tunnel_cli::trust_add(&node, &a.fingerprint, &a.name).await
+                },
+            )
+        }
+        Cmd::Trust(TrustCmd::Remove(args)) => {
+            let a = args.clone();
+            run_new_room_verb(
+                args.profile.clone(),
+                args.identity_passphrase.clone(),
+                move |node, _anchors| async move {
+                    crate::tunnel_cli::trust_remove(&node, &a.fingerprint).await
+                },
+            )
+        }
         Cmd::Grant(args) => {
             let a = args.clone();
             run_tunnel_verb(args.room.clone(), move |node, cid| async move {
