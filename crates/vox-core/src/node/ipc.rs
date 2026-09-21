@@ -57,7 +57,7 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// The protocol this build speaks. Bumped when a frame's shape changes in a way
 /// an older client would misread; a client that sees a version it does not know
 /// MUST disconnect rather than guess.
-pub const PROTOCOL_VERSION: u64 = 1;
+pub const PROTOCOL_VERSION: u64 = 2;
 
 /// Largest frame accepted in either direction.
 ///
@@ -245,6 +245,15 @@ pub enum Frame {
     Hello {
         /// The [`PROTOCOL_VERSION`] this node speaks.
         protocol: u64,
+        /// **Who this client is**: the node's own identity fingerprint, or `None`
+        /// if no identity exists yet.
+        ///
+        /// Added in protocol 2 for the work board (ADR-020 §5). Without it a
+        /// client cannot answer "did my claim win?" — `resolve` returns an owner
+        /// fingerprint and the client had no way to tell whether that was itself.
+        /// A claim that cannot report whether it was won is useless for splitting
+        /// work, which is the whole point of claims.
+        me: Option<Digest32>,
     },
     /// This client fell behind and `missed` events were dropped **for it alone**.
     ///
@@ -286,8 +295,13 @@ impl Frame {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
-            Frame::Hello { protocol } => {
-                e.array(2).uint(T_HELLO).uint(*protocol);
+            Frame::Hello { protocol, me } => {
+                // An absent identity is the empty byte string, so the arity stays
+                // fixed — ADR-008's canonical encoding has no optionals.
+                e.array(3)
+                    .uint(T_HELLO)
+                    .uint(*protocol)
+                    .bytes(me.as_ref().map_or(&[][..], |d| &d[..]));
             }
             Frame::Lagged { missed } => {
                 e.array(2).uint(T_LAGGED).uint(*missed);
@@ -474,10 +488,20 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
 
 fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
     let ev = match (tag, n) {
-        (T_HELLO, 2) => {
-            return Ok(Frame::Hello {
-                protocol: d.uint().map_err(|_| Error::MalformedBundle("ipc hello"))?,
-            })
+        (T_HELLO, 3) => {
+            let protocol = d.uint().map_err(|_| Error::MalformedBundle("ipc hello"))?;
+            let fp = d
+                .bytes()
+                .map_err(|_| Error::MalformedBundle("ipc hello identity"))?;
+            let me = if fp.is_empty() {
+                None
+            } else {
+                Some(
+                    Digest32::try_from(fp)
+                        .map_err(|_| Error::MalformedBundle("ipc hello identity length"))?,
+                )
+            };
+            return Ok(Frame::Hello { protocol, me });
         }
         (T_LAGGED, 2) => {
             return Ok(Frame::Lagged {
@@ -763,6 +787,7 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         &mut stream,
         &Frame::Hello {
             protocol: PROTOCOL_VERSION,
+            me: handle.view().identity.map(|i| i.fingerprint),
         }
         .to_bytes(),
     )
@@ -916,9 +941,19 @@ async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
 #[derive(Debug)]
 pub struct IpcClient {
     stream: UnixStream,
+    me: Option<Digest32>,
 }
 
 impl IpcClient {
+    /// This client's own identity fingerprint, as the node reported it at hello,
+    /// or `None` if the node has no identity yet.
+    ///
+    /// This is what lets a client tell its own claims from everyone else's.
+    #[must_use]
+    pub fn me(&self) -> Option<Digest32> {
+        self.me
+    }
+
     /// Connect and check the protocol version, without subscribing.
     ///
     /// Use this for a client that issues requests. [`IpcClient::subscribe`] turns
@@ -932,12 +967,12 @@ impl IpcClient {
         let Some(hello) = read_frame(&mut stream).await? else {
             return Err(Error::MalformedBundle("ipc closed before hello"));
         };
-        match Frame::from_bytes(&hello)? {
-            Frame::Hello { protocol } if protocol == PROTOCOL_VERSION => {}
+        let me = match Frame::from_bytes(&hello)? {
+            Frame::Hello { protocol, me } if protocol == PROTOCOL_VERSION => me,
             Frame::Hello { .. } => return Err(Error::MalformedBundle("ipc protocol version")),
             _ => return Err(Error::MalformedBundle("ipc expected hello")),
-        }
-        Ok(Self { stream })
+        };
+        Ok(Self { stream, me })
     }
 
     /// Send one request and read its answer.

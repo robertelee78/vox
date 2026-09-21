@@ -189,11 +189,22 @@ fn emit(format: Format, raw_input: &str, event: &str, context: &str) {
 /// Returns `Ok(())` in every case a hook should not disturb the turn. The only
 /// `Err` is a usage error from the caller's own arguments, which is reported
 /// before any harness is involved.
-pub async fn run(paths: &Paths, room_arg: Option<&str>, format: Format) -> Result<(), AppError> {
+pub async fn run(
+    paths: &Paths,
+    room_arg: Option<&str>,
+    format: Format,
+    session: Option<&str>,
+) -> Result<(), AppError> {
     let mut raw = String::new();
-    // A harness always provides stdin; a person testing by hand may not.
-    let _ = std::io::stdin().read_to_string(&mut raw);
-    let input = parse_input(&raw);
+    // A harness always provides stdin; a person testing by hand may not — and
+    // OpenCode's plugin cannot, so it passes `--session` instead.
+    if session.is_none() {
+        let _ = std::io::stdin().read_to_string(&mut raw);
+    }
+    let mut input = parse_input(&raw);
+    if let Some(s) = session {
+        input.session_id = s.to_owned();
+    }
 
     let Some(room_arg) = room_arg
         .map(str::to_owned)
@@ -289,3 +300,14 @@ async fn drain(
     }
     Ok(())
 }
+
+/// The OpenCode plugin, shipped in the binary so `vox agent plugin opencode` can
+/// print it.
+///
+/// OpenCode is the odd harness of the three: Claude Code and Codex both run a
+/// **command** at turn start, so they need only a settings entry naming `vox agent
+/// hook`. OpenCode has no such hook — it loads JavaScript plugins into its own
+/// process — so the integration has to be a file. It is still a shim over the same
+/// `vox agent hook`, reading `--format text`, so there is exactly one
+/// implementation of what an agent has not yet read.
+pub const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode-plugin.js");
