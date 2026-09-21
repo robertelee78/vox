@@ -34,6 +34,13 @@ secrecy.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
+# `vox update` verifies the release record's SHA-256 over the downloaded binary before anything
+# is renamed into place (ADR-015 §"Install and update"). Same pin as vox-core, so there is one
+# SHA-256 implementation in the tree.
+sha2.workspace = true
+# The release record is fetched into a private temporary directory, so `vox update --check`
+# needs no write access to the install directory. Promoted from a dev-dependency for that.
 tempfile.workspace = true
+
+# No `[dev-dependencies]`: `tempfile` is a normal dependency above and is in scope for the
+# integration proofs too.

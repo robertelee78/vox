@@ -114,11 +114,39 @@ crates/vox-core/   The shared Rust core: identity, crypto, join, group, log/sync
 crates/vox-tui/    The Rust TUI client, binary `vox` (M12, ADR-015)
 docs/adr/          Architecture Decision Records (the design spine; each records its
                    implementation status and Implementation notes)
-.github/           CI: fmt · clippy -D warnings · test · rustdoc -D warnings · real-parameter PoW gate
+.github/           CI and the release workflow (three targets, macOS signed + notarized)
+scripts/           release helpers: package-release.sh, sign-macos.sh
+install.sh         the installer the curl one-liner runs
 Cargo.toml         Workspace manifest (Rust 1.94, pinned in rust-toolchain.toml)
 README.md          This file
 LICENSE            MIT
 ```
+
+## Install
+
+GitHub Releases are the distribution — no vanity domain, no package manager, no account, no token:
+
+```
+curl -fsSL https://raw.githubusercontent.com/robertelee78/vox/main/install.sh | sh
+```
+
+That fetches the release record for your machine's target, downloads the binary from the exact
+release the record names, verifies its size and SHA-256 **before** putting it in place, installs it
+atomically into `~/.local/bin` (override with `VOX_INSTALL_DIR`), and runs `vox shell-setup` so
+`vox` is on `PATH` with tab completion in your next shell. macOS builds are signed and notarized
+with a Developer ID, so Gatekeeper does not quarantine them.
+
+Afterwards:
+
+```
+vox update              # replace this binary with the next release
+vox update --check      # just say whether one exists
+vox update --rollback   # put the binary it replaced back
+```
+
+A build from source is never overwritten by `vox update`; it says so and tells you to
+`git pull && cargo build --release` instead. The mechanism is specified in
+[ADR-015](docs/adr/ADR-015-rust-tui-client.md) §"Install and update".
 
 ## Building
 
@@ -127,21 +155,46 @@ native crypto is `aws-lc-rs` inside the TLS stack, documented in ADR-011).
 
 ```
 cargo build --workspace                 # core library + the `vox` binary
-cargo test --workspace                  # the unit + integration suite (~20 s)
 cargo run --release -p vox-tui -- --help
+
+# The proofs (ADR-018); there are no unit tests. The allow-list names the gaps that are
+# accepted today — a bare `cargo test` fails on them, deliberately.
+VOX_PROOF_ALLOW_UNPROVEN=fish,journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused \
+  cargo test --workspace
 ```
 
-**What works today.** Every layer in `vox-core` is implemented to its ADR and tested (including
-real loopback QUIC, a real TCP-over-Vox tunnel, and a real `(200,9)` Equihash solve cross-checked by
-the librustzcash verifier). The node runtime ([ADR-016](docs/adr/ADR-016-node-runtime.md), accepted)
-is landing in milestones: **M13 (single device) is in** — `vox` creates an identity behind a masked
-passphrase, creates channels double-locked under a channel passphrase, appends and renders messages,
-locks (`:lock`, idle, `SIGHUP`) and unlocks, and everything survives a restart as sealed segments in a
-redb store under `~/.local/share/vox/<profile>/` (macOS: `~/Library/Application Support/vox/`).
-What does **not** exist yet is the network: join, consent, sync and the rendezvous service are
-**M14**, the headless anchor and tunnel CLI **M15** — so today a channel has exactly one member (you)
-and the network verbs say "not available yet". The macOS client (ADR-014) follows; Linux (as a TUI
-host) is supported now; iOS is a separate future capability.
+A proof whose prover is missing — an uninstalled shell, a release that does not exist yet — is
+reported as **unproven** and **fails**, rather than being skipped quietly. Accepting a gap means
+naming it, which is why the command above is the length it is
+([ADR-018](docs/adr/ADR-018-quality-bar-and-product-proof.md) §3).
+
+**What works today.** Every layer in `vox-core` is implemented to its ADR (including real loopback
+QUIC, a real TCP-over-Vox tunnel, and a real `(200,9)` Equihash solve cross-checked by the
+librustzcash verifier), and the node runtime ([ADR-016](docs/adr/ADR-016-node-runtime.md)) has
+landed through M17:
+
+- **One device (M13).** `vox` creates an identity behind a masked passphrase, creates channels
+  double-locked under a channel passphrase, appends and renders messages, locks (`:lock`, idle,
+  `SIGHUP`) and unlocks, and everything survives a restart as sealed segments in a redb store under
+  `~/.local/share/vox/<profile>/` (macOS: `~/Library/Application Support/vox/`).
+- **Two machines over the real network (M14, M15).** Join, per-sender consent and log sync run
+  between separate hosts, over QUIC, through the NAT ladder — pinhole, UPnP-IGD mapping, hole
+  punch, and relay through an anchor you run yourself ([`vox node`](docs/adr/ADR-016-node-runtime.md)),
+  which holds no room and can read nothing.
+- **Room-bound services (M17).** `vox serve 22` offers a local port to a new room and prints the
+  invite; `vox connect` joins from it; `vox up` runs a loopback SOCKS5 proxy that resolves the
+  room's `<52-char-base32>.vox` name. `ssh` then reaches the offered port with one `ProxyCommand`
+  line — the same shape a Tor user reaches a `.onion` through, and needing no privilege of any kind
+  ([ADR-017](docs/adr/ADR-017-room-bound-services.md)). This has been run end to end against a real
+  `sshd` between two clients behind symmetric NAT, relayed by their own anchor.
+- **Sender-key rotation and per-member revocation (M18.1).** Revocation is rotation with one member
+  left out, re-keyed at the new generation's origin so an offline member loses nothing.
+
+What does **not** exist yet: the product-proof harness that will qualify releases
+([ADR-018](docs/adr/ADR-018-quality-bar-and-product-proof.md) M18.3), golden **wire-byte** vectors
+for the ADR-008 struct tags (they start mattering now that `v0.1.0`'s bytes are what `v0.2.0` must
+not break), and the macOS client ([ADR-014](docs/adr/ADR-014-macos-client.md)). Linux and macOS are
+supported today as TUI hosts; iOS is a separate future capability.
 
 ## Contributing
 

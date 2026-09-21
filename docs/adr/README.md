@@ -34,9 +34,10 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 - **Tier 4 — Network & overlay:** 011, 012, 013
 - **Tier 5 — App / platform:** 014, 015
 - **Tier 6 — Integration:** 016 (the runtime that composes Tiers 1–5 into a running node)
-- **Tier 7 — Product surface:** 017 (what a person actually does with the overlay)
+- **Tier 7 — Product surface:** 017 (what a person actually does with the overlay), 018 (how a
+  capability is proved to work)
 
-## Status (2026-09-19)
+## Status (2026-09-21)
 
 Each ADR's `Status` line is authoritative; this is the roll-up. Every ADR is grounded in a multi-pass
 research effort (Signal/PQXDH, Sender Keys/Megolm, MLS, SSB/Hypercore/Merkle-DAG, CPace/PAKE,
@@ -55,26 +56,34 @@ QUIC/DCUtR, NAT/IPv6, deniable authentication).
 | 009 | implemented, **not enabled** | M7 `deniable/` — formal analysis + `0x000B` wire codec outstanding |
 | 010 | implemented | M8 `atrest/` (codecs/mechanisms; no persistence layer yet) |
 | 011 | implemented | M9 `transport/` |
-| 012 | implemented (primitives) | M10 `nat/` — not composed into the ladder |
-| 013 | implemented (library) | M11 `tunnel/` — no CLI surface |
+| 012 | implemented | M10 `nat/`, composed into the ladder by ADR-016 M14.8–M14.10 + M15.1c (pinhole → UPnP-IGD → hole punch → anchor relay); real-router UPnP validation still pending |
+| 013 | implemented | M11 `tunnel/`; CLI surface landed with M16.1 (`vox service`, `vox grant`, `vox forward`) |
 | 014 | proposed — not started | native macOS GUI |
-| 015 | implemented (live, single-device) | M12 + M13.5 `vox-tui/` — embedded node; network verbs arrive with M14 |
-| 016 | accepted — **M13 done**, M14 next | node runtime: M13 single-device ✓ → M14 two machines chat → M15 headless anchor + tunnel CLI |
+| 015 | implemented | M12 + M13.5 `vox-tui/` — embedded node, network verbs wired; §Distribution's install/update model landed 2026-09-21 (`install.sh`, `vox update`, three targets, macOS signed + notarized) |
+| 016 | implemented (M13–M15) | node runtime: M13 single device ✓, M14 two machines over the real network ✓, M15 anchors + headless anchor ✓ |
+| 017 | implemented (M17.1–M17.3) | room-bound services: genesis service grant, `vox serve`/`vox connect`, `.vox` names resolved by the `vox up` SOCKS5 entry point |
+| 018 | accepted — **in force** | quality bar: unit tests removed (M18.2 ✓), distribution proved as built (M18.2a ✓), the node/edge/journey harness outstanding (M18.3) |
 
-**What is missing is the node runtime** that composes the implemented layers (join → transport →
-NAT → sync → governance) and gives the TUI a live `CoreHandle`; that is ADR-016, accepted
-2026-09-19 with its decisions taken (redb; member bundle records on the rendezvous board; passphrase
-never in the invite link; single-device M13 before network M14). Each ADR's "Known gaps" bullet
-records its residual drift as of 2026-09-19. Later
-capabilities (voice/video, iOS, Linux client, metadata/traffic-analysis resistance, PQ
-post-compromise security) are **distinct named capabilities** with their own ADRs — not deferred
-increments of the ones here (ADR-003 §Scope).
+**The node runtime that composes the layers is in.** ADR-016 landed through M15 — join, per-sender
+consent and log sync run between separate hosts over QUIC, through the full NAT ladder, relayed by an
+anchor you run yourself — and ADR-017 landed through M17.3, so a room-bound TCP service is reachable
+by its `.vox` name through a loopback SOCKS5 proxy. **What is missing** is the proof harness that will
+qualify releases (ADR-018 M18.3), golden **wire-byte** vectors for the ADR-008 struct tags (see the
+gates below; `v0.1.0`'s bytes are now what `v0.2.0` must not break), re-keying for a member first met
+off the join path, and the native macOS client (ADR-014, not started). Later capabilities
+(voice/video, iOS, metadata/traffic-analysis resistance, PQ post-compromise security) are **distinct
+named capabilities** with their own ADRs — not deferred increments of the ones here (ADR-003 §Scope).
 
 ## Release gates & test-vector obligations (consolidated)
 
 "Ship complete" (the mantra) means a release MUST satisfy every gate below; this is the single
-auditable list so none is missed. **Status (2026-09-19)** is recorded per gate so the list is
-honest, not aspirational:
+auditable list so none is missed. Status is recorded per gate so the list is honest, not
+aspirational.
+
+**`v0.1.0` was cut on 2026-09-21 with the canonical-serialization gate still UNMET.** That is stated
+here rather than quietly carried: from `v0.1.0` on, these bytes are what a later version must not
+break, so the golden wire-byte vectors stop being a future obligation and become a compatibility
+debt with a known start date.
 
 - **Canonical serialization (ADR-008):** golden vectors for every struct tag `0x0001–0x0012`; two
   independent implementations must produce byte-identical canonical CBOR. — **UNMET**: only the

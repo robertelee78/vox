@@ -27,5 +27,6 @@ pub mod shell;
 pub mod state;
 pub mod tunnel_cli;
 pub mod ui;
+pub mod update;
 pub mod verify;
 pub mod viewmodel;
