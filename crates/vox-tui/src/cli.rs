@@ -244,6 +244,42 @@ enum RoomCmd {
     List(ProfileArgs),
 }
 
+/// `vox agent` — wiring an agent session into a room.
+#[derive(Subcommand, Debug, Clone)]
+enum AgentCmd {
+    /// Read this session's unread messages and print them for the harness to
+    /// inject. Meant to be run BY a harness hook, not by hand.
+    ///
+    /// Reads the harness's hook JSON on stdin and writes injected context on
+    /// stdout in whatever shape that harness reads. Always exits 0: a hook must
+    /// never break the turn it rides on.
+    ///
+    /// Register it on a turn-start event — `UserPromptSubmit` in both Claude Code
+    /// and Codex — and for Codex register it with `async: false`, or the output is
+    /// observed and discarded.
+    Hook(AgentHookArgs),
+}
+
+/// `vox agent hook`
+#[derive(Args, Debug, Clone)]
+pub struct AgentHookArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room to drain, or a unique prefix. Falls back to `VOX_ROOM`, which is
+    /// usually the easier place to put it since a hook's arguments are fixed at
+    /// install time while its environment is not.
+    #[arg(long)]
+    pub room: Option<String>,
+    /// Output shape: `auto` (default), `claude`, or `text`.
+    ///
+    /// `auto` reads it off the input — Claude Code's hook JSON names its event,
+    /// Codex's does not — so the same installed command works in either, and
+    /// anything unrecognised gets plain text, which cannot corrupt a harness that
+    /// wanted the other.
+    #[arg(long, default_value = "auto")]
+    pub format: String,
+}
+
 /// Naming a room on a running node. No passphrase: the node is already unlocked.
 #[derive(Args, Debug, Clone)]
 pub struct RoomRefArgs {
@@ -449,6 +485,9 @@ enum Cmd {
     /// takes a passphrase, and nothing here creates, joins or leaves a room.
     #[command(subcommand)]
     Room(RoomCmd),
+    /// Wire an agent session into a room (ADR-020) — harness-agnostic.
+    #[command(subcommand)]
+    Agent(AgentCmd),
     /// Bring up the local entry point for a room's services: a SOCKS5 proxy that resolves
     /// the room's `.vox` name (ADR-017).
     ///
@@ -637,6 +676,32 @@ pub fn run() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Cmd::Agent(AgentCmd::Hook(args)) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let format = match args.format.parse() {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("vox: --format: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                // Even this is not worth failing a turn over.
+                return ExitCode::SUCCESS;
+            };
+            let _ = rt.block_on(crate::agent_hook::run(&paths, args.room.as_deref(), format));
+            // Always success: a hook that fails must not break the turn.
+            ExitCode::SUCCESS
         }
         Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
             let sub = sub.clone();

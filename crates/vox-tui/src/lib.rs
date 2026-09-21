@@ -19,6 +19,7 @@
 // deny so it wins under the test cfg.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod agent_hook;
 pub mod app;
 pub mod cli;
 pub mod live;
