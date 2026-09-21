@@ -57,7 +57,10 @@ pub const LINK_SCHEME: &str = "vox://";
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 /// Length of a 32-byte digest in unpadded base32.
-const B32_DIGEST_LEN: usize = 52;
+/// Characters in the base32 rendering of a 32-byte digest — how every `vox`
+/// verb identifies a room, a member or an entry, and the same 52 characters that
+/// begin an invite link and a `.vox` name.
+pub const B32_DIGEST_LEN: usize = 52;
 
 /// The DNS suffix a Vox name ends in (ADR-017 decision 4). It is resolved only on a
 /// machine running `vox up`, from rooms that machine has joined — there is no global
