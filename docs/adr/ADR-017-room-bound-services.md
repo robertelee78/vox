@@ -938,13 +938,31 @@ New work, in dependency order:
   reaching the responder, and removing the witness-signer check fails it on an unadmitted signer admitting
   somebody.
 
-  **Three existing gates were rewritten rather than extended**, on the M17.3 precedent: `node_m14_gate`
-  and both gates in `node_m15_anchor_gate` each waited for a sender key to arrive *before anyone consented*
-  — the automatic release — and so asserted the defect. That three independent gates encoded it is the
-  clearest measure of how load-bearing the behaviour had become. Each now has both parties grant
-  explicitly; the properties under test (two nodes chat and an unconsented third reads nothing; two
-  symmetric-NAT clients form a swarm through their own anchor; members never online together converge)
-  are unchanged. `node_m14_gate` is also what caught the ordering bug above.
+  **Six existing gates needed correcting, in two distinct failure modes, and every one of them was
+  green.** This is the clearest measure of how load-bearing the removed behaviour had become, and it is
+  recorded at length because the second mode is the dangerous one.
+
+  *Mode 1 — the gate asserted the defect.* Rewritten rather than extended, on the M17.3 precedent:
+  `node_m14_gate`, both gates in `node_m15_anchor_gate`, and `node_m18_revocation_gate` each waited for a
+  sender key to arrive **before anyone consented**, which is the automatic release. Each now has the
+  relevant parties grant explicitly, and the properties under test are unchanged — two nodes chat and an
+  unconsented third reads nothing; two symmetric-NAT clients form a swarm through their own anchor;
+  members never online together converge; revoking one member keeps the others whole.
+
+  `node_m18_revocation_gate` is the instructive one. Its comment read *"Alice must hold both joiners' keys
+  before she serves anything: an ADR-004 responder has no sending chain until it has received."* The
+  premise is **true** — it is the same fact that broke `Consent` and forced `JoinFrame::Open`. The
+  conclusion was the defect: what a responder needs is a *ratchet message*, not a *sender key*.
+
+  *Mode 2 — the label had drifted from the assertion*, so the gate was green, passing, and testing
+  something nobody intended. `node_m15_anchor_gate` asserted `entries >= 3` as "genesis, consent and the
+  message", but the genesis is never a DAG entry (`entry_count()` is `dag.len()`), so the third was
+  another node's *automatic* consent, synced in. Both gates in `node_m19_trust_gate` labelled a check
+  "both members admitted" while asserting `entries > 0` — and the entry they waited for was that same
+  auto-consent, so the check could never pass once it was gone, while the property they named had been
+  true all along. Both now assert membership directly.
+
+  `node_m14_gate` is also what caught the ordering bug above.
 - **M17.7 — consent is the authorization.** `build_evaluator` stops passing `authors.keys()`
   (`governance/channel.rs:935`); the dial check keys off **(in the host's trust keyring) AND (in the bound
   room)**. `vox grant`, `GenesisBody::service_grant`'s authorization role and the `bind:` class with
