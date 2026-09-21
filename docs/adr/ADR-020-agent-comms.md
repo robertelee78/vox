@@ -427,8 +427,32 @@ Both unknowns are already spiked; neither remains open.
   The bulk provision-time import wrapper is **not** here: it is a CLI convenience over
   `NodeCommand::Trust`, so it lands with the CLI in M19.4 rather than adding a second trust path to
   the library.
-- **M19.3 — `crates/vox-agentcomms`.** The envelope, the reserved core, the claim rules of §5, the
-  `hops` and reply-only-when-addressed rules of §9.
+- **M19.3 — `crates/vox-agentcomms`. DONE 2026-09-21.** The app tier's first crate: `envelope`
+  (reserved `hello`/`bye`/`say`, open type tail, `urgent` as its own field, `to[]`/`re`/`thread`/
+  `hops`, context split by volatility) and `claim` (`claim`/`release`/`handoff`).
+  **It does not depend on `vox-core`** — a message is JSON in an ordinary log entry's text, so the
+  app crate never touches the core's types. That is the seam working; if it had needed them, the
+  layer would not be a layer.
+  Decisions taken while building: a bare `say` with nothing to carry is written as **plain text**, so
+  a room stays readable and greppable and a human never learns a format; prose that is not JSON
+  parses *as* a `say` rather than failing; an unknown `type` is carried unchanged while a newer `v`
+  is refused rather than guessed at; an **urgent broadcast interrupts nobody** (interrupting requires
+  addressed *and* urgent, or one agent could stop the whole room); and a handoff to a name this node
+  cannot resolve leaves ownership exactly as it was, since recording the sender as owner would be a
+  lie and freeing the resource would let an unresolvable name silently release it.
+  *Gate* `agentcomms_gate` (13 tests, debug — pure, no network or Argon2): claim resolution is run
+  over **every permutation** of a contested set and must yield one owner; ties break by
+  `(created_secs, entry_hash)` and not arrival order; only the owner may release or hand off; a
+  lapsed TTL frees a resource with nobody saying so; and the room rules hold (interrupt, auto-reply,
+  hop exhaustion).
+  Mutation-checked twice: removing the canonical sort — caught with "nodes disagreed about the owner
+  depending on arrival order" — and removing just the entry-hash tie-break, which the permutation
+  test still passes (its claims have distinct times) and the dead-heat test catches. Each test earns
+  its place.
+  **Honest limit, recorded in the module**: a dishonest `created_secs` can win a race it should have
+  lost. Accepted, and the same trade the ADR-007 evaluator makes for concurrent governance — the
+  alternative is a clock nobody has. Claims schedule cooperating agents; they are not a defence
+  against one that lies.
 - **M19.4 — CLI and skill.** `vox room post|read|tail|wait|roster|say`, plus the skill.
 - **M19.5 — the harness drain hook.** `UserPromptSubmit` for Claude Code and Codex; the OpenCode
   plugin. *Gate*: a message posted by one agent appears in another agent's context at its next turn
