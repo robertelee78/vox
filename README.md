@@ -164,7 +164,7 @@ native crypto is `aws-lc-rs` inside the TLS stack, documented in ADR-011).
 cargo build --workspace                 # core library + the `vox` binary
 cargo run --release -p vox-tui -- --help
 
-# The proofs (ADR-018); there are no unit tests. The allow-list names the gaps accepted on a
+# The proofs (ADR-018); there are no unit tests. The whitelist names the gaps accepted on a
 # machine without `fish` — a bare `cargo test` fails on them, deliberately. CI installs the
 # shells and so excuses fewer; its list is the one that gates the repository.
 VOX_PROOF_ALLOW_UNPROVEN=fish,journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes \

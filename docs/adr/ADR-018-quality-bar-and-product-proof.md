@@ -96,7 +96,7 @@ not on the runners, and the entry itself named what would close it — "installi
 runner". The workflows now install `zsh` and `fish` before running the proofs, so **CI does not
 excuse `fish`**. An accepted gap that states its own remedy SHOULD be closed rather than renewed.
 
-The allow-list is therefore per-environment, and CI's is the strict one:
+The whitelist is therefore per-environment, and CI's is the strict one:
 
 ```
 # CI (ubuntu + macOS, both with zsh, bash and fish installed):
@@ -114,7 +114,7 @@ Removing an entry MUST make the proof fail until that gap is closed — that is 
 value is set once in `.github/workflows/ci.yml` and `.github/workflows/release.yml`, so the accepted
 gaps are visible in the gate itself and not only here.
 
-An allow-list entry matches either a whole claim id or its first segment, so a gap MAY be accepted
+A whitelist entry matches either a whole claim id or its first segment, so a gap MAY be accepted
 precisely (`verify.digest_mismatch_is_refused`) rather than by area (`verify`). Accepting by area
 would silently absorb claims added later, which is the failure this section exists to prevent.
 

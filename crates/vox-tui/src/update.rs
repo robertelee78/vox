@@ -17,7 +17,7 @@
 //! `redirect::Policy::none()`, so "the response came from where I asked" is a string equality.
 //! vox is GitHub-only by decision, and `releases/latest/download/<name>` *is* a redirect chain,
 //! so vox must follow redirects and check the final origin instead. Strictly weaker, and the
-//! reason the origin allow-list below is load-bearing rather than belt-and-braces.
+//! reason the origin whitelist below is load-bearing rather than belt-and-braces.
 //!
 //! **vox ships Linux.** hf2q is Apple-Silicon-only and refuses to update anywhere else, so
 //! every release it installs is Apple-authenticated. vox cannot do that on Linux: there the
