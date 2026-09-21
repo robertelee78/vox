@@ -20,6 +20,8 @@ pub const VAULT_FILE: &str = "vault.cbor";
 pub const STORE_FILE: &str = "store.redb";
 /// The ADR-020 §7 local control socket, inside the profile directory.
 pub const SOCKET_FILE: &str = "node.sock";
+/// Directory of per-session read cursors inside a profile.
+pub const CURSOR_DIR: &str = "cursors";
 /// The default profile name.
 pub const DEFAULT_PROFILE: &str = "default";
 
@@ -92,6 +94,40 @@ impl Paths {
     pub fn socket_file(&self) -> PathBuf {
         self.profile_dir.join(SOCKET_FILE)
     }
+
+    /// Where an agent session's read cursor for one room is kept
+    /// (`<profile_dir>/cursors/<room>-<session>`).
+    ///
+    /// Per session, because two agent sessions on one node have read different
+    /// amounts and each must be told only what *it* has not seen. Beside the
+    /// store rather than in the config directory: it is state, not configuration.
+    ///
+    /// The cursor is an ADR-008 entry hash, so it is not secret — it names a
+    /// message without revealing it — but it lives in the private profile
+    /// directory like everything else here.
+    #[must_use]
+    pub fn cursor_file(&self, room: &str, session: &str) -> PathBuf {
+        self.profile_dir
+            .join(CURSOR_DIR)
+            .join(format!("{}-{}", sanitize(room), sanitize(session)))
+    }
+
+    /// The directory holding this profile's cursors.
+    #[must_use]
+    pub fn cursor_dir(&self) -> PathBuf {
+        self.profile_dir.join(CURSOR_DIR)
+    }
+}
+
+/// Keep a session or room id to characters that cannot escape the cursor
+/// directory. Ids are already base32 or uuid-shaped in practice; this is the
+/// boundary check, not a formatting step, because the session id arrives from a
+/// harness and is not ours to trust.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(96)
+        .collect()
 }
 
 fn home_dir() -> Result<PathBuf> {
