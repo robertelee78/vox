@@ -194,7 +194,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
 - **Known gaps / shipping blockers (recorded 2026-09-19; (2) closed 2026-09-21).** (1) **The formal
   analysis of the DGKA+DSKE construction the Decision requires before shipping is not on file** —
   deniable mode must not be enabled in a shipped build until it is (the module docs say the same).
-  (2) **Closed 2026-09-21.** `deniable::wire::DgkaMessage` is the `dgka-setup` (`0x000B`) codec: one
+  (2) **PARTLY closed 2026-09-21; reopened the same day by review — see below.** `deniable::wire::DgkaMessage` is the `dgka-setup` (`0x000B`) codec: one
   struct tag, four rounds told apart by a leading discriminant, each a fixed-arity canonical CBOR body
   (`COMMIT` 3, `REVEAL` 7, `CONFIRM` 5, `REKEY` 7). The round-3 `X_i` broadcast travels in `CONFIRM`
   alongside the DSKE bind and the confirmation MAC. The codec decides nothing — it does not check a
@@ -203,7 +203,16 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   *signing input*, not the frame, so re-framing cannot change what was signed and a reveal lifted into
   another channel or epoch does not verify. **Every** DGKA round in the M7 suite is now carried through
   this codec rather than handed over in-process, so a field it drops or reorders fails those tests —
-  mutation-checked on both a `REVEAL` field and a `REKEY` field swap. (3) Re-key regenerates all shares and always
+  mutation-checked on both a `REVEAL` field and a `REKEY` field swap.
+
+  **Reopened the same day.** An independent review (`gpt-6-astra` via `codex exec`, 2026-09-21) showed
+  the codec still cannot drive a real exchange, and it is right: `finalize` requires the **full** `X_*`
+  map before it can produce any `Confirm`, and the only wire carrier of `X_i` **is** `Confirm`. Over a
+  log nobody can produce a confirm until everybody already has — a deadlock. The M7 tests do not hit it
+  because they gather `own_round2()` in-process, which is precisely the shortcut the codec existed to
+  remove. So the claim "deniable mode can travel on a log" was **false**; what shipped is four
+  well-formed message encodings, not a runnable protocol. A standalone round-3 `X_i` broadcast is
+  required, and until it exists blocker (2) stays open. (3) Re-key regenerates all shares and always
   re-derives `K'`, skips the commitment round (its shares are not protected against adaptive
   choice), carries no static reveal signature on the wire, and uses the unverified context
   constructor — identity binding on re-key rests on the caller sourcing descriptors from root-signed

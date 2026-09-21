@@ -439,7 +439,14 @@ fn rekey_round_trips_through_the_dgka_setup_codec_and_every_member_agrees() {
     // Every participant's X'_i must be gathered before any of them derives K'.
     let mut x_map: BTreeMap<Digest32, [u8; SHARE_LEN]> = BTreeMap::new();
     for p in &participants {
-        x_map.insert(p.author_id(), p.round2(&ctx).expect("X' for the new ring"));
+        let broadcast = on_the_wire(&DgkaMessage::Round2 {
+            author_id: p.author_id(),
+            x: p.round2(&ctx).expect("X' for the new ring"),
+        });
+        match broadcast {
+            DgkaMessage::Round2 { author_id, x } => x_map.insert(author_id, x),
+            other => panic!("round2 decoded as {other:?}"),
+        };
     }
 
     let mut rekeys = Vec::new();
