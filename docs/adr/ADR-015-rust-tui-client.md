@@ -2,7 +2,7 @@
 
 **Status**: implemented (M12 + M13.5, `crates/vox-tui/`) — live client over the embedded node; the network verbs landed with ADR-016 M14–M15 and the room-bound-service CLI with ADR-017 M17
 **Date**: 2026-06-20
-**Updated**: 2026-09-21 — macOS signing is now **enforced** (`scripts/sign-macos.sh` fails without the secrets; a tag cannot use the ad-hoc fallback), and the decision to hold `v0.1.0` until a Developer ID Application certificate exists is recorded in §Distribution. 2026-09-21 — `vox update`, `install.sh`, `scripts/package-release.sh`, `scripts/sign-macos.sh` and `.github/workflows/release.yml` implement §Distribution's install/update model, and the marker now **names the channel** (with a `proof` channel that exists so the digest-mismatch refusal can be proved); the absence of an independent release signature is recorded as a known gap. 2026-09-21 — the **install and update model** is specified (GitHub Releases only, a per-target release record fetched through `latest/download`, fail-closed transport, origin-confined redirects, atomic publish with rollback, `vox shell-setup`, signed+notarized macOS artifacts); see §Distribution. 2026-09-20 — the network verbs are wired (join from a link, invite, consent) and the binary listens (`--listen`); ADR-016 M14.7g. 2026-09-19 — status reconciled; test count corrected; Known gaps recorded. 2026-09-19 (M13.5): live `CoreHandle`, tokio runtime, masked onboarding prompts, composer, idle/SIGHUP lock, primary-buffer + lock gates met; `tui-textarea` dropped.
+**Updated**: 2026-09-21 — the macOS release path is now a port of `hf2q`'s signer (ephemeral keychain, sign by fingerprint, App Store Connect notary key, `apple-proof-<triple>.json` receipts verified at publish, credentials in an `apple-release` environment, **no unsigned fallback**); `v0.1.0` is held until that environment exists. The first attempt modelled this on `ctm`, whose Apple secrets were never configured — corrected. 2026-09-21 — `vox update`, `install.sh`, `scripts/package-release.sh`, `scripts/sign-macos.sh` and `.github/workflows/release.yml` implement §Distribution's install/update model, and the marker now **names the channel** (with a `proof` channel that exists so the digest-mismatch refusal can be proved); the absence of an independent release signature is recorded as a known gap. 2026-09-21 — the **install and update model** is specified (GitHub Releases only, a per-target release record fetched through `latest/download`, fail-closed transport, origin-confined redirects, atomic publish with rollback, `vox shell-setup`, signed+notarized macOS artifacts); see §Distribution. 2026-09-20 — the network verbs are wired (join from a link, invite, consent) and the binary listens (`--listen`); ADR-016 M14.7g. 2026-09-19 — status reconciled; test count corrected; Known gaps recorded. 2026-09-19 (M13.5): live `CoreHandle`, tokio runtime, masked onboarding prompts, composer, idle/SIGHUP lock, primary-buffer + lock gates met; `tui-textarea` dropped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: client, tui, rust, terminal, ratatui, verification, consent-ui
 
@@ -281,26 +281,57 @@ the binary, and it MUST be skippable (`VOX_NO_SHELL_SETUP=1`) and exactly remova
 (`--remove`). Its proof is the standard ADR-018 cites.
 
 **Targets** are `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. macOS
-artifacts MUST be signed and notarized with a **Developer ID Application** certificate: an unsigned
+artifacts MUST be signed with a **Developer ID Application** certificate and notarized: an unsigned
 download is quarantined by Gatekeeper, and "clear the quarantine flag by hand" is not an acceptable
 first run for a tool whose purpose is confidentiality. Signing MUST happen **after** `strip`, which
-rewrites the Mach-O and invalidates any earlier signature.
+rewrites the Mach-O and invalidates any earlier signature, and **before** packaging, so the release
+record's `sha256` covers the signed bytes.
 
-That obligation is **enforced, not merely stated**: `scripts/sign-macos.sh` fails when the signing
-secrets are absent, and the release workflow permits its ad-hoc fallback only on a non-tag run
-(`VOX_ALLOW_UNSIGNED=1`, set for a manual dispatch, a fork or a pull request). A tag never sets it, so
-an unsigned release cannot be published.
+**The signer is `scripts/sign_notarize_release.sh`, ported from `hf2q`'s
+`sign_notarize_standalone_release.sh`**, which is the reference implementation in this account. It
+MUST: decode the credentials into a `0700` directory it deletes on exit; import them into an
+**ephemeral keychain** and assert that keychain holds **exactly one** identity, which MUST be the
+expected `Developer ID Application: … (<team>)`; sign by that identity's **fingerprint** (never by
+name) with `--options runtime --timestamp`; and then verify out of `codesign --display --verbose=4`
+that the identifier, Team ID and authority are the expected ones, that the hardened runtime flag and
+a secure timestamp are present, and that exactly one canonical `CDHash` was produced.
+
+Notarization MUST use an **App Store Connect API key** (`--key`/`--key-id`/`--issuer`), not an Apple
+ID and app-specific password. The submission MUST be waited on to `Accepted`, the notary **log**
+MUST be fetched and MUST bind the same `CDHash` under SHA-256 with no issues, and the online ticket
+MUST then be verified with `codesign --check-notarization --test-requirement '=notarized'`. A bare
+CLI Mach-O cannot be stapled, so this online check is the only proof the ticket exists;
+`spctl --assess --type execute` MUST NOT be used, because it assesses app bundles and rejects a
+valid raw CLI as "not an app".
+
+Each signed target MUST emit `apple-proof-<triple>.json` — a `vox.apple-release-proof` receipt
+naming the unsigned and signed digests, the minimum macOS the toolchain produced, the signing
+authority, Team ID, identifier and `CDHash`, the notary submission id and status, and the SHA-256 of
+every log — and that receipt MUST be published with the release. The publish job MUST refuse to
+release unless both receipts attest `Accepted` for the version being tagged **and** each
+`stable-<triple>.json` digest equals its receipt's `asset.sha256`, so a record can never describe
+bytes other than the ones Apple notarized.
+
+**Credentials** are split the way `hf2q` splits them — repository *variables* for what is not
+secret, *secrets* for what is, both in a GitHub environment named `apple-release`:
+
+| Kind | Name |
+|---|---|
+| var | `APPLE_DEVELOPER_ID_APPLICATION`, `APPLE_TEAM_ID`, `APPLE_CODESIGN_IDENTIFIER`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID` |
+| secret | `APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64`, `APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD`, `APPLE_NOTARY_KEY_P8_BASE64` |
+
+There is **no unsigned fallback**. The macOS jobs draw their credentials from that environment, so a
+fork or a pull request cannot reach them and therefore cannot produce a release artifact at all.
+That is the enforcement: not a warning, an absence of capability.
 
 **Decision, 2026-09-21 — `v0.1.0` is not tagged yet, and that is deliberate.** The machinery above is
-implemented and proved, but no Developer ID Application certificate exists: vox's repository has no
-`APPLE_*` secrets, and the development machine holds only an *Apple Development* certificate, which
-notarytool rejects. The options were weighed and the decision was **to wait for the certificate rather
-than publish an unsigned macOS artifact** — a curl-installed ad-hoc-signed binary does in fact run
-(`curl` sets `com.apple.provenance`, not `com.apple.quarantine`, verified 2026-09-21), so the
-temptation to ship anyway was real; it was declined because the asset downloaded from the release page
-in a browser *is* quarantined, and telling a confidentiality tool's users to wave Gatekeeper through
-teaches the wrong reflex. The tag is blocked on: a Developer ID Application certificate exported as a
-`.p12`, and the six repository secrets `scripts/sign-macos.sh` names.
+implemented, but the `apple-release` environment does not exist on this repository yet. The options
+were weighed and the decision was **to wait for the credentials rather than publish an unsigned macOS
+artifact** — a curl-installed ad-hoc-signed binary does in fact run (`curl` sets
+`com.apple.provenance`, not `com.apple.quarantine`, verified 2026-09-21), so the temptation to ship
+anyway was real; it was declined because the asset downloaded from the release page in a browser *is*
+quarantined, and telling a confidentiality tool's users to wave Gatekeeper through teaches the wrong
+reflex.
 
 ## Consequences
 

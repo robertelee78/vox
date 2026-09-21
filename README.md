@@ -115,7 +115,7 @@ crates/vox-tui/    The Rust TUI client, binary `vox` (M12, ADR-015)
 docs/adr/          Architecture Decision Records (the design spine; each records its
                    implementation status and Implementation notes)
 .github/           CI and the release workflow (three targets, macOS signed + notarized)
-scripts/           release helpers: package-release.sh, sign-macos.sh
+scripts/           release helpers: package-release.sh, sign_notarize_release.sh
 install.sh         the installer the curl one-liner runs
 Cargo.toml         Workspace manifest (Rust 1.94, pinned in rust-toolchain.toml)
 README.md          This file
@@ -137,8 +137,8 @@ atomically into `~/.local/bin` (override with `VOX_INSTALL_DIR`), and runs `vox 
 with a Developer ID, so Gatekeeper does not quarantine them.
 
 > **No release is published yet.** The installer and updater are implemented and proved, but
-> `v0.1.0` is deliberately held until a **Developer ID Application** certificate exists to sign and
-> notarize the macOS artifacts — an unsigned build of a confidentiality tool is not shipped with a
+> `v0.1.0` is deliberately held until the `apple-release` credentials exist to sign and notarize
+> the macOS artifacts — an unsigned build of a confidentiality tool is not shipped with a
 > footnote telling you to wave Gatekeeper through ([ADR-015](docs/adr/ADR-015-rust-tui-client.md)
 > §Distribution). Until then, **build from source** as below. Running the line above today tells you
 > the release record is not published, and changes nothing.
