@@ -267,13 +267,24 @@ would stall the entire node: no sync, no commands. The tree already meets this h
 `node/tunnel.rs:103`, where `TunnelServed` uses `try_send` precisely so "a client that stopped
 draining cannot stall a tunnel". This ADR generalises that rule.
 
-The REQUIRED architecture:
+The REQUIRED architecture — **amended 2026-09-21 during M19.1, and simpler than first specified**:
 
 ```
-actor --(bounded mpsc, awaited)--> fan-out task --(broadcast, non-blocking)--> N clients
+actor --(broadcast, non-blocking)--> N clients
 ```
 
-- The fan-out task **MUST NOT** perform any operation that can block, or the actor stalls behind it.
+This ADR originally specified `actor --(bounded mpsc, awaited)--> fan-out task --(broadcast)--> N
+clients`, preserving the existing channel. Implementation showed the intermediate queue and task are
+not merely unnecessary but a liability: `broadcast::Sender::send` is synchronous and never blocks, so
+the actor **MUST** hold the broadcast sender directly. There is then no fan-out task that could
+itself stall, and one fewer moving part.
+
+What made this safe to simplify is a property the TUI already had: `vox-tui`'s `drain_events` folds
+events into unread counts and transient notices, while the rendered timeline comes from
+`ChannelDetail` over the `NodeView` watch. The existing client already treated events as notification
+rather than as truth, so removing backpressure costs an unread badge at worst, never a message.
+
+- Emission **MUST NOT** perform any operation that can block or await.
 - A lagging subscriber **MUST** be told it lagged. `Lagged(n)` is **not** an error: it means "re-read
   the log from your cursor", which is safe only because §6 makes the log the delivery mechanism.
 - **A burst larger than the buffer drops for every subscriber, not only the slow one.** No client may
@@ -360,11 +371,18 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
 
 Both unknowns are already spiked; neither remains open.
 
-- **M19.1 — IPC and fan-out (`vox-core`).** The Unix socket, the broadcast fan-out of §7, per-client
-  cursors, and the rule that no client can stall the actor. *Gate*: two clients attached to one node
-  both receive every event; one client stops draining and the node keeps syncing and answering
-  commands; the stalled client is told it lagged and recovers from its cursor. Mutation-checked by
-  reverting to the direct `send().await`.
+- **M19.1a — the fan-out (`vox-core`). DONE 2026-09-21.** `NodeHandle::subscribe()` returns an
+  independent `EventStream` per client; emission is a non-blocking broadcast; `EventStreamItem::
+  Lagged(n)` surfaces lag instead of hiding it. `next_event()`/`try_next_event()` keep their
+  signatures, so the TUI, `tunnel_cli` and every existing gate were untouched.
+  *Gate* `node_m19_fanout_gate` (release, ≈2.9 s): with a client wedged from the start, 400 appends
+  all succeed and the node still answers afterwards; a second client draining concurrently sees the
+  whole burst; the wedged client is told it lagged and then resumes; the log holds every entry.
+  Mutation-checked twice — swallowing the lag report, and a 100 000-event buffer — both caught.
+- **M19.1b — the IPC socket (`vox-core`).** The `0600` Unix socket, its framing, per-client
+  authentication and per-client cursor storage, carrying the stream of M19.1a to out-of-process
+  clients. *Gate*: two separate processes attached to one node both receive every event; killing one
+  disturbs neither the node nor the other.
 - **M19.2 — the trust keyring (`vox-core`).** `vox trust add|list|remove`, persistence, the bulk
   import wrapper, and auto-consent on an admitted author whose fingerprint is trusted. *Gate*: a
   member in the keyring is read without a manual consent act; a **vouched** author absent from the
