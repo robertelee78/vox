@@ -311,8 +311,8 @@ impl ConnectionManager {
     /// authenticated peer identity. `Ok(None)` when the endpoint is closed.
     ///
     /// **Performs the handshake inline**, so this is for a caller that wants exactly one
-    /// connection. An accept *loop* must use [`NodeNet::accept_incoming`] and
-    /// [`NodeNet::finish_incoming`] instead, or it serialises on handshakes and one stalled
+    /// connection. An accept *loop* must use [`Self::accept_incoming`] and
+    /// [`Self::finish_incoming`] instead, or it serialises on handshakes and one stalled
     /// unauthenticated peer blocks every other inbound connection.
     pub async fn accept(&self, admission: Admission) -> Result<Option<Arc<VoxConnection>>> {
         let Some(conn) = self

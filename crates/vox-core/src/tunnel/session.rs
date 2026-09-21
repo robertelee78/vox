@@ -206,14 +206,21 @@ pub struct HostService {
 /// 2. asks `resolve` about the `(channel, service_tag)` it named — pure host
 ///    configuration: `Some(HostService)` if this node holds that channel and offers
 ///    that service, `None` otherwise, and *no* authorization logic;
-/// 3. enforces `dial:<service_tag>` for `client_id` against **that channel's**
-///    evaluator via [`authorize_dial`] — the authorization gate lives here, not in
-///    the caller, so a misconfigured resolver cannot grant reach;
-/// 4. connects the local endpoint and splices bytes.
+/// 3. checks `client_id` against that channel's **live reacher set** — the host's own
+///    trust keyring intersected with the room's current author set (ADR-017 decision 3,
+///    M17.7). The gate lives here, not in the caller, so a misconfigured resolver
+///    cannot grant reach;
+/// 4. connects the local endpoint and splices bytes, leaving the moment `client_id`
+///    stops being a reacher (M17.11).
 ///
-/// The evaluator comes from the resolver rather than the caller because a QUIC
-/// connection is per peer, not per channel: which authority applies is known only
-/// once the request has been read (ADR-013 Implementation notes).
+/// `service_tag` is **not** an authorization input. It was, as `dial:<tag>` against the
+/// channel's evaluator, but that capability came from a genesis grant conferred on every
+/// admitted member — which made joining the authorization, and was the vulnerability.
+/// Reach is per (host, room): every service a host bound to a room goes to the same set.
+///
+/// Which channel's set applies comes from the resolver rather than the caller because a
+/// QUIC connection is per peer, not per channel: the authority is known only once the
+/// request has been read (ADR-013 Implementation notes).
 ///
 /// Steps 2 and 3 both fail to a **uniform** [`TunnelStatus::Denied`] (and
 /// [`Error::TunnelDenied`]) — unauthorized, unknown channel, unknown service and
@@ -366,9 +373,9 @@ async fn splice(send: SendStream, recv: RecvStream, mut tcp: TcpStream) -> Resul
     let mut quic = tokio::io::join(recv, send);
     match tokio::io::copy_bidirectional(&mut tcp, &mut quic).await {
         Ok(_) => Ok(()),
-        Err(e) if reset_reason(&e) == Some(REACH_WITHDRAWN_CODE) => {
-            Err(Error::TunnelRevoked("the host withdrew access to this service"))
-        }
+        Err(e) if reset_reason(&e) == Some(REACH_WITHDRAWN_CODE) => Err(Error::TunnelRevoked(
+            "the host withdrew access to this service",
+        )),
         Err(_) => Err(Error::MalformedTunnel("tunnel splice")),
     }
 }

@@ -128,10 +128,9 @@ async fn park_across_withdrawal() -> (u8, usize) {
     // The live reacher set the actor owns (`node::tunnel::Reachers`). The client starts in
     // it: at the moment it opens its stream it is trusted and a current author, which is
     // exactly the state the attack begins from.
-    let reachers: vox_core::node::tunnel::Reachers =
-        Arc::new(tokio::sync::watch::Sender::new(
-            [client_fp].into_iter().collect::<BTreeSet<_>>(),
-        ));
+    let reachers: vox_core::node::tunnel::Reachers = Arc::new(tokio::sync::watch::Sender::new(
+        [client_fp].into_iter().collect::<BTreeSet<_>>(),
+    ));
 
     // ---- the host: the real server, taking its snapshot when the stream opens ----
     let host_ep = VoxEndpoint::bind(&host_signer, "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -331,9 +330,8 @@ async fn m17_11_a_live_session_is_cut_when_reach_is_withdrawn() {
     let client_ep = VoxEndpoint::bind(&client_signer, "127.0.0.1:0".parse().unwrap()).unwrap();
     let conn = client_ep.connect(host_addr, host_id, NOW).await.unwrap();
     let (send, recv) = open_typed(&conn, StreamKind::Tunnel).await.unwrap();
-    let dialing = tokio::spawn(async move {
-        session::dial(send, recv, &channel_id, "22", spliced).await
-    });
+    let dialing =
+        tokio::spawn(async move { session::dial(send, recv, &channel_id, "22", spliced).await });
 
     // Prove the session is alive: a round trip through the real echo, end to end.
     app.write_all(b"alive before the withdrawal").await.unwrap();

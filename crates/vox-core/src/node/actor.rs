@@ -3263,8 +3263,11 @@ impl Node {
             // (in this node's ring) AND (a current author of this room). Neither alone:
             // trust is room-independent so it cannot name the room, and membership is a
             // passphrase and a proof of work rather than a decision about a person.
-            let next: std::collections::BTreeSet<Digest32> =
-                trusted.iter().copied().filter(|fp| ch.is_author(fp)).collect();
+            let next: std::collections::BTreeSet<Digest32> = trusted
+                .iter()
+                .copied()
+                .filter(|fp| ch.is_author(fp))
+                .collect();
             let slot = self
                 .reachers
                 .entry(*cid)

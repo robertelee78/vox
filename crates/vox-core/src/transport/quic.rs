@@ -352,7 +352,7 @@ impl VoxEndpoint {
 
     /// **Phase two: complete one connection's handshake and admission.**
     ///
-    /// Bounded by [`HANDSHAKE_TIMEOUT`], so a peer that opens a connection and then says
+    /// Bounded by a 30-second handshake timeout, so a peer that opens a connection and then says
     /// nothing costs one task for that long and not for ever. Spawn this; do not await it in
     /// an accept loop.
     pub async fn finish_incoming(
