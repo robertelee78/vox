@@ -145,6 +145,22 @@ pub fn identity_passphrase_for(
 /// The room-making verbs need this instead of the room-opening preamble the one-shot
 /// verbs share: `serve` is about to create a room and `connect` to join one, so neither
 /// has a room to open yet.
+/// What to say when another `vox` already holds this profile.
+///
+/// Shared by both spawn paths: the first version of this covered `open_profile` only, so
+/// `serve`, `connect`, `service`, `forward`, `grant` and `up` — which go through
+/// `open_room` — still got the bare "another vox already has this profile open" with no
+/// remedy, which is the message the fix existed to replace.
+fn profile_busy(socket: &std::path::Path) -> AppError {
+    AppError::Usage(format!(
+        "a vox is already running for this profile, and only one at a time may hold it.\n\
+         \x20      Its control socket is {}\n\
+         \x20      Stop that node to run this command, or use the `vox room …` verbs, \
+         which ask the running node instead of starting a second one.",
+        socket.display()
+    ))
+}
+
 pub async fn open_profile(
     paths: Paths,
     listen: SocketAddr,
@@ -162,15 +178,7 @@ pub async fn open_profile(
         // with "store open: Database already open. Cannot acquire lock.", which names a
         // storage engine and no remedy. Running a daemon is the documented way to run
         // agent comms, so this was the ordinary case, not an edge one.
-        Err(vox_core::error::Error::ProfileBusy) => {
-            return Err(AppError::Usage(format!(
-                "a vox is already running for this profile, and only one at a time may \
-                 hold it.\n       Its control socket is {}\n       Stop that node to run \
-                 this command, or use the `vox room …` verbs, which ask the running node \
-                 instead of starting a second one.",
-                socket.display()
-            )));
-        }
+        Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&socket)),
         Err(e) => return Err(e.into()),
     };
     let secret = Secret::new(identity_passphrase.as_bytes().to_vec());
@@ -198,7 +206,12 @@ async fn open_room(
     room_passphrase: &str,
 ) -> Result<(NodeHandle, Digest32), AppError> {
     let cfg = NodeConfig::new().bind(Bind::Addr(listen)).anchors(anchors);
-    let node = Node::spawn_config(paths, cfg)?;
+    let socket = paths.socket_file();
+    let node = match Node::spawn_config(paths, cfg) {
+        Ok(n) => n,
+        Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&socket)),
+        Err(e) => return Err(e.into()),
+    };
     let out = node
         .apply(NodeCommand::Unlock {
             passphrase: Secret::new(identity_passphrase.as_bytes().to_vec()),
@@ -366,8 +379,17 @@ pub async fn forward(
         })
         .await;
     if !out.is_done() {
+        // Not "do you hold dial:<tag>": that capability was withdrawn with the rest of
+        // the model in ADR-017's third revision, and nothing has consulted it since
+        // M17.7. The message asked a person to check a permission that cannot be held
+        // and cannot be granted — `vox grant`, the only thing that issued it, is
+        // withdrawn too. What actually decides is the host's keyring, and the host is
+        // the only one who can change it.
         return Err(AppError::Usage(format!(
-            "cannot forward: {out:?} — is {} reachable, and do you hold dial:{tag}?",
+            "cannot forward: {out:?}\n       Two things it could be: {} is not reachable \
+             right now, or they have not run `vox trust add` on you.\n       Reach is \
+             the HOST's decision (ADR-017 decision 3) — there is nothing you can grant \
+             yourself.",
             short(&host)
         )));
     }

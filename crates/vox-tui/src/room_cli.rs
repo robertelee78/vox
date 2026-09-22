@@ -673,37 +673,21 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
     {
         Ok(Frame::Ok) => {}
         Ok(Frame::Error { reason }) => {
-            return Err(AppError::Usage(format!(
-                "cannot offer {tag:?}: {reason} — offering a service needs bind:{tag} in this \
-                 room, which the room's admin grants"
-            )))
+            // Not "needs bind:<tag>, which the room's admin grants": that capability was
+            // deleted in ADR-017's third revision — offering a port of your own machine
+            // is not the room's business — and `add_service` stopped checking it at M17.7.
+            // The message named a permission nobody can hold and an admin nobody has.
+            return Err(AppError::Usage(format!("cannot offer {tag:?}: {reason}")));
         }
         Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     }
 
-    // **A dial grant per member, and why it is here even though it should not be
-    // needed.** Under the ring-keyed reach gate, whoever can read the announcement
-    // can already reach the bytes, and this loop is redundant. Under the capability
-    // model it is required: a plain room carries no genesis service grant, so a
-    // member holds neither `dial:` nor `bind:` until an admin says so. Issuing it
-    // is idempotent and cheap, and it means this verb works under either model
-    // rather than failing in a way that looks like a networking fault.
-    if let Ok(Frame::Members { members }) = client.request(&Request::Roster { channel_id }).await {
-        let me = client.me();
-        let expiry = now_secs().saturating_add(86_400);
-        for target in members.into_iter().filter(|m| Some(*m) != me) {
-            let _ = client
-                .request(&Request::Grant {
-                    channel_id,
-                    target,
-                    service_tag: tag.clone(),
-                    may_bind: false,
-                    expiry,
-                })
-                .await;
-        }
-    }
+    // A `dial:` grant per member used to be issued here, "so it works under either
+    // model". There is one model: reach is the host's trust keyring (M17.7), and the
+    // capability has not been consulted since. The loop wrote a governance fact per
+    // member per offer onto the room's log, which nothing read — and it kept the
+    // withdrawn model alive in the one verb a person uses most.
 
     let env = {
         let mut e = Envelope::new(FILE, &format!("offering {name} ({size} bytes)"));
