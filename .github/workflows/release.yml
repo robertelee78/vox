@@ -9,8 +9,16 @@ env:
   CARGO_TERM_COLOR: always
   # The gaps ADR-018 §3 accepts today. Removing one MUST make the proofs fail until it is
   # closed — that is what makes an accepted gap a decision rather than a silence.
+  #
+  # `opencode` — the M19.7 rehearsal and the OpenCode plugin proof drive a **live model**
+  # through a real harness. A CI runner has neither the harness nor a credential, so they
+  # report unproven here and are proved on a developer machine instead. Removing this name
+  # does not make CI prove them; it makes CI fail.
+  # `cross-process-join` / `cross-process-tunnel` — the open reachability defects recorded
+  # in ADR-012 and ADR-016 with measurements. Named separately so a tunnel regression
+  # cannot hide behind a join defect, or the reverse.
   # See ci.yml: `fish` is not excused here, the gates job installs it.
-  VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes"
+  VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes,opencode,cross-process-join,cross-process-tunnel"
 
 jobs:
   # ADR-018 §6: nothing is published from a tree the gates have not passed on. The tag is the
