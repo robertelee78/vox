@@ -66,8 +66,14 @@ struct OneConnection {
 }
 
 impl HostDialer for OneConnection {
-    async fn connection(&self, host: &Digest32) -> Option<Arc<VoxConnection>> {
-        (*host == self.host).then(|| Arc::clone(&self.conn))
+    async fn connection(&self, host: &Digest32) -> vox_core::error::Result<Arc<VoxConnection>> {
+        if *host == self.host {
+            Ok(Arc::clone(&self.conn))
+        } else {
+            Err(vox_core::error::Error::Unreachable(
+                "this harness holds one connection, and not to that host",
+            ))
+        }
     }
 }
 

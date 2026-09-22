@@ -63,12 +63,16 @@ pub const DEFAULT_SOCKS_PORT: u16 = 1080;
 /// handler blocks the progress it is waiting for. Binding immediately and dialling on demand
 /// removes the race instead of timing it.
 pub trait HostDialer: Send + Sync {
-    /// A connection to `host`, dialling if this node has none. `None` when the host cannot be
-    /// reached at all.
+    /// A connection to `host`, dialling if this node has none.
+    ///
+    /// The error carries **which rung failed** — no candidates, the relay refused, the target
+    /// never answered. Every rung already produces a specific error, and a proxy that reduced
+    /// them all to "cannot reach the host" left a person with five minutes of waiting and
+    /// nothing to act on.
     fn connection(
         &self,
         host: &Digest32,
-    ) -> impl core::future::Future<Output = Option<Arc<VoxConnection>>> + Send;
+    ) -> impl core::future::Future<Output = Result<Arc<VoxConnection>>> + Send;
 }
 
 /// Serve SOCKS5 on `bind` until the task is dropped.
@@ -183,14 +187,21 @@ const HOST_POLL: Duration = Duration::from_millis(250);
 async fn reach_host_with_patience<D: HostDialer>(
     dialer: &D,
     host: &Digest32,
-) -> Option<Arc<VoxConnection>> {
+) -> Result<Arc<VoxConnection>> {
     let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
+    // The **last** reason, not a generic one. Every rung of the ladder already produces a
+    // specific error — no candidates, the relay refused, the target never answered — and
+    // this loop used to discard all of them and hand the caller `None`. A person then saw
+    // "cannot reach that room's host" after five minutes with nothing to act on, and a
+    // diagnosis needed a debugger. Keeping the last one costs a String and turns the same
+    // five minutes into a sentence.
     loop {
-        if let Some(conn) = dialer.connection(host).await {
-            return Some(conn);
-        }
+        let last = match dialer.connection(host).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => e,
+        };
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            return Err(last);
         }
         tokio::time::sleep(HOST_POLL).await;
     }
@@ -227,9 +238,12 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16)>(
         socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
         return Err(Error::MalformedTunnel("no such .vox name on this machine"));
     };
-    let Some(conn) = reach_host_with_patience(dialer, &room.host).await else {
-        socks::write_reply(&mut stream, Reply::GeneralFailure, UNSPECIFIED).await?;
-        return Err(Error::Unreachable("no connection to that room's host"));
+    let conn = match reach_host_with_patience(dialer, &room.host).await {
+        Ok(conn) => conn,
+        Err(why) => {
+            socks::write_reply(&mut stream, Reply::GeneralFailure, UNSPECIFIED).await?;
+            return Err(why);
+        }
     };
 
     // Reply *before* the tunnel is dialled, because a SOCKS client sends nothing until it

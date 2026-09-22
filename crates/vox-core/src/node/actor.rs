@@ -3745,13 +3745,13 @@ struct NodeDialer {
 }
 
 impl crate::node::up::HostDialer for NodeDialer {
-    async fn connection(&self, host: &Digest32) -> Option<Arc<VoxConnection>> {
+    async fn connection(&self, host: &Digest32) -> crate::error::Result<Arc<VoxConnection>> {
         // `reach` returns a live connection when there is one and otherwise runs the whole
         // ADR-012 ladder, so this is both "give me the connection" and "make one". The
         // endpoint hints come from the board, which is also why this must happen per
         // request: a node that has only just joined has not read the board yet.
         let endpoints = self.net.board_endpoints(&self.channel_id, host);
-        self.net.reach(*host, &endpoints).await.ok()
+        self.net.reach(*host, &endpoints).await
     }
 }
 
