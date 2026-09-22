@@ -2,6 +2,42 @@
 
 **Status**: accepted (2026-09-19) — **M13 (single-device node), M14 (two machines chat), M15 (anchors: symmetric-NAT swarm formation *and* convergence between members never online together) and M16.1 (a TCP service reached across the overlay) are all gated in `crates/vox-core/tests/` and run in CI's release step**; the person-facing service surface moves to ADR-017
 **Date**: 2026-09-19
+**Updated**: 2026-09-22 (second note) — **OPEN DEFECT: a cross-process join through an anchor fails roughly
+half the time, at the responder dial.** Named here rather than left as a flaky gate, because it is a product
+defect and the gate is telling the truth.
+
+`service_rehearsal_proof`'s untrusted-joiner control fails ~40–50% of runs with
+`vox: cannot join: Failed(Unreachable)`, after **250–285 seconds**. Instrumented, so this is measured and
+not inferred:
+
+```
+JDIAG: board ok, peer=uhjrm6v4…
+JDIAG: responder=uucpadv6… board_is_responder=false eps=1 members=2 bundles=2
+JDIAG: dialling responder with 1 endpoints
+vox: cannot join: Failed(Unreachable)
+```
+
+What that rules out: the board is reached, so `reach_a_board` is not implicated; and `eps=1`, so the
+responder's **address record had propagated** — the first note below fixed that and it is working. What
+remains is that a dial to an endpoint **we hold** fails. The 250s is one dial, not a loop: the ADR-012
+ladder tries direct, then a punch, then a circuit, each with its own budget.
+
+Leading hypothesis, **not yet confirmed**: the responder advertises an endpoint the joiner cannot use.
+`local_endpoints()` enumerates interfaces, so a LAN address can land in the record while the reachable
+loopback one does not — which would make this the third instance in one day of "the address we have is not
+the address that works". It did not reproduce in the three runs made after the endpoint text was added to
+the instrumentation, so the next step is more runs, not a fix.
+
+**This blocks a release.** It is the join path, so it is not confined to services: agent comms joins too,
+and ADR-020's premise is sessions on remote hosts. Note also that `service_rehearsal_proof` is currently
+the **only** gate in the tree that joins across processes through an anchor, which is why it is the only one
+that catches this — an argument for more proofs of that shape, not for distrusting this one.
+
+Two related items, neither blocking: a user's **first** `ssh` into a fresh room can wait minutes inside
+`up::reach_host_with_patience` (working as designed, bad as an experience, same family one layer up); and
+the dial ladder reports `Unreachable` **without naming which rung failed**, which is ADR-018 §8b and is why
+this took instrumentation to narrow at all.
+
 **Updated**: 2026-09-22 — **a join no longer reports "I do not know your address yet" as "you are unreachable."**
 Two fixes to `join_channel`, one of which was a real ~40% failure on `main`:
 
