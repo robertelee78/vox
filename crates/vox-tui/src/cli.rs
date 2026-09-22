@@ -225,6 +225,20 @@ where
     }
 }
 
+/// Whether a node is already serving this profile.
+fn node_answers(profile: &ProfileArgs) -> bool {
+    let Ok(paths) = profile.paths() else {
+        return false;
+    };
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    rt.block_on(crate::room_cli::node_is_running(&paths))
+}
+
 /// Whether a node is already serving this profile, so a trust verb should ask it.
 fn trust_over_socket(sub: &TrustCmd) -> bool {
     let profile = match sub {
@@ -1249,6 +1263,33 @@ pub fn run() -> ExitCode {
                 }
             }
         }),
+        // Ask the running node when there is one: a fingerprint is public, the hello
+        // already carries it, and needing the profile to yourself to read your own name
+        // was the most gratuitous case of the busy-profile problem.
+        Cmd::Id(args) if node_answers(&args.profile) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            else {
+                eprintln!("vox: could not start a runtime");
+                return ExitCode::FAILURE;
+            };
+            match rt.block_on(crate::room_cli::print_identity(&paths)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Cmd::Id(args) => run_new_room_verb(
             args.profile.clone(),
             args.identity_passphrase.clone(),

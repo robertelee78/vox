@@ -33,13 +33,23 @@ use crate::tunnel_cli::resolve_prefix;
 /// Connect to the running node's control socket for this profile.
 ///
 /// The failure an operator will actually hit is "no node is running", so it says
-/// that rather than surfacing a connect error.
+/// that rather than surfacing a connect error — **and names the thing that would
+/// actually fix it.** It used to say "Start one with `vox node`", which is the first
+/// error a new person meets and it sent them in a circle: `vox node` is an anchor, it
+/// holds no room and serves no control socket, so following the advice produced this
+/// same message again, verbatim. `vox daemon` is what holds a profile's rooms and
+/// serves this socket.
 async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
     let sock = paths.socket_file();
     if !sock.exists() {
         return Err(AppError::Usage(format!(
-            "no node is running for this profile ({}). Start one with `vox node`, \
-             or run `vox tui`, and try again.",
+            "no node is running for this profile, so there is nothing to ask.\n\
+             \x20      Start one:  vox daemon        (holds this profile's rooms, no \
+             terminal needed)\n\
+             \x20             or:  vox tui           (the interactive client)\n\
+             \x20      `vox node` will NOT do: it is an anchor, it holds no room and \
+             serves no socket.\n\
+             \x20      Socket: {}",
             paths.socket_file().display()
         )));
     }
@@ -1037,4 +1047,27 @@ pub async fn trust_list(paths: &Paths, identity_passphrase: &str) -> Result<(), 
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
+}
+
+/// `vox id`, asked of the running node.
+///
+/// Printing your own fingerprint is the most ordinary thing a person does — it is what
+/// they send to somebody who will type it into `vox trust add` — and it needs no secret
+/// and changes nothing. It nevertheless failed outright whenever a daemon held the
+/// profile, because it went through a node of its own.
+///
+/// The socket's hello already carries it (protocol 2's `me`), so this costs no new
+/// request and no passphrase: a fingerprint is public.
+pub async fn print_identity(paths: &Paths) -> Result<(), AppError> {
+    let client = attach(paths).await?;
+    let Some(me) = client.me() else {
+        return Err(AppError::Usage(
+            "the running node has no identity yet. Make one:  vox id  (with the daemon \
+             stopped)"
+                .into(),
+        ));
+    };
+    // The whole fingerprint, alone on the line, so it pipes and pastes without editing.
+    println!("{}", vox_core::node::link::b32_encode(&me));
+    Ok(())
 }

@@ -109,16 +109,32 @@ pub fn identity_passphrase_for(
         }
         return Ok(p);
     }
+    // **Without a terminal there is nobody to ask twice.** `prompt_passphrase` falls back
+    // to reading a line, so a closed stdin yielded "" and this printed "creating one",
+    // asked for a confirmation nobody could give, and then said "an empty identity
+    // passphrase" — three lines, none of which say what to do, after announcing a
+    // creation that did not happen.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(AppError::Usage(
+            "this profile has no identity yet, and there is no terminal to ask at.\n\
+             \x20      Make one interactively:  vox id\n\
+             \x20      Or give the passphrase:  --identity-passphrase-file <path>, or \
+             VOX_IDENTITY_PASSPHRASE"
+                .into(),
+        ));
+    }
     println!("vox: this profile has no identity yet; creating one.");
     let first = prompt_passphrase("new identity passphrase")?;
+    if first.is_empty() {
+        return Err(AppError::Usage(
+            "an empty identity passphrase; nothing was created".into(),
+        ));
+    }
     let again = prompt_passphrase("again")?;
     if first != again {
         return Err(AppError::Usage(
             "the two passphrases differ; nothing was created".into(),
         ));
-    }
-    if first.is_empty() {
-        return Err(AppError::Usage("an empty identity passphrase".into()));
     }
     Ok(first)
 }

@@ -447,9 +447,27 @@ pub fn run_daemon(
             })
             .await;
         if !outcome.is_done() {
-            return Err(AppError::Usage(format!(
-                "could not unlock this profile's identity: {outcome:?}"
-            )));
+            // **Say what to do, not which enum variant lost.** A new person is sent here
+            // by `vox room list`'s "start one: vox daemon", and this is the second thing
+            // they see; `Failed(NoIdentity)` names nothing they can act on and does not
+            // mention that `vox id` is what creates an identity. The two failures a
+            // person actually hits are distinguished, because the remedies are opposite:
+            // one means make an identity, the other means you typed the wrong thing.
+            use vox_core::node::api::{Fault, Outcome};
+            return Err(AppError::Usage(match outcome {
+                Outcome::Failed(Fault::NoIdentity) => format!(
+                    "this profile has no identity yet, so there is nothing to unlock.\n\
+                     \x20      Make one:  vox id\n\
+                     \x20      Then start the daemon again. Profile: {}",
+                    paths.profile_dir.display()
+                ),
+                Outcome::Failed(Fault::WrongPassphrase) => {
+                    "that identity passphrase is wrong.\n       The first line piped to \
+                     `vox daemon` is the identity passphrase; lines after it open rooms."
+                        .to_owned()
+                }
+                other => format!("could not unlock this profile's identity: {other:?}"),
+            }));
         }
         // Then the second lock. `vox room post|read|board` all need the room OPEN,
         // not merely known — a daemon that unlocked the identity and stopped there
