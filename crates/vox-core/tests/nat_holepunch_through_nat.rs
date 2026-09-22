@@ -297,7 +297,9 @@ fn serve_streams(
                         }
                     });
                 }
-                Ok(Inbound::Sync { peer, send, recv }) => {
+                Ok(Inbound::Sync {
+                    peer, send, recv, ..
+                }) => {
                     if let Some(h) = &handoff {
                         let _ = h.send((peer, send, recv));
                     }

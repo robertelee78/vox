@@ -294,6 +294,23 @@ enum NetEvent {
         /// The connection that landed.
         conn: Arc<VoxConnection>,
     },
+    /// A peer asked to reconcile a channel, and its request has **already been read** on
+    /// the stream's own task. The actor does the reconciliation; it never waits for the
+    /// peer to speak, because anything the actor awaits inline stops the whole node.
+    SyncRequest {
+        /// The connection the stream came in on.
+        conn: Arc<VoxConnection>,
+        /// The authenticated peer.
+        peer: Digest32,
+        /// The channel it asked to reconcile.
+        channel_id: Digest32,
+        /// The epoch it named.
+        epoch: u64,
+        /// The stream's send half.
+        send: quinn::SendStream,
+        /// The stream's receive half.
+        recv: quinn::RecvStream,
+    },
     /// A peer connected inbound: it gets a sync schedule, due immediately.
     Connected {
         /// The authenticated peer.
@@ -362,6 +379,45 @@ fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Send
                     | Inbound::ServedCoord { .. }
                     | Inbound::ServedCircuit { .. },
                 ) => failures = 0,
+                // A sync stream's preamble is read **here, on a task of its own**, and the
+                // actor is told only once the request is in hand.
+                //
+                // The actor is a single task and the only writer of channel state, so
+                // anything it awaits inline stops the whole node: commands, the tick, and —
+                // once the network queue fills — accepting connections at all. Awaiting an
+                // untrusted peer's first frame there meant one stream carrying zero bytes
+                // stopped a node permanently, from any peer holding a valid identity, with an
+                // anchor the worst target because it is always addressable. The connection's
+                // keep-alive is no defence: quinn PINGs the connection for ever while a
+                // stream on it stays silent.
+                //
+                // A task per stream, rather than reading in this loop, so a silent stream does
+                // not even hold up the other streams on its own connection. The read is
+                // bounded by `framing::FRAME_PATIENCE`. Every state mutation still happens in
+                // the actor, in order.
+                Ok(Inbound::Sync { peer, send, recv }) => {
+                    failures = 0;
+                    let tx = tx.clone();
+                    let conn = Arc::clone(&conn);
+                    tokio::spawn(async move {
+                        let mut recv = recv;
+                        let Ok((channel_id, epoch)) =
+                            crate::node::syncstream::read_sync_request(&mut recv).await
+                        else {
+                            return;
+                        };
+                        let _ = tx
+                            .send(NetEvent::SyncRequest {
+                                conn,
+                                peer,
+                                channel_id,
+                                epoch,
+                                send,
+                                recv,
+                            })
+                            .await;
+                    });
+                }
                 Ok(inbound) => {
                     failures = 0;
                     let event = NetEvent::Stream {
@@ -1446,6 +1502,17 @@ impl Node {
             NetEvent::Stopped => {
                 self.net = None;
             }
+            NetEvent::SyncRequest {
+                conn,
+                peer,
+                channel_id,
+                epoch,
+                send,
+                recv,
+            } => {
+                let _ = (&conn, peer);
+                self.run_sync_session(channel_id, epoch, send, recv).await;
+            }
             NetEvent::AddressesDiscovered { mappings } => {
                 // Re-publish every open channel's records: the addresses in them were
                 // composed before discovery and may name only loopback.
@@ -1502,8 +1569,9 @@ impl Node {
                     Inbound::Pairwise { peer, recv, .. } => {
                         self.take_inbound_skdm(peer, recv).await;
                     }
-                    Inbound::Sync { send, recv, .. } => {
-                        self.run_sync_session(send, recv).await;
+                    Inbound::Sync { .. } => {
+                        // Unreachable: the stream loop converts these into
+                        // `NetEvent::SyncRequest` once the preamble is read.
                     }
                     Inbound::Punch {
                         peer,
@@ -2790,11 +2858,20 @@ impl Node {
 
     /// Reconcile one channel's log with a peer over an inbound `sync` stream (ADR-008
     /// frontier mode), on its own task for the reason [`NetEvent::SyncDone`] gives.
-    async fn run_sync_session(&mut self, send: quinn::SendStream, mut recv: quinn::RecvStream) {
-        use crate::node::syncstream::{accept_sync, read_sync_request};
-        let Ok((channel_id, epoch)) = read_sync_request(&mut recv).await else {
-            return;
-        };
+    /// Serve one sync session for a request that has **already been read**.
+    ///
+    /// The preamble is read on the per-connection stream task (`node::network`), not here: the
+    /// actor is the only writer of channel state and anything it awaits inline stops the whole
+    /// node, so it must never wait on an untrusted peer to speak. What it does here is local
+    /// and ordered, which is what the single-task design is for.
+    async fn run_sync_session(
+        &mut self,
+        channel_id: Digest32,
+        epoch: u64,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+    ) {
+        use crate::node::syncstream::accept_sync;
         // Only a channel we hold open at that epoch — or keep as an anchor — can be
         // reconciled. An anchor whose board just received the genesis adopts it here
         // rather than making the member wait for the next tick.
