@@ -835,3 +835,107 @@ async fn collect(bound: &str, dest: &std::path::Path, offer: &Offer) -> Result<(
     println!("vox: {} ({total} bytes) verified", dest.display());
     Ok(())
 }
+
+/// Read a passphrase from stdin, stripping exactly one trailing newline.
+///
+/// Stdin rather than an argument: argv is visible to anything that can run `ps`.
+fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| AppError::Usage(format!("reading {what} on stdin: {e}")))?;
+    let p = buf
+        .strip_suffix('\n')
+        .unwrap_or(&buf)
+        .strip_suffix('\r')
+        .unwrap_or_else(|| buf.strip_suffix('\n').unwrap_or(&buf));
+    if p.is_empty() {
+        return Err(AppError::Usage(format!(
+            "no {what} on stdin — pipe it in, e.g. `echo … | vox room join …`"
+        )));
+    }
+    Ok(p.to_owned())
+}
+
+/// `vox room join` — join a room over a running node (ADR-020 §12).
+///
+/// This is what makes agent comms reachable on a host with no terminal. `vox
+/// daemon` lets a node *hold* rooms unattended; until this existed, the only way
+/// to get a room onto that node was the TUI, so an agent on a remote machine could
+/// run a daemon and never have anything to put in it.
+///
+/// # Errors
+/// If the node cannot be reached, or the join is refused — and the refusal is
+/// reported as the node gave it, because `Unreachable` and a wrong passphrase need
+/// completely different responses from whoever holds the link.
+pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), AppError> {
+    let passphrase = passphrase_from_stdin("the room's passphrase")?;
+    let mut client = attach(paths).await?;
+    match client
+        .request(&Request::Join {
+            link: link.to_owned(),
+            local_name: local_name.to_owned(),
+            passphrase,
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!("vox: joined {local_name}");
+            println!("     you can read this room; whether anyone can read YOU is their decision");
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot join: {reason}"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox room create` — create a room over a running node.
+///
+/// # Errors
+/// If the node cannot be reached or the create is refused.
+pub async fn create(paths: &Paths, local_name: &str) -> Result<(), AppError> {
+    let passphrase = passphrase_from_stdin("a passphrase for the new room")?;
+    let mut client = attach(paths).await?;
+    match client
+        .request(&Request::Create {
+            local_name: local_name.to_owned(),
+            passphrase,
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!("vox: created {local_name}");
+            println!("     `vox room list` shows its id; that id is what agents pass as --room");
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot create: {reason}"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox room invite` — print a room's address for someone else to join with.
+///
+/// The address is rendezvous information, not a credential: it names the room and
+/// where to look, it carries no passphrase, and since M17.6 joining with it grants
+/// nothing. Send the passphrase by a different channel, and decide separately who
+/// may read you.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, or no link is minted.
+pub async fn invite(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client.request(&Request::Invite { channel_id }).await {
+        Ok(Frame::Link { url }) => {
+            println!("{url}");
+            eprintln!("vox: send the passphrase by a different channel than this address");
+            eprintln!("     joining grants nothing — use `vox trust add` to decide who reads you");
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
