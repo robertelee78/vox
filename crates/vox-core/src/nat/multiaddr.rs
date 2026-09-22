@@ -269,6 +269,28 @@ impl EndpointList {
     /// preserving the advertiser's ordering within each family). This is the
     /// Happy-Eyeballs-friendly candidate order the reachability ladder consumes
     /// (ADR-012 step 1–2).
+    ///
+    /// **A circuit address is never a direct candidate.** Vox derives a circuit's address
+    /// from the far peer's fingerprint into `240.0.0.0/4` (`transport::mux`), so such an
+    /// address is an overlay handle one node's mux can interpret and no datagram can reach.
+    /// One used to arrive here whenever a peer had learned its "observed" address over a
+    /// relayed path and advertised it, and each one then consumed a full
+    /// `PER_ATTEMPT_TIMEOUT` before failing — sometimes as the *only* candidate for a peer,
+    /// which is what made a cross-process join fail about 40% of the time and take 250s.
+    ///
+    /// **The source is not yet fixed.** `node::network` answers `WHOAMI` with the
+    /// connection's remote address, and over a relayed path that is a circuit address — so a
+    /// peer reached through a relay learns a circuit address as its own reflexive address and
+    /// advertises it. The fix for that is a protocol behaviour change (a relayed path must
+    /// answer no `WHOAMI`) and is written but **not landed**, because it could not be shown
+    /// to change the observed failure rate and the reachability ladder is not a place to land
+    /// unproven changes. See ADR-012.
+    ///
+    /// This filter lands on its own because it cannot make anything worse: it removes
+    /// candidates that provably cannot be reached by a datagram, each of which otherwise
+    /// costs a full `PER_ATTEMPT_TIMEOUT`.
+    /// Loopback and private addresses are **kept**: both are legitimately dialable from the
+    /// right vantage point, and it is not this function's place to decide which.
     #[must_use]
     pub fn direct_candidates(&self) -> Vec<SocketAddr> {
         let mut v6 = Vec::new();
@@ -276,7 +298,12 @@ impl EndpointList {
         for a in &self.addrs {
             match a {
                 Multiaddr::Ip6(s) => v6.push(SocketAddr::V6(*s)),
-                Multiaddr::Ip4(s) => v4.push(SocketAddr::V4(*s)),
+                Multiaddr::Ip4(s) => {
+                    let sa = SocketAddr::V4(*s);
+                    if !crate::transport::mux::is_circuit_addr(sa) {
+                        v4.push(sa);
+                    }
+                }
                 Multiaddr::Relay(_) => {}
             }
         }

@@ -6,6 +6,39 @@
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
 
+## Open finding 2026-09-22: a relayed path teaches a peer a false reflexive address
+
+**Measured, and only partly fixed.** Instrumenting `connect_direct` during the cross-process join defect
+(ADR-016) showed nodes dialling candidates like `254.245.191.165:6427` and `246.252.112.25:52967`. Those are
+in `240.0.0.0/4`, which is where **Vox derives its own circuit addresses** from a peer's fingerprint
+(`transport::mux`). No datagram can reach one; each attempt burns a full `PER_ATTEMPT_TIMEOUT` (10s), and in
+one failing join such an address was the *only* candidate for a peer.
+
+**Where they come from.** `node::network` answers a `WHOAMI` (rung 3, the reflexive address) with
+`conn.quinn().remote_address()`. When that connection is itself a circuit, the remote address is the circuit
+address — an overlay handle only the local mux can interpret. So a peer reached through a relay is told
+"your public address is 254.245.191.165", and it advertises that.
+
+**Landed:** `EndpointList::direct_candidates` no longer returns circuit addresses. This cannot make anything
+worse — it drops candidates that provably cannot work — and it makes an already-poisoned record cheap
+instead of expensive. Loopback and private addresses are deliberately kept.
+
+**Written and NOT landed:** the source fix, where a relayed path answers no `WHOAMI` at all, on the grounds
+that a relayed path reveals nothing about a peer's reachability so the honest answer is no answer. It is not
+landed because **it could not be shown to change the observed failure rate** (`service_rehearsal_proof` went
+1-of-3 with it, against 2-of-6 without — indistinguishable), and the accept-loop regression earlier the same
+day is the argument against landing unproven changes in this ladder. It needs a proof that a peer reached
+only through a relay never advertises a circuit address.
+
+**What this does NOT explain.** The rehearsal still fails at two sites with the filter in place: the first
+SOCKS CONNECT refused after **314 seconds** — past `up::HOST_PATIENCE`, so the proxy genuinely could not
+reach the host for five minutes — and a mid-stream read failing at 55s. So at least one further cause is
+unfound, and the circuit-address leak is a contributing cause rather than the cause.
+
+Related: the ladder reports `Unreachable` without naming which rung failed, which is why this needed
+instrumentation at all (ADR-018 §8b).
+
+
 ## Context
 
 The overlay must connect peers with no privileged central server (ADR-001), including the hardest
