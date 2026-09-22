@@ -761,18 +761,27 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
     }
     let _lock = InstallLock::acquire(&install_dir)?;
 
-    let mut candidate = tempfile::Builder::new()
+    let mut downloading = tempfile::Builder::new()
         .prefix("vox-update.")
         .tempfile()
         .map_err(AppError::Io)?;
-    download_asset(&release, candidate.as_file_mut())?;
-    candidate
+    download_asset(&release, downloading.as_file_mut())?;
+    downloading
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o555))
         .map_err(AppError::Io)?;
-    candidate.as_file().sync_all().map_err(AppError::Io)?;
-    verify_apple_release(&active, candidate.path(), &release.version_text)?;
-    publish(&install_dir, candidate.path())?;
+    downloading.as_file().sync_all().map_err(AppError::Io)?;
+
+    // **Close the write handle before anything executes this file.** Linux's `execve`
+    // returns `ETXTBSY` for a file that still has an open writable descriptor, and the
+    // non-macOS trust check runs the candidate to read its `--version`. Holding the
+    // `NamedTempFile` across that call made `vox update` fail on Linux every time, at
+    // every version — the error surfaced as "Text file busy", three layers from the
+    // cause. `into_temp_path` drops the handle and keeps both the path and the
+    // delete-on-drop, so nothing else about the transition changes.
+    let candidate = downloading.into_temp_path();
+    verify_apple_release(&active, &candidate, &release.version_text)?;
+    publish(&install_dir, &candidate)?;
 
     println!("updated: {} -> {}", active.display(), release.version_text);
     println!(
