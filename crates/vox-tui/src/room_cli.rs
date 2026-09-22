@@ -939,3 +939,99 @@ pub async fn invite(paths: &Paths, room: &str) -> Result<(), AppError> {
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
+
+// ---------------------------------------------------------------- the trust keyring
+
+/// Whether a node is already serving this profile's control socket.
+///
+/// Used to decide whether a verb should ask the running node or start its own. It is a
+/// probe, not a guarantee: the node may stop between this answering and the request being
+/// made, and the caller handles that the same way it handles any other socket failure.
+pub async fn node_is_running(paths: &Paths) -> bool {
+    let sock = paths.socket_file();
+    sock.exists() && IpcClient::open(&sock).await.is_ok()
+}
+
+/// `vox trust add`, asked of the running node instead of a second one.
+///
+/// The keyring is the one thing an agent session must not be able to change (ADR-020 §7),
+/// so the request carries the identity passphrase and the node checks it before doing
+/// anything. That is what makes this safe to put on a socket an agent can reach.
+pub async fn trust_add(
+    paths: &Paths,
+    target: Digest32,
+    petname: &str,
+    identity_passphrase: &str,
+) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    match client
+        .request(&Request::Trust {
+            target,
+            petname: petname.to_owned(),
+            identity_passphrase: identity_passphrase.to_owned(),
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!("vox: trusting {} as {petname:?}", short(&target));
+            println!("     it may now read what you write in every room you share — now and later");
+            println!("     and reach every service you bind to a room you are both in");
+            println!("     `vox trust remove` undoes it and changes the lock everywhere");
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox trust remove`, asked of the running node.
+pub async fn trust_remove(
+    paths: &Paths,
+    target: Digest32,
+    identity_passphrase: &str,
+) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    match client
+        .request(&Request::Untrust {
+            target,
+            identity_passphrase: identity_passphrase.to_owned(),
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!("vox: no longer trusting {}", short(&target));
+            println!("     your sender key is rotated and everyone still trusted is re-keyed");
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox trust list`, asked of the running node.
+pub async fn trust_list(paths: &Paths, identity_passphrase: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    match client
+        .request(&Request::TrustList {
+            identity_passphrase: identity_passphrase.to_owned(),
+        })
+        .await
+    {
+        Ok(Frame::Trusted { entries }) => {
+            if entries.is_empty() {
+                println!("no trusted identities");
+                println!("     nobody can read what you write until you `vox trust add` them");
+                return Ok(());
+            }
+            for (id, petname) in entries {
+                println!("{}  {petname}", vox_core::node::link::b32_encode(&id));
+            }
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}

@@ -157,6 +157,25 @@ impl Profile {
         Ok(())
     }
 
+    /// Check a passphrase against the vault **without changing any state**.
+    ///
+    /// [`Profile::unlock`] cannot be used for this: it short-circuits on an already
+    /// unlocked profile and answers `Ok(())` for any passphrase at all. That is correct
+    /// for unlocking — the work is already done — and useless as a check, which matters
+    /// because a running daemon is always unlocked. Anything that needs to know the
+    /// caller holds the passphrase must ask here.
+    ///
+    /// # Errors
+    /// [`Error::AtRestUnlockFailed`] for a wrong passphrase or a tampered vault, and
+    /// [`Error::Profile`] if the vault and the store disagree about the identity.
+    pub fn verify_passphrase(&self, passphrase: &[u8]) -> Result<()> {
+        let signer = self.vault.unlock_signer(passphrase)?;
+        if signer.fingerprint() != self.fingerprint {
+            return Err(Error::Profile("vault identity does not match the store"));
+        }
+        Ok(())
+    }
+
     /// Lock: drop the unlocked identity (its secrets zeroize on drop). Idempotent.
     pub fn lock(&mut self) {
         self.unlocked = None;

@@ -57,7 +57,7 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// The protocol this build speaks. Bumped when a frame's shape changes in a way
 /// an older client would misread; a client that sees a version it does not know
 /// MUST disconnect rather than guess.
-pub const PROTOCOL_VERSION: u64 = 4;
+pub const PROTOCOL_VERSION: u64 = 5;
 
 /// Largest frame accepted in either direction.
 ///
@@ -96,8 +96,13 @@ const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
 const T_MEMBERS: u64 = 6;
 const T_ROOMS: u64 = 7;
+
 const T_BOUND: u64 = 8;
 const T_LINK: u64 = 9;
+/// Protocol 5. 8 and 9 were taken (`T_BOUND`, `T_LINK`), which a first attempt at this
+/// collided with — the decoder then read a trusted list as a bound address and said
+/// "malformed identity bundle", three layers from the cause.
+const T_TRUSTED: u64 = 26;
 // Client → node.
 const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
@@ -121,6 +126,21 @@ const T_GRANT: u64 = 10;
 const T_JOIN: u64 = 11;
 const T_CREATE: u64 = 12;
 const T_INVITE: u64 = 13;
+// Protocol 5 — the trust keyring, **gated on the identity passphrase** (ADR-020 §3, §7).
+//
+// §7 keeps keyring edits off this socket because an agent session runs model-authored
+// code, and that reasoning stands. But the consequence was that `vox trust add` — the
+// act that decides who may read you, and therefore unavoidable — could not be run at all
+// while a `vox daemon` held the profile, which is the documented way to run agent comms.
+// A person setting up two agents hit "Database already open. Cannot acquire lock." on the
+// one command they could not skip.
+//
+// So the door opens only for someone who can prove they hold the identity passphrase,
+// which the operator does and the agent does not. The socket's file mode is still the
+// outer boundary; this is the inner one.
+const T_TRUST: u64 = 14;
+const T_UNTRUST: u64 = 15;
+const T_TRUST_LIST: u64 = 16;
 
 /// What a client sends.
 ///
@@ -221,6 +241,27 @@ pub enum Request {
     Invite {
         /// The room.
         channel_id: Digest32,
+    },
+    /// Add an identity to the trust keyring. Requires the identity passphrase.
+    Trust {
+        /// Who to trust, as a full fingerprint.
+        target: Digest32,
+        /// The petname to file it under.
+        petname: String,
+        /// The identity passphrase, proving this is the operator and not an agent.
+        identity_passphrase: String,
+    },
+    /// Remove an identity from the trust keyring. Requires the identity passphrase.
+    Untrust {
+        /// Who to stop trusting.
+        target: Digest32,
+        /// The identity passphrase.
+        identity_passphrase: String,
+    },
+    /// Read the trust keyring. Requires the identity passphrase.
+    TrustList {
+        /// The identity passphrase.
+        identity_passphrase: String,
     },
     /// Grant a member the capability to dial (and optionally offer) a service.
     Grant {
@@ -324,6 +365,31 @@ impl Request {
             Request::Invite { channel_id } => {
                 e.array(2).uint(T_INVITE).bytes(channel_id);
             }
+            Request::Trust {
+                target,
+                petname,
+                identity_passphrase,
+            } => {
+                e.array(4)
+                    .uint(T_TRUST)
+                    .bytes(target)
+                    .text(petname)
+                    .text(identity_passphrase);
+            }
+            Request::Untrust {
+                target,
+                identity_passphrase,
+            } => {
+                e.array(3)
+                    .uint(T_UNTRUST)
+                    .bytes(target)
+                    .text(identity_passphrase);
+            }
+            Request::TrustList {
+                identity_passphrase,
+            } => {
+                e.array(2).uint(T_TRUST_LIST).text(identity_passphrase);
+            }
             Request::Grant {
                 channel_id,
                 target,
@@ -400,6 +466,36 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Rooms)
+            }
+            (T_TRUST, 4) => {
+                let target = digest(&mut d)?;
+                let petname = text(&mut d, "ipc petname")?;
+                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Trust {
+                    target,
+                    petname,
+                    identity_passphrase,
+                })
+            }
+            (T_UNTRUST, 3) => {
+                let target = digest(&mut d)?;
+                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Untrust {
+                    target,
+                    identity_passphrase,
+                })
+            }
+            (T_TRUST_LIST, 2) => {
+                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::TrustList {
+                    identity_passphrase,
+                })
             }
             (T_ADD_SERVICE, 4) => {
                 let channel_id = digest(&mut d)?;
@@ -556,6 +652,11 @@ pub enum Frame {
         /// The `vox://` address.
         url: String,
     },
+    /// The trust keyring a [`Request::TrustList`] asked for.
+    Trusted {
+        /// `(fingerprint, petname)` in fingerprint order.
+        entries: Vec<(Digest32, String)>,
+    },
     /// The rooms a [`Request::Rooms`] asked for.
     Rooms {
         /// `(channel_id, local name, open)` per room.
@@ -613,6 +714,12 @@ impl Frame {
                 e.array(2).uint(T_ROOMS).array(rooms.len());
                 for (id, name, open) in rooms {
                     e.array(3).bytes(id).text(name).uint(u64::from(*open));
+                }
+            }
+            Frame::Trusted { entries } => {
+                e.array(2).uint(T_TRUSTED).array(entries.len());
+                for (id, petname) in entries {
+                    e.array(2).bytes(id).text(petname);
                 }
             }
         }
@@ -870,6 +977,27 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 rooms.push((id, name, open));
             }
             return Ok(Frame::Rooms { rooms });
+        }
+        (T_TRUSTED, 2) => {
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedBundle("ipc trusted array"))?;
+            let mut entries = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let arity = d
+                    .array()
+                    .map_err(|_| Error::MalformedBundle("ipc trusted row"))?;
+                if arity != 2 {
+                    return Err(Error::MalformedBundle("ipc trusted row arity"));
+                }
+                let id = digest(d)?;
+                let petname = d
+                    .text()
+                    .map_err(|_| Error::MalformedBundle("ipc trusted petname"))?
+                    .to_owned();
+                entries.push((id, petname));
+            }
+            return Ok(Frame::Trusted { entries });
         }
         (T_NEW_ENTRY, 6) => {
             let channel_id = digest(d)?;
@@ -1136,6 +1264,33 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
     }
 }
 
+/// Prove the caller holds the identity passphrase, or say why not.
+///
+/// ADR-020 §7 keeps trust-keyring edits off this socket, on the grounds that an agent
+/// session runs model-authored code and the socket is reachable by anything running as
+/// the user. That reasoning is kept; this is the exception that does not weaken it. The
+/// operator knows the identity passphrase and an agent does not, so requiring it here
+/// lets the person who owns the profile use their own daemon without handing the agent
+/// the ability to decide who may read them.
+async fn verify_operator(
+    handle: &NodeHandle,
+    passphrase: String,
+) -> std::result::Result<(), Frame> {
+    match handle
+        .apply(crate::node::api::NodeCommand::VerifyPassphrase {
+            passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+        })
+        .await
+    {
+        crate::node::api::Outcome::Done => Ok(()),
+        _ => Err(Frame::Error {
+            reason: "the identity passphrase does not match; the trust keyring is only \
+                     editable by whoever holds it"
+                .to_owned(),
+        }),
+    }
+}
+
 /// Answer one request against the node.
 ///
 /// Every failure comes back as [`Frame::Error`] rather than ending the
@@ -1145,6 +1300,53 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     match request {
         // Handled by the caller; the connection becomes a stream.
         Request::Subscribe => Frame::Ok,
+        // The keyring, gated on the identity passphrase. The check is first and the
+        // command is only issued if it passes, so a caller who cannot prove they are the
+        // operator changes nothing and learns nothing.
+        Request::Trust {
+            target,
+            petname,
+            identity_passphrase,
+        } => match verify_operator(handle, identity_passphrase).await {
+            Err(f) => f,
+            Ok(()) => match handle
+                .apply(crate::node::api::NodeCommand::Trust {
+                    fingerprint: target,
+                    petname,
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: format!("{other:?}"),
+                },
+            },
+        },
+        Request::Untrust {
+            target,
+            identity_passphrase,
+        } => match verify_operator(handle, identity_passphrase).await {
+            Err(f) => f,
+            Ok(()) => match handle
+                .apply(crate::node::api::NodeCommand::Untrust {
+                    fingerprint: target,
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: format!("{other:?}"),
+                },
+            },
+        },
+        Request::TrustList {
+            identity_passphrase,
+        } => match verify_operator(handle, identity_passphrase).await {
+            Err(f) => f,
+            Ok(()) => Frame::Trusted {
+                entries: handle.view().trusted,
+            },
+        },
         Request::Post { channel_id, text } => {
             match handle
                 .apply(crate::node::api::NodeCommand::SendText { channel_id, text })

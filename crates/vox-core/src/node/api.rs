@@ -151,6 +151,17 @@ pub enum NodeCommand {
         /// The identity passphrase.
         passphrase: Secret,
     },
+    /// Check the identity passphrase without changing anything.
+    ///
+    /// Exists so a request arriving over the control socket can prove the caller holds
+    /// the identity passphrase before it is allowed to change the trust keyring. ADR-020
+    /// §7 keeps keyring edits off the socket because an agent session runs model-authored
+    /// code; this is what lets the *operator* make them through a daemon they are already
+    /// running, without widening that door for the agent.
+    VerifyPassphrase {
+        /// The identity passphrase to check.
+        passphrase: Secret,
+    },
     /// Unlock the identity.
     Unlock {
         /// The identity passphrase.

@@ -688,6 +688,24 @@ pub async fn trust_remove(node: &NodeHandle, fingerprint: &str) -> Result<(), Ap
     Ok(())
 }
 
+/// A full base32 fingerprint, for a caller with no node to resolve a prefix against.
+///
+/// The socket path deliberately refuses prefixes rather than guessing: resolving one needs
+/// the node's view of who it knows, and trusting the wrong key is exactly the mistake this
+/// model exists to prevent. The error says what to paste.
+///
+/// # Errors
+/// [`AppError::Usage`] if the text is not a whole fingerprint.
+pub fn parse_fingerprint(fingerprint: &str) -> Result<Digest32, AppError> {
+    b32_decode(fingerprint, "trust fingerprint").map_err(|_| {
+        AppError::Usage(format!(
+            "{fingerprint:?} is not a whole fingerprint. Paste the 52-character one that \
+             `vox id` prints on their machine — a prefix is only resolved when this \
+             command starts its own node, and a node is already running for this profile."
+        ))
+    })
+}
+
 /// Resolve a fingerprint argument: a full base32 fingerprint, or a unique prefix of one this
 /// node already knows — a member of some room it holds, or an identity it already trusts.
 ///

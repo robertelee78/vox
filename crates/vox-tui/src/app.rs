@@ -402,13 +402,25 @@ pub fn run_daemon(
                 .into(),
         ));
     }
-    let rooms: Vec<(String, String)> = lines
-        .map(|l| l.trim_end_matches('\r'))
+    // `<room> <passphrase>` opens that room. **A line with no space is a passphrase to
+    // try against every closed room**, and that form exists because the other one was
+    // unusable after a restart.
+    //
+    // A room's local name lives inside the SEK-sealed manifest, so it cannot be read
+    // until the room is open. After a restart every room is closed, so `vox room list`
+    // shows them all as `(unnamed)` — correct, the name is the operator's data and must
+    // not leak from a locked profile, but it means `mission <pass>` answers "nothing
+    // here matches mission". The room *id* does work, and nothing said so; worse,
+    // `room list` needs a running node, so learning the ids meant starting a daemon
+    // bare, listing, stopping it and starting it again. A person setting up a host for
+    // the first time cannot be expected to find that.
+    //
+    // So: one passphrase on a line of its own opens everything it opens. Nothing is
+    // guessed — a room whose passphrase this is not simply stays closed, exactly as it
+    // would have.
+    let rooms: Vec<String> = lines
+        .map(|l| l.trim_end_matches('\r').to_owned())
         .filter(|l| !l.is_empty())
-        .map(|l| match l.split_once(' ') {
-            Some((room, pass)) => (room.to_owned(), pass.to_owned()),
-            None => (l.to_owned(), String::new()),
-        })
         .collect();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -435,20 +447,71 @@ pub fn run_daemon(
         // not merely known — a daemon that unlocked the identity and stopped there
         // would answer `room list` and refuse everything else, which is the defect
         // this proof found the first time it ran.
-        for (prefix, pass) in &rooms {
+        for line in &rooms {
+            // **Each line is resolved, not parsed.** The obvious split — `<room> <pass>`
+            // on the first space — is ambiguous the moment a passphrase contains a
+            // space, and passphrases contain spaces: this file already notes that one
+            // may legitimately begin or end with one. A first version of this shipped
+            // that split and read the passphrase "channel passphrase" as room "channel",
+            // passphrase "passphrase", so the room never opened and the daemon refused
+            // to start. Found by a proof using an ordinary passphrase.
+            //
+            // So: if the first word names a room this profile holds, the rest is that
+            // room's passphrase. Otherwise the whole line is a passphrase, tried against
+            // every room still closed. Nothing new to learn, and no line that a person
+            // would reasonably write is read as the other thing.
             let ids: Vec<_> = node.view().channels.iter().map(|c| c.channel_id).collect();
-            let channel_id = crate::tunnel_cli::resolve_prefix(prefix, &ids)?;
-            let outcome = node
-                .apply(NodeCommand::OpenChannel {
-                    channel_id,
-                    passphrase: Secret::new(pass.as_bytes().to_vec()),
-                })
-                .await;
-            if !outcome.is_done() {
-                return Err(AppError::Usage(format!(
-                    "could not open room {prefix}: {outcome:?}"
-                )));
+            let named = line.split_once(' ').and_then(|(prefix, pass)| {
+                crate::tunnel_cli::resolve_prefix(prefix, &ids)
+                    .ok()
+                    .map(|id| (id, pass.to_owned()))
+            });
+            if let Some((channel_id, pass)) = named {
+                let outcome = node
+                    .apply(NodeCommand::OpenChannel {
+                        channel_id,
+                        passphrase: Secret::new(pass.as_bytes().to_vec()),
+                    })
+                    .await;
+                if !outcome.is_done() {
+                    return Err(AppError::Usage(format!(
+                        "could not open that room: {outcome:?}"
+                    )));
+                }
+                continue;
             }
+            // A passphrase, tried everywhere still closed. A room it does not open stays
+            // closed — the state it was already in — so this cannot lose anything, and it
+            // is no kind of oracle: whoever piped this in already holds the identity
+            // passphrase.
+            let closed: Vec<_> = node
+                .view()
+                .channels
+                .iter()
+                .filter(|c| !c.open)
+                .map(|c| c.channel_id)
+                .collect();
+            for channel_id in closed {
+                let _ = node
+                    .apply(NodeCommand::OpenChannel {
+                        channel_id,
+                        passphrase: Secret::new(line.as_bytes().to_vec()),
+                    })
+                    .await;
+            }
+        }
+        // Say what is actually held, by id, because the names cannot be shown for the
+        // rooms that stayed closed and a silent daemon is how this went unnoticed.
+        let view = node.view();
+        let (open, shut) = (
+            view.channels.iter().filter(|c| c.open).count(),
+            view.channels.iter().filter(|c| !c.open).count(),
+        );
+        if shut > 0 {
+            eprintln!(
+                "vox daemon: {open} room(s) open, {shut} still closed — a closed room \
+                 answers nothing but `room list`"
+            );
         }
         Ok(())
     })?;

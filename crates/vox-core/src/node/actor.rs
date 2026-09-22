@@ -997,6 +997,13 @@ impl Node {
                 self.lock_all().await;
                 Outcome::Done
             }
+            NodeCommand::VerifyPassphrase { passphrase } => match self.profile.as_ref() {
+                None => Outcome::Failed(Fault::NoIdentity),
+                Some(profile) => match profile.verify_passphrase(&passphrase) {
+                    Ok(()) => Outcome::Done,
+                    Err(_) => Outcome::Failed(Fault::WrongPassphrase),
+                },
+            },
             NodeCommand::CreateChannel {
                 local_name,
                 passphrase,

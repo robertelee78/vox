@@ -220,6 +220,79 @@ where
     }
 }
 
+/// Whether a node is already serving this profile, so a trust verb should ask it.
+fn trust_over_socket(sub: &TrustCmd) -> bool {
+    let profile = match sub {
+        TrustCmd::List(a) => &a.profile,
+        TrustCmd::Add(a) => &a.profile,
+        TrustCmd::Remove(a) => &a.profile,
+    };
+    let Ok(paths) = profile.paths() else {
+        return false;
+    };
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    rt.block_on(crate::room_cli::node_is_running(&paths))
+}
+
+/// Run a trust verb against the node that is already holding this profile.
+fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
+    let (profile, pass) = match &sub {
+        TrustCmd::List(a) => (a.profile.clone(), a.identity_passphrase.clone()),
+        TrustCmd::Add(a) => (a.profile.clone(), a.identity_passphrase.clone()),
+        TrustCmd::Remove(a) => (a.profile.clone(), a.identity_passphrase.clone()),
+    };
+    let paths = match profile.paths() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let identity = match crate::tunnel_cli::identity_passphrase_for(&paths, pass) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = rt.block_on(async move {
+        match sub {
+            TrustCmd::List(_) => crate::room_cli::trust_list(&paths, &identity).await,
+            TrustCmd::Add(a) => {
+                let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
+                crate::room_cli::trust_add(&paths, target, &a.name, &identity).await
+            }
+            TrustCmd::Remove(a) => {
+                let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
+                crate::room_cli::trust_remove(&paths, target, &identity).await
+            }
+        }
+    });
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `vox service …`
 #[derive(Subcommand, Clone)]
 enum ServiceCmd {
@@ -1112,6 +1185,13 @@ pub fn run() -> ExitCode {
                 Ok(())
             },
         ),
+        // **Ask the running node when there is one.** These three used to spawn a node of
+        // their own, which redb refuses while a `vox daemon` holds the profile — so the
+        // one command a person cannot skip, deciding who may read them, was unavailable
+        // exactly when they were setting up agent comms. Over the socket the request
+        // carries the identity passphrase and the node checks it, so an agent session
+        // that can reach the socket still cannot edit the keyring (ADR-020 §7).
+        Cmd::Trust(sub) if trust_over_socket(&sub) => run_trust_over_socket(sub),
         Cmd::Trust(TrustCmd::List(args)) => run_new_room_verb(
             args.profile.clone(),
             args.identity_passphrase.clone(),
