@@ -17,8 +17,18 @@ env:
   # `cross-process-join` / `cross-process-tunnel` — the open reachability defects recorded
   # in ADR-012 and ADR-016 with measurements. Named separately so a tunnel regression
   # cannot hide behind a join defect, or the reverse.
+  # `journey.update_replaces_an_older_install` — this claim drives a **published binary**,
+  # not this tree: it runs v<older>'s own `vox update`. v0.1.0 and v0.2.0 shipped the Linux
+  # ETXTBSY defect (ADR-015), so on Linux they cannot update to anything and no change here
+  # can alter that. The proof reports it blocked with the versions named, and the condition
+  # clears itself once the newest release other than the current one is >= v0.2.1.
+  # `verify.digest_mismatch_is_refused` was REMOVED on 2026-09-22: it had been excused since
+  # v0.1.0, and while it was excused the `proof` channel record was unreadable by every
+  # released binary, so the refusal it names had never once run. It passes now, and an
+  # accepted gap that has closed MUST be removed rather than renewed — otherwise the next
+  # regression is green.
   # See ci.yml: `fish` is not excused here, the gates job installs it.
-  VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes,opencode,cross-process-join,cross-process-tunnel"
+  VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,install.apple_gate_refuses_unsigned_bytes,opencode,cross-process-join,cross-process-tunnel"
 
 jobs:
   # ADR-018 §6: nothing is published from a tree the gates have not passed on. The tag is the
