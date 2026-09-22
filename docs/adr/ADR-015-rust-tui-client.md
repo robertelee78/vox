@@ -213,6 +213,23 @@ A terminal has no camera, so the strong scan path is **relocated to the peer's d
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD** and **MAY** in this section are to be
 interpreted as described in BCP 14 (RFC 2119 and RFC 8174).
 
+> **`vox update` never worked on Linux, in any release — fixed 2026-09-22.** The non-macOS trust
+> check executes the downloaded candidate to read its `--version`, and the candidate was still held
+> as an open, writable `NamedTempFile`. Linux returns `ETXTBSY` from `execve` on a file with an open
+> writable descriptor, so the update failed every time, at every version, on the one platform where
+> that check runs. macOS takes the Developer ID path and never executes the candidate, which is why
+> it went unseen.
+>
+> It went unseen for a second reason worth recording next to the first: `update_proof`'s
+> `journey.update_replaces_an_older_install` needs **two** published releases, so until `v0.2.1` it
+> was reported *blocked* rather than run. `v0.1.0` and `v0.2.0` both shipped a Linux updater that
+> could not update. This is the second defect in one week found the moment a blocked claim finally
+> executed — see ADR-018's accepted-gaps note — and the lesson is the same: a blocked claim is
+> missing evidence, and missing evidence hides working defects, not just unproven ones.
+>
+> A candidate binary MUST therefore be closed before anything executes it. The fix is
+> `into_temp_path()`, which drops the write handle and keeps both the path and the delete-on-drop.
+
 `vox` MUST be installable and updatable from **GitHub Releases only** — no vanity domain, no
 third-party host, no account, no package manager.
 

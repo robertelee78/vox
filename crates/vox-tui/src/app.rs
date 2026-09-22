@@ -47,8 +47,15 @@ use crate::viewmodel::{Command, CommandStatus, ViewModel};
 /// Errors from the terminal loop / runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    /// A terminal I/O error (raw mode, alternate screen, draw, or event read).
-    #[error("terminal I/O error: {0}")]
+    /// An I/O error, from anywhere in the CLI — the terminal (raw mode, alternate
+    /// screen, draw, event read) but also the updater, the installer and the file
+    /// verbs, all of which convert `io::Error` through this `From`.
+    ///
+    /// It said "terminal I/O error" until 2026-09-22, which was wrong everywhere
+    /// except the terminal loop and actively misleading: a Linux `vox update` that
+    /// could not execute its downloaded candidate reported a terminal problem to a
+    /// person who was not looking at a terminal problem.
+    #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     /// The embedded node could not be started (profile/store error).
     #[error("node: {0}")]
