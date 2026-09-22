@@ -360,3 +360,72 @@ async fn m17_11_a_live_session_is_cut_when_reach_is_withdrawn() {
          — the dialer must be able to tell a decision from a dropped connection"
     );
 }
+
+/// **A recompute is not a withdrawal.** The regression guard for the mid-session reset.
+///
+/// The actor re-derives every room's reacher set on **every accept**. It used to write them
+/// with `watch::Sender::send_replace`, which notifies unconditionally — so each new tunnel
+/// stream woke every serving task in every room, and a serving task answers a wake by
+/// re-evaluating whether to tear down the live session it is carrying. That surfaced as
+/// `Connection reset by peer` in the middle of a transfer with nobody having withdrawn
+/// anything: reproduced on `edfdcc5` by a second session, reading the echo back.
+///
+/// The discriminating observable is **the wake itself, not the survival**, and getting that
+/// right took a deleted draft. Under the old code a spurious wake happens and the task
+/// usually re-checks membership successfully, so a test that merely keeps a session alive
+/// across recomputes passes on the broken code too — it would have been a green test proving
+/// nothing, which is the failure mode this repository has been bitten by all day.
+///
+/// So this asserts what the writer does, through the one function that writes these sets:
+/// an unchanged recompute must not notify anybody. Mutation: put `send_replace` back inside
+/// `publish_reachers` and the third assertion fails.
+#[tokio::test]
+async fn m17_11_an_unchanged_recompute_does_not_wake_the_serving_tasks() {
+    let fp: vox_core::hash::Digest32 = [0x7A; 32];
+    let other: vox_core::hash::Digest32 = [0x7B; 32];
+    let handle = vox_core::node::tunnel::empty_reachers();
+    let mut rx = handle.subscribe();
+
+    // (1) The first real change notifies — without this the rest proves nothing, because a
+    // writer that never notifies would also pass assertion (3) and would break withdrawal.
+    let changed = vox_core::node::tunnel::publish_reachers(
+        &handle,
+        [fp].into_iter().collect::<BTreeSet<_>>(),
+    );
+    assert!(changed, "adding a reacher must count as a change");
+    assert!(
+        rx.has_changed().unwrap(),
+        "a real change did not wake the serving tasks, so a withdrawal would not reach a \
+         live session either"
+    );
+    let _ = rx.borrow_and_update();
+
+    // (2) Recomputing the *same* set, as every accept does, must change nothing...
+    let changed = vox_core::node::tunnel::publish_reachers(
+        &handle,
+        [fp].into_iter().collect::<BTreeSet<_>>(),
+    );
+    assert!(
+        !changed,
+        "an identical recompute reported itself as a change"
+    );
+
+    // (3) ...and must not wake anybody. This is the bug: a wake here makes every serving
+    // task re-decide whether to cut the session it is carrying, on every accept.
+    assert!(
+        !rx.has_changed().unwrap(),
+        "an unchanged recompute woke the serving tasks — every new tunnel stream then makes \
+         every live session re-decide whether to tear itself down, and a person sees \
+         `Connection reset by peer` mid-transfer with nothing having been withdrawn"
+    );
+
+    // (4) And a genuine withdrawal still gets through, which is what M17.11 is for.
+    let changed = vox_core::node::tunnel::publish_reachers(
+        &handle,
+        [other].into_iter().collect::<BTreeSet<_>>(),
+    );
+    assert!(
+        changed && rx.has_changed().unwrap(),
+        "a withdrawal must still wake them"
+    );
+}

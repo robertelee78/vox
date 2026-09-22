@@ -3393,6 +3393,15 @@ impl Node {
     /// Called whenever either input moves — the keyring (`Trust`/`Revoke`) or a channel's
     /// author set (any board admission) — and once per accept as a backstop.
     async fn refresh_reachers(&mut self) {
+        // A **locked** node is not a node that withdrew its trust. `lock` clears the keyring
+        // because it is sealed under the identity (ADR-020 §3), so recomputing here would
+        // produce an empty set and read as "everyone was withdrawn" — tearing down every live
+        // tunnel on a SIGHUP (ADR-015). Splicing bytes needs no identity, and locking is
+        // about what this node can *read*, so live tunnels are left alone and the sets keep
+        // their last values until the next unlock.
+        if self.profile.is_none() {
+            return;
+        }
         let trusted = self.trust.trusted();
         for (cid, shared) in &self.channels {
             let ch = shared.lock().await;
@@ -3408,16 +3417,16 @@ impl Node {
                 .reachers
                 .entry(*cid)
                 .or_insert_with(crate::node::tunnel::empty_reachers);
-            // `send_replace` wakes every serving task subscribed to this set, which is how
-            // a withdrawal reaches a session that is already carrying bytes (M17.11).
-            slot.send_replace(next);
+            // A recompute is not a decision: this wakes the serving tasks only if the set
+            // really moved. The rule and its reason live in `publish_reachers`.
+            crate::node::tunnel::publish_reachers(slot, next);
         }
         // A channel this node no longer holds must deny, including to tasks still holding
         // the handle: empty it before letting go, or they would read the last value forever.
         self.reachers.retain(|cid, slot| {
             let held = self.channels.contains_key(cid);
             if !held {
-                slot.send_replace(std::collections::BTreeSet::new());
+                crate::node::tunnel::publish_reachers(slot, std::collections::BTreeSet::new());
             }
             held
         });

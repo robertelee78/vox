@@ -1195,6 +1195,32 @@ New work, in dependency order:
   - Each half has its own mutation: snapshot the set again and the parked request is accepted and the echo
     logs a hit; drop the `changed()` arm and the live session flows on; `finish()` instead of `reset()` and
     the dialer cannot tell a withdrawal from a normal close.
+  - **Corrected 2026-09-22 — the first cut of this tore down live sessions it had no business
+    touching.** `refresh_reachers` wrote the sets with `watch::Sender::send_replace`, which notifies
+    unconditionally, and it runs on **every accept**. So every new tunnel stream woke every serving task in
+    every room, and a serving task answers a wake by re-evaluating whether to cut the live session it is
+    carrying. That reached a person as `Connection reset by peer` mid-transfer with nobody having withdrawn
+    anything — reproduced on `edfdcc5` by the agent-comms session while reading an echo back, after I had
+    reported the mechanism as a hypothesis I could not reproduce myself.
+
+    **A recompute is not a decision.** There is now exactly one writer,
+    `node::tunnel::publish_reachers`, which notifies only on a real change, and a locked node no longer
+    recomputes at all — `lock` clears the keyring because it is sealed under the identity, so recomputing
+    there produced an empty set that read as "everyone was withdrawn" and would have cut every live tunnel
+    on a SIGHUP (ADR-015). Splicing needs no identity; locking is about what this node can *read*.
+
+    Proved by `m17_11_an_unchanged_recompute_does_not_wake_the_serving_tasks`. The discriminating
+    observable is **the wake, not the survival** — under the old code a spurious wake happens and the task
+    usually re-checks membership successfully, so a test that merely kept a session alive across recomputes
+    would have passed on the broken code. A first draft did exactly that and was deleted. Mutation: put
+    `send_replace` back inside `publish_reachers` and it fails.
+
+    **Not yet confirmed:** whether this fully accounts for the mid-stream reset observed in
+    `service_rehearsal_proof`. The spurious wake is removed and cannot recur, but if a reacher set moves
+    *genuinely* for a moment — an author set rebuilt during sync, say — the teardown would still fire and
+    this does not touch it. The open cross-process join defect (ADR-016) fails the same gate first, so runs
+    cannot currently distinguish them. If it recurs, the fix is to make a withdrawal an explicit act the
+    actor announces rather than something a serving task infers from set membership.
   - **Not covered:** a *room-level* `Revoke` of a **trusted** identity, because M17.14 makes that refuse
     outright (`Fault::StillTrusted`) — "revoked here but still trusted" is not a state the model has, so
     there is no path by which it could remove a reacher. `Untrust` is the act that means it.

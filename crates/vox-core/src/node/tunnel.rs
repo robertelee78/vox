@@ -48,6 +48,30 @@ pub fn empty_reachers() -> Reachers {
     Arc::new(tokio::sync::watch::Sender::new(BTreeSet::new()))
 }
 
+/// Publish a newly computed reacher set, waking the serving tasks **only if it changed**.
+/// Returns whether it changed.
+///
+/// One named function because the rule it enforces is easy to lose and expensive to lose:
+/// **a recompute is not a decision.** The actor re-derives these sets on every accept, and
+/// `watch::Sender::send_replace` notifies unconditionally — so writing with that woke every
+/// serving task in every room on every new tunnel stream, and each of those tasks answers a
+/// wake by re-evaluating whether to tear down the live session it is carrying
+/// ([`crate::tunnel::session`]). A person saw `Connection reset by peer` in the middle of
+/// their work with nobody having withdrawn anything.
+///
+/// So the teardown path must only ever be woken by a real change, and the only way to keep
+/// that true is to have exactly one place that writes these sets.
+pub fn publish_reachers(handle: &Reachers, next: BTreeSet<Digest32>) -> bool {
+    handle.send_if_modified(|current| {
+        if *current == next {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    })
+}
+
 /// One channel's host-side facts, as the actor snapshots them for the serving task:
 /// the authority that decides, and the services this node offers there.
 #[derive(Clone)]
