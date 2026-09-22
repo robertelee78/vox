@@ -107,7 +107,15 @@ async fn a_peer_that_opens_a_stream_and_says_nothing_does_not_stop_the_loop() {
 // stream-kind gate), so its `Sync` stream was refused before it ever reached the actor, and
 // the test was measuring a refusal rather than a wedge.
 //
-// Reproducing the wedge needs an attacker that is already an admitted member of a room the
-// victim holds, which is the honest severity: an insider denial of service, not an anonymous
-// one. That is still worth closing — a member should not be able to stop a node by saying
-// nothing — but it is not proven here, and a test that cannot fail is worse than none.
+// The severity claimed next was WRONG, and is corrected here rather than quietly dropped.
+// It read: "Reproducing the wedge needs an attacker that is already an admitted member of a
+// room the victim holds, which is the honest severity: an insider denial of service, not an
+// anonymous one." An audit found otherwise. A stranger reaches `PendingJoiner` by itself —
+// connect, open `Rendezvous`, publish a self-signed pre-join naming any channelID the board
+// serves — and `PendingJoiner` may open `Join`. A channelID is the public `.vox` name, so
+// the wedge was reachable by anyone who had ever been handed an address.
+//
+// That is now both fixed and proved, in `a_vox_name_is_not_a_licence_to_wedge.rs`. The
+// lesson this note carried is still the right one, and it is the reason the claim above went
+// unchallenged for as long as it did: a stream kind refused at the gate makes a test go green
+// for the wrong reason, so the escalation itself must be asserted, not assumed.
