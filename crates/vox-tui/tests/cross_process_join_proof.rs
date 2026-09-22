@@ -130,6 +130,9 @@ fn vox(dir: &std::path::Path, args: &[String], stdin: Option<&str>) -> (bool, St
     cmd.args(args)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        // Not `--identity-passphrase`: a command line is world-readable while the process
+        // runs, so the flag is refused (ADR-015).
+        .env("VOX_IDENTITY_PASSPHRASE", "an identity passphrase")
         .env_remove("VOX_ROOM")
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -213,15 +216,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     // ---- identities, headless. `vox id` bootstraps one on a fresh profile ----
     let mut fps = Vec::new();
     for dir in [&alice_dir, &bob_dir] {
-        let (ok, out, err) = vox(
-            dir,
-            &[
-                "id".into(),
-                "--identity-passphrase".into(),
-                idpass.trim().into(),
-            ],
-            None,
-        );
+        let (ok, out, err) = vox(dir, &["id".into()], None);
         assert!(ok, "vox id must bootstrap an identity headlessly: {err}");
         fps.push(out.trim().to_owned());
     }
@@ -242,8 +237,6 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
                 fp.clone(),
                 "--name".into(),
                 name.into(),
-                "--identity-passphrase".into(),
-                idpass.trim().into(),
             ],
             None,
         );

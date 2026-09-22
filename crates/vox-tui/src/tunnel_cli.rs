@@ -53,13 +53,61 @@ pub fn resolve_prefix(prefix: &str, among: &[Digest32]) -> Result<Digest32, AppE
 /// The confirmation is not politeness. A profile's identity is unlocked by this
 /// passphrase and by nothing else (ADR-010's double lock), so a typo on first use does
 /// not produce a warning later — it produces an identity nobody can ever open.
-pub fn identity_passphrase_for(paths: &Paths, given: Option<String>) -> Result<String, AppError> {
-    if let Some(p) = given {
-        return Ok(p);
+pub fn identity_passphrase_for(
+    paths: &Paths,
+    given: Option<String>,
+    file: Option<std::path::PathBuf>,
+) -> Result<String, AppError> {
+    // **A passphrase on a command line is disclosed to the whole machine.** `ps` and
+    // `/proc/<pid>/cmdline` are world-readable while a process runs, so `--identity-
+    // passphrase secret` hands the identity to every other process on the box, including
+    // ones running as other users on a default configuration. It is refused rather than
+    // removed so that anything scripted against it says what to do instead of failing to
+    // parse, which is the failure nobody can diagnose.
+    if given.is_some() {
+        return Err(AppError::Usage(
+            "--identity-passphrase is refused: a command line is world-readable while the \
+             process runs (`ps`, /proc/<pid>/cmdline), so the passphrase would be \
+             disclosed to every process on this machine, and kept in the shell's history.\n\
+             \x20      Use --identity-passphrase-file <path>, or VOX_IDENTITY_PASSPHRASE, \
+             or omit it and be prompted."
+                .into(),
+        ));
+    }
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+        let first = text.lines().next().unwrap_or_default();
+        if first.is_empty() {
+            return Err(AppError::Usage(format!(
+                "{} is empty; an identity passphrase cannot be",
+                path.display()
+            )));
+        }
+        return Ok(first.to_owned());
+    }
+    // Read the variable here rather than through clap's `env`, because clap merges a flag
+    // and its variable into one value and the whole point is to tell them apart.
+    if let Ok(p) = std::env::var("VOX_IDENTITY_PASSPHRASE") {
+        if !p.is_empty() {
+            return Ok(p);
+        }
     }
     let exists = vox_core::node::profile::Profile::exists(paths);
     if exists {
-        return prompt_passphrase("identity passphrase");
+        let p = prompt_passphrase("identity passphrase")?;
+        // Without a terminal `prompt_passphrase` reads a line, and a closed or empty
+        // stdin yields "" — which would otherwise be tried as a passphrase and reported
+        // as a wrong one, sending a person to look at their passphrase instead of at the
+        // fact that they never supplied it.
+        if p.is_empty() {
+            return Err(AppError::Usage(
+                "no identity passphrase: nothing on stdin and no terminal to prompt at.\n\
+                 \x20      Use --identity-passphrase-file <path> or VOX_IDENTITY_PASSPHRASE."
+                    .into(),
+            ));
+        }
+        return Ok(p);
     }
     println!("vox: this profile has no identity yet; creating one.");
     let first = prompt_passphrase("new identity passphrase")?;

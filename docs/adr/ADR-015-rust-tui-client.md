@@ -208,6 +208,28 @@ A terminal has no camera, so the strong scan path is **relocated to the peer's d
   `gpg-agent`, XDG). Windows is **not a target**; supporting it would need its own ADR (DPAPI/`VirtualLock`/
   `%APPDATA%` mappings) only if it is ever wanted — it is not planned.
 
+> **CLI break, 2026-09-22: `--identity-passphrase` is refused.** A command line is
+> world-readable while the process runs — `ps`, `/proc/<pid>/cmdline` — so a passphrase
+> given that way is disclosed to every process on the machine, and on a default
+> configuration to processes of other users. It is also kept in the shell's history. This
+> is a credential disclosure requiring no attacker skill, not a polish item, and being
+> older than the rest of the CLI makes it older rather than better.
+>
+> The flag is **still parsed**, and fails with a message naming the replacement. Deleting
+> it would make anything scripted against it fail to parse, which is the failure nobody
+> can diagnose. The replacements, in the order the code tries them:
+> `--identity-passphrase-file <path>` (a file has an owner and a mode, where a command
+> line has neither), then `VOX_IDENTITY_PASSPHRASE`, then an unechoed prompt.
+>
+> `VOX_IDENTITY_PASSPHRASE` is read directly rather than through clap's `env`, because
+> clap merges a flag and its variable into one value and telling them apart is the whole
+> point.
+>
+> A tty-less empty stdin is also refused rather than tried: `prompt_passphrase` reads a
+> line when there is no terminal, and a closed stdin yields `""`, which would have been
+> attempted and reported as a wrong passphrase — sending a person to look at their
+> passphrase instead of at the fact they never supplied one.
+
 ### Install and update (added 2026-09-21)
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD** and **MAY** in this section are to be

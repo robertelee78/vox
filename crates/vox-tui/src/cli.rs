@@ -167,6 +167,7 @@ where
 fn run_new_room_verb<F, Fut>(
     profile: ProfileArgs,
     identity_passphrase: Option<String>,
+    identity_passphrase_file: Option<std::path::PathBuf>,
     body: F,
 ) -> ExitCode
 where
@@ -187,7 +188,11 @@ where
             return ExitCode::FAILURE;
         }
     };
-    let identity = match crate::tunnel_cli::identity_passphrase_for(&paths, identity_passphrase) {
+    let identity = match crate::tunnel_cli::identity_passphrase_for(
+        &paths,
+        identity_passphrase,
+        identity_passphrase_file,
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("vox: {e}");
@@ -241,10 +246,22 @@ fn trust_over_socket(sub: &TrustCmd) -> bool {
 
 /// Run a trust verb against the node that is already holding this profile.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
-    let (profile, pass) = match &sub {
-        TrustCmd::List(a) => (a.profile.clone(), a.identity_passphrase.clone()),
-        TrustCmd::Add(a) => (a.profile.clone(), a.identity_passphrase.clone()),
-        TrustCmd::Remove(a) => (a.profile.clone(), a.identity_passphrase.clone()),
+    let (profile, pass, pass_file) = match &sub {
+        TrustCmd::List(a) => (
+            a.profile.clone(),
+            a.identity_passphrase.clone(),
+            a.identity_passphrase_file.clone(),
+        ),
+        TrustCmd::Add(a) => (
+            a.profile.clone(),
+            a.identity_passphrase.clone(),
+            a.identity_passphrase_file.clone(),
+        ),
+        TrustCmd::Remove(a) => (
+            a.profile.clone(),
+            a.identity_passphrase.clone(),
+            a.identity_passphrase_file.clone(),
+        ),
     };
     let paths = match profile.paths() {
         Ok(p) => p,
@@ -253,7 +270,7 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let identity = match crate::tunnel_cli::identity_passphrase_for(&paths, pass) {
+    let identity = match crate::tunnel_cli::identity_passphrase_for(&paths, pass, pass_file) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("vox: {e}");
@@ -602,13 +619,19 @@ pub struct RoomArgs {
     /// to give it: a passphrase in a flag is in the shell's history.
     #[arg(long, env = "VOX_ROOM_PASSPHRASE")]
     pub passphrase: Option<String>,
-    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
-    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
-    /// script. **Not as a flag:** a command line is world-readable while the process
-    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
-    /// its owner, and the flag lands in the shell's history besides.
-    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    /// **Refused.** A command line is world-readable while the process runs — `ps`, or
+    /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
+    /// machine, and lands in the shell's history besides. It is still accepted by the
+    /// parser so that anything scripted against it fails with a message naming the
+    /// replacement, rather than breaking in a way nobody can diagnose.
+    ///
+    /// Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`, or let it prompt.
+    #[arg(long)]
     pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line). The scripted way to
+    /// give it: a file has an owner and a mode, where a command line has neither.
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox service add`
@@ -637,13 +660,19 @@ pub struct ServiceRemoveArgs {
 pub struct IdentityArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
-    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
-    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
-    /// script. **Not as a flag:** a command line is world-readable while the process
-    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
-    /// its owner, and the flag lands in the shell's history besides.
-    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    /// **Refused.** A command line is world-readable while the process runs — `ps`, or
+    /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
+    /// machine, and lands in the shell's history besides. It is still accepted by the
+    /// parser so that anything scripted against it fails with a message naming the
+    /// replacement, rather than breaking in a way nobody can diagnose.
+    ///
+    /// Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`, or let it prompt.
+    #[arg(long)]
     pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line). The scripted way to
+    /// give it: a file has an owner and a mode, where a command line has neither.
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox trust`
@@ -679,13 +708,19 @@ pub struct TrustAddArgs {
     /// other node ever sees it.
     #[arg(long, default_value = "peer")]
     pub name: String,
-    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
-    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
-    /// script. **Not as a flag:** a command line is world-readable while the process
-    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
-    /// its owner, and the flag lands in the shell's history besides.
-    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    /// **Refused.** A command line is world-readable while the process runs — `ps`, or
+    /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
+    /// machine, and lands in the shell's history besides. It is still accepted by the
+    /// parser so that anything scripted against it fails with a message naming the
+    /// replacement, rather than breaking in a way nobody can diagnose.
+    ///
+    /// Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`, or let it prompt.
+    #[arg(long)]
     pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line). The scripted way to
+    /// give it: a file has an owner and a mode, where a command line has neither.
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox trust remove`
@@ -695,13 +730,19 @@ pub struct TrustRemoveArgs {
     pub profile: ProfileArgs,
     /// The identity to stop trusting.
     pub fingerprint: String,
-    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
-    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
-    /// script. **Not as a flag:** a command line is world-readable while the process
-    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
-    /// its owner, and the flag lands in the shell's history besides.
-    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    /// **Refused.** A command line is world-readable while the process runs — `ps`, or
+    /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
+    /// machine, and lands in the shell's history besides. It is still accepted by the
+    /// parser so that anything scripted against it fails with a message naming the
+    /// replacement, rather than breaking in a way nobody can diagnose.
+    ///
+    /// Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`, or let it prompt.
+    #[arg(long)]
     pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line). The scripted way to
+    /// give it: a file has an owner and a mode, where a command line has neither.
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox forward`
@@ -749,13 +790,19 @@ pub struct ServeArgs {
     /// A local name for the room (this device only; never leaves it).
     #[arg(long, default_value = "service")]
     pub name: String,
-    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
-    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
-    /// script. **Not as a flag:** a command line is world-readable while the process
-    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
-    /// its owner, and the flag lands in the shell's history besides.
-    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    /// **Refused.** A command line is world-readable while the process runs — `ps`, or
+    /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
+    /// machine, and lands in the shell's history besides. It is still accepted by the
+    /// parser so that anything scripted against it fails with a message naming the
+    /// replacement, rather than breaking in a way nobody can diagnose.
+    ///
+    /// Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`, or let it prompt.
+    #[arg(long)]
     pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line). The scripted way to
+    /// give it: a file has an owner and a mode, where a command line has neither.
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox connect`
@@ -772,13 +819,19 @@ pub struct ConnectArgs {
     /// A local name for the room (this device only).
     #[arg(long, default_value = "service")]
     pub name: String,
-    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
-    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
-    /// script. **Not as a flag:** a command line is world-readable while the process
-    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
-    /// its owner, and the flag lands in the shell's history besides.
-    #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
+    /// **Refused.** A command line is world-readable while the process runs — `ps`, or
+    /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
+    /// machine, and lands in the shell's history besides. It is still accepted by the
+    /// parser so that anything scripted against it fails with a message naming the
+    /// replacement, rather than breaking in a way nobody can diagnose.
+    ///
+    /// Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`, or let it prompt.
+    #[arg(long)]
     pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line). The scripted way to
+    /// give it: a file has an owner and a mode, where a command line has neither.
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox up`
@@ -993,6 +1046,7 @@ pub fn run() -> ExitCode {
             run_new_room_verb(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
+                args.identity_passphrase_file.clone(),
                 move |node, anchors| async move {
                     crate::tunnel_cli::serve(&node, &anchors, &a.name, a.port, a.at).await
                 },
@@ -1013,6 +1067,7 @@ pub fn run() -> ExitCode {
             run_new_room_verb(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
+                args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
                     crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp).await
                 },
@@ -1197,6 +1252,7 @@ pub fn run() -> ExitCode {
         Cmd::Id(args) => run_new_room_verb(
             args.profile.clone(),
             args.identity_passphrase.clone(),
+            args.identity_passphrase_file.clone(),
             move |node, _anchors| async move {
                 let Some(id) = node.view().identity else {
                     return Err(crate::app::AppError::Usage(
@@ -1220,6 +1276,7 @@ pub fn run() -> ExitCode {
         Cmd::Trust(TrustCmd::List(args)) => run_new_room_verb(
             args.profile.clone(),
             args.identity_passphrase.clone(),
+            args.identity_passphrase_file.clone(),
             move |node, _anchors| async move {
                 let trusted = node.view().trusted;
                 if trusted.is_empty() {
@@ -1238,6 +1295,7 @@ pub fn run() -> ExitCode {
             run_new_room_verb(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
+                args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
                     crate::tunnel_cli::trust_add(&node, &a.fingerprint, &a.name).await
                 },
@@ -1248,6 +1306,7 @@ pub fn run() -> ExitCode {
             run_new_room_verb(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
+                args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
                     crate::tunnel_cli::trust_remove(&node, &a.fingerprint).await
                 },

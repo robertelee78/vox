@@ -64,11 +64,38 @@ impl Drop for Daemon {
     }
 }
 
+/// `vox` with a different identity passphrase in the environment, for the claim that a
+/// wrong one is refused.
+fn vox_as(
+    data: &std::path::Path,
+    cfg: &std::path::Path,
+    args: &[&str],
+    passphrase: &str,
+) -> (bool, String, String) {
+    let out = Command::new(VOX)
+        .args(args)
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", cfg)
+        .env("VOX_IDENTITY_PASSPHRASE", passphrase)
+        .env_remove("VOX_ROOM")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn vox");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 fn vox(data: &std::path::Path, cfg: &std::path::Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(VOX)
         .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
+        // The identity passphrase goes in the environment, not argv: a command line is
+        // world-readable while the process runs, so the flag is refused (ADR-015).
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM")
         .stdin(Stdio::null())
         .output()
@@ -202,15 +229,7 @@ fn the_verbs_a_person_cannot_skip_work_while_a_daemon_holds_the_profile() {
     let (ok, out, err) = vox(
         &data,
         &cfg,
-        &[
-            "trust",
-            "add",
-            &stranger,
-            "--name",
-            "agent-two",
-            "--identity-passphrase",
-            IDENTITY,
-        ],
+        &["trust", "add", &stranger, "--name", "agent-two"],
     );
     assert!(
         ok,
@@ -227,18 +246,11 @@ fn the_verbs_a_person_cannot_skip_work_while_a_daemon_holds_the_profile() {
     // This is the load-bearing one. ADR-020 §7 keeps keyring edits off this socket
     // because an agent session can reach it; the passphrase is what replaces that
     // exclusion. If it were not checked, claim 1 would be measuring a hole.
-    let (ok, _, err) = vox(
+    let (ok, _, err) = vox_as(
         &data,
         &cfg,
-        &[
-            "trust",
-            "add",
-            &stranger,
-            "--name",
-            "not-me",
-            "--identity-passphrase",
-            "this is not the passphrase",
-        ],
+        &["trust", "add", &stranger, "--name", "not-me"],
+        "this is not the passphrase",
     );
     assert!(
         !ok,
@@ -251,11 +263,7 @@ fn the_verbs_a_person_cannot_skip_work_while_a_daemon_holds_the_profile() {
     );
 
     // ---- claim 2: trust list, over the socket ----
-    let (ok, out, err) = vox(
-        &data,
-        &cfg,
-        &["trust", "list", "--identity-passphrase", IDENTITY],
-    );
+    let (ok, out, err) = vox(&data, &cfg, &["trust", "list"]);
     assert!(ok, "`vox trust list` against a running daemon: {err:?}");
     assert!(
         out.contains("agent-two") && out.contains(&stranger),
@@ -267,23 +275,9 @@ fn the_verbs_a_person_cannot_skip_work_while_a_daemon_holds_the_profile() {
     );
 
     // ---- claim 4: trust remove, over the socket ----
-    let (ok, _, err) = vox(
-        &data,
-        &cfg,
-        &[
-            "trust",
-            "remove",
-            &stranger,
-            "--identity-passphrase",
-            IDENTITY,
-        ],
-    );
+    let (ok, _, err) = vox(&data, &cfg, &["trust", "remove", &stranger]);
     assert!(ok, "`vox trust remove` against a running daemon: {err:?}");
-    let (_, out, _) = vox(
-        &data,
-        &cfg,
-        &["trust", "list", "--identity-passphrase", IDENTITY],
-    );
+    let (_, out, _) = vox(&data, &cfg, &["trust", "list"]);
     assert!(
         !out.contains("agent-two"),
         "and the entry must be gone: {out:?}"
