@@ -226,7 +226,76 @@ Therefore:
 - **Instrumentation can be load-bearing.** A debug round that logged a frame send *sent it twice*, masking
   a real race so the failing gate passed. Remove instrumentation and re-run before believing a green.
 
-### 8. The six gates remain
+### 8. A proof must never restate a constant it depends on
+
+**If a test hard-codes a number that has to stand in a relationship to a constant in the
+source, it must reference the constant.** A comment cannot enforce a relationship between
+two numbers, and nothing checks a comment.
+
+The case that produced this rule, 2026-09-22. `service_rehearsal_proof` — the flagship
+real-binary proof — contained:
+
+```rust
+// Longer than `node::up::HOST_PATIENCE`, or this times out on the proxy's own wait
+// and reports EAGAIN instead of what the proxy decided.
+s.set_read_timeout(Some(Duration::from_secs(150)))?;
+```
+
+`HOST_PATIENCE` was later raised to 300s. **The comment stayed true as prose and stopped
+being true as fact**, and the gate then failed roughly half its runs with
+`Resource temporarily unavailable (os error 35)` about 155 seconds in — the test giving up
+while the proxy was still legitimately waiting, with the operating system reporting the
+read timeout as EAGAIN.
+
+What made it expensive is that it does not look like a test bug. It looks like a race in
+the service path: a different error text at a different stage on each run. Two sessions
+spent hours on it, one of them chasing `ConnectionManager::file` and the
+one-connection-per-peer rule on a shared hypothesis that three distinct error texts could
+not be one cause.
+
+**Two lessons, both general:**
+
+1. **Export the constant and derive from it.** `HOST_PATIENCE` is now `pub` and the proof
+   adds to it, so the invariant is carried by the compiler. The same applies to any bound a
+   proof must outlast — a retry deadline, a patience window, a watchdog.
+2. **"A timeout fails the same way every time" is false for a read timeout.** The kernel
+   surfaces the same expiry as `EAGAIN` when it lands on a connect-shaped wait and as a
+   reset when it lands mid-stream, so *one* cause routinely wears several faces. Distinct
+   error texts are therefore **not** evidence of a race, which is what both sessions
+   believed. Treat varied symptoms as a reason to find the common deadline first.
+
+### 8b. Whatever knows why must say why
+
+The general form of §8, and of §7, arrived at after a single day produced four instances of
+one shape. In each, something held the answer and did not report it, and each cost about an
+hour:
+
+| Where | What knew, and stayed quiet |
+|---|---|
+| A test | `assert!(out.is_done(), "carol joins")` discarded the `Outcome`. Printing it gave `Failed(Unreachable)` and the diagnosis in one run. |
+| Three golden vectors | They pinned a live vulnerability as the guaranteed behaviour, and being green said nothing. |
+| A comment | It asserted a relationship between two constants; when one moved, nothing checked it (§8). |
+| The product | The ADR-012 dial ladder returns `Unreachable` without naming which rung failed — direct, punch, or circuit. |
+
+The last is the important one, because it is the product rather than the scaffolding. A
+serverless overlay's hardest failures are reachability failures, and "it did not work" is
+the least useful thing the code can say about one. **A failure must carry what the code
+learned while failing**, at least to the degree that does not leak across a trust boundary —
+and a *local* diagnosis leaks nothing, since the dialer already knows what it tried.
+
+This is distinct from what the *wire* may say. ADR-013's dark-services rule deliberately
+makes a refusal indistinguishable from "no such service" **to the peer**; that stays. The
+rule here is about what a node tells its own operator.
+
+Applies to: `Fault::Unreachable` from a dial (which rung, and what each said), a join
+(which candidate, and why each was rejected), and any bound expiring (which bound, and what
+it was waiting for).
+
+Related: §7, and the rule that a red gate has three possible meanings — the product is
+broken, the test asserts a model that was withdrawn, or the environment cannot prove the
+claim — and its colour distinguishes none of them.
+
+### 8a. The six gates remain
 
 `fmt`, `clippy -D warnings`, `test`, `rustdoc -D warnings`, and the release-only `--ignored` run remain
 REQUIRED for every change. This ADR changes what `test` *contains*, not whether it must pass.
