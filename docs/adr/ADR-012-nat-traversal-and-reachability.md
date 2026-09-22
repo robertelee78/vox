@@ -6,7 +6,55 @@
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
 
-## Open finding 2026-09-22: a relayed path teaches a peer a false reflexive address
+## Open finding 2026-09-22: `is_circuit_addr` guesses from a prefix, and the guess collides with real addresses
+
+**This is the root finding of the day's reachability work, and it supersedes the reasoning in the note
+below — including a change of mine that was landed and has now been reverted.**
+
+Vox derives a circuit's address from the far peer's fingerprint into `240.0.0.0/4` (`transport::mux`), and
+`is_circuit_addr` decides whether an address is a circuit by **testing that prefix**:
+
+```rust
+IpAddr::V4(v4) => v4.octets()[0] & 0xF0 == 0xF0,
+```
+
+`240.0.0.0/4` is not unused space in practice. It is in real-world use on hosts running VPNs, iCloud
+Private Relay and some CGNAT deployments — **including the machine this was found on, whose default route
+runs over an interface addressed in that range.** Measured: `local_route_ips()` on that host returns a
+`240.x` address, and `is_routable` (which rejects `o[0] >= 240` on the grounds that "Vox's own circuit
+addresses live here") therefore rejects the host's *only* route address.
+
+So on such a host the prefix test is **wrong in both directions**:
+
+- a genuine direct connection whose remote address is `240.x` is classified `PathClass::Relayed`
+  (`node::net::path_class`), which feeds `ConnectionManager::file`'s relay-first/upgrade-later rule — so the
+  one-connection-per-peer preference makes its decisions on a false premise;
+- a genuine, locally-dialable `240.x` endpoint is treated as an overlay handle.
+
+**`mux` already holds the fact.** It keeps a circuit table — `circuits: Mutex<HashMap<SocketAddr, ...>>`,
+keyed by `key(addr)` — so whether an address is a circuit is *known*, not something to infer from its shape.
+`is_circuit_addr` should consult that table. Inferring it from a prefix is the same class of error as
+ADR-018 §8b: something knew the answer and was not asked.
+
+**Reverted:** my `EndpointList::direct_candidates` filter (`bb083f7`), which dropped `240/4` candidates. It
+is built on this unsound predicate, so on a host with a real `240/4` interface it drops a **working**
+address. I landed it believing the range was Vox's alone. Measured after the revert decision: the rehearsal
+went 1-of-6 with that filter plus two related changes, against 2-of-6 without — indistinguishable, so the
+filter cannot be claimed to help, and it carries a known risk of harm. Out until the predicate is sound.
+
+**Also written and NOT landed:** making a relayed path answer no `WHOAMI` (the note below). Correct in
+principle — a relayed path reveals nothing about a peer's reachability — but it depends on the same
+predicate to decide what "relayed" means, so it must wait for the table-based check too.
+
+**What is still unexplained.** `service_rehearsal_proof` fails 4–5 of 6 runs at three sites: the untrusted
+joiner's `vox connect` reporting `Failed(Unreachable)` (43s–223s), the first SOCKS CONNECT refused after up
+to 314s (past `up::HOST_PATIENCE`, so the proxy could not reach the host for five minutes), and a mid-stream
+read failing at ~55–84s. Two independent lines of evidence now point at **circuit establishment** as the
+remaining suspect: this one, and the fact that splitting the accept loop (finding #3) broke exactly the two
+relayed-circuit gates and nothing else. That is where the next investigation should start, and it should
+start by making `is_circuit_addr` ask the table.
+
+## Open finding 2026-09-22 (superseded by the one below): a relayed path teaches a peer a false reflexive address
 
 **Measured, and only partly fixed.** Instrumenting `connect_direct` during the cross-process join defect
 (ADR-016) showed nodes dialling candidates like `254.245.191.165:6427` and `246.252.112.25:52967`. Those are
