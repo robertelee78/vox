@@ -1440,6 +1440,12 @@ impl ChannelState {
         self.authors.values().cloned().collect()
     }
 
+    /// Every admitted author's fingerprint, in deterministic order.
+    #[must_use]
+    pub fn author_fingerprints(&self) -> Vec<Digest32> {
+        self.authors.keys().copied().collect()
+    }
+
     /// Mint an SKDM releasing this identity's sender key at its **current
     /// position** — the forward-only release consent normally uses (ADR-006: the
     /// recipient reads from here on, never the history before it).

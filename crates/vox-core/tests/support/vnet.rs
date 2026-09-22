@@ -127,6 +127,21 @@ impl VirtualNet {
         socket
     }
 
+    /// Change how a NAT behaves after it was created, so a test can model the thing that
+    /// actually happens in the field: conditions improve. A pair that could only be relayed
+    /// because both sides sat behind symmetric NATs becomes punchable when one of them moves
+    /// to a cone NAT — a different network, a router that stopped being hostile, a captive
+    /// portal released.
+    ///
+    /// `at` is the index handed back by the order of [`VirtualNet::behind_nat`] calls: the
+    /// first is 0, the second 1.
+    pub fn set_nat_kind(&self, at: usize, kind: NatKind) {
+        let mut g = self.lock();
+        if let Some(nat) = g.nats.get_mut(at) {
+            nat.kind = kind;
+        }
+    }
+
     /// How many datagrams a NAT has dropped for want of a mapping or filter. A
     /// hole-punch test asserts this is non-zero for the unsolicited case: without it,
     /// the "NAT" would be letting everything through and proving nothing.

@@ -98,6 +98,16 @@ pub struct NodeView {
     /// The trust keyring: `(fingerprint, petname)` in fingerprint order, empty
     /// while locked because the keyring is sealed under the identity (ADR-020 §3).
     pub trusted: Vec<(Digest32, String)>,
+    /// Peers this node currently reaches **through a relay** rather than directly.
+    ///
+    /// Worth surfacing rather than hiding: a relayed path means a third party is carrying
+    /// the packets — it cannot read them, but it can see that two identities are talking,
+    /// and it costs a hop of latency. An operator who cannot tell the difference cannot
+    /// reason about either. `tailscale status` shows the same distinction for the same
+    /// reason.
+    pub relayed_peers: Vec<Digest32>,
+    /// How many circuits this node is carrying **for other peers** right now.
+    pub relaying: usize,
     /// Every channel this node's **board** holds a genesis for — the channels it
     /// anchors, whether or not it is a member — in channelID order. What an anchor
     /// can say about itself: which rooms it serves and how many members it knows of

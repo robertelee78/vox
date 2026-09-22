@@ -87,6 +87,18 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// on the network.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How often a peer reached over a relay is retried for a direct path.
+///
+/// A relayed path works, so nothing forces a retry — but it costs a third party's bandwidth
+/// and a round trip, and the conditions that prevented a direct path are usually temporary:
+/// a NAT mapping expires, a firewall state clears, a laptop leaves a captive network. One
+/// attempt at dial time is a snapshot of the worst moment, when neither side has learned the
+/// other's addresses yet.
+///
+/// A minute, which is `upgradeUDPDirectInterval` in tailscale's magicsock — the same
+/// reasoning and the same figure, chosen there because NAT conditions change on that order.
+const UPGRADE_RETRY: Duration = Duration::from_secs(60);
+
 /// Bound on the internal network→actor queue. Inbound streams are back-pressured
 /// rather than dropped: a full queue slows the accept loop, it never loses work.
 const NET_QUEUE: usize = 64;
@@ -654,6 +666,9 @@ pub struct Node {
     /// The ADR-020 §3 trust keyring, loaded on unlock and empty while locked
     /// (it is sealed under the identity, so there is nothing to hold locked).
     trust: crate::node::trust::Keyring,
+    /// When each peer was last tried for a better path, so a relayed connection is retried
+    /// on a schedule rather than only at the moment it was made.
+    last_upgrade: std::collections::BTreeMap<Digest32, u64>,
     /// The live reacher set per channel (M17.11), written here and read by serving tasks.
     /// Kept out of `Channel` because it is a *join* of channel state with the node-wide
     /// keyring, and the keyring is not a property of any one room.
@@ -765,6 +780,7 @@ impl Node {
             view_tx: watch::Sender::new(NodeView::default()),
             event_tx,
             trust: crate::node::trust::Keyring::new(),
+            last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
         };
         let view_rx = node.view_tx.subscribe();
@@ -823,6 +839,7 @@ impl Node {
                         // grace is up (M15.1b).
                         net.manager().retire_expired();
                     }
+                    self.retry_upgrades_if_due().await;
                     self.renew_mappings_if_due();
                     self.adopt_anchored_from_board().await;
                     self.redial_anchors_if_due();
@@ -1648,6 +1665,7 @@ impl Node {
         {
             let tx = self.net_tx.clone();
             let endpoints = endpoints.clone();
+            self.last_upgrade.insert(peer, self.now());
             tokio::spawn(async move {
                 if let Some(better) = net.upgrade(peer, &endpoints).await {
                     let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
@@ -1655,6 +1673,65 @@ impl Node {
             });
         }
         Ok(conn)
+    }
+
+    /// Retry a direct path for every peer still reached over a relay.
+    ///
+    /// The attempt at dial time happens at the worst possible moment: neither side has
+    /// learned the other's addresses, and whatever blocked a direct path is at its most
+    /// likely. Retrying on a schedule is what turns a relayed path into a direct one when
+    /// the network changes underneath it — a NAT mapping expiring, a laptop leaving a
+    /// captive portal — without which a pair that starts relayed stays relayed for the life
+    /// of the connection, paying a third party's bandwidth and an extra hop for ever.
+    ///
+    /// Endpoints come from each channel's board, so a peer is retried once per channel it
+    /// shares with this node, and the timestamp is written **before** the attempt so a slow
+    /// one cannot stack.
+    async fn retry_upgrades_if_due(&mut self) {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let now = self.now();
+        let endpoint = Arc::clone(net.manager().endpoint());
+        // Collected first: the borrow of `self.channels` cannot outlive the mutation of
+        // `self.last_upgrade` below.
+        let mut due: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
+        for (cid, shared) in &self.channels {
+            let authors: Vec<Digest32> = {
+                let ch = shared.lock().await;
+                ch.author_fingerprints()
+            };
+            for peer in authors {
+                let Some(conn) = net.manager().existing(&peer) else {
+                    continue;
+                };
+                if crate::node::net::path_class(&endpoint, &conn)
+                    != crate::node::net::PathClass::Relayed
+                {
+                    continue;
+                }
+                let last = self.last_upgrade.get(&peer).copied().unwrap_or(0);
+                if now.saturating_sub(last) < UPGRADE_RETRY.as_secs() {
+                    continue;
+                }
+                due.push((peer, net.board_endpoints(cid, &peer)));
+            }
+        }
+        if !due.is_empty() {
+            // The reflexive address is the punch's main input and it is cached. A retry that
+            // reuses a stale one asks the same failed question again.
+            net.refresh_observed();
+        }
+        for (peer, endpoints) in due {
+            self.last_upgrade.insert(peer, now);
+            let net = Arc::clone(&net);
+            let tx = self.net_tx.clone();
+            tokio::spawn(async move {
+                if let Some(better) = net.upgrade(peer, &endpoints).await {
+                    let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
+                }
+            });
+        }
     }
 
     /// Give a connection the bookkeeping every connection needs, however it arrived:
@@ -3513,6 +3590,8 @@ impl Node {
             open_channels: Vec::new(),
             forwards: Vec::new(),
             trusted: self.trust_rows(),
+            relayed_peers: Vec::new(),
+            relaying: 0,
         });
     }
 
@@ -3586,6 +3665,7 @@ impl Node {
                     .collect(),
             });
         }
+        let (relayed_peers, relaying) = self.path_view();
         NodeView {
             identity,
             locked,
@@ -3605,7 +3685,31 @@ impl Node {
                 })
                 .collect(),
             trusted: self.trust_rows(),
+            relayed_peers,
+            relaying,
         }
+    }
+
+    /// Which peers are reached through a relay, and how many circuits this node carries for
+    /// others. Both come from the connection manager, which is the only authority on either.
+    fn path_view(&self) -> (Vec<Digest32>, usize) {
+        let Some(net) = self.net.as_ref() else {
+            return (Vec::new(), 0);
+        };
+        let endpoint = net.manager().endpoint();
+        let mut relayed: Vec<Digest32> = net
+            .manager()
+            .peers()
+            .into_iter()
+            .filter(|p| {
+                net.manager().existing(p).is_some_and(|c| {
+                    crate::node::net::path_class(endpoint, &c)
+                        == crate::node::net::PathClass::Relayed
+                })
+            })
+            .collect();
+        relayed.sort_unstable();
+        (relayed, net.relaying())
     }
 
     /// The keyring as the view carries it — empty while locked, because the

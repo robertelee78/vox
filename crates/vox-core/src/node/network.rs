@@ -609,6 +609,22 @@ impl NodeNet {
         lock(&self.observed).remove(peer);
     }
 
+    /// Discard every cached reflexive address, so the next punch asks again.
+    ///
+    /// A reflexive address is what a peer says this node looks like from outside, and it is
+    /// only true of the network this node was on when it asked. It changes when the NAT
+    /// remaps, when the machine moves between networks, when a VPN comes up. Cached and never
+    /// refreshed, it makes every later hole punch offer an address that no longer routes —
+    /// and a punch that offers a stale address fails in a way that looks like the NAT being
+    /// hostile rather than like stale data.
+    ///
+    /// Called when retrying a path upgrade, because a retry exists precisely on the
+    /// assumption that conditions have changed. tailscale re-STUNs on a timer and on link
+    /// change for the same reason (`magicsock.go`'s `periodicReSTUN`).
+    pub fn refresh_observed(&self) {
+        lock(&self.observed).clear();
+    }
+
     /// Reach `peer` by whatever rung lands **first** (M15.1b, relay-first / upgrade-
     /// later). A live connection is returned at once; otherwise a direct dial of the
     /// advertised endpoints (rungs 1–2) and a circuit through every connected helper
