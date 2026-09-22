@@ -215,18 +215,25 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         // With two seconds here this gate failed four runs in five, and instrumenting it
         // showed why: in a failing run Carol's dial to the *survivor* failed too, not
         // just to the member that had been shut down. A member does not become
-        // unreachable because somebody else died — unless something about the death is
-        // blocking it, and something is. The node's accept loop performs the TLS
-        // handshake inline, so a peer that opens a connection and never finishes it stops
-        // every other inbound connection to that node; a member holding a half-finished
-        // exchange with the peer that just vanished is exactly that case. The window
-        // closes when the handshake times out, which is what this sleep is waiting for.
+        // unreachable because somebody else died.
         //
-        // It is written here rather than tuned away because the wait is evidence. Twenty
-        // seconds passes 3 runs of 3; two seconds fails 4 of 5. A fix for the accept loop
-        // is in flight on another branch, and when it lands this sleep should come down to
-        // a couple of seconds — if it does not, the fix did not do what it claims, and
-        // this number is the measurement that says so.
+        // **What blocks it, measured rather than reasoned.** A first version of this note
+        // blamed the accept loop's inline TLS handshake. That was wrong, and the timings
+        // say so: `HANDSHAKE_TIMEOUT` is 30s, and a 20s wait is enough, which it could not
+        // be if the handshake were what had to expire. The window tracks
+        // `SYNC_FRAME_TIMEOUT` instead — `ChannelState::sync_over` holds the room's mutex
+        // for a whole exchange, the actor needs that mutex to answer almost anything, and
+        // `NetEvent::Connected` goes to the actor over a bounded channel, so a stalled
+        // sync stops the node accepting connections at all.
+        //
+        // Cutting `SYNC_FRAME_TIMEOUT` to 5s and re-running proves it: 5 runs of 5 pass
+        // with a 10s wait, where 20s is needed at the shipped 20s timeout. Two mechanisms
+        // with the same signature were in play — the other is the accept loop, fixed on
+        // another branch — and this number belongs to this one.
+        //
+        // It stays written here because it is evidence: 2s fails 4 of 5, 20s passes 3 of
+        // 3, and when `SYNC_FRAME_TIMEOUT` comes down this must come down with it. If it
+        // does not, something else is holding the node and this number will say so.
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         // ---- Carol has a link that names nobody in particular ----
