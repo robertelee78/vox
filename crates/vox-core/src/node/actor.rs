@@ -555,6 +555,24 @@ const JOIN_ADDRESS_PATIENCE: Duration = Duration::from_secs(20);
 /// Poll interval while waiting for it. One extra board fetch is cheap; a failed join is not.
 const JOIN_ADDRESS_POLL: Duration = Duration::from_millis(250);
 
+/// How many members a join will try when the link pins no responder.
+///
+/// Each attempt runs the ADR-005 join, which carries a proof of work, so walking every
+/// member of a large room would turn one join into minutes of hashing. Three is enough to
+/// survive the case this exists for — the first member the board lists happens to be
+/// offline — without making an unreachable room expensive to fail against.
+const MAX_JOIN_RESPONDERS: usize = 3;
+
+/// Whether a failed join attempt is worth repeating against a different member.
+///
+/// Only faults that describe *this responder* qualify. A wrong passphrase, a locked
+/// identity or a malformed link will fail identically against every member of the room, and
+/// retrying them would multiply the proof-of-work cost while changing nothing — and, for a
+/// wrong passphrase, would look from the outside like an attempt to guess it.
+const fn worth_another_responder(fault: Fault) -> bool {
+    matches!(fault, Fault::Unreachable | Fault::Refused)
+}
+
 /// A client's handle to a running node.
 ///
 /// Several clients may hold clones of one handle and each take its own event
@@ -2075,64 +2093,43 @@ impl Node {
         // one just fails, the identity is pinned — and the ladder does the rest: the
         // anchor we are connected to is exactly the helper a punch or a circuit
         // through needs when the responder is behind a NAT too.
-        let responder = match parsed.responder {
-            Some(r) => r,
-            None => match set.members.first() {
-                Some(record) => record.author_id,
-                None => return Outcome::Failed(Fault::BadLink),
-            },
-        };
-        let mut responder_endpoints = set
-            .members
-            .iter()
-            .find(|r| r.author_id == responder)
-            .map(|r| r.endpoints.clone())
-            .unwrap_or_default();
-        // **An address we do not know yet is not an address that does not exist.**
+        // **Every member the board knows is a candidate, not just the first one.**
         //
-        // `unwrap_or_default()` above yields an *empty* endpoint list when the responder has
-        // no address record on this board, and dialling an empty list fails at once — which
-        // this returned to the caller as `Fault::Unreachable`, in under three seconds, for a
-        // member who was online and perfectly reachable. It made
-        // `node_m15_session_from_bundle_gate` fail about two runs in five on clean `main`.
+        // A link that pins a responder names exactly one, and that is the owner's choice.
+        // A link that pins none used to take `set.members.first()` and stop there, so one
+        // member being offline failed a join that any other member in the room could have
+        // served — and the room looked broken to the person joining it, with nothing to
+        // suggest that trying again later, or from a different link, would behave any
+        // differently.
         //
-        // Measured, not deduced. On a failing run the board held `members=1, bundles=2`: the
-        // responder's *bundle* record had arrived but its *address* record had not. The two
-        // propagate separately, so a joiner who arrives in that window sees a member it has a
-        // key for and no way to reach — and concluded the member was unreachable.
-        //
-        // A deadline is what separates "not yet" from "not there", which is the same
-        // distinction `up::reach_host_with_patience` draws for a service host, and the same
-        // one every peer-to-peer client draws when a peer list is incomplete: keep asking the
-        // source, do not conclude absence from silence.
-        if responder_endpoints.is_empty() && board.peer_id() != responder {
-            let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
-            while tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(JOIN_ADDRESS_POLL).await;
-                let Ok(fresh) = net.fetch_channel(&board, &parsed.channel_id, 0).await else {
-                    continue;
-                };
-                let found = fresh
-                    .members
-                    .iter()
-                    .find(|r| r.author_id == responder)
-                    .map(|r| r.endpoints.clone())
-                    .unwrap_or_default();
-                if !found.is_empty() {
-                    // Take the fresher board too: it is a superset by construction, and the
-                    // records that arrived alongside the address are ones we are about to want.
-                    responder_endpoints = found;
-                    set = fresh;
-                    break;
+        // The walk is bounded. Each attempt runs the ADR-005 join, and that carries a proof
+        // of work, so an unbounded list would let a room with many members turn one join
+        // into minutes of hashing. `MAX_JOIN_RESPONDERS` is the bound, and an attempt is
+        // only retried when the fault says *this responder* could not serve it.
+        let candidates: Vec<crate::hash::Digest32> = match parsed.responder {
+            Some(r) => vec![r],
+            None => {
+                let mut all: Vec<crate::hash::Digest32> =
+                    set.members.iter().map(|r| r.author_id).collect();
+                if all.is_empty() {
+                    return Outcome::Failed(Fault::BadLink);
                 }
+                // **Sorted, because the board's order is not an order.** The members come
+                // from a `HashMap`'s `values()`, so which one a join reached was effectively
+                // random — and with no fallback, a room with one offline member failed joins
+                // at a rate nobody could reproduce and a retry could "fix" by chance. Sorting
+                // by fingerprint makes the walk the same every time, so a join that fails
+                // fails for a reason, and a gate can name which member it expects to be
+                // tried first.
+                all.sort_unstable();
+                all.into_iter().take(MAX_JOIN_RESPONDERS).collect()
             }
-        }
-        // Announce ourselves — **before** reaching for the responder. The pre-join
-        // record is what makes an unknown peer eligible (ADR-016): on the anchor it is
-        // what lets the anchor coordinate a punch or carry a circuit for us to a
-        // responder behind a NAT, and on the responder it is what authorizes the join
-        // stream. So it goes on the anchor's board now, and on the responder's own
-        // board the moment we reach it.
+        };
+
+        // The pre-join record does not depend on which member answers, so it is built once
+        // and announced to the board once, before any of them is reached (ADR-016): on the
+        // anchor it is what lets the anchor coordinate a punch or carry a circuit for us,
+        // and on the responder it is what authorizes the join stream.
         let prejoin_wire = {
             let Some(profile) = self.profile.as_ref() else {
                 return Outcome::Failed(Fault::NoIdentity);
@@ -2173,19 +2170,82 @@ impl Node {
         if let Err(e) = announce(&board, &prejoin_wire).await {
             return Outcome::Failed(fault_of(&e));
         }
-        let conn = if board.peer_id() == responder {
-            Arc::clone(&board)
-        } else {
-            let conn = match self.dial(responder, &responder_endpoints).await {
-                Ok(c) => c,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            };
-            if let Err(e) = announce(&conn, &prejoin_wire).await {
-                return Outcome::Failed(fault_of(&e));
+
+        let mut last_fault = Fault::Unreachable;
+        let mut joined_outcome = None;
+        for responder in candidates {
+            let mut responder_endpoints = set
+                .members
+                .iter()
+                .find(|r| r.author_id == responder)
+                .map(|r| r.endpoints.clone())
+                .unwrap_or_default();
+            // **An address we do not know yet is not an address that does not exist.**
+            //
+            // `unwrap_or_default()` above yields an *empty* endpoint list when the responder
+            // has no address record on this board, and dialling an empty list fails at once —
+            // which this returned to the caller as `Fault::Unreachable`, in under three
+            // seconds, for a member who was online and perfectly reachable. It made
+            // `node_m15_session_from_bundle_gate` fail about two runs in five on clean `main`.
+            //
+            // Measured, not deduced. On a failing run the board held `members=1, bundles=2`:
+            // the responder's *bundle* record had arrived but its *address* record had not.
+            // The two propagate separately, so a joiner who arrives in that window sees a
+            // member it has a key for and no way to reach — and concluded the member was
+            // unreachable.
+            //
+            // A deadline is what separates "not yet" from "not there", which is the same
+            // distinction `up::reach_host_with_patience` draws for a service host, and the
+            // same one every peer-to-peer client draws when a peer list is incomplete: keep
+            // asking the source, do not conclude absence from silence.
+            if responder_endpoints.is_empty() && board.peer_id() != responder {
+                let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
+                while tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(JOIN_ADDRESS_POLL).await;
+                    let Ok(fresh) = net.fetch_channel(&board, &parsed.channel_id, 0).await else {
+                        continue;
+                    };
+                    let found = fresh
+                        .members
+                        .iter()
+                        .find(|r| r.author_id == responder)
+                        .map(|r| r.endpoints.clone())
+                        .unwrap_or_default();
+                    if !found.is_empty() {
+                        // Take the fresher board too: it is a superset by construction, and
+                        // the records that arrived alongside the address are ones we are
+                        // about to want.
+                        responder_endpoints = found;
+                        set = fresh;
+                        break;
+                    }
+                }
             }
-            conn
-        };
-        let outcome = {
+
+            let conn = if board.peer_id() == responder {
+                Arc::clone(&board)
+            } else {
+                match self.dial(responder, &responder_endpoints).await {
+                    Ok(c) => {
+                        if let Err(e) = announce(&c, &prejoin_wire).await {
+                            last_fault = fault_of(&e);
+                            if !worth_another_responder(last_fault) {
+                                return Outcome::Failed(last_fault);
+                            }
+                            continue;
+                        }
+                        c
+                    }
+                    Err(e) => {
+                        last_fault = fault_of(&e);
+                        if !worth_another_responder(last_fault) {
+                            return Outcome::Failed(last_fault);
+                        }
+                        continue;
+                    }
+                }
+            };
+
             let Some(profile) = self.profile.as_ref() else {
                 return Outcome::Failed(Fault::NoIdentity);
             };
@@ -2202,11 +2262,21 @@ impl Node {
             }
             let ik = crate::identity::keyagreement::X25519IdentityKey::from_secret_bytes(dh);
             match net.start_join(&conn, ctx, passphrase, signer, &ik).await {
-                Ok(o) => (o, genesis, set),
-                Err(e) => return Outcome::Failed(fault_of(&e)),
+                Ok(o) => {
+                    joined_outcome = Some((o, responder, conn));
+                    break;
+                }
+                Err(e) => {
+                    last_fault = fault_of(&e);
+                    if !worth_another_responder(last_fault) {
+                        return Outcome::Failed(last_fault);
+                    }
+                }
             }
+        }
+        let Some((joined, responder, conn)) = joined_outcome else {
+            return Outcome::Failed(last_fault);
         };
-        let (joined, genesis, set) = outcome;
 
         // Local state for the channel we just joined.
         let channel = {
