@@ -135,6 +135,35 @@ impl Admission {
     }
 }
 
+/// How long a connection may sit silent before QUIC closes it.
+///
+/// quinn's default is 30s, and Vox carries **tunnels**: an `ssh` session between keystrokes,
+/// a port-forward waiting on the far end, a room with nothing being said in it. Those are
+/// idle for far longer than 30s and must not be torn down for it, so the timeout is raised
+/// and a keep-alive keeps the path warm underneath it.
+const MAX_IDLE_MS: u32 = 60_000;
+
+/// How often a silent connection sends a keep-alive.
+///
+/// Comfortably under half [`MAX_IDLE_MS`], so a single lost keep-alive cannot expire the
+/// connection — the ratio iroh uses for the same reason (25s against a 35s idle timeout in
+/// `iroh-relay`). Without this quinn sends nothing on an idle path and the connection dies
+/// at the idle timeout, which for a tunnel means a person's session dropping while they
+/// read.
+const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The transport parameters every Vox connection runs with, in both directions.
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut cfg = quinn::TransportConfig::default();
+    cfg.keep_alive_interval(Some(KEEP_ALIVE));
+    // `From<VarInt>` rather than `try_from(Duration)`: the millisecond value is a compile-
+    // time constant inside the varint range, so there is no error case to handle.
+    cfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
+        MAX_IDLE_MS,
+    ))));
+    Arc::new(cfg)
+}
+
 /// How long one inbound handshake may take before it is abandoned.
 ///
 /// This bounds a **pre-authentication** cost: until the handshake completes there is no
@@ -248,7 +277,8 @@ impl VoxEndpoint {
         )?;
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(s_cfg)
             .map_err(|_| Error::MalformedBundle("quic server config"))?;
-        let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        server_cfg.transport_config(transport_config());
 
         let endpoint =
             make(server_cfg).map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
@@ -298,7 +328,8 @@ impl VoxEndpoint {
         )?;
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(c_cfg)
             .map_err(|_| Error::MalformedBundle("quic client config"))?;
-        let client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
+        client_cfg.transport_config(transport_config());
 
         // The SNI server name is unused for authentication (we authenticate by the
         // Vox identity), but rustls requires a syntactically valid name.
@@ -388,7 +419,8 @@ impl VoxEndpoint {
         )?;
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(s_cfg)
             .map_err(|_| Error::MalformedBundle("quic server config (accept)"))?;
-        let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        server_cfg.transport_config(transport_config());
         // Bounded: an unauthenticated peer must not be able to hold a task open for ever by
         // beginning a handshake and never finishing it.
         let connecting = incoming
@@ -468,7 +500,8 @@ impl VoxEndpoint {
 
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(cfg)
             .map_err(|_| Error::MalformedBundle("classical quic client config"))?;
-        let client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
+        client_cfg.transport_config(transport_config());
         let connecting = self
             .endpoint
             .connect_with(client_cfg, addr, "vox.invalid")

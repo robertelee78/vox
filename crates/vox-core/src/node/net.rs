@@ -360,7 +360,8 @@ impl ConnectionManager {
     ///
     /// - a newcomer on a *better* path than the one held — direct where the held one
     ///   is relayed — **replaces** it, and the old one is retired: kept open for
-    ///   [`RETIRE_GRACE_SECS`] so whatever is in flight on it finishes, closed after;
+    ///   [`RETIRE_GRACE_SECS`], and beyond it for as long as anything is still carried on
+    ///   it, so a tunnel that took the old path is not cut when a better one appears;
     /// - otherwise the held one is kept and the newcomer closed with a clean code (a
     ///   simultaneous dial from both sides lands here).
     ///
@@ -394,7 +395,18 @@ impl ConnectionManager {
         let mut retiring = lock(&self.retiring);
         let before = retiring.len();
         retiring.retain(|(conn, at)| {
-            if now >= *at || !is_live(conn) {
+            // **Still carried** means somebody other than this list holds the connection:
+            // a tunnel task splicing bytes, a sync in progress. Those hold an `Arc` for as
+            // long as they run, so the strong count is the liveness signal, and it needs no
+            // bookkeeping that could disagree with reality.
+            //
+            // The grace alone is not enough to close on. It is sized for a request finishing
+            // — but what rides a connection here is a *tunnel*, and an `ssh` session or a
+            // file transfer is in flight for hours. Closing on the timer killed live sessions
+            // mid-stream whenever a better path displaced the one they were on, which reached
+            // the person as `Connection reset by peer` in the middle of their work.
+            let still_carried = Arc::strong_count(conn) > 1;
+            if (now >= *at && !still_carried) || !is_live(conn) {
                 conn.close(WireError::AuthenticatorInvalid);
                 false
             } else {
@@ -402,6 +414,18 @@ impl ConnectionManager {
             }
         });
         before - retiring.len()
+    }
+
+    /// Retire `conn` as [`Self::file`] would when a better path displaces it. For proofs of
+    /// the retirement rule, which otherwise needs two real paths to the same peer.
+    #[doc(hidden)]
+    pub fn retire_for_test(&self, conn: &Arc<VoxConnection>) {
+        // Exactly what `file` does: the displaced connection leaves the per-peer map and
+        // moves to the retiring list. Leaving it in the map would keep a reference of the
+        // manager's own, which is not what "still carried" means.
+        lock(&self.conns).retain(|_, c| !Arc::ptr_eq(c, conn));
+        let at = (self.clock)().saturating_add(self.retire_grace_secs);
+        lock(&self.retiring).push((Arc::clone(conn), at));
     }
 
     /// How many displaced connections are still within their grace.
