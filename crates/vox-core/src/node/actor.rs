@@ -565,12 +565,36 @@ const MAX_JOIN_RESPONDERS: usize = 3;
 
 /// Whether a failed join attempt is worth repeating against a different member.
 ///
-/// Only faults that describe *this responder* qualify. A wrong passphrase, a locked
-/// identity or a malformed link will fail identically against every member of the room, and
-/// retrying them would multiply the proof-of-work cost while changing nothing — and, for a
-/// wrong passphrase, would look from the outside like an attempt to guess it.
+/// **Stated as what must not be retried, not as what may be.** The first version listed the
+/// two faults worth another try, which meant any fault it had not heard of stopped the walk
+/// — and that is exactly what happened: a new `Error::LadderExhausted` was added elsewhere
+/// with no `fault_of` arm, fell through to `Fault::Internal`, and silently turned the walk
+/// back into "try one member and give up". Nothing failed loudly; joins simply stopped
+/// falling through, and six single-variable reverts could not find it because every one of
+/// them left the new variant in place.
+///
+/// A whitelist of retryable faults is the wrong default for a bounded walk. The cost of
+/// retrying a fault that will not change is one more attempt out of at most
+/// [`MAX_JOIN_RESPONDERS`]; the cost of *not* retrying one that would have succeeded is a
+/// room that looks unreachable while a member sits there able to serve it. So the refusals
+/// that genuinely cannot change are named, and anything else gets another member.
+///
+/// Named here because each would fail identically against every member of the room, and
+/// retrying would multiply the proof-of-work cost while changing nothing — and for a
+/// passphrase it would look from the outside like an attempt to guess it.
 const fn worth_another_responder(fault: Fault) -> bool {
-    matches!(fault, Fault::Unreachable | Fault::Refused)
+    !matches!(
+        fault,
+        Fault::WrongPassphrase
+            | Fault::Locked
+            | Fault::NoIdentity
+            | Fault::BadLink
+            | Fault::TooLong
+            | Fault::Storage
+            | Fault::ShuttingDown
+            | Fault::NotNetworked
+            | Fault::IdentityExists
+    )
 }
 
 /// A client's handle to a running node.
