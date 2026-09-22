@@ -72,6 +72,72 @@ async fn rooms_of(client: &mut IpcClient) -> Result<Vec<(Digest32, String, bool)
     }
 }
 
+/// A held-since time, as a person reads it.
+///
+/// It was printed as raw epoch seconds — `held by … since 1790105354` — which nobody
+/// reads, and which is the one number in the message that is supposed to tell you
+/// whether to wait or go and find the holder. Both forms are given: the elapsed time
+/// answers that question, and the absolute time survives being pasted into a report.
+fn held_since(since_secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let ago = now.saturating_sub(since_secs);
+    let elapsed = if ago < 60 {
+        format!("{ago}s ago")
+    } else if ago < 3600 {
+        format!("{}m ago", ago / 60)
+    } else if ago < 86_400 {
+        format!("{}h{:02}m ago", ago / 3600, (ago % 3600) / 60)
+    } else {
+        format!("{}d ago", ago / 86_400)
+    };
+    // A fixed-offset UTC stamp without pulling in a date library: the fields are
+    // arithmetic on the epoch, and the only calendar subtlety is leap years.
+    let (days, secs) = (since_secs / 86_400, since_secs % 86_400);
+    let (mut y, mut d) = (1970_u64, days);
+    loop {
+        let len = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            366
+        } else {
+            365
+        };
+        if d < len {
+            break;
+        }
+        d -= len;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let months = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut m = 0;
+    while m < 12 && d >= months[m] {
+        d -= months[m];
+        m += 1;
+    }
+    format!(
+        "{y:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z ({elapsed})",
+        m + 1,
+        d + 1,
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
 /// Resolve a room prefix against what the node holds, and insist it is open.
 ///
 /// A closed room is reported as closed rather than "unknown": the two are
@@ -405,7 +471,7 @@ pub async fn claim_resource(
         Some(own) => Err(AppError::Usage(format!(
             "{resource} is held by {} since {} — you did not get it",
             short(&own.owner),
-            own.since_secs
+            held_since(own.since_secs)
         ))),
         // Resolvable only if the post has not converged yet; treat it as not held
         // rather than claiming success we cannot see.
