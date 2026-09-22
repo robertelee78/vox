@@ -2,7 +2,16 @@
 
 **Status**: implemented (M6, `crates/vox-core/src/governance/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-21 (third note that day) — **consent is keyring-caused.** The per-sender decision of
+**Updated**: 2026-09-22 — **the consent fold's epoch semantics are settled and proved** (ADR-017 M17.8).
+An entry naming a retired epoch is **inert**, not merely old: `Evaluator::in_effect` requires an entry's
+body epoch to equal the epoch established in its strict causal past, and that gate runs before causal
+position is consulted. So a passphrase rotation empties the audience, and a pre-rotation consent grant
+replayed afterwards resurrects nobody. Proved by
+`vector_m17_8_a_rotation_empties_the_audience_and_a_stale_epoch_grant_is_inert`, which isolates the epoch
+stamp as the deciding variable across three logs and is mutation-checked by making `in_effect` return
+`true` unconditionally. Two of three plan reviewers had assumed the opposite — that without head-epoch
+filtering a rotation would not empty the audience — so this is recorded as an answer, not a change.
+2026-09-21 (third note that day) — **consent is keyring-caused.** The per-sender decision of
 step 2/3 is an *identity-level* one recorded in the trust keyring (ADR-020 decision 3, built M19.2), not a
 per-room one: approving a member in a room **is** adding them to the ring, and from then on they read the
 grantor in every shared room including future ones. **Every consent grant must be caused by a ring entry**

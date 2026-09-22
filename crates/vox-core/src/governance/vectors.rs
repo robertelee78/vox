@@ -986,6 +986,87 @@ mod golden {
         );
     }
 
+    /// **M17.8 — a passphrase rotation empties the audience, and a stale-epoch grant cannot
+    /// resurrect a revoked reader.**
+    ///
+    /// ADR-017's gate for M17.8 was "a test that either exhibits the resurrection or shows it
+    /// cannot happen." This shows it **cannot happen**, and identifies why by isolating the
+    /// one variable rather than asserting the reassuring outcome once:
+    ///
+    /// | log | `can_read` |
+    /// |---|---|
+    /// | rotate 0→1, then a grant stamped **epoch 0** | **false** — the stale grant is inert |
+    /// | rotate 0→1, then a grant stamped **epoch 1** | true — a current grant still counts |
+    /// | **no rotation**, then a grant stamped epoch 0 | true — epoch 0 is still current |
+    ///
+    /// The three together say the epoch stamp is what decides, not the ordering and not the
+    /// rotation on its own. An entry naming a retired epoch does not participate in the
+    /// consent fold, so replaying a grant from before a rotation — or a partitioned client
+    /// catching up with one — buys nothing.
+    ///
+    /// **This closes the question behind the downgraded finding #5.** The concern was that
+    /// `consent()` folds last-write-wins over the causal order with no visible epoch filter
+    /// (`evaluator.rs`), so a grant landing after a rotation would win on position. It does
+    /// not, because the epoch is checked before position is consulted.
+    ///
+    /// I expected the opposite when I wrote this and had drafted it as a failing-by-design
+    /// expectation. Recording that here because a vector asserting a *reassuring* property is
+    /// exactly the kind that rots into a green test nobody re-reads: the second leg is what
+    /// keeps it honest, since it fails if the filter ever starts rejecting everything.
+    #[test]
+    fn vector_m17_8_a_rotation_empties_the_audience_and_a_stale_epoch_grant_is_inert() {
+        let creator = root(1, 1);
+        let alice = root(2, 2);
+        let bob = root(3, 3);
+        let genesis = genesis_for(&creator);
+        let cid = genesis.channel_id();
+
+        let read_after = |mk: &dyn Fn(&mut LogBuilder)| -> bool {
+            let mut h = LogBuilder::new(&genesis);
+            h.consent_grant(&alice, &cid, 0, bob.fingerprint(), [0xB0; 32]);
+            h.consent_revocation(&alice, &cid, 0, bob.fingerprint(), 1);
+            mk(&mut h);
+            Evaluator::build(
+                &genesis,
+                &h.entries(),
+                2_000,
+                key_resolver(vec![&creator, &alice, &bob]),
+            )
+            .unwrap()
+            .can_read(&bob.fingerprint(), &alice.fingerprint())
+        };
+
+        // (1) The attack: rotate away from epoch 0, then replay a grant stamped epoch 0.
+        assert!(
+            !read_after(&|h| {
+                h.passphrase_rotation(&creator, &cid, 0, 1);
+                h.consent_grant(&alice, &cid, 0, bob.fingerprint(), [0xB9; 32]);
+            }),
+            "a grant naming the epoch a rotation just retired resurrected a revoked reader: \
+             the rotation did not empty the audience, which is the whole reason it exists"
+        );
+
+        // (2) The control that keeps (1) meaningful: a grant at the CURRENT epoch, after the
+        // same rotation, does count. Without this, (1) would also pass if the filter rejected
+        // every post-rotation grant, or if consent were broken outright.
+        assert!(
+            read_after(&|h| {
+                h.passphrase_rotation(&creator, &cid, 0, 1);
+                h.consent_grant(&alice, &cid, 1, bob.fingerprint(), [0xB9; 32]);
+            }),
+            "a grant at the current epoch was refused, so (1) proves nothing about epochs"
+        );
+
+        // (3) And the epoch stamp, not the rotation's mere presence, is what decides: with no
+        // rotation, epoch 0 is still current and the same grant counts.
+        assert!(
+            read_after(&|h| {
+                h.consent_grant(&alice, &cid, 0, bob.fingerprint(), [0xB9; 32]);
+            }),
+            "an epoch-0 grant was refused in a room still at epoch 0"
+        );
+    }
+
     /// A non-member is refused. Still true, and now true for a stronger reason: since
     /// M17.7 the grant confers nothing on anybody, member or not, so this is no longer a
     /// statement about who counts as a member.

@@ -1127,10 +1127,35 @@ New work, in dependency order:
   cannot learn the service exists; a trusted identity that is **not** in the room reaches nothing bound to
   it; and a trusted identity that joins **after** the service was bound gains reach on joining, with no act
   by the host at that moment.
-- **M17.8 — the evaluator's head-epoch filtering.** The open question behind the downgraded finding #5:
-  whether exclusion and consent folding should filter on the head epoch (`governance/evaluator.rs:519`,
-  `:797`). Gate: a test that either exhibits the resurrection or shows it cannot happen. **Blocks nothing
-  here.**
+- **M17.8 — the evaluator's head-epoch filtering. DONE 2026-09-22 — the resurrection cannot happen.**
+  The gate was "a test that either exhibits the resurrection or shows it cannot happen", and the answer is
+  the second: `vector_m17_8_a_rotation_empties_the_audience_and_a_stale_epoch_grant_is_inert`.
+
+  The concern was that `consent()` folds grants and revocations last-write-wins over the causal order with
+  no *visible* epoch filter, so a grant landing after a rotation would win on position and resurrect a
+  revoked reader. It does not, because `Evaluator::in_effect` gates every entry first: an entry counts only
+  if its body epoch equals the epoch established in its **strict causal past**. An entry naming a retired
+  epoch is inert, so replaying a pre-rotation grant — or a partitioned client catching up with one — buys
+  nothing.
+
+  Isolated rather than asserted once, because a reassuring property is exactly the kind that rots into a
+  green test nobody re-reads:
+
+  | log | `can_read` |
+  |---|---|
+  | rotate 0→1, then a grant stamped **epoch 0** | **false** — inert |
+  | rotate 0→1, then a grant stamped **epoch 1** | true — a current grant still counts |
+  | no rotation, then a grant stamped epoch 0 | true — epoch 0 is still current |
+
+  The second leg is what keeps the first meaningful: without it the vector would also pass if the filter
+  rejected every post-rotation grant, or if consent were broken outright. Mutation-checked by making
+  `in_effect` return `true` unconditionally, which fails the first leg.
+
+  **Two of three plan reviewers called this a prerequisite for M17.7**, on the grounds that without it a
+  passphrase rotation would not empty the audience at the dial gate. It is neither a prerequisite nor a
+  defect: the rotation does empty the audience, and since M17.7 the dial gate does not consult the
+  evaluator at all — reach is the host's keyring intersected with the room's author set. What the fold
+  governs is **readability**, which is ADR-007's older and separate promise, and it holds.
 - **M17.9 — the name.** `H("vox service name v1" ‖ host_composite_pk ‖ nonce)` in base32; nonce minted per
   (host, room) on first serve, reused for further ports, retired with the last one; persisted in the profile.
   `node::resolver` resolves name → descriptor across rooms. Gate: a name survives a restart, two ports share
