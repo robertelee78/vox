@@ -148,22 +148,15 @@ impl BootstrapSet {
         Ok(set)
     }
 
-    /// Every node of `other` this set does not have, appended in `other`'s order
-    /// (the set's own entries keep their higher preference).
-    pub fn merge(&mut self, other: &BootstrapSet) -> Result<()> {
-        for n in other.nodes() {
-            self.add(n.clone())?;
-        }
-        Ok(())
-    }
-
     /// Merge `other`, **unioning the addresses** of anchors already present.
     ///
-    /// [`BootstrapSet::merge`] goes through [`BootstrapSet::add`], which keeps the first
-    /// entry for an identity and discards the rest — correct for building a set from
-    /// configuration, and wrong for refreshing one. An anchor that moved is the *same
-    /// identity at a new address*, so `merge` silently threw the new address away and a
-    /// long-running node kept dialling the old one for ever.
+    /// This replaced a plain `merge` that went through [`BootstrapSet::add`], which keeps
+    /// the first entry for an identity and discards the rest — correct for building a set
+    /// from configuration, and wrong for refreshing one, because an anchor that moved is
+    /// the *same identity at a new address*. That version silently threw the new address
+    /// away, in four separate callers, and a long-running node kept dialling the old one
+    /// for ever. It is gone rather than deprecated: every caller wanted this, so leaving
+    /// the other one available left a landmine with no legitimate use.
     ///
     /// The old addresses are kept rather than replaced: an anchor may legitimately have
     /// several, the ladder tries them in order, and one that has stopped answering costs

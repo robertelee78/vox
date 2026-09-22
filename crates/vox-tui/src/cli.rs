@@ -602,7 +602,11 @@ pub struct RoomArgs {
     /// to give it: a passphrase in a flag is in the shell's history.
     #[arg(long, env = "VOX_ROOM_PASSPHRASE")]
     pub passphrase: Option<String>,
-    /// The identity passphrase. Prompted for when omitted.
+    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
+    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
+    /// script. **Not as a flag:** a command line is world-readable while the process
+    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
+    /// its owner, and the flag lands in the shell's history besides.
     #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
     pub identity_passphrase: Option<String>,
 }
@@ -633,7 +637,11 @@ pub struct ServiceRemoveArgs {
 pub struct IdentityArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
-    /// The identity passphrase. Prompted for when omitted.
+    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
+    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
+    /// script. **Not as a flag:** a command line is world-readable while the process
+    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
+    /// its owner, and the flag lands in the shell's history besides.
     #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
     pub identity_passphrase: Option<String>,
 }
@@ -671,7 +679,11 @@ pub struct TrustAddArgs {
     /// other node ever sees it.
     #[arg(long, default_value = "peer")]
     pub name: String,
-    /// The identity passphrase. Prompted for when omitted.
+    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
+    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
+    /// script. **Not as a flag:** a command line is world-readable while the process
+    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
+    /// its owner, and the flag lands in the shell's history besides.
     #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
     pub identity_passphrase: Option<String>,
 }
@@ -683,7 +695,11 @@ pub struct TrustRemoveArgs {
     pub profile: ProfileArgs,
     /// The identity to stop trusting.
     pub fingerprint: String,
-    /// The identity passphrase. Prompted for when omitted.
+    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
+    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
+    /// script. **Not as a flag:** a command line is world-readable while the process
+    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
+    /// its owner, and the flag lands in the shell's history besides.
     #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
     pub identity_passphrase: Option<String>,
 }
@@ -733,7 +749,11 @@ pub struct ServeArgs {
     /// A local name for the room (this device only; never leaves it).
     #[arg(long, default_value = "service")]
     pub name: String,
-    /// The identity passphrase. Prompted for when omitted.
+    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
+    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
+    /// script. **Not as a flag:** a command line is world-readable while the process
+    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
+    /// its owner, and the flag lands in the shell's history besides.
     #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
     pub identity_passphrase: Option<String>,
 }
@@ -752,7 +772,11 @@ pub struct ConnectArgs {
     /// A local name for the room (this device only).
     #[arg(long, default_value = "service")]
     pub name: String,
-    /// The identity passphrase. Prompted for when omitted.
+    /// The identity passphrase. Prompted for (unechoed) when omitted, which is the way
+    /// to give it interactively; `VOX_IDENTITY_PASSPHRASE` is the way to give it to a
+    /// script. **Not as a flag:** a command line is world-readable while the process
+    /// runs — `ps`, or `/proc/<pid>/cmdline` — where the environment is readable only by
+    /// its owner, and the flag lands in the shell's history besides.
     #[arg(long, env = "VOX_IDENTITY_PASSPHRASE")]
     pub identity_passphrase: Option<String>,
 }

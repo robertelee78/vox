@@ -1466,7 +1466,7 @@ impl Node {
             if let Some(profile) = self.profile.as_ref() {
                 let mut add = self.anchors.clone();
                 if let Some(more) = more {
-                    let _ = add.merge(more);
+                    let _ = add.merge_endpoints(more);
                 }
                 let _ = channel.add_anchors(profile.store(), &add);
             }
@@ -2380,7 +2380,11 @@ impl Node {
         for a in parsed.anchors.iter().filter(|a| a.id != me) {
             let _ = learned.add(a.clone());
         }
-        let _ = learned.merge(&self.anchors);
+        // `merge_endpoints`, not `merge`: the link's anchors went in first, so with
+        // keep-first semantics a link minted before the anchor moved would win and this
+        // node's freshly resolved address for the same identity would be discarded —
+        // the joiner would adopt the stale address and keep it.
+        let _ = learned.merge_endpoints(&self.anchors);
         self.adopt_channel_anchors(&parsed.channel_id, Some(&learned))
             .await;
         self.refresh_network_view().await;
