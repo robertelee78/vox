@@ -1,14 +1,26 @@
-//! ADR-017 **M17.2 gate** — the two-command flow, with the third step *absent*.
+//! ADR-017 **M17.2 gate** — `vox serve`, a decision about a person, `vox connect`.
 //!
-//! The M16.1 gate proved the mechanism: a TCP service reached across the overlay
-//! between two clients behind symmetric NATs, through the user's own anchor. It needed
-//! six steps, and the worst of them was the sixth — Alice waiting for Bob to appear and
-//! then granting him `dial:`. This gate is the same reachability with that step deleted.
+//! The M16.1 gate proved the mechanism: a TCP service reached across the overlay between
+//! two clients behind symmetric NATs, through the user's own anchor. It needed six steps,
+//! and the worst of them was the sixth — Alice waiting for Bob to appear and then granting
+//! him `dial:<port>`, a decision about a *port*, repeated per service.
 //!
-//! So the central assertion here is a **negative**: nowhere does this test issue
-//! `GrantTunnel`, or any certificate, to anybody. Bob reaches Alice's service because
-//! her room's genesis says members may (ADR-017 decision 3), and he became a member by
-//! holding the passphrase and paying the proof of work.
+//! **This gate asserted the wrong replacement until 2026-09-22.** It read: "Bob reaches
+//! Alice's service because her room's genesis says members may, and he became a member by
+//! holding the passphrase and paying the proof of work." That is finding #1 written down as
+//! a feature. Admission to a room is a passphrase and a proof of work, so under it anyone
+//! holding the address and the passphrase — or anyone a single member vouched onto the
+//! board — could reach every service bound to the room. The grant step was not deleted; it
+//! was replaced by no step at all.
+//!
+//! What replaces it is **one decision about a person**: Alice trusts Bob, once, and that
+//! covers every service she binds in every room they share (ADR-017 decision 3, M17.7).
+//! Still not per-port, still not per-service, and still nothing issued to anybody — but it
+//! is a decision somebody makes, which is what the old model lacked.
+//!
+//! The negative assertion survives and is stronger: nowhere does this test issue
+//! `GrantTunnel` or any certificate, and since M17.7 neither would confer anything if it
+//! did.
 //!
 //! It also proves the two things the host needs and the service cannot give:
 //! - the room's **`.vox` hostname** is derivable from the address Bob was handed, with
@@ -97,7 +109,7 @@ async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) 
 
 #[test]
 #[ignore = "production Argon2id, a relayed join and a tunneled TCP round trip: ~15 s in release"]
-fn m17_a_service_room_is_reached_with_no_grant_step() {
+fn m17_a_service_room_is_reached_after_one_decision_about_a_person() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -220,10 +232,24 @@ fn m17_a_service_room_is_reached_with_no_grant_step() {
         })
         .await;
 
-        // ---- and he reaches it, with no grant having been issued to anyone ----
+        // ---- Alice decides she trusts Bob ----
         //
-        // NOTE: there is deliberately no `GrantTunnel` anywhere in this test. Joining
-        // was the authorization (ADR-017 decision 3).
+        // The one act that opens the service, and the only one. It names a person, not a
+        // port: it is not scoped to this room, this service or this moment, and Alice will
+        // not repeat it when she binds her next port.
+        let out = alice
+            .apply(NodeCommand::Trust {
+                fingerprint: bob_fp,
+                petname: "bob".into(),
+            })
+            .await;
+        assert!(out.is_done(), "Alice trusts Bob: {out:?}");
+
+        // ---- and he reaches it ----
+        //
+        // NOTE: there is deliberately no `GrantTunnel` anywhere in this test, and no
+        // certificate is issued to anybody. Reach is Alice's keyring intersected with the
+        // room's author set (M17.7); the genesis grant authorizes nobody.
         let out = bob
             .apply(NodeCommand::Forward {
                 channel_id: cid,
