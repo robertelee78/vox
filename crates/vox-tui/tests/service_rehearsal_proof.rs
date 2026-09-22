@@ -197,9 +197,17 @@ fn echo_service() -> u16 {
 /// a resolver.
 fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> std::io::Result<TcpStream> {
     let mut s = TcpStream::connect(proxy)?;
-    // Longer than `node::up::HOST_PATIENCE`, or this times out on the proxy's own wait
-    // and reports EAGAIN instead of what the proxy decided.
-    s.set_read_timeout(Some(Duration::from_secs(150)))?;
+    // Longer than `node::up::HOST_PATIENCE`, or this times out on the proxy's own wait and
+    // reports EAGAIN instead of what the proxy decided.
+    //
+    // **Derived, not restated.** This was a hand-written 150s beside that comment; when
+    // HOST_PATIENCE was raised to 300s the comment stayed true and the number stopped being,
+    // and this gate then failed at ~155s with `Resource temporarily unavailable` — which
+    // reads like a race in the service path and is not one. Two of us spent real time on it.
+    // Adding to the constant makes the invariant hold by construction.
+    s.set_read_timeout(Some(
+        vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
+    ))?;
     // Greeting: one method, "no authentication".
     s.write_all(&[0x05, 0x01, 0x00])?;
     let mut hello = [0u8; 2];

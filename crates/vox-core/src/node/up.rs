@@ -163,7 +163,15 @@ where
 /// machine is busy is not a fix, so this is generous on purpose. A host that is genuinely
 /// gone still refuses — it just takes a few minutes to say so, which is the right way round
 /// for a wait a person only pays on their first connection.
-const HOST_PATIENCE: Duration = Duration::from_secs(300);
+/// Public so a proof can derive its own read timeout from it rather than restate it.
+///
+/// A rehearsal that waits on this has to wait *longer* than this, or it reports the
+/// operating system's "would block" instead of what the proxy decided. That invariant used
+/// to live in a comment beside a hand-written 150s, and when this constant was raised to
+/// 300s the comment stayed true and the number stopped being: `service_rehearsal_proof`
+/// then failed at ~155s with `Resource temporarily unavailable`, which reads like a product
+/// race and is not one. Exported so the compiler carries the invariant instead of prose.
+pub const HOST_PATIENCE: Duration = Duration::from_secs(300);
 
 /// Poll interval while waiting. Short enough that a ready host costs a person nothing.
 const HOST_POLL: Duration = Duration::from_millis(250);
