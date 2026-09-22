@@ -105,7 +105,7 @@ where
     let anchors = match room.profile.anchor_set() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("vox: --anchor: {e}");
+            eprintln!("vox: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -184,7 +184,7 @@ where
     let anchors = match profile.anchor_set() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("vox: --anchor: {e}");
+            eprintln!("vox: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1020,7 +1020,7 @@ pub fn run() -> ExitCode {
             let anchors = match args.anchor_set() {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!("vox: --anchor: {e}");
+                    eprintln!("vox: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -1202,7 +1202,7 @@ pub fn run() -> ExitCode {
             let anchors = match args.profile.anchor_set() {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!("vox: --anchor: {e}");
+                    eprintln!("vox: {e}");
                     return ExitCode::FAILURE;
                 }
             };

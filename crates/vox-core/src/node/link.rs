@@ -163,13 +163,18 @@ pub fn b32_decode(text: &str, ctx: &'static str) -> Result<Digest32> {
 /// merges into one node with several addresses (`BootstrapSet::add` keeps the first;
 /// callers that want the merge use [`merge_anchor_spec`]).
 pub fn parse_anchor_spec(text: &str) -> Result<BootstrapNode> {
-    let (id, addr) = text.split_once('@').ok_or(Error::MalformedLink(
-        "anchor spec: expected <fingerprint>@<multiaddr>",
+    let (id, addr) = text.split_once('@').ok_or(Error::MalformedAnchor(
+        "expected <fingerprint>@<host:port>, or @ followed by a multiaddr",
     ))?;
-    let id = b32_decode(id.trim(), "anchor spec fingerprint")?;
+    // `b32_decode` reports a malformed *link*, which is what it is used for everywhere
+    // else; an anchor is a different input from a different place and a person fixes it
+    // in a different file, so the error is restated as one.
+    let id = b32_decode(id.trim(), "").map_err(|_| {
+        Error::MalformedAnchor("the part before @ is not a 52-character fingerprint")
+    })?;
     let addrs = parse_anchor_addrs(addr.trim())?;
     BootstrapNode::new(id, EndpointList::new(addrs)?)
-        .map_err(|_| Error::MalformedLink("anchor spec"))
+        .map_err(|_| Error::MalformedAnchor("the part before @ is not a fingerprint"))
 }
 
 /// The address half of an anchor spec: a multiaddr, or **a host and port**.
@@ -202,7 +207,7 @@ fn parse_anchor_addrs(text: &str) -> Result<Vec<Multiaddr>> {
         }
         return Multiaddr::parse(text)
             .map(|a| vec![a])
-            .map_err(|_| Error::MalformedLink("anchor spec address"));
+            .map_err(|_| Error::MalformedAnchor("the address after @ is not a multiaddr"));
     }
     // `host:port`, the form a person types. An IPv6 literal must be bracketed, as
     // everywhere else, and `rsplit_once` keeps that working.
@@ -217,10 +222,10 @@ fn resolve_host(host: &str, port: &str, want6: Option<bool>) -> Result<Vec<Multi
     use std::net::ToSocketAddrs as _;
     let port: u16 = port
         .parse()
-        .map_err(|_| Error::MalformedLink("anchor spec port"))?;
+        .map_err(|_| Error::MalformedAnchor("the port is not a number"))?;
     let resolved: Vec<std::net::SocketAddr> = (host, port)
         .to_socket_addrs()
-        .map_err(|_| Error::MalformedLink("anchor spec: host does not resolve"))?
+        .map_err(|_| Error::MalformedAnchor("that host does not resolve"))?
         .collect();
     let mut out: Vec<Multiaddr> = resolved
         .into_iter()
@@ -235,9 +240,7 @@ fn resolve_host(host: &str, port: &str, want6: Option<bool>) -> Result<Vec<Multi
     out.sort_by_key(|a| u8::from(matches!(a, Multiaddr::Ip4(_))));
     out.dedup();
     if out.is_empty() {
-        return Err(Error::MalformedLink(
-            "anchor spec: host resolved to nothing",
-        ));
+        return Err(Error::MalformedLink("that host resolved to no address"));
     }
     Ok(out)
 }
@@ -273,7 +276,7 @@ pub fn merge_anchors_file(
         }
         merge_anchor_spec(set, line).map_err(|_| {
             // The line number is the whole point: a person edits this file by hand.
-            Error::MalformedLink("anchors file: malformed anchor spec")
+            Error::MalformedAnchor("a line of the anchors file is not <fingerprint>@<host:port>")
         })?;
         let _ = i;
     }

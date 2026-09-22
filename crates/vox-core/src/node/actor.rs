@@ -4072,7 +4072,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,
         Error::AtRestLocked => Fault::Locked,
         Error::SizeLimitExceeded(_) => Fault::TooLong,
-        Error::MalformedLink(_) => Fault::BadLink,
+        Error::MalformedLink(_) | Error::MalformedAnchor(_) => Fault::BadLink,
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,

@@ -295,6 +295,17 @@ pub enum Error {
     #[error("malformed invite link: {0}")]
     MalformedLink(&'static str),
 
+    /// An `--anchor` spec, or a line of the anchors file, could not be used: it is not
+    /// `<fingerprint>@<host:port>` or `<fingerprint>@<multiaddr>`, its fingerprint is not
+    /// base32, its port is not a number, or its host does not resolve.
+    ///
+    /// Its own variant because it was [`Error::MalformedLink`], which renders as
+    /// "malformed invite link" — so a person who mistyped `--anchor` was told their
+    /// invite link was wrong, and they had not given one. The two are different inputs
+    /// arriving from different places and a person fixes them in different files.
+    #[error("bad anchor: {0}")]
+    MalformedAnchor(&'static str),
+
     /// The responder refused a join (ADR-016 §"Join over the network"): the coarse
     /// reason it sent on the join stream. Deliberately not a fine-grained taxonomy —
     /// a wrong passphrase already fails locally on the joiner, so the responder has
