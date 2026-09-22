@@ -933,10 +933,19 @@ mod golden {
         Genesis::create_with_nonce_and_grant(creator, 1_000, policy, grant, [0x5A; 16]).unwrap()
     }
 
-    /// The whole point: a member holding **no certificate at all** dials, because the
-    /// genesis says membership confers it. And the same member holds nothing else.
+    /// **The regression guard for finding #1.** A member holding no certificate is
+    /// refused, *even though the genesis names the capability* — because a grant conferred
+    /// on every admitted member made joining the authorization, and admission to a room is
+    /// a passphrase and a proof of work. Anyone with an address and a passphrase, or anyone
+    /// a single member vouched onto the board, could reach every service bound to the room.
+    ///
+    /// This vector asserted the opposite until 2026-09-22, and it was green the whole time:
+    /// its name — "confers dial on a member with no cert" — is a plain statement of the
+    /// vulnerability, kept as a golden vector. Reach is now the host's own trust keyring
+    /// intersected with the room's author set (ADR-017 decision 3, M17.7), which is not a
+    /// lattice question at all, so the evaluator must confer nothing here.
     #[test]
-    fn vector_service_grant_confers_dial_on_a_member_with_no_cert() {
+    fn vector_a_genesis_service_grant_confers_nothing_on_a_member() {
         let creator = root(1, 1);
         let member = root(2, 2);
         let grant = CapabilitySet::from_iter_caps([Capability::dial("22")]);
@@ -953,11 +962,16 @@ mod golden {
                 .collect(),
         )
         .unwrap();
-        assert!(matches!(
-            eval.grants(&member.fingerprint(), &Capability::dial("22")),
-            Verdict::Granted { .. }
-        ));
-        // Membership confers exactly what the genesis named, and nothing adjacent.
+        // The capability the genesis names, asked of a member of that very room.
+        assert!(
+            matches!(
+                eval.grants(&member.fingerprint(), &Capability::dial("22")),
+                Verdict::Denied(_)
+            ),
+            "the genesis service grant authorized a member: joining is authorization again, \
+             which is finding #1"
+        );
+        // And nothing adjacent, as before.
         assert!(matches!(
             eval.grants(&member.fingerprint(), &Capability::dial("23")),
             Verdict::Denied(_)
@@ -968,12 +982,13 @@ mod golden {
         ));
         assert!(
             !eval.is_admin(&member.fingerprint()),
-            "the grant confers capabilities, never authority"
+            "a grant never conferred authority, and now confers nothing at all"
         );
     }
 
-    /// A non-member is refused even though the capability is in the genesis — the
-    /// grant is conferred on *members*, and this node decides who those are.
+    /// A non-member is refused. Still true, and now true for a stronger reason: since
+    /// M17.7 the grant confers nothing on anybody, member or not, so this is no longer a
+    /// statement about who counts as a member.
     #[test]
     fn vector_service_grant_denies_a_non_member() {
         let creator = root(1, 1);
@@ -1021,74 +1036,21 @@ mod golden {
         ));
     }
 
-    /// An authorized exclusion withdraws the grant from one member and leaves the
-    /// others holding it — the per-member control a capability-bearing room must keep.
-    #[test]
-    fn vector_service_grant_exclusion_removes_one_member_only() {
-        let creator = root(1, 1);
-        let out = root(2, 2);
-        let kept = root(3, 3);
-        let grant = CapabilitySet::from_iter_caps([Capability::dial("22")]);
-        let genesis = genesis_with_grant(&creator, grant);
-        let cid = genesis.channel_id();
-
-        let mut h = LogBuilder::new(&genesis);
-        h.service_grant_exclusion(&creator, &cid, 0, out.fingerprint());
-
-        let eval = Evaluator::build_with_members(
-            &genesis,
-            &h.entries(),
-            2_000,
-            key_resolver(vec![&creator, &out, &kept]),
-            [out.fingerprint(), kept.fingerprint()]
-                .into_iter()
-                .collect(),
-        )
-        .unwrap();
-        assert!(
-            matches!(
-                eval.grants(&out.fingerprint(), &Capability::dial("22")),
-                Verdict::Denied(DenyReason::Revoked)
-            ),
-            "a deliberate withdrawal reports as Revoked"
-        );
-        assert!(eval.is_excluded(&out.fingerprint()));
-        assert!(matches!(
-            eval.grants(&kept.fingerprint(), &Capability::dial("22")),
-            Verdict::Granted { .. }
-        ));
-    }
-
-    /// An exclusion from an identity that holds no `delegate` is inert — the same
-    /// authorization test an admin-delegation revocation must pass.
-    #[test]
-    fn vector_unauthorized_service_grant_exclusion_ignored() {
-        let creator = root(1, 1);
-        let nobody = root(4, 4);
-        let target = root(2, 2);
-        let grant = CapabilitySet::from_iter_caps([Capability::dial("22")]);
-        let genesis = genesis_with_grant(&creator, grant);
-        let cid = genesis.channel_id();
-
-        let mut h = LogBuilder::new(&genesis);
-        h.service_grant_exclusion(&nobody, &cid, 0, target.fingerprint());
-
-        let eval = Evaluator::build_with_members(
-            &genesis,
-            &h.entries(),
-            2_000,
-            key_resolver(vec![&creator, &nobody, &target]),
-            [nobody.fingerprint(), target.fingerprint()]
-                .into_iter()
-                .collect(),
-        )
-        .unwrap();
-        assert!(!eval.is_excluded(&target.fingerprint()));
-        assert!(matches!(
-            eval.grants(&target.fingerprint(), &Capability::dial("22")),
-            Verdict::Granted { .. }
-        ));
-    }
+    // Two vectors were deleted here on 2026-09-22:
+    // `vector_service_grant_exclusion_removes_one_member_only` and
+    // `vector_unauthorized_service_grant_exclusion_ignored`.
+    //
+    // Both asserted `Verdict::Granted` for a member the genesis grant was supposed to
+    // confer `dial:22` on — one to show an exclusion removed it, the other to show an
+    // unauthorized exclusion did not. Neither property exists any more: the grant confers
+    // nothing, so there is nothing for an exclusion to take back, and `0x0013` is retired
+    // and not reused (ADR-007, ADR-017 M17.13). Rewriting them would have meant asserting
+    // that a withdrawn mechanism correctly does nothing, which is not a property worth a
+    // golden vector.
+    //
+    // The tag still *parses*, deliberately, so every room created before this keeps its
+    // channelID — `Evaluator::is_excluded` remains as the parsed fact and is consulted by
+    // no authorization path.
 
     /// An exclusion suppresses the *grant*, never a certificate. An admin who excludes
     /// a member and then deliberately certifies them again has done exactly that.
