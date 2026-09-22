@@ -88,8 +88,28 @@ or blocked obligation MUST be recorded as failing or blocked, never as waived-gr
 | Gap | Accepted because | What would close it |
 |---|---|---|
 | `install.apple_gate_refuses_unsigned_bytes` in `install_sh_proof` | the installer's Developer ID and notarization gate is macOS-only, so on Linux there is nothing to measure. On macOS it is proved, by forcing the gate on against an unsigned fixture. | nothing closes it on Linux; it is a property that does not exist there |
-| `journey.update_replaces_an_older_install` in `update_proof` | there is no earlier release to update *from*. The version the binary reports is compiled in, so an older `vox` cannot be fabricated locally. | publishing a second release. The proof already asks GitHub for the newest release other than the current one, fetches it, and drives *its* `vox update`; it starts measuring at `v0.1.1` with no code change |
-| `verify.digest_mismatch_is_refused` in `update_proof` | reaching the updater's digest check needs a release *newer* than the running binary whose record does not describe it, so it is gated behind the same missing earlier release. The equivalent refusals in `install.sh` **are** proved today, against a loopback release server. | the same second release. The `proof-<triple>.json` record ADR-015 requires is published from `v0.1.0` onwards, so this too starts measuring at `v0.1.1` |
+
+**Closed by `v0.2.0`, 2026-09-22: the two `update_proof` gaps — and what the second one found.**
+Both were accepted because there was no earlier release to update *from*. `v0.2.0` supplied one, and
+`journey.update_replaces_an_older_install` began passing with no code change, exactly as its remedy
+predicted.
+
+`verify.digest_mismatch_is_refused` did not. It failed, and the failure was the point: the
+published `proof-<triple>.json` carried a `note` field explaining why its digest was deliberately
+wrong, while `ReleaseRecord` is `deny_unknown_fields`. So every released `vox` refused that record
+**at the parser** — "release record is not strict schema-1 JSON" — one step before the digest check
+the record exists to exercise. `v0.1.0` and `v0.2.0` both shipped it. The refusal ADR-018 §3
+requires to be *proved rather than assumed* had never once been reached.
+
+Two things follow, and both are now enforced rather than remembered:
+
+1. **A record read by a strict parser carries exactly the schema's fields and nothing else.** The
+   explanation belongs in the generator's comment, where a person reads it; the record is for
+   machines. `scripts/package-release.sh` now compares each record's key set against schema-1's and
+   refuses to package if it differs, so this class of defect cannot reach a release again.
+2. **A gap accepted for one reason can be held open by another.** These two entries sat under one
+   stated cause — "no earlier release" — and when that cause was removed only one of them cleared.
+   An accepted gap SHOULD be re-measured when its stated remedy lands, not assumed closed by it.
 
 **Closed in CI, 2026-09-21: `fish` in `shell_setup_proof`.** It was accepted because the shell was
 not on the runners, and the entry itself named what would close it — "installing `fish` on the
