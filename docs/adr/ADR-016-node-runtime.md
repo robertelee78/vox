@@ -2,7 +2,26 @@
 
 **Status**: accepted (2026-09-19) — **M13 (single-device node), M14 (two machines chat), M15 (anchors: symmetric-NAT swarm formation *and* convergence between members never online together) and M16.1 (a TCP service reached across the overlay) are all gated in `crates/vox-core/tests/` and run in CI's release step**; the person-facing service surface moves to ADR-017
 **Date**: 2026-09-19
-**Updated**: 2026-09-21 — the M15 "sessions to members we have not met" gap is **half closed**: members now open ADR-004 sessions from one another's bundle records (`PairwiseFrame::Hello`, `NodeNet::board_bundle`, `Actor::ensure_session`), so consent and re-key reach a member admitted through somebody else; the restart half stays open because the board is in-memory too. 2026-09-21 — M18.1: the node enforces ADR-006's rotation bound and carries ADR-007's
+**Updated**: 2026-09-22 — **a join no longer reports "I do not know your address yet" as "you are unreachable."**
+Two fixes to `join_channel`, one of which was a real ~40% failure on `main`:
+
+1. *The responder's address record.* The joiner read the responder's endpoints from the board with
+   `unwrap_or_default()` and dialled whatever came back; an empty list fails at once, and that surfaced as
+   `Fault::Unreachable` in under three seconds for a member who was online. Measured cause, from instrumenting
+   the join: on a failing run the board held `members=1, bundles=2` — the responder's *bundle* record had
+   propagated but its *address* record had not. The two travel separately, so a joiner arriving in that window
+   held a key for a member it had no way to reach, and concluded the member was gone. It now waits up to 20s,
+   re-fetching the board, because a deadline is what separates "not yet" from "not there". `node_m15_session_from_bundle_gate`
+   went from ~2 failures in 5 to **10/10**, and setting the patience to zero puts it back to 3 failures in 6 —
+   so the gate measures the fix rather than the weather.
+2. *Routes to a board are hints, not the only route.* The joiner tried only the anchors embedded in the invite
+   link, once each, and refused. A room address is a magnet link and its trackers are hints, so it now tries the
+   link's anchors, then the node's configured anchors, then any anchor it already holds a connection to, and
+   retries against a deadline. **Stated honestly: this did not fix the failure above** — it was written first on
+   the wrong diagnosis, and the instrumentation is what corrected it. It is kept because one stale or not-yet-ready
+   hint ending a join is still the wrong shape.
+
+2026-09-21 — the M15 "sessions to members we have not met" gap is **half closed**: members now open ADR-004 sessions from one another's bundle records (`PairwiseFrame::Hello`, `NodeNet::board_bundle`, `Actor::ensure_session`), so consent and re-key reach a member admitted through somebody else; the restart half stays open because the board is in-memory too. 2026-09-21 — M18.1: the node enforces ADR-006's rotation bound and carries ADR-007's
 per-member revocation end to end (`vox revoke`), with two new sealed segments and a re-key retry on the
 tick; gated by `node_m18_revocation_gate`. 2026-09-20 — M13 complete: paths, store, profile, channel state, actor + API, live TUI, and the M13 gate test (production Argon2id, run in release by CI).
 **Deciders**: Robert E. Lee <robert@agidreams.us>

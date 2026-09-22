@@ -434,6 +434,15 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     });
 }
 
+/// How long a joiner waits for the responder's **address record** to reach the board.
+///
+/// Separate from [`NodeActor::BOARD_PATIENCE`] because it waits on a different thing: the
+/// board is already answering, and what is missing is one record propagating onto it.
+const JOIN_ADDRESS_PATIENCE: Duration = Duration::from_secs(20);
+
+/// Poll interval while waiting for it. One extra board fetch is cheap; a failed join is not.
+const JOIN_ADDRESS_POLL: Duration = Duration::from_millis(250);
+
 /// A client's handle to a running node.
 ///
 /// Several clients may hold clones of one handle and each take its own event
@@ -1727,6 +1736,95 @@ impl Node {
         Outcome::Done
     }
 
+    /// How long a join keeps looking for a board before refusing.
+    ///
+    /// Shorter than `up::HOST_PATIENCE` on purpose: `vox up` waits on a *service host* who
+    /// may be a person at another desk, while this waits on infrastructure that is either
+    /// coming up now or is not there.
+    const BOARD_PATIENCE: Duration = Duration::from_secs(30);
+
+    /// Interval between rounds. A board that is ready costs a joiner one dial.
+    const BOARD_RETRY: Duration = Duration::from_millis(250);
+
+    /// A connection to something that can serve this channel's board, trying every route
+    /// this node has and retrying until [`Self::BOARD_PATIENCE`] runs out.
+    ///
+    /// **A room address is a magnet link, and a magnet's trackers are hints, not the only
+    /// route.** This used to try only the anchors embedded in the link, once each, in order,
+    /// and refuse — so one hint that was stale, or merely not listening *yet*, ended the
+    /// join. `invite()` builds that list as [the channel's anchors, the configured set, this
+    /// node last], so a host whose only anchor is itself hands out a link naming only itself;
+    /// a joiner who arrives in the second before that host is accepting gets
+    /// `Failed(Unreachable)` and is told nothing useful. That is what made
+    /// `node_m15_session_from_bundle_gate` fail about two runs in five, on clean `main`,
+    /// long before either of the branches in flight — and it failed in under three seconds
+    /// against a 35-second happy path, which is how a deterministic refusal announces itself.
+    ///
+    /// Two things change. **Every route is tried, not just the link's:** the link's hints
+    /// first, because whoever wrote the link knows where that room lives; then this node's
+    /// configured anchors, which are the routes its operator chose; then any anchor it is
+    /// **already connected to** from an earlier join, which costs nothing to ask. Duplicates
+    /// are dialled once. **And it retries**, because "not yet" and "not there" are different
+    /// answers and only a deadline can tell them apart.
+    ///
+    /// The third tier carries no endpoints, deliberately: this node does not keep an address
+    /// book for anchors it met once, and inventing one here would be a second feature. An
+    /// empty endpoint list is exactly right for a peer that is already connected, because
+    /// `NodeNet::connect` returns the live connection before it looks at addresses — and for
+    /// one that is not, it fails, which is the honest answer.
+    ///
+    /// `None` means no route answered for the whole window, which is a refusal a person
+    /// should see: the room may genuinely have nobody serving it.
+    async fn reach_a_board(
+        &mut self,
+        parsed: &crate::node::link::InviteLink,
+    ) -> Option<Arc<VoxConnection>> {
+        let me = self.net.as_ref()?.local_id();
+        // Ordered, de-duplicated, best hint first. Collected up front so the set does not
+        // shift under the retry loop.
+        let mut routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
+        let mut seen: std::collections::BTreeSet<Digest32> = [me].into_iter().collect();
+        for a in parsed
+            .anchors
+            .iter()
+            .chain(self.anchors.nodes())
+            .filter(|a| seen.insert(a.id))
+        {
+            routes.push((a.id, a.endpoints.clone()));
+        }
+        // Anchors from earlier joins that this node still holds a connection to.
+        let live: std::collections::BTreeSet<Digest32> =
+            self.net.as_ref()?.manager().peers().into_iter().collect();
+        let empty = crate::nat::multiaddr::EndpointList::new(Vec::new()).ok()?;
+        let learned: Vec<Digest32> = self
+            .anchor_ids
+            .iter()
+            .copied()
+            .filter(|id| live.contains(id) && seen.insert(*id))
+            .collect();
+        for id in learned {
+            routes.push((id, empty.clone()));
+        }
+        if routes.is_empty() {
+            return None;
+        }
+
+        let deadline = tokio::time::Instant::now() + Self::BOARD_PATIENCE;
+        loop {
+            for (id, endpoints) in &routes.clone() {
+                if let Ok(conn) = self.dial(*id, endpoints).await {
+                    self.anchor_ids.insert(*id);
+                    self.refresh_network_view().await;
+                    return Some(conn);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Self::BOARD_RETRY).await;
+        }
+    }
+
     /// Join a channel from an invite link (ADR-016 §"Join over the network"): resolve
     /// the anchor, read the board, announce a pre-join record, run the ADR-005 join,
     /// then build local channel state and publish our own records.
@@ -1743,23 +1841,13 @@ impl Node {
             return Outcome::Failed(Fault::IdentityExists);
         }
         let now = self.now();
-        // First, a board: the link's anchors in its order, pinned to the identity the
-        // link names for each. An anchor that does not answer is skipped.
         let me = net.local_id();
-        let mut board: Option<Arc<VoxConnection>> = None;
-        for anchor in parsed.anchors.iter().filter(|a| a.id != me) {
-            if let Ok(conn) = self.dial(anchor.id, &anchor.endpoints).await {
-                self.anchor_ids.insert(anchor.id);
-                board = Some(conn);
-                break;
-            }
-        }
-        let Some(board) = board else {
+        let Some(board) = self.reach_a_board(&parsed).await else {
             return Outcome::Failed(Fault::Unreachable);
         };
         self.refresh_network_view().await;
         // The board tells us what the channel is and who is in it.
-        let set = match net.fetch_channel(&board, &parsed.channel_id, 0).await {
+        let mut set = match net.fetch_channel(&board, &parsed.channel_id, 0).await {
             Ok(s) => s,
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
@@ -1778,12 +1866,51 @@ impl Node {
                 None => return Outcome::Failed(Fault::BadLink),
             },
         };
-        let responder_endpoints = set
+        let mut responder_endpoints = set
             .members
             .iter()
             .find(|r| r.author_id == responder)
             .map(|r| r.endpoints.clone())
             .unwrap_or_default();
+        // **An address we do not know yet is not an address that does not exist.**
+        //
+        // `unwrap_or_default()` above yields an *empty* endpoint list when the responder has
+        // no address record on this board, and dialling an empty list fails at once — which
+        // this returned to the caller as `Fault::Unreachable`, in under three seconds, for a
+        // member who was online and perfectly reachable. It made
+        // `node_m15_session_from_bundle_gate` fail about two runs in five on clean `main`.
+        //
+        // Measured, not deduced. On a failing run the board held `members=1, bundles=2`: the
+        // responder's *bundle* record had arrived but its *address* record had not. The two
+        // propagate separately, so a joiner who arrives in that window sees a member it has a
+        // key for and no way to reach — and concluded the member was unreachable.
+        //
+        // A deadline is what separates "not yet" from "not there", which is the same
+        // distinction `up::reach_host_with_patience` draws for a service host, and the same
+        // one every peer-to-peer client draws when a peer list is incomplete: keep asking the
+        // source, do not conclude absence from silence.
+        if responder_endpoints.is_empty() && board.peer_id() != responder {
+            let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
+            while tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(JOIN_ADDRESS_POLL).await;
+                let Ok(fresh) = net.fetch_channel(&board, &parsed.channel_id, 0).await else {
+                    continue;
+                };
+                let found = fresh
+                    .members
+                    .iter()
+                    .find(|r| r.author_id == responder)
+                    .map(|r| r.endpoints.clone())
+                    .unwrap_or_default();
+                if !found.is_empty() {
+                    // Take the fresher board too: it is a superset by construction, and the
+                    // records that arrived alongside the address are ones we are about to want.
+                    responder_endpoints = found;
+                    set = fresh;
+                    break;
+                }
+            }
+        }
         // Announce ourselves — **before** reaching for the responder. The pre-join
         // record is what makes an unknown peer eligible (ADR-016): on the anchor it is
         // what lets the anchor coordinate a punch or carry a circuit for us to a
