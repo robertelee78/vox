@@ -263,6 +263,19 @@ pub enum Error {
     #[error("malformed tunnel artifact: {0}")]
     MalformedTunnel(&'static str),
 
+    /// **Another process already holds this profile.** redb is single-writer, so one
+    /// `vox` at a time may open a profile's store — and a running `vox daemon` or `vox
+    /// tui` holds it for as long as it runs.
+    ///
+    /// Distinct from [`Error::Storage`] because the remedy is completely different and
+    /// the caller is the only layer that can state it: nothing is wrong with the store,
+    /// there is simply a node already running, and the verb should be asked of *that*
+    /// node rather than of a second one. Collapsing it into a generic storage failure is
+    /// how a person came to be told "store open: Database already open. Cannot acquire
+    /// lock." for the ordinary act of running a command while their daemon was up.
+    #[error("another vox already has this profile open")]
+    ProfileBusy,
+
     /// The node's persistent store (ADR-016) failed an operation: opening or
     /// creating the file, a transaction, or a table access. `op` is a static
     /// description of what was attempted; `detail` carries the engine's message

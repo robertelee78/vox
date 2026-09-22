@@ -89,7 +89,26 @@ pub async fn open_profile(
 ) -> Result<NodeHandle, AppError> {
     let existed = vox_core::node::profile::Profile::exists(&paths);
     let cfg = NodeConfig::new().bind(Bind::Addr(listen)).anchors(anchors);
-    let node = Node::spawn_config(paths, cfg)?;
+    let socket = paths.socket_file();
+    let node = match Node::spawn_config(paths, cfg) {
+        Ok(n) => n,
+        // **A profile that is busy is not a profile that is broken.** redb is
+        // single-writer, so a running `vox daemon` or `vox tui` holds this profile for
+        // as long as it runs — and every verb that spawns its own node therefore failed
+        // with "store open: Database already open. Cannot acquire lock.", which names a
+        // storage engine and no remedy. Running a daemon is the documented way to run
+        // agent comms, so this was the ordinary case, not an edge one.
+        Err(vox_core::error::Error::ProfileBusy) => {
+            return Err(AppError::Usage(format!(
+                "a vox is already running for this profile, and only one at a time may \
+                 hold it.\n       Its control socket is {}\n       Stop that node to run \
+                 this command, or use the `vox room …` verbs, which ask the running node \
+                 instead of starting a second one.",
+                socket.display()
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let secret = Secret::new(identity_passphrase.as_bytes().to_vec());
     let out = if existed {
         node.apply(NodeCommand::Unlock { passphrase: secret }).await

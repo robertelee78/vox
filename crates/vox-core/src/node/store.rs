@@ -86,7 +86,16 @@ impl Store {
     /// initialize or verify the schema version. A file this build cannot read
     /// (garbage, or a newer schema) is a [`Error::Storage`], never a panic.
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Database::create(path).map_err(storage("open"))?;
+        let db = Database::create(path).map_err(|e| {
+            // redb names this case precisely; do not lose that by flattening it into a
+            // generic storage failure. A profile that is merely *busy* is not a profile
+            // that is broken, and only the caller can say what to do about it.
+            if matches!(e, redb::DatabaseError::DatabaseAlreadyOpen) {
+                Error::ProfileBusy
+            } else {
+                storage("open")(e)
+            }
+        })?;
         super::paths::set_private_file_mode(path)?;
         let store = Self { db };
         store.init_schema()?;
