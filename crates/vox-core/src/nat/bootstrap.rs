@@ -156,4 +156,53 @@ impl BootstrapSet {
         }
         Ok(())
     }
+
+    /// Merge `other`, **unioning the addresses** of anchors already present.
+    ///
+    /// [`BootstrapSet::merge`] goes through [`BootstrapSet::add`], which keeps the first
+    /// entry for an identity and discards the rest — correct for building a set from
+    /// configuration, and wrong for refreshing one. An anchor that moved is the *same
+    /// identity at a new address*, so `merge` silently threw the new address away and a
+    /// long-running node kept dialling the old one for ever.
+    ///
+    /// The old addresses are kept rather than replaced: an anchor may legitimately have
+    /// several, the ladder tries them in order, and one that has stopped answering costs
+    /// a dial rather than a failure.
+    ///
+    /// # Errors
+    /// [`Error::SizeLimitExceeded`] if a merged endpoint list outgrows its bound.
+    pub fn merge_endpoints(&mut self, other: &BootstrapSet) -> Result<()> {
+        for n in other.nodes() {
+            match self.get(&n.id).cloned() {
+                None => {
+                    self.add(n.clone())?;
+                }
+                Some(existing) => {
+                    let mut addrs: Vec<crate::nat::multiaddr::Multiaddr> =
+                        existing.endpoints.addrs().to_vec();
+                    let mut gained = false;
+                    for a in n.endpoints.addrs() {
+                        if !addrs.contains(a) {
+                            addrs.push(*a);
+                            gained = true;
+                        }
+                    }
+                    if !gained {
+                        continue;
+                    }
+                    let merged = BootstrapNode::new(existing.id, EndpointList::new(addrs)?)?;
+                    let mut rebuilt = BootstrapSet::new();
+                    for existing in self.nodes() {
+                        rebuilt.add(if existing.id == merged.id {
+                            merged.clone()
+                        } else {
+                            existing.clone()
+                        })?;
+                    }
+                    *self = rebuilt;
+                }
+            }
+        }
+        Ok(())
+    }
 }

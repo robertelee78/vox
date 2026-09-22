@@ -997,6 +997,28 @@ impl Node {
                 self.lock_all().await;
                 Outcome::Done
             }
+            NodeCommand::AddAnchors { anchors } => {
+                // `merge` keeps the first entry per identity, so it would discard exactly
+                // the thing a refresh carries: the same anchor at its new address.
+                if self.anchors.merge_endpoints(&anchors).is_err() {
+                    return Outcome::Failed(Fault::TooLong);
+                }
+                // Dial straight away rather than waiting for the throttle: the caller
+                // refreshed because something changed, and the whole point is not to sit
+                // on a stale address.
+                self.redial_anchors_at = 0;
+                self.redial_anchors_if_due();
+                // And give the rooms the new address too. A channel keeps the anchor set
+                // it adopted when it was created or joined, and that set is what an
+                // invite link carries — so without this a room minted before the move
+                // would go on handing out an address nobody can dial.
+                let open: Vec<Digest32> = self.channels.keys().copied().collect();
+                for channel_id in open {
+                    self.adopt_channel_anchors(&channel_id, Some(&anchors))
+                        .await;
+                }
+                Outcome::Done
+            }
             NodeCommand::VerifyPassphrase { passphrase } => match self.profile.as_ref() {
                 None => Outcome::Failed(Fault::NoIdentity),
                 Some(profile) => match profile.verify_passphrase(&passphrase) {

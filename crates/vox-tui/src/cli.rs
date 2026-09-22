@@ -1117,6 +1117,7 @@ pub fn run() -> ExitCode {
                 paths,
                 args.profile.listen,
                 anchors,
+                args.profile.anchors.clone(),
                 args.passphrase_file.clone(),
             ) {
                 Ok(()) => ExitCode::SUCCESS,

@@ -372,10 +372,18 @@ pub fn run_node(
 /// or wrong, a named room is unknown or its passphrase is refused, or the control
 /// socket cannot be bound — the last of which **is** fatal here, unlike in the TUI,
 /// because serving that socket is this command's entire purpose.
+/// How often a daemon re-reads its anchor configuration and re-resolves it.
+///
+/// Short enough that a moved anchor is followed within a minute, long enough that it is
+/// not a resolver load: the node only acts when something actually changed, because
+/// merging an address it already holds is a no-op.
+const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn run_daemon(
     paths: Paths,
     listen: std::net::SocketAddr,
     anchors: vox_core::nat::bootstrap::BootstrapSet,
+    anchor_specs: Vec<String>,
     passphrase_file: Option<std::path::PathBuf>,
 ) -> Result<(), AppError> {
     use std::io::Read as _;
@@ -515,6 +523,45 @@ pub fn run_daemon(
         }
         Ok(())
     })?;
+
+    // **Follow the anchor when it moves.**
+    //
+    // An anchor spec may name a host rather than an address, and the reason it may is
+    // that a home connection's address changes whenever the ISP decides — the point
+    // being that a person should not have to re-issue it to every client. Resolution
+    // happened once, when this process read its configuration, so a daemon that runs for
+    // days held whatever the name meant at startup and redialled that address for ever.
+    // The failure attributes badly: the anchor is up, the name is right, and the client
+    // says only that it cannot reach a peer.
+    //
+    // So re-read the configuration and re-resolve every spec on a timer, and hand the
+    // node anything new. Re-reading is what makes this provable without a DNS record to
+    // move: the same `merge_anchor_spec` runs again, so a name is resolved again whether
+    // it was the file or the record that changed.
+    {
+        let node = node.clone();
+        let paths = paths.clone();
+        let specs = anchor_specs.clone();
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(ANCHOR_REFRESH).await;
+                let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
+                if vox_core::node::link::merge_anchors_file(&mut set, &paths.anchors_file())
+                    .is_err()
+                {
+                    continue;
+                }
+                for spec in &specs {
+                    let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
+                }
+                if !set.is_empty() {
+                    let _ = node
+                        .apply(vox_core::node::api::NodeCommand::AddAnchors { anchors: set })
+                        .await;
+                }
+            }
+        });
+    }
 
     // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
     let _ipc = rt

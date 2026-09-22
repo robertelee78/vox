@@ -850,8 +850,11 @@ fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
         .strip_suffix('\r')
         .unwrap_or_else(|| buf.strip_suffix('\n').unwrap_or(&buf));
     if p.is_empty() {
+        // The caller's phrase is a noun phrase ("the room's passphrase", "a passphrase
+        // for the new room"), so it reads as "expected <phrase> on stdin" and never as
+        // "no a passphrase", which is what "no {what}" produced.
         return Err(AppError::Usage(format!(
-            "no {what} on stdin — pipe it in, e.g. `echo … | vox room join …`"
+            "expected {what} on stdin — pipe it in, e.g. `echo … | vox room join …`"
         )));
     }
     Ok(p.to_owned())

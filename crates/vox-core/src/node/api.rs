@@ -162,6 +162,17 @@ pub enum NodeCommand {
         /// The identity passphrase to check.
         passphrase: Secret,
     },
+    /// Merge more anchors into the configured set, and dial any not yet connected.
+    ///
+    /// The set is resolved when configuration is read, so a long-running node holds the
+    /// addresses it got at startup. An anchor named by hostname — which is the point of
+    /// naming one by hostname — moves when its ISP decides, and the node would keep
+    /// redialling the old address for ever. This is how a re-resolved set reaches a node
+    /// that is already running.
+    AddAnchors {
+        /// The freshly resolved anchors to merge in.
+        anchors: crate::nat::bootstrap::BootstrapSet,
+    },
     /// Unlock the identity.
     Unlock {
         /// The identity passphrase.
