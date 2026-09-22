@@ -6,107 +6,47 @@
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
 
-## Open finding 2026-09-22: `is_circuit_addr` guesses from a prefix, and the guess collides with real addresses
+## Circuit addressing
 
-**This is the root finding of the day's reachability work, and it supersedes the reasoning in the note
-below — including a change of mine that was landed and has now been reverted.**
+quinn addresses every path by `SocketAddr`, so each relayed path needs one. A circuit's
+address is **allocated at random** inside `240.0.0.0/4` (reserved by RFC 1112 §4, never
+routed publicly), and the mapping from peer to address lives in the mux's table
+(`transport::mux`). Three properties, each load-bearing:
 
-Vox derives a circuit's address from the far peer's fingerprint into `240.0.0.0/4` (`transport::mux`), and
-`is_circuit_addr` decides whether an address is a circuit by **testing that prefix**:
+**Unlinkable to the peer.** The address is no function of the peer's identity. A fingerprint
+is published deliberately — it is what `vox trust add` takes — so an address *derived* from
+one would let anyone holding a fingerprint compute it and test whether it appears among a
+node's endpoints, reading that node's relay topology out of public data. Random host bits
+mean an address that escapes identifies nothing, and a replacement circuit is a new address.
 
-```rust
-IpAddr::V4(v4) => v4.octets()[0] & 0xF0 == 0xF0,
-```
+**Known, not guessed.** `MuxSocket::is_circuit` answers from the table. This is what makes
+the range's choice non-critical: `240.0.0.0/4` *is* used privately in the field, including by
+VPN software, so a host can legitimately hold an interface there — and a real address in the
+range is simply absent from the table. Deciding by range instead answers wrongly in both
+directions, and the answer feeds `ConnectionManager::file`'s relay-first/upgrade-later rule
+and therefore which connection to a peer survives.
 
-**Correction, same day, before anyone builds on the paragraph that used to be here.** This section
-originally claimed the machine in question had an interface addressed in `240.0.0.0/4`. That was wrong, and
-enumerating the interfaces disproves it:
+**In the socket's own family.** The range is IPv4 whatever the socket is: quinn refuses an
+IPv6 destination on an IPv4 socket and maps an IPv4 one on an IPv6 socket, so IPv4 is the
+only family that works on both. An IPv6 Unique Local Address with a random RFC 4193 Global ID
+is the better container — collision with a real network becomes negligible rather than merely
+unlikely — and is what to move to if endpoints ever bind dual-stack.
 
-```
-lo0    127.0.0.1
-en0    192.168.1.48
-utun7  10.10.3.201     (a split-mode corporate VPN)
-```
+The address space is 28 bits, so `attach` checks the table for a collision rather than
+trusting uniqueness. The port is a fixed placeholder: a circuit is identified by its address,
+and a stable `SocketAddr` is what quinn keys paths on.
 
-No `240.x` interface. The `240.x` dial candidates seen in the instrumentation — `254.245.191.165:6427`,
-`246.252.112.25:52967` — are **Vox's own circuit addresses**, which `mux::circuit_addr` derives from a peer
-fingerprint as `0xF0 | (h[0] & 0x0F)` in the first octet with a hash-derived port. That is why they looked
-random and differed every run: fresh identities per run.
+Proved by `crates/vox-core/tests/mux_circuit_addressing.rs`, one test per property.
 
-So the original diagnosis was right and the correction that replaced it was wrong. What remains true, and is
-the reason `is_circuit_addr` should still consult the table rather than test a prefix, is that `240.0.0.0/4`
-**is** used privately by some VPN and CGNAT deployments, so the prefix test is unsound on *some* hosts even
-though it happens to be safe on this one. That is a robustness argument, not the explanation of this bug.
+## Open finding 2026-09-22: the SOCKS path to a service is unreliable
 
-The separately-reverted change — filtering `local_route_ips()` through `is_routable` — was wrong for a
-different and simpler reason: `is_routable` means *globally* routable, so it rejects `192.168.1.48` and
-`10.10.3.201`, which are this host's only usable addresses and are exactly what a LAN or same-machine peer
-needs. ADR-012 advertises private addresses deliberately ("the routable IPv4 address (a LAN peer can use
-it)"). Reverting it was right; the reason given at the time was not.
-
-So on such a host the prefix test is **wrong in both directions**:
-
-- a genuine direct connection whose remote address is `240.x` is classified `PathClass::Relayed`
-  (`node::net::path_class`), which feeds `ConnectionManager::file`'s relay-first/upgrade-later rule — so the
-  one-connection-per-peer preference makes its decisions on a false premise;
-- a genuine, locally-dialable `240.x` endpoint is treated as an overlay handle.
-
-**`mux` already holds the fact.** It keeps a circuit table — `circuits: Mutex<HashMap<SocketAddr, ...>>`,
-keyed by `key(addr)` — so whether an address is a circuit is *known*, not something to infer from its shape.
-`is_circuit_addr` should consult that table. Inferring it from a prefix is the same class of error as
-ADR-018 §8b: something knew the answer and was not asked.
-
-**Reverted, and the revert was over-cautious.** `EndpointList::direct_candidates` filtering `240/4`
-(`bb083f7`) was reverted on the false premise above. On this host it dropped only genuine circuit addresses,
-which is correct behaviour. It is nonetheless still out, because the 1-of-6 measurement that triggered the
-revert was confounded by the `is_routable` change landing alongside it — that one demonstrably removed
-working addresses, so the pair cannot be attributed. It should return once the source fix below is in and
-the predicate consults the table, and be measured on its own.
-
-**Also written and NOT landed:** making a relayed path answer no `WHOAMI` (the note below). Correct in
-principle — a relayed path reveals nothing about a peer's reachability — but it depends on the same
-predicate to decide what "relayed" means, so it must wait for the table-based check too.
-
-**What is still unexplained.** `service_rehearsal_proof` fails 4–5 of 6 runs at three sites: the untrusted
-joiner's `vox connect` reporting `Failed(Unreachable)` (43s–223s), the first SOCKS CONNECT refused after up
-to 314s (past `up::HOST_PATIENCE`, so the proxy could not reach the host for five minutes), and a mid-stream
-read failing at ~55–84s. Two independent lines of evidence now point at **circuit establishment** as the
-remaining suspect: this one, and the fact that splitting the accept loop (finding #3) broke exactly the two
-relayed-circuit gates and nothing else. That is where the next investigation should start, and it should
-start by making `is_circuit_addr` ask the table.
-
-## Open finding 2026-09-22 (superseded by the one below): a relayed path teaches a peer a false reflexive address
-
-**Measured, and only partly fixed.** Instrumenting `connect_direct` during the cross-process join defect
-(ADR-016) showed nodes dialling candidates like `254.245.191.165:6427` and `246.252.112.25:52967`. Those are
-in `240.0.0.0/4`, which is where **Vox derives its own circuit addresses** from a peer's fingerprint
-(`transport::mux`). No datagram can reach one; each attempt burns a full `PER_ATTEMPT_TIMEOUT` (10s), and in
-one failing join such an address was the *only* candidate for a peer.
-
-**Where they come from.** `node::network` answers a `WHOAMI` (rung 3, the reflexive address) with
-`conn.quinn().remote_address()`. When that connection is itself a circuit, the remote address is the circuit
-address — an overlay handle only the local mux can interpret. So a peer reached through a relay is told
-"your public address is 254.245.191.165", and it advertises that.
-
-**Landed:** `EndpointList::direct_candidates` no longer returns circuit addresses. This cannot make anything
-worse — it drops candidates that provably cannot work — and it makes an already-poisoned record cheap
-instead of expensive. Loopback and private addresses are deliberately kept.
-
-**Written and NOT landed:** the source fix, where a relayed path answers no `WHOAMI` at all, on the grounds
-that a relayed path reveals nothing about a peer's reachability so the honest answer is no answer. It is not
-landed because **it could not be shown to change the observed failure rate** (`service_rehearsal_proof` went
-1-of-3 with it, against 2-of-6 without — indistinguishable), and the accept-loop regression earlier the same
-day is the argument against landing unproven changes in this ladder. It needs a proof that a peer reached
-only through a relay never advertises a circuit address.
-
-**What this does NOT explain.** The rehearsal still fails at two sites with the filter in place: the first
-SOCKS CONNECT refused after **314 seconds** — past `up::HOST_PATIENCE`, so the proxy genuinely could not
-reach the host for five minutes — and a mid-stream read failing at 55s. So at least one further cause is
-unfound, and the circuit-address leak is a contributing cause rather than the cause.
-
-Related: the ladder reports `Unreachable` without naming which rung failed, which is why this needed
-instrumentation at all (ADR-018 §8b).
-
+`vox up` → SOCKS5 → `.vox` name fails roughly 40% of runs in
+`crates/vox-tui/tests/service_rehearsal_proof.rs`: the first CONNECT refused (up to 314s,
+past `up::HOST_PATIENCE`), or a mid-stream read failing 55–84s in. `NodeCommand::Forward`
+over the same overlay is reliable — agent comms moves a 200 KB file across processes through
+an anchor 3-of-3 — so the defect is in the `vox up` path (name resolution,
+`reach_host_with_patience`, or how the proxy establishes and holds the stream) rather than in
+circuit establishment generally.
 
 ## Context
 

@@ -457,8 +457,17 @@ fn two_nated_nodes_reach_each_other_through_a_coordinator_then_upgrade_to_a_punc
             started.elapsed()
         );
         assert_eq!(conn.peer_id(), b_id, "the peer is authenticated");
-        assert_eq!(path_class(&conn), PathClass::Relayed);
-        assert_eq!(conn.quinn().remote_address(), circuit_addr(&b_id));
+        let a_ep = s.a.manager().endpoint();
+        assert_eq!(path_class(a_ep, &conn), PathClass::Relayed);
+        // The address is allocated, not derived, so what matters is that A's own mux
+        // holds it as B's live circuit — which is also the only thing any code should
+        // ever ask about a circuit address.
+        assert!(a_ep.is_circuit(conn.quinn().remote_address()));
+        assert_eq!(
+            a_ep.circuit_addr_of(&b_id),
+            Some(conn.quinn().remote_address()),
+            "the circuit A dialled is the one filed under B"
+        );
         assert_eq!(s.c.relaying(), 1, "the coordinator is carrying the circuit");
         // The connection is filed, so the next reach is free.
         assert!(Arc::ptr_eq(&s.a.manager().existing(&b_id).unwrap(), &conn));
@@ -473,7 +482,10 @@ fn two_nated_nodes_reach_each_other_through_a_coordinator_then_upgrade_to_a_punc
         .expect("upgrade did not hang")
         .expect("a punch through cone NATs lands");
         assert_eq!(better.peer_id(), b_id);
-        assert_eq!(path_class(&better), PathClass::Direct);
+        assert_eq!(
+            path_class(s.a.manager().endpoint(), &better),
+            PathClass::Direct
+        );
         // B discovered its own observed address to answer the punch.
         assert!(
             s.b.observed_addr().is_some(),
@@ -512,7 +524,7 @@ fn two_nated_nodes_reach_each_other_through_a_coordinator_then_upgrade_to_a_punc
         let b_primary = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(c) = s.b.manager().existing(&a_id) {
-                    if path_class(&c) == PathClass::Direct {
+                    if path_class(s.b.manager().endpoint(), &c) == PathClass::Direct {
                         return c;
                     }
                 }
@@ -564,7 +576,10 @@ fn a_private_address_is_tried_and_dropped_while_the_circuit_carries_the_day() {
             started.elapsed()
         );
         assert_eq!(conn.peer_id(), b_id);
-        assert_eq!(path_class(&conn), PathClass::Relayed);
+        assert_eq!(
+            path_class(s.a.manager().endpoint(), &conn),
+            PathClass::Relayed
+        );
         assert!(
             s.net.unroutable() > unroutable_before,
             "the direct dial to a private address was attempted and dropped"
@@ -577,7 +592,6 @@ fn a_private_address_is_tried_and_dropped_while_the_circuit_carries_the_day() {
 // ---------------------------------------------------------------------------
 
 use vox_core::node::net::{path_class, PathClass};
-use vox_core::transport::mux::circuit_addr;
 use vox_core::transport::streams::{open_typed, StreamKind};
 
 #[test]
@@ -623,7 +637,11 @@ fn two_nodes_behind_symmetric_nats_reach_each_other_through_a_relay() {
         // because B's identity is what the handshake proved.
         assert_eq!(conn.peer_id(), b_id);
         // The path is a circuit, not the wire — and the relay is carrying exactly one.
-        assert_eq!(conn.quinn().remote_address(), circuit_addr(&b_id));
+        assert_eq!(
+            s.a.manager().endpoint().circuit_addr_of(&b_id),
+            Some(conn.quinn().remote_address()),
+            "A's connection to B runs over the circuit A filed for B"
+        );
         assert_eq!(s.c.relaying(), 1, "the relay carries one circuit");
         assert_eq!(s.a.manager().endpoint().circuit_count(), 1);
         assert_eq!(s.b.manager().endpoint().circuit_count(), 1);
@@ -645,7 +663,11 @@ fn two_nodes_behind_symmetric_nats_reach_each_other_through_a_relay() {
             s.b.manager()
                 .existing(&a_id)
                 .expect("B holds A's relayed connection");
-        assert_eq!(b_conn.quinn().remote_address(), circuit_addr(&a_id));
+        assert_eq!(
+            s.b.manager().endpoint().circuit_addr_of(&a_id),
+            Some(b_conn.quinn().remote_address()),
+            "B's side of the same circuit is filed under A"
+        );
         let b_side = tokio::spawn(async move {
             let got = br.read_to_end(1 << 20).await.unwrap();
             bs.write_all(&got).await.unwrap();

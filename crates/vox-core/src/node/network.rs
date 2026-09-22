@@ -500,7 +500,22 @@ impl NodeNet {
             StreamKind::Coord => {
                 // The answer to `WHOAMI` is this connection's source address as *this*
                 // node sees it — the peer's reflexive address (ADR-012 rung 3).
-                let observed = Multiaddr::from(conn.quinn().remote_address());
+                //
+                // **Only when this node can actually observe it.** Over a circuit the
+                // remote address is a synthetic handle belonging to this node's own mux, not
+                // the peer's address, so a relayed path reveals nothing about the peer's
+                // reachability and no answer is the truthful one.
+                //
+                // Answering anyway would hand the peer an address nobody can dial, which it
+                // would advertise: every other node then spends a full `PER_ATTEMPT_TIMEOUT`
+                // on a destination that cannot exist, and the address itself is a fact about
+                // this node's relay topology that has no business in a published record.
+                //
+                // `ask_observed` returns a `Result` and its callers tolerate failure,
+                // falling back to local endpoints.
+                let remote = conn.quinn().remote_address();
+                let observed =
+                    (!self.manager.endpoint().is_circuit(remote)).then(|| Multiaddr::from(remote));
                 let manager = Arc::clone(&self.manager);
                 match coordstream::serve_coord(
                     peer,
@@ -659,7 +674,9 @@ impl NodeNet {
         endpoints: &EndpointList,
     ) -> Option<Arc<VoxConnection>> {
         let current = self.manager.existing(&peer)?;
-        if crate::node::net::path_class(&current) == crate::node::net::PathClass::Direct {
+        if crate::node::net::path_class(self.manager.endpoint(), &current)
+            == crate::node::net::PathClass::Direct
+        {
             return None;
         }
         let mut set: JoinSet<Result<VoxConnection>> = JoinSet::new();

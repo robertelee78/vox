@@ -299,7 +299,7 @@ pub enum CoordInbound {
 /// coordinator's own peer table).
 pub async fn serve_coord<F>(
     peer: Digest32,
-    observed: Multiaddr,
+    observed: Option<Multiaddr>,
     classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
     mut send: SendStream,
     mut recv: RecvStream,
@@ -309,9 +309,17 @@ where
     F: FnOnce(&Digest32) -> Option<Arc<VoxConnection>>,
 {
     match next_frame(&mut recv).await? {
-        // Open to anyone: the answer is the asker's own address.
+        // Open to anyone: the answer is the asker's own address — when this node can
+        // actually observe it. Over a relayed path it cannot (see the caller), and a
+        // circuit address handed back as "your address" is a destination nobody can dial
+        // which the peer would then advertise.
         CoordFrame::WhoAmI => {
-            send_frame(&mut send, &CoordFrame::Observed { addr: observed }).await?;
+            let Some(addr) = observed else {
+                return Err(Error::HolePunchFailed(
+                    "coord: no reflexive address over a relayed path",
+                ));
+            };
+            send_frame(&mut send, &CoordFrame::Observed { addr }).await?;
             let _ = send.finish();
             Ok(CoordInbound::Answered)
         }

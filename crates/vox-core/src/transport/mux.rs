@@ -14,16 +14,36 @@
 //! what makes it **ciphertext-only by construction** rather than by promise.
 //!
 //! ## Synthetic addresses
-//! A circuit's address is derived from the far peer's fingerprint into `240.0.0.0/4`
-//! (reserved, never routed — RFC 1112 §4), so it can never collide with a real
-//! destination and a datagram for a circuit that no longer exists is dropped here
-//! rather than handed to the kernel. IPv4 is used whatever the socket's family:
-//! quinn refuses an IPv6 destination on an IPv4 socket, and maps an IPv4 one on an
-//! IPv6 socket, so an IPv4 synthetic address works on both.
+//! quinn addresses every path by `SocketAddr`, so each circuit needs one. A circuit's
+//! address is **allocated at random** inside a Vox-specific IPv6 Unique Local Address
+//! subnet, and the mapping from peer to address is held in this socket's table. Three
+//! properties follow, and each is load-bearing:
+//!
+//! - **Unlinkable.** The address carries no function of the peer's identity, so it tells
+//!   an observer who obtains one nothing about which peer it stands for. A fingerprint is
+//!   published deliberately — it is what `vox trust add` takes — so an address *derived*
+//!   from one would let anybody holding a fingerprint test whether a node has a circuit to
+//!   that peer, and read a node's relay topology out of any address that escaped.
+//! - **Known, not guessed.** Whether an address is a circuit is answered by
+//!   [`MuxSocket::is_circuit`] from the table, never by testing its range. This is what
+//!   makes the range's choice non-critical: `240.0.0.0/4` is reserved but *is* used
+//!   privately in the field, including by VPN software, so a host can legitimately have an
+//!   interface there — and a real address in the range is simply not in the table, so it is
+//!   not a circuit. Guessing from the range answers wrongly in both directions.
+//! - **Contained, in the socket's own family.** The range is IPv4 whatever the socket is:
+//!   quinn refuses an IPv6 destination on an IPv4 socket and maps an IPv4 one on an IPv6
+//!   socket, so an IPv4 address is the only one that works on both. An IPv6 Unique Local
+//!   Address with a random RFC 4193 Global ID would be the better container — collision
+//!   with a real network becomes negligible rather than merely unlikely — and is what to
+//!   move to if endpoints ever bind dual-stack.
+//!
+//! A datagram for a circuit that no longer exists is dropped here rather than handed to
+//! the kernel, and the port is a fixed placeholder because a circuit is identified by its
+//! address alone.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
@@ -32,10 +52,8 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::sync::mpsc;
 
-use crate::hash::{domain_hash, Digest32};
-
-/// The domain label under which a circuit address is derived from a fingerprint.
-pub const CIRCUIT_ADDR_LABEL: &str = "vox/circuit-addr/v1";
+use crate::error::Result;
+use crate::hash::Digest32;
 
 /// How many outbound datagrams a circuit will queue before dropping. A relay stream
 /// that cannot keep up is a slow path, and QUIC on a slow path drops packets — it
@@ -46,31 +64,44 @@ pub const CIRCUIT_QUEUE: usize = 256;
 /// the oldest is dropped.
 const INBOX_LIMIT: usize = 1024;
 
-/// The synthetic address that stands for a circuit to `peer` on this endpoint.
-#[must_use]
-pub fn circuit_addr(peer: &Digest32) -> SocketAddr {
-    let h = domain_hash(CIRCUIT_ADDR_LABEL, peer);
-    // 240.0.0.0/4: the first octet's high nibble is fixed, 28 bits of address and 16
-    // of port come from the hash. 255.255.255.255 is broadcast and port 0 is not a
-    // port, so both are steered away from.
-    let mut d = h[3];
-    if h[0] & 0x0F == 0x0F && h[1] == 0xFF && h[2] == 0xFF && d == 0xFF {
-        d = 0xFE;
-    }
-    let ip = Ipv4Addr::new(0xF0 | (h[0] & 0x0F), h[1], h[2], d);
-    let port = u16::from_be_bytes([h[4], h[5]]).max(1);
-    SocketAddr::V4(SocketAddrV4::new(ip, port))
-}
+/// The range circuit addresses are allocated inside: `240.0.0.0/4`, reserved by RFC 1112
+/// §4 and never routed on the public internet.
+///
+/// Containment only. It is **not** how a circuit is identified — see
+/// [`MuxSocket::is_circuit`] — which matters because this range is used privately in the
+/// field, so a host can have a real interface in it.
+const CIRCUIT_RANGE_HIGH_NIBBLE: u8 = 0xF0;
 
-/// Whether `addr` is in the synthetic range, whatever family quinn presented it in —
-/// which is how a connection's path is told apart: a peer whose remote address is a
-/// circuit's is being relayed.
+/// The placeholder port every circuit address carries. A circuit is identified by its
+/// address, so the port conveys nothing; a fixed value keeps the `SocketAddr` stable for
+/// quinn, which keys paths on the pair.
+pub const CIRCUIT_PORT: u16 = 1;
+
+/// Whether `addr` falls inside the range circuits are allocated from.
+///
+/// Containment, not identification: an address can be in the range and belong to a real
+/// interface. Use [`MuxSocket::is_circuit`] to ask whether an address *is* a live circuit.
 #[must_use]
-pub fn is_circuit_addr(addr: SocketAddr) -> bool {
+pub fn in_circuit_range(addr: SocketAddr) -> bool {
     match addr.ip().to_canonical() {
-        IpAddr::V4(v4) => v4.octets()[0] & 0xF0 == 0xF0,
+        IpAddr::V4(v4) => v4.octets()[0] & 0xF0 == CIRCUIT_RANGE_HIGH_NIBBLE,
         IpAddr::V6(_) => false,
     }
+}
+
+/// A fresh circuit address: 28 random bits inside the range.
+///
+/// Random, not derived from the peer. A fingerprint is published deliberately — it is what
+/// `vox trust add` takes — so an address derived from one would let anybody holding a
+/// fingerprint compute it and test whether it appears among a node's endpoints, reading
+/// that node's relay topology out of public data.
+///
+/// 28 bits is a small space, which is why [`MuxSocket::attach`] checks the table for a
+/// collision rather than trusting uniqueness.
+fn random_circuit_addr() -> Result<SocketAddr> {
+    let r: [u8; 4] = crate::identity::rng::random_array()?;
+    let ip = Ipv4Addr::new(CIRCUIT_RANGE_HIGH_NIBBLE | (r[0] & 0x0F), r[1], r[2], r[3]);
+    Ok(SocketAddr::new(IpAddr::V4(ip), CIRCUIT_PORT))
 }
 
 /// The circuit table's canonical key: IPv4, whatever quinn presented.
@@ -82,6 +113,9 @@ fn key(addr: SocketAddr) -> SocketAddr {
 pub struct MuxSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     circuits: Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
+    /// Which address each peer's live circuit stands at. The addresses are random, so
+    /// this is the only way to get from a peer to its circuit.
+    by_peer: Mutex<HashMap<Digest32, SocketAddr>>,
     inbox: Mutex<Inbox>,
 }
 
@@ -166,23 +200,59 @@ impl MuxSocket {
         Arc::new(Self {
             inner,
             circuits: Mutex::new(HashMap::new()),
+            by_peer: Mutex::new(HashMap::new()),
             inbox: Mutex::new(Inbox::default()),
         })
     }
 
-    /// Attach a circuit to `peer`, replacing any earlier one to the same peer: the
-    /// old driver's outbound queue closes, which ends its stream, which is how a
-    /// stale circuit is torn down when a fresh one is wanted.
-    #[must_use]
-    pub fn attach(self: &Arc<Self>, peer: &Digest32) -> CircuitPort {
-        let addr = circuit_addr(peer);
+    /// Attach a circuit to `peer` at a freshly allocated address, replacing any earlier
+    /// one to the same peer: the old driver's outbound queue closes, which ends its
+    /// stream, which is how a stale circuit is torn down when a fresh one is wanted.
+    ///
+    /// # Errors
+    /// If the OS CSPRNG is unavailable. Vox never falls back to a weaker source, and a
+    /// guessable circuit address would leak which peers this node relays to.
+    pub fn attach(self: &Arc<Self>, peer: &Digest32) -> Result<CircuitPort> {
         let (tx, rx) = mpsc::channel(CIRCUIT_QUEUE);
-        self.circuits().insert(addr, tx);
-        CircuitPort {
+        let mut circuits = self.circuits();
+        // Retried rather than assumed unique: 28 bits is a small space and a collision
+        // would silently cross two circuits' datagrams.
+        let addr = loop {
+            let candidate = random_circuit_addr()?;
+            if !circuits.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        circuits.insert(addr, tx);
+        if let Some(stale) = self.by_peer().insert(*peer, addr) {
+            circuits.remove(&stale);
+        }
+        drop(circuits);
+        Ok(CircuitPort {
             addr,
             mux: Arc::clone(self),
             outbound: Some(rx),
-        }
+        })
+    }
+
+    /// Whether `addr` is a **live circuit** on this socket.
+    ///
+    /// The answer comes from the table. A circuit address is random, so nothing about its
+    /// shape identifies it, and an address that merely falls inside the subnet
+    /// ([`in_circuit_range`]) is not a circuit unless it is attached.
+    #[must_use]
+    pub fn is_circuit(&self, addr: SocketAddr) -> bool {
+        self.circuits().contains_key(&key(addr))
+    }
+
+    /// The address `peer`'s live circuit stands at, if it has one.
+    #[must_use]
+    pub fn circuit_addr_of(&self, peer: &Digest32) -> Option<SocketAddr> {
+        self.by_peer().get(peer).copied()
+    }
+
+    fn by_peer(&self) -> std::sync::MutexGuard<'_, HashMap<Digest32, SocketAddr>> {
+        self.by_peer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The number of live circuits.
@@ -193,6 +263,7 @@ impl MuxSocket {
 
     fn detach(&self, addr: SocketAddr) {
         self.circuits().remove(&addr);
+        self.by_peer().retain(|_, a| *a != addr);
     }
 
     fn circuits(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>> {
@@ -231,7 +302,10 @@ impl AsyncUdpSocket for MuxSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        if !is_circuit_addr(transmit.destination) {
+        // The table decides, not the address's shape. A datagram for the subnet with no
+        // live circuit behind it is not a circuit send; it goes to the socket and fails
+        // there, which is the same answer any unreachable destination gets.
+        if !self.is_circuit(transmit.destination) {
             return self.inner.try_send(transmit);
         }
         match transmit.segment_size {

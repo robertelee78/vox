@@ -1643,7 +1643,9 @@ impl Node {
         // and swapped in underneath by the manager's preference rule.
         let conn = net.reach(peer, endpoints).await?;
         self.adopt_connection(Arc::clone(&conn));
-        if crate::node::net::path_class(&conn) == crate::node::net::PathClass::Relayed {
+        if crate::node::net::path_class(net.manager().endpoint(), &conn)
+            == crate::node::net::PathClass::Relayed
+        {
             let tx = self.net_tx.clone();
             let endpoints = endpoints.clone();
             tokio::spawn(async move {

@@ -41,7 +41,7 @@ use crate::hash::Digest32;
 use crate::node::coordstream::{accepts_relayed, relays_for};
 use crate::node::net::PeerClass;
 use crate::transport::framing::{read_frame, write_frame};
-use crate::transport::mux::{circuit_addr, CircuitPort};
+use crate::transport::mux::CircuitPort;
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
 use crate::transport::streams::{open_typed, StreamKind};
 
@@ -324,7 +324,7 @@ where
                 return Err(Error::StreamRefused("circuit: peer may not relay to us"));
             }
             send_frame(&mut send, &CircuitFrame::Opened).await?;
-            let port = endpoint.attach_circuit(&origin);
+            let port = endpoint.attach_circuit(&origin)?;
             tokio::spawn(terminate(port, send, recv));
             Ok(())
         }
@@ -358,13 +358,15 @@ pub async fn connect_through(
         }
         _ => return Err(Error::Unreachable("circuit: relay did not open")),
     }
-    let port = endpoint.attach_circuit(&peer);
+    let port = endpoint.attach_circuit(&peer)?;
+    // Read before the port moves into the driver: the address is allocated per circuit,
+    // so the port is the only thing that knows it.
+    let target = port.addr();
     // The driver lives exactly as long as the attempt does, unless the attempt
     // succeeds: a failed dial — or an attempt abandoned because another rung won the
     // race (M15.1b) — aborts it on drop, which drops the port, which detaches the
     // circuit and closes the stream, which tells the relay and the far side to let go.
     let driver = DriverGuard::new(tokio::spawn(terminate(port, send, recv)));
-    let target = circuit_addr(&peer);
     let conn =
         crate::nat::reachability::connect_direct(Arc::clone(endpoint), &[target], peer, now_secs)
             .await?;

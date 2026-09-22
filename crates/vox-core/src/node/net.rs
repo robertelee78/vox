@@ -206,10 +206,15 @@ pub enum PathClass {
     Direct,
 }
 
-/// The path a connection is on, read off its remote address.
+/// The path a connection is on.
+///
+/// Asked of the endpoint whose socket carries it, because a circuit's address is random:
+/// only the mux's table knows which addresses are circuits, and a guess from the address
+/// would be wrong in both directions — a real address can fall inside the subnet, and a
+/// circuit's address looks like nothing in particular.
 #[must_use]
-pub fn path_class(conn: &VoxConnection) -> PathClass {
-    if crate::transport::mux::is_circuit_addr(conn.quinn().remote_address()) {
+pub fn path_class(endpoint: &VoxEndpoint, conn: &VoxConnection) -> PathClass {
+    if endpoint.is_circuit(conn.quinn().remote_address()) {
         PathClass::Relayed
     } else {
         PathClass::Direct
@@ -368,7 +373,7 @@ impl ConnectionManager {
         if let Some(existing) = map.get(&peer) {
             if is_live(existing) {
                 let existing = Arc::clone(existing);
-                if path_class(&conn) <= path_class(&existing) {
+                if path_class(&self.endpoint, &conn) <= path_class(&self.endpoint, &existing) {
                     drop(map);
                     conn.close(WireError::AuthenticatorInvalid);
                     return existing;
