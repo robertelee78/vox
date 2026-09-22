@@ -18,11 +18,31 @@ Vox derives a circuit's address from the far peer's fingerprint into `240.0.0.0/
 IpAddr::V4(v4) => v4.octets()[0] & 0xF0 == 0xF0,
 ```
 
-`240.0.0.0/4` is not unused space in practice. It is in real-world use on hosts running VPNs, iCloud
-Private Relay and some CGNAT deployments — **including the machine this was found on, whose default route
-runs over an interface addressed in that range.** Measured: `local_route_ips()` on that host returns a
-`240.x` address, and `is_routable` (which rejects `o[0] >= 240` on the grounds that "Vox's own circuit
-addresses live here") therefore rejects the host's *only* route address.
+**Correction, same day, before anyone builds on the paragraph that used to be here.** This section
+originally claimed the machine in question had an interface addressed in `240.0.0.0/4`. That was wrong, and
+enumerating the interfaces disproves it:
+
+```
+lo0    127.0.0.1
+en0    192.168.1.48
+utun7  10.10.3.201     (a split-mode corporate VPN)
+```
+
+No `240.x` interface. The `240.x` dial candidates seen in the instrumentation — `254.245.191.165:6427`,
+`246.252.112.25:52967` — are **Vox's own circuit addresses**, which `mux::circuit_addr` derives from a peer
+fingerprint as `0xF0 | (h[0] & 0x0F)` in the first octet with a hash-derived port. That is why they looked
+random and differed every run: fresh identities per run.
+
+So the original diagnosis was right and the correction that replaced it was wrong. What remains true, and is
+the reason `is_circuit_addr` should still consult the table rather than test a prefix, is that `240.0.0.0/4`
+**is** used privately by some VPN and CGNAT deployments, so the prefix test is unsound on *some* hosts even
+though it happens to be safe on this one. That is a robustness argument, not the explanation of this bug.
+
+The separately-reverted change — filtering `local_route_ips()` through `is_routable` — was wrong for a
+different and simpler reason: `is_routable` means *globally* routable, so it rejects `192.168.1.48` and
+`10.10.3.201`, which are this host's only usable addresses and are exactly what a LAN or same-machine peer
+needs. ADR-012 advertises private addresses deliberately ("the routable IPv4 address (a LAN peer can use
+it)"). Reverting it was right; the reason given at the time was not.
 
 So on such a host the prefix test is **wrong in both directions**:
 
@@ -36,11 +56,12 @@ keyed by `key(addr)` — so whether an address is a circuit is *known*, not some
 `is_circuit_addr` should consult that table. Inferring it from a prefix is the same class of error as
 ADR-018 §8b: something knew the answer and was not asked.
 
-**Reverted:** my `EndpointList::direct_candidates` filter (`bb083f7`), which dropped `240/4` candidates. It
-is built on this unsound predicate, so on a host with a real `240/4` interface it drops a **working**
-address. I landed it believing the range was Vox's alone. Measured after the revert decision: the rehearsal
-went 1-of-6 with that filter plus two related changes, against 2-of-6 without — indistinguishable, so the
-filter cannot be claimed to help, and it carries a known risk of harm. Out until the predicate is sound.
+**Reverted, and the revert was over-cautious.** `EndpointList::direct_candidates` filtering `240/4`
+(`bb083f7`) was reverted on the false premise above. On this host it dropped only genuine circuit addresses,
+which is correct behaviour. It is nonetheless still out, because the 1-of-6 measurement that triggered the
+revert was confounded by the `is_routable` change landing alongside it — that one demonstrably removed
+working addresses, so the pair cannot be attributed. It should return once the source fix below is in and
+the predicate consults the table, and be measured on its own.
 
 **Also written and NOT landed:** making a relayed path answer no `WHOAMI` (the note below). Correct in
 principle — a relayed path reveals nothing about a peer's reachability — but it depends on the same
