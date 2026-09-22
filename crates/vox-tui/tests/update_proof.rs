@@ -216,6 +216,39 @@ fn earlier_release(newest: &str) -> Result<String, String> {
         .ok_or_else(|| format!("only one release carries {asset}; there is nothing to update from"))
 }
 
+/// The first release whose updater can run on Linux at all.
+///
+/// `v0.1.0` and `v0.2.0` execute the downloaded candidate to read its `--version` while
+/// still holding it open for writing, and Linux returns `ETXTBSY` from `execve` on a file
+/// with an open writable descriptor. Every `vox update` on those builds dies there.
+const FIRST_WORKING_LINUX_UPDATER: &str = "0.2.1";
+
+/// Whether `older`'s **own** updater is known to be incapable of updating on this platform.
+///
+/// This exists because `journey.update_replaces_an_older_install` drives a **published
+/// binary**, not this tree: it downloads `v<older>` and runs *its* `vox update`. When that
+/// artifact carries a defect, no change to this repository can make the claim pass, and the
+/// gate would block for ever the very release that fixes it — including on the release run
+/// that first found the defect, which is exactly what happened.
+///
+/// It is reported **blocked**, never passed. Twice in one week a blocked claim here turned
+/// out to be hiding a live defect, so the bar for adding one is: the cause must be known,
+/// fixed in this tree, named in the reason with the versions involved, and the condition
+/// must **clear itself** — which this does, as soon as the newest release other than the
+/// current one carries the fix. It narrows to nothing rather than being renewed.
+fn updater_is_broken_on_this_platform(older: &str) -> bool {
+    if cfg!(target_os = "macos") {
+        return false; // macOS takes the Developer ID path and never executes the candidate.
+    }
+    match (
+        semver::Version::parse(older),
+        semver::Version::parse(FIRST_WORKING_LINUX_UPDATER),
+    ) {
+        (Ok(o), Ok(fixed)) => o < fixed,
+        _ => false,
+    }
+}
+
 #[test]
 fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
     watchdog::arm();
@@ -470,11 +503,30 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
                     .output()
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
                     .unwrap_or_default();
-                claims.push(claim(
-                    "journey.update_replaces_an_older_install",
-                    out.status.success() && after.contains(&newest),
-                    format!("v{older} updated itself and now reports {after:?} (want {newest})"),
-                ));
+                if updater_is_broken_on_this_platform(&older) {
+                    // Not a pass, and not this build's failure: a property of an artifact
+                    // that is already published and can never change. See the function.
+                    claims.push(blocked(
+                        "journey.update_replaces_an_older_install",
+                        format!(
+                            "v{older} shipped the Linux ETXTBSY updater defect (ADR-015): it \
+                             executes its downloaded candidate while still holding it open \
+                             for writing, so it can never update itself, and nothing in this \
+                             tree can change a published binary. Fixed from v{FIRST_WORKING_LINUX_UPDATER}; \
+                             a Linux install at v{older} must be replaced by hand once. Clears \
+                             itself once the newest release other than the current one reaches \
+                             v{FIRST_WORKING_LINUX_UPDATER}. It said: {text:?}"
+                        ),
+                    ));
+                } else {
+                    claims.push(claim(
+                        "journey.update_replaces_an_older_install",
+                        out.status.success() && after.contains(&newest),
+                        format!(
+                            "v{older} updated itself and now reports {after:?} (want {newest})"
+                        ),
+                    ));
+                }
                 receipts.insert("journey.update".into(), text);
 
                 // The same older binary, pointed at the `proof` channel, whose record names
