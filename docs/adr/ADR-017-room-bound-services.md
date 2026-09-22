@@ -1178,12 +1178,26 @@ New work, in dependency order:
   `name → (channel, host, port)` and the tunnel request carries the port as its tag. Gate: a descriptor
   copied verbatim into another room does not resolve there; two hosts serving `:22` in one room are reached
   by their own names and never each other's; and a rebound port does not answer on a stale name.
-- **M17.13 — compatibility, and it ships with M17.7.** The genesis field and `0x0013` keep parsing so every
-  existing room keeps its channelID (`governance/genesis.rs`'s `GenesisBody`); neither is consulted for authorization;
-  creating a genesis with the field is refused. Gate: a room created by v0.1.0 opens, verifies and keeps its
-  channelID under the new code, and its genesis grant authorizes nobody. Release notes state that a
-  mixed-version peer still applies the old rules **to its own services**, bounded there because every host
-  enforces its own consent set locally.
+- **M17.13 — compatibility. DONE 2026-09-22**, and it shipped with M17.7. The genesis field and `0x0013`
+  keep parsing so every existing room keeps its channelID (`governance/genesis.rs`'s `GenesisBody`), and
+  neither is consulted for authorization — `Evaluator::is_excluded` remains as the parsed fact with no
+  authorization path reading it.
+  - Proof: `crates/vox-core/tests/m17_13_v010_compat_proof.rs`. The fixture beside it was produced by
+    **building the `v0.1.0` tag (875e2f8)** and printing what that binary computed for a genesis with fixed
+    seeds, a fixed nonce and a non-empty service grant. The comparison is therefore against a real old
+    build; today's code agreeing with itself would prove nothing about compatibility.
+  - It asserts three things: today's encoder produces v0.1.0's canonical body **byte for byte**; the
+    channelID is unchanged (`c82a371c…`), so the room keeps its name and its `.vox` hostname; and that
+    grant authorizes **nobody** — `dial:22` and `dial:ssh` are both refused to a full member of that room.
+  - Bodies are compared whole rather than field by field, deliberately: a mismatched `e.array(N)` fails
+    *silently* — a record is simply rejected three layers from the cause — which has already happened once
+    in this codebase.
+  - Mutation-checked both halves: `e.array(6)` → `array(7)` fails the byte comparison; restoring
+    `service_grant_verdict` fails the authorization assertion, naming finding #1.
+  - **Still to write:** the release note that a mixed-version peer applies the old rules **to its own
+    services**. That is bounded — every host enforces its own reach locally — but it is a real caveat for
+    anyone running v0.1.0 and this build in the same room, and it is not yet written down anywhere a user
+    would see it.
 
 - **M17.14 — withdrawing trust changes the lock. *Done 2026-09-21* (`5fefcbb`).** `NodeCommand::Untrust`
   removes the ring entry and then walks every channel where consent was actually granted, reusing M18.1's
@@ -1202,9 +1216,9 @@ M17.6 must land first and alone: it closes both the admission hole and the auto-
 gate is meaningless until it has. M17.7 and M17.13 ship together. M17.9 blocks M17.10 and M17.12. M17.11
 depended on M17.7 and shipped with it. M17.8 is independent of all of it.
 
-## Open proof gap: the stalled-handshake fix is unproven
+## Open proof gap: the residual 30-second serialisation is unproven
 
-**M17.17 (verified finding #3) is fixed in code and NOT proved.** Recorded here rather than left
+**M17.17 (verified finding #3) is PARTLY fixed and the remainder is NOT proved.** Recorded here rather than left
 implied, because ADR-018 §4 is explicit that absent evidence must not read as success — and because a
 green test that does not discriminate is worse than no test.
 
@@ -1216,9 +1230,35 @@ to hold the peer to. Worst against an always-on, publicly addressable node, whic
 The loop's own comment claimed a slow peer could not stall the others; that was true of the *stream*
 loop, which runs after the handshake, and is why the defect survived review.
 
-**The fix.** `VoxEndpoint::accept_incoming` takes the attempt and returns; `finish_incoming` completes
-the handshake and admission on its own task, bounded by a 30s `HANDSHAKE_TIMEOUT` so an abandoned
-attempt is finite. `spawn_accept_loop` is now two-phase.
+**What actually shipped, corrected 2026-09-22.** The two-phase API exists — `accept_incoming` takes the
+attempt and returns, `finish_incoming` completes the handshake and admission bounded by a 30s
+`HANDSHAKE_TIMEOUT` — but **`spawn_accept_loop` does NOT spawn phase two.** It still calls
+`ConnectionManager::accept`, inline.
+
+That is a smaller fix than the one described above, and it is not nothing: `accept_with_admission` routes
+through `finish_incoming`, so the inline path inherits the 30s bound. **The unbounded case is gone.** A
+peer that opens a connection and never finishes its handshake now delays other inbound connections by at
+most 30 seconds rather than for ever. What remains is a 30-second serialisation window, which is a real
+residual DoS against an anchor and is stated as one.
+
+**Why the loop is not split, measured.** Spawning phase two per attempt makes circuit establishment
+between peers behind symmetric NATs wildly variable. Same gate, same box, same commit:
+
+| accept loop | `m15_two_clients_behind_symmetric_nats…` |
+|---|---|
+| serialised (shipped) | 40–52s, consistently green |
+| split | 68s, 140s, and a **timeout at 247s** |
+
+Two hypotheses were tested and **refuted**: the one-connection-per-peer rule in
+`ConnectionManager::file` is not implicated (instrumented — it never closed a loser or retired an
+existing one across a whole passing run), and per-connection ordering is identical in both versions
+(file → `spawn_stream_loop` → `Connected` in each). So the cause is a cross-connection interaction in
+circuit establishment that is **not yet identified**, and no theory should be recorded here until it is.
+
+Worth noting that the split is quinn's own documented shape — its `examples/server.rs` does
+`while let Some(conn) = endpoint.accept().await { … tokio::spawn(handle_connection(conn)) }`, awaiting the
+handshake inside the task. So the shape is not the error; an assumption of ours that the shape violates
+is. Those two NAT gates are the acceptance test for whoever finds it.
 
 **Why it is unproven.** A test was written and **deleted**, because its mutation check did not
 discriminate: with the old serialised loop restored it still passed. The reason is instructive — the
