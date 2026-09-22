@@ -319,6 +319,26 @@ impl RendezvousStore {
         // 2. Time sanity (store-applied default TTL).
         check_time_validity(record.timestamp, prejoin_expiry(&record), now)?;
 
+        // 2a. A pre-join is only meaningful for a channel this board actually serves.
+        //
+        // Without this, `entry(...).or_default()` created a bucket for **any** channelID an
+        // unauthenticated peer named, and the peer was then classified `PendingJoiner` for it
+        // (`node::network::classify` → `peer_has_prejoin`), which is what lets it open a
+        // `Join` or `Pairwise` stream. A pre-join needs no membership, no passphrase and no
+        // proof of work — by design, since a joiner has none of those yet — so that
+        // classification was self-service, and a channelID is public: it is the 52-character
+        // `.vox` name, and it is in every invite link.
+        //
+        // Requiring the genesis costs a legitimate joiner nothing. The board it publishes to
+        // is an anchor for that room or a member of it, and both hold the genesis; a board
+        // that does not is not one that could answer the join anyway. It also stops an
+        // unauthenticated peer making this node allocate a bucket per fabricated channelID.
+        if self.genesis(&record.channel_id).is_none() {
+            return Err(Error::RendezvousRejected(
+                "pre-join for a channel this board does not serve",
+            ));
+        }
+
         let asserted_id = record.asserted_id();
         let bucket = self.prejoins.entry(record.channel_id).or_default();
 

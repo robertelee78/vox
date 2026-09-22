@@ -294,6 +294,22 @@ enum NetEvent {
         /// The connection that landed.
         conn: Arc<VoxConnection>,
     },
+    /// A peer asked to join a channel, and its request has **already been read** on the
+    /// stream's own task. Reading it in the actor was a denial of service reachable by
+    /// anyone holding a valid identity and a `.vox` name — see the comment in
+    /// `spawn_stream_loop`.
+    JoinRequest {
+        /// The authenticated peer.
+        peer: Digest32,
+        /// The channel it asked to join.
+        channel_id: Digest32,
+        /// The epoch it named.
+        epoch: u64,
+        /// The stream's send half.
+        send: quinn::SendStream,
+        /// The stream's receive half.
+        recv: quinn::RecvStream,
+    },
     /// A peer asked to reconcile a channel, and its request has **already been read** on
     /// the stream's own task. The actor does the reconciliation; it never waits for the
     /// peer to speak, because anything the actor awaits inline stops the whole node.
@@ -395,6 +411,34 @@ fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Send
                 // not even hold up the other streams on its own connection. The read is
                 // bounded by `framing::FRAME_PATIENCE`. Every state mutation still happens in
                 // the actor, in order.
+                // A join request is read here for the same reason a sync preamble is, and the
+                // exposure is worse: a peer needs only a valid identity and a `.vox` name.
+                // `Unknown` may open a `Rendezvous` stream, publish a self-signed pre-join
+                // record naming itself for any channel this board serves, and is then
+                // classified `PendingJoiner` — which may open `Join`. So the read that used to
+                // sit in the actor was reachable by anyone who had ever seen an invite link.
+                Ok(Inbound::Join { peer, send, recv }) => {
+                    failures = 0;
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let mut recv = recv;
+                        let Ok((channel_id, epoch)) =
+                            crate::node::joinstream::read_join_request(&mut recv).await
+                        else {
+                            crate::node::joinstream::refuse_join(send).await;
+                            return;
+                        };
+                        let _ = tx
+                            .send(NetEvent::JoinRequest {
+                                peer,
+                                channel_id,
+                                epoch,
+                                send,
+                                recv,
+                            })
+                            .await;
+                    });
+                }
                 Ok(Inbound::Sync { peer, send, recv }) => {
                     failures = 0;
                     let tx = tx.clone();
@@ -1502,6 +1546,16 @@ impl Node {
             NetEvent::Stopped => {
                 self.net = None;
             }
+            NetEvent::JoinRequest {
+                peer,
+                channel_id,
+                epoch,
+                send,
+                recv,
+            } => {
+                self.answer_inbound_join(peer, channel_id, epoch, send, recv)
+                    .await;
+            }
             NetEvent::SyncRequest {
                 conn,
                 peer,
@@ -1563,8 +1617,9 @@ impl Node {
                 // opened on it, or the peer sees it close mid-exchange.
                 let _connection = conn;
                 match inbound {
-                    Inbound::Join { peer, send, recv } => {
-                        self.answer_inbound_join(peer, send, recv).await;
+                    Inbound::Join { .. } => {
+                        // Unreachable: the stream loop turns these into
+                        // `NetEvent::JoinRequest` once the request is read.
                     }
                     Inbound::Pairwise { peer, recv, .. } => {
                         self.take_inbound_skdm(peer, recv).await;
@@ -1617,17 +1672,16 @@ impl Node {
     /// by the join's PoP and it holds the channel passphrase) and the session is
     /// kept — but it is granted no read access: that waits for this user's consent
     /// (ADR-007).
+    /// Answer a join whose request has **already been read** off the actor's task.
     async fn answer_inbound_join(
         &mut self,
         peer: Digest32,
+        channel_id: Digest32,
+        epoch: u64,
         send: quinn::SendStream,
-        mut recv: quinn::RecvStream,
+        recv: quinn::RecvStream,
     ) {
-        use crate::node::joinstream::{read_join_request, refuse_join};
-        let Ok((channel_id, epoch)) = read_join_request(&mut recv).await else {
-            refuse_join(send).await;
-            return;
-        };
+        use crate::node::joinstream::refuse_join;
         let answerable = match self.channels.get(&channel_id) {
             Some(shared) => {
                 let c = shared.lock().await;
