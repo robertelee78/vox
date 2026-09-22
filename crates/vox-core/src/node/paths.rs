@@ -20,6 +20,13 @@ pub const VAULT_FILE: &str = "vault.cbor";
 pub const STORE_FILE: &str = "store.redb";
 /// The ADR-020 §7 local control socket, inside the profile directory.
 pub const SOCKET_FILE: &str = "node.sock";
+
+/// The longest socket path we will use before falling back to a short one.
+///
+/// `sockaddr_un.sun_path` is 104 bytes on macOS and 108 on Linux, including the
+/// terminator. 100 is under both with room to spare, and being conservative costs
+/// nothing: the fallback is as good a socket, just less self-describing.
+const SUN_PATH_BUDGET: usize = 100;
 /// The anchors file inside a profile's **config** directory (ADR-017 decision 7, M17.4):
 /// one `<fingerprint>@<multiaddr>` per line, `#` comments and blank lines ignored.
 ///
@@ -99,9 +106,35 @@ impl Paths {
     /// Per profile, so several nodes on one machine never contend for it, and
     /// inside the profile directory because that is already the trust boundary:
     /// whoever can open the socket can already read `vault.cbor` beside it.
+    /// **Falls back to a short path when the profile's is too long.** A Unix socket
+    /// address is a fixed-size buffer — 104 bytes on macOS, 108 on Linux — and a
+    /// profile under a deep directory blows it. `vox daemon` then dies at startup
+    /// with `path must be shorter than SUN_LEN`, which tells a person nothing about
+    /// what to do, and the feature is simply unavailable on a path they chose for
+    /// unrelated reasons.
+    ///
+    /// The fallback is `<tmp>/vox-<16 hex>.sock`, where the hex is a digest of the
+    /// profile directory. **Deterministic**, so a client computes the same path the
+    /// daemon bound without being told, and distinct per profile, so two nodes never
+    /// collide. It is only used when the natural path does not fit, so an ordinary
+    /// profile keeps the socket beside its vault where the trust boundary already is.
     #[must_use]
     pub fn socket_file(&self) -> PathBuf {
-        self.profile_dir.join(SOCKET_FILE)
+        let natural = self.profile_dir.join(SOCKET_FILE);
+        if natural.as_os_str().len() < SUN_PATH_BUDGET {
+            return natural;
+        }
+        let digest = crate::hash::domain_hash(
+            "vox/control-socket/v1",
+            self.profile_dir.as_os_str().as_encoded_bytes(),
+        );
+        let mut name = String::from("vox-");
+        for byte in &digest[..8] {
+            use std::fmt::Write as _;
+            let _ = write!(name, "{byte:02x}");
+        }
+        name.push_str(".sock");
+        std::env::temp_dir().join(name)
     }
 
     /// The anchors file for this profile ([`ANCHORS_FILE`]).

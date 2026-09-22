@@ -596,6 +596,23 @@ is where padding belongs if it is ever wanted.
 > the anchor it learned from the file; a third profile runs `vox connect` with no `--anchor` and joins.
 > Mutation-checked: stop reading the file and it fails.
 
+> **A name is resolved once, at startup — known gap, 2026-09-22.** M17.5 let an anchor be named
+> `home.example.us:4433` instead of `/ip4/.../udp/4433`, and the stated motivation was precisely that
+> a person should not have to "re-issue it to every client when it moves — which for a home connection
+> is whenever the ISP decides". The implementation does not yet deliver that for a **long-running**
+> process. `resolve_host` has one call path, `parse_anchor_spec`, which runs when the CLI reads its
+> configuration; nothing re-resolves afterwards. So `vox daemon`, `vox up` and `vox node` hold the
+> address they got at launch, and when a home anchor's address changes they keep dialling the old one
+> until someone restarts them. A short-lived command is unaffected, because it resolves and exits.
+>
+> This is a reachability failure that attributes badly — the anchor is up, the name is right, and the
+> client says only that it cannot reach a peer — which is the exact complaint this decision exists to
+> answer. It is recorded here rather than fixed in the same breath because the honest proof is the hard
+> part: proving *re-resolution* rather than the proxy property "re-reads the file" needs a name whose
+> record actually changes under the proof's control, and this machine has no such name. Closing it means
+> both a re-resolve on the reconnect path and a prover that can move a record — a local resolver the
+> proof owns, so the assertion is on the quantifier that matters.
+
 `--anchor <fp>@<addr>` on every command is the second-worst step. Anchors become **configuration**:
 
 - `vox node` writes its own anchor spec to `<config_dir>/anchors` when it starts, so a client on the
