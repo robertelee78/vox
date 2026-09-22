@@ -9,13 +9,36 @@
 //! wire; this record makes the fact auditable at the application/log layer too
 //! (e.g. a peer can later prove which group a session used).
 //!
+//! **What `negotiated_group` is, exactly.** It is a compile-time constant, written
+//! unconditionally by [`SessionEstablishment::new`]. Nothing downstream of our own
+//! configuration is consulted, so the field would read `X25519MLKEM768` just as
+//! confidently if a handshake had used something else. It records **the group this
+//! build offers**, and the module heading's "prove which group a session used"
+//! overstated it.
+//!
+//! This is a defect in the evidence, not in the cryptography, and the distinction
+//! matters because the record's whole job is to be independent evidence. The
+//! guarantee itself holds without this field: the provider offers exactly one
+//! `kx_group` so there is no downgrade target,
+//! `provider::assert_pq_only` enforces that at every config
+//! boundary, and TLS 1.3 binds the negotiated parameters into the Finished MAC, so a
+//! mismatch breaks the handshake rather than passing quietly. Nobody's traffic is at
+//! risk; the audit record is simply restating our intent under a name that reads like
+//! an observation.
+//!
+//! Making it an observation needs the value rustls already holds: quinn 0.11 gates
+//! `negotiated_key_exchange_group` behind a test-only cfg, so it is not reachable
+//! from a `Connection` today. Until it is, this field MUST NOT be cited as evidence
+//! of what a session negotiated.
+//!
 //! Body field order (fixed, canonical-CBOR array): `[peer_id, suite_id,
 //! negotiated_group, ts]`:
 //! - `peer_id` — the authenticated peer's 32-byte composite-identity fingerprint;
 //! - `suite_id` — the ADR-003 ciphersuite id in force (`vox-suite-1` = `0x0001`);
 //! - `negotiated_group` — the TLS named-group code point (X25519MLKEM768 =
-//!   `0x11EC`); a record whose group is anything else is a downgrade and is
-//!   rejected on parse;
+//!   `0x11EC`). **This build writes the group it offers, not a group it observed.**
+//!   See the note below; a record whose group is anything else is rejected on parse,
+//!   which bites for a record from elsewhere and can never fire for one of ours;
 //! - `ts` — unix seconds the session was established.
 
 use crate::cbor::{Decoder, Encoder};
@@ -32,7 +55,11 @@ pub struct SessionEstablishment {
     pub peer_id: Digest32,
     /// The ADR-003 ciphersuite id in force for the session.
     pub suite_id: u16,
-    /// The negotiated TLS named-group code point (must be X25519MLKEM768).
+    /// The TLS named-group code point this build **offers** (X25519MLKEM768).
+    ///
+    /// Not an observation of the handshake — see the module docs. The name is the
+    /// wire field's, which is why it has not been changed; the documentation is where
+    /// the correction belongs.
     pub negotiated_group: u16,
     /// Unix seconds at which the session was established.
     pub ts: u64,
@@ -41,6 +68,10 @@ pub struct SessionEstablishment {
 impl SessionEstablishment {
     /// Build a record for a session negotiated with the Vox default suite
     /// (`vox-suite-1`) over the X25519MLKEM768 group.
+    ///
+    /// `negotiated_group` is filled from the constant, unconditionally: this
+    /// constructor has no access to what the handshake actually chose. See the module
+    /// docs before citing the field as evidence.
     #[must_use]
     pub fn new(peer_id: Digest32, ts: u64) -> Self {
         Self {
