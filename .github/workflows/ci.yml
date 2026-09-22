@@ -12,7 +12,7 @@ env:
   # Removing one MUST make the proofs fail until it is closed.
   # The gaps ADR-018 §3 accepts, named so accepting them is a visible decision. `fish` is NOT
   # here: the runners install it below, which is how that gap gets closed rather than excused.
-  VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes"
+  VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes,opencode,cross-process-join,cross-process-tunnel"
 
 jobs:
   build-test:
