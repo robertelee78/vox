@@ -336,6 +336,8 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     }
 
     // ---- and they talk, over the overlay, as agents ----
+    let room_for_file = room.clone();
+    let room_for_announce = room.clone();
     let (ok, _, err) = vox(
         &alice_dir,
         &[
@@ -378,6 +380,86 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     )
     .expect("the claim crosses");
 
+    // ---- the file leg: agent-comms file transfer, across processes ----
+    //
+    // This is a **different subsystem** from everything above. Posting and claiming
+    // ride the log and its sync; `vox room send|get` rides a room-bound service and
+    // a `Forward` — a QUIC tunnel over the overlay. ADR-012 currently records that
+    // path failing at establishment and mid-stream, so this leg is expected to be
+    // the flaky one, and it is named separately for exactly that reason: a single
+    // allowance covering both would let a tunnel regression hide behind a join
+    // defect, or the reverse.
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let source = tmp.path().join("artifact.bin");
+    std::fs::write(&source, &payload).unwrap();
+
+    let mut offer = Proc::spawn(
+        "alice-send",
+        &alice_dir,
+        &[
+            "room".into(),
+            "send".into(),
+            room_for_file.clone(),
+            source.to_string_lossy().into_owned(),
+        ],
+        None,
+    );
+    offer.expect_line("the offer's announcement", |l| l.contains("offering"));
+
+    // The announcement is a log entry and has to reach bob before he can ask for it.
+    // Without this wait the collector reports "no offer in this room matches", which
+    // is the *test* being early rather than the transfer failing — a distinction the
+    // error message makes and an earlier version of this leg did not respect.
+    until(
+        &bob_dir,
+        "the file announcement to reach bob",
+        &["room".into(), "read".into(), room_for_announce.clone()],
+        60,
+        |o| o.contains("artifact.bin"),
+    )
+    .expect("the announcement crosses");
+
+    let dest = tmp.path().join("collected.bin");
+    let (ok, out, err) = vox(
+        &bob_dir,
+        &[
+            "room".into(),
+            "get".into(),
+            room_for_file,
+            "artifact.bin".into(),
+            "--out".into(),
+            dest.to_string_lossy().into_owned(),
+        ],
+        None,
+    );
+    if !ok {
+        assert!(
+            allow_unproven("cross-process-tunnel"),
+            "UNPROVEN: a file transfer across processes failed — {err}\n\
+             `vox room send|get` rides a room-bound service and a `Forward`, which is \
+             the tunnel path ADR-012 records as failing at establishment and mid-stream. \
+             Set VOX_PROOF_ALLOW_UNPROVEN=cross-process-tunnel to accept it deliberately; \
+             remove the allowance when that path is fixed."
+        );
+        eprintln!("UNPROVEN (allowed): cross-process file transfer failed: {err}");
+        drop(offer);
+        drop(daemons);
+        drop(anchor);
+        return;
+    }
+    assert!(
+        out.contains("verified"),
+        "the collector must verify: {out:?}"
+    );
+    let got = std::fs::read(&dest).expect("the collected file");
+    assert!(
+        got == payload,
+        "the bytes differ across the overlay: got {} of {}",
+        got.len(),
+        payload.len()
+    );
+
+    drop(offer);
     drop(daemons);
     drop(anchor);
 }
