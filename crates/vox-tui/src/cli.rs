@@ -273,12 +273,56 @@ enum RoomCmd {
     /// Nobody is granted anything: whoever can read the announcement can reach
     /// the bytes, because both are gated on this node's trust keyring.
     Send(SendFileArgs),
+    /// Join a room from a `vox://` address, over a running node (ADR-020 §12).
+    ///
+    /// The passphrase is read from **stdin**, never argv, which anything that can
+    /// run `ps` would see:
+    ///
+    /// ```text
+    /// echo 'the room passphrase' | vox room join vox://… --name mission
+    /// ```
+    ///
+    /// This is what makes agent comms usable on a host with no terminal: `vox
+    /// daemon` lets a node hold rooms unattended, and this is how a room gets
+    /// onto it. Joining grants nothing — whether anyone can read you is their
+    /// decision, made with `vox trust`.
+    Join(JoinRoomArgs),
+    /// Create a room on a running node. Passphrase on stdin.
+    Create(CreateRoomArgs),
+    /// Print a room's address, for someone else to `vox room join` with.
+    ///
+    /// The address is rendezvous information, not a credential — no passphrase,
+    /// and joining with it grants nothing. Goes to stdout so it pipes; the
+    /// warnings go to stderr so they do not.
+    Invite(RoomRefArgs),
     /// Collect a file offered in this room, verifying it against the announced
     /// SHA-256 before it is usable.
     ///
     /// A mismatch removes the partial file rather than leaving something that
     /// looks complete — a truncated `nc` transfer is the classic way this bites.
     Get(GetFileArgs),
+}
+
+/// `vox room join`
+#[derive(Args, Debug, Clone)]
+pub struct JoinRoomArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The `vox://` address you were given.
+    pub link: String,
+    /// A local name for the room. Never leaves this device.
+    #[arg(long, default_value = "room")]
+    pub name: String,
+}
+
+/// `vox room create`
+#[derive(Args, Debug, Clone)]
+pub struct CreateRoomArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// A local name for the room. Never leaves this device.
+    #[arg(long, default_value = "room")]
+    pub name: String,
 }
 
 /// `vox room send`
@@ -891,6 +935,9 @@ pub fn run() -> ExitCode {
                 RoomCmd::Handoff(a) => &a.profile,
                 RoomCmd::Send(a) => &a.profile,
                 RoomCmd::Get(a) => &a.profile,
+                RoomCmd::Join(a) => &a.profile,
+                RoomCmd::Create(a) => &a.profile,
+                RoomCmd::Invite(a) => &a.profile,
             };
             let paths = match profile.paths() {
                 Ok(p) => p,
@@ -931,6 +978,9 @@ pub fn run() -> ExitCode {
                     }
                     RoomCmd::Board(a) => crate::room_cli::board(&paths, &a.room).await,
                     RoomCmd::Send(a) => crate::room_cli::send_file(&paths, &a.room, &a.path).await,
+                    RoomCmd::Join(a) => crate::room_cli::join(&paths, &a.link, &a.name).await,
+                    RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
+                    RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
                     RoomCmd::Get(a) => {
                         crate::room_cli::get_file(&paths, &a.room, &a.file, a.out.as_deref()).await
                     }

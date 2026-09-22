@@ -57,7 +57,7 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// The protocol this build speaks. Bumped when a frame's shape changes in a way
 /// an older client would misread; a client that sees a version it does not know
 /// MUST disconnect rather than guess.
-pub const PROTOCOL_VERSION: u64 = 3;
+pub const PROTOCOL_VERSION: u64 = 4;
 
 /// Largest frame accepted in either direction.
 ///
@@ -97,6 +97,7 @@ const T_ROWS: u64 = 5;
 const T_MEMBERS: u64 = 6;
 const T_ROOMS: u64 = 7;
 const T_BOUND: u64 = 8;
+const T_LINK: u64 = 9;
 // Client → node.
 const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
@@ -112,6 +113,14 @@ const T_REMOVE_SERVICE: u64 = 7;
 const T_FORWARD: u64 = 8;
 const T_STOP_FORWARD: u64 = 9;
 const T_GRANT: u64 = 10;
+// Protocol 4 — joining and creating a room over the socket (ADR-020 §12).
+// Without these, a room can only be created or joined from the TUI, so an agent on
+// a host with no terminal has a daemon that can *hold* rooms and no way to ever
+// get one onto it. `vox daemon` made the feature runnable headless; these make it
+// reachable headless.
+const T_JOIN: u64 = 11;
+const T_CREATE: u64 = 12;
+const T_INVITE: u64 = 13;
 
 /// What a client sends.
 ///
@@ -183,6 +192,35 @@ pub enum Request {
     StopForward {
         /// The address [`Frame::Bound`] reported.
         local: String,
+    },
+    /// Join a room from an invite link.
+    ///
+    /// The passphrase travels over a `0600` socket on the local machine, which is
+    /// the same trust boundary the node's own unlocked identity already sits
+    /// behind — anything that can speak this socket can already read the rooms.
+    Join {
+        /// The `vox://` address.
+        link: String,
+        /// A local name for the room; never leaves this device.
+        local_name: String,
+        /// The room's passphrase, which the link does not carry.
+        passphrase: String,
+    },
+    /// Create a room on this node.
+    Create {
+        /// A local name for the room; never leaves this device.
+        local_name: String,
+        /// The room's passphrase.
+        passphrase: String,
+    },
+    /// Mint an invite link for a room.
+    ///
+    /// Answers [`Frame::Link`]. The link is rendezvous information, not a
+    /// credential: it names the room and where to look, carries no passphrase, and
+    /// since M17.6 joining with it grants nothing at all.
+    Invite {
+        /// The room.
+        channel_id: Digest32,
     },
     /// Grant a member the capability to dial (and optionally offer) a service.
     Grant {
@@ -265,6 +303,26 @@ impl Request {
             }
             Request::StopForward { local } => {
                 e.array(2).uint(T_STOP_FORWARD).text(local);
+            }
+            Request::Join {
+                link,
+                local_name,
+                passphrase,
+            } => {
+                e.array(4)
+                    .uint(T_JOIN)
+                    .text(link)
+                    .text(local_name)
+                    .text(passphrase);
+            }
+            Request::Create {
+                local_name,
+                passphrase,
+            } => {
+                e.array(3).uint(T_CREATE).text(local_name).text(passphrase);
+            }
+            Request::Invite { channel_id } => {
+                e.array(2).uint(T_INVITE).bytes(channel_id);
             }
             Request::Grant {
                 channel_id,
@@ -385,6 +443,34 @@ impl Request {
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::StopForward { local })
             }
+            (T_JOIN, 4) => {
+                let link = text(&mut d, "ipc join link")?;
+                let local_name = text(&mut d, "ipc join name")?;
+                let passphrase = text(&mut d, "ipc join passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Join {
+                    link,
+                    local_name,
+                    passphrase,
+                })
+            }
+            (T_CREATE, 3) => {
+                let local_name = text(&mut d, "ipc create name")?;
+                let passphrase = text(&mut d, "ipc create passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Create {
+                    local_name,
+                    passphrase,
+                })
+            }
+            (T_INVITE, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Invite { channel_id })
+            }
             (T_GRANT, 6) => {
                 let channel_id = digest(&mut d)?;
                 let target = digest(&mut d)?;
@@ -465,6 +551,11 @@ pub enum Frame {
         /// The bound local address.
         local: String,
     },
+    /// The invite link a [`Request::Invite`] asked for.
+    Link {
+        /// The `vox://` address.
+        url: String,
+    },
     /// The rooms a [`Request::Rooms`] asked for.
     Rooms {
         /// `(channel_id, local name, open)` per room.
@@ -514,6 +605,9 @@ impl Frame {
             }
             Frame::Bound { local } => {
                 e.array(2).uint(T_BOUND).text(local);
+            }
+            Frame::Link { url } => {
+                e.array(2).uint(T_LINK).text(url);
             }
             Frame::Rooms { rooms } => {
                 e.array(2).uint(T_ROOMS).array(rooms.len());
@@ -749,6 +843,11 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_BOUND, 2) => {
             return Ok(Frame::Bound {
                 local: text(d, "ipc bound address")?,
+            });
+        }
+        (T_LINK, 2) => {
+            return Ok(Frame::Link {
+                url: text(d, "ipc link")?,
             });
         }
         (T_ROOMS, 2) => {
@@ -1216,6 +1315,79 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
                     reason: format!("{other:?}"),
+                },
+            }
+        }
+        Request::Join {
+            link,
+            local_name,
+            passphrase,
+        } => match handle
+            .apply(crate::node::api::NodeCommand::JoinChannel {
+                link,
+                local_name,
+                passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+            })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            // The outcome is named, not reduced to "it failed". `Unreachable` and a
+            // refused passphrase call for completely different responses from whoever
+            // is holding the link, and this is the only place that knows which it was.
+            other => Frame::Error {
+                reason: format!("{other:?}"),
+            },
+        },
+        Request::Create {
+            local_name,
+            passphrase,
+        } => match handle
+            .apply(crate::node::api::NodeCommand::CreateChannel {
+                local_name,
+                passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+            })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: format!("{other:?}"),
+            },
+        },
+        Request::Invite { channel_id } => {
+            // Subscribe before asking: the link arrives as an event, and one emitted
+            // between the command and the wait would be lost.
+            let mut events = handle.subscribe();
+            match handle
+                .apply(crate::node::api::NodeCommand::Invite { channel_id })
+                .await
+            {
+                crate::node::api::Outcome::Done => {}
+                other => {
+                    return Frame::Error {
+                        reason: format!("{other:?}"),
+                    }
+                }
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    match events.next().await {
+                        Some(EventStreamItem::Event(NodeEvent::InviteLink {
+                            channel_id: c,
+                            url,
+                        })) if c == channel_id => return Some(url),
+                        Some(_) => {}
+                        None => return None,
+                    }
+                }
+            })
+            .await
+            {
+                Ok(Some(url)) => Frame::Link { url },
+                Ok(None) => Frame::Error {
+                    reason: "the node stopped before the link was minted".into(),
+                },
+                Err(_) => Frame::Error {
+                    reason: "the node did not mint a link".into(),
                 },
             }
         }
