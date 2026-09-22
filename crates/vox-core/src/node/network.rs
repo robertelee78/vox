@@ -360,7 +360,25 @@ impl NodeNet {
         if let Some(list) = lock(&self.advertised).clone() {
             return Ok(list);
         }
+        // Before the ladder has run there is nothing discovered to report, and the **bind**
+        // address is not a substitute. The normal way to run a node is to bind the wildcard —
+        // what it advertises is supposed to come from the ladder, not from here — so this
+        // fallback returned `0.0.0.0:<port>`, and that went into invite links as the
+        // responder's address and into rendezvous records as this node's. A joiner then had a
+        // destination it cannot dial, and the join fell entirely to the relay rung.
+        //
+        // Observed in the shipped product, not deduced: `vox serve --listen 0.0.0.0:0`
+        // against a real anchor minted
+        // `…&b=/ip4/0.0.0.0/udp/53638&r=<this node>`.
+        //
+        // An unspecified address is not an endpoint. Saying "I do not know my address yet" is
+        // both true and useful — the ladder's later rungs do not need one — where a wildcard
+        // is a lie that costs a dial attempt and, when the relay is slow, the whole join.
+        // Loopback is kept: a peer on this machine can use it.
         let addr = self.manager.endpoint().local_addr()?;
+        if addr.ip().is_unspecified() {
+            return EndpointList::new(Vec::new());
+        }
         EndpointList::new(vec![crate::nat::multiaddr::Multiaddr::from(addr)])
     }
 
