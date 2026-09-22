@@ -521,14 +521,18 @@ enum AgentCmd {
     Hook(AgentHookArgs),
     /// Print the integration a harness needs to run `vox agent hook` every turn.
     ///
-    /// Claude Code and Codex take a hook command in their own settings, so what
-    /// they need is a JSON snippet. OpenCode has no hook command — it loads
-    /// JavaScript plugins — so what it needs is a plugin file, which this writes
-    /// to stdout:
+    /// Whatever the harness wants, this prints it: Claude Code and Codex take a
+    /// hook entry in their own settings, so they get a JSON snippet; OpenCode has
+    /// no hook command and loads JavaScript plugins, so it gets a plugin file.
     ///
     /// ```text
     /// vox agent plugin opencode > ~/.config/opencode/plugin/vox.js
+    /// vox agent plugin claude            # merge into ~/.claude/settings.json
+    /// vox agent plugin codex             # merge into Codex's hooks.json
     /// ```
+    ///
+    /// The integration goes to stdout so it can be redirected or piped through
+    /// `jq`; where to put it goes to stderr, so it does not land in the file.
     ///
     /// The plugin is a shim over `vox agent hook`, not a second implementation.
     Plugin(AgentPluginArgs),
@@ -1229,20 +1233,42 @@ pub fn run() -> ExitCode {
                 print!("{}", crate::agent_hook::OPENCODE_PLUGIN);
                 ExitCode::SUCCESS
             }
-            // Naming a harness that needs no plugin is a question, not a failure —
-            // answer it rather than printing a usage error at someone who asked a
-            // reasonable thing.
-            "claude" | "claude-code" | "codex" => {
-                eprintln!(
-                    "vox: {} takes a hook command, not a plugin. Register `vox agent hook` on \
-                     UserPromptSubmit; for Codex set `async: false`, or the output is observed \
-                     and discarded.",
-                    args.harness
+            // **Print the thing, do not describe it.** These take a hook entry rather than
+            // a plugin file, and this used to answer with a sentence saying so — while its
+            // own `--help` promised "a JSON snippet". So the one command a person runs to
+            // wire an agent in left them to invent the settings shape themselves, for the
+            // feature ADR-020 exists to deliver. The snippet goes to stdout so it can be
+            // redirected or piped to `jq`; where to put it goes to stderr so it does not
+            // land in the file.
+            "claude" | "claude-code" => {
+                println!(
+                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
+                     \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
+                     \"vox agent hook\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
                 );
-                ExitCode::FAILURE
+                eprintln!(
+                    "vox: merge that into ~/.claude/settings.json, or .claude/settings.json \
+                     in a project.\n     Set VOX_ROOM in the session's environment, or pass \
+                     --room to the hook, so it knows which room to drain."
+                );
+                ExitCode::SUCCESS
+            }
+            "codex" => {
+                println!(
+                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{ \
+                     \"command\": \"vox agent hook\", \"async\": false }}\n    ]\n  \
+                     }}\n}}"
+                );
+                eprintln!(
+                    "vox: merge that into Codex's hooks.json.\n     `async` MUST be false: an \
+                     async hook's output is observed and discarded, so the room would drain \
+                     into nothing.\n     Set VOX_ROOM in the session's environment, or pass \
+                     --room to the hook."
+                );
+                ExitCode::SUCCESS
             }
             other => {
-                eprintln!("vox: no plugin for {other:?}; known harnesses: opencode");
+                eprintln!("vox: no integration for {other:?}. Known: claude, codex, opencode.");
                 ExitCode::FAILURE
             }
         },
