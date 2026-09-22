@@ -15,6 +15,57 @@ env:
   VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,install.apple_gate_refuses_unsigned_bytes,opencode,cross-process-join,cross-process-tunnel"
 
 jobs:
+  # **Every commit must build, not merely the tip.** `git bisect` compiles the commit it
+  # lands on, so one commit that does not build makes bisect useless for the whole range
+  # around it — and a range is exactly when you reach for bisect. This caught a real case
+  # the day it was proposed: a change moved a function to five arguments in one crate while
+  # its call site sat in the next commit, so the branch built and its first commit did not.
+  #
+  # `cargo check`, not a full build: this is about whether the tree is coherent at each
+  # step, and check catches that. Bounded to the last 20 commits of the range so a long
+  # branch cannot turn one push into an hour.
+  every-commit-builds:
+    name: every commit builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Needs history: the range is what is being checked, not the tip.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check each commit in this push or pull request
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          elif [ -n "${{ github.event.before }}" ] \
+               && git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null \
+               && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            range="${{ github.event.before }}..${{ github.sha }}"
+          else
+            # A first push, or a force-push whose predecessor is gone: check the tip alone
+            # rather than guessing at a range, and say so.
+            echo "no usable predecessor; checking ${{ github.sha }} only"
+            range="${{ github.sha }}~1..${{ github.sha }}"
+          fi
+          commits=$(git rev-list --reverse "$range" | tail -20)
+          if [ -z "$commits" ]; then
+            echo "no commits in $range"
+            exit 0
+          fi
+          n=$(echo "$commits" | wc -l | tr -d ' ')
+          echo "checking $n commit(s)"
+          for c in $commits; do
+            echo "::group::$c $(git log -1 --format=%s "$c")"
+            git checkout --quiet --detach "$c"
+            # RUSTFLAGS is not set here: a commit that builds with warnings still builds,
+            # and clippy/fmt are the tip's business. This asks one question only.
+            cargo check --workspace --all-targets
+            echo "::endgroup::"
+          done
+
   build-test:
     name: build · clippy · fmt · test
     # ADR-015 scopes clients to macOS + Linux; the core is checked on both.
