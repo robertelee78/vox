@@ -1657,10 +1657,25 @@ impl Node {
                 refuse_join(send).await;
                 return;
             };
-            let channel = shared.lock().await;
-            let Ok(mut ctx) = channel.join_context() else {
-                refuse_join(send).await;
-                return;
+            // **Everything the exchange needs is taken out, and the guard dropped, before
+            // it runs.** `answer_join` wanted the channel for exactly one thing — its join
+            // passphrase — and holding the guard across the exchange held the whole room for
+            // the duration of a CPace handshake *and* the joiner's Equihash solve. Every
+            // other operation on that room queued behind it: sending a message, syncing,
+            // consenting to somebody. One person joining stalled everyone already there.
+            let (mut ctx, passphrase) = {
+                let channel = shared.lock().await;
+                let Ok(ctx) = channel.join_context() else {
+                    refuse_join(send).await;
+                    return;
+                };
+                let Ok(passphrase) = channel.join_passphrase() else {
+                    refuse_join(send).await;
+                    return;
+                };
+                // Copied because it outlives the guard, and zeroized on drop like every
+                // other passphrase this node holds.
+                (ctx, zeroize::Zeroizing::new(passphrase.to_vec()))
             };
             if let Some(pow) = self.pow_params {
                 ctx.pow_params = pow;
@@ -1674,7 +1689,7 @@ impl Node {
                 send,
                 recv,
                 ctx,
-                &channel,
+                &passphrase,
                 signer,
                 profile.store(),
                 ring,

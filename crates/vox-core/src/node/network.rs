@@ -49,7 +49,6 @@ use crate::nat::service::{
     MembershipOracle, RecordKinds, RecordSet, RendezvousClient, RendezvousService,
 };
 use crate::nat::store::RendezvousStore;
-use crate::node::channel::ChannelState;
 use crate::node::circuitstream::{self, CircuitLedger};
 use crate::node::coordstream;
 use crate::node::joinstream::{run_initiator, run_responder, JoinOutcome, ResponderConfig};
@@ -1058,7 +1057,7 @@ impl NodeNet {
         send: SendStream,
         recv: RecvStream,
         ctx: JoinContext,
-        channel: &ChannelState,
+        passphrase: &[u8],
         signer: &(dyn RootSigner + Send + Sync),
         store: &Store,
         ring: &mut PrekeyRing,
@@ -1066,7 +1065,7 @@ impl NodeNet {
     ) -> Result<JoinOutcome> {
         let cfg = ResponderConfig {
             ctx,
-            passphrase: channel.join_passphrase()?,
+            passphrase,
             root: signer,
             base_difficulty: Difficulty::DEFAULT_INVITE,
             pending_joins,
