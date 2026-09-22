@@ -524,7 +524,7 @@ fn finish_connection(
 
     // Confirm the negotiated named group is the hybrid PQ group. quinn exposes the
     // negotiated group via the rustls handshake data attached to the connection.
-    confirm_hybrid_group(&connection)?;
+    confirm_vox_alpn(&connection)?;
 
     let session = SessionEstablishment::new(peer_id, now_secs);
     Ok(VoxConnection {
@@ -546,23 +546,35 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Confirm the connection negotiated X25519MLKEM768; abort otherwise. Because the
-/// provider offers only the hybrid group there is no downgrade target, but the
-/// check makes the guarantee explicit (defence in depth) and surfaces a clear
-/// error if a future config regression ever widened the offered groups.
-fn confirm_hybrid_group(connection: &Connection) -> Result<()> {
+/// Confirm this handshake ran under the Vox TLS configuration, by its ALPN.
+///
+/// **It does not observe the negotiated key-exchange group, and it is named for what
+/// it checks because it used to be named for what it does not.** It was
+/// `confirm_hybrid_group`, documented as confirming X25519MLKEM768 and as surfacing
+/// "a clear error if a future config regression ever widened the offered groups" —
+/// which it would not have done. Widening `kx_groups` leaves this function passing,
+/// since the ALPN is unchanged. The defence in depth the old name promised was not
+/// there, and a reader auditing the connection path had every reason to believe it
+/// was.
+///
+/// What actually guarantees the group is upstream of here and is sound: the provider
+/// offers exactly one `kx_group`, so there is no downgrade target to negotiate to;
+/// `provider::assert_pq_only` enforces that at every config
+/// boundary; and TLS 1.3 binds the negotiated parameters into the Finished MAC, so a
+/// mismatch breaks the handshake rather than passing quietly. The group cannot be
+/// checked *here* because quinn 0.11 gates rustls's
+/// `negotiated_key_exchange_group` behind a test-only cfg, so the value rustls holds
+/// is not reachable from the connection.
+///
+/// The ALPN check is still worth keeping: it confirms a Vox-configured handshake
+/// completed, and a non-Vox config would not carry this protocol.
+fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
     let Some(hd) = connection.handshake_data() else {
         return Err(Error::SignatureInvalid);
     };
     let Some(hd) = hd.downcast_ref::<quinn::crypto::rustls::HandshakeData>() else {
         return Err(Error::SignatureInvalid);
     };
-    // quinn 0.11's rustls HandshakeData does not surface the named group directly;
-    // the authoritative guarantee is the provider's single-group `kx_groups`
-    // (verified by `provider::tests::provider_offers_only_the_hybrid_group`) plus
-    // TLS 1.3's transcript binding. We assert the ALPN was the Vox protocol, which
-    // confirms a Vox-config handshake completed (a non-Vox config would not carry
-    // it), and rely on the offered-group restriction for the group guarantee.
     match &hd.protocol {
         Some(p) if p.as_slice() == crate::transport::provider::VOX_ALPN => Ok(()),
         _ => Err(Error::SignatureInvalid),
