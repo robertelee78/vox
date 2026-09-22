@@ -908,12 +908,23 @@ enum Cmd {
     Daemon(DaemonArgs),
     /// Offer a local TCP port as a room-bound service, in one command (ADR-017).
     ///
-    /// Creates a room whose genesis grants every member the right to reach that port —
-    /// so joining the room *is* the authorization and you never wait to grant anyone
-    /// anything — offers the port in it, and prints the address, the machine-generated
-    /// passphrase and the `.vox` hostname it answers on. Runs until interrupted,
-    /// reporting who reaches the service (the service itself cannot tell you: every Vox
-    /// client arrives at it from loopback).
+    /// Creates a room, offers the port in it, and prints the address, the
+    /// machine-generated passphrase and the `.vox` hostname it answers on. Runs until
+    /// interrupted, reporting who reaches the service (the service itself cannot tell
+    /// you: every Vox client arrives at it from loopback).
+    ///
+    /// **Joining the room does not grant access to the port.** Whoever you have run
+    /// `vox trust add` on can reach it, and nobody else — the trust keyring is the
+    /// authorization (ADR-017 decision 3, M17.6/M17.7). Handing somebody the address and
+    /// the passphrase lets them into the room; it does not let them at your machine's
+    /// port.
+    ///
+    /// This said the opposite until 2026-09-22 — that the room's genesis granted every
+    /// member the right to dial, so "joining the room *is* the authorization and you
+    /// never wait to grant anyone anything". That model was withdrawn in ADR-017's third
+    /// revision, along with the genesis service grant and the `vox grant` verb, and the
+    /// text outlived it. A person reading it would have believed that sharing an address
+    /// was all it took to let somebody at a local port.
     Serve(ServeArgs),
     /// Join a room from the address you were given, and print the name its services
     /// answer on (ADR-017). One-shot: joining is durable, so there is nothing to keep
