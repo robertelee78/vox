@@ -167,10 +167,79 @@ pub fn parse_anchor_spec(text: &str) -> Result<BootstrapNode> {
         "anchor spec: expected <fingerprint>@<multiaddr>",
     ))?;
     let id = b32_decode(id.trim(), "anchor spec fingerprint")?;
-    let addr =
-        Multiaddr::parse(addr.trim()).map_err(|_| Error::MalformedLink("anchor spec address"))?;
-    BootstrapNode::new(id, EndpointList::new(vec![addr])?)
+    let addrs = parse_anchor_addrs(addr.trim())?;
+    BootstrapNode::new(id, EndpointList::new(addrs)?)
         .map_err(|_| Error::MalformedLink("anchor spec"))
+}
+
+/// The address half of an anchor spec: a multiaddr, or **a host and port**.
+///
+/// A person configuring an anchor has a machine in mind, and that machine usually
+/// has a name. Requiring `/ip4/216.243.48.3/udp/4433` makes them look up an address
+/// they already have a name for, and re-issue it to every client when it moves —
+/// which for a home connection is whenever the ISP decides.
+///
+/// So `host:port` and `/dns4/host/udp/port` are accepted and **resolved here**,
+/// at the moment the spec is read. Deliberately not a new `Multiaddr` variant: a
+/// multiaddr is the wire form inside an ADR-016 invite link and must round-trip
+/// exactly, and a name is a convenience of configuration, not a thing to put on the
+/// wire. Resolving at parse keeps links byte-identical and keeps the dialler
+/// working in addresses.
+///
+/// A name with several records yields **several endpoints**, which is what the
+/// ladder wants anyway — it tries them in order.
+///
+/// # Errors
+/// [`Error::MalformedLink`] if the text is neither a multiaddr nor `host:port`, or
+/// if a name resolves to nothing.
+fn parse_anchor_addrs(text: &str) -> Result<Vec<Multiaddr>> {
+    if text.starts_with('/') {
+        // `/dns4/<name>/udp/<port>` — the multiaddr spelling of a name.
+        let parts: Vec<&str> = text.split('/').collect();
+        if let ["", kind @ ("dns4" | "dns6" | "dns"), host, "udp", port] = parts.as_slice() {
+            let want6 = *kind == "dns6";
+            return resolve_host(host, port, Some(want6));
+        }
+        return Multiaddr::parse(text)
+            .map(|a| vec![a])
+            .map_err(|_| Error::MalformedLink("anchor spec address"));
+    }
+    // `host:port`, the form a person types. An IPv6 literal must be bracketed, as
+    // everywhere else, and `rsplit_once` keeps that working.
+    let (host, port) = text.rsplit_once(':').ok_or(Error::MalformedLink(
+        "anchor spec: expected host:port or a multiaddr",
+    ))?;
+    resolve_host(host.trim_matches(['[', ']']), port, None)
+}
+
+/// Resolve `host:port` to every address it names, newest-style first.
+fn resolve_host(host: &str, port: &str, want6: Option<bool>) -> Result<Vec<Multiaddr>> {
+    use std::net::ToSocketAddrs as _;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| Error::MalformedLink("anchor spec port"))?;
+    let resolved: Vec<std::net::SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| Error::MalformedLink("anchor spec: host does not resolve"))?
+        .collect();
+    let mut out: Vec<Multiaddr> = resolved
+        .into_iter()
+        .filter(|a| match want6 {
+            Some(true) => a.is_ipv6(),
+            Some(false) => a.is_ipv4(),
+            None => true,
+        })
+        .map(Multiaddr::from)
+        .collect();
+    // IPv6 first, matching ADR-012's ladder: direct v6 needs no translation.
+    out.sort_by_key(|a| u8::from(matches!(a, Multiaddr::Ip4(_))));
+    out.dedup();
+    if out.is_empty() {
+        return Err(Error::MalformedLink(
+            "anchor spec: host resolved to nothing",
+        ));
+    }
+    Ok(out)
 }
 
 /// Merge every anchor spec in a profile's [`anchors file`](crate::node::paths::Paths::anchors_file)
