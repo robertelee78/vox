@@ -596,6 +596,19 @@ is where padding belongs if it is ever wanted.
 > the anchor it learned from the file; a third profile runs `vox connect` with no `--anchor` and joins.
 > Mutation-checked: stop reading the file and it fails.
 
+> **Closed 2026-09-22: a running node now follows its anchor.** `vox daemon` re-reads its
+> anchor configuration every 30s, re-resolves every spec and merges anything new; the
+> existing `redial_anchors_if_due` then dials it. Two places discarded the new address and
+> both had to go: `BootstrapSet::merge` and `ChannelState::add_anchors` both went through
+> `add`, which keeps the first entry per identity — right for building a set, wrong for
+> refreshing one, since an anchor that moved is the same identity at a new address. The
+> channel one mattered independently: a channel's stored set is what an invite link
+> carries, so a room made before the move would have handed out an unreachable address in
+> every invite for ever. Gate: `crates/vox-tui/tests/a_daemon_follows_its_anchor.rs`, real
+> binaries, mutation-checked on both halves. **Residual:** a name whose A record moves
+> while the file is untouched is the same code path but is not measured — that needs a
+> resolver the proof owns. The account of the gap as it stood follows.
+>
 > **A name is resolved once, at startup — known gap, 2026-09-22.** M17.5 let an anchor be named
 > `home.example.us:4433` instead of `/ip4/.../udp/4433`, and the stated motivation was precisely that
 > a person should not have to "re-issue it to every client when it moves — which for a home connection
