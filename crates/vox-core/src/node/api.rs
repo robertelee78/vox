@@ -523,6 +523,26 @@ pub enum NodeEvent {
         /// How long it was unable to answer, in milliseconds.
         millis: u64,
     },
+    /// A record this node tried to put on a board was not accepted, and the board said why.
+    ///
+    /// Publishing is how a member becomes findable: its bundle carries the key every other
+    /// member admits it as a log author with, so a record that does not land means a member that
+    /// nobody can reconcile with — which then shows up as "unreachable", three layers away and
+    /// on the wrong node. Every one of these puts used to be `let _ = client.put(..).await`, so a
+    /// board that refused a record refused it in complete silence.
+    ///
+    /// Not every refusal is a fault: the ADR-012 refresh floor declines a replacement that is
+    /// merely too soon, which means the previous announcement is still live and being announced
+    /// is all the put was for. It is reported anyway, because "still announced" and "never
+    /// announced" are the two cases this silence was hiding, and only one of them is fine.
+    PublishRefused {
+        /// The room the record was for.
+        channel_id: Digest32,
+        /// Which record it was — the genesis, an address, a bundle, or a mirrored one.
+        what: String,
+        /// What the board said.
+        why: String,
+    },
     /// A join failed, with what each responder that was tried reported.
     ///
     /// `Outcome::Failed(Fault)` is a single token with no room for a reason, so this carries the

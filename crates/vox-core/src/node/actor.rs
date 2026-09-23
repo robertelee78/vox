@@ -149,6 +149,26 @@ const STALL_BUDGET: Duration = Duration::from_secs(5);
 /// sessions for rooms whose state has since moved on is worse than none.
 const SYNCS_IN_FLIGHT: usize = 16;
 
+/// How many inbound joins this node answers at once.
+///
+/// Answering a join is the one inbound thing a **stranger** can ask for: the passphrase is the
+/// join credential, so anyone holding the address and the passphrase gets an exchange, and the
+/// exchange waits on them three times and verifies their proof of work. Run on the actor, that
+/// made one joiner — slow, malicious, or merely behind a bad link — able to stop a node from
+/// answering anybody: no messages, no syncs, nothing, for as long as it cared to stall. An anchor
+/// is the worst place for it, because the whole point of an anchor is being the node that is
+/// always there.
+///
+/// So the actor decides and a slot does the waiting. Past the cap a join is **refused, not
+/// queued** — the same rule as [`SYNCS_IN_FLIGHT`], and for a stronger reason here: a queue of
+/// half-finished exchanges is exactly the resource a flood wants to fill, and a joiner that is
+/// told "no" now retries in a second, which is cheaper for both sides than a held stream.
+///
+/// The count of joins actually in flight also feeds `Difficulty::adapted_for_load`, which raises
+/// the proof-of-work a joiner must do as the load climbs. That knob existed all along and was
+/// passed a hardcoded `0`, so it had never once adapted.
+const JOINS_IN_FLIGHT: usize = 16;
+
 /// A short name for what a command was, for the stall report.
 fn command_name(c: &NodeCommand) -> &'static str {
     match c {
@@ -180,6 +200,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AnchorConnected { .. } => "publishing every room to an anchor that answered",
         NetEvent::AddressesDiscovered { .. } => "publishing every room at a new address",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
+        NetEvent::JoinAnswered { .. } => "filing a join that finished",
+        NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
+        NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped => "shutting the network down",
     }
 }
@@ -453,6 +476,53 @@ enum NetEvent {
         channel_id: Digest32,
         /// What the session did, or why it failed.
         outcome: crate::error::Result<crate::node::channel::SyncOutcome>,
+    },
+    /// A join exchange finished on its own task and is handing back what the actor must
+    /// apply: the admission, the session, and the event a person sees.
+    ///
+    /// The exchange **cannot** be awaited inside the actor loop. It waits on the joiner for
+    /// the solve, the proof and the init, with a proof-of-work verification in between, and
+    /// every one of those waits is a stranger's to lengthen. See [`JOINS_IN_FLIGHT`].
+    JoinAnswered {
+        /// The authenticated peer that joined.
+        peer: Digest32,
+        /// The channel it joined.
+        channel_id: Digest32,
+        /// What the exchange produced, or the reason it did not.
+        ///
+        /// Boxed because a [`crate::node::joinstream::JoinOutcome`] carries a whole session,
+        /// and every other variant of this enum would otherwise pay for its size. The error is
+        /// already a `String`: it is formatted where it happened, off the actor.
+        outcome: Box<std::result::Result<crate::node::joinstream::JoinOutcome, String>>,
+    },
+    /// A join exchange has proved a joiner's identity and is **holding its acceptance** until the
+    /// actor has admitted it as an author.
+    ///
+    /// This exists to restore an ordering that was free while the exchange ran on the actor: the
+    /// admission happened in the same turn the exchange ended, before the joiner could have
+    /// returned. Off the actor it became an event reached later, and the joiner — which treats
+    /// `Accepted` as "I am in" — published its records into that gap, where they are refused
+    /// `author is not a channel member` and never retried. The newcomer then reached no board at
+    /// all. Measured: a third person joining went 6 of 10 to 0 of 10 (ADR-018 §"The admission
+    /// window").
+    ///
+    /// Cheap and local on purpose: admit the author, answer, done. Everything that touches the
+    /// network — republishing, mirroring to anchors — stays on `JoinAnswered`, *after* the joiner
+    /// has been accepted, so a joiner never waits on this node's round trips to somebody else.
+    JoinAdmit {
+        /// The room being joined.
+        channel_id: Digest32,
+        /// The joiner's proven identity.
+        identity: Box<crate::identity::composite::CompositePublicKey>,
+        /// Answered once the admission is applied, which releases the acceptance frame. A dropped
+        /// sender answers too — the slot must never wait on an actor that has moved on.
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
+    /// A record by another author was admitted to this node's board, so what this node can
+    /// vouch for has grown and its anchors do not know it yet.
+    BoardGrew {
+        /// The room whose board grew.
+        channel_id: Digest32,
     },
     /// A peer connected and opened a stream the actor must handle.
     Stream {
@@ -931,6 +1001,23 @@ pub struct Node {
     pending_push: std::collections::BTreeSet<Digest32>,
     /// Slots for sync setups and sessions; see [`SYNCS_IN_FLIGHT`].
     sync_slots: Arc<tokio::sync::Semaphore>,
+    /// The last refusal reported per room and record kind, so a standing one is said once.
+    ///
+    /// Most refusals are the ADR-012 refresh floor declining a replacement that is merely too
+    /// soon, which recurs every publish round for as long as the record stays live. Reported
+    /// every time, that buries the refusals which mean something under the one that does not —
+    /// an operator scrolling past `rejected: policy` is how a `not a channel member` goes unread.
+    /// Reported on change, like every other line a node says about itself.
+    last_publish_refusal: BTreeMap<(Digest32, String), String>,
+    /// Slots for answering inbound joins; see [`JOINS_IN_FLIGHT`].
+    join_slots: Arc<tokio::sync::Semaphore>,
+    /// The join exchanges running right now.
+    ///
+    /// Tracked rather than detached for one reason: each holds an `Arc<VaultRootSigner>`, and
+    /// ADR-015 says a locked node holds no identity secrets. [`Node::lock_all`] aborts this set,
+    /// so the last handle goes with the lock and "locked" keeps meaning *now* instead of *once
+    /// this joiner gets bored*.
+    join_tasks: tokio::task::JoinSet<()>,
     /// Rooms with a session in flight, so a second one cannot start for the same room.
     ///
     /// **This guard is not new, it was lost.** `sync_one`'s own doc still says "while the channel is
@@ -958,7 +1045,11 @@ pub struct Node {
     /// loaded (or generated on first use) by [`crate::node::prekeys::load_or_create`]
     /// after the identity unlocks and dropped on lock, so no prekey secret is in
     /// memory behind a lock (ADR-010/015). M14.4+ publishes its bundle.
-    prekeys: Option<PrekeyRing>,
+    ///
+    /// Shared, because answering a join needs it off the actor and two joins may overlap. The
+    /// lock is taken twice per exchange and never across a wait — see
+    /// [`crate::node::joinstream::run_responder`].
+    prekeys: Option<Arc<tokio::sync::Mutex<PrekeyRing>>>,
     channels: BTreeMap<Digest32, SharedChannel>,
     clock: Clock,
     argon2: Argon2Profile,
@@ -1073,6 +1164,9 @@ impl Node {
             schedules: BTreeMap::new(),
             pending_push: std::collections::BTreeSet::new(),
             sync_slots: Arc::new(tokio::sync::Semaphore::new(SYNCS_IN_FLIGHT)),
+            last_publish_refusal: BTreeMap::new(),
+            join_slots: Arc::new(tokio::sync::Semaphore::new(JOINS_IN_FLIGHT)),
+            join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -1413,7 +1507,28 @@ impl Node {
                 return Err(crate::error::Error::Profile("no identity in this profile"))
             }
         });
-        let net = Arc::new(NodeNet::new(endpoint, Arc::clone(&self.clock)));
+        let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
+        // **A record landing on this node's board is an event, not something to notice later.**
+        // A newcomer becomes findable to everyone away from the room only because a member that
+        // already knows it publishes its bundle onward, and until now nothing told this node one
+        // had arrived — the onward mirror went out when the join finished, which is *before* the
+        // newcomer publishes, and then waited for whatever triggered a publish next.
+        //
+        // `try_send` rather than a blocking send, and the reason is **deadlock, not queue state**:
+        // this runs inside the rendezvous service, on a path the actor may itself be waiting
+        // behind, so a send that blocks could hold the service against its own actor. The cost when
+        // the queue is full is worth stating plainly rather than implying it away — the hint is
+        // dropped, and that newcomer falls back to "whatever triggers a publish next", which is
+        // exactly the unbounded wait this change exists to remove. A full `NET_QUEUE` means the
+        // actor is behind, not that it is about to mirror this room: the 64 items ahead of it could
+        // all belong to other channels. The drop is acceptable, not harmless.
+        {
+            let tx = self.net_tx.clone();
+            net.on_board_growth(Arc::new(move |channel_id: Digest32| {
+                let _ = tx.try_send(NetEvent::BoardGrew { channel_id });
+            }));
+        }
+        let net = Arc::new(net);
         self.net = Some(Arc::clone(&net));
         // The configured anchors are dialled at once, each on its own task: they are
         // where this node's records go and the helpers its ladder climbs through, and
@@ -1522,7 +1637,8 @@ impl Node {
             let Some(ring) = self.prekeys.as_ref() else {
                 return;
             };
-            net.own_records(signer, channel_id, epoch, ring, seq, admission)
+            let ring = ring.lock().await;
+            net.own_records(signer, channel_id, epoch, &ring, seq, admission)
         };
         let Ok((address, bundle)) = records else {
             return;
@@ -1530,9 +1646,44 @@ impl Node {
         let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await else {
             return;
         };
-        let _ = client.put(&genesis_wire).await;
-        let _ = client.put(&address.to_wire()).await;
-        let _ = client.put(&bundle.to_wire()).await;
+        // **Said, not swallowed.** A refused bundle is a member no other member can admit as a
+        // log author, and every one of these was `let _ = ...` — so the board's reason existed,
+        // was specific, and was dropped on the floor at the one place that could report it.
+        //
+        // Each kind's outcome is carried, success as well as failure, because a refusal that
+        // *stops* has to clear its memo below — otherwise a standing refusal reported once would
+        // be silent the second time it mattered.
+        let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
+        outcomes.push((
+            "the room's genesis",
+            client.put(&genesis_wire).await.err().map(|e| e.to_string()),
+        ));
+        // **Our bundle before our address, for the reason this file already states about *other*
+        // members' records and did not apply to its own.** An address record carries no key, so a
+        // board can only verify it against a key it already holds — which is what the bundle
+        // carries. Published address-first, a member whose key the board does not know yet has its
+        // address refused with `author is not a channel member`, microseconds before the bundle
+        // that would have made it admissible arrives on the same connection; and nothing retries
+        // it until the next publish round. `network.rs` `board_records` has emitted bundles first
+        // all along and says why. This did the opposite for the records that matter most — a
+        // newcomer's own — so a member could be on an anchor's board with a key and no way to
+        // reach it, which a joiner reports as the member being unreachable.
+        outcomes.push((
+            "our member bundle",
+            client
+                .put(&bundle.to_wire())
+                .await
+                .err()
+                .map(|e| e.to_string()),
+        ));
+        outcomes.push((
+            "our address",
+            client
+                .put(&address.to_wire())
+                .await
+                .err()
+                .map(|e| e.to_string()),
+        ));
         // And every other member's records this node's board holds: an anchor learns
         // a channel's members only from a member that vouches for them (M15.2a), and
         // a bundle carries the key an address record is verified against, so bundles
@@ -1545,10 +1696,50 @@ impl Node {
         // from 3 runs in 5 to 1 in 6 and the user-level rehearsal from 10 in 10 to 6 in 8. The
         // stall is real and now *named* by `NodeEvent::Stalled`; removing it needs the ordering
         // made explicit, not the wait deleted.
+        let mut mirrored_refused = 0usize;
+        let mut mirrored_why = String::new();
         for wire in net.board_records(channel_id, epoch) {
-            let _ = client.put(&wire).await;
+            if let Err(e) = client.put(&wire).await {
+                mirrored_refused += 1;
+                if mirrored_why.is_empty() {
+                    mirrored_why = e.to_string();
+                }
+            }
         }
         client.finish();
+        outcomes.push((
+            "another member's record we vouch for",
+            (mirrored_refused > 0)
+                .then(|| format!("{mirrored_refused} refused, first: {mirrored_why}")),
+        ));
+        // **Keyed per board, not per room.** A node publishes the same record to several boards and
+        // they answer differently — an anchor that has not been vouched this author says "not a
+        // channel member" while the node's own board says "policy" — so a memo keyed only by room
+        // and record kind alternates between the two reasons and reports on every publish round,
+        // which is the spam it was added to stop. It also matters to whoever reads the line: "some
+        // board refused this" is not actionable and "that board refused this" is.
+        let board = crate::node::network::short_id(conn.peer_id());
+        for (kind, why) in outcomes {
+            let what = format!("{kind} (board {board})");
+            let key = (*channel_id, what.clone());
+            match why {
+                Some(why) => {
+                    if self.last_publish_refusal.get(&key) == Some(&why) {
+                        continue;
+                    }
+                    self.last_publish_refusal.insert(key, why.clone());
+                    let _ = self.event_tx.send(NodeEvent::PublishRefused {
+                        channel_id: *channel_id,
+                        what,
+                        why,
+                    });
+                }
+                // It went on this time, so the next refusal is news again.
+                None => {
+                    self.last_publish_refusal.remove(&key);
+                }
+            }
+        }
     }
 
     /// The store anchored logs and channels live in: the profile's, or the headless
@@ -1793,12 +1984,13 @@ impl Node {
         let Some(ring) = self.prekeys.as_ref() else {
             return;
         };
+        let ring = ring.lock().await;
         let _ = net.publish_local(&channel.genesis().to_wire());
         let Some(admission) = channel.own_admission().cloned() else {
             return;
         };
         if let Ok((address, bundle)) =
-            net.own_records(signer, channel_id, channel.epoch(), ring, seq, admission)
+            net.own_records(signer, channel_id, channel.epoch(), &ring, seq, admission)
         {
             let _ = net.publish_local(&address.to_wire());
             let _ = net.publish_local(&bundle.to_wire());
@@ -1888,6 +2080,44 @@ impl Node {
             } => {
                 self.answer_inbound_join(peer, channel_id, epoch, send, recv)
                     .await;
+            }
+            NetEvent::JoinAnswered {
+                peer,
+                channel_id,
+                outcome,
+            } => {
+                self.apply_join_outcome(peer, channel_id, *outcome).await;
+            }
+            NetEvent::JoinAdmit {
+                channel_id,
+                identity,
+                ack,
+            } => {
+                // The join proved this identity; admit it as an author so its entries — and its
+                // records on this node's board — are accepted. Reading still needs consent.
+                let now = self.now();
+                if let (Some(profile), Some(shared)) = (
+                    self.profile.as_ref(),
+                    self.channels.get(&channel_id).map(Arc::clone),
+                ) {
+                    let _ = shared
+                        .lock()
+                        .await
+                        .admit_author(profile.store(), &identity, now);
+                }
+                // Answered whatever happened: a joiner waiting on this must not be left holding a
+                // stream because the room closed or this node has no profile. It will find out from
+                // the join's own outcome, which is the right place for it to learn.
+                let _ = ack.send(());
+            }
+            NetEvent::BoardGrew { channel_id } => {
+                // Pass it on, which for a member means its anchors. A node that is not a member of
+                // this room falls out of `publish_channel_to_anchor` on its missing admission, so
+                // an anchor receiving a mirror does not mirror it onward and this cannot ring
+                // around a ring of anchors.
+                if self.channels.contains_key(&channel_id) {
+                    self.publish_channel_to_anchors(&channel_id).await;
+                }
             }
             NetEvent::SyncRequest {
                 conn,
@@ -2038,6 +2268,22 @@ impl Node {
     /// kept — but it is granted no read access: that waits for this user's consent
     /// (ADR-007).
     /// Answer a join whose request has **already been read** off the actor's task.
+    /// Answer a peer's join: **decide here, wait in a slot.**
+    ///
+    /// Everything above the spawn is a decision this node can make on its own — is this room
+    /// answerable at this epoch, is the identity unlocked, is there a free slot — and none of it
+    /// waits on the joiner. Everything that does wait on the joiner runs on its own task and
+    /// comes back as [`NetEvent::JoinAnswered`], so the state changes still happen on the actor,
+    /// in order, while the waiting does not.
+    ///
+    /// The exchange used to be awaited right here. A stranger holding only the address and the
+    /// passphrase — which is all joining has ever required — could therefore hold the actor for a
+    /// CPace handshake, its own proof-of-work solve, and three frame waits it controlled the
+    /// length of. Nothing else in the node ran meanwhile: not a message, not a sync, not another
+    /// join. On an anchor that is the whole failure, because an anchor's only job is to be
+    /// reachable.
+    ///
+    /// See [`JOINS_IN_FLIGHT`] for the cap and why a join past it is refused rather than queued.
     async fn answer_inbound_join(
         &mut self,
         peer: Digest32,
@@ -2046,7 +2292,6 @@ impl Node {
         send: quinn::SendStream,
         recv: quinn::RecvStream,
     ) {
-        use crate::node::joinstream::refuse_join;
         let answerable = match self.channels.get(&channel_id) {
             Some(shared) => {
                 let c = shared.lock().await;
@@ -2054,90 +2299,184 @@ impl Node {
             }
             None => false,
         };
-        if !answerable || self.net.is_none() || self.prekeys.is_none() {
-            refuse_join(send).await;
+        if !answerable {
+            Self::spawn_refuse_join(send);
             return;
         }
-        let now = self.now();
-        let net = match self.net.as_ref() {
-            Some(n) => Arc::clone(n),
-            None => return,
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            Self::spawn_refuse_join(send);
+            return;
         };
-        let outcome = {
-            let Some(profile) = self.profile.as_ref() else {
-                refuse_join(send).await;
-                return;
-            };
-            let Ok(signer) = profile.signer() else {
-                refuse_join(send).await;
-                return;
-            };
-            let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
-                refuse_join(send).await;
-                return;
-            };
-            // **Everything the exchange needs is taken out, and the guard dropped, before
-            // it runs.** `answer_join` wanted the channel for exactly one thing — its join
-            // passphrase — and holding the guard across the exchange held the whole room for
-            // the duration of a CPace handshake *and* the joiner's Equihash solve. Every
-            // other operation on that room queued behind it: sending a message, syncing,
-            // consenting to somebody. One person joining stalled everyone already there.
-            let (mut ctx, passphrase) = {
-                let channel = shared.lock().await;
-                let Ok(ctx) = channel.join_context() else {
-                    refuse_join(send).await;
-                    return;
-                };
-                let Ok(passphrase) = channel.join_passphrase() else {
-                    refuse_join(send).await;
-                    return;
-                };
-                // Copied because it outlives the guard, and zeroized on drop like every
-                // other passphrase this node holds.
-                (ctx, zeroize::Zeroizing::new(passphrase.to_vec()))
-            };
-            if let Some(pow) = self.pow_params {
-                ctx.pow_params = pow;
-            }
-            let Some(ring) = self.prekeys.as_mut() else {
-                refuse_join(send).await;
-                return;
-            };
-            net.answer_join(
-                peer,
-                send,
-                recv,
-                ctx,
-                &passphrase,
-                signer,
-                profile.store(),
-                ring,
-                0,
-            )
-            .await
+        let Some(ring) = self.prekeys.as_ref().map(Arc::clone) else {
+            Self::spawn_refuse_join(send);
+            return;
         };
+        let Some(profile) = self.profile.as_ref() else {
+            Self::spawn_refuse_join(send);
+            return;
+        };
+        // An owned handle, not a borrow: the exchange outlives this call. `Profile::signer_arc`
+        // documents what that costs and how locking still zeroizes.
+        let Ok(signer) = profile.signer_arc() else {
+            Self::spawn_refuse_join(send);
+            return;
+        };
+        let store = profile.store_handle();
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            Self::spawn_refuse_join(send);
+            return;
+        };
+        // **Everything the exchange needs is taken out, and the guard dropped, before it
+        // runs.** `answer_join` wanted the channel for exactly one thing — its join
+        // passphrase — and holding the guard across the exchange held the whole room for
+        // the duration of a CPace handshake *and* the joiner's Equihash solve. Every
+        // other operation on that room queued behind it: sending a message, syncing,
+        // consenting to somebody. One person joining stalled everyone already there.
+        let (mut ctx, passphrase) = {
+            let channel = shared.lock().await;
+            let Ok(ctx) = channel.join_context() else {
+                Self::spawn_refuse_join(send);
+                return;
+            };
+            let Ok(passphrase) = channel.join_passphrase() else {
+                Self::spawn_refuse_join(send);
+                return;
+            };
+            // Copied because it outlives the guard, and zeroized on drop like every
+            // other passphrase this node holds.
+            (ctx, zeroize::Zeroizing::new(passphrase.to_vec()))
+        };
+        if let Some(pow) = self.pow_params {
+            ctx.pow_params = pow;
+        }
+        let Ok(slot) = Arc::clone(&self.join_slots).try_acquire_owned() else {
+            // Past the cap: **refused, not queued**, and said out loud. A silent drop here
+            // would leave the joiner reading a stream that never answers, which is the
+            // failure shape this whole change exists to remove.
+            let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                reason: format!(
+                    "refused {}: already answering {JOINS_IN_FLIGHT} joins — it should retry",
+                    crate::node::network::short_id(peer)
+                ),
+            });
+            Self::spawn_refuse_join(send);
+            return;
+        };
+        // Including the slot just taken, so the first joiner sees a load of 1. This is what
+        // `Difficulty::adapted_for_load` is for, and it was passed a literal `0` until now — so the
+        // anti-flood knob ADR-005 specifies, and ADR-016 describes as adapting "against the
+        // responder's live queue", had never once adapted.
+        //
+        // This costs an ordinary joiner nothing: `Difficulty::ADAPT_THRESHOLD` is 4, so a load of
+        // 1–3 adds zero bits and one person joining a quiet room does exactly the work it did
+        // before. Past four it adds a bit per doubling of the queue, capped at `Difficulty::MAX`.
+        let pending_joins =
+            u32::try_from(JOINS_IN_FLIGHT.saturating_sub(self.join_slots.available_permits()))
+                .unwrap_or(u32::MAX);
+        let tx = self.net_tx.clone();
+        self.reap_join_tasks();
+        let admit_tx = self.net_tx.clone();
+        self.join_tasks.spawn(async move {
+            let _slot = slot;
+            let outcome = net
+                .answer_join(
+                    peer,
+                    send,
+                    recv,
+                    ctx,
+                    &passphrase,
+                    &*signer,
+                    &store,
+                    &ring,
+                    pending_joins,
+                    // **The admission lands before the joiner is told it is in.** Awaited here, on
+                    // this task, so the actor is never the thing waiting — which is the whole point
+                    // of the slot. See `NetEvent::JoinAdmit`.
+                    |identity| async move {
+                        let (ack, wait) = tokio::sync::oneshot::channel();
+                        if admit_tx
+                            .send(NetEvent::JoinAdmit {
+                                channel_id,
+                                identity: Box::new(identity),
+                                ack,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            // A dropped sender resolves this too, so a shutting-down actor cannot
+                            // strand a joiner mid-exchange.
+                            let _ = wait.await;
+                        }
+                    },
+                )
+                .await
+                // **Never dropped.** A responder whose exchange failed said nothing, so the
+                // joiner's `Unreachable` was the only trace of it and it names the wrong side.
+                // Formatted here because this is where the reason exists.
+                .map_err(|e| format!("answering {}: {e}", crate::node::network::short_id(peer)));
+            let _ = tx
+                .send(NetEvent::JoinAnswered {
+                    peer,
+                    channel_id,
+                    outcome: Box::new(outcome),
+                })
+                .await;
+        });
+    }
+
+    /// Tell a joiner "no" without waiting for it to hear that.
+    ///
+    /// A refusal is one small frame, which is *almost* always writable at once — and "almost" is
+    /// the problem. The stream belongs to the peer, so if it opens one and never reads, QUIC flow
+    /// control stalls the write, and awaiting that on the actor hands a stranger the same stall
+    /// this change removes from the exchange itself. Nothing here needs the result.
+    fn spawn_refuse_join(send: quinn::SendStream) {
+        tokio::spawn(crate::node::joinstream::refuse_join(send));
+    }
+
+    /// Drop the bookkeeping for join tasks that have already finished.
+    ///
+    /// [`Node::join_tasks`] exists to be aborted on lock, not to collect results, and a
+    /// `JoinSet` holds an entry per task until something reaps it. Called on the way in to each
+    /// spawn, which is the only place the set grows.
+    fn reap_join_tasks(&mut self) {
+        while self.join_tasks.try_join_next().is_some() {}
+    }
+
+    /// Apply what a finished join exchange produced. Runs **on the actor**, which is the point:
+    /// the waiting happened elsewhere, the state changes happen here, in order.
+    async fn apply_join_outcome(
+        &mut self,
+        peer: Digest32,
+        channel_id: Digest32,
+        outcome: std::result::Result<crate::node::joinstream::JoinOutcome, String>,
+    ) {
         let outcome = match outcome {
             Ok(o) => o,
-            // **Never dropped.** A responder whose exchange failed said nothing, so the joiner's
-            // `Unreachable` was the only trace of it and it names the wrong side.
-            Err(e) => {
-                let _ = self.event_tx.send(NodeEvent::JoinFailed {
-                    reason: format!("answering {}: {e}", crate::node::network::short_id(peer)),
-                });
+            Err(reason) => {
+                let _ = self.event_tx.send(NodeEvent::JoinFailed { reason });
                 return;
             }
         };
-        // The join proved this identity; admit it as an author so its entries are
-        // accepted (reading still needs consent).
-        let admitted = match (self.profile.as_ref(), self.channels.get(&channel_id)) {
-            (Some(profile), Some(shared)) => shared
-                .lock()
-                .await
-                .admit_author(profile.store(), &outcome.peer.identity, now)
-                .is_ok(),
-            _ => false,
+        // The room can go away while an exchange runs — it is closed, or the node locked and
+        // the task was aborted late. Filing a session against a room this node no longer holds
+        // would keep ratchet material for nothing and announce a join into a room that is not
+        // there, so say what happened and drop it.
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                reason: format!(
+                    "answered {} but the room closed before it could be filed",
+                    crate::node::network::short_id(peer)
+                ),
+            });
+            return;
         };
-        if admitted {
+        // The admission already happened, on `NetEvent::JoinAdmit`, before this joiner was sent
+        // its acceptance — that ordering is what lets its own records onto this node's board at
+        // all. What is left is the part that touches the network, deliberately after the joiner is
+        // in so it never waits on our round trips to somebody else.
+        let _ = &shared;
+        {
             self.refresh_network_view().await;
             // The newcomer's records reach the anchors through this node: it
             // witnessed the join, so it vouches (ADR-016 M15.2a). The joiner has
@@ -2499,16 +2838,53 @@ impl Node {
         // the one peer the link happened to name, and no second attempt.
         //
         // The pin is still tried first: whoever minted the link knows who is expected to answer.
+        //
+        // **Every member the board knows, not only the ones it has an address for.** The list was
+        // built from `set.members`, which is the *address records* — so a member the board knew by
+        // its **bundle**, or the **creator named by the genesis**, was not a candidate at all. The
+        // patience loop below exists precisely to wait for an address record that has not arrived
+        // yet, and a member in that state could never reach it: it was filtered out one step
+        // earlier, by the very condition the loop was written to tolerate.
+        //
+        // That is how a room with a live host became unjoinable. Measured, with the joiner naming
+        // what it tried: one candidate, both its paths dead, and the host — online, on loopback,
+        // the genesis creator — never in the list, because its address record had been refused on
+        // the anchor while its identity was never in question. The genesis is the one record whose
+        // author cannot be in doubt: its hash *is* the channelID, and it names the creator.
+        //
+        // **Ordered so that a member we can reach is tried before one we would have to wait for.**
+        // Mixing them without that gives a 20s `JOIN_ADDRESS_PATIENCE` stall in front of a peer
+        // that was dialable immediately, which is the cost this widening would otherwise add.
         let candidates: Vec<crate::hash::Digest32> = {
-            let mut all: Vec<crate::hash::Digest32> =
+            use std::collections::BTreeSet;
+            let with_address: BTreeSet<crate::hash::Digest32> = set
+                .members
+                .iter()
+                .filter(|r| !r.endpoints.is_empty())
+                .map(|r| r.author_id)
+                .collect();
+            let mut known: BTreeSet<crate::hash::Digest32> =
                 set.members.iter().map(|r| r.author_id).collect();
-            all.sort_unstable();
-            let mut ordered = Vec::with_capacity(all.len() + 1);
+            known.extend(set.bundles.iter().map(|b| b.author_id));
+            if let Some(g) = set.genesis.as_ref() {
+                known.insert(g.body.creator_pubkey.fingerprint());
+            }
+            // Never ourselves: a node does not join a room by asking itself to answer.
+            known.remove(&me);
+            let mut reachable: Vec<crate::hash::Digest32> =
+                known.intersection(&with_address).copied().collect();
+            let mut awaited: Vec<crate::hash::Digest32> =
+                known.difference(&with_address).copied().collect();
+            reachable.sort_unstable();
+            awaited.sort_unstable();
+            let mut ordered = Vec::with_capacity(known.len() + 1);
             if let Some(r) = parsed.responder {
                 ordered.push(r);
-                all.retain(|m| *m != r);
+                reachable.retain(|m| *m != r);
+                awaited.retain(|m| *m != r);
             }
-            ordered.extend(all);
+            ordered.extend(reachable);
+            ordered.extend(awaited);
             if ordered.is_empty() {
                 return Outcome::Failed(Fault::BadLink);
             }
@@ -2528,7 +2904,7 @@ impl Node {
                 return Outcome::Failed(Fault::Locked);
             };
             let ring = match self.prekeys.as_ref() {
-                Some(r) => r,
+                Some(r) => r.lock().await,
                 None => return Outcome::Failed(Fault::NotNetworked),
             };
             let bundle =
@@ -3247,7 +3623,22 @@ impl Node {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
                     continue;
                 }
-                if state.lock().await.is_author(&peer) {
+                // **An anchor does not filter out the member it is forwarding to.**
+                //
+                // `is_author` is the right question on an interval pass and the wrong one here, for
+                // the same reason it was wrong for an open room: a member that has just joined is not
+                // yet an author in this anchor's view, so the node whose entire job is holding the
+                // log for whoever is away declined to hand it over. Measured, timestamped on both
+                // sides: the anchor took the entry at **1s** and the member could not read it until
+                // **31s** — `SYNC_INTERVAL_SECS`, i.e. it arrived by the member's own periodic pull
+                // because the anchor never pushed. Not slow: not sent.
+                //
+                // On a connect or a push, reconcile and let the session decide — it verifies
+                // authorship per entry and hard-fails on one it cannot verify, which is an answer.
+                // The interval pass keeps the filter, where it costs nothing and bounds the work.
+                let forwarding =
+                    matches!(trigger, SyncTrigger::Connected | SyncTrigger::LocalAppend);
+                if forwarding || state.lock().await.is_author(&peer) {
                     channels.push(*cid);
                 }
             }
@@ -3507,7 +3898,14 @@ impl Node {
         }
         if self.syncing.contains(&channel_id) {
             // Answering while our own session holds this room is the other half of the deadlock.
-            // Dropping the stream tells the peer at once; its schedule brings it back.
+            //
+            // **Refused explicitly, not by dropping the streams.** Letting them drop leaves the peer
+            // reading for a frame that will never come until `SYNC_FRAME_TIMEOUT` expires — the
+            // silent refusal that reads as a hang, which is the shape of defect this whole change
+            // exists to remove. A reset reaches it on the next read, and its schedule brings it
+            // back in a second.
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream(&mut send, &mut recv);
             return;
         }
         let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
@@ -3557,11 +3955,15 @@ impl Node {
         let Ok(signer) = profile.signer() else {
             return false;
         };
-        // The ring is borrowed mutably below, so take what the save needs first.
-        let signer: &dyn crate::identity::composite::RootSigner = signer;
-        let Some(ring) = self.prekeys.as_mut() else {
+        // The ring is taken under its lock below, so take what the save needs first. The
+        // `Send + Sync` bound is load-bearing, not decoration: this function now awaits the
+        // ring lock, so the actor's whole future has to stay `Send`, and a bare
+        // `&dyn RootSigner` is not.
+        let signer: &(dyn crate::identity::composite::RootSigner + Send + Sync) = signer;
+        let Some(ring) = self.prekeys.as_ref().map(Arc::clone) else {
             return false;
         };
+        let mut ring = ring.lock().await;
         if let Some(id) = init.one_time_prekey_id {
             match ring.use_one_time(id, now) {
                 prekeys::OneTimeUse::Fresh => {}
@@ -3574,7 +3976,7 @@ impl Node {
             }
             // Persist the consume before the handshake completes: a crash here must not
             // leave the prekey re-offerable.
-            if prekeys::save(store, signer, ring).is_err() {
+            if prekeys::save(store, signer, &ring).is_err() {
                 return false;
             }
         }
@@ -3661,7 +4063,7 @@ impl Node {
         let shared = self.channels.get(channel_id).map(Arc::clone)?;
         let ctx = { shared.lock().await.join_context().ok()? };
         let record = net.board_bundle(channel_id, ctx.epoch, &target)?;
-        let ring = self.prekeys.as_ref()?;
+        let ring = self.prekeys.as_ref()?.lock().await;
         let (initial, session) = crate::pairwise::session::Session::initiate(
             ring.identity_dh(),
             &record.prekey_bundle,
@@ -3769,7 +4171,7 @@ impl Node {
         // unlocked vault — never a fresh one, or a restore would change it.
         let dh_secret = *signer.x25519_identity_secret();
         let (ring, _created) = prekeys::load_or_create(profile.store(), signer, &dh_secret, now)?;
-        self.prekeys = Some(ring);
+        self.prekeys = Some(Arc::new(tokio::sync::Mutex::new(ring)));
         // The keyring is sealed under this identity, so it can only be opened now
         // (ADR-020 §3). Without this the node would hold an empty keyring and
         // silently trust nobody after every restart.
@@ -3782,6 +4184,13 @@ impl Node {
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
+        // Abort the join exchanges first. Each holds an `Arc<VaultRootSigner>` and an
+        // `Arc` of the ring below, so locking while one runs would otherwise mean the
+        // secrets outlive the lock — for however long a joiner felt like waiting. Aborting
+        // drops both at the task's next await point, which is what makes ADR-015's
+        // lock/zeroize still true now that the exchange runs off the actor.
+        self.join_tasks.abort_all();
+        while self.join_tasks.try_join_next().is_some() {}
         // Drop the prekey ring: its secrets zeroize on drop, so a locked node holds
         // no key-agreement material (ADR-015 lock/zeroize).
         self.prekeys = None;

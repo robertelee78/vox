@@ -582,19 +582,52 @@ pub async fn refuse_join(mut send: SendStream) {
 /// stream (the manager authorized the kind; `peer_fp` is the connection's
 /// authenticated identity).
 ///
-/// The ring is borrowed mutably and **persisted here** the moment a one-time prekey
-/// is consumed, so the one-shot rule survives a crash (see the module docs).
-pub async fn run_responder(
+/// The ring is **shared, not borrowed mutably**, and is **persisted here** the moment a
+/// one-time prekey is consumed, so the one-shot rule survives a crash (see the module docs).
+///
+/// # Why the ring is behind a lock
+/// This exchange waits on the joiner three times and verifies its proof of work, so it must
+/// not run on the node's actor and must not hold anything the rest of the node needs while it
+/// waits. The ring is needed at exactly two points — the bundle that goes out in the
+/// `Challenge`, and the prekey consume after the *last* frame arrives — with every wait in
+/// between. Taking the lock twice, briefly, is what lets concurrent joins overlap instead of
+/// queueing behind whichever joiner is slowest; a `&mut` borrow across the whole exchange
+/// would serialize them and reproduce the stall one layer down.
+///
+/// # `admit_before_accepting`
+/// Called with the joiner's proven identity **after the exchange succeeds and before the
+/// acceptance frame goes out**, and awaited. That ordering is the whole reason it exists.
+///
+/// The joiner treats `Accepted` as "I am in", and the very next thing it does is publish its
+/// records to this node's board. Those records are refused unless this node has already admitted
+/// it as an author, and nothing retries them. While the exchange ran on the actor that ordering was
+/// free — the admission happened in the same actor turn the exchange ended, before the joiner could
+/// possibly have returned. Moving the exchange into a slot broke it: the admission became an event
+/// the actor reached *later*, the joiner published into the gap, and the newcomer never reached any
+/// board. Measured, real binaries: a third person joining went 6 of 10 to **0 of 10** (ADR-018
+/// §"The admission window").
+///
+/// So the caller uses this to apply the admission on the actor and wait for it. The wait happens
+/// here, on the slot's task, which is what keeps the actor free — the property the slot was
+/// introduced for.
+pub async fn run_responder<F, Fut>(
     mut send: SendStream,
     mut recv: RecvStream,
     peer_fp: Digest32,
     cfg: &ResponderConfig<'_>,
     store: &Store,
-    ring: &mut PrekeyRing,
-) -> Result<JoinOutcome> {
+    ring: &tokio::sync::Mutex<PrekeyRing>,
+    admit_before_accepting: F,
+) -> Result<JoinOutcome>
+where
+    F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let mut result = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring).await;
     match &mut result {
         Ok(outcome) => {
+            // **Admitted before it is told it is in.** See `admit_before_accepting`.
+            admit_before_accepting(outcome.peer.identity.clone()).await;
             // The witness `responder_exchange` minted beside the verification that
             // justifies it. The joiner keeps it: it is what makes that key admissible
             // to anyone else (M17.6).
@@ -642,7 +675,7 @@ async fn responder_exchange(
     peer_fp: Digest32,
     cfg: &ResponderConfig<'_>,
     store: &Store,
-    ring: &mut PrekeyRing,
+    ring: &tokio::sync::Mutex<PrekeyRing>,
 ) -> Result<JoinOutcome> {
     // 1. CHALLENGE — difficulty adapts to the responder's live join load and is
     //    capped by `adapted_for_load` at `Difficulty::MAX`.
@@ -651,7 +684,9 @@ async fn responder_exchange(
     let challenge_sig = challenge.sign(cfg.root)?;
     let sid = fresh_sid()?;
     let root_pub = cfg.root.public_key();
-    let bundle = ring.bundle(&root_pub)?;
+    // Held only for the bundle, and dropped before the first frame goes out: everything
+    // below this line waits on the joiner.
+    let bundle = { ring.lock().await.bundle(&root_pub)? };
     send_frame(
         send,
         &JoinFrame::Challenge {
@@ -706,40 +741,47 @@ async fn responder_exchange(
         return Err(Error::MalformedJoin("expected init"));
     };
     let init = InitialMessage::from_wire(&message)?;
-    let mut reuse = OtpReuseTracker::new();
-    let mut last_resort_grade = false;
-    if let Some(id) = init.one_time_prekey_id {
-        match ring.use_one_time(id, cfg.now_secs) {
-            OneTimeUse::Fresh => {}
-            OneTimeUse::Reused => {
-                // Seed the per-process tracker from the ring's persistent record so
-                // `Session::accept` flags the downgrade even after a restart
-                // (ADR-004 reconciliation).
-                reuse.observe(id);
-                last_resort_grade = true;
+    // The last frame has arrived, so the ring is taken again here — for the consume, the
+    // durable save and the session bootstrap that depends on both. No wait happens under
+    // this guard, which is what keeps one joiner from delaying another's prekeys.
+    let (session, last_resort_grade) = {
+        let mut ring = ring.lock().await;
+        let mut reuse = OtpReuseTracker::new();
+        let mut last_resort_grade = false;
+        if let Some(id) = init.one_time_prekey_id {
+            match ring.use_one_time(id, cfg.now_secs) {
+                OneTimeUse::Fresh => {}
+                OneTimeUse::Reused => {
+                    // Seed the per-process tracker from the ring's persistent record so
+                    // `Session::accept` flags the downgrade even after a restart
+                    // (ADR-004 reconciliation).
+                    reuse.observe(id);
+                    last_resort_grade = true;
+                }
+                OneTimeUse::Unknown => {
+                    return Err(Error::MalformedJoin(
+                        "init names an unknown one-time prekey",
+                    ))
+                }
             }
-            OneTimeUse::Unknown => {
-                return Err(Error::MalformedJoin(
-                    "init names an unknown one-time prekey",
-                ))
-            }
+            // Persist the consume before the handshake completes: a crash here must not
+            // leave the prekey re-offerable.
+            prekeys::save(store, cfg.root, &ring)?;
         }
-        // Persist the consume before the handshake completes: a crash here must not
-        // leave the prekey re-offerable.
-        prekeys::save(store, cfg.root, ring)?;
-    }
-    let signed_prekey = ring
-        .signed_prekey_for(init.signed_prekey_id)
-        .ok_or(Error::MalformedJoin("init names an unknown signed prekey"))?;
-    let one_time_prekey = init
-        .one_time_prekey_id
-        .and_then(|id| ring.consumed_one_time(id));
-    let prekeys = ResponderPrekeys {
-        identity_dh_key: ring.identity_dh(),
-        signed_prekey,
-        one_time_prekey,
+        let signed_prekey = ring
+            .signed_prekey_for(init.signed_prekey_id)
+            .ok_or(Error::MalformedJoin("init names an unknown signed prekey"))?;
+        let one_time_prekey = init
+            .one_time_prekey_id
+            .and_then(|id| ring.consumed_one_time(id));
+        let prekeys = ResponderPrekeys {
+            identity_dh_key: ring.identity_dh(),
+            signed_prekey,
+            one_time_prekey,
+        };
+        let session = bootstrap.bootstrap(&init, &prekeys, &mut reuse)?;
+        (session, last_resort_grade)
     };
-    let session = bootstrap.bootstrap(&init, &prekeys, &mut reuse)?;
     debug_assert_eq!(session.is_last_resort_grade(), last_resort_grade);
     // This node verified the joiner's ADR-005 proof of possession above, so it is the
     // only party that can honestly attest to this join. The witness is minted here,

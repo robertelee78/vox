@@ -19,6 +19,8 @@
 //! The passphrase is taken as `&[u8]` and never retained; the UI keeps it in a
 //! `SecretString` and drops it after the call (ADR-015).
 
+use std::sync::Arc;
+
 use zeroize::Zeroizing;
 
 use crate::atrest::sek::Argon2Profile;
@@ -43,7 +45,7 @@ pub struct Profile {
     vault: IdentityVault,
     fingerprint: Digest32,
     created: u64,
-    unlocked: Option<VaultRootSigner>,
+    unlocked: Option<Arc<VaultRootSigner>>,
 }
 
 impl std::fmt::Debug for Profile {
@@ -105,7 +107,7 @@ impl Profile {
             vault,
             fingerprint,
             created: now_secs,
-            unlocked: Some(signer),
+            unlocked: Some(Arc::new(signer)),
         })
     }
 
@@ -153,7 +155,7 @@ impl Profile {
             // than silently adopt either.
             return Err(Error::Profile("vault identity does not match the store"));
         }
-        self.unlocked = Some(signer);
+        self.unlocked = Some(Arc::new(signer));
         Ok(())
     }
 
@@ -189,7 +191,28 @@ impl Profile {
 
     /// The unlocked root signer, or [`Error::Profile`] while locked.
     pub fn signer(&self) -> Result<&VaultRootSigner> {
-        self.unlocked.as_ref().ok_or(Error::Profile("locked"))
+        self.unlocked.as_deref().ok_or(Error::Profile("locked"))
+    }
+
+    /// The unlocked root signer as a handle a **spawned task** can own, or
+    /// [`Error::Profile`] while locked.
+    ///
+    /// [`Profile::signer`] hands out a borrow, which is right for anything running on the
+    /// node's actor and useless for anything that must outlive the call — answering a join
+    /// runs off the actor precisely so a joiner cannot stall the node, and it signs five
+    /// times while it does (the challenge, the CPace accept, its own proof, the prekey-ring
+    /// save and the join witness).
+    ///
+    /// # Zeroize
+    /// This extends the signer's life past [`Profile::lock`] for as long as a holder keeps
+    /// the handle, which ADR-015 otherwise forbids. The node therefore tracks the tasks it
+    /// gives handles to and aborts them when it locks, so "locked" still means the secrets
+    /// are gone rather than gone *soon*.
+    pub fn signer_arc(&self) -> Result<Arc<VaultRootSigner>> {
+        self.unlocked
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(Error::Profile("locked"))
     }
 
     /// The identity's composite fingerprint (public; available while locked).

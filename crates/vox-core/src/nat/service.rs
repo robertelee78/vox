@@ -326,6 +326,12 @@ pub struct RecordSet {
     pub genesis: Option<Genesis>,
 }
 
+/// Told a channelID when a member-kind record **from a peer** is admitted to this board.
+///
+/// A plain closure rather than a typed sender because `nat` must not depend on `node`: the
+/// node installs one that turns the call into an event on its actor's queue.
+pub type AdmittedHook = Arc<dyn Fn(Digest32) + Send + Sync>;
+
 /// The server side: a [`RendezvousStore`] behind a lock, the membership oracle
 /// and a clock. Clone-cheap (`Arc`s) so one service serves every connection.
 #[derive(Clone)]
@@ -333,6 +339,8 @@ pub struct RendezvousService {
     store: Arc<Mutex<RendezvousStore>>,
     oracle: Arc<dyn MembershipOracle>,
     clock: Clock,
+    /// See [`RendezvousService::on_admitted`].
+    admitted: Option<AdmittedHook>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -351,7 +359,21 @@ impl RendezvousService {
             store,
             oracle,
             clock,
+            admitted: None,
         }
+    }
+
+    /// Be told when a record by an author **other than this node** is admitted.
+    ///
+    /// This is the seam that makes learning a new member event-driven. A member's bundle only
+    /// reaches an anchor because a member that already knows it **vouches** by publishing it on
+    /// (see this service's `put`), and the node holding that board had no way to notice one
+    /// had arrived: the record landed, nothing was told, and the onward mirror waited for whatever
+    /// happened to trigger a publish next. Measured on a real three-process room, that left the
+    /// anchor knowing 1 of 2 members in 2 runs of 3 — a newcomer nobody away from the room could
+    /// reconcile with, for no reason a person could see.
+    pub fn on_admitted(&mut self, hook: AdmittedHook) {
+        self.admitted = Some(hook);
     }
 
     /// The shared store (for the owning node's own reads and pruning).
@@ -463,11 +485,21 @@ impl RendezvousService {
         let tag = parse_frame(record)
             .map(|f| f.tag)
             .map_err(|e| RejectReason::for_error(&e))?;
+        // Set by the arms below for a member-kind record that arrived **from a peer** rather than
+        // from this node's own local publish. That is the test, and the narrower one — "the
+        // publisher is not the author" — is wrong: the case that matters most is a newcomer
+        // putting *its own* bundle on a member's board, which is publisher == author and is
+        // precisely the record that has to travel onward for anyone else to reconcile with it.
+        // A local publish is excluded because this node already mirrors its own records.
+        let mut grew: Option<Digest32> = None;
         let res = match tag {
             StructTag::RendezvousRecord => {
                 let rec =
                     RendezvousRecord::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
+                if publisher.is_some() {
+                    grew = Some(cid);
+                }
                 let mut store = lock(&self.store);
                 let key = self.known_key(&store, &cid, epoch, &author, now);
                 store.accept_member(rec, |_| key.clone(), now)
@@ -476,6 +508,9 @@ impl RendezvousService {
                 let rec = MemberBundleRecord::from_wire(record)
                     .map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
+                if publisher.is_some() {
+                    grew = Some(cid);
+                }
                 let mut store = lock(&self.store);
                 let key = self
                     .known_key(&store, &cid, epoch, &author, now)
@@ -505,6 +540,16 @@ impl RendezvousService {
             }
             _ => return Err(RejectReason::UnknownKind),
         };
+        // Fired **after** the match, so the store guard each arm took is already gone: a hook runs
+        // node code, and holding a board lock into it is how a board lock ends up inside somebody
+        // else's await. Only for a record whose author is not the publisher — that is precisely
+        // the "somebody new landed here" case — and only on admission, so a refreshed record
+        // declined by the ADR-012 floor says nothing.
+        if res.is_ok() {
+            if let (Some(hook), Some(cid)) = (self.admitted.as_ref(), grew) {
+                hook(cid);
+            }
+        }
         res.map_err(|e| RejectReason::for_error(&e))
     }
 

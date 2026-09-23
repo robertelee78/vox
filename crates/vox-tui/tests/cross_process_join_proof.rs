@@ -42,8 +42,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 
@@ -59,6 +60,8 @@ struct Proc {
     name: &'static str,
     child: Child,
     out: Option<BufReader<ChildStdout>>,
+    /// Everything the child wrote to stderr, drained continuously — see `spawn`.
+    err: Arc<Mutex<String>>,
 }
 
 impl Drop for Proc {
@@ -98,7 +101,30 @@ impl Proc {
             drop(child.stdin.take());
         }
         let out = child.stdout.take().map(BufReader::new);
-        Self { name, child, out }
+        // **stderr is piped, so it must be read.** It was piped and never read, which is a
+        // 64 KiB fuse on the child: once the pipe buffer fills, the daemon blocks in `write` and
+        // the proof sees a node that has stopped doing anything, with no failure and no output —
+        // a hang, and bimodal in exactly the shape ADR-018 recorded for this gate's own flake.
+        // `vox daemon` now reports every event that explains a failure, so it writes more than it
+        // used to and this fuse got shorter, not longer. Drained on a thread into a string the
+        // panic below prints, so the bytes that were the hazard become the diagnosis.
+        let err = Arc::new(Mutex::new(String::new()));
+        if let Some(mut pipe) = child.stderr.take() {
+            let sink = Arc::clone(&err);
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                let _ = pipe.read_to_string(&mut buf);
+                if let Ok(mut guard) = sink.lock() {
+                    guard.push_str(&buf);
+                }
+            });
+        }
+        Self {
+            name,
+            child,
+            out,
+            err,
+        }
     }
 
     /// Wait for a line matching `want`, so readiness is observed rather than slept on.
@@ -120,7 +146,15 @@ impl Proc {
                 Err(_) => break,
             }
         }
-        panic!("{}: never printed {what}; saw: {seen:#?}", self.name);
+        let err = self
+            .err
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone());
+        panic!(
+            "{}: never printed {what}; saw: {seen:#?}\nits stderr:\n{err}",
+            self.name
+        );
     }
 }
 

@@ -102,6 +102,8 @@ const T_STALLED: u64 = 1715;
 
 /// `NodeEvent::PeerUnreachable`.
 const T_PEER_UNREACHABLE: u64 = 1716;
+/// `NodeEvent::PublishRefused`. Additive, and deliberately away from the sequential range.
+const T_PUBLISH_REFUSED: u64 = 1717;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -828,6 +830,17 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::Stalled { what, millis } => {
             e.array(3).uint(T_STALLED).text(what).uint(*millis);
         }
+        NodeEvent::PublishRefused {
+            channel_id,
+            what,
+            why,
+        } => {
+            e.array(4)
+                .uint(T_PUBLISH_REFUSED)
+                .bytes(channel_id)
+                .text(what)
+                .text(why);
+        }
         NodeEvent::JoinFailed { reason } => {
             e.array(2).uint(T_JOIN_FAILED).text(reason);
         }
@@ -1079,6 +1092,17 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             millis: d
                 .uint()
                 .map_err(|_| Error::MalformedBundle("ipc stall ms"))?,
+        },
+        (T_PUBLISH_REFUSED, 4) => NodeEvent::PublishRefused {
+            channel_id: digest(d)?,
+            what: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc publish what"))?
+                .to_owned(),
+            why: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc publish why"))?
+                .to_owned(),
         },
         (T_JOIN_FAILED, 2) => NodeEvent::JoinFailed {
             reason: d

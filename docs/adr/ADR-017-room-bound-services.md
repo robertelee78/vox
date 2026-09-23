@@ -1322,6 +1322,36 @@ peer that opens a connection and never finishes its handshake now delays other i
 most 30 seconds rather than for ever. What remains is a 30-second serialisation window, which is a real
 residual DoS against an anchor and is stated as one.
 
+**The residual is no longer unproven (2026-09-23).** This section's title says the 30-second
+serialisation is unproven, and that was the honest state: the cost was reasoned from the code and the
+only thing that failed because of it was an intermittent proof nobody could attribute. It now has a
+deterministic, two-process, real-binary reproduction — one host and two sequential `vox connect`s, no
+trust, no malice, nothing exotic:
+
+| what | result |
+|---|---|
+| a **lone** joiner 35s after the host starts | in, 2s |
+| a second joiner **immediately** after the first | **locked out** — `direct attempt timed out` against the host's real, still-bound port |
+| a second joiner **40s** after the first | in |
+
+The host prints `vox: <first joiner> joined` and then says *nothing at all* about the second, because
+the second's handshake never reaches it. The socket stays bound, so the symptom is a timeout rather
+than a refusal, and it surfaces three nodes away as `Fault::Unreachable` against a peer that is up and
+listening. The recovery at 40s is what identifies the window as `HANDSHAKE_TIMEOUT` rather than
+anything permanent.
+
+**A joiner's `vox connect` is a one-shot: it exits the moment it has joined.** So the ordinary,
+intended use of the product leaves the host mid-handshake on something and deaf for the next 30
+seconds — no attacker required. That is what makes this a defect rather than a hardening item, and it
+is the cause of `service_rehearsal_proof:490`, which has been read as a flaky proof and has blocked
+releases (ADR-018).
+
+It also matters for what "proved" has to mean here. Those two NAT gates are the acceptance test for
+*splitting* the handshake; the reproduction above is the acceptance test for *not* splitting it. A
+change to this loop must now satisfy both, and until this session only one of the two existed — which
+is why the serialised version could be shipped as the safe option. It is not the safe option; it is
+the option whose cost had no test.
+
 **Why the loop is not split, measured.** Spawning phase two per attempt makes circuit establishment
 between peers behind symmetric NATs wildly variable. Same gate, same box, same commit:
 

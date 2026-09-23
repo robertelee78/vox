@@ -397,6 +397,230 @@ Neither currently does: the daemon has no event reader, so every `NodeEvent` it 
 and the one configuration where a person cannot watch a foreground verb is the one with no reporting
 at all.
 
+## A red on a gate's *precondition* is still a product defect (2026-09-23)
+
+`a_join_is_not_hostage_to_one_member` blocked **v0.2.2, v0.2.3 and v0.2.4** from publishing — three
+tags, three CI runs of roughly forty minutes each, all dying on the same line. That line is not the
+gate's claim. It is the gate checking, before it measures anything, that the anchor came to know both
+members of the room, and saying "this gate cannot measure a fallback" when it had not.
+
+Everything about that phrasing invited the wrong response. It reads like the gate apologising for
+itself, so the available moves looked like raising the timeout or adding it to the exclusion list
+above — and both would have shipped the defect. What it was actually reporting: a newcomer's member
+bundle never reached the anchor's board, so a room stopped being joinable by anyone else the moment
+its creator went offline. Measured **1 of 2 members in 2 runs of 3**.
+
+Three rules come out of it.
+
+**A precondition must accuse the product, or it will be read as the gate's own weakness.** The gate
+now opens that panic with "PRODUCT DEFECT, not a flaky gate", states what the board knew, and says
+outright not to raise the timeout or exclude it. A red nobody can attribute is as bad as a green that
+asserts the bug — the same failure this ADR was written about, one level up.
+
+**An intermittent red is a lost event until proven otherwise.** The instinct is latency: measure the
+distribution, find it long, shorten an interval. It was not latency. The joiner's own put is refused
+by design and the one path that works fired before the record existed, so no duration existed to
+measure and no timeout would ever have been long enough. "Bimodal" is the tell — a passing run in
+seconds and a failing run that burns the whole budget is an event that never arrived, not a slow one.
+
+**The reason was being produced all along and had nowhere to go.** Every board put was
+`let _ = client.put(..).await`, and `vox daemon` — the always-on host — had no event reporter at all,
+so its stderr measured **0 bytes** across a full run. Wiring both took under an hour and the anchor
+then named the cause in one run: `rejected: author is not a channel member`. Three releases were lost
+to a missing `eprintln!`, which is the cheapest possible lesson and was not learned cheaply. Before
+theorising about an intermittent failure, check whether the component that knows the answer is able to
+say anything at all.
+
+**And the box was lying, because of us.** Both sessions working this were reasoning against a load
+average of 42 caused by **324 orphaned `vox` processes**, the oldest alive 2h46m, leaked by harnesses
+that cleaned up with `pkill -f "$datadir"` — a pattern that matches nothing, because `vox node`'s argv
+carries no path and `VOX_DATA_DIR` is an environment variable `pgrep -f` cannot see. That is not an
+excuse for the red (it was deterministic once instrumented, and §"gates flake under load" still
+stands: never explain a red with the environment). It is a rule about measurement: record `$!`, kill by
+PID, and assert zero strays at the end of a run. A *functional* pass under high load is stronger
+evidence than a clean one; a *timing* number under load is worth nothing.
+
+## An observation about a parent process is not an observation about the work (2026-09-23)
+
+A method failure, recorded because it cost time twice in one day and both times the honest reading
+was narrower than the inference drawn from it.
+
+Thirteen `sccache rustc` processes sat at 0.0% CPU in state `S` with `cargo` also at 0.0%, and that
+was read as a deadlocked cache server. It is the normal shape: `sccache rustc` forks the real
+compiler and waits on it, and the `ps` output being read had already printed the busy child on the
+next line. The shared server was restarted on that reading — cold-starting a 10 GiB cache mid-build —
+and three compiler processes were killed by hand, any of which could have belonged to another
+project. The machine was simply loaded, by other things: `qemu` at 159%, `opencode` at 48%, Teams at
+41%, and exactly **two** vox processes.
+
+Two rules, and the second corrects the first attempt at the first:
+
+- **Check the process tree, not the process.** `ps` on a wrapper reports idle every single time.
+- **`%CPU` cannot answer "is this working now" on macOS**: it is a ratio of CPU time to elapsed time,
+  a lifetime average. It reads low for a process that is busy after a long wait, and high for one
+  that worked hard and then blocked. The column that answers the question is `state` — `R` against
+  `S` — or repeated instantaneous samples.
+
+And: **never restart or kill a shared service to test a theory.** The theory here was falsifiable with
+one more line of the `ps` output already on screen.
+
+This is the same error the product defects in this ADR are made of. `Fault::Unreachable` meant
+"nobody answered", not "the address is wrong". 0% on a wrapper means "this process is waiting", not
+"nothing is happening". A red that is intermittent means "an event was lost", not "a timeout is too
+short". Each time the observation was real and the inference did not follow — which is why §"gates
+flake under parallel load" forbids explaining a red with the environment even when the environment is
+genuinely bad. It was genuinely bad today, and it still was not the cause.
+
+## The admission window: one cycle, and moving the join off the actor widened it (2026-09-23)
+
+**FIXED 2026-09-23, and the window is closed rather than narrowed.** `run_responder` takes an
+`admit_before_accepting` callback, awaited after the exchange succeeds and **before the `Accepted`
+frame goes out**. The node turns it into `NetEvent::JoinAdmit` with a `oneshot` and waits for the
+actor to answer — on the slot's task, so the actor is still never the thing waiting, which is the
+property the slot exists for. The joiner is therefore an admitted author before it is ever told it is
+in, which is the ordering the inline version got for free. `JoinAdmit` is deliberately cheap and local
+(admit, answer, done); everything touching the network stays on `JoinAnswered`, after acceptance, so a
+joiner never waits on this node's round trips to somebody else. A dropped `oneshot` resolves the wait,
+so a shutting-down actor cannot strand a joiner mid-exchange.
+
+Measured on the harness that discriminates, written by the other session (five reps each):
+
+| tree | third person gets in |
+|---|---|
+| `main` | 6 of 10 |
+| the join-slots branch, before this | **0 of 10** |
+| with the admission window closed | **5 of 5** (12s, 12s, 14s, 15s, 12s) |
+
+Better than `main`, not merely recovered — because closing the window also removes the narrow version
+of the same cycle that gave `main` its 6-of-10 and the hostage gate its 3-of-5.
+
+**The record of the regression is kept below rather than deleted, because the mechanism is the lesson.**
+
+Answering a join was moved into a slot so a stranger could not hold the node (ADR-016 §"Answering a
+join runs off the actor"). That change **defers the responder's `admit_author` by one event hop**: on
+the previous code the responder admitted the joiner in the *same actor turn* the exchange ended, before
+the joiner's `join` call had returned. With the exchange in a slot it completes, posts
+`NetEvent::JoinAnswered`, and the admission happens when the actor reaches that event.
+
+In that window the newcomer has already returned from its join and published its records to the
+responder's board, where they are refused `author is not a channel member`. Nothing retries. So the
+responder's oracle never lists the newcomer, no record is ever admitted, the `BoardGrew` hook never
+fires because it fires *on admission*, the anchor's board stays at one member, and the next person to
+join the room is handed the one member that is offline and never tries the one that is up.
+
+Measured, real binaries, one host plus two joiners, the creator killed between them:
+
+| tree | third person gets in |
+|---|---|
+| `main` | 6 of 10 |
+| the join-slots branch | **0 of 10** |
+| bisected: the join-slots commit alone, reorder absent | **0 of 5** |
+
+The failures are five identical ~11s, and that constancy is the tell: **a structural window does not
+vary.** The same reading explains main's 6-of-10 and the 3-of-5 on
+`a_join_is_not_hostage_to_one_member` before this work — there the window is narrow but real, so the
+cycle is possible and merely rare. It is **one cycle with two widths**, not two defects, which also
+retires the idea that the board-population failure and the join failure were independent.
+
+**Why a retry is the wrong fix.** Retrying the newcomer's publish, or polling until the responder
+catches up, makes the symptom rarer and leaves the cycle in place — which produces exactly the
+unexplainable 4-of-5 this ADR exists to forbid. The window has to close: **the joiner must be admitted
+before its join returns**, which means the admission has to be part of the exchange completing rather
+than an event the actor reaches afterwards. That is a design question about how a slot hands work back
+to the actor, and it has to keep the property the slot was introduced for — no network wait on the
+actor — while restoring the ordering the inline version got for free.
+
+Both acceptance tests now exist and a change must satisfy both: the two-joiner reproduction above
+(which discriminates at 5-of-5) and `a_join_is_not_hostage_to_one_member`.
+
+**Process note, since it is the same lesson as the rest of this ADR.** Three mechanisms were proposed
+for the `:490` failure and measurement killed each one — the publish ordering, the candidate list, and
+trust gating the connection. Two of them were coherent enough to have been written up as the cause.
+The localisation of *this* regression was also proposed wrongly first (the two-line publish reorder)
+and settled only by bisecting with the suspect change verifiably absent from the arm. A coherent
+mechanism is a hypothesis, and the only thing that ever separated them was a measurement.
+
+## Root cause of `service_rehearsal_proof:490`: a host serves one joiner, then no one for 30s (2026-09-23)
+
+`:490` — "the stranger must still be able to JOIN" — is **not** a flaky proof and **not** about the
+stranger. It reproduces deterministically with two joiners and no trust involved at all:
+
+```text
+J1 rc=0 in  2s     (first joiner, in immediately)
+J2 rc=1 in 21s     (second joiner, locked out)
+J2 dialed 127.0.0.1:50116 — the host's real, still-bound, listening port
+host stdout: "vox: <J1> joined"   and nothing whatsoever about J2
+```
+
+Three controls establish the shape:
+
+| test | result |
+|---|---|
+| a **lone** joiner 35s after the host starts | in, 2s — so the host does not stop accepting with age |
+| J2 immediately after J1 | locked out |
+| J2 **40s** after J1 | in — so it recovers, it is not permanently broken |
+
+The recovery at 40s names the cause: **`spawn_accept_loop` awaits `finish_incoming` inline**, so the
+accept path handles one connection at a time and is occupied for up to `HANDSHAKE_TIMEOUT` (30s) by
+a handshake that does not complete. A joiner's `vox connect` exits as soon as it has joined, leaving
+the host mid-handshake on something, and for the next 30 seconds the host answers nobody. The socket
+stays bound, which is why the symptom is a **timeout** rather than a refusal, and why it surfaces
+three nodes away as `Fault::Unreachable` on a peer that is up.
+
+**This is the same defect class as the join exchange running on the actor, one layer below it.** The
+decider's requirement was that nobody attempting to join can render a node inoperable; answering a
+join now runs in a slot, and the *accept* of the connection that carries it still does not. Any peer,
+malicious or merely abrupt, costs a node 30 seconds of deafness.
+
+**It is also the ADR-017 "Open proof gap", now with a deterministic reproduction.** That gap records
+that spawning phase two — quinn's own documented shape, which is the obvious fix — was measured
+*worse*: serialised 40-52s consistently green on `m15_two_clients_behind_symmetric_nats`, split 68s,
+140s, and a timeout at 247s, with the cause "a cross-connection interaction in circuit establishment
+that is still unidentified". So the fix is known, was tried, regressed two NAT gates, and was
+reverted for a reason nobody has explained yet.
+
+What is new here is that the gap has a **cheap, deterministic, two-process reproduction of its cost**
+rather than only a flaky proof: `scratchpad/order4.sh` in that session, or any host plus two
+sequential `vox connect`s. ADR-017 says those two NAT gates are the acceptance test for splitting the
+handshake; this is the acceptance test for *not* splitting it, and the two must now be satisfied
+together. That is what makes it tractable where it was not before.
+
+**Not fixed in v0.2.5.** It is pre-existing — reproduced on `0590cdc` (v0.2.4's commit) 5 times of 5,
+and present in CI history on v0.2.3's runs, before any of this session's work existed.
+
+## Open defect: a node joining a room answers nobody for 30 seconds (2026-09-23)
+
+Found by typing `vox connect` and watching, on a room whose members cannot be reached:
+
+```text
+vox: busy 30535ms — joining a room — nobody could be answered
+vox: cannot join: ...
+```
+
+Three runs, 30.5s each — a bound, not a variance, and consistent with `HANDSHAKE_TIMEOUT` being
+awaited inline. `busy … nobody could be answered` is `NodeEvent::Stalled`, and `joining a room` is
+`command_name(NodeCommand::JoinChannel)`, so this is not the network being slow: it is **the joiner's
+own actor held for the whole half minute**, during which that node answers no sync, no message and no
+inbound join.
+
+It is the initiator half of the defect this release fixed on the responder half. Answering a join now
+runs in a slot (ADR-016 §"Answering a join runs off the actor"); *making* one still runs on the actor.
+The fix is the same shape — decide on the actor, wait in a slot, outcome as an event — and is
+deliberately **not** in v0.2.5: it is an unproved actor change, and this release already carries
+measured evidence for what it does change. Bolting it on would trade that for a guess.
+
+Two things to fix together, since they are one experience:
+
+1. The walk holds the actor. Nothing else on that node runs for up to 30s per unreachable member tried.
+2. The walk says nothing while it waits. `forward` prints a verdict per rung (ADR-013); the join walk
+   has exactly the same information — which member it tried and what that member said — and discards
+   it, so a person sees a blank terminal for thirty seconds and is then told no.
+
+Recorded here rather than left to be rediscovered: the `Stalled` line above exists only because this
+node was made to say when it cannot answer, which is the same instrumentation that found the
+board-growth defect. Before that, this was thirty silent seconds and nothing in the product could have
+told anyone why.
+
 ## Links
 
 **Depends on**: ADR-007 (the golden evaluator suite this retains), ADR-010 (the Argon2 cost this

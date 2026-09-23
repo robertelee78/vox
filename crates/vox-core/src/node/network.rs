@@ -319,6 +319,15 @@ impl NodeNet {
         }
     }
 
+    /// Be told, by channelID, when a record by another author is admitted to this node's board.
+    ///
+    /// Set before this is shared, which is why it takes `&mut self`: the service is cloned into
+    /// every connection that serves a stream. See
+    /// [`crate::nat::service::RendezvousService::on_admitted`] for why this seam exists.
+    pub fn on_board_growth(&mut self, hook: crate::nat::service::AdmittedHook) {
+        self.service.on_admitted(hook);
+    }
+
     /// The connection manager (one connection per peer).
     #[must_use]
     pub fn manager(&self) -> &Arc<ConnectionManager> {
@@ -1146,7 +1155,7 @@ impl NodeNet {
     /// the binding is the caller's single decision — `ChannelState::join_context` in
     /// production.
     #[allow(clippy::too_many_arguments)] // each argument is a distinct required input
-    pub async fn answer_join(
+    pub async fn answer_join<F, Fut>(
         &self,
         peer: Digest32,
         send: SendStream,
@@ -1155,9 +1164,14 @@ impl NodeNet {
         passphrase: &[u8],
         signer: &(dyn RootSigner + Send + Sync),
         store: &Store,
-        ring: &mut PrekeyRing,
+        ring: &tokio::sync::Mutex<PrekeyRing>,
         pending_joins: u32,
-    ) -> Result<JoinOutcome> {
+        admit_before_accepting: F,
+    ) -> Result<JoinOutcome>
+    where
+        F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let cfg = ResponderConfig {
             ctx,
             passphrase,
@@ -1166,7 +1180,7 @@ impl NodeNet {
             pending_joins,
             now_secs: self.now(),
         };
-        run_responder(send, recv, peer, &cfg, store, ring).await
+        run_responder(send, recv, peer, &cfg, store, ring, admit_before_accepting).await
     }
 
     /// Run the ADR-005 **joiner** side against a member over `conn` (which must be
