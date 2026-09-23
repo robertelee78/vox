@@ -290,6 +290,8 @@ pub fn run_node(
         // Addresses are discovered on a task after start-up (a route probe and a
         // gateway request); print the anchor specs once they are known, then serve.
         let mut printed: Vec<String> = Vec::new();
+        let mut last_state: (usize, usize, usize) = (usize::MAX, 0, 0);
+        let mut stalls = node.subscribe();
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
             tokio::select! {
@@ -315,6 +317,50 @@ pub fn run_node(
                             println!("  {fp}@{addr}");
                         }
                         printed = listening;
+                    }
+
+                    // **An anchor must be able to say how it is.**
+                    //
+                    // Until this, a `vox node` printed four lines at start-up and then
+                    // nothing for the rest of its life. It serves no control socket and
+                    // has no status verb, so there was no way — from the box it runs on
+                    // or anywhere else — to ask whether it was healthy, how many peers it
+                    // held, or whether it was answering at all.
+                    //
+                    // That is how a real anchor sat wedged for an hour looking perfectly
+                    // alive: it accepted nothing, said nothing, and the only signal its
+                    // operator had was somebody else reporting they could not reach it.
+                    // An always-on process with no observability is one you cannot
+                    // operate, and this one exists to be always on.
+                    //
+                    // It reports on change rather than on a timer, so a healthy quiet
+                    // anchor stays quiet and a log is not a heartbeat to scroll past —
+                    // and every line is something that actually happened.
+                    let view = node.view();
+                    let now = (view.connected, view.relaying, view.anchoring.len());
+                    if now != last_state {
+                        let (peers, circuits, rooms) = now;
+                        println!(
+                            "vox node: {peers} peer(s) connected, {circuits} circuit(s) \
+                             carried, {rooms} room(s) on the board"
+                        );
+                        last_state = now;
+                    }
+                    // Drained without blocking: this arm also has an anchors file to
+                    // write, and a status line nobody reads is better than a tick nobody
+                    // reaches.
+                    while let Some(item) = stalls.try_next() {
+                        if let vox_core::node::actor::EventStreamItem::Event(
+                            vox_core::node::api::NodeEvent::Stalled { what, millis },
+                        ) = item
+                        {
+                            // The one thing an operator cannot see from outside: the node
+                            // is up, listening, and answering nobody.
+                            eprintln!(
+                                "vox node: BUSY {millis}ms — {what} — nobody could be \
+                                 answered while this ran"
+                            );
+                        }
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {

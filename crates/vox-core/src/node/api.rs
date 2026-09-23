@@ -108,6 +108,13 @@ pub struct NodeView {
     pub relayed_peers: Vec<Digest32>,
     /// How many circuits this node is carrying **for other peers** right now.
     pub relaying: usize,
+    /// How many peers this node currently has a live connection to, by any path.
+    ///
+    /// The one number that separates "this node has not finished starting", or "this node
+    /// is wedged", from "this node cannot reach that particular peer". An anchor with zero
+    /// is an anchor doing nothing at all, and without this nobody could see that from
+    /// outside — which is how one sat wedged for an hour looking healthy.
+    pub connected: usize,
     /// Every channel this node's **board** holds a genesis for — the channels it
     /// anchors, whether or not it is a member — in channelID order. What an anchor
     /// can say about itself: which rooms it serves and how many members it knows of

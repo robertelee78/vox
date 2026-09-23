@@ -4121,6 +4121,7 @@ impl Node {
             forwards: Vec::new(),
             trusted: self.trust_rows(),
             relayed_peers: Vec::new(),
+            connected: 0,
             relaying: 0,
         });
     }
@@ -4217,6 +4218,10 @@ impl Node {
             trusted: self.trust_rows(),
             relayed_peers,
             relaying,
+            connected: self
+                .net
+                .as_ref()
+                .map_or(0, |net| net.manager().peers().len()),
         }
     }
 
