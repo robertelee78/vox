@@ -1626,18 +1626,28 @@ impl Node {
             "the room's genesis",
             client.put(&genesis_wire).await.err().map(|e| e.to_string()),
         ));
+        // **Our bundle before our address, for the reason this file already states about *other*
+        // members' records and did not apply to its own.** An address record carries no key, so a
+        // board can only verify it against a key it already holds — which is what the bundle
+        // carries. Published address-first, a member whose key the board does not know yet has its
+        // address refused with `author is not a channel member`, microseconds before the bundle
+        // that would have made it admissible arrives on the same connection; and nothing retries
+        // it until the next publish round. `network.rs` `board_records` has emitted bundles first
+        // all along and says why. This did the opposite for the records that matter most — a
+        // newcomer's own — so a member could be on an anchor's board with a key and no way to
+        // reach it, which a joiner reports as the member being unreachable.
         outcomes.push((
-            "our address",
+            "our member bundle",
             client
-                .put(&address.to_wire())
+                .put(&bundle.to_wire())
                 .await
                 .err()
                 .map(|e| e.to_string()),
         ));
         outcomes.push((
-            "our member bundle",
+            "our address",
             client
-                .put(&bundle.to_wire())
+                .put(&address.to_wire())
                 .await
                 .err()
                 .map(|e| e.to_string()),
