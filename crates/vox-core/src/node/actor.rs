@@ -708,54 +708,133 @@ fn spawn_stream_loop(
 /// now the acceptance test for the real fix.
 fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     tokio::spawn(async move {
+        // **Experiment scaffolding, to be removed once ADR-017's open gap is settled.**
+        //
+        // `VOX_SPLIT_ACCEPT=1` runs phase two on its own task instead of inline. Both
+        // shapes exist in one binary **on purpose**: the measurement that reverted the
+        // split compared runs taken at different times, and the whole question is whether
+        // the 68s/140s/247s spread belongs to the split or to a flaky long tail. One
+        // binary lets the arms be interleaved A/B/A/B in a single window, which is the
+        // only way to control for the box drifting underneath — this machine has carried
+        // 324 orphaned processes and a wedged compiler cache in one evening.
+        //
+        // Whichever arm wins, this switch goes and the loser's code goes with it. A
+        // permanent environment variable choosing between two security-relevant shapes is
+        // a configuration bug waiting to happen.
+        let split = std::env::var("VOX_SPLIT_ACCEPT").is_ok_and(|v| v == "1");
+        // Bounded, because "spawn per connection" without a ceiling is the DoS the
+        // serialised loop was protecting against by accident. At the cap an attempt is
+        // **refused**, not queued: queueing would put the wait back in the accept path and
+        // reintroduce exactly the stall being removed.
+        let gate = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_IN_FLIGHT));
         loop {
             let Some(incoming) = net.manager().accept_incoming().await else {
                 break;
             };
-            // **Awaited here, not spawned — and that is ADR-017's recorded decision, not an
-            // oversight.** Spawning phase two is quinn's own documented shape and removes a 30s
-            // serialisation window, but ADR-017 "Open proof gap" records it measured: serialised
-            // 40-52s consistently green on `m15_two_clients_behind_symmetric_nats`, split 68s,
-            // 140s and a timeout at 247s. The cause is a cross-connection interaction in circuit
-            // establishment that is still unidentified, and those two NAT gates are its acceptance
-            // test. The unbounded case is already gone either way: this path routes through
-            // `finish_incoming`, which bounds the handshake at `HANDSHAKE_TIMEOUT`.
-            let filed = match net
-                .manager()
-                .finish_incoming(
-                    incoming,
-                    crate::transport::quic::Admission::AcceptAnyAuthenticated,
-                )
-                .await
-            {
-                Ok(filed) => filed,
-                Err(_) => continue, // an attempt that never authenticated is not an event
+            if !split {
+                // **Awaited here, not spawned — ADR-017's recorded decision.** Spawning phase
+                // two is quinn's own documented shape (`finish_incoming` says "Spawn this; do
+                // not await it in an accept loop") and removes a 30s serialisation window, but
+                // ADR-017 "Open proof gap" records it measured: serialised 40-52s consistently
+                // green on `m15_two_clients_behind_symmetric_nats`, split 68s, 140s and a
+                // timeout at 247s. The unbounded case is gone either way: `finish_incoming`
+                // bounds the handshake at `HANDSHAKE_TIMEOUT`.
+                if let Some(filed) = finish_one(&net, incoming).await {
+                    if !serve_filed(&net, &tx, filed).await {
+                        break;
+                    }
+                }
+                continue;
+            }
+            let Ok(permit) = Arc::clone(&gate).try_acquire_owned() else {
+                // **At capacity, and what we do here decides what a flood costs.**
+                //
+                // This codebase has never used quinn's address-validation tools —
+                // `retry`, `refuse`, `ignore` and `remote_address_validated` appear
+                // nowhere else — so today a spoofed source address costs an attacker one
+                // packet and costs us a whole handshake slot. Refusing at the cap keeps
+                // that property: 64 spoofed packets and every real peer is turned away.
+                //
+                // `retry` sends a Retry packet, which makes the client prove it can
+                // receive at the address it claims before we allocate anything. A spoofed
+                // flood cannot answer one; a real peer pays a single round trip. So the
+                // cost inverts, using quinn's own anti-amplification mechanism rather
+                // than something invented here.
+                //
+                // An already-validated peer gets `refuse` instead, because for them the
+                // honest answer is "not now" rather than another round trip.
+                //
+                // **The residual, stated rather than implied:** 64 *validated* handshakes
+                // that stall still deny service for up to `HANDSHAKE_TIMEOUT` each. That
+                // is bounded and far better than a single slot, and it is not nothing.
+                if incoming.remote_address_validated() {
+                    incoming.refuse();
+                } else if incoming.retry().is_err() {
+                    // Already a retried attempt; validating it again would loop.
+                    continue;
+                }
+                continue;
             };
-            let peer = filed.kept.peer_id();
-            // **Both connections get read.** `file_reporting` may have preferred one we already
-            // held and retired the one just accepted. The peer dialled that one and does not know
-            // we preferred another, so it opens streams there — and serving only the kept
-            // connection leaves the retired one transport-alive and application-deaf, which is
-            // worse than the close it replaced.
-            if let Some(also) = filed.also_serve {
-                // Bounded by the retirement grace: `retire_expired` will not close a connection
-                // while anything still holds it, and a stream loop holds its `Arc` for the
-                // connection's life — so an unbounded reader would pin the very thing whose
-                // purpose is to be let go.
-                let grace = Duration::from_secs(net.manager().retire_grace_secs());
-                let loop_task = spawn_stream_loop(Arc::clone(&net), also, tx.clone());
-                tokio::spawn(async move {
-                    tokio::time::sleep(grace).await;
-                    loop_task.abort();
-                });
-            }
-            spawn_stream_loop(Arc::clone(&net), filed.kept, tx.clone());
-            if tx.send(NetEvent::Connected { peer }).await.is_err() {
-                break;
-            }
+            let net = Arc::clone(&net);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                if let Some(filed) = finish_one(&net, incoming).await {
+                    let _ = serve_filed(&net, &tx, filed).await;
+                }
+            });
         }
         let _ = tx.send(NetEvent::Stopped).await;
     });
+}
+
+/// How many inbound handshakes may run at once when the accept loop is split.
+///
+/// The serialised loop's ceiling is one, which is the defect. This is the same bound in
+/// spirit as [`JOINS_IN_FLIGHT`]: enough that ordinary use never reaches it, small enough
+/// that an attacker cannot make a node hold unbounded state.
+const HANDSHAKES_IN_FLIGHT: usize = 64;
+
+/// Phase two for one connection: complete the handshake and admission, or drop it.
+async fn finish_one(
+    net: &Arc<NodeNet>,
+    incoming: quinn::Incoming,
+) -> Option<crate::node::net::Filed> {
+    net.manager()
+        .finish_incoming(
+            incoming,
+            crate::transport::quic::Admission::AcceptAnyAuthenticated,
+        )
+        .await
+        .ok()
+}
+
+/// Serve a filed connection and announce it. `false` when the actor has gone away.
+async fn serve_filed(
+    net: &Arc<NodeNet>,
+    tx: &mpsc::Sender<NetEvent>,
+    filed: crate::node::net::Filed,
+) -> bool {
+    let peer = filed.kept.peer_id();
+    // **Both connections get read.** `file_reporting` may have preferred one we already
+    // held and retired the one just accepted. The peer dialled that one and does not know
+    // we preferred another, so it opens streams there — and serving only the kept
+    // connection leaves the retired one transport-alive and application-deaf, which is
+    // worse than the close it replaced.
+    if let Some(also) = filed.also_serve {
+        // Bounded by the retirement grace: `retire_expired` will not close a connection
+        // while anything still holds it, and a stream loop holds its `Arc` for the
+        // connection's life — so an unbounded reader would pin the very thing whose
+        // purpose is to be let go.
+        let grace = Duration::from_secs(net.manager().retire_grace_secs());
+        let loop_task = spawn_stream_loop(Arc::clone(net), also, tx.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            loop_task.abort();
+        });
+    }
+    spawn_stream_loop(Arc::clone(net), filed.kept, tx.clone());
+    tx.send(NetEvent::Connected { peer }).await.is_ok()
 }
 
 /// How long a joiner waits for the responder's **address record** to reach the board.
