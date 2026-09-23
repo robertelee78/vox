@@ -471,6 +471,54 @@ short". Each time the observation was real and the inference did not follow — 
 flake under parallel load" forbids explaining a red with the environment even when the environment is
 genuinely bad. It was genuinely bad today, and it still was not the cause.
 
+## Root cause of `service_rehearsal_proof:490`: a host serves one joiner, then no one for 30s (2026-09-23)
+
+`:490` — "the stranger must still be able to JOIN" — is **not** a flaky proof and **not** about the
+stranger. It reproduces deterministically with two joiners and no trust involved at all:
+
+```text
+J1 rc=0 in  2s     (first joiner, in immediately)
+J2 rc=1 in 21s     (second joiner, locked out)
+J2 dialed 127.0.0.1:50116 — the host's real, still-bound, listening port
+host stdout: "vox: <J1> joined"   and nothing whatsoever about J2
+```
+
+Three controls establish the shape:
+
+| test | result |
+|---|---|
+| a **lone** joiner 35s after the host starts | in, 2s — so the host does not stop accepting with age |
+| J2 immediately after J1 | locked out |
+| J2 **40s** after J1 | in — so it recovers, it is not permanently broken |
+
+The recovery at 40s names the cause: **`spawn_accept_loop` awaits `finish_incoming` inline**, so the
+accept path handles one connection at a time and is occupied for up to `HANDSHAKE_TIMEOUT` (30s) by
+a handshake that does not complete. A joiner's `vox connect` exits as soon as it has joined, leaving
+the host mid-handshake on something, and for the next 30 seconds the host answers nobody. The socket
+stays bound, which is why the symptom is a **timeout** rather than a refusal, and why it surfaces
+three nodes away as `Fault::Unreachable` on a peer that is up.
+
+**This is the same defect class as the join exchange running on the actor, one layer below it.** The
+decider's requirement was that nobody attempting to join can render a node inoperable; answering a
+join now runs in a slot, and the *accept* of the connection that carries it still does not. Any peer,
+malicious or merely abrupt, costs a node 30 seconds of deafness.
+
+**It is also the ADR-017 "Open proof gap", now with a deterministic reproduction.** That gap records
+that spawning phase two — quinn's own documented shape, which is the obvious fix — was measured
+*worse*: serialised 40-52s consistently green on `m15_two_clients_behind_symmetric_nats`, split 68s,
+140s, and a timeout at 247s, with the cause "a cross-connection interaction in circuit establishment
+that is still unidentified". So the fix is known, was tried, regressed two NAT gates, and was
+reverted for a reason nobody has explained yet.
+
+What is new here is that the gap has a **cheap, deterministic, two-process reproduction of its cost**
+rather than only a flaky proof: `scratchpad/order4.sh` in that session, or any host plus two
+sequential `vox connect`s. ADR-017 says those two NAT gates are the acceptance test for splitting the
+handshake; this is the acceptance test for *not* splitting it, and the two must now be satisfied
+together. That is what makes it tractable where it was not before.
+
+**Not fixed in v0.2.5.** It is pre-existing — reproduced on `0590cdc` (v0.2.4's commit) 5 times of 5,
+and present in CI history on v0.2.3's runs, before any of this session's work existed.
+
 ## Open defect: a node joining a room answers nobody for 30 seconds (2026-09-23)
 
 Found by typing `vox connect` and watching, on a room whose members cannot be reached:
