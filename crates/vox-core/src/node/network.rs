@@ -1216,5 +1216,25 @@ fn join_addrs(addrs: &[std::net::SocketAddr]) -> String {
 /// A peer id shortened to the first four bytes, which is enough to tell two helpers apart
 /// in a diagnostic without putting a full fingerprint in front of somebody.
 pub(crate) fn short_id(id: Digest32) -> String {
-    id[..4].iter().map(|b| format!("{b:02x}")).collect()
+    // **The same rendering the rest of the product uses for an identity**, because these
+    // ids are read side by side with it and were not comparable.
+    //
+    // This printed four bytes as hex while `vox daemon: identity …`, `vox node: identity …`,
+    // invite links and every CLI message print base32. So an operator saw
+    //
+    //     vox daemon: identity dv5w5nclhdyffrdcgjzghi4jsxqumlzufeoufvbljliluisy5guq
+    //     vox: a board would not take our address (board c181cc9a) — not a channel member
+    //     vox: cannot join: c92c1ff9: peer unreachable — circuit via c181cc9a
+    //
+    // and could not tell whether `c92c1ff9` was the member that was away, the one that was
+    // up, or the anchor — the three cases that decide what is actually wrong. Two people
+    // spent an evening inferring which peer a diagnostic referred to, from diagnostics that
+    // had been made specific precisely so they would not have to.
+    //
+    // Twelve characters of base32, matching the CLI's own `short`, so a fingerprint printed
+    // anywhere can be matched by eye against one printed anywhere else.
+    crate::node::link::b32_encode(&id)
+        .chars()
+        .take(12)
+        .collect()
 }
