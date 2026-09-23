@@ -397,6 +397,113 @@ Neither currently does: the daemon has no event reader, so every `NodeEvent` it 
 and the one configuration where a person cannot watch a foreground verb is the one with no reporting
 at all.
 
+## A red on a gate's *precondition* is still a product defect (2026-09-23)
+
+`a_join_is_not_hostage_to_one_member` blocked **v0.2.2, v0.2.3 and v0.2.4** from publishing — three
+tags, three CI runs of roughly forty minutes each, all dying on the same line. That line is not the
+gate's claim. It is the gate checking, before it measures anything, that the anchor came to know both
+members of the room, and saying "this gate cannot measure a fallback" when it had not.
+
+Everything about that phrasing invited the wrong response. It reads like the gate apologising for
+itself, so the available moves looked like raising the timeout or adding it to the exclusion list
+above — and both would have shipped the defect. What it was actually reporting: a newcomer's member
+bundle never reached the anchor's board, so a room stopped being joinable by anyone else the moment
+its creator went offline. Measured **1 of 2 members in 2 runs of 3**.
+
+Three rules come out of it.
+
+**A precondition must accuse the product, or it will be read as the gate's own weakness.** The gate
+now opens that panic with "PRODUCT DEFECT, not a flaky gate", states what the board knew, and says
+outright not to raise the timeout or exclude it. A red nobody can attribute is as bad as a green that
+asserts the bug — the same failure this ADR was written about, one level up.
+
+**An intermittent red is a lost event until proven otherwise.** The instinct is latency: measure the
+distribution, find it long, shorten an interval. It was not latency. The joiner's own put is refused
+by design and the one path that works fired before the record existed, so no duration existed to
+measure and no timeout would ever have been long enough. "Bimodal" is the tell — a passing run in
+seconds and a failing run that burns the whole budget is an event that never arrived, not a slow one.
+
+**The reason was being produced all along and had nowhere to go.** Every board put was
+`let _ = client.put(..).await`, and `vox daemon` — the always-on host — had no event reporter at all,
+so its stderr measured **0 bytes** across a full run. Wiring both took under an hour and the anchor
+then named the cause in one run: `rejected: author is not a channel member`. Three releases were lost
+to a missing `eprintln!`, which is the cheapest possible lesson and was not learned cheaply. Before
+theorising about an intermittent failure, check whether the component that knows the answer is able to
+say anything at all.
+
+**And the box was lying, because of us.** Both sessions working this were reasoning against a load
+average of 42 caused by **324 orphaned `vox` processes**, the oldest alive 2h46m, leaked by harnesses
+that cleaned up with `pkill -f "$datadir"` — a pattern that matches nothing, because `vox node`'s argv
+carries no path and `VOX_DATA_DIR` is an environment variable `pgrep -f` cannot see. That is not an
+excuse for the red (it was deterministic once instrumented, and §"gates flake under load" still
+stands: never explain a red with the environment). It is a rule about measurement: record `$!`, kill by
+PID, and assert zero strays at the end of a run. A *functional* pass under high load is stronger
+evidence than a clean one; a *timing* number under load is worth nothing.
+
+## An observation about a parent process is not an observation about the work (2026-09-23)
+
+A method failure, recorded because it cost time twice in one day and both times the honest reading
+was narrower than the inference drawn from it.
+
+Thirteen `sccache rustc` processes sat at 0.0% CPU in state `S` with `cargo` also at 0.0%, and that
+was read as a deadlocked cache server. It is the normal shape: `sccache rustc` forks the real
+compiler and waits on it, and the `ps` output being read had already printed the busy child on the
+next line. The shared server was restarted on that reading — cold-starting a 10 GiB cache mid-build —
+and three compiler processes were killed by hand, any of which could have belonged to another
+project. The machine was simply loaded, by other things: `qemu` at 159%, `opencode` at 48%, Teams at
+41%, and exactly **two** vox processes.
+
+Two rules, and the second corrects the first attempt at the first:
+
+- **Check the process tree, not the process.** `ps` on a wrapper reports idle every single time.
+- **`%CPU` cannot answer "is this working now" on macOS**: it is a ratio of CPU time to elapsed time,
+  a lifetime average. It reads low for a process that is busy after a long wait, and high for one
+  that worked hard and then blocked. The column that answers the question is `state` — `R` against
+  `S` — or repeated instantaneous samples.
+
+And: **never restart or kill a shared service to test a theory.** The theory here was falsifiable with
+one more line of the `ps` output already on screen.
+
+This is the same error the product defects in this ADR are made of. `Fault::Unreachable` meant
+"nobody answered", not "the address is wrong". 0% on a wrapper means "this process is waiting", not
+"nothing is happening". A red that is intermittent means "an event was lost", not "a timeout is too
+short". Each time the observation was real and the inference did not follow — which is why §"gates
+flake under parallel load" forbids explaining a red with the environment even when the environment is
+genuinely bad. It was genuinely bad today, and it still was not the cause.
+
+## Open defect: a node joining a room answers nobody for 30 seconds (2026-09-23)
+
+Found by typing `vox connect` and watching, on a room whose members cannot be reached:
+
+```text
+vox: busy 30535ms — joining a room — nobody could be answered
+vox: cannot join: ...
+```
+
+Three runs, 30.5s each — a bound, not a variance, and consistent with `HANDSHAKE_TIMEOUT` being
+awaited inline. `busy … nobody could be answered` is `NodeEvent::Stalled`, and `joining a room` is
+`command_name(NodeCommand::JoinChannel)`, so this is not the network being slow: it is **the joiner's
+own actor held for the whole half minute**, during which that node answers no sync, no message and no
+inbound join.
+
+It is the initiator half of the defect this release fixed on the responder half. Answering a join now
+runs in a slot (ADR-016 §"Answering a join runs off the actor"); *making* one still runs on the actor.
+The fix is the same shape — decide on the actor, wait in a slot, outcome as an event — and is
+deliberately **not** in v0.2.5: it is an unproved actor change, and this release already carries
+measured evidence for what it does change. Bolting it on would trade that for a guess.
+
+Two things to fix together, since they are one experience:
+
+1. The walk holds the actor. Nothing else on that node runs for up to 30s per unreachable member tried.
+2. The walk says nothing while it waits. `forward` prints a verdict per rung (ADR-013); the join walk
+   has exactly the same information — which member it tried and what that member said — and discards
+   it, so a person sees a blank terminal for thirty seconds and is then told no.
+
+Recorded here rather than left to be rediscovered: the `Stalled` line above exists only because this
+node was made to say when it cannot answer, which is the same instrumentation that found the
+board-growth defect. Before that, this was thirty silent seconds and nothing in the product could have
+told anyone why.
+
 ## Links
 
 **Depends on**: ADR-007 (the golden evaluator suite this retains), ADR-010 (the Argon2 cost this
