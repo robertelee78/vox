@@ -573,6 +573,46 @@ pub fn run_daemon(
             // room's passphrase. Otherwise the whole line is a passphrase, tried against
             // every room still closed. Nothing new to learn, and no line that a person
             // would reasonably write is read as the other thing.
+            // **Try the whole line as a passphrase FIRST.** The `<room> <pass>` form is
+            // still supported below, but it can no longer win by accident.
+            //
+            // The previous version split on the first space and resolved the prefix as a
+            // room id — and `resolve_prefix` takes a *prefix*, so a single letter names a
+            // room whenever exactly one id starts with it. A profile holding one room
+            // called `asmu2miy723t` therefore read the passphrase `a room passphrase` as
+            // room `a`, passphrase `room passphrase`, failed, and **refused to start**.
+            // Any passphrase beginning "a ", "the ", "my " hits this; in English most do.
+            //
+            // That is the same defect the note below already describes, one layer in: the
+            // split was made unambiguous against a *full* id and then handed a prefix.
+            // Trying the line as a passphrase first costs nothing — a room it does not
+            // open stays closed, which is the state it was already in — and a genuine
+            // `<room> <pass>` line cannot open anything as a whole-line passphrase,
+            // because it has the room id in front of it. So each form still works and
+            // neither can be mistaken for the other.
+            let closed_now: Vec<_> = node
+                .view()
+                .channels
+                .iter()
+                .filter(|c| !c.open)
+                .map(|c| c.channel_id)
+                .collect();
+            let mut opened_by_line = false;
+            for channel_id in closed_now {
+                if node
+                    .apply(NodeCommand::OpenChannel {
+                        channel_id,
+                        passphrase: Secret::new(line.as_bytes().to_vec()),
+                    })
+                    .await
+                    .is_done()
+                {
+                    opened_by_line = true;
+                }
+            }
+            if opened_by_line {
+                continue;
+            }
             let ids: Vec<_> = node.view().channels.iter().map(|c| c.channel_id).collect();
             let named = line.split_once(' ').and_then(|(prefix, pass)| {
                 crate::tunnel_cli::resolve_prefix(prefix, &ids)
@@ -593,10 +633,9 @@ pub fn run_daemon(
                 }
                 continue;
             }
-            // A passphrase, tried everywhere still closed. A room it does not open stays
-            // closed — the state it was already in — so this cannot lose anything, and it
-            // is no kind of oracle: whoever piped this in already holds the identity
-            // passphrase.
+            // Neither form opened anything. Nothing to undo — a room this did not open
+            // stays closed — and the report at the end of this loop names what is still
+            // shut, so this is stated rather than silent.
             let closed: Vec<_> = node
                 .view()
                 .channels
