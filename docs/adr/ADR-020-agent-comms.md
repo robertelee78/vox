@@ -310,6 +310,12 @@ A **suggested work vocabulary** shipped as convention (not enforced): `assign`, 
 `working`, `blocked`, `result`, `failed`, `status`, `ask`, `answer`, `ack`. It is shaped to map onto
 A2A's `TaskState` so a future bridge is mechanical.
 
+> **Amended by ADR-021 (proposed 2026-09-23, not built).** For any message carrying a work-item reference
+> (`data.work`), ADR-021 §3 gives each of these types a normative meaning. In particular, `result` is an
+> assertion and not completion, and `release` is neither completion nor failure. ADR-021 also makes a
+> worker's Vox version a session-static fact that rides `hello` (`data.vox`, §5). `status` appears in
+> this list but not yet in the code (ADR-021 F7).
+
 ### 5. Work assignment is a claim, and the log resolves it
 
 Borrowed from ruflo's agentbbs, which solved this problem in the same shape. "Assignment of work" is
@@ -329,6 +335,18 @@ Resolution rules, which every node **MUST** apply identically so the answer conv
 
 This is deliberately a *convention over the open tail* of §4, not new protocol: the log already
 provides the total order and the deterministic tie-break key.
+
+> **Amended by ADR-021 §4–§6 (proposed 2026-09-23, not built).** The rules above stay what the shipped
+> binary does. ADR-021 replaces them with one corrected claim protocol that keeps these type names:
+> - **ownership is `(author fingerprint, session)`**, not the harness key;
+> - **a `handoff` names the recipient's fingerprint** (`data.to_fp`), because a petname is local and
+>   rule 4 therefore cannot converge. It makes the resource **pending** for that recipient, with a
+>   finite deadline of its own. An eligible recipient session completes it by claiming, and a `decline`
+>   frees the resource;
+> - **`renew` extends one specific acquisition** and cannot revive an expired claim;
+> - every operation carries an **operation id**, where a conflict voids the operation, and a **version
+>   stamp**. Workers on different Vox versions refuse to coordinate rather than fold under different
+>   rules.
 
 **Reachability — a gap found 2026-09-21 and not yet closed.** Everything above has existed in
 `crates/vox-agentcomms` since M19.3 and **nothing in the shipped binary called any of it**:
@@ -798,8 +816,8 @@ Both unknowns are already spiked; neither remains open.
   > `claim::resolve`, which resolves no recipient (`room_cli.rs:409` → `claim.rs:182-184`). A handoff
   > therefore never moves ownership. `work_board_proof.rs` does not exercise handoff, so the gate above
   > stayed green. Resolving by petname would not converge either, because petnames are local. Recorded
-  > as ADR-021 F1–F3, with per-session ownership, and to be fixed by ADR-021 M21.1: a handoff carries
-  > the recipient's fingerprint.
+  > as ADR-021 F1–F3, with per-session ownership, and to be fixed by ADR-021 M21.2: a handoff carries
+  > the recipient's fingerprint and leaves the resource pending until an eligible session claims it.
 
 - **M19.6 — the interrupt path. DONE 2026-09-22**, for Claude Code and OpenCode; Codex named and not implemented. §6 says queue always and interrupt only when
   *addressed* and *urgent*; the queue half is built and proven, this is the other half. It is the
