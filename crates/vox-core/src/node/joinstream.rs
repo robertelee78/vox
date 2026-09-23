@@ -593,17 +593,41 @@ pub async fn refuse_join(mut send: SendStream) {
 /// between. Taking the lock twice, briefly, is what lets concurrent joins overlap instead of
 /// queueing behind whichever joiner is slowest; a `&mut` borrow across the whole exchange
 /// would serialize them and reproduce the stall one layer down.
-pub async fn run_responder(
+///
+/// # `admit_before_accepting`
+/// Called with the joiner's proven identity **after the exchange succeeds and before the
+/// acceptance frame goes out**, and awaited. That ordering is the whole reason it exists.
+///
+/// The joiner treats `Accepted` as "I am in", and the very next thing it does is publish its
+/// records to this node's board. Those records are refused unless this node has already admitted
+/// it as an author, and nothing retries them. While the exchange ran on the actor that ordering was
+/// free — the admission happened in the same actor turn the exchange ended, before the joiner could
+/// possibly have returned. Moving the exchange into a slot broke it: the admission became an event
+/// the actor reached *later*, the joiner published into the gap, and the newcomer never reached any
+/// board. Measured, real binaries: a third person joining went 6 of 10 to **0 of 10** (ADR-018
+/// §"The admission window").
+///
+/// So the caller uses this to apply the admission on the actor and wait for it. The wait happens
+/// here, on the slot's task, which is what keeps the actor free — the property the slot was
+/// introduced for.
+pub async fn run_responder<F, Fut>(
     mut send: SendStream,
     mut recv: RecvStream,
     peer_fp: Digest32,
     cfg: &ResponderConfig<'_>,
     store: &Store,
     ring: &tokio::sync::Mutex<PrekeyRing>,
-) -> Result<JoinOutcome> {
+    admit_before_accepting: F,
+) -> Result<JoinOutcome>
+where
+    F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let mut result = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring).await;
     match &mut result {
         Ok(outcome) => {
+            // **Admitted before it is told it is in.** See `admit_before_accepting`.
+            admit_before_accepting(outcome.peer.identity.clone()).await;
             // The witness `responder_exchange` minted beside the verification that
             // justifies it. The joiner keeps it: it is what makes that key admissible
             // to anyone else (M17.6).

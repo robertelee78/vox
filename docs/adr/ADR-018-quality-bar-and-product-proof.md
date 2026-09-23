@@ -473,8 +473,28 @@ genuinely bad. It was genuinely bad today, and it still was not the cause.
 
 ## The admission window: one cycle, and moving the join off the actor widened it (2026-09-23)
 
-**Not landed. This records a regression found in the fix for the defect above, and why the obvious
-patch is the wrong one.**
+**FIXED 2026-09-23, and the window is closed rather than narrowed.** `run_responder` takes an
+`admit_before_accepting` callback, awaited after the exchange succeeds and **before the `Accepted`
+frame goes out**. The node turns it into `NetEvent::JoinAdmit` with a `oneshot` and waits for the
+actor to answer — on the slot's task, so the actor is still never the thing waiting, which is the
+property the slot exists for. The joiner is therefore an admitted author before it is ever told it is
+in, which is the ordering the inline version got for free. `JoinAdmit` is deliberately cheap and local
+(admit, answer, done); everything touching the network stays on `JoinAnswered`, after acceptance, so a
+joiner never waits on this node's round trips to somebody else. A dropped `oneshot` resolves the wait,
+so a shutting-down actor cannot strand a joiner mid-exchange.
+
+Measured on the harness that discriminates, written by the other session (five reps each):
+
+| tree | third person gets in |
+|---|---|
+| `main` | 6 of 10 |
+| the join-slots branch, before this | **0 of 10** |
+| with the admission window closed | **5 of 5** (12s, 12s, 14s, 15s, 12s) |
+
+Better than `main`, not merely recovered — because closing the window also removes the narrow version
+of the same cycle that gave `main` its 6-of-10 and the hostage gate its 3-of-5.
+
+**The record of the regression is kept below rather than deleted, because the mechanism is the lesson.**
 
 Answering a join was moved into a slot so a stranger could not hold the node (ADR-016 §"Answering a
 join runs off the actor"). That change **defers the responder's `admit_author` by one event hop**: on

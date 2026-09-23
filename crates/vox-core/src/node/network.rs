@@ -1155,7 +1155,7 @@ impl NodeNet {
     /// the binding is the caller's single decision — `ChannelState::join_context` in
     /// production.
     #[allow(clippy::too_many_arguments)] // each argument is a distinct required input
-    pub async fn answer_join(
+    pub async fn answer_join<F, Fut>(
         &self,
         peer: Digest32,
         send: SendStream,
@@ -1166,7 +1166,12 @@ impl NodeNet {
         store: &Store,
         ring: &tokio::sync::Mutex<PrekeyRing>,
         pending_joins: u32,
-    ) -> Result<JoinOutcome> {
+        admit_before_accepting: F,
+    ) -> Result<JoinOutcome>
+    where
+        F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let cfg = ResponderConfig {
             ctx,
             passphrase,
@@ -1175,7 +1180,7 @@ impl NodeNet {
             pending_joins,
             now_secs: self.now(),
         };
-        run_responder(send, recv, peer, &cfg, store, ring).await
+        run_responder(send, recv, peer, &cfg, store, ring, admit_before_accepting).await
     }
 
     /// Run the ADR-005 **joiner** side against a member over `conn` (which must be

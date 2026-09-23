@@ -202,6 +202,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
+        NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped => "shutting the network down",
     }
 }
@@ -493,6 +494,29 @@ enum NetEvent {
         /// and every other variant of this enum would otherwise pay for its size. The error is
         /// already a `String`: it is formatted where it happened, off the actor.
         outcome: Box<std::result::Result<crate::node::joinstream::JoinOutcome, String>>,
+    },
+    /// A join exchange has proved a joiner's identity and is **holding its acceptance** until the
+    /// actor has admitted it as an author.
+    ///
+    /// This exists to restore an ordering that was free while the exchange ran on the actor: the
+    /// admission happened in the same turn the exchange ended, before the joiner could have
+    /// returned. Off the actor it became an event reached later, and the joiner — which treats
+    /// `Accepted` as "I am in" — published its records into that gap, where they are refused
+    /// `author is not a channel member` and never retried. The newcomer then reached no board at
+    /// all. Measured: a third person joining went 6 of 10 to 0 of 10 (ADR-018 §"The admission
+    /// window").
+    ///
+    /// Cheap and local on purpose: admit the author, answer, done. Everything that touches the
+    /// network — republishing, mirroring to anchors — stays on `JoinAnswered`, *after* the joiner
+    /// has been accepted, so a joiner never waits on this node's round trips to somebody else.
+    JoinAdmit {
+        /// The room being joined.
+        channel_id: Digest32,
+        /// The joiner's proven identity.
+        identity: Box<crate::identity::composite::CompositePublicKey>,
+        /// Answered once the admission is applied, which releases the acceptance frame. A dropped
+        /// sender answers too — the slot must never wait on an actor that has moved on.
+        ack: tokio::sync::oneshot::Sender<()>,
     },
     /// A record by another author was admitted to this node's board, so what this node can
     /// vouch for has grown and its anchors do not know it yet.
@@ -2064,6 +2088,28 @@ impl Node {
             } => {
                 self.apply_join_outcome(peer, channel_id, *outcome).await;
             }
+            NetEvent::JoinAdmit {
+                channel_id,
+                identity,
+                ack,
+            } => {
+                // The join proved this identity; admit it as an author so its entries — and its
+                // records on this node's board — are accepted. Reading still needs consent.
+                let now = self.now();
+                if let (Some(profile), Some(shared)) = (
+                    self.profile.as_ref(),
+                    self.channels.get(&channel_id).map(Arc::clone),
+                ) {
+                    let _ = shared
+                        .lock()
+                        .await
+                        .admit_author(profile.store(), &identity, now);
+                }
+                // Answered whatever happened: a joiner waiting on this must not be left holding a
+                // stream because the room closed or this node has no profile. It will find out from
+                // the join's own outcome, which is the right place for it to learn.
+                let _ = ack.send(());
+            }
             NetEvent::BoardGrew { channel_id } => {
                 // Pass it on, which for a member means its anchors. A node that is not a member of
                 // this room falls out of `publish_channel_to_anchor` on its missing admission, so
@@ -2329,6 +2375,7 @@ impl Node {
                 .unwrap_or(u32::MAX);
         let tx = self.net_tx.clone();
         self.reap_join_tasks();
+        let admit_tx = self.net_tx.clone();
         self.join_tasks.spawn(async move {
             let _slot = slot;
             let outcome = net
@@ -2342,6 +2389,25 @@ impl Node {
                     &store,
                     &ring,
                     pending_joins,
+                    // **The admission lands before the joiner is told it is in.** Awaited here, on
+                    // this task, so the actor is never the thing waiting — which is the whole point
+                    // of the slot. See `NetEvent::JoinAdmit`.
+                    |identity| async move {
+                        let (ack, wait) = tokio::sync::oneshot::channel();
+                        if admit_tx
+                            .send(NetEvent::JoinAdmit {
+                                channel_id,
+                                identity: Box::new(identity),
+                                ack,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            // A dropped sender resolves this too, so a shutting-down actor cannot
+                            // strand a joiner mid-exchange.
+                            let _ = wait.await;
+                        }
+                    },
                 )
                 .await
                 // **Never dropped.** A responder whose exchange failed said nothing, so the
@@ -2405,18 +2471,12 @@ impl Node {
             });
             return;
         };
-        // The join proved this identity; admit it as an author so its entries are
-        // accepted (reading still needs consent).
-        let now = self.now();
-        let admitted = match self.profile.as_ref() {
-            Some(profile) => shared
-                .lock()
-                .await
-                .admit_author(profile.store(), &outcome.peer.identity, now)
-                .is_ok(),
-            None => false,
-        };
-        if admitted {
+        // The admission already happened, on `NetEvent::JoinAdmit`, before this joiner was sent
+        // its acceptance — that ordering is what lets its own records onto this node's board at
+        // all. What is left is the part that touches the network, deliberately after the joiner is
+        // in so it never waits on our round trips to somebody else.
+        let _ = &shared;
+        {
             self.refresh_network_view().await;
             // The newcomer's records reach the anchors through this node: it
             // witnessed the join, so it vouches (ADR-016 M15.2a). The joiner has
