@@ -1488,8 +1488,16 @@ impl Node {
         // A newcomer becomes findable to everyone away from the room only because a member that
         // already knows it publishes its bundle onward, and until now nothing told this node one
         // had arrived — the onward mirror went out when the join finished, which is *before* the
-        // newcomer publishes, and then waited for whatever triggered a publish next. `try_send`,
-        // because this is a hint the actor acts on and a full queue means it is already about to.
+        // newcomer publishes, and then waited for whatever triggered a publish next.
+        //
+        // `try_send` rather than a blocking send, and the reason is **deadlock, not queue state**:
+        // this runs inside the rendezvous service, on a path the actor may itself be waiting
+        // behind, so a send that blocks could hold the service against its own actor. The cost when
+        // the queue is full is worth stating plainly rather than implying it away — the hint is
+        // dropped, and that newcomer falls back to "whatever triggers a publish next", which is
+        // exactly the unbounded wait this change exists to remove. A full `NET_QUEUE` means the
+        // actor is behind, not that it is about to mirror this room: the 64 items ahead of it could
+        // all belong to other channels. The drop is acceptable, not harmless.
         {
             let tx = self.net_tx.clone();
             net.on_board_growth(Arc::new(move |channel_id: Digest32| {
@@ -2770,16 +2778,53 @@ impl Node {
         // the one peer the link happened to name, and no second attempt.
         //
         // The pin is still tried first: whoever minted the link knows who is expected to answer.
+        //
+        // **Every member the board knows, not only the ones it has an address for.** The list was
+        // built from `set.members`, which is the *address records* — so a member the board knew by
+        // its **bundle**, or the **creator named by the genesis**, was not a candidate at all. The
+        // patience loop below exists precisely to wait for an address record that has not arrived
+        // yet, and a member in that state could never reach it: it was filtered out one step
+        // earlier, by the very condition the loop was written to tolerate.
+        //
+        // That is how a room with a live host became unjoinable. Measured, with the joiner naming
+        // what it tried: one candidate, both its paths dead, and the host — online, on loopback,
+        // the genesis creator — never in the list, because its address record had been refused on
+        // the anchor while its identity was never in question. The genesis is the one record whose
+        // author cannot be in doubt: its hash *is* the channelID, and it names the creator.
+        //
+        // **Ordered so that a member we can reach is tried before one we would have to wait for.**
+        // Mixing them without that gives a 20s `JOIN_ADDRESS_PATIENCE` stall in front of a peer
+        // that was dialable immediately, which is the cost this widening would otherwise add.
         let candidates: Vec<crate::hash::Digest32> = {
-            let mut all: Vec<crate::hash::Digest32> =
+            use std::collections::BTreeSet;
+            let with_address: BTreeSet<crate::hash::Digest32> = set
+                .members
+                .iter()
+                .filter(|r| !r.endpoints.is_empty())
+                .map(|r| r.author_id)
+                .collect();
+            let mut known: BTreeSet<crate::hash::Digest32> =
                 set.members.iter().map(|r| r.author_id).collect();
-            all.sort_unstable();
-            let mut ordered = Vec::with_capacity(all.len() + 1);
+            known.extend(set.bundles.iter().map(|b| b.author_id));
+            if let Some(g) = set.genesis.as_ref() {
+                known.insert(g.body.creator_pubkey.fingerprint());
+            }
+            // Never ourselves: a node does not join a room by asking itself to answer.
+            known.remove(&me);
+            let mut reachable: Vec<crate::hash::Digest32> =
+                known.intersection(&with_address).copied().collect();
+            let mut awaited: Vec<crate::hash::Digest32> =
+                known.difference(&with_address).copied().collect();
+            reachable.sort_unstable();
+            awaited.sort_unstable();
+            let mut ordered = Vec::with_capacity(known.len() + 1);
             if let Some(r) = parsed.responder {
                 ordered.push(r);
-                all.retain(|m| *m != r);
+                reachable.retain(|m| *m != r);
+                awaited.retain(|m| *m != r);
             }
-            ordered.extend(all);
+            ordered.extend(reachable);
+            ordered.extend(awaited);
             if ordered.is_empty() {
                 return Outcome::Failed(Fault::BadLink);
             }
