@@ -168,6 +168,11 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         // one member, so the walk had nothing to walk to and the gate reported the
         // fallback broken when the fallback was never reached. The anchor can say what it
         // knows, so ask it.
+        //
+        // **When this precondition fails it is the product, not this gate.** That
+        // distinction cost a release cycle, so the failure below names the mechanism
+        // rather than saying "cannot measure" — a red nobody could attribute is the same
+        // defect as a green that asserts the bug.
         let both_known = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let known = anchor
@@ -185,15 +190,34 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         .await;
         let known = both_known.unwrap_or_else(|_| {
             panic!(
-                "the anchor never came to know both members of the room, so this gate cannot \
-                 measure a fallback. It knows {:?}. A room whose members never reach their \
-                 anchor's board is a separate defect from the one under test here",
+                "PRODUCT DEFECT, not a flaky gate: the anchor's board still knows {:?} of the \
+                 2 members, {}s after a join that returned Done. Carol cannot fall through to \
+                 a second member the board never learned, so the claim below is unmeasurable \
+                 — but the reason it is unmeasurable is itself the bug.\n\n\
+                 The mechanism, so nobody re-derives it:\n\
+                 - A joiner's own put is REFUSED by design. `store.rs` `accept_member` and \
+                   `accept_bundle` both answer `author is not a channel member`, and the \
+                   anchor's oracle does not know a newcomer. That is M15.2a working as \
+                   specified, so no timeout here could ever have fixed it.\n\
+                 - The only path onto the board is a MEMBER mirroring the joiner's bundle: \
+                   `service.rs` vouches for a `MemberBundleRecord` when the publisher is a \
+                   known member and `publisher != author`. Note it is bundle-only — an \
+                   address record gets no vouch at all.\n\
+                 - The responder runs that mirror when the join FINISHES, which is before \
+                   the joiner has put its bundle on the responder's board. The code concedes \
+                   it: \"whatever is there now goes up, and what arrives later goes with the \
+                   next mirror\". There is no next mirror.\n\n\
+                 So this is a LOST event, not a slow one, which is why it reads as a coin \
+                 flip: a green here is the ordering landing the other way, not a fast box. \
+                 Do NOT raise this timeout and do NOT exclude this gate — the fix is for a \
+                 member to mirror when the newcomer's bundle actually arrives.",
                 anchor
                     .view()
                     .anchoring
                     .iter()
                     .find(|a| a.channel_id == cid)
-                    .map(|a| a.members)
+                    .map(|a| a.members),
+                60,
             )
         });
         assert!(

@@ -794,6 +794,13 @@ Both unknowns are already spiked; neither remains open.
   contend for one resource, exactly one holds it, the loser is told so, and a claim with a `ttl_secs`
   that lapses returns the resource without either agent acting.
 
+  > **Named defect, 2026-09-23 — `handoff` is inert.** The shipped board folds with
+  > `claim::resolve`, which resolves no recipient (`room_cli.rs:409` → `claim.rs:182-184`). A handoff
+  > therefore never moves ownership. `work_board_proof.rs` does not exercise handoff, so the gate above
+  > stayed green. Resolving by petname would not converge either, because petnames are local. Recorded
+  > as ADR-021 F1–F3, with per-session ownership, and to be fixed by ADR-021 M21.1: a handoff carries
+  > the recipient's fingerprint.
+
 - **M19.6 — the interrupt path. DONE 2026-09-22**, for Claude Code and OpenCode; Codex named and not implemented. §6 says queue always and interrupt only when
   *addressed* and *urgent*; the queue half is built and proven, this is the other half. It is the
   most speculative milestone left, because all three mechanisms are undocumented and the OpenCode

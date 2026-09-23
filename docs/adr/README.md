@@ -25,6 +25,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [016](ADR-016-node-runtime.md) | Node Runtime — composing the core (persistence, rendezvous service, join over the network, sync, headless anchor) | 002, 003, 005–008, 010–013, 015 |
 | [017](ADR-017-room-bound-services.md) | Room-Bound Services (the Tor-hidden-service equivalent) | 005, 007, 012, 013, 016 |
 | [020](ADR-020-agent-comms.md) | Agent Comms (a room-based messaging app for AI coding agents across hosts) | 007, 008, 012, 016, 017, 018 |
+| [021](ADR-021-work-item-interop.md) | Work-Item Interop (the contract Vox exposes to an external work tracker) | 008, 018, 020 |
 
 ## Tiers
 
@@ -37,7 +38,8 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 - **Tier 6 — Integration:** 016 (the runtime that composes Tiers 1–5 into a running node)
 - **Tier 7 — Product surface:** 017 (what a person actually does with the overlay), 018 (how a
   capability is proved to work)
-- **Tier 8 — Applications on the layer:** 020 (agent comms). The first ADR in the app tier: chat's
+- **Tier 8 — Applications on the layer:** 020 (agent comms), and 021 (the work-item interop contract an
+  external tracker consumes). 020 is the first ADR in the app tier: chat's
   semantics still live inside `vox-core`, and extracting them into a sibling `vox-chat` crate is the
   follow-on this tier anticipates.
 
