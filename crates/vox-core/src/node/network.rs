@@ -319,6 +319,15 @@ impl NodeNet {
         }
     }
 
+    /// Be told, by channelID, when a record by another author is admitted to this node's board.
+    ///
+    /// Set before this is shared, which is why it takes `&mut self`: the service is cloned into
+    /// every connection that serves a stream. See
+    /// [`crate::nat::service::RendezvousService::on_admitted`] for why this seam exists.
+    pub fn on_board_growth(&mut self, hook: crate::nat::service::AdmittedHook) {
+        self.service.on_admitted(hook);
+    }
+
     /// The connection manager (one connection per peer).
     #[must_use]
     pub fn manager(&self) -> &Arc<ConnectionManager> {
@@ -1139,7 +1148,7 @@ impl NodeNet {
         passphrase: &[u8],
         signer: &(dyn RootSigner + Send + Sync),
         store: &Store,
-        ring: &mut PrekeyRing,
+        ring: &tokio::sync::Mutex<PrekeyRing>,
         pending_joins: u32,
     ) -> Result<JoinOutcome> {
         let cfg = ResponderConfig {

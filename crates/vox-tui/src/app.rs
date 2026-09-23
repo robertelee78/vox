@@ -291,6 +291,8 @@ pub fn run_node(
         // gateway request); print the anchor specs once they are known, then serve.
         let mut printed: Vec<String> = Vec::new();
         let mut last_state: (usize, usize, usize) = (usize::MAX, 0, 0);
+        // What the board actually holds per room, reported when it changes. See below.
+        let mut last_board: Vec<String> = Vec::new();
         let mut stalls = node.subscribe();
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
@@ -346,6 +348,32 @@ pub fn run_node(
                         );
                         last_state = now;
                     }
+                    // **How many members of each room this board knows.** The line above counts
+                    // rooms, which is the one number that was never wrong. Whether an anchor has
+                    // come to know a room's *members* is the fact that decides whether anyone away
+                    // from the room can reconcile with them — a board holding a room and one member
+                    // of a two-member room is useless in exactly the way that looks like working —
+                    // and an operator had no way to see it. It is also unreadable from outside: the
+                    // symptom appears on somebody else's node, as a peer that cannot be reached.
+                    //
+                    // On change, like everything else here, so a settled anchor stays silent.
+                    let board: Vec<String> = view
+                        .anchoring
+                        .iter()
+                        .map(|a| {
+                            format!(
+                                "{} {}m/{}p{}",
+                                crate::tunnel_cli::short_id_of(&a.channel_id),
+                                a.members,
+                                a.pending,
+                                a.entries.map_or(String::new(), |e| format!("/{e}e"))
+                            )
+                        })
+                        .collect();
+                    if board != last_board {
+                        println!("vox node: board — {}", board.join(", "));
+                        last_board = board;
+                    }
                     // Drained without blocking: this arm also has an anchors file to
                     // write, and a status line nobody reads is better than a tick nobody
                     // reaches.
@@ -373,6 +401,16 @@ pub fn run_node(
                                 }
                                 vox_core::node::api::NodeEvent::JoinFailed { reason } => {
                                     eprintln!("vox node: a join did not complete — {reason}");
+                                }
+                                vox_core::node::api::NodeEvent::PublishRefused {
+                                    channel_id,
+                                    what,
+                                    why,
+                                } => {
+                                    eprintln!(
+                                        "vox node: a board would not take {what} for room {} — {why}",
+                                        crate::tunnel_cli::short_id_of(&channel_id)
+                                    );
                                 }
                                 vox_core::node::api::NodeEvent::StillRelayed { peer, reason } => {
                                     eprintln!(
@@ -702,10 +740,18 @@ pub fn run_daemon(
         rt.spawn(async move {
             let mut events = node.subscribe();
             while let Some(item) = events.next().await {
-                let vox_core::node::actor::EventStreamItem::Event(
-                    vox_core::node::api::NodeEvent::NewEntry { channel_id, row },
-                ) = item
-                else {
+                let vox_core::node::actor::EventStreamItem::Event(ev) = item else {
+                    continue;
+                };
+                // **A daemon is the node nobody is watching, so it has to say things out
+                // loud.** This loop existed for the interrupt path and discarded every other
+                // event with a `continue`, which meant the one host a person runs unattended —
+                // their always-on node, the anchor their other devices reach through — reported
+                // no unreachable peer, no refused publish, no stall, ever. `vox node` has
+                // reported these all along; the daemon swallowing them is why a room that
+                // silently stopped converging looked like patience from every side.
+                crate::tunnel_cli::say_if_it_explains_a_failure(&ev);
+                let vox_core::node::api::NodeEvent::NewEntry { channel_id, row } = ev else {
                     continue;
                 };
                 let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {

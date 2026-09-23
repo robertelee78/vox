@@ -137,6 +137,16 @@ A terminal has no camera, so the strong scan path is **relocated to the peer's d
   (unread markers in the channel list, a status line) and, on a desktop session, as OS notifications via
   `notify-rust`; over SSH the fallback is **OSC 9 / terminal bell**. The TUI does **not** spawn a
   background agent (that is the headless-node binary's role, ADR-012/014) — it notifies only while running.
+- **`vox daemon` says what it cannot do (2026-09-23).** The daemon had **no diagnostic reporting at
+  all**. Its one `node.subscribe()` loop existed for the ADR-020 §6 interrupt path and pattern-matched
+  `NewEntry`, discarding every other event with a `continue` — so the single host a person runs
+  unattended, the always-on node their other devices reach the world through, never reported an
+  unreachable peer, a refused publish, or a stall. `vox node` has reported these all along, which is why
+  the same room could look fine from the anchor's logs and be silently broken from the daemon's. It now
+  passes every event through the one reporter the CLI already uses
+  (`tunnel_cli::say_if_it_explains_a_failure`) before the interrupt match, so there is one place that
+  decides what a failure sounds like and no second copy to drift. This is the diagnostic that found the
+  ADR-016 board-growth defect: the reason was already being produced and had nowhere to go.
 - **Tunneling (ADR-013): first-class, present but OFF (inactive, not hidden) by default.** The terminal
   is its natural surface: the **full** ADR-013 surface ships — `vox service add`, `vox forward` / SOCKS,
   and per-member `bind:`/`dial:` grants require **no privilege** and are the default tunneling path;
@@ -158,6 +168,14 @@ A terminal has no camera, so the strong scan path is **relocated to the peer's d
   locks on terminal detach / `SIGHUP` / connection drop** (the SSH analogue of "lock on sleep"). Lock is
   **user-configurable incl. disable** (with a direct warning, ADR-014 parity). On first run inside a
   detected multiplexer it shows a **one-time honest warning** about capture being outside Vox's control.
+- **Lock must outrank a task that borrowed the identity (2026-09-23).** Answering a join runs off the
+  node's actor (ADR-016 §"Answering a join runs off the actor") and signs five times while it does,
+  so it holds an `Arc<VaultRootSigner>` rather than a borrow. That is a real tension with the rule
+  above: an `Arc` outlives `Profile::lock`, so "locked" would have quietly meant *locked once this
+  joiner gets bored* — and a joiner sets that timing. The node therefore **tracks every task it
+  hands a signer handle to and aborts them all when it locks**, before dropping the prekey ring, so
+  the last handle goes with the lock. `Profile::signer_arc` carries this requirement in its own
+  docs, because the next caller that wants an owned signer inherits the obligation.
 - **Memory protection (no false claim).** Secrets use `zeroize`/`secrecy` types **and are `mlock`'d**
   (explicit `libc::mlock`/`region`). Where `mlock` is **unavailable** (e.g. `RLIMIT_MEMLOCK=0` in an
   unprivileged container — exactly the headless target), the client does **not** silently pretend: it

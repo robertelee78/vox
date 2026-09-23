@@ -413,6 +413,18 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   none of. It is now enforced against what the board can *know*: the creator by the genesis, and every
   further member by a bundle record that a known member published — vouching, the same trust members
   already place in one another's boards. Details in ADR-016.
+- **A refused record now says so (2026-09-23).** Every put a node made to a board was
+  `let _ = client.put(..).await` — the genesis, its own address, its own bundle, and each record it
+  mirrors for another member. The refusal reasons this ADR defines are specific and were all discarded at
+  the one place that could report them, so "my record is on that board" and "that board threw my record
+  away" were the same observable: nothing. The consequence surfaced three layers away as a peer being
+  unreachable, on the wrong node. There is now `NodeEvent::PublishRefused { channel_id, what, why }`, and
+  it is deliberately raised for a **refresh-floor** decline too: that one is benign — the previous
+  announcement is still live, which is all the put was for — but "still announced" and "never announced"
+  are exactly the two cases the silence was merging, and only one of them is fine. The two reasons a
+  three-process room actually produces are `rejected: policy` (the floor, benign) and `rejected: author is
+  not a channel member` (the vouching rule, ADR-016 M15.2a), and telling them apart is what found the
+  board-growth defect recorded there.
 - **Known gaps, after rung 4 (2026-09-20).** The ladder is complete and every rung is proved against a
   middlebox that behaves like the real one. What remains is around it, not in it: a helper (coordinator or
   relay) must already be connected to both peers, and is found by trial over current connections —

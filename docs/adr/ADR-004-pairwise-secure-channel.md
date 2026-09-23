@@ -120,6 +120,18 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   ADR's documented forward-secrecy residual by a week to serve an initiator that can simply refetch.
   Exhaustion is proven by a test: a drained pool still publishes a verifying bundle, without a one-time
   prekey.
+- **The ring is shared, and the lock is held twice and briefly (2026-09-23).** The responder side of
+  a join no longer runs on the node's actor (ADR-016 §"Answering a join runs off the actor"), so the
+  ring can no longer be a `&mut` borrow held for the length of an exchange. It sits behind a
+  `tokio::sync::Mutex` that the exchange takes at exactly two points: once to read the bundle that
+  goes out in the `Challenge`, and once *after* the last frame arrives for the `use_one_time`
+  consume, its durable `prekeys::save`, and the session bootstrap that depends on both. **No wait
+  happens under the guard**, which is the property that matters: holding it across the exchange's
+  three frame waits would have serialized every concurrent join behind whichever joiner was
+  slowest, reproducing one layer down the stall that moving off the actor removed. The consume and
+  its save stay in one critical section, so the one-shot rule and its crash-safety ordering are
+  unchanged, and two genuinely concurrent joiners are still graded by the retained set above rather
+  than racing it.
 - **The two records are reconciled where sessions are established (done, M14.4).** The ring is the
   *persistent* record of what was consumed; `OtpReuseTracker` is a *per-process* one, so a node that
   restarted and then accepted a duplicate could have seen `use_one_time` → `Reused` while a fresh

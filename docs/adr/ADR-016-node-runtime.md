@@ -204,6 +204,43 @@ bundle, and delivers its SKDM when — and only when — its user consents (`Com
 records and delivers its own SKDM. Consent remains per-sender and human-initiated (ADR-007); the
 runtime automates delivery, never the decision.
 
+**Joining a room and being readable in it are two different gates, and only the second one is
+anybody's decision.** The passphrase is the join credential and always was: anyone holding the
+address and the passphrase gets an exchange and becomes an author. What that does *not* buy is
+reach — every existing member still delivers its SKDM only when its own user consents, above. So
+there is deliberately **no "somebody is knocking" step** for a member to approve: it would be
+ceremony for a decision the passphrase already made, in front of members who already have the
+consent decision that actually matters in their hands. A lobby the room must let you out of was
+considered and rejected for that reason.
+
+#### Answering a join runs off the actor
+
+The exchange above is **not** awaited on the actor. It waits on the joiner three times — the
+`PowToken`, the sealed proof, the `InitialMessage` — with the joiner's own proof-of-work
+verification in between, and a stranger sets the length of every one of those waits. Awaited
+inline, as it was through v0.2.4, one joiner stopped the node answering *anything*: no message, no
+sync, no other join, for as long as it cared to stall. The node that suffers most is an always-on
+one, whose entire purpose is being reachable.
+
+So the actor decides — is the room answerable at this epoch, is the identity unlocked, is there a
+free slot — and a slot does the waiting, with the outcome returning as an event that the actor
+applies in order (`NetEvent::JoinAnswered`). Past `JOINS_IN_FLIGHT` a join is **refused, not
+queued**: a queue of half-finished exchanges is the resource a flood wants to fill, and a joiner
+told "no" now retries in a second. The refusal is also *sent*, on its own task — dropping the
+stream would leave the joiner reading until its frame timeout, which is a hang wearing a refusal's
+clothes.
+
+Two supporting facts follow from moving it:
+
+- `Difficulty::adapted_for_load(pending_joins)` above is described against "the responder's live
+  queue", and until this change it was passed a literal `0` from the only caller — so the
+  anti-flood knob this ADR specifies had **never once adapted**. The slot count is that number,
+  and now supplies it.
+- The prekey ring is needed at exactly two points in the exchange (the bundle in the `Challenge`,
+  and the ADR-004 one-time consume after the last frame) with every wait in between, so it moves
+  behind a lock taken twice and briefly rather than borrowed across the whole exchange. Borrowing
+  it across would have serialized concurrent joins and rebuilt the same stall one layer down.
+
 ### Connections, reachability and sync
 
 - **Connection manager.** One `VoxConnection` per peer fingerprint, dialed with `connect_direct`
@@ -767,6 +804,25 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   to its anchors: when it answers a join, and whenever learning members from a peer's board gains its own
   board a record — bundles first. The M15.1 gate now runs against a headless anchor and ends with the
   anchor knowing both members: the creator by her genesis, the joiner by her vouch.
+  **Corrected 2026-09-23 — the second trigger did not cover the case that matters.** "Whenever our
+  board gains a record" was implemented only for records *this node fetched* from a peer's board while
+  syncing. The way a joiner's bundle actually arrives is the joiner **putting it on the responder's
+  board**, which fired nothing. So the only mirror that could carry it ran when the join was answered —
+  *before* the joiner had published — and the comment in `publish_channel_to_anchor` said so outright:
+  "whatever is there now goes up, and what arrives later goes with the next mirror." There was no next
+  mirror. Measured on three real processes: the anchor knew **1 of 2 members in 2 runs of 3**, and
+  `a_join_is_not_hostage_to_one_member` failed on its own precondition rather than its claim — so a room
+  stopped being joinable by anyone else the moment its creator went offline, which is the entire property
+  that gate exists to defend. The joiner's own put to the anchor cannot substitute: the anchor refuses it
+  with "author is not a channel member", correctly, because vouching is the only way it learns members.
+  It is now an event, as the paragraph above always claimed: `RendezvousService::on_admitted` fires when a
+  member-kind record arrives **from a peer** and is admitted, the node turns that into
+  `NetEvent::BoardGrew`, and the actor mirrors that room to its anchors. The test is "came from a peer",
+  not "the publisher is not the author" — the case that matters is a newcomer putting *its own* bundle on
+  a member's board, where publisher and author are the same. It cannot ring around a ring of anchors: a
+  node that is not a member of the room falls out of `publish_channel_to_anchor` on its missing admission,
+  and a re-put of a record already current is declined by the ADR-012 refresh floor, so the cascade is
+  bounded by that floor rather than by hop count.
   **Not yet (closed by M15.2b below):** ~~the anchor stores no log, so two members never online at once do
   not converge through it~~; a headless node that receives `Lock` stops its network with nothing to
   unlock it.

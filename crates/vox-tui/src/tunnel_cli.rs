@@ -668,13 +668,23 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
 /// produce — reached nobody. That is the same silent-failure shape as dropping an `Err`, one layer
 /// further out, and it is why `vox forward` through an anchor could be driven to failure on demand
 /// and still say nothing about which rung refused it.
-fn say_if_it_explains_a_failure(ev: &NodeEvent) {
+pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
     match ev {
         NodeEvent::PeerUnreachable { peer, why } => {
             eprintln!("vox: could not reach {} — {why}", short(peer));
         }
         NodeEvent::JoinFailed { reason } => {
             eprintln!("vox: a join did not complete — {reason}");
+        }
+        NodeEvent::PublishRefused {
+            channel_id,
+            what,
+            why,
+        } => {
+            eprintln!(
+                "vox: a board would not take {what} for room {} — {why}",
+                short(channel_id)
+            );
         }
         NodeEvent::StillRelayed { peer, reason } => {
             eprintln!("vox: still relayed to {} — {reason}", short(peer));
