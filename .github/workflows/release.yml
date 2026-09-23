@@ -122,9 +122,12 @@ jobs:
     name: excluded proofs (reporting only — never blocks a release)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # No `VOX_PROOF_ALLOW_UNPROVEN` here: a job inherits the workflow-level `env` above, and the
+    # `env` **context** is not available inside a job-level `env` block — writing
+    # `${{ env.VOX_PROOF_ALLOW_UNPROVEN }}` there made GitHub reject this whole file, so the run
+    # failed in 0s with no jobs and no log. v0.2.6's first two tags died that way.
     env:
       RUSTFLAGS: "-D warnings"
-      VOX_PROOF_ALLOW_UNPROVEN: ${{ env.VOX_PROOF_ALLOW_UNPROVEN }}
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y zsh fish
