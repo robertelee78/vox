@@ -989,17 +989,33 @@ impl NodeNet {
     /// epoch)` — bundles first, then address records — as wire frames, ready to be
     /// mirrored to an anchor.
     #[must_use]
+    /// **Bundles first, and the order is load-bearing — do not sort or merge these.**
+    ///
+    /// On an anchor, a newcomer's *address* record has no way in on its own: the
+    /// `MemberRecord` arm of `RendezvousService::put` has no vouch fallback, so it is
+    /// refused outright unless the anchor can already resolve the author's key. The
+    /// *bundle* arm does have one, and a bundle carries the author's key. So a member
+    /// mirroring a newcomer onward gets the address record admitted only because the
+    /// vouched bundle went up first and taught the board that key.
+    ///
+    /// Reverse these two, collect them into one sorted vector, or emit them
+    /// concurrently, and every mirrored address record is silently refused — the
+    /// newcomer stays reachable-but-unaddressed on every anchor, which reads as an
+    /// intermittent unreachable peer and attributes to nothing. Nothing outside this
+    /// comment enforces the order today.
     pub fn board_records(&self, channel_id: &Digest32, epoch: u64) -> Vec<Vec<u8>> {
         let now = self.now();
         let me = self.local_id();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        // 1. Bundles, which carry the author's key and can be vouched for.
         let mut out: Vec<Vec<u8>> = guard
             .current_bundles(channel_id, epoch, now)
             .into_iter()
             .filter(|r| r.author_id != me)
             .map(MemberBundleRecord::to_wire)
             .collect();
+        // 2. Address records, which can only resolve through a key the board now has.
         out.extend(
             guard
                 .current_members(channel_id, epoch, now)
