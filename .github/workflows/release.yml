@@ -36,7 +36,11 @@ jobs:
   gates:
     name: gates (fmt · clippy · test · docs)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 60, not 45: this job compiles every release target and then runs the whole `--ignored` suite,
+    # which is ~20 minutes of the total on a developer machine and longer on a shared runner. At 45
+    # a green release was a race against the clock — v0.2.5's run reached 32 minutes with the release
+    # suite still going. A gate that fails on its own budget teaches nobody anything.
+    timeout-minutes: 60
     # Set once for the whole job so every step shares one flag set and nothing is rebuilt
     # between them. Deliberately NOT workflow-wide: a release build has no business failing on
     # a dependency's warning under a cross-compile.
@@ -80,6 +84,30 @@ jobs:
             --skip two_agents_on_separate_processes_join_through_an_anchor_and_talk \
             --skip a_relayed_pair_finds_a_direct_path_once_one_becomes_possible \
             --skip a_room_bound_service_carries_real_bytes_through_the_real_binaries
+
+  # **Reporting only, and in its OWN job on purpose.** These are the proofs excluded from the gate
+  # above. Every command here ends in `|| echo "::warning::"`, so none of them can fail a release —
+  # but while they lived as a step inside `gates` they could still *time out* that job, and a timed
+  # out `gates` blocks the release completely. A step forbidden from failing the release could
+  # nonetheless kill it, by spending a budget it shared with the real gate.
+  #
+  # That very nearly happened: adding a third proof here (`service_rehearsal_proof`, whose failing
+  # path burns its whole timeout) lengthened this work inside a 45-minute budget that the blocking
+  # steps had already spent 32 minutes of.
+  #
+  # So it is a separate job that **nothing needs and which needs nothing**. It cannot consume the
+  # gate's time, cannot block publication, and a rate that changes is still visible as a warning —
+  # which is the entire reason these are run at all rather than deleted (ADR-018).
+  flaky-watch:
+    name: excluded proofs (reporting only — never blocks a release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-D warnings"
+      VOX_PROOF_ALLOW_UNPROVEN: ${{ env.VOX_PROOF_ALLOW_UNPROVEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y zsh fish
       # Run them anyway, reporting only: a rate that changes is information, and a gate that hides
       # them entirely would let them rot.
       - run: |
