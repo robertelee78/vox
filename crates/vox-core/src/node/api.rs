@@ -504,6 +504,54 @@ pub enum NodeEvent {
         /// The port that was being carried, which is the service tag.
         port: u16,
     },
+    /// This node was unable to answer anybody for a noticeable time, and what it was doing.
+    ///
+    /// The actor is the only writer of channel state, so whatever it awaits stops the node
+    /// answering *everyone* — a request arriving in that window waits out its own patience and
+    /// reports this node as unreachable when it was merely busy. That failure is indistinguishable
+    /// from a network problem at the far end, which is why the node has to say it about itself.
+    Stalled {
+        /// What the node was doing.
+        what: String,
+        /// How long it was unable to answer, in milliseconds.
+        millis: u64,
+    },
+    /// A join failed, with what each responder that was tried reported.
+    ///
+    /// `Outcome::Failed(Fault)` is a single token with no room for a reason, so this carries the
+    /// one thing a person needs: which member was asked and what it said. "That member is
+    /// offline", "the board has not caught up yet" and "the room does not want you" are three
+    /// different problems that all render as `Unreachable`.
+    JoinFailed {
+        /// What each responder reported, as this node saw it.
+        reason: String,
+    },
+    /// An upgrade off a relayed path was tried and nothing better landed, with what each rung
+    /// reported.
+    ///
+    /// Not an error. A peer behind a symmetric NAT stays relayed and that is ADR-012's
+    /// documented limit. It is an event because "relayed because the NAT says no" and "relayed
+    /// because a rung failed" look identical from outside, and only one of them is somebody's
+    /// problem to fix.
+    StillRelayed {
+        /// The peer still reached over a relay.
+        peer: Digest32,
+        /// What each rung reported, as this node saw it.
+        reason: String,
+    },
+    /// A dial this node started in the background failed, with what it reported.
+    ///
+    /// Connecting cannot run on the actor — it would stop the node answering anyone — so it runs
+    /// off it, and the result came back through a channel that dropped the `Err`. A room then sits
+    /// at an empty timeline having never said why: "the anchor refused", "the anchor is not
+    /// listening" and "we never tried" are three different problems and all three looked like
+    /// patience. This is the node reporting the one it actually hit.
+    PeerUnreachable {
+        /// The peer that could not be reached.
+        peer: Digest32,
+        /// What the attempt reported, as this node saw it.
+        why: String,
+    },
     /// A forward is live: the local port is accepting connections for a member's
     /// service (ADR-013).
     Forwarding {

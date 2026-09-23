@@ -424,6 +424,23 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   UPnP-IGD was built the same day, M15.1c — its validation against real router hardware is pending,
   the network it was built on having no UPnP device to answer.)
 
+- **A dial that failed reported nothing (2026-09-23).** Connecting runs the ladder with all of its
+  timeouts and the actor may not await that, so every dial is spawned and its result returned through
+  a channel. Three of those spawns kept the connection on success and dropped the `Err`: the startup
+  anchor dial, the anchor redial, and channel-anchor adoption. A node that could not reach its anchor
+  therefore reported *nothing at all*, and an empty room was indistinguishable from a patient one.
+  Measured from the node's own view rather than from a timeout: `epoch-timeline=0`, `members=2`, and
+  no event after `ChannelOpened`. Each now sends `NetEvent::ReachFailed`, which the actor turns into
+  `NodeEvent::PeerUnreachable { peer, why }`. The ladder's error carries every rung's verdict
+  (`Error::LadderExhausted`) instead of whichever attempt happened to finish last, and `fault_of`
+  maps it to `Fault::Unreachable` — without that arm it fell through to `Internal`, which silently
+  ended the join walk after one responder.
+- **`upgrade` reports why, and only a real exhaustion means "still relayed" (2026-09-23).** A silent
+  `None` made "the punch was refused", "no helper would coordinate" and "nothing was even tried"
+  indistinguishable. It now returns a reason, but only `LadderExhausted` raises
+  `NodeEvent::StillRelayed`: "already direct" and "nothing to upgrade" are also `Err` now, and
+  reporting those as still-relayed would say something false about a peer that is not relayed.
+
 ## Links
 **Depends on**: ADR-005, ADR-011.
 - Depended on by: ADR-013, ADR-014.

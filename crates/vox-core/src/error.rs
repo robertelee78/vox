@@ -239,6 +239,18 @@ pub enum Error {
     #[error("peer unreachable: {0}")]
     Unreachable(&'static str),
 
+    /// Every rung of the ADR-012 ladder was tried and none landed, carrying **what each
+    /// rung reported**.
+    ///
+    /// [`Self::Unreachable`] cannot say this: the direct rung and each circuit rung fail
+    /// for independent reasons, and one `&'static str` can only name one of them. Keeping
+    /// whichever rung happened to finish last is worse than useless, because the direct
+    /// rung is always the slowest and so always wins that race — the operator is then
+    /// told about a timeout while the rung that knew the real answer is discarded
+    /// (ADR-018 §8b: whatever knows why must say why).
+    #[error("peer unreachable — {0}")]
+    LadderExhausted(String),
+
     /// A tunnel operation was refused by authorization (ADR-013): the requesting
     /// member holds no valid `dial:<service>` capability (or the host no
     /// `bind:<service>`), or the service is dark/unknown. Default-deny: the absence

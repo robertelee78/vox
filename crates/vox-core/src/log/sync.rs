@@ -46,6 +46,20 @@ use crate::log::entry::{Entry, EntryKind, MAX_AUTHENTICATOR_LEN, MAX_PAYLOAD_LEN
 use crate::log::negentropy::{self, Role, MAX_MESSAGE_LEN as MAX_NEG_MESSAGE_LEN};
 use crate::wire::{FrameId, WireError, SYNC_MODE_FRONTIER, SYNC_MODE_RANGE_RECONCILIATION};
 
+/// The whole drain phase's budget, however many frames arrive.
+///
+/// Chosen absolutely, not derived from the per-frame timeout. A room's lock is held for the entire
+/// session, so this is how long one member may stop every other operation on that room — a bound on
+/// what the rest of the node will tolerate, which is a different question from how patient any one
+/// frame should be. The two must not be tied: a per-frame bound tightened to abandon a dead peer
+/// sooner would otherwise also abandon an honest sync that is merely slow.
+///
+/// The references bound the total as well as the gap, for this reason: go-libp2p's relay sets a
+/// per-stream timeout *and* an absolute `Duration` cap on the whole relayed connection, and Tor
+/// reclaims a circuit on total idle. A per-frame bound alone defends only against a peer that
+/// stops, never against one that drips.
+const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Hard upper bound on an `ENTRY` frame's carried wire bytes, checked **before**
 /// `to_vec` so a hostile frame cannot force a large allocation ahead of
 /// [`Entry::from_wire`]'s own per-field caps (ADR-008 anti-abuse). It is the sum
@@ -727,7 +741,22 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
     now_secs: u64,
 ) -> std::result::Result<usize, WireError> {
     let mut applied = 0;
+    // **The whole phase is bounded, not just the gap between frames.**
+    //
+    // The transport's timeout is per frame, and this loop had no limit on how many frames it
+    // would take, so a peer that sent one frame every nineteen seconds — forever — held this
+    // room's lock for ever. The lock is taken for the entire session (see `sync_over`'s caller),
+    // so that is every operation on the room stopped by one member, at no cost to it.
+    //
+    // The references bound the total as well as the gap: go-libp2p's relay sets a per-stream
+    // timeout *and* an absolute `Duration` cap on the whole relayed connection, and Tor reclaims a
+    // circuit on total idle. A per-frame bound alone only defends against a peer that stops, never
+    // against one that drips.
+    let deadline = std::time::Instant::now() + DRAIN_BUDGET;
     while let Some(frame) = t.recv().map_err(|_| WireError::TransportFailed)? {
+        if std::time::Instant::now() >= deadline {
+            return Err(WireError::SyncModeUnsupported);
+        }
         match decode_frame(&frame) {
             Ok(SyncFrame::Entry(wire)) => {
                 if matches!(
@@ -737,7 +766,11 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
                     applied += 1;
                 }
             }
-            Ok(_) => {} // ignore non-entry frames in the drain phase
+            // **A protocol violation, not something to ignore.** This phase is defined as entries
+            // only, and silently accepting anything else is what made the hold above free: a
+            // non-entry frame costs the sender nothing, never reaches `apply_entry`, and therefore
+            // never touches the quota that is supposed to bound this exchange.
+            Ok(_) => return Err(WireError::SyncModeUnsupported),
             Err(_) => return Err(WireError::SyncModeUnsupported),
         }
     }

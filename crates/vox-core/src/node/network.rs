@@ -407,13 +407,31 @@ impl NodeNet {
     /// serve it if it is the board. Anything the actor must handle comes back as an
     /// [`Inbound`].
     pub async fn accept_stream(&self, conn: &VoxConnection) -> Result<Inbound> {
-        let peer = conn.peer_id();
         // **Authorize when the stream arrives, not before.** Accepting blocks until
         // the peer opens something, which may be long after this loop iteration began
         // — and in that window the peer can become a member (a join completes, a
         // channel opens). Classifying against a snapshot taken *before* the await
         // refused exactly the stream that mattered: a member delivering its sender key
         // on a connection we had dialled before we knew it.
+        let (kind, send, recv) = self.accept_authorized(conn).await?;
+        self.dispatch(conn, kind, send, recv).await
+    }
+
+    /// Wait for the next stream on `conn` and authorize it — **and nothing else**.
+    ///
+    /// The serving is [`Self::dispatch`], which a caller running a loop must put on its own
+    /// task. Doing both in one call, which [`Self::accept_stream`] still does for callers that
+    /// want one stream, makes a loop serve every stream inline and therefore serialise on them:
+    /// a rendezvous, coord or circuit stream is answered *inside* `dispatch`, so one slow one
+    /// delays every other stream on the same connection. That is how a hole punch loses its
+    /// coordinator — the initiator's `coord` request waits behind a sync already in progress
+    /// and gives up at `coordstream`'s frame timeout, which reads as "the peer went quiet" when
+    /// the peer was never asked.
+    pub async fn accept_authorized(
+        &self,
+        conn: &VoxConnection,
+    ) -> Result<(StreamKind, SendStream, RecvStream)> {
+        let peer = conn.peer_id();
         let (kind, mut send, mut recv) = accept_typed(conn).await?;
         if !PeerPolicy::allows(self.classify(&peer), kind) {
             crate::node::net::refuse_stream(&mut send, &mut recv);
@@ -421,7 +439,7 @@ impl NodeNet {
                 "peer may not open this stream kind",
             ));
         }
-        self.dispatch(conn, kind, send, recv).await
+        Ok((kind, send, recv))
     }
 
     /// How this node classifies `peer` right now: the actor's policy where it has an
@@ -497,8 +515,9 @@ impl NodeNet {
         self.dispatch(conn, kind, send, recv).await
     }
 
-    /// Serve or hand up an authorized stream.
-    async fn dispatch(
+    /// Serve or hand up an authorized stream. Put this on its own task when accepting in a
+    /// loop — see [`Self::accept_authorized`].
+    pub async fn dispatch(
         &self,
         conn: &VoxConnection,
         kind: StreamKind,
@@ -663,34 +682,56 @@ impl NodeNet {
         if let Some(conn) = self.manager.existing(&peer) {
             return Ok(conn);
         }
-        let mut set: JoinSet<Result<VoxConnection>> = JoinSet::new();
+        // Each rung is spawned with the label it will be reported under, because a rung
+        // that fails is only actionable if the operator knows *which* rung it was: a
+        // dialable address that never answers and a helper that refuses to relay call for
+        // opposite next steps.
+        let mut set: JoinSet<(String, Result<VoxConnection>)> = JoinSet::new();
         let candidates = direct_candidates(endpoints);
         if !candidates.is_empty() {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
-            set.spawn(async move { connect_direct(endpoint, &candidates, peer, now).await });
+            // The addresses go into the label: "all direct candidates failed" is not a
+            // diagnosis on its own, and which addresses this node believed in is exactly
+            // what distinguishes a stale board record from a blocked path.
+            let label = format!("direct to {}", join_addrs(&candidates));
+            set.spawn(async move {
+                (
+                    label,
+                    connect_direct(endpoint, &candidates, peer, now).await,
+                )
+            });
         }
         for relay in self.helpers(peer) {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
-            set.spawn(
-                async move { circuitstream::connect_through(&relay, peer, &endpoint, now).await },
-            );
+            let label = format!("circuit via {}", short_id(relay.peer_id()));
+            set.spawn(async move {
+                (
+                    label,
+                    circuitstream::connect_through(&relay, peer, &endpoint, now).await,
+                )
+            });
         }
         if set.is_empty() {
             return Err(Error::Unreachable(
                 "no direct candidates, and no peer is connected to carry a circuit",
             ));
         }
-        let mut last: Option<Error> = None;
+        // Every rung's verdict is kept. `join_next` yields in *completion* order, so the
+        // slowest rung finishes last — and the direct rung, which stages one dial per
+        // candidate, is essentially always the slowest. Keeping "the last error" therefore
+        // reported the direct timeout and threw away the circuit's answer every time.
+        let mut why: Vec<String> = Vec::with_capacity(set.len());
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok(Ok(conn)) => return Ok(self.manager.adopt(conn)),
-                Ok(Err(e)) => last = Some(e),
-                Err(_) => last = Some(Error::Unreachable("a reach attempt was cancelled")),
+                Ok((_, Ok(conn))) => return Ok(self.manager.adopt(conn)),
+                Ok((rung, Err(e))) => why.push(format!("{rung}: {e}")),
+                Err(_) => why.push("a rung was cancelled".to_owned()),
             }
         }
-        Err(last.unwrap_or(Error::Unreachable("no path to the peer")))
+        why.sort(); // a reason a person compares between runs must not reorder itself
+        Err(Error::LadderExhausted(why.join("; ")))
     }
 
     /// Try for a **better path** to a peer already reached over a relayed one: a direct
@@ -699,18 +740,22 @@ impl NodeNet {
     /// preference rule, which retires the relayed connection underneath whatever is
     /// in flight on it; the peer's manager does the same on its side.
     ///
-    /// `None` when the current path is already direct, or when nothing better lands —
-    /// a peer behind a symmetric NAT stays relayed, honestly.
+    /// `Ok` is a better path that was filed. `Err(LadderExhausted)` carries **why nothing
+    /// better landed**, rung by rung — a peer behind a symmetric NAT staying relayed is an
+    /// honest outcome, but it must be distinguishable from a rung that failed for a reason
+    /// somebody could act on.
     pub async fn upgrade(
         &self,
         peer: Digest32,
         endpoints: &EndpointList,
-    ) -> Option<Arc<VoxConnection>> {
-        let current = self.manager.existing(&peer)?;
+    ) -> Result<Arc<VoxConnection>> {
+        let Some(current) = self.manager.existing(&peer) else {
+            return Err(Error::Unreachable("no connection to upgrade"));
+        };
         if crate::node::net::path_class(self.manager.endpoint(), &current)
             == crate::node::net::PathClass::Direct
         {
-            return None;
+            return Err(Error::Unreachable("the path is already direct"));
         }
         let mut set: JoinSet<Result<VoxConnection>> = JoinSet::new();
         let candidates = direct_candidates(endpoints);
@@ -745,17 +790,33 @@ impl NodeNet {
                 coordstream::execute_punch(endpoint, plan, peer, now).await
             });
         }
+        let mut why: Vec<String> = Vec::with_capacity(set.len());
         while let Some(joined) = set.join_next().await {
-            if let Ok(Ok(conn)) = joined {
-                let filed = self.manager.adopt(conn);
-                // `adopt` keeps the better of the two; only a real replacement is an
-                // upgrade.
-                if !Arc::ptr_eq(&filed, &current) {
-                    return Some(filed);
+            match joined {
+                Ok(Ok(conn)) => {
+                    let filed = self.manager.adopt(conn);
+                    // `adopt` keeps the better of the two; only a real replacement is an
+                    // upgrade.
+                    if !Arc::ptr_eq(&filed, &current) {
+                        return Ok(filed);
+                    }
+                    why.push("a better path landed but the manager kept the held one".to_owned());
                 }
+                Ok(Err(e)) => why.push(e.to_string()),
+                Err(_) => why.push("an upgrade attempt was cancelled".to_owned()),
             }
         }
-        None
+        // Nothing better landed. Which is an ordinary outcome -- a peer behind a symmetric NAT
+        // stays relayed, honestly -- but "nothing landed" and "nothing was even tried" are
+        // different facts, and so are the reasons each rung gave. Returning `Option` threw all
+        // of that away, which made a pair that silently never upgraded impossible to diagnose
+        // without a debugger (ADR-018 §8b).
+        why.sort();
+        Err(Error::LadderExhausted(if why.is_empty() {
+            "no rung was available to try".to_owned()
+        } else {
+            why.join("; ")
+        }))
     }
 
     /// The connected peers that could help reach `peer`: every live connection but
@@ -1125,4 +1186,19 @@ impl NodeNet {
         client.finish();
         res
     }
+}
+
+/// The addresses a rung tried, rendered for a person to read.
+fn join_addrs(addrs: &[std::net::SocketAddr]) -> String {
+    addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A peer id shortened to the first four bytes, which is enough to tell two helpers apart
+/// in a diagnostic without putting a full fingerprint in front of somebody.
+pub(crate) fn short_id(id: Digest32) -> String {
+    id[..4].iter().map(|b| format!("{b:02x}")).collect()
 }

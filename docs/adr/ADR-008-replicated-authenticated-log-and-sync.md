@@ -296,6 +296,29 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   the reason no longer lies, which matters because the ADR's own words are that a peer "logs the coded
   reason and surfaces it".
 
+- **The drain phase is bounded in total, not only per frame (2026-09-23).** A session holds the
+  room's lock for its whole length, so a peer sending one frame just inside the per-frame timeout,
+  for ever, held that lock for ever — every other operation on the room stopped by one member at no
+  cost to it. `DRAIN_BUDGET` bounds the whole phase at thirty seconds. The honest bound is thirty
+  seconds *plus* one frame timeout, because the deadline is only checked when a frame arrives; the
+  engine is synchronous over channel state and cannot be wrapped in a timeout from outside. The
+  references separate the two for the same reason: go-libp2p's relay sets a per-stream timeout *and*
+  an absolute `Duration` cap, and Tor reclaims a circuit on total idle.
+- **A non-entry frame in the drain phase is now a protocol violation, not something to ignore
+  (2026-09-23).** This phase is defined as entries only, and tolerating anything else is what made
+  the hold above free: a non-entry frame costs the sender nothing, never reaches `apply_entry`, and
+  so never touches the quota meant to bound the exchange. This is a **wire-visible behaviour
+  change**, recorded as such: a sender that emits a non-entry frame mid-drain now has the session
+  failed rather than the frame skipped. Unknown frame *ids* are still rejected separately by
+  `decode_frame`, so this is not the RFC 9000 §12.4 "ignore what you do not know" case.
+- **The root cause both of these bound rather than fix (2026-09-23).** A sync runs with the channel's
+  lock held, so every network wait inside it is a wait the rest of the node serves behind. A naive
+  three-second bound on the *publish* path was written and **withdrawn before landing** for exactly
+  this reason: publishing also takes that lock, so a budget shorter than a sync's lock-hold would
+  have dropped records systematically whenever a sync was in flight — trading a visible stall for a
+  silent loss. The fix is for the exchange not to hold the lock across network waits, which is a
+  change to this ADR's implementation and not to a constant.
+
 ## Links
 **Depends on**: ADR-002, ADR-006.
 - Depended on by: ADR-007, ADR-009, ADR-010, ADR-011.

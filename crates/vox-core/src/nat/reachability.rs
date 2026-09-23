@@ -380,8 +380,13 @@ pub async fn connect_direct_within(
         return Err(Error::Unreachable("no direct candidates"));
     }
 
-    let mut set: JoinSet<Result<VoxConnection>> = JoinSet::new();
+    // Each attempt carries the address it was for, so a failure can name it. Flattening
+    // every candidate to one message hid, for a long time, the difference between "nothing
+    // is listening there" and "something answered but was not the peer we expected" — the
+    // two failures a person would act on in completely opposite ways (ADR-018 §8b).
+    let mut set: JoinSet<(SocketAddr, Result<VoxConnection>)> = JoinSet::new();
     let mut next = 0usize;
+    let mut why: Vec<String> = Vec::with_capacity(candidates.len());
 
     loop {
         // Nothing in flight: launch the next candidate at once — there is nothing to
@@ -390,7 +395,7 @@ pub async fn connect_direct_within(
         // defect the M15.1 gate caught when an attempt failed faster than the timer.)
         if set.is_empty() {
             if next >= candidates.len() {
-                return Err(Error::Unreachable("all direct candidates failed"));
+                return Err(exhausted(&why));
             }
             spawn_attempt(
                 &mut set,
@@ -412,20 +417,22 @@ pub async fn connect_direct_within(
                     next += 1;
                 }
                 joined = set.join_next() => {
-                    if let Some(conn) = take_success(joined) {
-                        return Ok(conn); // JoinSet drop cancels the rest
+                    match take_success(joined) {
+                        Ok(conn) => return Ok(conn), // JoinSet drop cancels the rest
+                        Err(Some(reason)) => why.push(reason),
+                        Err(None) => {}
                     }
                 }
             }
         } else {
             // All candidates launched: drain remaining attempts.
             match set.join_next().await {
-                Some(joined) => {
-                    if let Some(conn) = take_success(Some(joined)) {
-                        return Ok(conn);
-                    }
-                }
-                None => return Err(Error::Unreachable("all direct candidates failed")),
+                Some(joined) => match take_success(Some(joined)) {
+                    Ok(conn) => return Ok(conn),
+                    Err(Some(reason)) => why.push(reason),
+                    Err(None) => {}
+                },
+                None => return Err(exhausted(&why)),
             }
         }
     }
@@ -433,7 +440,7 @@ pub async fn connect_direct_within(
 
 /// Spawn one staggered QUIC connection attempt onto `set`.
 fn spawn_attempt(
-    set: &mut JoinSet<Result<VoxConnection>>,
+    set: &mut JoinSet<(SocketAddr, Result<VoxConnection>)>,
     endpoint: &Arc<VoxEndpoint>,
     addr: SocketAddr,
     expected_peer: Digest32,
@@ -442,10 +449,16 @@ fn spawn_attempt(
 ) {
     let ep = Arc::clone(endpoint);
     set.spawn(async move {
-        match tokio::time::timeout(per_attempt, ep.connect(addr, expected_peer, now_secs)).await {
+        let outcome = match tokio::time::timeout(
+            per_attempt,
+            ep.connect(addr, expected_peer, now_secs),
+        )
+        .await
+        {
             Ok(res) => res,
             Err(_) => Err(Error::Unreachable("direct attempt timed out")),
-        }
+        };
+        (addr, outcome)
     });
 }
 
@@ -453,11 +466,27 @@ fn spawn_attempt(
 /// authenticated attempt; `None` if the attempt failed, timed out, or its task
 /// panicked/was cancelled (the caller keeps draining the set).
 fn take_success(
-    joined: Option<std::result::Result<Result<VoxConnection>, tokio::task::JoinError>>,
-) -> Option<VoxConnection> {
+    joined: Option<
+        std::result::Result<(SocketAddr, Result<VoxConnection>), tokio::task::JoinError>,
+    >,
+) -> std::result::Result<VoxConnection, Option<String>> {
     match joined {
-        Some(Ok(Ok(conn))) => Some(conn),
-        // Connect error, timeout, or a join error (panic/cancel): not a success.
-        _ => None,
+        Some(Ok((_, Ok(conn)))) => Ok(conn),
+        // A failure names the address it was for: see the note on the `JoinSet` above.
+        Some(Ok((addr, Err(e)))) => Err(Some(format!("{addr}: {e}"))),
+        // A panicked or cancelled attempt is not a candidate's verdict, so it contributes
+        // nothing to the reason — but it must not be read as a success either.
+        Some(Err(_)) | None => Err(None),
     }
+}
+
+/// The error for "every candidate was tried and none connected", carrying each one's
+/// verdict. Ordered so the same failure reads the same way between runs.
+fn exhausted(why: &[String]) -> Error {
+    if why.is_empty() {
+        return Error::Unreachable("all direct candidates failed");
+    }
+    let mut sorted = why.to_vec();
+    sorted.sort();
+    Error::LadderExhausted(sorted.join(", "))
 }

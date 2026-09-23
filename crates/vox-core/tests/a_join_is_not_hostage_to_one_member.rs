@@ -258,9 +258,22 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         .await
         .expect("carol's join did not finish");
 
+        // `Fault` is one token with no room for a reason, so the node sends the reason
+        // separately. Drain it before asserting: "Unreachable" on its own has cost hours.
+        let mut why = String::new();
+        if !out.is_done() {
+            while let Ok(Some(e)) =
+                tokio::time::timeout(Duration::from_millis(200), carol.next_event()).await
+            {
+                if let NodeEvent::JoinFailed { reason } = e {
+                    why = reason;
+                    break;
+                }
+            }
+        }
         assert!(
             out.is_done(),
-            "carol could not join a room with a live member in it. {offline_name} is offline \
+            "carol could not join a room with a live member in it. The node said: {why}. {offline_name} is offline \
              and sorts first, so she must fall through to {survivor_name} — one member being \
              away is not the room being gone. Outcome: {out:?}",
         );

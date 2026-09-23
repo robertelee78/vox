@@ -75,7 +75,9 @@ pub const MAX_RELAYED_FRAMES: usize = 8;
 pub const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for one signaling frame from the peer.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// Public so a proof about coordination stalling can derive its bound from the value the product
+/// actually gives up at, rather than restating it (ADR-018 §8).
+pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the synchronized dial waits per target. Shorter than a plain dial's:
 /// QUIC retransmits its Initial at about 1, 2 and 4 s, so a punch that has not

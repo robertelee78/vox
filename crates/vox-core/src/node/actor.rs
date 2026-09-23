@@ -99,6 +99,49 @@ const TICK: Duration = Duration::from_secs(1);
 /// reasoning and the same figure, chosen there because NAT conditions change on that order.
 const UPGRADE_RETRY: Duration = Duration::from_secs(60);
 
+/// How long the actor may be busy before it says so.
+///
+/// **Derived from the tick, not chosen.** The actor is the only writer of channel state, so while
+/// it is busy the node answers nobody; anything beyond a few ticks means some peer's request is
+/// queued behind it, and a peer's patience is measured in seconds. Five ticks is long enough that
+/// ordinary work never reports, and short enough that a stall a person would notice always does.
+const STALL_BUDGET: Duration = Duration::from_secs(5);
+
+/// A short name for what a command was, for the stall report.
+fn command_name(c: &NodeCommand) -> &'static str {
+    match c {
+        NodeCommand::JoinChannel { .. } => "joining a room",
+        NodeCommand::CreateChannel { .. } => "creating a room",
+        NodeCommand::OpenChannel { .. } => "opening a room",
+        NodeCommand::SendText { .. } => "sending a message",
+        NodeCommand::Sync { .. } => "syncing",
+        NodeCommand::Consent { .. } => "consenting to a member",
+        NodeCommand::Revoke { .. } => "revoking a member",
+        NodeCommand::Serve { .. } => "publishing a service",
+        NodeCommand::Up { .. } => "bringing the proxy up",
+        NodeCommand::Forward { .. } => "opening a forward",
+        NodeCommand::Unlock { .. } => "unlocking the identity",
+        _ => "a client command",
+    }
+}
+
+/// A short name for what inbound work was, for the stall report.
+fn net_event_name(e: &NetEvent) -> &'static str {
+    match e {
+        NetEvent::JoinRequest { .. } => "answering somebody's join",
+        NetEvent::SyncRequest { .. } => "answering a sync",
+        NetEvent::Stream { .. } => "serving a stream",
+        NetEvent::Connected { .. } => "filing a new connection",
+        NetEvent::BetterPath { .. } => "adopting a connection",
+        NetEvent::ReachFailed { .. } => "filing a failed dial",
+        NetEvent::UpgradeFailed { .. } => "filing a path upgrade that failed",
+        NetEvent::AnchorConnected { .. } => "publishing every room to an anchor that answered",
+        NetEvent::AddressesDiscovered { .. } => "publishing every room at a new address",
+        NetEvent::SyncDone { .. } => "filing a sync that finished",
+        NetEvent::Stopped => "shutting the network down",
+    }
+}
+
 /// Bound on the internal network→actor queue. Inbound streams are back-pressured
 /// rather than dropped: a full queue slows the accept loop, it never loses work.
 const NET_QUEUE: usize = 64;
@@ -285,6 +328,30 @@ enum NetEvent {
     AnchorConnected {
         /// The connection to the anchor.
         conn: Arc<VoxConnection>,
+    },
+    /// A background dial failed. **The one thing that must never be dropped.**
+    ///
+    /// Every dial runs off the actor, because the actor may not await a ladder. Each of those
+    /// spawns kept the connection on success and discarded the error on failure, so a node that
+    /// could not reach its anchor reported nothing at all and a room stayed at an empty timeline
+    /// looking like patience. Measured: a member whose own view showed `epoch-timeline=0` and no
+    /// event after `ChannelOpened`.
+    ReachFailed {
+        /// The peer that could not be reached.
+        peer: Digest32,
+        /// What the attempt reported.
+        why: String,
+    },
+    /// An upgrade off a relayed path was tried and nothing better landed, with the reason.
+    ///
+    /// Not an error: a pair behind symmetric NATs stays relayed and that is ADR-012's documented
+    /// limit. It is an event because "relayed because the NAT says no" and "relayed because a rung
+    /// failed" look identical from outside, and only one of them is somebody's problem.
+    UpgradeFailed {
+        /// The peer still reached over a relay.
+        peer: Digest32,
+        /// What each rung reported.
+        reason: String,
     },
     /// A better path to a peer landed — a punch answered, or an upgrade behind a
     /// relayed dial (ADR-012 rungs 3–4, M15.1b): the connection needs the same
@@ -963,7 +1030,10 @@ impl Node {
                 received = cmd_rx.recv() => {
                     let Some((command, reply)) = received else { break };
                     let shutdown = matches!(command, NodeCommand::Shutdown);
+                    let name = command_name(&command);
+                    let started = std::time::Instant::now();
                     let outcome = self.handle(command).await;
+                    self.note_if_stalled(name, started);
                     self.publish().await;
                     // A dropped reply receiver is the caller's choice, not an error.
                     let _ = reply.send(outcome);
@@ -972,7 +1042,10 @@ impl Node {
                     }
                 }
                 Some(event) = net_rx.recv() => {
+                    let name = net_event_name(&event);
+                    let started = std::time::Instant::now();
                     self.handle_net(event).await;
+                    self.note_if_stalled(name, started);
                     self.publish().await;
                 }
                 _ = ticker.tick() => {
@@ -1134,6 +1207,23 @@ impl Node {
         }
     }
 
+    /// Say so if the actor was busy longer than a peer will wait.
+    ///
+    /// The actor is the only writer of channel state, so whatever it awaits stops the node
+    /// answering *everyone* — and a request arriving in that window waits out its own patience and
+    /// reports this node as unreachable when it was merely busy. That failure is indistinguishable
+    /// from a network problem at the far end, which is why the node has to say it about itself.
+    fn note_if_stalled(&self, what: &str, since: std::time::Instant) {
+        let took = since.elapsed();
+        if took < STALL_BUDGET {
+            return;
+        }
+        let _ = self.event_tx.send(NodeEvent::Stalled {
+            what: what.to_owned(),
+            millis: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+        });
+    }
+
     fn now(&self) -> u64 {
         (self.clock)()
     }
@@ -1226,8 +1316,18 @@ impl Node {
             let tx = self.net_tx.clone();
             let (id, endpoints) = (anchor.id, anchor.endpoints.clone());
             tokio::spawn(async move {
-                if let Ok(conn) = net.manager().connect(id, &endpoints).await {
-                    let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                match net.manager().connect(id, &endpoints).await {
+                    Ok(conn) => {
+                        let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(NetEvent::ReachFailed {
+                                peer: id,
+                                why: e.to_string(),
+                            })
+                            .await;
+                    }
                 }
             });
         }
@@ -1470,8 +1570,18 @@ impl Node {
             let net = Arc::clone(&net);
             let tx = self.net_tx.clone();
             tokio::spawn(async move {
-                if let Ok(conn) = net.manager().connect(anchor.id, &anchor.endpoints).await {
-                    let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                match net.manager().connect(anchor.id, &anchor.endpoints).await {
+                    Ok(conn) => {
+                        let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(NetEvent::ReachFailed {
+                                peer: anchor.id,
+                                why: e.to_string(),
+                            })
+                            .await;
+                    }
                 }
             });
         }
@@ -1511,8 +1621,18 @@ impl Node {
             let tx = self.net_tx.clone();
             let (id, endpoints) = (anchor.id, anchor.endpoints.clone());
             tokio::spawn(async move {
-                if let Ok(conn) = net.manager().connect(id, &endpoints).await {
-                    let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                match net.manager().connect(id, &endpoints).await {
+                    Ok(conn) => {
+                        let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(NetEvent::ReachFailed {
+                                peer: id,
+                                why: e.to_string(),
+                            })
+                            .await;
+                    }
                 }
             });
         }
@@ -1648,6 +1768,12 @@ impl Node {
                     self.publish_channel_locally(&channel_id).await;
                     self.publish_channel_to_anchors(&channel_id).await;
                 }
+            }
+            NetEvent::ReachFailed { peer, why } => {
+                let _ = self.event_tx.send(NodeEvent::PeerUnreachable { peer, why });
+            }
+            NetEvent::UpgradeFailed { peer, reason } => {
+                let _ = self.event_tx.send(NodeEvent::StillRelayed { peer, reason });
             }
             NetEvent::AnchorConnected { conn } => {
                 let peer = conn.peer_id();
@@ -1822,7 +1948,17 @@ impl Node {
             )
             .await
         };
-        let Ok(outcome) = outcome else { return };
+        let outcome = match outcome {
+            Ok(o) => o,
+            // **Never dropped.** A responder whose exchange failed said nothing, so the joiner's
+            // `Unreachable` was the only trace of it and it names the wrong side.
+            Err(e) => {
+                let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                    reason: format!("answering {}: {e}", crate::node::network::short_id(peer)),
+                });
+                return;
+            }
+        };
         // The join proved this identity; admit it as an author so its entries are
         // accepted (reading still needs consent).
         let admitted = match (self.profile.as_ref(), self.channels.get(&channel_id)) {
@@ -1875,8 +2011,18 @@ impl Node {
             let endpoints = endpoints.clone();
             self.last_upgrade.insert(peer, self.now());
             tokio::spawn(async move {
-                if let Some(better) = net.upgrade(peer, &endpoints).await {
-                    let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
+                match net.upgrade(peer, &endpoints).await {
+                    Ok(better) => {
+                        let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
+                    }
+                    // Only a ladder that tried every rung and got nowhere means "still relayed".
+                    // `upgrade` also returns `Err` for "already direct" and "nothing to upgrade",
+                    // which were a silently-fine `None` before this change; reporting those as
+                    // `StillRelayed` would say something false about a peer that is not relayed.
+                    Err(crate::error::Error::LadderExhausted(reason)) => {
+                        let _ = tx.send(NetEvent::UpgradeFailed { peer, reason }).await;
+                    }
+                    Err(_) => {}
                 }
             });
         }
@@ -1935,8 +2081,18 @@ impl Node {
             let net = Arc::clone(&net);
             let tx = self.net_tx.clone();
             tokio::spawn(async move {
-                if let Some(better) = net.upgrade(peer, &endpoints).await {
-                    let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
+                match net.upgrade(peer, &endpoints).await {
+                    Ok(better) => {
+                        let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
+                    }
+                    // Only a ladder that tried every rung and got nowhere means "still relayed".
+                    // `upgrade` also returns `Err` for "already direct" and "nothing to upgrade",
+                    // which were a silently-fine `None` before this change; reporting those as
+                    // `StillRelayed` would say something false about a peer that is not relayed.
+                    Err(crate::error::Error::LadderExhausted(reason)) => {
+                        let _ = tx.send(NetEvent::UpgradeFailed { peer, reason }).await;
+                    }
+                    Err(_) => {}
                 }
             });
         }
@@ -4089,6 +4245,9 @@ async fn admit_board_records(
 
 fn fault_of(e: &Error) -> Fault {
     match e {
+        // A ladder that tried every rung and got nowhere is unreachable, not an internal
+        // fault: falling through to `Internal` made the join walk stop after one responder.
+        Error::LadderExhausted(_) => Fault::Unreachable,
         Error::Profile("no identity in this profile") => Fault::NoIdentity,
         Error::Profile("identity already exists in this profile") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,

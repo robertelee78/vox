@@ -813,6 +813,17 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     mismatches still map to `0x01`. Recorded in ADR-008's Implementation notes with the registry table
     updated; the behaviour is unchanged, the diagnosis is true.
 
+- **The node says when it could not answer, and names what it was doing (2026-09-23).** The actor is
+  the only writer of channel state, so whatever it awaits stops the node answering *everyone*, and a
+  request arriving in that window waits out its own patience and reports this node as unreachable
+  when it was merely busy — indistinguishable, from outside, from a fault at the far end.
+  `NodeEvent::Stalled { what, millis }` is emitted when handling one command or one inbound event
+  exceeds `STALL_BUDGET`, and `what` comes from an **exhaustive** match over both enums. An earlier
+  version of that match had a `_` arm reporting "inbound network work", which named no event and so
+  identified nothing: it reported a twenty-second stall without saying which piece of work could not
+  be interrupted. The first thing it named once exhaustive was publishing a room's records to an
+  anchor that had gone quiet.
+
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
 ADR-013, ADR-015.

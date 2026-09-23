@@ -91,6 +91,15 @@ const T_SHUTDOWN: u64 = 25;
 /// this additive tag from colliding with one a concurrently-developed branch assigns. The
 /// tag space is sparse and `u64`; there is nothing to save by packing it.
 const T_REACH_WITHDRAWN: u64 = 1711;
+/// Additive, and deliberately away from the sequential range (see above).
+const T_STILL_RELAYED: u64 = 1713;
+/// Additive, and deliberately away from the sequential range (see above).
+const T_JOIN_FAILED: u64 = 1714;
+/// Additive, and deliberately away from the sequential range (see above).
+const T_STALLED: u64 = 1715;
+
+/// `NodeEvent::PeerUnreachable`.
+const T_PEER_UNREACHABLE: u64 = 1716;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -814,6 +823,18 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .text(service_tag)
                 .text(&local.to_string());
         }
+        NodeEvent::Stalled { what, millis } => {
+            e.array(3).uint(T_STALLED).text(what).uint(*millis);
+        }
+        NodeEvent::JoinFailed { reason } => {
+            e.array(2).uint(T_JOIN_FAILED).text(reason);
+        }
+        NodeEvent::StillRelayed { peer, reason } => {
+            e.array(3).uint(T_STILL_RELAYED).bytes(peer).text(reason);
+        }
+        NodeEvent::PeerUnreachable { peer, why } => {
+            e.array(3).uint(T_PEER_UNREACHABLE).bytes(peer).text(why);
+        }
         NodeEvent::ReachWithdrawn { channel_id, port } => {
             e.array(3)
                 .uint(T_REACH_WITHDRAWN)
@@ -1044,6 +1065,35 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .map_err(|_| Error::MalformedBundle("ipc tag"))?
                 .to_owned(),
             local: addr(d)?,
+        },
+        (T_STALLED, 3) => NodeEvent::Stalled {
+            what: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc stall what"))?
+                .to_owned(),
+            millis: d
+                .uint()
+                .map_err(|_| Error::MalformedBundle("ipc stall ms"))?,
+        },
+        (T_JOIN_FAILED, 2) => NodeEvent::JoinFailed {
+            reason: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc join reason"))?
+                .to_owned(),
+        },
+        (T_STILL_RELAYED, 3) => NodeEvent::StillRelayed {
+            peer: digest(d)?,
+            reason: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc relayed reason"))?
+                .to_owned(),
+        },
+        (T_PEER_UNREACHABLE, 3) => NodeEvent::PeerUnreachable {
+            peer: digest(d)?,
+            why: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc unreachable reason"))?
+                .to_owned(),
         },
         (T_REACH_WITHDRAWN, 3) => NodeEvent::ReachWithdrawn {
             channel_id: digest(d)?,

@@ -170,7 +170,12 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
 /// identity to hold anybody to, so the only defence is that an unfinished attempt is cheap
 /// and finite. Generous enough for a slow or relayed path — the ADR-012 ladder's rung 4 is a
 /// circuit through an anchor — and short enough that abandoned attempts do not accumulate.
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long one inbound handshake may take before it is abandoned.
+///
+/// Public so a proof about handshake stalling can derive its own bound from this instead of
+/// restating it: a gate that hard-codes 30 seconds keeps passing when this constant moves,
+/// which is the failure mode ADR-018 §8 exists to prevent.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl VoxEndpoint {
     /// Bind a Vox endpoint to `addr`, authenticating as `signer`'s identity.

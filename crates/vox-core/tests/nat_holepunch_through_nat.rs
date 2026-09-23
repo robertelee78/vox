@@ -550,7 +550,7 @@ fn two_nated_nodes_reach_each_other_through_a_coordinator_then_upgrade_to_a_punc
             "the coordinator gained no connection of its own"
         );
         // A second upgrade has nothing to do: the path is already the best there is.
-        assert!(s.a.upgrade(b_id, &EndpointList::default()).await.is_none());
+        assert!(s.a.upgrade(b_id, &EndpointList::default()).await.is_err());
     });
 }
 
@@ -630,7 +630,7 @@ fn two_nodes_behind_symmetric_nats_reach_each_other_through_a_relay() {
             )
             .await
             .expect("upgrade did not hang")
-            .is_none(),
+            .is_err(),
             "a symmetric NAT defeats the punch; the relay stays"
         );
         assert_eq!(s.a.manager().retiring_count(), 0);

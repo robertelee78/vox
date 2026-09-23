@@ -212,6 +212,16 @@ fn a_relayed_pair_finds_a_direct_path_once_one_becomes_possible() {
             }
         })
         .await;
+        // The node knows why it is still relayed; make it say so before the assertion fires.
+        if upgraded.is_err() {
+            while let Ok(Some(e)) =
+                tokio::time::timeout(Duration::from_millis(200), alice.next_event()).await
+            {
+                if let NodeEvent::StillRelayed { reason, .. } = e {
+                    eprintln!("[why] alice stayed relayed: {reason}");
+                }
+            }
+        }
         assert!(
             upgraded.is_ok(),
             "alice is still relayed through the anchor a full retry interval after a direct \
