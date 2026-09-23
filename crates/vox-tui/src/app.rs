@@ -664,11 +664,24 @@ pub fn run_daemon(
                         passphrase: Secret::new(pass.as_bytes().to_vec()),
                     })
                     .await;
-                if !outcome.is_done() {
-                    return Err(AppError::Usage(format!(
-                        "could not open that room: {outcome:?}"
-                    )));
+                if outcome.is_done() {
+                    continue;
                 }
+                // **Say so; do not exit.** This branch used to `return Err(..)`, which
+                // killed the daemon over one bad room line — and `7ff0f56` claimed to have
+                // fixed that while leaving this return in place. The case that proves it
+                // is narrow and is exactly the one that was never run: a line whose first
+                // word *does* prefix a room id but whose remainder is the wrong
+                // passphrase. A line that resolves nothing takes the whole-line path
+                // below, which never had a fatal return, which is why four verified cases
+                // all passed and the claim was still false.
+                //
+                // A room that did not open stays closed, which is the state it was already
+                // in, and the summary at the end of this loop names every room still shut.
+                // An operator who mistyped one passphrase wants the other rooms served and
+                // a line telling them which one failed — not a process that refuses to
+                // start.
+                eprintln!("vox daemon: could not open that room: {outcome:?}");
                 continue;
             }
             // Neither form opened anything. Nothing to undo — a room this did not open
