@@ -349,17 +349,58 @@ pub fn run_node(
                     // Drained without blocking: this arm also has an anchors file to
                     // write, and a status line nobody reads is better than a tick nobody
                     // reaches.
+                    // **Everything that explains a failure, not only a stall.** An anchor is the
+                    // one node in a room that nobody is watching, and it is the hop a message takes
+                    // when two members are never online together. Reporting only `Stalled` meant an
+                    // anchor that could not reach a member, or refused a join, or sat on an entry it
+                    // had just been handed, said nothing at all — and the room simply looked quiet.
                     while let Some(item) = stalls.try_next() {
-                        if let vox_core::node::actor::EventStreamItem::Event(
-                            vox_core::node::api::NodeEvent::Stalled { what, millis },
-                        ) = item
-                        {
-                            // The one thing an operator cannot see from outside: the node
-                            // is up, listening, and answering nobody.
-                            eprintln!(
-                                "vox node: BUSY {millis}ms — {what} — nobody could be \
-                                 answered while this ran"
-                            );
+                        match item {
+                            vox_core::node::actor::EventStreamItem::Event(ev) => match ev {
+                                // The one thing an operator cannot see from outside: the node is
+                                // up, listening, and answering nobody.
+                                vox_core::node::api::NodeEvent::Stalled { what, millis } => {
+                                    eprintln!(
+                                        "vox node: BUSY {millis}ms — {what} — nobody could be \
+                                         answered while this ran"
+                                    );
+                                }
+                                vox_core::node::api::NodeEvent::PeerUnreachable { peer, why } => {
+                                    eprintln!(
+                                        "vox node: could not reach {} — {why}",
+                                        crate::tunnel_cli::short_id_of(&peer)
+                                    );
+                                }
+                                vox_core::node::api::NodeEvent::JoinFailed { reason } => {
+                                    eprintln!("vox node: a join did not complete — {reason}");
+                                }
+                                vox_core::node::api::NodeEvent::StillRelayed { peer, reason } => {
+                                    eprintln!(
+                                        "vox node: still relayed to {} — {reason}",
+                                        crate::tunnel_cli::short_id_of(&peer)
+                                    );
+                                }
+                                vox_core::node::api::NodeEvent::Synced {
+                                    channel_id,
+                                    applied,
+                                    ..
+                                } => {
+                                    // Not a failure — but on an anchor it is the whole job, and
+                                    // seeing it arrive is how "the anchor has it but nobody else
+                                    // does" becomes distinguishable from "nobody sent it".
+                                    if applied > 0 {
+                                        eprintln!(
+                                            "vox node: took {applied} entr{} for room {}",
+                                            if applied == 1 { "y" } else { "ies" },
+                                            crate::tunnel_cli::short_id_of(&channel_id)
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            },
+                            vox_core::node::actor::EventStreamItem::Lagged(n) => {
+                                eprintln!("vox node: fell behind its own events by {n}");
+                            }
                         }
                     }
                 }

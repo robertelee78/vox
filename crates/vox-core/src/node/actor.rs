@@ -107,6 +107,48 @@ const UPGRADE_RETRY: Duration = Duration::from_secs(60);
 /// ordinary work never reports, and short enough that a stall a person would notice always does.
 const STALL_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long the actor will spend *setting up* one sync before abandoning it.
+///
+/// **The actor may not block on the wire, and this is the interim bound while the setup moves into
+/// its own slot.** Deciding to reconcile a room with a peer is cheap; the two steps before the
+/// session are not — reading that peer's board (`fetch_channel`) and opening the sync stream
+/// (`open_sync`) are both round trips, and both were bounded only by `SYNC_FRAME_TIMEOUT`. So one
+/// peer that went quiet mid-setup stopped the one task allowed to write channel state, for twenty
+/// seconds, and the node answered nobody — including the pushes it had just marked owed.
+///
+/// Measured on an anchor, which is the node it hurts most:
+///
+/// ```text
+/// vox node: took 1 entry for room 4yxukqstptuq
+/// vox node: BUSY 20033ms — filing a sync that finished — nobody could be answered
+/// ```
+///
+/// Safe to bound, unlike a publish: both steps are best-effort and their failure already means
+/// "skip this one, the schedule will come round again". Nothing downstream needs them to have
+/// completed, so a cut-short setup costs a tick where a cut-short publish lost a record.
+///
+/// This is a bound, not the fix. The fix is for the whole setup to run in a slot and report back
+/// through `NetEvent::SyncDone`, which is the seam that already exists for it.
+/// How many sync setups and sessions may be in flight at once.
+///
+/// **The actor decides; slots do the waiting.** Everything about reconciling a room with a peer that
+/// touches the wire — reading that peer's board, opening the stream, the session itself — runs in one
+/// of these, so the one task allowed to write channel state never waits on a network round trip. It
+/// used to: `fetch_channel` and `open_sync` were awaited inline, bounded only by
+/// `SYNC_FRAME_TIMEOUT`, so a peer that went quiet mid-setup stopped the node for twenty seconds and
+/// it answered nobody — including the pushes it had just marked owed. Measured on an anchor, which is
+/// the node it hurts most because it is the hop a message takes when two members are never online
+/// together:
+///
+/// ```text
+/// vox node: took 1 entry for room 4yxukqstptuq
+/// vox node: BUSY 20033ms — filing a sync that finished — nobody could be answered
+/// ```
+///
+/// Past the cap a sync is **skipped, not queued**: the schedule comes round again, and a queue of
+/// sessions for rooms whose state has since moved on is worse than none.
+const SYNCS_IN_FLIGHT: usize = 16;
+
 /// A short name for what a command was, for the stall report.
 fn command_name(c: &NodeCommand) -> &'static str {
     match c {
@@ -887,6 +929,23 @@ pub struct Node {
     schedules: BTreeMap<Digest32, SyncSchedule>,
     /// Channels with a local append not yet pushed to peers.
     pending_push: std::collections::BTreeSet<Digest32>,
+    /// Slots for sync setups and sessions; see [`SYNCS_IN_FLIGHT`].
+    sync_slots: Arc<tokio::sync::Semaphore>,
+    /// Rooms with a session in flight, so a second one cannot start for the same room.
+    ///
+    /// **This guard is not new, it was lost.** `sync_one`'s own doc still says "while the channel is
+    /// away it is invisible to commands and, usefully, to this function, so a second pass cannot
+    /// start a concurrent session for the same channel", and `start_session` is still titled "take
+    /// the channel out of the actor's map" — that removal *was* the guard. The code now clones the
+    /// `Arc` instead, which is better for commands (they no longer answer `UnknownChannel` mid-sync)
+    /// and silently dropped the protection.
+    ///
+    /// Without it two nodes that reconcile at the same moment deadlock on each other: each holds its
+    /// own room's lock for its initiated session and waits for frames from a peer whose lock is held
+    /// by *its* initiated session. Nothing breaks it but `SYNC_FRAME_TIMEOUT`. Measured as a user, a
+    /// message posted right after a join crossed in 20s or 40s — one and two frame timeouts — instead
+    /// of the 0-1s it takes when the rooms are free.
+    syncing: std::collections::BTreeSet<Digest32>,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012).
     record_seq: BTreeMap<Digest32, u64>,
@@ -1013,6 +1072,8 @@ impl Node {
             renew_mappings_at: None,
             schedules: BTreeMap::new(),
             pending_push: std::collections::BTreeSet::new(),
+            sync_slots: Arc::new(tokio::sync::Semaphore::new(SYNCS_IN_FLIGHT)),
+            syncing: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
             prekeys: None,
@@ -1746,11 +1807,36 @@ impl Node {
 
     /// Republish the membership snapshot and peer policy the served board and the
     /// accept path read (see `node::network`). Called whenever channels change.
+    /// Rebuild the network's view of who may do what.
+    ///
+    /// **Never waits for a room's lock, and that is the point.** This took every channel's lock in
+    /// turn, and a sync session holds a room's lock across its network waits — up to
+    /// `SYNC_FRAME_TIMEOUT` — so a peer that went quiet mid-exchange stopped this function, and with
+    /// it the one task allowed to write channel state. Measured on an anchor, which is the node this
+    /// hurts most because it is the hop a message takes when two members are never online together:
+    ///
+    /// ```text
+    /// vox node: took 1 entry for room 4yxukqstptuq
+    /// vox node: BUSY 20033ms — filing a sync that finished — nobody could be answered
+    /// ```
+    ///
+    /// Twenty seconds and change, which is that frame timeout to the millisecond. During it the
+    /// anchor could not act on the very entries it had just taken, so a message that had reached the
+    /// anchor never reached the other member and the room looked quiet. This is a **view**: it is
+    /// rebuilt on every tick and on every piece of network work, so abandoning one attempt costs a
+    /// tick and nothing else.
+    ///
+    /// Abandoned whole rather than in part. A policy assembled from the rooms that happened to be
+    /// free would be missing members, and this policy is what authorizes streams — a partial one
+    /// would refuse a peer that is perfectly entitled. The previous policy is complete and at most
+    /// one tick stale, which is the safe side of that trade.
     async fn refresh_network_view(&self) {
         let Some(net) = self.net.as_ref() else { return };
         let mut policy = PeerPolicy::new();
         for (cid, shared) in &self.channels {
-            let ch = shared.lock().await;
+            let Ok(ch) = shared.try_lock() else {
+                return; // busy: a session holds it. Keep the policy we have; the tick retries.
+            };
             let members: BTreeMap<Digest32, CompositePublicKey> = ch
                 .author_keys()
                 .into_iter()
@@ -1763,7 +1849,9 @@ impl Node {
         // board and streams are concerned (M15.2b): their records verify, and they may
         // open what a member may.
         for (cid, state) in &self.anchored {
-            let st = state.lock().await;
+            let Ok(st) = state.try_lock() else {
+                return; // same: an anchored room mid-sync must not stop the actor.
+            };
             let members: BTreeMap<Digest32, CompositePublicKey> = st
                 .author_keys()
                 .into_iter()
@@ -1852,8 +1940,34 @@ impl Node {
                 channel_id,
                 outcome,
             } => {
+                self.syncing.remove(&channel_id);
                 self.refresh_network_view().await;
                 if let Ok(o) = outcome {
+                    // **Event, not interval.** Propagation was event-driven in one direction only:
+                    // an append here pushed at once, but a sync that *brought entries in* marked
+                    // nothing, so this node sat on them until its own `SYNC_INTERVAL_SECS`. For an
+                    // anchor that is the entire job undone — it holds the log for whoever is away and
+                    // then forwards it a half-minute late. End to end the worst case was 30s to reach
+                    // the anchor plus 30s for the next member to pull.
+                    //
+                    // Self-limiting rather than a storm: reconciliation is idempotent, so the peer
+                    // this came from applies nothing on the way back and marks nothing onward.
+                    // The actor-side half of what the slot just did: a session may have admitted
+                    // authors and mirrored records onto this node's board, and both change who may
+                    // reach whom and what the anchors should hold. `learn_members` used to do this
+                    // inline, which is how a round trip ended up on the single writer.
+                    //
+                    // **Only when the session actually brought something in**, which is the guard
+                    // the original had (`if learned > 0`, `if gained > 0`) and I dropped when moving
+                    // this out. Without it the actor did a publish round trip after *every* sync,
+                    // and syncs are frequent: measured, that turned a 0-1s crossing into 20s in
+                    // seven runs of ten while removing the losses. Losses gone is the right trade;
+                    // paying a publish per sync for it is not.
+                    if o.applied > 0 {
+                        self.note_local_append(&channel_id);
+                        self.refresh_reachers().await;
+                        self.publish_channel_to_anchors(&channel_id).await;
+                    }
                     if o.rendered > 0 || o.governance > 0 {
                         let _ = self.event_tx.send(NodeEvent::Synced {
                             channel_id,
@@ -3066,6 +3180,8 @@ impl Node {
             return false;
         }
         let mut ran = false;
+        // Which channels a local-append push actually got out. Everything else stays owed.
+        let mut pushed: std::collections::BTreeSet<Digest32> = std::collections::BTreeSet::new();
         for (peer, trigger) in due {
             if net.manager().existing(&peer).is_none() {
                 continue;
@@ -3078,18 +3194,57 @@ impl Node {
             // anchors, which keep the log for whoever is away (M15.2b).
             let peer_is_anchor = self.anchor_ids.contains(&peer);
 
+            // **Learn who this peer is before deciding we share nothing with it.**
+            //
+            // The filter below asks `is_author(&peer)`, and the thing that admits a newly joined
+            // peer as an author — `learn_members`, reading the bundle records off this node's own
+            // board — lives inside `sync_one`, which only runs for channels that already passed the
+            // filter. So a peer that has just joined is skipped for having no entries, by the node
+            // holding the evidence that it belongs, and the only code that would fix that sits
+            // behind the check it is meant to satisfy. `learn_members`' own comment says reading
+            // membership from the board "is a precondition for reconciling at all"; it was not one.
+            //
+            // The consequence, measured as a user: a message posted seconds after somebody joins is
+            // **lost, not delayed** — the sender skips them, the connect trigger is consumed, and
+            // the next chance is a full `SYNC_INTERVAL_SECS`. With the daemons settled, twelve posts
+            // crossed twelve times in 0-1s; posting immediately after a join lost one in six even
+            // after the owed-push fix below.
+            //
+            // Done only on a connect, not every tick: this reads the board and admits authors, which
+            // is exactly the work a new connection warrants and would be waste on the interval.
             for (cid, shared) in &self.channels {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
                     continue;
                 }
-                if peer_is_anchor || shared.lock().await.is_author(&peer) {
+                // **A fresh connection is never filtered out.**
+                //
+                // The `is_author` test below is the right question on an interval pass and the wrong
+                // one here: a peer that has *just joined* is by definition not yet an author in this
+                // node's view, so the node holding the evidence that it belongs skipped it for not
+                // belonging. Worse, the code that admits it — `learn_members`, reading the bundle
+                // records off this node's own board — runs inside `sync_one`, which only executes for
+                // channels that already passed this filter. The precondition sat behind the check it
+                // was the precondition for.
+                //
+                // So on a connect, reconcile every open channel with the peer and let the ADR-008
+                // session decide: it verifies authorship per entry and hard-fails on an author it
+                // cannot verify, which is a real answer. Silently skipping is not — measured as a
+                // user, a message posted seconds after somebody joined was lost, not delayed.
+                if trigger == SyncTrigger::Connected
+                    || peer_is_anchor
+                    || shared.lock().await.is_author(&peer)
+                {
                     channels.push(*cid);
                 }
             }
             // An anchor reconciles every channel it keeps with each of that channel's
             // known members.
             for (cid, state) in &self.anchored {
-                if trigger == SyncTrigger::LocalAppend {
+                // An anchored room takes part in a push: this skipped them on the reasoning that an
+                // anchor never appends locally — true, and beside the point, because an anchor is
+                // exactly the node that must forward what it was just given. The push trigger is now
+                // set by entries arriving as well as by a local append.
+                if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
                     continue;
                 }
                 if state.lock().await.is_author(&peer) {
@@ -3099,77 +3254,32 @@ impl Node {
             for channel_id in channels {
                 if self.sync_one(&channel_id, peer).await {
                     ran = true;
+                    if trigger == SyncTrigger::LocalAppend {
+                        pushed.insert(channel_id);
+                    }
                 }
             }
             if let Some(schedule) = self.schedules.get_mut(&peer) {
                 schedule.note_synced(now);
             }
         }
-        self.pending_push.clear();
+        // **Keep what did not go out.** This cleared unconditionally, which discarded the intent to
+        // push an append whenever it had not actually been pushed — and the ordinary case is a peer
+        // that has just joined: `note_local_append` marks "every peer's schedule due", but a peer
+        // whose `NetEvent::Connected` the actor has not handled yet **has no schedule to mark**, so
+        // nothing was owed to it and the entry was dropped rather than delayed. It then waited for
+        // that peer's own `SYNC_INTERVAL_SECS`, and if that raced too, longer.
+        //
+        // Measured as a user: with the daemons settled, twelve posts crossed twelve times in 0-1s;
+        // the proof that posts seconds after joining lost one in three.
+        //
+        // Note what is deliberately NOT changed: `note_synced` above still runs whether or not
+        // anything went out. Making it conditional looks right and is wrong — it leaves the peer due
+        // every tick, so one that cannot sync is retried once a second, each attempt taking the
+        // room's lock. Measured: that took the same proof from 4 of 6 to 3 of 8. The backoff must
+        // hold on failure; what must survive is the work owed, which is this line.
+        self.pending_push.retain(|cid| !pushed.contains(cid));
         ran
-    }
-
-    /// Admit every member whose prekey bundle is on `peer`'s board for this channel.
-    ///
-    /// This is not optional politeness: an ADR-008 session **hard-fails** on the first
-    /// entry from an author this node has not admitted, because it cannot verify it. A
-    /// member that joined after us is exactly such an author, and its full composite
-    /// key is on the board (ADR-016) — so learning the current membership from the
-    /// board is a precondition for reconciling at all, and doing it here means a node
-    /// never has to be told out of band that someone new arrived.
-    async fn learn_members(&mut self, channel_id: &Digest32, peer: Digest32) -> usize {
-        let Some(net) = self.net.as_ref().map(Arc::clone) else {
-            return 0;
-        };
-        let Some(conn) = net.manager().existing(&peer) else {
-            return 0;
-        };
-        let epoch = match self.channels.get(channel_id) {
-            Some(shared) => shared.lock().await.epoch(),
-            None => return 0,
-        };
-        let Ok(set) = net.fetch_channel(&conn, channel_id, epoch).await else {
-            return 0;
-        };
-        let now = self.now();
-        let mut learned = 0usize;
-        if let (Some(profile), Some(shared)) = (
-            self.profile.as_ref(),
-            self.channels.get(channel_id).map(Arc::clone),
-        ) {
-            let mut channel = shared.lock().await;
-            learned = admit_board_records(
-                &mut channel,
-                profile.store(),
-                &set.bundles,
-                ChannelState::MAX_ADMISSIONS_PER_SWEEP,
-                now,
-            )
-            .await;
-        }
-        if learned > 0 {
-            self.refresh_reachers().await;
-            self.refresh_network_view().await;
-        }
-        // What the peer's board holds is filed on this node's own, so its board
-        // carries the whole membership it knows; whenever that gains a record, the
-        // anchors — which learn members only from members (M15.2a) — get a mirror.
-        // Bundles go first: they carry the key an address record is verified with.
-        let mut gained = 0usize;
-        for wire in set
-            .bundles
-            .iter()
-            .map(MemberBundleRecord::to_wire)
-            .chain(set.members.iter().map(RendezvousRecord::to_wire))
-        {
-            if net.publish_local(&wire).is_ok() {
-                gained += 1;
-            }
-        }
-        if gained > 0 {
-            self.publish_channel_to_anchors(channel_id).await;
-        }
-        learned
     }
 
     /// Start reconciling one channel with one peer: learn who else has joined, then
@@ -3184,34 +3294,106 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return false;
         };
-        if net.manager().existing(&peer).is_none() {
-            return false;
-        }
-        // Learn who else has joined before reconciling, or the first entry from a
-        // newer member kills the session (ADR-008 Implementation notes).
-        let epoch = if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
-            self.learn_members(channel_id, peer).await;
-            shared.lock().await.epoch()
-        } else if self.anchored.contains_key(channel_id) {
-            // The anchor's authors come from its board, not from a peer's.
-            self.refresh_anchored_authors(channel_id).await;
-            match self.anchored.get(channel_id) {
-                Some(state) => state.lock().await.epoch(),
-                None => return false,
-            }
-        } else {
-            return false;
-        };
         let Some(conn) = net.manager().existing(&peer) else {
             return false;
         };
-        let handle = tokio::runtime::Handle::current();
-        let transport =
-            match crate::node::syncstream::open_sync(&conn, handle, channel_id, epoch).await {
-                Ok(t) => t,
-                Err(_) => return false,
+        let Some(store) = self.log_store() else {
+            return false;
+        };
+        let target = match (
+            self.channels.get(channel_id).map(Arc::clone),
+            self.anchored.get(channel_id).map(Arc::clone),
+        ) {
+            (Some(shared), _) => SessionTarget::Channel(shared),
+            (None, Some(state)) => SessionTarget::Anchored(state),
+            (None, None) => return false,
+        };
+        // An anchor's authors come from its own board, which is local: cheap, and it has to happen
+        // before the session so the anchor can verify what arrives.
+        if matches!(target, SessionTarget::Anchored(_)) {
+            self.refresh_anchored_authors(channel_id).await;
+        }
+        if self.syncing.contains(channel_id) {
+            return false; // a session already has this room; a second would deadlock against it
+        }
+        let Ok(slot) = Arc::clone(&self.sync_slots).try_acquire_owned() else {
+            return false; // past the cap: skipped, not queued. The schedule comes round again.
+        };
+        self.syncing.insert(*channel_id);
+        let admit_store = self.profile.as_ref().map(Profile::store_handle);
+        let cid = *channel_id;
+        let now = self.now();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            // 1. Learn who else has joined, or the first entry from a newer member kills the session
+            //    (ADR-008). A round trip, so it belongs here and not on the actor.
+            let epoch = match &target {
+                SessionTarget::Channel(shared) => {
+                    let known = shared.lock().await.epoch();
+                    if let Some(pstore) = admit_store {
+                        if let Ok(set) = net.fetch_channel(&conn, &cid, known).await {
+                            {
+                                let mut ch = shared.lock().await;
+                                let _ = admit_board_records(
+                                    &mut ch,
+                                    &pstore,
+                                    &set.bundles,
+                                    ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+                                    now,
+                                )
+                                .await;
+                            }
+                            // What the peer's board holds is filed on this node's own, so its board
+                            // carries the whole membership it knows. Bundles go first: they carry
+                            // the key an address record is verified with (M15.2a). Mirroring to the
+                            // anchors follows on the actor when `SyncDone` lands, because that needs
+                            // channel state.
+                            for wire in set
+                                .bundles
+                                .iter()
+                                .map(MemberBundleRecord::to_wire)
+                                .chain(set.members.iter().map(RendezvousRecord::to_wire))
+                            {
+                                let _ = net.publish_local(&wire);
+                            }
+                        }
+                    }
+                    shared.lock().await.epoch()
+                }
+                SessionTarget::Anchored(state) => state.lock().await.epoch(),
             };
-        self.start_session(*channel_id, transport);
+            // 2. Open the stream. Also a round trip.
+            let handle = tokio::runtime::Handle::current();
+            let Ok(transport) =
+                crate::node::syncstream::open_sync(&conn, handle, &cid, epoch).await
+            else {
+                return;
+            };
+            // 3. Run the session. `blocking_lock` is the sanctioned way to take a tokio mutex off a
+            //    blocking thread; anything else wanting this room waits for the session rather than
+            //    finding it missing.
+            let joined = tokio::task::spawn_blocking(move || {
+                let mut t = transport;
+                match target {
+                    SessionTarget::Channel(shared) => {
+                        shared.blocking_lock().sync_over(&store, &mut t, now)
+                    }
+                    SessionTarget::Anchored(state) => {
+                        state.blocking_lock().sync_over(&store, &mut t, now)
+                    }
+                }
+            })
+            .await;
+            if let Ok(outcome) = joined {
+                let _ = tx
+                    .send(NetEvent::SyncDone {
+                        channel_id: cid,
+                        outcome,
+                    })
+                    .await;
+            }
+        });
         true
     }
 
@@ -3323,7 +3505,13 @@ impl Node {
         if !matches_epoch {
             return;
         }
+        if self.syncing.contains(&channel_id) {
+            // Answering while our own session holds this room is the other half of the deadlock.
+            // Dropping the stream tells the peer at once; its schedule brings it back.
+            return;
+        }
         let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
+        self.syncing.insert(channel_id);
         self.start_session(channel_id, transport);
     }
 

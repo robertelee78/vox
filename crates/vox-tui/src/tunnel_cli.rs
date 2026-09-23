@@ -689,6 +689,11 @@ fn say_if_it_explains_a_failure(ev: &NodeEvent) {
     }
 }
 
+/// [`short`], reachable from the other CLI modules that report a peer.
+pub(crate) fn short_id_of(d: &Digest32) -> String {
+    short(d)
+}
+
 /// The first 12 characters of a fingerprint, as `vox` shows ids on screen.
 fn short(d: &Digest32) -> String {
     b32_encode(d).chars().take(12).collect()
