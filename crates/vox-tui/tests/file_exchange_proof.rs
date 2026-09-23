@@ -33,8 +33,10 @@ mod watchdog;
 
 use std::process::{Child, Command, Stdio};
 
+use std::sync::{Arc, Mutex};
 use vox_core::node::actor::{Node, NodeHandle};
 use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
+
 use vox_core::node::paths::Paths;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
@@ -44,14 +46,50 @@ fn secret(s: &str) -> Secret {
     Secret::new(s.as_bytes().to_vec())
 }
 
-/// A long-running child, killed however the test ends.
-struct Running(Child);
+/// A long-running child, killed however the test ends, with its pipes drained.
+struct Running(Child, Arc<Mutex<String>>);
+
+impl Running {
+    /// Whatever the child has said so far, for an assertion message.
+    #[allow(dead_code)]
+    fn said(&self) -> String {
+        self.1.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+}
 
 impl Drop for Running {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Drain a long-lived child's pipes on threads, into a string the test can print.
+///
+/// **A piped stream nobody reads is a fuse, not a convenience.** The pipe buffer is
+/// 64 KiB; when it fills, the child blocks on `write` and stops making progress, and
+/// that looks exactly like a hang with no output to explain it. It was harmless only
+/// while these children said nothing — `vox daemon` measured **0 bytes** of stderr over
+/// a 40s run, which is the reporting blindness this codebase has been fixing all week.
+/// Now that a node reports unreachable peers, refused publishes and stalls, the same
+/// run produces kilobytes, and at ~140 B/s a 64 KiB pipe fills in about eight minutes.
+/// So the bytes that were the hazard become the diagnosis instead.
+fn drain(stream: Option<impl std::io::Read + Send + 'static>, into: &Arc<Mutex<String>>) {
+    let Some(mut stream) = stream else { return };
+    let sink = Arc::clone(into);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if let Ok(mut s) = sink.lock() {
+                        s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
+                }
+            }
+        }
+    });
 }
 
 struct Agent {
@@ -79,7 +117,7 @@ impl Agent {
     }
 
     fn spawn(&self, args: &[&str]) -> Running {
-        Running(
+        let mut child = {
             Command::new(VOX)
                 .args(args)
                 .env("VOX_DATA_DIR", &self.data)
@@ -89,8 +127,12 @@ impl Agent {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .expect("spawn vox"),
-        )
+                .expect("spawn vox")
+        };
+        let said = Arc::new(Mutex::new(String::new()));
+        drain(child.stdout.take(), &said);
+        drain(child.stderr.take(), &said);
+        Running(child, said)
     }
 }
 

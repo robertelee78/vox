@@ -17,7 +17,7 @@ use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::nat::multiaddr::Multiaddr;
 use vox_core::nat::reachability::is_routable;
 use vox_core::node::actor::{Bind, Node, NodeConfig, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
+use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome, Secret};
 use vox_core::node::link::{b32_decode, b32_encode, vox_hostname};
 use vox_core::node::paths::Paths;
 
@@ -590,9 +590,7 @@ pub async fn connect(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!(
-            "cannot join: {out:?} — check the address and the passphrase"
-        )));
+        return Err(AppError::Usage(why_a_join_failed(node, out).await));
     }
     let channel_id = loop {
         match node.next_event().await {
@@ -696,6 +694,83 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
             eprintln!("vox: busy {millis}ms — {what} — nobody could be answered");
         }
         _ => {}
+    }
+}
+
+/// Explain a failed join in terms of what actually refused it.
+///
+/// This used to be `"cannot join: {out:?} — check the address and the passphrase"`, and
+/// that sentence was **wrong in the case that matters**. A BASE run of the stranger-join
+/// proof produced it verbatim while Carol held the correct address and the correct
+/// passphrase, for a room that was alive with a member in it: the product sent her to
+/// check the two things that were already right, and said nothing about the one thing
+/// that was not.
+///
+/// `Fault` is a single token with no room for a reason, so the node sends the reason
+/// separately as [`NodeEvent::JoinFailed`] — and the old code returned before ever
+/// reading it. So this drains what the node already took the trouble to say, and only
+/// then falls back to advice, chosen by the fault rather than by guesswork.
+async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
+    // The reason usually lands within a tick; a join that failed has nothing else to
+    // do, so a short bounded drain costs nothing and is the difference between a
+    // diagnosis and a shrug.
+    let mut said: Vec<String> = Vec::new();
+    while let Ok(Some(ev)) =
+        tokio::time::timeout(Duration::from_millis(600), node.next_event()).await
+    {
+        match ev {
+            NodeEvent::JoinFailed { reason } => {
+                said.push(reason);
+                break;
+            }
+            NodeEvent::PeerUnreachable { peer, why } => {
+                said.push(format!("could not reach {} — {why}", short(&peer)));
+            }
+            ref other => say_if_it_explains_a_failure(other),
+        }
+    }
+
+    // House style: one short line saying what happened, then an indented line saying
+    // what to actually do. A paragraph is not a better error message than a sentence —
+    // the first version of this fix was four lines of prose and read like documentation
+    // at exactly the moment somebody is stuck.
+    let advice = match out {
+        Outcome::Failed(Fault::WrongPassphrase) => {
+            "the room passphrase is wrong\n       the address is not in question — this is the passphrase alone"
+        }
+        Outcome::Failed(Fault::BadLink) => {
+            "that address will not parse, or names a room this node cannot use\n       this one IS the address — check you copied all of it"
+        }
+        // **Do not claim the passphrase is fine here.** Nobody answered, so nobody
+        // checked it — a wrong passphrase against an offline room reaches exactly this
+        // branch. The first version of this fix said "NOT the address or the
+        // passphrase", which is the same false confidence as the sentence it replaced,
+        // pointed the other way. Say what was and was not established.
+        Outcome::Failed(Fault::Unreachable) => {
+            "nobody who can answer for this room could be reached\n       so your passphrase was never checked — this is not a verdict on it\n       every member the board knows is offline: ask one to come online, or check\n       `vox node` on the anchor shows more than `1m` for this room"
+        }
+        // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
+        // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
+        // responder, so it is the responder that says no. Leading with "the refusal is
+        // the thing to chase" was true and useless at the one moment a person most
+        // needs a suggestion. Name the likely cause first, without pretending it is the
+        // only one.
+        Outcome::Failed(Fault::Refused) => {
+            "a member answered and refused the join\n       usually the room passphrase is wrong — it is checked by them, not by you,\n       so a typo arrives here rather than as a passphrase error\n       if you are sure of it, they may have revoked you, or be on a different room"
+        }
+        Outcome::Failed(Fault::NotNetworked) => {
+            "this node is not networked, or its identity is locked\n       nothing about the room is in question"
+        }
+        Outcome::Failed(Fault::Locked | Fault::NoIdentity) => {
+            "this profile has no unlocked identity, so there is nobody to join as\n       run `vox id` to make one"
+        }
+        _ => "the node did not say why, which is itself worth reporting",
+    };
+
+    if said.is_empty() {
+        format!("cannot join: {advice}")
+    } else {
+        format!("cannot join: {} — {advice}", said.join("; "))
     }
 }
 
