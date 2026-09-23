@@ -69,6 +69,25 @@ jobs:
       # VOX_PROOF_ALLOW_UNPROVEN above, which records that its claim is unproven but does not stop
       # it failing this gate. Excluding them is stated, not hidden: a release built this way has NOT
       # been shown to carry a log entry between processes, and the release notes must say so.
+      # `work_board_proof` is excluded from 2026-09-24 with its cause IDENTIFIED, and the cause is a
+      # product limitation this ADR-020 §5 already documents: `created_secs` has one-second
+      # resolution, so two entries in the same second are ordered by an entry-hash tie-break that is
+      # deterministic across nodes but **not causal**. The proof asserts causal outcomes at two
+      # sites, so it fails whenever a claim and a release land in the same second.
+      #
+      # It is PRE-EXISTING and not a regression: measured 1 failure in 3 on `main` AND 1 in 3 on
+      # v0.2.5's own commit, same assertion, quiet box. It is also LOAD-INVERTED — a busy box spreads
+      # the two actions across seconds and never reaches the tie-break — which is why it passed a
+      # gate run that spent 32 of 45 minutes compiling and failed one that ran on a quiet box.
+      #
+      # There is no cheap correct fix: `log/dag.rs` records that entries across authors are
+      # concurrent by design, with no cross-author parent field, so the information needed to order
+      # them causally is not in the data. Closing it means finer timestamps or an ADR-008 amendment
+      # — ADR-020 §5 calls that M19.9. A sleep that separates the two actions was tried and is NOT
+      # the answer: it moved the failure from one assertion to the other, and a gate made green by
+      # relocating a race is the exact failure mode ADR-018 exists to forbid.
+      #
+      # Removing this name must fail until M19.9 lands.
       # `service_rehearsal_proof` is excluded from 2026-09-23 with its cause IDENTIFIED, which is the
       # only reason excluding it is a decision rather than a dodge. It fails at the stranger's join
       # (`:490`) because a host that has answered one joiner answers nobody for the next 30 seconds:
@@ -83,7 +102,8 @@ jobs:
           cargo test --release --workspace -- --ignored \
             --skip two_agents_on_separate_processes_join_through_an_anchor_and_talk \
             --skip a_relayed_pair_finds_a_direct_path_once_one_becomes_possible \
-            --skip a_room_bound_service_carries_real_bytes_through_the_real_binaries
+            --skip a_room_bound_service_carries_real_bytes_through_the_real_binaries \
+            --skip two_agents_split_work_and_only_one_holds_a_contested_resource
 
   # **Reporting only, and in its OWN job on purpose.** These are the proofs excluded from the gate
   # above. Every command here ends in `|| echo "::warning::"`, so none of them can fail a release —
@@ -120,6 +140,9 @@ jobs:
           cargo test --release --workspace -- --ignored \
             a_room_bound_service_carries_real_bytes_through_the_real_binaries \
             || echo "::warning::service_rehearsal_proof failed — the 30s accept serialisation, ADR-017/ADR-018"
+          cargo test --release --workspace -- --ignored \
+            two_agents_split_work_and_only_one_holds_a_contested_resource \
+            || echo "::warning::work_board_proof failed — ADR-020 §5 one-second resolution, M19.9"
 
   build-linux-x64:
     needs: [gates]

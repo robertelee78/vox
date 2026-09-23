@@ -365,6 +365,57 @@ Each item is one branch, red→green, with this ADR updated in the same change (
   `anchor → serve`, `serve → connect`, `connect → up`, `up → ssh`. Gate: each of the three known defects
   is reproduced by the harness when its fix is reverted.
 
+## A third, and a gate that asserted a guarantee the model declines to make (2026-09-24)
+
+`work_board_proof::two_agents_split_work_and_only_one_holds_a_contested_resource` is excluded from
+the release gate, by name, with its cause identified. It is worth its own entry because it is the
+**mirror image** of the failure this ADR is mostly about: not a gate that asserts a bug, but a gate
+that asserts a promise the product explicitly does not make.
+
+ADR-020 §5 says it plainly: *"Resolution is deterministic but not causal within one second."*
+`created_secs` has one-second resolution, so two entries in the same second are ordered by an
+entry-hash tie-break — every node computes the same answer, and that answer need not match the order
+things happened in. The proof asserts causal outcomes at two sites: that a later claim **loses**
+(step 3), and that a fresh claim **succeeds** after a release (step 4). Both fail whenever the two
+actions land in the same second.
+
+**Pre-existing, and measured on both arms rather than assumed:**
+
+| tree | result |
+|---|---|
+| `main` (tonight's 8 commits) | 1 failure in 3, quiet box, loads 6-7 |
+| `3f1cb7d` (v0.2.5, shipped) | 1 failure in 3, quiet box, loads 6-9 |
+
+Same assertion, both arms. So it is not a regression, and the eight commits in between were
+eliminated two ways: by measurement above, and by reading — the accept-loop refactor's serial path is
+statement-for-statement identical, and the other seven touch only docs, the workflow, daemon stdin
+parsing, or rendered strings, none of which can reach claim convergence.
+
+**It is LOAD-INVERTED, which is why it looked new.** A busy box spreads the claim and the release
+across seconds and never reaches the tie-break; a quiet box completes both inside one second and does.
+So it passed a gate run that spent 32 of 45 minutes compiling, and failed one that ran on a quiet box.
+That is the opposite of the usual reading, and it is a reminder that "it only fails when the box is
+loaded" is a hypothesis, not a category.
+
+**Two things were tried and are recorded so they are not re-proposed.**
+
+- *Use the log's DAG order instead of the hash tie-break.* Wrong, and `log/dag.rs` says why: across
+  authors entries are **concurrent by design** — the ADR-008 entry schema has no cross-author parent
+  field, so no happens-before edge exists between two authors' entries. The information needed to
+  order them causally is not in the data. Closing this means finer timestamps or an ADR-008
+  amendment; ADR-020 §5 calls that M19.9.
+- *Sleep past the one-second boundary in the proof.* Tried, and **reverted**. It stopped site 3
+  firing and site 4 started instead — it relocated the race rather than removing it, and 8 further
+  reps then passed, which is worse: a gate made green by moving a race reads as evidence. That is the
+  failure mode §"gates can assert the bug" exists to forbid, arrived at from the other direction.
+
+**What this costs a person, and it belongs in the release notes rather than only here.** Two agents
+claiming the same work item **within one second** can both be wrong about who holds it. Agents are
+fast; two sessions reaching for the same item milliseconds apart is the ordinary case for the feature
+ADR-020 exists to build, not a pathological one. The work board is usable and that limitation is real.
+
+Removing this name must fail until M19.9 lands.
+
 ## Two proofs are excluded from the release gate, by name (2026-09-23)
 
 **Status: open defects, not accepted gaps.** Both are excluded from `release.yml`'s `--ignored` step
