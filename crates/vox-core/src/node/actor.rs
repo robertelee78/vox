@@ -775,6 +775,16 @@ const JOIN_ADDRESS_POLL: Duration = Duration::from_millis(250);
 /// offline — without making an unreachable room expensive to fail against.
 const MAX_JOIN_RESPONDERS: usize = 3;
 
+/// How long one of **our own** records may keep being refused `author is not a channel
+/// member` before the node says so.
+///
+/// Every join starts in that state and leaves it when a member mirrors us onward, so a
+/// shorter grace reports successful joins as problems. Sixty seconds is longer than any
+/// join measured here (12-21s end to end, two machines through a real anchor) and short
+/// enough that a node genuinely stranded off a board is named while somebody is still
+/// looking at the terminal.
+const PUBLISH_REFUSAL_GRACE: u64 = 60;
+
 /// Whether a failed join attempt is worth repeating against a different member.
 ///
 /// **Stated as what must not be retried, not as what may be.** The first version listed the
@@ -1009,6 +1019,29 @@ pub struct Node {
     /// an operator scrolling past `rejected: policy` is how a `not a channel member` goes unread.
     /// Reported on change, like every other line a node says about itself.
     last_publish_refusal: BTreeMap<(Digest32, String), String>,
+    /// When we first saw a still-uncured refusal of one of **our own** records.
+    ///
+    /// A newcomer's own bundle and address are refused `author is not a channel member`
+    /// by every board until a member vouches for it — that is M15.2a working, it is the
+    /// ordinary first step of every join, and it cures itself when the responder mirrors
+    /// us onward. Printing it makes a **successful** join look like a failure: the
+    /// decider's first real cross-machine join showed two of these and then `joined.`,
+    /// which is exactly the "scary message on a working command" that teaches people to
+    /// ignore messages.
+    ///
+    /// So it is not suppressed, it is **deferred by time**: the first sighting is
+    /// remembered silently, and the refusal is reported only if the same board still
+    /// refuses the same record [`PUBLISH_REFUSAL_GRACE`] later. A join that cures itself
+    /// never prints; a node that is genuinely stuck out of a room still does, which is
+    /// the whole reason this event exists.
+    ///
+    /// **Counting publish rounds instead of seconds was tried and was wrong.** A join
+    /// legitimately takes more than one round, so "report it the second time" printed on
+    /// one successful join in three — less noise than before, and still noise on a
+    /// command that worked. Rounds are driven by whatever else the node is doing; the
+    /// question being asked here is "has this cured *yet*", which is a question about
+    /// time.
+    publish_refusal_first_seen: BTreeMap<(Digest32, String), u64>,
     /// Slots for answering inbound joins; see [`JOINS_IN_FLIGHT`].
     join_slots: Arc<tokio::sync::Semaphore>,
     /// The join exchanges running right now.
@@ -1165,6 +1198,7 @@ impl Node {
             pending_push: std::collections::BTreeSet::new(),
             sync_slots: Arc::new(tokio::sync::Semaphore::new(SYNCS_IN_FLIGHT)),
             last_publish_refusal: BTreeMap::new(),
+            publish_refusal_first_seen: BTreeMap::new(),
             join_slots: Arc::new(tokio::sync::Semaphore::new(JOINS_IN_FLIGHT)),
             join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
@@ -1727,6 +1761,22 @@ impl Node {
                     if self.last_publish_refusal.get(&key) == Some(&why) {
                         continue;
                     }
+                    // Our own records, refused because nobody has vouched for us yet: the
+                    // ordinary opening move of a join, which cures when a member mirrors us
+                    // onward. Say nothing until it has had time to cure.
+                    let curable = matches!(kind, "our member bundle" | "our address")
+                        && why.contains("author is not a channel member");
+                    if curable {
+                        let now = self.now();
+                        let first = *self
+                            .publish_refusal_first_seen
+                            .entry(key.clone())
+                            .or_insert(now);
+                        if now.saturating_sub(first) < PUBLISH_REFUSAL_GRACE {
+                            continue;
+                        }
+                    }
+                    self.publish_refusal_first_seen.remove(&key);
                     self.last_publish_refusal.insert(key, why.clone());
                     let _ = self.event_tx.send(NodeEvent::PublishRefused {
                         channel_id: *channel_id,
@@ -1737,6 +1787,7 @@ impl Node {
                 // It went on this time, so the next refusal is news again.
                 None => {
                     self.last_publish_refusal.remove(&key);
+                    self.publish_refusal_first_seen.remove(&key);
                 }
             }
         }
