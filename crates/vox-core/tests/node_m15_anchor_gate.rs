@@ -399,14 +399,24 @@ fn m15_members_never_online_together_converge_through_the_anchor() {
         .await;
         let bob = node(&tmp, "bob", Arc::clone(&b_sock), BootstrapSet::new()).await;
         let bob_fp = bob.view().identity.unwrap().fingerprint;
-        assert!(bob
+        let joined = bob
             .apply(NodeCommand::JoinChannel {
                 link: url,
                 local_name: "team".into(),
                 passphrase: secret("channel passphrase"),
             })
-            .await
-            .is_done());
+            .await;
+        if !joined.is_done() {
+            // `Outcome::Failed(Fault)` is one token with no room for a reason, so ask the node
+            // what it reported alongside it.
+            eprintln!("[why] bob's join outcome: {joined:?}");
+            while let Ok(Some(e)) =
+                tokio::time::timeout(Duration::from_millis(500), bob.next_event()).await
+            {
+                eprintln!("[why]   bob event {e:?}");
+            }
+        }
+        assert!(joined.is_done(), "bob's join must succeed: {joined:?}");
         let _ = wait_for(&bob, |e| match e {
             NodeEvent::Joined { channel_id, .. } if channel_id == cid => Some(()),
             _ => None,
@@ -517,13 +527,37 @@ fn m15_members_never_online_together_converge_through_the_anchor() {
             })
             .await
             .is_done());
-        tokio::time::timeout(TIMEOUT, async {
+        let converged = tokio::time::timeout(TIMEOUT, async {
             while !sees(&bob, cid, "said while you were away") {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
-        .await
-        .expect("Bob converged through the anchor and read what Alice said");
+        .await;
+        if converged.is_err() {
+            // The node knows what it was doing; ask it rather than inferring from a timeout.
+            let v = bob.view();
+            eprintln!(
+                "[why] bob: channels={} open={} relayed_peers={} relaying={} listening={:?}",
+                v.channels.len(),
+                v.open_channels.len(),
+                v.relayed_peers.len(),
+                v.relaying,
+                v.listening
+            );
+            for d in &v.open_channels {
+                eprintln!(
+                    "[why]   room timeline={} members={}",
+                    d.timeline.len(),
+                    d.members.len()
+                );
+            }
+            while let Ok(Some(e)) =
+                tokio::time::timeout(Duration::from_millis(500), bob.next_event()).await
+            {
+                eprintln!("[why]   event {e:?}");
+            }
+        }
+        converged.expect("Bob converged through the anchor and read what Alice said");
 
         for h in [&bob, &carol] {
             assert!(h.apply(NodeCommand::Shutdown).await.is_done());

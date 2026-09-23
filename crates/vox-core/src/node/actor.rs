@@ -433,7 +433,11 @@ pub use crate::time::{system_clock, Clock};
 /// **Every** connection needs this, dialed or accepted: QUIC is symmetric, so a peer
 /// we dialed will open streams back at us — a member we joined through has to be able
 /// to deliver its sender key on the connection *we* opened.
-fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Sender<NetEvent>) {
+fn spawn_stream_loop(
+    net: Arc<NodeNet>,
+    conn: Arc<VoxConnection>,
+    tx: mpsc::Sender<NetEvent>,
+) -> tokio::task::JoinHandle<()> {
     let peer = conn.peer_id();
     // Ask this peer what source address it sees for us (ADR-012 rung 3's observed
     // address), on its own task so the stream loop starts serving immediately. It is
@@ -552,7 +556,7 @@ fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Send
         }
         // This peer's report of our address dies with its connection.
         net.forget_observed(&peer);
-    });
+    })
 }
 
 /// Accept connections and their streams forever, forwarding to the actor the ones
@@ -593,20 +597,49 @@ fn spawn_stream_loop(net: Arc<NodeNet>, conn: Arc<VoxConnection>, tx: mpsc::Send
 fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     tokio::spawn(async move {
         loop {
-            let accepted = net
+            let Some(incoming) = net.manager().accept_incoming().await else {
+                break;
+            };
+            // **Awaited here, not spawned — and that is ADR-017's recorded decision, not an
+            // oversight.** Spawning phase two is quinn's own documented shape and removes a 30s
+            // serialisation window, but ADR-017 "Open proof gap" records it measured: serialised
+            // 40-52s consistently green on `m15_two_clients_behind_symmetric_nats`, split 68s,
+            // 140s and a timeout at 247s. The cause is a cross-connection interaction in circuit
+            // establishment that is still unidentified, and those two NAT gates are its acceptance
+            // test. The unbounded case is already gone either way: this path routes through
+            // `finish_incoming`, which bounds the handshake at `HANDSHAKE_TIMEOUT`.
+            let filed = match net
                 .manager()
-                .accept(crate::transport::quic::Admission::AcceptAnyAuthenticated)
-                .await;
-            match accepted {
-                Ok(Some(conn)) => {
-                    let peer = conn.peer_id();
-                    spawn_stream_loop(Arc::clone(&net), conn, tx.clone());
-                    if tx.send(NetEvent::Connected { peer }).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => continue,
+                .finish_incoming(
+                    incoming,
+                    crate::transport::quic::Admission::AcceptAnyAuthenticated,
+                )
+                .await
+            {
+                Ok(filed) => filed,
+                Err(_) => continue, // an attempt that never authenticated is not an event
+            };
+            let peer = filed.kept.peer_id();
+            // **Both connections get read.** `file_reporting` may have preferred one we already
+            // held and retired the one just accepted. The peer dialled that one and does not know
+            // we preferred another, so it opens streams there — and serving only the kept
+            // connection leaves the retired one transport-alive and application-deaf, which is
+            // worse than the close it replaced.
+            if let Some(also) = filed.also_serve {
+                // Bounded by the retirement grace: `retire_expired` will not close a connection
+                // while anything still holds it, and a stream loop holds its `Arc` for the
+                // connection's life — so an unbounded reader would pin the very thing whose
+                // purpose is to be let go.
+                let grace = Duration::from_secs(net.manager().retire_grace_secs());
+                let loop_task = spawn_stream_loop(Arc::clone(&net), also, tx.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(grace).await;
+                    loop_task.abort();
+                });
+            }
+            spawn_stream_loop(Arc::clone(&net), filed.kept, tx.clone());
+            if tx.send(NetEvent::Connected { peer }).await.is_err() {
+                break;
             }
         }
         let _ = tx.send(NetEvent::Stopped).await;
@@ -1213,6 +1246,19 @@ impl Node {
     /// answering *everyone* — and a request arriving in that window waits out its own patience and
     /// reports this node as unreachable when it was merely busy. That failure is indistinguishable
     /// from a network problem at the far end, which is why the node has to say it about itself.
+    /// Say why a join failed, with what each responder that was tried reported.
+    ///
+    /// The walk may have tried three members and been refused by all of them for three different
+    /// reasons, and all the caller ever got was one `Fault`. This is what makes a retry informed.
+    fn say_why_the_join_failed(&self, why: &[String]) {
+        if why.is_empty() {
+            return;
+        }
+        let _ = self.event_tx.send(NodeEvent::JoinFailed {
+            reason: why.join("; "),
+        });
+    }
+
     fn note_if_stalled(&self, what: &str, since: std::time::Instant) {
         let took = since.elapsed();
         if took < STALL_BUDGET {
@@ -1430,6 +1476,14 @@ impl Node {
         // a channel's members only from a member that vouches for them (M15.2a), and
         // a bundle carries the key an address record is verified against, so bundles
         // go first.
+        //
+        // **Awaited, and it has to be.** Sending this off the actor was tried: it removed the
+        // measured `busy 19416ms — publishing every room at a new address` stall, and cost more
+        // than it saved. Convergence depends on these records actually being on the anchor's board
+        // before the next step reads it, so spawning the send dropped the anchor-convergence gate
+        // from 3 runs in 5 to 1 in 6 and the user-level rehearsal from 10 in 10 to 6 in 8. The
+        // stall is real and now *named* by `NodeEvent::Stalled`; removing it needs the ordering
+        // made explicit, not the wait deleted.
         for wire in net.board_records(channel_id, epoch) {
             let _ = client.put(&wire).await;
         }
@@ -2315,24 +2369,37 @@ impl Node {
         // of work, so an unbounded list would let a room with many members turn one join
         // into minutes of hashing. `MAX_JOIN_RESPONDERS` is the bound, and an attempt is
         // only retried when the fault says *this responder* could not serve it.
-        let candidates: Vec<crate::hash::Digest32> = match parsed.responder {
-            Some(r) => vec![r],
-            None => {
-                let mut all: Vec<crate::hash::Digest32> =
-                    set.members.iter().map(|r| r.author_id).collect();
-                if all.is_empty() {
-                    return Outcome::Failed(Fault::BadLink);
-                }
-                // **Sorted, because the board's order is not an order.** The members come
-                // from a `HashMap`'s `values()`, so which one a join reached was effectively
-                // random — and with no fallback, a room with one offline member failed joins
-                // at a rate nobody could reproduce and a retry could "fix" by chance. Sorting
-                // by fingerprint makes the walk the same every time, so a join that fails
-                // fails for a reason, and a gate can name which member it expects to be
-                // tried first.
-                all.sort_unstable();
-                all.into_iter().take(MAX_JOIN_RESPONDERS).collect()
+        // **Sorted, because the board's order is not an order.** The members come from a
+        // `HashMap`'s `values()`, so which one a join reached was effectively random — and with
+        // no fallback, a room with one offline member failed joins at a rate nobody could
+        // reproduce and a retry could "fix" by chance. Sorting by fingerprint makes the walk the
+        // same every time, so a join that fails fails for a reason.
+        //
+        // **And a pinned responder is a preference, not the only candidate.** That fallback was
+        // added for exactly the reason above and then applied to only one of the two branches: a
+        // link naming a responder still produced a list of length one, so an invite whose author
+        // had since gone offline took the whole room down for the joiner while the anchor sat
+        // there reachable. Measured, with the node naming it rather than a timeout implying it:
+        // `bob's join outcome: Failed(Unreachable)` beside
+        // `Stalled { what: "joining a room", millis: 10005 }` — the whole dial budget spent on
+        // the one peer the link happened to name, and no second attempt.
+        //
+        // The pin is still tried first: whoever minted the link knows who is expected to answer.
+        let candidates: Vec<crate::hash::Digest32> = {
+            let mut all: Vec<crate::hash::Digest32> =
+                set.members.iter().map(|r| r.author_id).collect();
+            all.sort_unstable();
+            let mut ordered = Vec::with_capacity(all.len() + 1);
+            if let Some(r) = parsed.responder {
+                ordered.push(r);
+                all.retain(|m| *m != r);
             }
+            ordered.extend(all);
+            if ordered.is_empty() {
+                return Outcome::Failed(Fault::BadLink);
+            }
+            ordered.truncate(MAX_JOIN_RESPONDERS);
+            ordered
         };
 
         // The pre-join record does not depend on which member answers, so it is built once
@@ -2379,6 +2446,8 @@ impl Node {
         if let Err(e) = announce(&board, &prejoin_wire).await {
             return Outcome::Failed(fault_of(&e));
         }
+
+        let mut why: Vec<String> = Vec::new();
 
         let mut last_fault = Fault::Unreachable;
         let mut joined_outcome = None;
@@ -2447,7 +2516,17 @@ impl Node {
                     }
                     Err(e) => {
                         last_fault = fault_of(&e);
+                        // **Every rung's verdict, not the fault token.** `Outcome::Failed(Fault)` is
+                        // one word with no room for a reason, so a join that could not be carried
+                        // reported `Unreachable` and nothing else — and "that member is offline",
+                        // "no helper would relay" and "the board has not caught up" are three
+                        // different problems that all render as that one word.
+                        why.push(format!(
+                            "{}: {e}",
+                            crate::node::network::short_id(responder)
+                        ));
                         if !worth_another_responder(last_fault) {
+                            self.say_why_the_join_failed(&why);
                             return Outcome::Failed(last_fault);
                         }
                         continue;
@@ -2484,6 +2563,7 @@ impl Node {
             }
         }
         let Some((joined, responder, conn)) = joined_outcome else {
+            self.say_why_the_join_failed(&why);
             return Outcome::Failed(last_fault);
         };
 
@@ -3797,10 +3877,18 @@ impl Node {
             listener,
             resolver,
             dialer,
-            move |room: &Digest32, port: u16| {
-                let _ = events.send(NodeEvent::ReachWithdrawn {
-                    channel_id: *room,
-                    port,
+            {
+                let events = events.clone();
+                move |room: &Digest32, port: u16| {
+                    let _ = events.send(NodeEvent::ReachWithdrawn {
+                        channel_id: *room,
+                        port,
+                    });
+                }
+            },
+            move |reason: &str| {
+                let _ = events.send(NodeEvent::ProxyRefused {
+                    reason: reason.to_owned(),
                 });
             },
         ));
@@ -3840,9 +3928,22 @@ impl Node {
             .as_ref()
             .map(|net| net.board_endpoints(channel_id, host))
             .unwrap_or_default();
+        // **The ladder's own words, not `Fault::Unreachable`.** `fault_of` collapses
+        // `LadderExhausted` to one token, so a forward that could not be carried told the person to
+        // check a permission they cannot hold. The common case here is not a refusal at all: a
+        // one-shot verb dials before its anchor connection exists, so there is no helper to carry a
+        // circuit and no board hint to dial directly — `no direct candidates, and no peer is
+        // connected to carry a circuit`. That sentence is the whole diagnosis and it was being
+        // thrown away.
         let conn = match self.dial(*host, &endpoints).await {
             Ok(c) => c,
-            Err(e) => return Outcome::Failed(fault_of(&e)),
+            Err(e) => {
+                let _ = self.event_tx.send(NodeEvent::PeerUnreachable {
+                    peer: *host,
+                    why: e.to_string(),
+                });
+                return Outcome::Failed(fault_of(&e));
+            }
         };
         match crate::node::tunnel::Forward::bind(conn, *channel_id, service_tag.to_owned(), local)
             .await

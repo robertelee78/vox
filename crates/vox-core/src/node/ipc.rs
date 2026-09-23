@@ -92,6 +92,8 @@ const T_SHUTDOWN: u64 = 25;
 /// tag space is sparse and `u64`; there is nothing to save by packing it.
 const T_REACH_WITHDRAWN: u64 = 1711;
 /// Additive, and deliberately away from the sequential range (see above).
+const T_PROXY_REFUSED: u64 = 1712;
+/// Additive, and deliberately away from the sequential range (see above).
 const T_STILL_RELAYED: u64 = 1713;
 /// Additive, and deliberately away from the sequential range (see above).
 const T_JOIN_FAILED: u64 = 1714;
@@ -832,6 +834,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::StillRelayed { peer, reason } => {
             e.array(3).uint(T_STILL_RELAYED).bytes(peer).text(reason);
         }
+        NodeEvent::ProxyRefused { reason } => {
+            e.array(2).uint(T_PROXY_REFUSED).text(reason);
+        }
         NodeEvent::PeerUnreachable { peer, why } => {
             e.array(3).uint(T_PEER_UNREACHABLE).bytes(peer).text(why);
         }
@@ -1086,6 +1091,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             reason: d
                 .text()
                 .map_err(|_| Error::MalformedBundle("ipc relayed reason"))?
+                .to_owned(),
+        },
+        (T_PROXY_REFUSED, 2) => NodeEvent::ProxyRefused {
+            reason: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc proxy refusal reason"))?
                 .to_owned(),
         },
         (T_PEER_UNREACHABLE, 3) => NodeEvent::PeerUnreachable {

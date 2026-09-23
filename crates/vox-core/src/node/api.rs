@@ -539,6 +539,18 @@ pub enum NodeEvent {
         /// What each rung reported, as this node saw it.
         reason: String,
     },
+    /// The proxy refused a CONNECT, with the reason **this node** saw.
+    ///
+    /// The SOCKS reply the client gets stays uniform — one code covers unauthorized, no such
+    /// service and could-not-get-there, so a peer learns nothing (ADR-013 dark services). This is
+    /// the other side of that: the operator's own node telling them what happened, which is the
+    /// difference between a diagnosable failure and `ssh` failing for no stated reason. Measured:
+    /// a real SOCKS5 client got "SOCKS reply code 1" and the ladder's actual verdict — which
+    /// `reach_host_with_patience` had deliberately kept — died in a dropped `Result`.
+    ProxyRefused {
+        /// What went wrong, as this node saw it.
+        reason: String,
+    },
     /// A dial this node started in the background failed, with what it reported.
     ///
     /// Connecting cannot run on the actor — it would stop the node answering anyone — so it runs

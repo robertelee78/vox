@@ -88,7 +88,7 @@ pub async fn serve<D>(
 where
     D: HostDialer + 'static,
 {
-    serve_reporting(listener, resolver, dialer, |_, _| {}).await
+    serve_reporting(listener, resolver, dialer, |_, _| {}, |_| {}).await
 }
 
 /// [`serve`], reporting each carried tunnel that was **cut by a withdrawal of reach**
@@ -99,19 +99,25 @@ where
 /// turns these into [`crate::node::api::NodeEvent::ReachWithdrawn`], which is what puts
 /// the sentence in front of the person whose `ssh` just died.
 ///
-/// Only a withdrawal is reported. An ordinary disconnect, an unreachable host and a
-/// refused dial are all silent here, because none of them is a decision anybody took.
-pub async fn serve_reporting<D, R>(
+/// A **refusal** is reported too, through `refused`. The SOCKS reply the client gets stays
+/// uniform, because which of unauthorized / no-such-service / could-not-get-there it was is not
+/// the proxy's to disclose (ADR-013). But the operator's own node is not the peer: the ladder's
+/// verdict was already kept specifically so it could be said, and returning it into a dropped
+/// `Result` meant `ssh` failed with nothing to act on. An ordinary disconnect stays silent.
+pub async fn serve_reporting<D, R, F>(
     listener: TcpListener,
     resolver: Arc<VoxResolver>,
     dialer: Arc<D>,
     withdrawn: R,
+    refused: F,
 ) -> Result<()>
 where
     D: HostDialer + 'static,
     R: Fn(&Digest32, u16) + Send + Sync + 'static,
+    F: Fn(&str) + Send + Sync + 'static,
 {
     let withdrawn = Arc::new(withdrawn);
+    let refused = Arc::new(refused);
     // The caller binds and hands the live listener over, rather than passing an address
     // for this function to bind (M17.16). Binding here meant the caller had to bind once
     // to learn the port, **drop it**, and let this re-bind — which announced an address
@@ -136,9 +142,17 @@ where
         let resolver = Arc::clone(&resolver);
         let dialer = Arc::clone(&dialer);
         let withdrawn = Arc::clone(&withdrawn);
+        let refused = Arc::clone(&refused);
         tokio::spawn(async move {
             // One connection's failure is its own; the proxy keeps serving.
-            let _ = handle(stream, &resolver, dialer.as_ref(), withdrawn.as_ref()).await;
+            let _ = handle(
+                stream,
+                &resolver,
+                dialer.as_ref(),
+                withdrawn.as_ref(),
+                refused.as_ref(),
+            )
+            .await;
         });
     }
 }
@@ -213,11 +227,12 @@ const UNSPECIFIED: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// Negotiate, resolve, and carry one SOCKS5 connection.
-async fn handle<D: HostDialer, R: Fn(&Digest32, u16)>(
+async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
     mut stream: TcpStream,
     resolver: &VoxResolver,
     dialer: &D,
     withdrawn: &R,
+    refused: &F,
 ) -> Result<()> {
     socks::negotiate(&mut stream).await?;
     let target = socks::read_connect(&mut stream).await?;
@@ -226,6 +241,7 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16)>(
         Target::Ip(_) => {
             // Not a Vox name. Refusing is the point: a proxy on loopback that forwarded
             // arbitrary addresses would be an open relay for anything on this machine.
+            refused("a CONNECT to a bare address: vox up carries .vox names only");
             socks::write_reply(&mut stream, Reply::AddressNotSupported, UNSPECIFIED).await?;
             return Err(Error::MalformedTunnel(
                 "vox up carries .vox names only; configure socks5h so the name reaches it",
@@ -235,12 +251,15 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16)>(
     let Some(room) = resolver.resolve(&name).copied() else {
         // A room this machine has not joined, or not a `.vox` name at all. One uniform
         // refusal for both: which of the two it was is not the proxy's to disclose.
+        refused(&format!("no room on this machine answers to {name}"));
         socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
         return Err(Error::MalformedTunnel("no such .vox name on this machine"));
     };
     let conn = match reach_host_with_patience(dialer, &room.host).await {
         Ok(conn) => conn,
         Err(why) => {
+            // The ladder's own verdict, which `reach_host_with_patience` kept for exactly this.
+            refused(&format!("could not reach this room's host: {why}"));
             socks::write_reply(&mut stream, Reply::GeneralFailure, UNSPECIFIED).await?;
             return Err(why);
         }

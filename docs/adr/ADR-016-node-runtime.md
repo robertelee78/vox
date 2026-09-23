@@ -824,6 +824,24 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   be interrupted. The first thing it named once exhaustive was publishing a room's records to an
   anchor that had gone quiet.
 
+- **Every one-shot verb threw away the reason (2026-09-23).** `forward`, `invite`, `connect` and
+  `up`'s startup wait each sat in a `match node.next_event()` with a `Some(_) => {}` arm — six sites.
+  The node was reporting exactly what had gone wrong into loops that discarded it, so a verb failed
+  with a bare `Fault` and the reason reached nobody. That is the same shape as dropping an `Err`, one
+  layer further out, and it is why a reproducible `vox forward` failure could be driven on demand and
+  still say nothing about which rung refused. One reporter now serves every wait loop.
+- **A duplicate connection is retired rather than closed, but only where somebody reads it
+  (2026-09-23).** Closing a duplicate reset whatever the peer already had in flight on it: the peer
+  dialled that connection and was never told we preferred another, so it opens streams there and
+  reads back a reset it had every reason to expect to work. Measured at the product level as a
+  `ConnectionReset` mid-exchange, and reported from the field as
+  `malformed identity bundle: quic stream read len`.
+  The first version of this retired the loser everywhere, which was worse: `connect`, the one-shot
+  `accept` and `adopt` all discarded the handle, leaving the connection transport-alive and
+  application-deaf for the whole grace. Retiring is now confined to the accept path, where the caller
+  serves it; everywhere else the loser is closed as before, and a `debug_assert!` holds the
+  invariant. Found independently by two reviewers reading the diff, not by a gate.
+
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
 ADR-013, ADR-015.

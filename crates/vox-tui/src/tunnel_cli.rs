@@ -10,6 +10,7 @@
 //! way to offer a service, or to grant reach, without opening the room.
 
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use vox_core::hash::Digest32;
 use vox_core::nat::bootstrap::BootstrapSet;
@@ -370,14 +371,52 @@ pub async fn forward(
         .map(|d| d.members.clone())
         .unwrap_or_default();
     let host = resolve_prefix(host_prefix, &members)?;
-    let out = node
-        .apply(NodeCommand::Forward {
-            channel_id,
-            host,
-            service_tag: tag.to_owned(),
-            local,
-        })
-        .await;
+    // **Retried until the host becomes reachable, not asked once.**
+    //
+    // `forward` is a one-shot verb: it starts a node, opens the room and dials, all inside a few
+    // seconds. At the moment of that dial the node has usually not finished connecting to the
+    // room's anchor — so `helpers()` is empty, no circuit rung can be built, and the only rung
+    // tried is a direct dial, which cannot work between two peers behind NATs. The command then
+    // returned `Unreachable` immediately. Measured against a real always-on anchor: four build
+    // configurations, four failures, `direct=0 helpers=0 peers=0` at the moment of the dial.
+    //
+    // `vox up` already solved this and `forward` never got the same treatment: `up` binds before it
+    // can reach the host **deliberately** and waits inside the request
+    // (`node::up::reach_host_with_patience`, `HOST_PATIENCE`). This is that patience, applied from
+    // out here rather than on the actor — the node keeps running between attempts, so the anchor
+    // connection it needs is established by the work this loop is waiting for, and the actor is
+    // never blocked for more than one attempt.
+    let deadline = Instant::now() + vox_core::node::up::HOST_PATIENCE;
+    let mut said = false;
+    let out = loop {
+        let out = node
+            .apply(NodeCommand::Forward {
+                channel_id,
+                host,
+                service_tag: tag.to_owned(),
+                local,
+            })
+            .await;
+        if out.is_done() || Instant::now() >= deadline {
+            break out;
+        }
+        // Drain whatever the node has to say about the attempt that just failed, so a person
+        // watching sees which rung refused rather than a silent wait.
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(50), node.next_event()).await
+        {
+            say_if_it_explains_a_failure(&ev);
+        }
+        if !said {
+            eprintln!(
+                "vox: {} is not reachable yet — waiting for a path (up to {:?})",
+                short(&host),
+                vox_core::node::up::HOST_PATIENCE
+            );
+            said = true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
     if !out.is_done() {
         // Not "do you hold dial:<tag>": that capability was withdrawn with the rest of
         // the model in ADR-017's third revision, and nothing has consulted it since
@@ -397,7 +436,7 @@ pub async fn forward(
     let bound = loop {
         match node.next_event().await {
             Some(NodeEvent::Forwarding { local, .. }) => break local,
-            Some(_) => {}
+            Some(ref other) => say_if_it_explains_a_failure(other),
             None => return Err(AppError::Usage("the node stopped".into())),
         }
     };
@@ -480,7 +519,7 @@ pub async fn serve(
     let url = loop {
         match node.next_event().await {
             Some(NodeEvent::InviteLink { url, .. }) => break url,
-            Some(_) => {}
+            Some(ref other) => say_if_it_explains_a_failure(other),
             None => return Err(AppError::Usage("the node stopped".into())),
         }
     };
@@ -519,7 +558,7 @@ pub async fn serve(
                 Some(NodeEvent::PeerJoined { peer, .. }) => {
                     println!("vox: {} joined", short(&peer));
                 }
-                Some(_) => {}
+                Some(ref other) => say_if_it_explains_a_failure(other),
                 None => return Err(AppError::Usage("the node stopped".into())),
             },
         }
@@ -558,7 +597,7 @@ pub async fn connect(
     let channel_id = loop {
         match node.next_event().await {
             Some(NodeEvent::Joined { channel_id, .. }) => break channel_id,
-            Some(_) => {}
+            Some(ref other) => say_if_it_explains_a_failure(other),
             None => return Err(AppError::Usage("the node stopped".into())),
         }
     };
@@ -583,7 +622,7 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     let (hostname, bound) = loop {
         match node.next_event().await {
             Some(NodeEvent::ProxyUp { hostname, bind, .. }) => break (hostname, bind),
-            Some(_) => {}
+            Some(ref other) => say_if_it_explains_a_failure(other),
             None => return Err(AppError::Usage("the node stopped".into())),
         }
     };
@@ -610,7 +649,7 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
                     println!("vox: the host withdrew access to port {port} — that session was cut");
                     println!("     nothing to retry: ask them to trust this identity again");
                 }
-                Some(_) => {}
+                Some(ref other) => say_if_it_explains_a_failure(other),
                 None => break,
             },
         }
@@ -618,6 +657,36 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     println!("vox: stopping the proxy");
     let _ = node.apply(NodeCommand::Shutdown).await;
     Ok(())
+}
+
+/// Print an event that tells the person why something is not working, and say nothing otherwise.
+///
+/// **Every one-shot verb waits for exactly one event and discarded the rest.** `forward`, `invite`,
+/// `connect` and `up` each sat in a `match node.next_event()` with a `Some(ref other) => say_if_it_explains_a_failure(other),` arm, so a node
+/// that was reporting precisely what had gone wrong was talking into a loop that threw it away. The
+/// verb then failed with a bare `Fault` and the reason — which the node had gone to some trouble to
+/// produce — reached nobody. That is the same silent-failure shape as dropping an `Err`, one layer
+/// further out, and it is why `vox forward` through an anchor could be driven to failure on demand
+/// and still say nothing about which rung refused it.
+fn say_if_it_explains_a_failure(ev: &NodeEvent) {
+    match ev {
+        NodeEvent::PeerUnreachable { peer, why } => {
+            eprintln!("vox: could not reach {} — {why}", short(peer));
+        }
+        NodeEvent::JoinFailed { reason } => {
+            eprintln!("vox: a join did not complete — {reason}");
+        }
+        NodeEvent::StillRelayed { peer, reason } => {
+            eprintln!("vox: still relayed to {} — {reason}", short(peer));
+        }
+        NodeEvent::ProxyRefused { reason } => {
+            eprintln!("vox: refused a request — {reason}");
+        }
+        NodeEvent::Stalled { what, millis } => {
+            eprintln!("vox: busy {millis}ms — {what} — nobody could be answered");
+        }
+        _ => {}
+    }
 }
 
 /// The first 12 characters of a fingerprint, as `vox` shows ids on screen.

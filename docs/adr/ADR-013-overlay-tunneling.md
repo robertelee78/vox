@@ -299,6 +299,29 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
   (`vox serve` / `vox connect`, capability-bearing rooms, anchors as configuration) is ADR-017's. The TUN/VPN datapath remains ADR-014's, as the
   Decision says.
 
+- **`vox forward` asked once and gave up (2026-09-23).** A one-shot verb starts a node, opens the
+  room and dials, all inside a few seconds — and at the moment of that dial the node has usually not
+  finished connecting to the room's anchor. `helpers()` is therefore empty, no circuit rung can be
+  built, and the only rung attempted is a direct dial, which cannot succeed between two peers behind
+  NATs. The command returned `Fault::Unreachable` immediately and the person was told to check a
+  permission. Measured against a real always-on anchor: four build configurations, four failures,
+  `direct=0 helpers=0 peers=0` at the moment of the dial.
+  `vox up` had already solved exactly this and `forward` never got the same treatment — `up` binds
+  before it can reach the host *deliberately* and waits inside the request
+  (`node::up::reach_host_with_patience`, `HOST_PATIENCE`). `forward` now waits with the same
+  patience, applied from the CLI rather than on the actor, so the node keeps running between
+  attempts and the actor is never blocked for longer than one attempt. Each attempt's rung verdicts
+  are printed while it waits.
+  **And this path has no proof at all — including the gate that looks like one.**
+  `node_m17_serve_gate` does call `NodeCommand::Forward`, so it reads as covering this. It does not:
+  its joiner joined in-process seconds earlier, so `reach` returns at once from
+  `ConnectionManager::existing` and **the ladder inside `Forward` is never run**. The gate is green
+  while the path a real user takes is structurally unable to work — a green test that does not
+  discriminate, which ADR-018 §4 warns is worse than no test. CI says the same thing outright:
+  `cross-process-tunnel` sits on `VOX_PROOF_ALLOW_UNPROVEN` and no tunnel proof file exists.
+  What closes this is a person running `vox forward` against a real anchor on a real network. Nothing
+  short of that is evidence, and the gate must not be cited as if it were.
+
 ## Links
 **Depends on**: ADR-002, ADR-007, ADR-011, ADR-012.
 - Depended on by: ADR-014 (client surfacing).

@@ -341,12 +341,12 @@ impl ConnectionManager {
         &self,
         incoming: quinn::Incoming,
         admission: Admission,
-    ) -> Result<Arc<VoxConnection>> {
+    ) -> Result<Filed> {
         let conn = self
             .endpoint
             .finish_incoming(incoming, (self.clock)(), admission)
             .await?;
-        Ok(self.file(conn))
+        Ok(self.file_reporting(conn))
     }
 
     /// Take ownership of a connection this manager did not dial — one a hole punch
@@ -369,6 +369,39 @@ impl ConnectionManager {
     /// protocol: the side that punched files the direct connection as an improvement,
     /// and the side that accepted it does too.
     fn file(&self, conn: VoxConnection) -> Arc<VoxConnection> {
+        // **Closes the loser, because this caller will not serve it.** Retiring a duplicate is only
+        // safe where somebody keeps reading it; retiring it here and dropping the handle would
+        // leave it transport-alive and application-deaf, which is strictly worse than the close it
+        // replaced. `connect`, the one-shot `accept` and `adopt` all arrive through here and none of
+        // them serves a second connection, so for them the old behaviour is the correct one.
+        let filed = self.file_inner(conn, false);
+        debug_assert!(filed.also_serve.is_none());
+        filed.kept
+    }
+
+    /// [`Self::file`], also handing back a duplicate it **retired rather than closed**.
+    ///
+    /// The tie-break is unchanged: the held connection still wins when the newcomer is no
+    /// better. What changes is what happens to the loser. Closing it reset whatever the peer
+    /// already had in flight on it — the peer dialled that connection and was never told we
+    /// preferred another, so it opens streams there and reads back a reset it had every reason
+    /// to expect to work. Measured at the product level: a real SOCKS5 client through a real
+    /// `vox up` wrote its bytes and then got `ConnectionReset` reading the echo, and the same
+    /// close showed up on `vox forward` as `malformed identity bundle: quic stream read len`.
+    ///
+    /// So the loser is retired on the ordinary grace instead, and returned here so the caller
+    /// can keep reading it until that grace is up. `retire_expired` closes it after that.
+    /// Retiring without serving it would be worse than the close it replaces: the connection
+    /// would be transport-alive and application-deaf, and the peer's request would never be
+    /// answered at all.
+    fn file_reporting(&self, conn: VoxConnection) -> Filed {
+        self.file_inner(conn, true)
+    }
+
+    /// [`Self::file_reporting`]'s body. `serve_loser` says whether the caller will read a duplicate
+    /// this keeps alive: with it the loser is retired and handed back, without it the loser is
+    /// closed. There is no third option — a retired connection nobody reads is the worst of both.
+    fn file_inner(&self, conn: VoxConnection, serve_loser: bool) -> Filed {
         let peer = conn.peer_id();
         let mut map = lock(&self.conns);
         if let Some(existing) = map.get(&peer) {
@@ -376,8 +409,20 @@ impl ConnectionManager {
                 let existing = Arc::clone(existing);
                 if path_class(&self.endpoint, &conn) <= path_class(&self.endpoint, &existing) {
                     drop(map);
-                    conn.close(WireError::AuthenticatorInvalid);
-                    return existing;
+                    if !serve_loser {
+                        conn.close(WireError::AuthenticatorInvalid);
+                        return Filed {
+                            kept: existing,
+                            also_serve: None,
+                        };
+                    }
+                    let retire_at = (self.clock)().saturating_add(self.retire_grace_secs);
+                    let retired = Arc::new(conn);
+                    lock(&self.retiring).push((Arc::clone(&retired), retire_at));
+                    return Filed {
+                        kept: existing,
+                        also_serve: Some(retired),
+                    };
                 }
                 let retire_at = (self.clock)().saturating_add(self.retire_grace_secs);
                 lock(&self.retiring).push((existing, retire_at));
@@ -385,7 +430,16 @@ impl ConnectionManager {
         }
         let conn = Arc::new(conn);
         map.insert(peer, Arc::clone(&conn));
-        conn
+        Filed {
+            kept: conn,
+            also_serve: None,
+        }
+    }
+
+    /// How long a retired connection is kept readable before it is closed.
+    #[must_use]
+    pub fn retire_grace_secs(&self) -> u64 {
+        self.retire_grace_secs
     }
 
     /// Close every retired connection whose grace has elapsed (or that the peer
@@ -478,6 +532,15 @@ impl ConnectionManager {
 /// Whether a connection is still usable.
 fn is_live(conn: &VoxConnection) -> bool {
     conn.quinn().close_reason().is_none()
+}
+
+/// What filing one connection decided: which one is the peer's primary, and whether a duplicate was
+/// retired rather than closed and so still needs reading.
+pub struct Filed {
+    /// The connection that is now this peer's primary.
+    pub kept: Arc<VoxConnection>,
+    /// A duplicate that was retired rather than closed, and still needs reading for its grace.
+    pub also_serve: Option<Arc<VoxConnection>>,
 }
 
 /// Accept the next stream on `conn` and authorize it against `policy`: the peer's
