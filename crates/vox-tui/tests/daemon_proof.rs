@@ -28,6 +28,7 @@ mod watchdog;
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use vox_core::node::api::{NodeCommand, Secret};
 use vox_core::node::paths::Paths;
@@ -38,14 +39,50 @@ fn secret(s: &str) -> Secret {
     Secret::new(s.as_bytes().to_vec())
 }
 
-/// A daemon child, killed when the test ends however it ends.
-struct Daemon(Child);
+/// A daemon child, killed when the test ends however it ends, with its pipes drained.
+struct Daemon(Child, Arc<Mutex<String>>);
+
+impl Daemon {
+    /// Whatever the daemon has said so far, for an assertion message.
+    #[allow(dead_code)]
+    fn said(&self) -> String {
+        self.1.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+}
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Drain a long-lived child's pipes on threads, into a string the test can print.
+///
+/// **A piped stream nobody reads is a fuse, not a convenience.** The pipe buffer is
+/// 64 KiB; when it fills, the child blocks on `write` and stops making progress, which
+/// looks exactly like a hang with no output to explain it. This was harmless only while
+/// the daemon said nothing — measured at **0 bytes** of stderr over a 40s run, which is
+/// precisely the reporting blindness being fixed. A daemon that now reports unreachable
+/// peers, refused publishes and stalls produces kilobytes over the same run, and at
+/// ~140 B/s a 64 KiB pipe fills in about eight minutes. The bytes that were the hazard
+/// become the diagnosis instead.
+fn drain(stream: Option<impl std::io::Read + Send + 'static>, into: &Arc<Mutex<String>>) {
+    let Some(mut stream) = stream else { return };
+    let sink = Arc::clone(into);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if let Ok(mut s) = sink.lock() {
+                        s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn vox(data: &std::path::Path, cfg: &std::path::Path, args: &[&str]) -> (bool, String, String) {
@@ -194,7 +231,10 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
     // Closing stdin is what a pipe does; the daemon must not need it held open.
     drop(child.stdin.take());
     let pid = child.id();
-    let daemon = Daemon(child);
+    let said = Arc::new(Mutex::new(String::new()));
+    drain(child.stdout.take(), &said);
+    drain(child.stderr.take(), &said);
+    let daemon = Daemon(child, said);
 
     // ---- (2) another process attaches to it ----
     let listed = until_attached(&data, &cfg, "the daemon to serve its control socket");
