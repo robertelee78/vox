@@ -471,6 +471,55 @@ short". Each time the observation was real and the inference did not follow — 
 flake under parallel load" forbids explaining a red with the environment even when the environment is
 genuinely bad. It was genuinely bad today, and it still was not the cause.
 
+## The admission window: one cycle, and moving the join off the actor widened it (2026-09-23)
+
+**Not landed. This records a regression found in the fix for the defect above, and why the obvious
+patch is the wrong one.**
+
+Answering a join was moved into a slot so a stranger could not hold the node (ADR-016 §"Answering a
+join runs off the actor"). That change **defers the responder's `admit_author` by one event hop**: on
+the previous code the responder admitted the joiner in the *same actor turn* the exchange ended, before
+the joiner's `join` call had returned. With the exchange in a slot it completes, posts
+`NetEvent::JoinAnswered`, and the admission happens when the actor reaches that event.
+
+In that window the newcomer has already returned from its join and published its records to the
+responder's board, where they are refused `author is not a channel member`. Nothing retries. So the
+responder's oracle never lists the newcomer, no record is ever admitted, the `BoardGrew` hook never
+fires because it fires *on admission*, the anchor's board stays at one member, and the next person to
+join the room is handed the one member that is offline and never tries the one that is up.
+
+Measured, real binaries, one host plus two joiners, the creator killed between them:
+
+| tree | third person gets in |
+|---|---|
+| `main` | 6 of 10 |
+| the join-slots branch | **0 of 10** |
+| bisected: the join-slots commit alone, reorder absent | **0 of 5** |
+
+The failures are five identical ~11s, and that constancy is the tell: **a structural window does not
+vary.** The same reading explains main's 6-of-10 and the 3-of-5 on
+`a_join_is_not_hostage_to_one_member` before this work — there the window is narrow but real, so the
+cycle is possible and merely rare. It is **one cycle with two widths**, not two defects, which also
+retires the idea that the board-population failure and the join failure were independent.
+
+**Why a retry is the wrong fix.** Retrying the newcomer's publish, or polling until the responder
+catches up, makes the symptom rarer and leaves the cycle in place — which produces exactly the
+unexplainable 4-of-5 this ADR exists to forbid. The window has to close: **the joiner must be admitted
+before its join returns**, which means the admission has to be part of the exchange completing rather
+than an event the actor reaches afterwards. That is a design question about how a slot hands work back
+to the actor, and it has to keep the property the slot was introduced for — no network wait on the
+actor — while restoring the ordering the inline version got for free.
+
+Both acceptance tests now exist and a change must satisfy both: the two-joiner reproduction above
+(which discriminates at 5-of-5) and `a_join_is_not_hostage_to_one_member`.
+
+**Process note, since it is the same lesson as the rest of this ADR.** Three mechanisms were proposed
+for the `:490` failure and measurement killed each one — the publish ordering, the candidate list, and
+trust gating the connection. Two of them were coherent enough to have been written up as the cause.
+The localisation of *this* regression was also proposed wrongly first (the two-line publish reorder)
+and settled only by bisecting with the suspect change verifiably absent from the arm. A coherent
+mechanism is a hypothesis, and the only thing that ever separated them was a measurement.
+
 ## Root cause of `service_rehearsal_proof:490`: a host serves one joiner, then no one for 30s (2026-09-23)
 
 `:490` — "the stranger must still be able to JOIN" — is **not** a flaky proof and **not** about the
