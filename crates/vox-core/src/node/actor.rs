@@ -3709,6 +3709,10 @@ impl Node {
         let mut ran = false;
         // Which channels a local-append push actually got out. Everything else stays owed.
         let mut pushed: std::collections::BTreeSet<Digest32> = std::collections::BTreeSet::new();
+        // Rooms any peer was skipped for because they were mid-session. Added to `pending_push`
+        // only **after** the `retain` below — see there.
+        let mut owed_rooms: std::collections::BTreeSet<Digest32> =
+            std::collections::BTreeSet::new();
         for (peer, trigger) in due {
             if net.manager().existing(&peer).is_none() {
                 continue;
@@ -3835,7 +3839,7 @@ impl Node {
                 // against: nothing here takes a lock, and it is retried only while that room is
                 // mid-session, which is milliseconds. The next tick finds the room free.
                 if !owed.is_empty() {
-                    self.pending_push.extend(owed.iter().copied());
+                    owed_rooms.extend(owed.iter().copied());
                     schedule.note_local_append();
                 }
             }
@@ -3856,6 +3860,16 @@ impl Node {
         // room's lock. Measured: that took the same proof from 4 of 6 to 3 of 8. The backoff must
         // hold on failure; what must survive is the work owed, which is this line.
         self.pending_push.retain(|cid| !pushed.contains(cid));
+        // **After** the retain, or it undoes this. The skip happens in exactly the pass where the
+        // room *was* pushed — to whichever peer took it first — so an owed room added inside the loop
+        // was then removed here as "pushed", and the skipped peer's retry next tick found nothing
+        // owed and dropped the push. It still arrived, on the next interval: up to 30s late instead
+        // of immediately, and invisible to any gate that only asks whether it arrived. Found in
+        // review by the other session.
+        //
+        // Known and not fixed here: `pushed` means a session *started*, not that it delivered, so a
+        // push to a peer whose session then fails is counted as done.
+        self.pending_push.extend(owed_rooms);
         ran
     }
 
