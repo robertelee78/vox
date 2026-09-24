@@ -557,6 +557,14 @@ pub enum NodeEvent {
         /// What each responder reported, as this node saw it.
         reason: String,
     },
+    /// Where a join's time went, step by step — raised for every join this node starts, whether
+    /// it got in or not, so a slow or failed join carries its own breakdown.
+    JoinSteps {
+        /// Whether the join got in.
+        joined: bool,
+        /// Each step and how long it took, in order.
+        steps: String,
+    },
     /// An upgrade off a relayed path was tried and nothing better landed, with what each rung
     /// reported.
     ///
