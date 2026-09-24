@@ -584,7 +584,58 @@ fn spawn_stream_loop(
         const MAX_CONSECUTIVE_STREAM_FAILURES: u32 = 16;
         let mut failures = 0;
         loop {
-            match net.accept_stream(&conn).await {
+            // **The kinds this node serves to completion get a task each.** `accept_stream`
+            // served them inline — `dispatch`'s own doc says to put it on its own task when
+            // accepting in a loop, and this loop did not — so while one was being served no other
+            // stream from this peer was even accepted. A rendezvous stream holds its server until
+            // the client finishes or a 20s frame read gives up; a circuit's opening exchange waits
+            // on the *target* peer's answer, which is another node's loop. On an anchor that put a
+            // member's next board `put` behind whatever that member's last stream was waiting for,
+            // 20s at a time, and the member's actor — which awaits its puts — answered nobody for
+            // 30s, 60s, 80s, measured through the real binaries.
+            //
+            // Only these three. Every other kind is handed on in the order it arrived, as before:
+            // a pairwise hello and the key that follows it are separate streams, and reordering
+            // them is exactly the race F12 was.
+            let (kind, send, recv) = match net.accept_authorized(&conn).await {
+                Ok(accepted) => accepted,
+                Err(_) => {
+                    if conn.quinn().close_reason().is_some() {
+                        break; // the peer or the network closed it
+                    }
+                    failures += 1;
+                    if failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if matches!(
+                kind,
+                crate::transport::streams::StreamKind::Rendezvous
+                    | crate::transport::streams::StreamKind::Coord
+                    | crate::transport::streams::StreamKind::Circuit
+            ) {
+                failures = 0;
+                let net = Arc::clone(&net);
+                let conn = Arc::clone(&conn);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    // A coordination stream can end by handing the actor a punch to run.
+                    if let Ok(inbound @ Inbound::Punch { .. }) =
+                        net.dispatch(&conn, kind, send, recv).await
+                    {
+                        let _ = tx
+                            .send(NetEvent::Stream {
+                                conn: Arc::clone(&conn),
+                                inbound,
+                            })
+                            .await;
+                    }
+                });
+                continue;
+            }
+            match net.dispatch(&conn, kind, send, recv).await {
                 Ok(
                     Inbound::ServedRendezvous { .. }
                     | Inbound::ServedCoord { .. }
