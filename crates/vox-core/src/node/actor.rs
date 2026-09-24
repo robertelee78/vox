@@ -213,6 +213,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
+        NetEvent::Dialed { .. } => "adopting a connection a join dialled",
+        NetEvent::JoinerDone { .. } => "finishing a join",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped => "shutting the network down",
     }
@@ -550,6 +552,33 @@ enum NetEvent {
         /// Answered once the admission is applied, which releases the acceptance frame. A dropped
         /// sender answers too — the slot must never wait on an actor that has moved on.
         ack: tokio::sync::oneshot::Sender<()>,
+    },
+    /// A joiner's task dialled a peer: adopt the connection now, so its streams are served while
+    /// the join is still running over it.
+    Dialed {
+        /// The connection.
+        conn: Arc<crate::transport::quic::VoxConnection>,
+        /// The endpoints it was dialled at, for a later path upgrade.
+        endpoints: crate::nat::multiaddr::EndpointList,
+        /// Whether it is the board the join reads from (and so an anchor of ours).
+        board: bool,
+    },
+    /// A joiner's task finished: make the room, or say why not, and answer the command.
+    JoinerDone {
+        /// The `JoinChannel` command's reply.
+        reply: oneshot::Sender<Outcome>,
+        /// The link joined with.
+        parsed: Box<crate::node::link::InviteLink>,
+        /// The room's local name.
+        local_name: String,
+        /// The passphrase, kept by the room's state.
+        passphrase: Secret,
+        /// When the join began.
+        now: u64,
+        /// This node's fingerprint.
+        me: Digest32,
+        /// What the join came to. Boxed: a won join carries a whole session.
+        result: Box<std::result::Result<JoinerWon, JoinerLost>>,
     },
     /// A room's key was sealed under its passphrase on a blocking thread (the slow part of
     /// creating a room): finish the room and answer the command that asked for it.
@@ -949,6 +978,279 @@ const PUBLISH_REFUSAL_GRACE: u64 = 60;
 /// Named here because each would fail identically against every member of the room, and
 /// retrying would multiply the proof-of-work cost while changing nothing — and for a
 /// passphrase it would look from the outside like an attempt to guess it.
+/// Everything the network half of a join needs, captured on the actor so the half can run on a
+/// task of its own. See `Node::begin_join_channel`.
+struct Joiner {
+    net: Arc<NodeNet>,
+    tx: mpsc::Sender<NetEvent>,
+    me: Digest32,
+    parsed: crate::node::link::InviteLink,
+    routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)>,
+    signer: Arc<crate::atrest::vault::VaultRootSigner>,
+    ring: Arc<tokio::sync::Mutex<PrekeyRing>>,
+    seq: u64,
+    now: u64,
+    pow_params: Option<crate::join::pow::PowParams>,
+    argon2: Argon2Profile,
+    passphrase: Secret,
+}
+
+/// A join that got in: what the actor needs to make the room.
+struct JoinerWon {
+    joined: crate::node::joinstream::JoinOutcome,
+    responder: Digest32,
+    conn: Arc<VoxConnection>,
+    set: crate::nat::service::RecordSet,
+    genesis: crate::governance::genesis::Genesis,
+    sealed: (crate::atrest::sek::Sek, crate::atrest::SekWrap),
+}
+
+/// A join that did not: the fault to answer with, and each responder's reason.
+struct JoinerLost {
+    fault: Fault,
+    why: Vec<String>,
+}
+
+impl JoinerLost {
+    fn of(fault: Fault) -> Self {
+        Self {
+            fault,
+            why: Vec::new(),
+        }
+    }
+}
+
+impl Joiner {
+    /// Dial a peer, and tell the actor at once so it serves the connection's streams — the
+    /// responder talks to us over it during the join itself.
+    async fn dial(
+        &self,
+        peer: Digest32,
+        endpoints: &crate::nat::multiaddr::EndpointList,
+        board: bool,
+    ) -> crate::error::Result<Arc<VoxConnection>> {
+        let conn = self.net.reach(peer, endpoints).await?;
+        let _ = self
+            .tx
+            .send(NetEvent::Dialed {
+                conn: Arc::clone(&conn),
+                endpoints: endpoints.clone(),
+                board,
+            })
+            .await;
+        Ok(conn)
+    }
+
+    async fn reach_a_board(&self) -> Option<Arc<VoxConnection>> {
+        let deadline = tokio::time::Instant::now() + Node::BOARD_PATIENCE;
+        loop {
+            for (id, endpoints) in &self.routes {
+                if let Ok(conn) = self.dial(*id, endpoints, true).await {
+                    return Some(conn);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Node::BOARD_RETRY).await;
+        }
+    }
+
+    /// The network half of a join, and the room key's seal: the old inline `join_channel` from
+    /// reaching a board to the end of the exchange, unchanged in order and in its refusals.
+    async fn run(self) -> std::result::Result<JoinerWon, JoinerLost> {
+        let parsed = &self.parsed;
+        let net = Arc::clone(&self.net);
+        let Some(board) = self.reach_a_board().await else {
+            return Err(JoinerLost::of(Fault::Unreachable));
+        };
+        let mut set = net
+            .fetch_channel(&board, &parsed.channel_id, 0)
+            .await
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        let Some(genesis) = set.genesis.clone() else {
+            return Err(JoinerLost::of(Fault::BadLink));
+        };
+        let me = self.me;
+        let candidates: Vec<Digest32> = {
+            use std::collections::BTreeSet;
+            let with_address: BTreeSet<Digest32> = set
+                .members
+                .iter()
+                .filter(|r| !r.endpoints.is_empty())
+                .map(|r| r.author_id)
+                .collect();
+            let mut known: BTreeSet<Digest32> = set.members.iter().map(|r| r.author_id).collect();
+            known.extend(set.bundles.iter().map(|b| b.author_id));
+            if let Some(g) = set.genesis.as_ref() {
+                known.insert(g.body.creator_pubkey.fingerprint());
+            }
+            known.remove(&me);
+            let mut reachable: Vec<Digest32> = known.intersection(&with_address).copied().collect();
+            let mut awaited: Vec<Digest32> = known.difference(&with_address).copied().collect();
+            reachable.sort_unstable();
+            awaited.sort_unstable();
+            let mut ordered = Vec::with_capacity(known.len() + 1);
+            if let Some(r) = parsed.responder {
+                ordered.push(r);
+                reachable.retain(|m| *m != r);
+                awaited.retain(|m| *m != r);
+            }
+            ordered.extend(reachable);
+            ordered.extend(awaited);
+            if ordered.is_empty() {
+                return Err(JoinerLost::of(Fault::BadLink));
+            }
+            ordered.truncate(MAX_JOIN_RESPONDERS);
+            ordered
+        };
+        let prejoin_wire = {
+            let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
+            let ring = self.ring.lock().await;
+            let bundle = ring
+                .bundle(&crate::identity::composite::RootSigner::public_key(signer))
+                .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+            let endpoints = net
+                .local_endpoints()
+                .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+            crate::nat::record::PreJoinRecord::build(
+                signer,
+                &parsed.channel_id,
+                bundle,
+                endpoints,
+                self.seq,
+                self.now,
+            )
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?
+            .to_wire()
+        };
+        announce(&board, &prejoin_wire)
+            .await
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        let mut why: Vec<String> = Vec::new();
+        let mut last_fault = Fault::Unreachable;
+        let mut joined_outcome = None;
+        for responder in candidates {
+            let mut responder_endpoints = set
+                .members
+                .iter()
+                .find(|r| r.author_id == responder)
+                .map(|r| r.endpoints.clone())
+                .unwrap_or_default();
+            if responder_endpoints.is_empty() && board.peer_id() != responder {
+                let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
+                while tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(JOIN_ADDRESS_POLL).await;
+                    let Ok(fresh) = net.fetch_channel(&board, &parsed.channel_id, 0).await else {
+                        continue;
+                    };
+                    let found = fresh
+                        .members
+                        .iter()
+                        .find(|r| r.author_id == responder)
+                        .map(|r| r.endpoints.clone())
+                        .unwrap_or_default();
+                    if !found.is_empty() {
+                        responder_endpoints = found;
+                        set = fresh;
+                        break;
+                    }
+                }
+            }
+            let conn = if board.peer_id() == responder {
+                Arc::clone(&board)
+            } else {
+                match self.dial(responder, &responder_endpoints, false).await {
+                    Ok(c) => {
+                        if let Err(e) = announce(&c, &prejoin_wire).await {
+                            last_fault = fault_of(&e);
+                            if !worth_another_responder(last_fault) {
+                                return Err(JoinerLost {
+                                    fault: last_fault,
+                                    why,
+                                });
+                            }
+                            continue;
+                        }
+                        c
+                    }
+                    Err(e) => {
+                        last_fault = fault_of(&e);
+                        why.push(format!(
+                            "{}: {e}",
+                            crate::node::network::short_id(responder)
+                        ));
+                        if !worth_another_responder(last_fault) {
+                            return Err(JoinerLost {
+                                fault: last_fault,
+                                why,
+                            });
+                        }
+                        continue;
+                    }
+                }
+            };
+            let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
+            let dh = *signer.x25519_identity_secret();
+            let mut ctx = crate::node::channel::join_context_from_genesis(&genesis, 0)
+                .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+            if let Some(pow) = self.pow_params {
+                ctx.pow_params = pow;
+            }
+            let ik = crate::identity::keyagreement::X25519IdentityKey::from_secret_bytes(dh);
+            match net
+                .start_join(&conn, ctx, &self.passphrase, signer, &ik)
+                .await
+            {
+                Ok(o) => {
+                    joined_outcome = Some((o, responder, conn));
+                    break;
+                }
+                Err(e) => {
+                    last_fault = fault_of(&e);
+                    if !worth_another_responder(last_fault) {
+                        return Err(JoinerLost {
+                            fault: last_fault,
+                            why,
+                        });
+                    }
+                }
+            }
+        }
+        let Some((joined, responder, conn)) = joined_outcome else {
+            return Err(JoinerLost {
+                fault: last_fault,
+                why,
+            });
+        };
+        // The room key, sealed under the passphrase with production Argon2id — seconds of CPU,
+        // on a blocking thread and not the actor.
+        let sek = crate::atrest::sek::Sek::generate().map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        let (signer, channel_id, passphrase, argon2) = (
+            Arc::clone(&self.signer),
+            parsed.channel_id,
+            self.passphrase.clone(),
+            self.argon2,
+        );
+        let sealed = tokio::task::spawn_blocking(move || {
+            let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
+            sek.seal(&factor, &channel_id, &passphrase, argon2)
+                .map(|wrap| (sek, wrap))
+        })
+        .await
+        .unwrap_or(Err(Error::Argon2Failed))
+        .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        Ok(JoinerWon {
+            joined,
+            responder,
+            conn,
+            set,
+            genesis,
+            sealed,
+        })
+    }
+}
+
 const fn worth_another_responder(fault: Fault) -> bool {
     !matches!(
         fault,
@@ -1439,6 +1741,19 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
+                    // Joining is answered later for the same reason, and for a longer wait: see
+                    // `begin_join_channel`.
+                    if let NodeCommand::JoinChannel {
+                        link,
+                        local_name,
+                        passphrase,
+                    } = command
+                    {
+                        self.begin_join_channel(link, local_name, passphrase, reply).await;
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
+                        continue;
+                    }
                     let outcome = self.handle(command).await;
                     self.note_if_stalled(name, started);
                     self.publish().await;
@@ -1566,11 +1881,13 @@ impl Node {
             NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id).await,
             NodeCommand::SendText { channel_id, text } => self.send_text(&channel_id, &text).await,
             NodeCommand::Invite { channel_id } => self.invite(&channel_id).await,
-            NodeCommand::JoinChannel {
-                link,
-                local_name,
-                passphrase,
-            } => self.join_channel(&link, &local_name, &passphrase).await,
+            // Answered through `begin_join_channel`, which the run loop calls instead of this; a
+            // join reaching here would have to be answered inline, which is the stall that
+            // function exists to remove.
+            NodeCommand::JoinChannel { .. } => {
+                debug_assert!(false, "JoinChannel is answered by begin_join_channel");
+                Outcome::Failed(Fault::Internal)
+            }
             NodeCommand::Consent { channel_id, target } => self.consent(&channel_id, target).await,
             NodeCommand::Revoke { channel_id, target } => {
                 // A per-room revocation of a **trusted** identity does not hold: the ring
@@ -2394,6 +2711,60 @@ impl Node {
                 // the join's own outcome, which is the right place for it to learn.
                 let _ = ack.send(());
             }
+            NetEvent::Dialed {
+                conn,
+                endpoints,
+                board,
+            } => {
+                let peer = conn.peer_id();
+                self.adopt_connection(Arc::clone(&conn));
+                if let Some(net) = self.net.as_ref().map(Arc::clone) {
+                    if crate::node::net::path_class(net.manager().endpoint(), &conn)
+                        == crate::node::net::PathClass::Relayed
+                    {
+                        let tx = self.net_tx.clone();
+                        self.last_upgrade.insert(peer, self.now());
+                        tokio::spawn(async move {
+                            match net.upgrade(peer, &endpoints).await {
+                                Ok(better) => {
+                                    let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
+                                }
+                                Err(crate::error::Error::LadderExhausted(reason)) => {
+                                    let _ = tx.send(NetEvent::UpgradeFailed { peer, reason }).await;
+                                }
+                                Err(_) => {}
+                            }
+                        });
+                    }
+                }
+                if board {
+                    self.anchor_ids.insert(peer);
+                    self.refresh_network_view().await;
+                }
+            }
+            NetEvent::JoinerDone {
+                reply,
+                parsed,
+                local_name,
+                passphrase,
+                now,
+                me,
+                result,
+            } => {
+                let outcome = match *result {
+                    Ok(won) => {
+                        self.finish_join_channel(*parsed, local_name, passphrase, now, me, won)
+                            .await
+                    }
+                    Err(lost) => {
+                        if !lost.why.is_empty() {
+                            self.say_why_the_join_failed(&lost.why);
+                        }
+                        Outcome::Failed(lost.fault)
+                    }
+                };
+                let _ = reply.send(outcome);
+            }
             NetEvent::ChannelSealed {
                 reply,
                 local_name,
@@ -3068,42 +3439,55 @@ impl Node {
     /// Interval between rounds. A board that is ready costs a joiner one dial.
     const BOARD_RETRY: Duration = Duration::from_millis(250);
 
-    /// A connection to something that can serve this channel's board, trying every route
-    /// this node has and retrying until [`Self::BOARD_PATIENCE`] runs out.
+    /// Join a channel from an invite link (ADR-016 §"Join over the network"): resolve
+    /// the anchor, read the board, announce a pre-join record, run the ADR-005 join,
+    /// then build local channel state and publish our own records.
+    /// Begin joining a room: capture what the join needs here, run the network half and the
+    /// Argon2id seal in a task, and answer through `NetEvent::JoinerDone`.
     ///
-    /// **A room address is a magnet link, and a magnet's trackers are hints, not the only
-    /// route.** This used to try only the anchors embedded in the link, once each, in order,
-    /// and refuse — so one hint that was stale, or merely not listening *yet*, ended the
-    /// join. `invite()` builds that list as [the channel's anchors, the configured set, this
-    /// node last], so a host whose only anchor is itself hands out a link naming only itself;
-    /// a joiner who arrives in the second before that host is accepting gets
-    /// `Failed(Unreachable)` and is told nothing useful. That is what made
-    /// `node_m15_session_from_bundle_gate` fail about two runs in five, on clean `main`,
-    /// long before either of the branches in flight — and it failed in under three seconds
-    /// against a 35-second happy path, which is how a deterministic refusal announces itself.
-    ///
-    /// Two things change. **Every route is tried, not just the link's:** the link's hints
-    /// first, because whoever wrote the link knows where that room lives; then this node's
-    /// configured anchors, which are the routes its operator chose; then any anchor it is
-    /// **already connected to** from an earlier join, which costs nothing to ask. Duplicates
-    /// are dialled once. **And it retries**, because "not yet" and "not there" are different
-    /// answers and only a deadline can tell them apart.
-    ///
-    /// The third tier carries no endpoints, deliberately: this node does not keep an address
-    /// book for anchors it met once, and inventing one here would be a second feature. An
-    /// empty endpoint list is exactly right for a peer that is already connected, because
-    /// `NodeNet::connect` returns the live connection before it looks at addresses — and for
-    /// one that is not, it fails, which is the honest answer.
-    ///
-    /// `None` means no route answered for the whole window, which is a refusal a person
-    /// should see: the room may genuinely have nobody serving it.
-    async fn reach_a_board(
+    /// **The joiner no longer holds its node still.** The whole joiner side ran on the actor —
+    /// reach a board, fetch, a poll of up to `JOIN_ADDRESS_PATIENCE` with `sleep` on the actor,
+    /// dial, announce, the exchange, and the room key sealed with production Argon2id — so a node
+    /// that was joining a room answered nothing else meanwhile: not its other rooms, not its
+    /// control socket, not the responder's own follow-ups. Measured through the real binaries:
+    /// `busy 9829–28943ms — joining a room`. The caller still waits for its join; nobody else does.
+    async fn begin_join_channel(
         &mut self,
-        parsed: &crate::node::link::InviteLink,
-    ) -> Option<Arc<VoxConnection>> {
-        let me = self.net.as_ref()?.local_id();
-        // Ordered, de-duplicated, best hint first. Collected up front so the set does not
-        // shift under the retry loop.
+        link: String,
+        local_name: String,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let parsed = match crate::node::link::InviteLink::parse(&link) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                return;
+            }
+        };
+        let (Some(net), Some(ring)) = (
+            self.net.as_ref().map(Arc::clone),
+            self.prekeys.as_ref().map(Arc::clone),
+        ) else {
+            let _ = reply.send(Outcome::Failed(Fault::NotNetworked));
+            return;
+        };
+        if self.channels.contains_key(&parsed.channel_id) {
+            let _ = reply.send(Outcome::Failed(Fault::IdentityExists));
+            return;
+        }
+        let Some(profile) = self.profile.as_ref() else {
+            let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
+            return;
+        };
+        let Ok(signer) = profile.signer_arc() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let now = self.now();
+        let me = net.local_id();
+        // The boards to try, in the order `reach_a_board` tried them: the link's anchors, this
+        // node's own, then any anchor it already holds a live connection to.
         let mut routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
         let mut seen: std::collections::BTreeSet<Digest32> = [me].into_iter().collect();
         for a in parsed
@@ -3114,334 +3498,87 @@ impl Node {
         {
             routes.push((a.id, a.endpoints.clone()));
         }
-        // Anchors from earlier joins that this node still holds a connection to.
         let live: std::collections::BTreeSet<Digest32> =
-            self.net.as_ref()?.manager().peers().into_iter().collect();
-        let empty = crate::nat::multiaddr::EndpointList::new(Vec::new()).ok()?;
-        let learned: Vec<Digest32> = self
-            .anchor_ids
-            .iter()
-            .copied()
-            .filter(|id| live.contains(id) && seen.insert(*id))
-            .collect();
-        for id in learned {
-            routes.push((id, empty.clone()));
+            net.manager().peers().into_iter().collect();
+        if let Ok(empty) = crate::nat::multiaddr::EndpointList::new(Vec::new()) {
+            for id in self.anchor_ids.iter().copied() {
+                if live.contains(&id) && seen.insert(id) {
+                    routes.push((id, empty.clone()));
+                }
+            }
         }
         if routes.is_empty() {
-            return None;
+            let _ = reply.send(Outcome::Failed(Fault::Unreachable));
+            return;
         }
-
-        let deadline = tokio::time::Instant::now() + Self::BOARD_PATIENCE;
-        loop {
-            for (id, endpoints) in &routes.clone() {
-                if let Ok(conn) = self.dial(*id, endpoints).await {
-                    self.anchor_ids.insert(*id);
-                    self.refresh_network_view().await;
-                    return Some(conn);
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(Self::BOARD_RETRY).await;
-        }
+        let seq = {
+            let entry = self.record_seq.entry(parsed.channel_id).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        let job = Joiner {
+            net,
+            tx: self.net_tx.clone(),
+            me,
+            parsed: parsed.clone(),
+            routes,
+            signer,
+            ring,
+            seq,
+            now,
+            pow_params: self.pow_params,
+            argon2: self.argon2,
+            passphrase: passphrase.clone(),
+        };
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let result = job.run().await;
+            let _ = tx
+                .send(NetEvent::JoinerDone {
+                    reply,
+                    parsed: Box::new(parsed),
+                    local_name,
+                    passphrase,
+                    now,
+                    me,
+                    result: Box::new(result),
+                })
+                .await;
+        });
     }
 
-    /// Join a channel from an invite link (ADR-016 §"Join over the network"): resolve
-    /// the anchor, read the board, announce a pre-join record, run the ADR-005 join,
-    /// then build local channel state and publish our own records.
-    async fn join_channel(&mut self, link: &str, local_name: &str, passphrase: &Secret) -> Outcome {
-        let parsed = match crate::node::link::InviteLink::parse(link) {
-            Ok(p) => p,
-            Err(e) => return Outcome::Failed(fault_of(&e)),
-        };
-        let (Some(net), Some(_)) = (self.net.as_ref().map(Arc::clone), self.prekeys.as_ref())
-        else {
-            return Outcome::Failed(Fault::NotNetworked);
-        };
-        if self.channels.contains_key(&parsed.channel_id) {
-            return Outcome::Failed(Fault::IdentityExists);
-        }
-        let now = self.now();
-        let me = net.local_id();
-        let Some(board) = self.reach_a_board(&parsed).await else {
-            return Outcome::Failed(Fault::Unreachable);
-        };
-        self.refresh_network_view().await;
-        // The board tells us what the channel is and who is in it.
-        let mut set = match net.fetch_channel(&board, &parsed.channel_id, 0).await {
-            Ok(s) => s,
-            Err(e) => return Outcome::Failed(fault_of(&e)),
-        };
-        let Some(genesis) = set.genesis.clone() else {
-            return Outcome::Failed(Fault::BadLink);
-        };
-        // The member to join through: the pinned responder, else any member the board
-        // has an address record for. Its record's endpoints are dial hints — a wrong
-        // one just fails, the identity is pinned — and the ladder does the rest: the
-        // anchor we are connected to is exactly the helper a punch or a circuit
-        // through needs when the responder is behind a NAT too.
-        // **Every member the board knows is a candidate, not just the first one.**
-        //
-        // A link that pins a responder names exactly one, and that is the owner's choice.
-        // A link that pins none used to take `set.members.first()` and stop there, so one
-        // member being offline failed a join that any other member in the room could have
-        // served — and the room looked broken to the person joining it, with nothing to
-        // suggest that trying again later, or from a different link, would behave any
-        // differently.
-        //
-        // The walk is bounded. Each attempt runs the ADR-005 join, and that carries a proof
-        // of work, so an unbounded list would let a room with many members turn one join
-        // into minutes of hashing. `MAX_JOIN_RESPONDERS` is the bound, and an attempt is
-        // only retried when the fault says *this responder* could not serve it.
-        // **Sorted, because the board's order is not an order.** The members come from a
-        // `HashMap`'s `values()`, so which one a join reached was effectively random — and with
-        // no fallback, a room with one offline member failed joins at a rate nobody could
-        // reproduce and a retry could "fix" by chance. Sorting by fingerprint makes the walk the
-        // same every time, so a join that fails fails for a reason.
-        //
-        // **And a pinned responder is a preference, not the only candidate.** That fallback was
-        // added for exactly the reason above and then applied to only one of the two branches: a
-        // link naming a responder still produced a list of length one, so an invite whose author
-        // had since gone offline took the whole room down for the joiner while the anchor sat
-        // there reachable. Measured, with the node naming it rather than a timeout implying it:
-        // `bob's join outcome: Failed(Unreachable)` beside
-        // `Stalled { what: "joining a room", millis: 10005 }` — the whole dial budget spent on
-        // the one peer the link happened to name, and no second attempt.
-        //
-        // The pin is still tried first: whoever minted the link knows who is expected to answer.
-        //
-        // **Every member the board knows, not only the ones it has an address for.** The list was
-        // built from `set.members`, which is the *address records* — so a member the board knew by
-        // its **bundle**, or the **creator named by the genesis**, was not a candidate at all. The
-        // patience loop below exists precisely to wait for an address record that has not arrived
-        // yet, and a member in that state could never reach it: it was filtered out one step
-        // earlier, by the very condition the loop was written to tolerate.
-        //
-        // That is how a room with a live host became unjoinable. Measured, with the joiner naming
-        // what it tried: one candidate, both its paths dead, and the host — online, on loopback,
-        // the genesis creator — never in the list, because its address record had been refused on
-        // the anchor while its identity was never in question. The genesis is the one record whose
-        // author cannot be in doubt: its hash *is* the channelID, and it names the creator.
-        //
-        // **Ordered so that a member we can reach is tried before one we would have to wait for.**
-        // Mixing them without that gives a 20s `JOIN_ADDRESS_PATIENCE` stall in front of a peer
-        // that was dialable immediately, which is the cost this widening would otherwise add.
-        let candidates: Vec<crate::hash::Digest32> = {
-            use std::collections::BTreeSet;
-            let with_address: BTreeSet<crate::hash::Digest32> = set
-                .members
-                .iter()
-                .filter(|r| !r.endpoints.is_empty())
-                .map(|r| r.author_id)
-                .collect();
-            let mut known: BTreeSet<crate::hash::Digest32> =
-                set.members.iter().map(|r| r.author_id).collect();
-            known.extend(set.bundles.iter().map(|b| b.author_id));
-            if let Some(g) = set.genesis.as_ref() {
-                known.insert(g.body.creator_pubkey.fingerprint());
-            }
-            // Never ourselves: a node does not join a room by asking itself to answer.
-            known.remove(&me);
-            let mut reachable: Vec<crate::hash::Digest32> =
-                known.intersection(&with_address).copied().collect();
-            let mut awaited: Vec<crate::hash::Digest32> =
-                known.difference(&with_address).copied().collect();
-            reachable.sort_unstable();
-            awaited.sort_unstable();
-            let mut ordered = Vec::with_capacity(known.len() + 1);
-            if let Some(r) = parsed.responder {
-                ordered.push(r);
-                reachable.retain(|m| *m != r);
-                awaited.retain(|m| *m != r);
-            }
-            ordered.extend(reachable);
-            ordered.extend(awaited);
-            if ordered.is_empty() {
-                return Outcome::Failed(Fault::BadLink);
-            }
-            ordered.truncate(MAX_JOIN_RESPONDERS);
-            ordered
-        };
-
-        // The pre-join record does not depend on which member answers, so it is built once
-        // and announced to the board once, before any of them is reached (ADR-016): on the
-        // anchor it is what lets the anchor coordinate a punch or carry a circuit for us,
-        // and on the responder it is what authorizes the join stream.
-        let prejoin_wire = {
-            let Some(profile) = self.profile.as_ref() else {
-                return Outcome::Failed(Fault::NoIdentity);
-            };
-            let Ok(signer) = profile.signer() else {
-                return Outcome::Failed(Fault::Locked);
-            };
-            let ring = match self.prekeys.as_ref() {
-                Some(r) => r.lock().await,
-                None => return Outcome::Failed(Fault::NotNetworked),
-            };
-            let bundle =
-                match ring.bundle(&crate::identity::composite::RootSigner::public_key(signer)) {
-                    Ok(b) => b,
-                    Err(e) => return Outcome::Failed(fault_of(&e)),
-                };
-            let endpoints = match net.local_endpoints() {
-                Ok(e) => e,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            };
-            let seq = {
-                let entry = self.record_seq.entry(parsed.channel_id).or_insert(0);
-                *entry = entry.saturating_add(1);
-                *entry
-            };
-            match crate::nat::record::PreJoinRecord::build(
-                signer,
-                &parsed.channel_id,
-                bundle,
-                endpoints,
-                seq,
-                now,
-            ) {
-                Ok(r) => r.to_wire(),
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            }
-        };
-        if let Err(e) = announce(&board, &prejoin_wire).await {
-            return Outcome::Failed(fault_of(&e));
-        }
-
-        let mut why: Vec<String> = Vec::new();
-
-        let mut last_fault = Fault::Unreachable;
-        let mut joined_outcome = None;
-        for responder in candidates {
-            let mut responder_endpoints = set
-                .members
-                .iter()
-                .find(|r| r.author_id == responder)
-                .map(|r| r.endpoints.clone())
-                .unwrap_or_default();
-            // **An address we do not know yet is not an address that does not exist.**
-            //
-            // `unwrap_or_default()` above yields an *empty* endpoint list when the responder
-            // has no address record on this board, and dialling an empty list fails at once —
-            // which this returned to the caller as `Fault::Unreachable`, in under three
-            // seconds, for a member who was online and perfectly reachable. It made
-            // `node_m15_session_from_bundle_gate` fail about two runs in five on clean `main`.
-            //
-            // Measured, not deduced. On a failing run the board held `members=1, bundles=2`:
-            // the responder's *bundle* record had arrived but its *address* record had not.
-            // The two propagate separately, so a joiner who arrives in that window sees a
-            // member it has a key for and no way to reach — and concluded the member was
-            // unreachable.
-            //
-            // A deadline is what separates "not yet" from "not there", which is the same
-            // distinction `up::reach_host_with_patience` draws for a service host, and the
-            // same one every peer-to-peer client draws when a peer list is incomplete: keep
-            // asking the source, do not conclude absence from silence.
-            if responder_endpoints.is_empty() && board.peer_id() != responder {
-                let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
-                while tokio::time::Instant::now() < deadline {
-                    tokio::time::sleep(JOIN_ADDRESS_POLL).await;
-                    let Ok(fresh) = net.fetch_channel(&board, &parsed.channel_id, 0).await else {
-                        continue;
-                    };
-                    let found = fresh
-                        .members
-                        .iter()
-                        .find(|r| r.author_id == responder)
-                        .map(|r| r.endpoints.clone())
-                        .unwrap_or_default();
-                    if !found.is_empty() {
-                        // Take the fresher board too: it is a superset by construction, and
-                        // the records that arrived alongside the address are ones we are
-                        // about to want.
-                        responder_endpoints = found;
-                        set = fresh;
-                        break;
-                    }
-                }
-            }
-
-            let conn = if board.peer_id() == responder {
-                Arc::clone(&board)
-            } else {
-                match self.dial(responder, &responder_endpoints).await {
-                    Ok(c) => {
-                        if let Err(e) = announce(&c, &prejoin_wire).await {
-                            last_fault = fault_of(&e);
-                            if !worth_another_responder(last_fault) {
-                                return Outcome::Failed(last_fault);
-                            }
-                            continue;
-                        }
-                        c
-                    }
-                    Err(e) => {
-                        last_fault = fault_of(&e);
-                        // **Every rung's verdict, not the fault token.** `Outcome::Failed(Fault)` is
-                        // one word with no room for a reason, so a join that could not be carried
-                        // reported `Unreachable` and nothing else — and "that member is offline",
-                        // "no helper would relay" and "the board has not caught up" are three
-                        // different problems that all render as that one word.
-                        why.push(format!(
-                            "{}: {e}",
-                            crate::node::network::short_id(responder)
-                        ));
-                        if !worth_another_responder(last_fault) {
-                            self.say_why_the_join_failed(&why);
-                            return Outcome::Failed(last_fault);
-                        }
-                        continue;
-                    }
-                }
-            };
-
-            let Some(profile) = self.profile.as_ref() else {
-                return Outcome::Failed(Fault::NoIdentity);
-            };
-            let Ok(signer) = profile.signer() else {
-                return Outcome::Failed(Fault::Locked);
-            };
-            let dh = *signer.x25519_identity_secret();
-            let mut ctx = match crate::node::channel::join_context_from_genesis(&genesis, 0) {
-                Ok(c) => c,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            };
-            if let Some(pow) = self.pow_params {
-                ctx.pow_params = pow;
-            }
-            let ik = crate::identity::keyagreement::X25519IdentityKey::from_secret_bytes(dh);
-            match net.start_join(&conn, ctx, passphrase, signer, &ik).await {
-                Ok(o) => {
-                    joined_outcome = Some((o, responder, conn));
-                    break;
-                }
-                Err(e) => {
-                    last_fault = fault_of(&e);
-                    if !worth_another_responder(last_fault) {
-                        return Outcome::Failed(last_fault);
-                    }
-                }
-            }
-        }
-        let Some((joined, responder, conn)) = joined_outcome else {
-            self.say_why_the_join_failed(&why);
-            return Outcome::Failed(last_fault);
-        };
-
-        // Local state for the channel we just joined.
+    /// Everything after the join exchange: make the room from the sealed key, record how this
+    /// node was admitted, learn who else is in it, and publish — the part that has to be on the
+    /// actor, and was the tail of the old inline `join_channel`.
+    async fn finish_join_channel(
+        &mut self,
+        parsed: crate::node::link::InviteLink,
+        local_name: String,
+        passphrase: Secret,
+        now: u64,
+        me: Digest32,
+        won: JoinerWon,
+    ) -> Outcome {
+        let JoinerWon {
+            joined,
+            responder,
+            conn,
+            set,
+            genesis,
+            sealed,
+        } = won;
         let channel = {
             let Some(profile) = self.profile.as_ref() else {
                 return Outcome::Failed(Fault::NoIdentity);
             };
-            match ChannelState::join_channel_with_profile(
+            match ChannelState::join_channel_from_sealed(
                 profile,
                 &genesis,
                 &parsed.channel_id,
-                local_name,
-                passphrase,
+                &local_name,
+                &passphrase,
                 now,
-                self.argon2,
+                sealed,
             ) {
                 Ok(c) => c,
                 Err(e) => return Outcome::Failed(fault_of(&e)),

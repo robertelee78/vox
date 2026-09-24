@@ -1084,11 +1084,37 @@ impl ChannelState {
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
+        Self::join_checks(profile, genesis, channel_id, local_name)?;
+        let sek = Sek::generate()?;
+        let signer = profile.signer()?;
+        let factor = SignatureIdentityFactor::new(signer);
+        let wrap = sek.seal(&factor, channel_id, channel_passphrase, argon2)?;
+        Self::join_channel_from_sealed(
+            profile,
+            genesis,
+            channel_id,
+            local_name,
+            channel_passphrase,
+            now_secs,
+            (sek, wrap),
+        )
+    }
+
+    /// What must hold before a joined room is made: a name within the limit, an unlocked signer,
+    /// a genesis that verifies and names this room, and no copy of the room already in the profile.
+    ///
+    /// # Errors
+    /// The first of those that does not hold.
+    pub fn join_checks(
+        profile: &Profile,
+        genesis: &Genesis,
+        channel_id: &Digest32,
+        local_name: &str,
+    ) -> Result<()> {
         if local_name.len() > MAX_LOCAL_NAME_LEN {
             return Err(Error::SizeLimitExceeded("channel local name"));
         }
-        let signer = profile.signer()?;
-        let me = signer.fingerprint();
+        profile.signer()?;
         genesis.verify()?;
         if genesis.channel_id() != *channel_id {
             return Err(Error::MalformedGovernance(
@@ -1098,10 +1124,29 @@ impl ChannelState {
         if profile.store().get_sek_wrap(channel_id)?.is_some() {
             return Err(Error::Profile("this channel is already in the profile"));
         }
+        Ok(())
+    }
+
+    /// Make a joined room from a room key already sealed under the passphrase — the slow step,
+    /// which the node runs off its actor. The checks of [`ChannelState::join_checks`] are repeated
+    /// here, because time passed while the seal ran.
+    ///
+    /// # Errors
+    /// A failed check, a segment that cannot be sealed, or a store write that fails.
+    pub fn join_channel_from_sealed(
+        profile: &Profile,
+        genesis: &Genesis,
+        channel_id: &Digest32,
+        local_name: &str,
+        channel_passphrase: &[u8],
+        now_secs: u64,
+        sealed: (Sek, crate::atrest::SekWrap),
+    ) -> Result<Self> {
+        Self::join_checks(profile, genesis, channel_id, local_name)?;
+        let (sek, wrap) = sealed;
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
         let epoch = 0u64;
-        let sek = Sek::generate()?;
-        let factor = SignatureIdentityFactor::new(signer);
-        let wrap = sek.seal(&factor, channel_id, channel_passphrase, argon2)?;
         let sender = SenderChain::new(channel_id, epoch, &me, 0, now_secs)?;
         let mut origins = OriginKeyStore::new();
         retain_generation(&mut origins, channel_id, epoch, &me, &sender, now_secs)?;

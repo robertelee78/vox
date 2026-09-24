@@ -460,16 +460,32 @@ pub async fn run_initiator(
 
     // 2. SOLVE — `join_initiate` verifies the signature, the binding and the
     //    difficulty cap before grinding, then solves and starts CPace.
-    let (initiator, token, share) = join_initiate(
-        ctx,
-        passphrase,
-        &sid,
-        &challenge,
-        &responder_pub,
-        &challenge_sig,
-        root,
-        ik,
-    )?;
+    //
+    //    **Ground off the runtime's worker.** The solve is Equihash — seconds of CPU — and this is
+    //    an async function, so it ran on one of the daemon's two runtime workers and took it away
+    //    from everything else scheduled there: measured through the real binary, a `vox room list`
+    //    issued during a join waited 0.8–17.5s, tracking the join's own length, although it needs
+    //    nothing but the published view. `block_in_place` moves this worker's other tasks elsewhere
+    //    for the duration. It panics on a current-thread runtime, which grinds inline as before.
+    let grind = || {
+        join_initiate(
+            ctx,
+            passphrase,
+            &sid,
+            &challenge,
+            &responder_pub,
+            &challenge_sig,
+            root,
+            ik,
+        )
+    };
+    let (initiator, token, share) = if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(grind)?
+    } else {
+        grind()?
+    };
     send_frame(
         &mut send,
         &JoinFrame::Solve {
