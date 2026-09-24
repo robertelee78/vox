@@ -1,6 +1,7 @@
 # ADR-020: Agent comms — a room-based messaging app on the Vox layer
 
-**Status**: **partly implemented** — 2026-09-21. Twelve decisions; the plan below marks each
+**Status**: **partly implemented** — 2026-09-21; the claim protocol of §5 corrected and extended by
+ADR-021, built 2026-09-24. Twelve decisions; the plan below marks each
 milestone `DONE` with the commit that landed it, or leaves it unmarked. Nothing here is marked done
 that has not passed a gate.
 
@@ -310,12 +311,12 @@ A **suggested work vocabulary** shipped as convention (not enforced): `assign`, 
 `working`, `blocked`, `result`, `failed`, `status`, `ask`, `answer`, `ack`. It is shaped to map onto
 A2A's `TaskState` so a future bridge is mechanical.
 
-> **Amended by ADR-021 (proposed 2026-09-23, not built).** For any message carrying a work-item reference
+> **Amended by ADR-021 (built 2026-09-24).** For any message carrying a work-item reference
 > (`data.work`), ADR-021 §3 gives each of these types a normative meaning. In particular, `result` is an
 > assertion rather than an acceptance verdict, Release ready or Done, and `release` is neither Done nor
 > failure. `blocked` is a Health observation and never a Work phase. ADR-021 also makes a
-> worker's Vox version a session-static fact that rides `hello` (`data.vox`, §5). `status` appears in
-> this list but not yet in the code (ADR-021 F7).
+> worker's Vox version a session-static fact that rides `hello` (`data.vox`, §5). `status` is now in
+> the code as well as this list (ADR-021 F7, closed).
 
 ### 5. Work assignment is a claim, and the log resolves it
 
@@ -337,8 +338,8 @@ Resolution rules, which every node **MUST** apply identically so the answer conv
 This is deliberately a *convention over the open tail* of §4, not new protocol: the log already
 provides the total order and the deterministic tie-break key.
 
-> **Amended by ADR-021 §4–§6 (proposed 2026-09-23, not built).** The rules above stay what the shipped
-> binary does. ADR-021 replaces them with one corrected claim protocol that keeps these type names:
+> **Amended by ADR-021 §4–§6 (built 2026-09-24).** The rules above are what the binary did through
+> v0.2.7. ADR-021 replaces them with one corrected claim protocol that keeps these type names:
 > - **ownership is `(author fingerprint, session)`**, not the harness key;
 > - **a `handoff` names the recipient's fingerprint** (`data.to_fp`), because a petname is local and
 >   rule 4 therefore cannot converge. It makes the resource **pending** for that recipient, with a
@@ -348,6 +349,10 @@ provides the total order and the deterministic tie-break key.
 > - every operation carries an **operation id**, where a conflict voids the operation, and a **version
 >   stamp**. Workers on different Vox versions refuse to coordinate rather than fold under different
 >   rules.
+>
+> A handoff's recipient is named on the CLI by a room member's fingerprint (or a unique prefix of one),
+> resolved once by the sender against the room's roster — the keyring's petnames are reachable over the
+> control socket only with the identity passphrase (ADR-021 §4 amendment).
 
 **Reachability — a gap found 2026-09-21 and not yet closed.** Everything above has existed in
 `crates/vox-agentcomms` since M19.3 and **nothing in the shipped binary called any of it**:
@@ -761,6 +766,13 @@ Both unknowns are already spiked; neither remains open.
 - **M19.4 — CLI and skill. DONE 2026-09-22.** `vox room post|read|tail|roster|list`, and
   `vox agent skill` prints the skill for an operator to install where their harness looks.
 
+  > **Named defect, found and fixed 2026-09-24 (ADR-021 F13) — `tail` never showed another member's
+  > message.** The node emits `NewEntry` only for its own appends; an entry synced from a peer is
+  > announced as `Synced`, which carries no row, and `tail` listened only for `NewEntry`. Every `tail`
+  > since this milestone showed the node's own posts and nothing else. `tail` now treats `Synced`,
+  > `SenderKeyReceived` and `Lagged` as wakes and re-reads the room — §6's own rule, that any push is
+  > only a wake. Proved by `adapter_stream_proof`'s liveness assertion, which the old behaviour fails.
+
   Two planned verbs were **not** built and are not missing: `wait` is what the drain hook does
   mechanically every turn, so a verb telling an agent to block would compete with it; and `say` is
   `post`, because §4 already makes plain text a `say` — a second verb for the same act would only
@@ -840,8 +852,10 @@ Both unknowns are already spiked; neither remains open.
   > `claim::resolve`, which resolves no recipient (`room_cli.rs:409` → `claim.rs:182-184`). A handoff
   > therefore never moves ownership. `work_board_proof.rs` does not exercise handoff, so the gate above
   > stayed green. Resolving by petname would not converge either, because petnames are local. Recorded
-  > as ADR-021 F1–F3, with per-session ownership, and to be fixed by ADR-021 M21.2: a handoff carries
-  > the recipient's fingerprint and leaves the resource pending until an eligible session claims it.
+  > as ADR-021 F1–F3, with per-session ownership. **Fixed by ADR-021 M21.2, 2026-09-24:** a handoff
+  > carries the recipient's fingerprint and leaves the resource pending until an eligible session
+  > claims it; `work_handoff_proof` runs every handoff case through the binary on two nodes and
+  > compares their folded boards.
 
   > **Ordering closed, 2026-09-24.** The gate above passed while the ordering underneath it was
   > wrong one time in three: §5's one-second `created_secs` put the entry-hash tie-break in the
@@ -892,6 +906,13 @@ Both unknowns are already spiked; neither remains open.
   verified path to its app-server socket from a hook's environment, so waking it reports plainly
   that it cannot, and the message waits for the session's next turn. That is the correct
   degradation, because queueing always is the default and the interrupt is the optimisation.
+
+  > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, not reproduced.** `vox daemon`
+  > decides on `NodeEvent::NewEntry`, which the node emits only for its **own** appends (ADR-021 F13's
+  > evidence), so an urgent message addressed to a session from *another* node would never interrupt
+  > it. The gate above calls the wake decision directly and never runs the daemon's loop, so it could
+  > not see this. Open; remove when an urgent, addressed message posted on one node interrupts a session
+  > registered on another, through `vox daemon`.
 
 - **M19.8 — file exchange. DONE 2026-09-22** (§11). `vox room send` offers a file over a room-bound
   service and posts the signed announcement carrying the name, the size, the SHA-256 and the service

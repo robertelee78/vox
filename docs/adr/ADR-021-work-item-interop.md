@@ -1,8 +1,10 @@
 # ADR-021: Work-item interop — the contract Vox exposes to an external work tracker
 
-**Status**: **proposed** — 2026-09-23, revised the same day. Design and plan only. **Nothing in this ADR
-is built.** Every statement about the tree describes `main` at `0590cdc` (v0.2.4). Every statement about
-the contract describes what is to be built.
+**Status**: **implemented** — 2026-09-24, M21.1–M21.8, each proved through the shipped `vox` binary and
+mutation-checked; the plan below names the proof, its mutations and the commit for each. Vox holds no
+work state: an external tracker owns it. **Three open defects** found while building this sit outside its
+boundary and are recorded rather than accepted — F12 and F14 in `vox-core`, F15 in the daemon's
+interrupt path. Statements about the tree before this change describe `main` at `96c47ed` (v0.2.7).
 **Date**: 2026-09-23
 **Updated**: 2026-09-23 — the decider's decisions on a review of the first version:
 - an **enforced, exact version match** among workers replaces any mixed-version support (§5);
@@ -13,6 +15,12 @@ the contract describes what is to be built.
 
 **Updated**: 2026-09-24 — tracker vocabulary and ownership were clarified without changing the wire
 format: Vox observations remain optional inputs to a client-independent external tracker.
+
+**Updated**: 2026-09-24 — **implemented**, with three amendments forced by the tree and each recorded in
+place: a handoff's recipient is resolved against the room roster, not the keyring (§4); a participating
+verb announces before it checks, and a worker excludes itself from the version table (§5); and `from` is
+the session id, never `VOX_AGENT_NAME` (§7). Implementation also found F13 — `tail` had never delivered
+another member's message — and fixed it, and found F12, F14 and F15, which are open.
 
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, interop, work-tracking, adapter, envelope, claims, versioning, defects
@@ -100,6 +108,26 @@ ADR is built. **F1 contradicts a milestone ADR-020 marks DONE**, and is noted in
 
 F1–F6 and F11 are prerequisites of this contract. F7–F10 are not, and are fixed alongside because they
 are small and sit on the same surface.
+
+**Re-verified 2026-09-24 against `main` at `96c47ed` (v0.2.7)**, before any of this ADR was built: all
+eleven still held. v0.2.7 changed the claim sort key from seconds to milliseconds and nothing else in
+these paths — `read_board` still folded with `claim::resolve`, whose resolver resolves nobody (F1–F2);
+the owner check was still `own.owner == client.me()` (F3); `post_claim_op` still built `Envelope::new`
+(F4); no verb had `--json` (F5); `tail` still subscribed only (F6); `envelope::work` still had no
+`STATUS` (F7); the drain hook compared neither author nor session (F8); the `--since` help still said 64
+characters (F9); the index still said ADR-020 was "not started" (F10); and no claim carried a version
+(F11). **Each is closed by this ADR's implementation**, milestone by milestone below.
+
+**Found while implementing, 2026-09-24.** Four more, each reproduced rather than inferred except where
+it says so. Two are in `vox-core` and outside this ADR's boundary; they are recorded as **open
+defects**, not accepted gaps, because each is a thing a user meets.
+
+| # | Defect | Evidence | State |
+|---|---|---|---|
+| F12 | **In a room of three, the two members who joined cannot read each other.** | Three in-process nodes on loopback, no anchor: alice creates, bob and carol join, all six `Trust` edges applied; after 60 s, `bob never received the sender key of ["carol"]`. Creator↔joiner keys arrive. `node_m19_untrust_lock_gate` stays green only because none of its joiners reads another joiner. It looks like the gap the ADR index already lists — "re-keying for a member first met off the join path" — but that is not confirmed. | **Open** (`vox-core` key distribution). The ADR-021 proofs therefore run on two nodes with several sessions each, and say why. Remove this entry when a three-member room in which each joiner reads the other passes through the real binaries. |
+| F13 | **`vox room tail` never showed another member's message.** | The node emits `NewEntry` only for its own appends; a synced entry is announced as `Synced`, which carries no row, and `tail` listened only for `NewEntry`. Reproduced: bob's `read` count rose while his `tail` printed nothing, in plain mode as well as `--json`. | **Fixed here** (§7 amendment); `adapter_stream_proof` asserts rows synced from another node reach a *live* consumer, and turns red against the old behaviour. |
+| F14 | **A member cannot post to a room again after about its 1,000th message.** | Two in-process nodes on loopback; each posts 1,100 messages through the control socket: posts 0–998 succeed and 999–1,099 all return `Failed(Internal)`, 101 of 101, on both nodes, with no network involved. `ROTATE_AFTER_MESSAGES` is 1,000 and `send_text` discards a rotation's error (`rotate_sender(..).is_ok()`); which call then fails every append has **not** been traced. | **Open** (`vox-core`, ADR-006 rotation). `adapter_stream_proof` caps each member at 900 messages and says why. Remove this entry when a member posts 2,000 messages to one room through the real binary and every post succeeds. |
+| F15 | **The daemon's interrupt path sees only this node's own posts.** | Found by reading, **not reproduced**: `vox daemon` wakes a session on `NodeEvent::NewEntry` (`app.rs`), which by F13's evidence is emitted only for local appends, so an urgent message addressed to a session from *another* node would never interrupt it. `interrupt_proof` calls the wake decision directly and never runs that loop, so nothing would catch it. | **Open** (ADR-020 §6's interrupt half; outside ADR-021). Remove when an urgent, addressed message posted on one node interrupts a session registered on another, through `vox daemon`. |
 
 ## Decision
 
@@ -197,7 +225,8 @@ consumer what the others mean. Three things are kept apart, as the decider asked
 ### 4. The claim protocol
 
 **There is one claim protocol.** It keeps ADR-020 §5's type names (`claim`, `release`, `handoff`) and
-its canonical order, `(created_secs, entry_hash)`. It corrects §5 in the ways below, and adds `renew`
+its canonical order, `(created_millis, entry_hash)` — milliseconds since v0.2.7 (ADR-020 §5, M19.9).
+It corrects §5 in the ways below, and adds `renew`
 and a resource-scoped `decline`. The decider rejected a second vocabulary kept for older binaries: older
 binaries are excluded by §5 instead.
 
@@ -216,12 +245,13 @@ proven, as in ADR-020 §2. The revocation grain remains the harness key.
 - `Pending { from: (fp, session), to_fp, to_session, deadline }`.
 
 **The rules are evaluated in canonical order. Before each operation, lapses are applied first:** a
-`Held` whose `expires ≤ op.created_secs` becomes `Free`, and a `Pending` whose `deadline ≤
-op.created_secs` becomes `Free`.
+`Held` whose `expires ≤ op.created_millis` becomes `Free`, and a `Pending` whose `deadline ≤
+op.created_millis` becomes `Free`. Every lease and deadline is kept in milliseconds (`ttl_secs × 1000`);
+nothing orders by seconds.
 
 1. **`claim`**:
-   - on `Free`: → `Held` by `(author, from)`. `acquisition` is this entry. `expires = created_secs +
-     ttl_secs` if a TTL was given, otherwise `None`.
+   - on `Free`: → `Held` by `(author, from)`. `acquisition` is this entry. `expires = created_millis +
+     ttl_secs × 1000` if a TTL was given, otherwise `None`.
    - on `Held`: no effect. The claimant lost.
    - on `Pending`: from an **eligible recipient** (below), → `Held` by `(author, from)`, with this entry
      as the new acquisition and its own TTL. **This completes the handoff.** From anyone else: no
@@ -230,10 +260,19 @@ op.created_secs` becomes `Free`.
    A pending handoff cannot be released: the sender has already relinquished, and the recipient uses
    `decline`.
 3. **`handoff`**: on `Held`, only from the exact owner, → `Pending`. `data.to_fp` is REQUIRED: the
-   recipient's composite fingerprint, resolved by the **sender** from its own keyring at posting time,
-   which fixes F1 and F2. `data.to_session` is OPTIONAL, and `data.to` (a petname) is kept for display
-   only.
-   - `deadline = created_secs + data.ttl_secs`. **`ttl_secs` is REQUIRED on a handoff**, so every pending
+   recipient's composite fingerprint, resolved **once, by the sender**, at posting time, which fixes F1
+   and F2. `data.to_session` is OPTIONAL, and `data.to` (what the sender typed) is kept for display only.
+
+   > **Amended 2026-09-24, during implementation.** This section said the sender resolves the recipient
+   > "from its own keyring". Measured against the tree, that cannot be done by a CLI verb: the keyring's
+   > petnames are reachable over the control socket only through `TrustList`, which is gated on the
+   > identity passphrase (`verify_operator`, `ipc.rs`), and an agent session never holds that
+   > passphrase (ADR-020 §8). So `vox room handoff --to` takes a room member's **fingerprint, or a unique
+   > prefix of one**, and resolves it against the room's roster (`Request::Roster`, ungated). What the
+   > design required — resolution once, by the sender, to a fingerprint no reader re-resolves — is
+   > unchanged; only the lookup table differs. Petname lookup is a convenience left for a later surface
+   > that has the passphrase.
+   - `deadline = created_millis + data.ttl_secs × 1000`. **`ttl_secs` is REQUIRED on a handoff**, so every pending
      handoff has a finite deadline, including when the original claim had none. The CLI stamps a default
      of 3600 s explicitly, so the fold never has to assume one.
    - **The holding's expiry is replaced, not inherited.** A nearly lapsed claim would otherwise hand the
@@ -246,7 +285,7 @@ op.created_secs` becomes `Free`.
    - `data.acquisition` equals the current holding's `acquisition`;
    - the holding has a TTL.
 
-   The effect: `expires = renew.created_secs + ttl`, where `ttl` is the acquiring claim's. Otherwise it
+   The effect: `expires = renew.created_millis + ttl × 1000`, where `ttl` is the acquiring claim's. Otherwise it
    has no effect and is reported as a stale renewal.
 
    The lapse check runs first, so a renewal that sorts after the holding expired finds the resource
@@ -258,8 +297,9 @@ to_session)`**. Another session of the same harness can neither accept nor decli
 without one, **any session of `to_fp`** is eligible. The first eligible `claim` or `decline` in
 canonical order decides, so one session declining frees the item for all of them: the harness declined.
 
-**The known limit is unchanged.** Resolution is deterministic but not causal within one second, as
-ADR-020 §5 records. Every node on one version computes the same state. That state need not match the
+**The known limit is unchanged in kind.** Resolution is deterministic but not causal between authors:
+two agents' entries have no causal edge in the log (ADR-008 gives no cross-author parent), and a tie in
+`created_millis` is broken by entry hash, as ADR-020 §5 records. Every node on one version computes the same state. That state need not match the
 order in which things happened in wall-clock time.
 
 ### 5. Workers must run the same Vox version, enforced
@@ -303,6 +343,22 @@ participant's version is mismatched, missing or unknown.
   when the session has not announced, so the gate does not depend on a client hook. A drain hook **MAY**
   announce earlier as a convenience. It is one message per session, which is what ADR-020 §4 reserves
   `hello` for, and it is not per-turn chatter.
+
+  > **Two rules added 2026-09-24, during implementation — both needed for the gate to be usable.**
+  >
+  > - **Announce first, then check.** A verb that checked before announcing would, after the operator
+  >   upgraded every worker, see only the others' *old-version* messages and refuse — and so would every
+  >   other worker, and nobody would ever announce. So a participating verb posts its stamped `hello`
+  >   when this session has not announced, **then** builds the version table. The first upgraded worker
+  >   to act may still be refused (the others have not announced yet); the second sees the first's new
+  >   version, and coordination resumes with nobody running a command for it.
+  > - **A worker excludes its own fingerprint** from the table. Its own earlier messages carry the
+  >   version it ran *before* an upgrade, and they must not make it refuse itself; its version is by
+  >   definition the one it runs.
+  >
+  > The drain hook does **not** announce: the MAY above is not exercised, because an announcement on
+  > the hook would put a `hello` from every session of every harness into every other agent's context,
+  > and the participating verbs already make the gate independent of any hook.
 - **What enforcement means.** When the version table holds any participant that does not match:
   - every claim-protocol verb (`claim`, `renew`, `handoff`, `release`, `decline`) and every `post
     --work` **MUST** refuse before posting and exit with status 3;
@@ -384,7 +440,18 @@ all over the existing control socket, and no new socket request**:
    row as it lands, **with no gap across a lag or a restart**. Internally:
    - subscribe first, then `Read { since }`;
    - emit the read rows, then the live rows, dropping duplicates by entry hash;
-   - on `Lagged`, re-read from the last emitted hash.
+   - on `Lagged`, re-read.
+
+   > **Amended 2026-09-24: an event is a wake, never the data (F13).** Implementation found that the
+   > node emits `NewEntry` **only for its own appends** (`actor.rs` `send_text`). An entry that arrives
+   > from another member by sync is announced as `Synced { channel_id, applied, rendered }`, and one made
+   > readable by a sender key as `SenderKeyReceived` — neither carries the row. `tail` listened only for
+   > `NewEntry`, so since M19.4 it has shown this node's own posts and **never another member's**. It
+   > now treats `Synced`, `SenderKeyReceived` and `Lagged` for the room as wakes: it re-reads the room
+   > and emits every row it has not emitted. The re-read is whole-room rather than `since <last>`,
+   > because an entry rendered late — its key arrived after it did — is not guaranteed to sit after the
+   > last one emitted. This is ADR-020 §6's own rule ("the log is the delivery mechanism; any push is
+   > only a wake") applied to the stream. On `Lagged`, `tail` also says so on stderr.
 
    Duplicates across a restart are permitted; **gaps are not**. The adapter owns the cursor and persists
    it after processing, as the drain hook does.
@@ -392,36 +459,59 @@ all over the existing control socket, and no new socket request**:
 
    ```json
    { "schema": "vox.room.row/1", "room": "<b32>", "entry_hash": "<b32>",
-     "author": "<fingerprint b32>", "created_secs": 1790000000,
+     "author": "<fingerprint b32>", "created_millis": 1790000000000,
      "text": "<raw>", "envelope": { … } | null, "parse_error": "…" | null,
      "op": { "id": "…", "status": "ok" | "duplicate" | "conflict",
              "group": ["<entry hash>", …] } | null }
    ```
 
    - Rows are in the node's local timeline order, **which is not the canonical order**, and the schema
-     says so. A consumer needing a total order sorts by `(created_secs, entry_hash)`.
+     says so. A consumer needing a total order sorts by `(created_millis, entry_hash)`.
+   - `op.status` is judged against everything the node holds: `ok` for the canonical first entry of an
+     agreeing group, `duplicate` for a later one, `conflict` for every entry of a disagreeing group.
    - When a newly landed row turns an operation into a conflict, the stream **MUST** also re-emit every
      earlier row of that group with `status: conflict`. A consumer therefore learns of the change from
      the stream alone.
-   - `--work REF` and `--type T` **MAY** filter on the client side.
+   - `--work REF` and `--type T` **MAY** filter on the client side. None was built: the consumer
+     filters, and a filter in `tail` would be one more place for a tracker to lose a row.
 3. **The folded board**: `vox room board ROOM --json`. It reports:
    - per resource: `state` (`held` or `pending`); `owner_fp`, `owner_session`, `acquisition`,
-     `since_secs`, `expires_secs`; or `to_fp`, `to_session`, `deadline_secs`;
+     `since_millis`, `ttl_secs`, `expires_millis`, `mine`; or `from_fp`, `from_session`, `to_fp`,
+     `to_session`, `to_name`, `handoff`, `since_millis`, `deadline_millis`, `eligible`;
    - `coordination` (`ok` or `refused`) with the version table (§5);
    - `violations`: invalid operations, stale renewals, conflicts, and operations from other versions that were ignored;
-   - the log position the board reflects.
+   - the log position the board reflects (`position.entries`, `position.last`), and `now_millis`.
+
+   Its schema is `vox.room.board/1`. Every claim-protocol verb also takes `--json` and prints one
+   `vox.room.op/1` object — the post's `entry_hash`, `op`, `status` (`posted` or `already-posted`), its
+   `outcome` in the fold and the resource's resulting `state`. Exit statuses are machine-readable: `0`
+   done, `1` not done (lost, not the holder, no handoff pending), `3` version refusal (§5), `4`
+   operation conflict (§6).
 
    The tracker records ownership from this and never reimplements the fold.
 4. **Structured posting**: `vox room post ROOM --type T [--work REF] [--attempt A] [--op ID] [--to
    NAME…] [--urgent] [--data JSON] -`, with the body on stdin.
-   - It fills `from` and `at` (F4). `from` is `VOX_AGENT_NAME` if set, else the harness session id.
-     `at` comes from the git state of the working directory.
+   - It fills `from` and `at` (F4). `at` comes from the git state of the working directory.
+   - `from` is **the session id**: `--session`, else `VOX_SESSION`, else what the harness puts in every
+     tool process's environment — Claude Code's `CLAUDE_CODE_SESSION_ID` and Codex's `CODEX_THREAD_ID`.
+     OpenCode puts nothing there, so its plugin exports `VOX_SESSION` to every shell it runs, through
+     the `shell.env` hook (measured against OpenCode 1.18.32: its shell tool triggers `shell.env` with
+     `{cwd, sessionID, callID}` and merges the result into the child's environment). These are the same
+     values each harness hands its drain hook as the session id, which is what lets the hook recognise
+     the session's own posts.
+
+     > **Amended 2026-09-24.** This said "`VOX_AGENT_NAME` if set, else the harness session id".
+     > `VOX_AGENT_NAME` is the name a session is **addressed** by, and it is set in harness settings
+     > shared by every session of the harness (`wake.rs`); used as `from`, it would make two sessions one
+     > owner again — F3, reintroduced. It is not used as the session. A claim-protocol verb or structured
+     > post with no resolvable session is refused rather than attributed to the whole harness.
    - It stamps `data.vox`, and honours §6.
    - With `--json`, it prints `{entry_hash, op, status}`.
 
    This is how workers report without hand-writing JSON, and how the tracker posts an `assign`.
-   **Raw `vox room post` of a claim-protocol type is refused.** Such an operation would lack the stamp
-   and the session that make it valid, and the verbs exist to set them.
+   **Raw `vox room post` of a claim-protocol type is refused**, and so is a structured post whose
+   `--type` is one. Such an operation would lack the stamp and the session that make it valid, and the
+   verbs exist to set them. `--data` may not set `vox` or `op`.
 
 An adapter **MUST** refuse visibly and record no owner when `board --json` reports `coordination:
 refused`, or when a row's schema is not exactly `vox.room.row/1`. It must not guess across an
@@ -430,7 +520,8 @@ incompatible contract.
 **The drain hook suppresses a session's own messages only when both the author fingerprint and the
 session match** (F8). A row is skipped only if `author == this node's fingerprint` **and** `from ==
 this session`. Another harness using the same session name, or another session on this harness, still
-reaches the model. The hook does not filter by work reference: a model should see what its room says to
+reaches the model. The hook names its session as the CLI does — `--session`, else `VOX_SESSION`, else the
+harness's hook input — and while coordination is refused it tells the session so, every turn. The hook does not filter by work reference: a model should see what its room says to
 it.
 
 **Explicitly not exposed:** a new `Request` variant, a server-side filter, a push to the tracker, or any
@@ -524,6 +615,15 @@ that proves it.**
   - compute the table only from messages stamped with the checker's own version — the
     before-first-participation case must be caught;
   - accept a missing stamp — the v0.2.1 case must be caught.
+
+  > **DONE 2026-09-24** (`ca267d5`, proof `6577864`). `work_version_proof` passes through the shipped
+  > binary. **One change from the plan:** the old worker is the published **v0.2.6**, not v0.2.1 —
+  > v0.2.1 speaks control-socket protocol 4 and cannot attach to a current node at all, while v0.2.6
+  > speaks protocol 5; it is fetched and verified against its published SHA-256. Its receipt records the
+  > divergence the gate exists to stop: v0.2.6 told its user "you hold old-work" under its old rules,
+  > while the current worker refused by name. Recovery is the stale worker's first participating verb
+  > (the drain hook does not announce, §5). All four mutations caught.
+
 - **M21.2 — session ownership and the pending handoff (F1, F2, F3).**
 
   *Proof* `work_handoff_proof`, with two nodes, three sessions, and **different petnames for the
@@ -545,6 +645,15 @@ that proves it.**
   - resolve by the local petname instead of `to_fp` — the two nodes' boards must disagree;
   - inherit the holding's expiry — the no-TTL case never lapses;
   - make a pending item return to the sender on decline.
+
+  > **DONE 2026-09-24** (`ca267d5`). `work_handoff_proof` passes. **One change from the plan:** it runs
+  > on **two nodes with five sessions**, not three nodes, because of open defect F12 (two joiners cannot
+  > read each other); the reason is written at the top of the proof. The nodes name each other by
+  > petnames the other never uses, and their folded boards are compared field by field. Five mutations
+  > caught: the handoff inert (F1), `to_session` ignored, a no-TTL holding's expiry inherited, a decline
+  > returning to the sender, and the owner compared by author only (F3). Also `agentcomms_gate` (17
+  > tests) folds every permutation — 120 orders of a contested claim plus handoff — to one state.
+
 - **M21.3 — renewal bound to one acquisition.**
 
   *Proof* `work_renew_proof`:
@@ -556,6 +665,12 @@ that proves it.**
 
   *Mutation*: match a renewal on owner alone, ignoring `acquisition` — the re-claim case must be
   caught.
+
+  > **DONE 2026-09-24** (`41f5180`). `work_renew_proof` passes; the late and stale renewals are written
+  > onto the socket as the bytes a delayed worker on this version writes, because `vox room renew`
+  > correctly reads the current acquisition and cannot produce them. Two mutations caught: matching on
+  > owner alone, and matching on the harness key alone.
+
 - **M21.4 — operation ids and conflicts.**
 
   *Proof* `work_op_proof`:
@@ -570,6 +685,11 @@ that proves it.**
   *Mutations*:
   - "first by canonical order wins" instead of voiding — the late-arriving case must be caught;
   - remove the post-then-re-read — the concurrent conflict must not exit 0.
+
+  > **DONE 2026-09-24** (`a2e20cd`). `work_op_proof` passes, with a live consumer on the other node.
+  > Both mutations caught; the second (no post-read conflict check) is caught when both racing posts
+  > land, which is timing-dependent and held in every run made.
+
 - **M21.5 — the adapter stream and the board (F5, F6).** `tail --since --json`, `read --json`, the row
   schema, and `board --json`.
 
@@ -582,6 +702,17 @@ that proves it.**
     claim, a completed handoff and a lapse.
 
   *Mutation*: subscribe *after* reading. The race window must be caught as a gap.
+
+  > **DONE 2026-09-24** (`a2e20cd` for the stream fix, `dbbdee7` for the proof). Building this found
+  > **F13**: `tail` had never delivered another member's message. `adapter_stream_proof` passes: three
+  > SIGKILLs, a real lag (the proof fails if none occurs — two earlier versions never lagged and failed
+  > for exactly that), 1,800 of 1,800 rows with none missing, rows from the other node delivered to a
+  > *live* consumer, and `board --json` equal to an independent fold. **1,800, not 2,000**, because of
+  > open defect F14. Mutations caught: ignoring `Lagged` (a 411-row gap) and ignoring `Synced` — the
+  > shipped behaviour — which the first version of the proof **did not catch**; the liveness assertion
+  > was added for that reason. The planned "subscribe after reading" mutation was not used: its race
+  > window is too narrow to be caught reliably, and a mutation that passes by luck proves nothing.
+
 - **M21.6 — structured posting and self-post filtering (F4, F7, F8).** `post` with `--type`, `--work`,
   `--attempt`, `--op`, `--data` and `--json`; `from` and `at` filled in; `status` added to the
   vocabulary; raw claim-type posts refused; and the drain hook's `(author, session)` suppression.
@@ -592,8 +723,19 @@ that proves it.**
   - H′'s post under the name "A" reaches session A on H, because the fingerprints differ.
 
   *Mutation*: compare `from` only — H′'s message is lost, and must be caught.
+
+  > **DONE 2026-09-24** (`ca267d5`, proof `dbbdee7`). `drain_self_filter_proof` passes, including its
+  > live half: a real OpenCode model ran `vox room post` through its shell, and the row's `from` was
+  > OpenCode's own session id — named by the plugin's new `shell.env` hook. Two mutations caught:
+  > comparing the session name only, and removing the plugin's `VOX_SESSION` export.
+
 - **M21.7 — housekeeping (F9, F10).** The `--since` help text; the index rows for 018–021; the skill
   carries the §3 table.
+
+  > **DONE 2026-09-24.** The `--since` help says 52 characters (F9); the index has rows for 018, 019
+  > and 021 and a current status table (F10); the skill carries the §3 table, the exit statuses and the
+  > retry rule.
+
 - **M21.8 — rehearsal against a stub tracker.** A stub tracker, about 100 lines living inside the proof
   and not the product:
   - it mints two references, posts `assign` through `post --op`, and records state from `tail` and
@@ -610,6 +752,23 @@ that proves it.**
   - **the operator runs no command.**
 
   *Mutation*: `--pure` models, which must turn it red.
+
+  > **DONE 2026-09-24** (proof `tracker_rehearsal_proof`). Two real OpenCode sessions on two nodes do
+  > the work through their own shells; the stub tracker lives only in the proof and consumes only
+  > `tail --since --json` and `board --json`. Passed twice, 123 s each. At each checkpoint: `blocked`
+  > left the item Executing and set Health to Blocked; a `failed` attempt left it Ready with the failure
+  > in its history; the worker killed mid-attempt lost the item only when its 45 s lease lapsed, leaving
+  > it Ready; a `result` naming commit `9f3c2e1a` moved it to Acceptance and no further, and it stayed
+  > there after its owner's `release`; no item's history ever contains Release ready or Done; the
+  > tracker was stopped while a worker failed, released and died, and resumed from its cursor missing
+  > nothing; and every work observation carries a model's own OpenCode session as `from`.
+  >
+  > **The mutation control changed.** The plan named `opencode run --pure`; with `--auto` it hung the
+  > warm-up turn until its deadline, a red nobody can attribute, so the control removes the Vox plugin
+  > from the workers' projects instead — the same thing `--pure` was to disable. It turned the rehearsal
+  > red at the first claim: without the plugin no session reached the model's shell, and the model
+  > improvised one (`w1`), which the proof rejected. Two earlier red runs of the control were
+  > **discarded**: a stray OpenCode process left by an interrupted run was contending with them.
 
 ## Links
 

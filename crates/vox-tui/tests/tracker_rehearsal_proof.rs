@@ -267,6 +267,7 @@ impl Agent<'_> {
             }
         }
         let mut args = vec!["run".to_owned(), "--auto".into(), "-m".into(), model()];
+
         if let Some(s) = &self.session {
             args.push("--session".into());
             args.push(s.clone());
@@ -284,11 +285,21 @@ impl Agent<'_> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().expect("opencode");
-        if let Some(d) = kill_after {
-            std::thread::sleep(d);
-            let _ = child.kill(); // the worker dies mid-attempt
+        // Every turn has a deadline of its own, so a turn that never returns is reported
+        // as exactly that — with its output — rather than surfacing as the whole-process
+        // watchdog, which says only that something, somewhere, hung.
+        let deadline = std::time::Instant::now() + kill_after.unwrap_or(Duration::from_secs(240));
+        while child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let timed_out = child.try_wait().ok().flatten().is_none();
+        if timed_out {
+            let _ = child.kill(); // the worker dies mid-attempt, or the turn overran
         }
         let out = child.wait_with_output().unwrap();
+        if timed_out && kill_after.is_none() {
+            eprintln!("[receipt] {} turn TIMED OUT after 240 s and was killed", self.name);
+        }
         let s = format!("{}\n--- stderr ---\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         eprintln!("[receipt] {} turn {prompt:?}\n{s}", self.name);
         s
@@ -329,7 +340,17 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     for (w, name) in [(alice, "w1"), (bob, "w2")] {
         let project = fixture.join(name);
         std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
-        std::fs::write(project.join(".opencode/plugin/vox.js"), vox_tui::agent_hook::OPENCODE_PLUGIN).unwrap();
+        let plugin = project.join(".opencode/plugin/vox.js");
+        // The mutation control: without the Vox plugin the room never reaches the model and
+        // the model's shells carry no session, so the rehearsal must fail — or it was
+        // measuring something other than Vox. (`opencode run --pure` was the first choice,
+        // and hung the warm-up turn for its whole deadline with `--auto`, which would make a
+        // red nobody can attribute.)
+        if std::env::var_os("VOX_PROOF_WITHOUT_PLUGIN").is_some() {
+            let _ = std::fs::remove_file(&plugin);
+        } else {
+            std::fs::write(&plugin, vox_tui::agent_hook::OPENCODE_PLUGIN).unwrap();
+        }
         agents.push(Agent { worker: w, name, project, session: None });
     }
     for a in &mut agents {
