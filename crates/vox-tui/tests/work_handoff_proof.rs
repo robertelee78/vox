@@ -28,16 +28,19 @@
 //! No assertion depends on causal order between two authors: every step waits until
 //! the node that acts next has *seen* what it acts on.
 //!
-//! ## Why two nodes, not three
+//! ## Why two nodes, not three — an open defect, not a limitation
 //!
-//! A third node was the first design, and it could not be built: two members who both
-//! **joined** (rather than created) the room never received each other's sender key
-//! within 60 s, although each trusted the other — measured, `bob never received the
-//! sender key of ["carol"]`. That is the gap `docs/adr/README.md` already lists as
-//! missing ("re-keying for a member first met off the join path"), in `vox-core`, and
-//! it is recorded in ADR-021 rather than worked around here. Every property above is a
-//! property of the fold across *nodes* and *sessions*; two nodes with several sessions
-//! each exhibit all of them.
+//! A third node was the first design, and it could not be built. Two members who both
+//! **joined** (rather than created) the room never received each other's sender key,
+//! although each trusted the other. Reproduction: three in-process nodes on loopback,
+//! no anchor, alice creates, bob and carol join, all six `Trust` edges applied; after
+//! 60 s, `bob never received the sender key of ["carol"]`. In a room of three, the two
+//! who joined cannot read each other — a user meets that the moment a third person
+//! arrives. It is recorded as **open defect F12 in ADR-021**, in `vox-core` key
+//! distribution, not accepted as a gap; `node_m19_untrust_lock_gate` stays green only
+//! because it never has one joiner read another. Every property this proof asserts is
+//! a property of the fold across *nodes* and *sessions*, and two nodes with several
+//! sessions each exhibit all of them.
 
 #![cfg(unix)]
 
