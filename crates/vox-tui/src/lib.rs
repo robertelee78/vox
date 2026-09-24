@@ -27,6 +27,7 @@ pub mod live;
 pub mod notify;
 pub mod qr;
 pub mod room_cli;
+pub mod share_cli;
 pub mod shell;
 pub mod state;
 pub mod status_cli;
