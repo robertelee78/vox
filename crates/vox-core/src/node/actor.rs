@@ -589,7 +589,58 @@ fn spawn_stream_loop(
         const MAX_CONSECUTIVE_STREAM_FAILURES: u32 = 16;
         let mut failures = 0;
         loop {
-            match net.accept_stream(&conn).await {
+            // **The kinds this node serves to completion get a task each.** `accept_stream`
+            // served them inline — `dispatch`'s own doc says to put it on its own task when
+            // accepting in a loop, and this loop did not — so while one was being served no other
+            // stream from this peer was even accepted. A rendezvous stream holds its server until
+            // the client finishes or a 20s frame read gives up; a circuit's opening exchange waits
+            // on the *target* peer's answer, which is another node's loop. On an anchor that put a
+            // member's next board `put` behind whatever that member's last stream was waiting for,
+            // 20s at a time, and the member's actor — which awaits its puts — answered nobody for
+            // 30s, 60s, 80s, measured through the real binaries.
+            //
+            // Only these three. Every other kind is handed on in the order it arrived, as before:
+            // a pairwise hello and the key that follows it are separate streams, and reordering
+            // them is exactly the race F12 was.
+            let (kind, send, recv) = match net.accept_authorized(&conn).await {
+                Ok(accepted) => accepted,
+                Err(_) => {
+                    if conn.quinn().close_reason().is_some() {
+                        break; // the peer or the network closed it
+                    }
+                    failures += 1;
+                    if failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if matches!(
+                kind,
+                crate::transport::streams::StreamKind::Rendezvous
+                    | crate::transport::streams::StreamKind::Coord
+                    | crate::transport::streams::StreamKind::Circuit
+            ) {
+                failures = 0;
+                let net = Arc::clone(&net);
+                let conn = Arc::clone(&conn);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    // A coordination stream can end by handing the actor a punch to run.
+                    if let Ok(inbound @ Inbound::Punch { .. }) =
+                        net.dispatch(&conn, kind, send, recv).await
+                    {
+                        let _ = tx
+                            .send(NetEvent::Stream {
+                                conn: Arc::clone(&conn),
+                                inbound,
+                            })
+                            .await;
+                    }
+                });
+                continue;
+            }
+            match net.dispatch(&conn, kind, send, recv).await {
                 Ok(
                     Inbound::ServedRendezvous { .. }
                     | Inbound::ServedCoord { .. }
@@ -691,104 +742,70 @@ fn spawn_stream_loop(
 /// Accept connections and their streams forever, forwarding to the actor the ones
 /// that need channel state. The board is served inside `accept_stream`.
 ///
-/// **Each connection's handshake runs on its own task** (M17.17). This loop used to call
-/// `accept`, which performs the TLS handshake inline, so the loop serialised on handshakes:
-/// one peer that opened a connection and then stalled its handshake blocked **every** other
-/// inbound connection — with no credential at all, because authentication had not happened
-/// yet. A pre-authentication denial of service, and worst against the node most likely to be
-/// always-on and public, which is an anchor. The loop's own comment claimed a slow peer could
-/// not stall the others; that was true only of the stream loop, after the handshake.
-/// The node's inbound accept loop.
+/// **Each connection's handshake runs on its own task, bounded, and the accept loop
+/// never waits for one.** Phase two (`finish_incoming`: the TLS handshake and admission,
+/// itself bounded at `HANDSHAKE_TIMEOUT`) is spawned per attempt, which is quinn's own
+/// documented shape — `finish_incoming` says "Spawn this; do not await it in an accept
+/// loop".
 ///
-/// **This performs each handshake inline, and that is a known denial-of-service gap**
-/// (finding #3): one peer that opens a connection and then stalls its TLS handshake blocks
-/// every other inbound connection, with no credential of any kind, because authentication
-/// has not happened yet. It matters most for an always-on node, which is what an anchor is.
+/// # What awaiting it inline cost
+/// Until v0.2.8 this loop awaited phase two, so it handled one handshake at a time. Two
+/// consequences, both measured:
 ///
-/// The two-phase API that fixes it exists and is tested — [`ConnectionManager::accept_incoming`]
-/// and [`ConnectionManager::finish_incoming`], the handshake bounded at 30 seconds — but it is
-/// **deliberately not wired in here yet.** Spawning phase two per attempt makes
-/// `m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor` and
-/// `m16_a_tcp_service_is_reached_across_the_overlay_between_two_nated_clients` time out, while
-/// `m15_members_never_online_together_converge_through_the_anchor` keeps passing. Measured, not
-/// suspected: serialising this loop again and changing nothing else turns both back green, and
-/// clean upstream passes all three in 40s.
+/// - **A pre-authentication denial of service.** One peer that opened a connection and
+///   stalled its handshake blocked every other inbound connection for up to 30s, with no
+///   credential of any kind. Worst against an anchor, the node most likely to be public.
+/// - **The same stall with no attacker at all.** `vox connect` exits the moment it has
+///   joined, which leaves the host mid-handshake, so a second person joining right after
+///   the first was locked out for 30s. `order4.sh` (a host and two back-to-back joiners)
+///   locked the second joiner out 5 of 5 on a quiet box, and the stranger's join in
+///   `service_rehearsal_proof` failed the same way.
 ///
-/// The two that break both carry a **relayed circuit** between peers behind symmetric NATs,
-/// where no punch is possible; the one that survives converges through the anchor without a
-/// live circuit. So something in circuit establishment depends on the ordering this loop
-/// currently imposes, and the mechanism is not yet understood.
+/// # Why it stayed inline so long
+/// ADR-017 recorded the split as tried and reverted: `m15_two_clients_behind_symmetric_
+/// nats…` timed out at 247s with it and passed serialised. That 247s was **not** the split.
+/// It was sync starvation — a room's in-flight mark let a failing anchor session take the
+/// room first every round, so the direct member session never ran — and it hit the
+/// serialised loop too, in 9 of ~15 CI runs on `main`. The evidence against the split was
+/// a different defect with the same signature.
 ///
-/// Shipping the split would trade a pre-authentication DoS for an overlay that cannot form a
-/// swarm through an anchor, which is a worse product. The ordering is deliberate: an
-/// authorization bypass outranks a DoS, and a DoS outranks not working. Those two NAT gates are
-/// now the acceptance test for the real fix.
+/// With that fixed (the owed-room change in `run_due_syncs`) the split exposed one real
+/// dependency on the serial order, and it was not in this loop: `ConnectionManager`'s
+/// duplicate tie-break was "the held connection wins", which the two ends of a pair only
+/// agree on if they file the pair in the same order. Concurrent handshakes broke that, and a
+/// node could be left holding a connection its peer had closed (see `tie_key` in
+/// `node::net`). Measured with both ends logging each connection's exporter tag: 2 of 5
+/// duplicate pairs disagreed before the tie-break became order-independent, 0 of 28 after.
+///
+/// # The bound, and what a flood costs
+/// At most [`HANDSHAKES_IN_FLIGHT`] handshakes run at once. At the cap an attempt is never
+/// queued — queueing would put the wait back into this loop:
+///
+/// - an attempt whose source address is **not yet validated** gets `retry()`, a QUIC Retry
+///   packet that makes the client prove it can receive at the address it claims before
+///   anything is allocated. A spoofed flood cannot answer one; a real peer pays one round
+///   trip. Before this, one spoofed packet cost an attacker a packet and cost the node a
+///   handshake slot.
+/// - an attempt that **is** validated gets `refuse()`, because for a peer that has proven
+///   itself the honest answer is "not now", not another round trip.
+///
+/// **Residual, stated rather than implied:** 64 *validated* handshakes that stall still
+/// deny service for up to `HANDSHAKE_TIMEOUT` each. Bounded, and far better than a single
+/// slot, but not nothing.
 fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     tokio::spawn(async move {
-        // **Experiment scaffolding, to be removed once ADR-017's open gap is settled.**
-        //
-        // `VOX_SPLIT_ACCEPT=1` runs phase two on its own task instead of inline. Both
-        // shapes exist in one binary **on purpose**: the measurement that reverted the
-        // split compared runs taken at different times, and the whole question is whether
-        // the 68s/140s/247s spread belongs to the split or to a flaky long tail. One
-        // binary lets the arms be interleaved A/B/A/B in a single window, which is the
-        // only way to control for the box drifting underneath — this machine has carried
-        // 324 orphaned processes and a wedged compiler cache in one evening.
-        //
-        // Whichever arm wins, this switch goes and the loser's code goes with it. A
-        // permanent environment variable choosing between two security-relevant shapes is
-        // a configuration bug waiting to happen.
-        let split = std::env::var("VOX_SPLIT_ACCEPT").is_ok_and(|v| v == "1");
-        // Bounded, because "spawn per connection" without a ceiling is the DoS the
-        // serialised loop was protecting against by accident. At the cap an attempt is
-        // **refused**, not queued: queueing would put the wait back in the accept path and
-        // reintroduce exactly the stall being removed.
         let gate = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_IN_FLIGHT));
         loop {
             let Some(incoming) = net.manager().accept_incoming().await else {
                 break;
             };
-            if !split {
-                // **Awaited here, not spawned — ADR-017's recorded decision.** Spawning phase
-                // two is quinn's own documented shape (`finish_incoming` says "Spawn this; do
-                // not await it in an accept loop") and removes a 30s serialisation window, but
-                // ADR-017 "Open proof gap" records it measured: serialised 40-52s consistently
-                // green on `m15_two_clients_behind_symmetric_nats`, split 68s, 140s and a
-                // timeout at 247s. The unbounded case is gone either way: `finish_incoming`
-                // bounds the handshake at `HANDSHAKE_TIMEOUT`.
-                if let Some(filed) = finish_one(&net, incoming).await {
-                    if !serve_filed(&net, &tx, filed).await {
-                        break;
-                    }
-                }
-                continue;
-            }
             let Ok(permit) = Arc::clone(&gate).try_acquire_owned() else {
-                // **At capacity, and what we do here decides what a flood costs.**
-                //
-                // This codebase has never used quinn's address-validation tools —
-                // `retry`, `refuse`, `ignore` and `remote_address_validated` appear
-                // nowhere else — so today a spoofed source address costs an attacker one
-                // packet and costs us a whole handshake slot. Refusing at the cap keeps
-                // that property: 64 spoofed packets and every real peer is turned away.
-                //
-                // `retry` sends a Retry packet, which makes the client prove it can
-                // receive at the address it claims before we allocate anything. A spoofed
-                // flood cannot answer one; a real peer pays a single round trip. So the
-                // cost inverts, using quinn's own anti-amplification mechanism rather
-                // than something invented here.
-                //
-                // An already-validated peer gets `refuse` instead, because for them the
-                // honest answer is "not now" rather than another round trip.
-                //
-                // **The residual, stated rather than implied:** 64 *validated* handshakes
-                // that stall still deny service for up to `HANDSHAKE_TIMEOUT` each. That
-                // is bounded and far better than a single slot, and it is not nothing.
                 if incoming.remote_address_validated() {
                     incoming.refuse();
-                } else if incoming.retry().is_err() {
-                    // Already a retried attempt; validating it again would loop.
-                    continue;
+                } else {
+                    // `Err` means this attempt is already a retried one; retrying it again
+                    // would loop, so it is simply dropped.
+                    let _ = incoming.retry();
                 }
                 continue;
             };
@@ -805,11 +822,11 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     });
 }
 
-/// How many inbound handshakes may run at once when the accept loop is split.
+/// How many inbound handshakes may run at once.
 ///
-/// The serialised loop's ceiling is one, which is the defect. This is the same bound in
-/// spirit as [`JOINS_IN_FLIGHT`]: enough that ordinary use never reaches it, small enough
-/// that an attacker cannot make a node hold unbounded state.
+/// Inline, the ceiling was one, which was the defect. This is the same bound in spirit as
+/// [`JOINS_IN_FLIGHT`]: enough that ordinary use never reaches it, small enough that an
+/// attacker cannot make a node hold unbounded state.
 const HANDSHAKES_IN_FLIGHT: usize = 64;
 
 /// Phase two for one connection: complete the handshake and admission, or drop it.
@@ -1854,6 +1871,16 @@ impl Node {
         let mut mirrored_why = String::new();
         for wire in net.board_records(channel_id, epoch) {
             if let Err(e) = client.put(&wire).await {
+                // A board that already holds something newer from that member has fresher news
+                // than the copy we vouch with: nothing was refused that anyone needed. For our
+                // *own* records, above, the same answer is real and still reported.
+                if matches!(
+                    e,
+                    Error::RendezvousRejected(r)
+                        if r == crate::nat::service::RejectReason::Stale.as_str()
+                ) {
+                    continue;
+                }
                 mirrored_refused += 1;
                 if mirrored_why.is_empty() {
                     mirrored_why = e.to_string();

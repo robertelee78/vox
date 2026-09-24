@@ -1,6 +1,7 @@
 # ADR-020: Agent comms — a room-based messaging app on the Vox layer
 
-**Status**: **partly implemented** — 2026-09-21. Twelve decisions; the plan below marks each
+**Status**: **partly implemented** — 2026-09-21; the claim protocol of §5 corrected and extended by
+ADR-021, built 2026-09-24 in PR #14 (not yet on `main`). Twelve decisions; the plan below marks each
 milestone `DONE` with the commit that landed it, or leaves it unmarked. Nothing here is marked done
 that has not passed a gate.
 
@@ -310,11 +311,12 @@ A **suggested work vocabulary** shipped as convention (not enforced): `assign`, 
 `working`, `blocked`, `result`, `failed`, `status`, `ask`, `answer`, `ack`. It is shaped to map onto
 A2A's `TaskState` so a future bridge is mechanical.
 
-> **Amended by ADR-021 (proposed 2026-09-23, not built).** For any message carrying a work-item reference
+> **Amended by ADR-021 (built 2026-09-24 in PR #14, not yet on `main`).** For any message carrying a work-item reference
 > (`data.work`), ADR-021 §3 gives each of these types a normative meaning. In particular, `result` is an
-> assertion and not completion, and `release` is neither completion nor failure. ADR-021 also makes a
-> worker's Vox version a session-static fact that rides `hello` (`data.vox`, §5). `status` appears in
-> this list but not yet in the code (ADR-021 F7).
+> assertion rather than an acceptance verdict, Release ready or Done, and `release` is neither Done nor
+> failure. `blocked` is a Health observation and never a Work phase. ADR-021 also makes a
+> worker's Vox version a session-static fact that rides `hello` (`data.vox`, §5). `status` is now in
+> the code as well as this list (ADR-021 F7, closed).
 
 ### 5. Work assignment is a claim, and the log resolves it
 
@@ -336,8 +338,8 @@ Resolution rules, which every node **MUST** apply identically so the answer conv
 This is deliberately a *convention over the open tail* of §4, not new protocol: the log already
 provides the total order and the deterministic tie-break key.
 
-> **Amended by ADR-021 §4–§6 (proposed 2026-09-23, not built).** The rules above stay what the shipped
-> binary does. ADR-021 replaces them with one corrected claim protocol that keeps these type names:
+> **Amended by ADR-021 §4–§6 (built 2026-09-24 in PR #14, not yet on `main`).** The rules above are what the binary did through
+> v0.2.7. ADR-021 replaces them with one corrected claim protocol that keeps these type names:
 > - **ownership is `(author fingerprint, session)`**, not the harness key;
 > - **a `handoff` names the recipient's fingerprint** (`data.to_fp`), because a petname is local and
 >   rule 4 therefore cannot converge. It makes the resource **pending** for that recipient, with a
@@ -347,6 +349,10 @@ provides the total order and the deterministic tie-break key.
 > - every operation carries an **operation id**, where a conflict voids the operation, and a **version
 >   stamp**. Workers on different Vox versions refuse to coordinate rather than fold under different
 >   rules.
+>
+> A handoff's recipient is named on the CLI by a room member's fingerprint (or a unique prefix of one),
+> resolved once by the sender against the room's roster — the keyring's petnames are reachable over the
+> control socket only with the identity passphrase (ADR-021 §4 amendment).
 
 **Reachability — a gap found 2026-09-21 and not yet closed.** Everything above has existed in
 `crates/vox-agentcomms` since M19.3 and **nothing in the shipped binary called any of it**:
@@ -498,8 +504,10 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
   **MUST NOT** auto-reply to `status`, `hello`, `bye` or `ack` at all.
 - `hops` **MUST** be decremented on relay and the message dropped at zero. The default **MUST** be 8
   (ruflo ADR-097's value, whose default "alone closes the recursion-loop class").
-- A sender **SHOULD** be rate-limited to one message per second, and identical repeats within a short
-  window **SHOULD** be dropped.
+- Identical repeats from the same `(author, session)` within a short window **MAY** be dropped. There is
+  **no rate cap**: the decider's product principle is no rate limits (2026-09-24), and loop prevention
+  rests on `hops`, on addressing, and on the rules above and below. (This said a sender "SHOULD be
+  rate-limited to one message per second"; nothing ever enforced it, and it is withdrawn.)
 - A terminal acknowledgement **MUST NOT** generate another terminal acknowledgement.
 - `status` **SHOULD** supersede the previous `status` from the same `(author, session, thread)` in a
   rendered view rather than appending a new line.
@@ -760,6 +768,13 @@ Both unknowns are already spiked; neither remains open.
 - **M19.4 — CLI and skill. DONE 2026-09-22.** `vox room post|read|tail|roster|list`, and
   `vox agent skill` prints the skill for an operator to install where their harness looks.
 
+  > **Named defect, found 2026-09-24 and fixed in PR #14 (ADR-021 F13) — `tail` never showed another member's
+  > message.** The node emits `NewEntry` only for its own appends; an entry synced from a peer is
+  > announced as `Synced`, which carries no row, and `tail` listened only for `NewEntry`. Every `tail`
+  > since this milestone showed the node's own posts and nothing else. `tail` now treats `Synced`,
+  > `SenderKeyReceived` and `Lagged` as wakes and re-reads the room — §6's own rule, that any push is
+  > only a wake. Proved by `adapter_stream_proof`'s liveness assertion, which the old behaviour fails.
+
   Two planned verbs were **not** built and are not missing: `wait` is what the drain hook does
   mechanically every turn, so a verb telling an agent to block would compete with it; and `say` is
   `post`, because §4 already makes plain text a `say` — a second verb for the same act would only
@@ -839,8 +854,10 @@ Both unknowns are already spiked; neither remains open.
   > `claim::resolve`, which resolves no recipient (`room_cli.rs:409` → `claim.rs:182-184`). A handoff
   > therefore never moves ownership. `work_board_proof.rs` does not exercise handoff, so the gate above
   > stayed green. Resolving by petname would not converge either, because petnames are local. Recorded
-  > as ADR-021 F1–F3, with per-session ownership, and to be fixed by ADR-021 M21.2: a handoff carries
-  > the recipient's fingerprint and leaves the resource pending until an eligible session claims it.
+  > as ADR-021 F1–F3, with per-session ownership. **Fixed by ADR-021 M21.2 in PR #14, 2026-09-24:** a handoff
+  > carries the recipient's fingerprint and leaves the resource pending until an eligible session
+  > claims it; `work_handoff_proof` runs every handoff case through the binary on two nodes and
+  > compares their folded boards.
 
   > **Ordering closed, 2026-09-24.** The gate above passed while the ordering underneath it was
   > wrong one time in three: §5's one-second `created_secs` put the entry-hash tie-break in the
@@ -892,6 +909,20 @@ Both unknowns are already spiked; neither remains open.
   that it cannot, and the message waits for the session's next turn. That is the correct
   degradation, because queueing always is the default and the interrupt is the optimisation.
 
+  > **Named defect, 2026-09-24 (ADR-021 F17) — measured: the OpenCode half of this milestone never
+  > worked for a hand-opened session.** OpenCode 1.18.32 sets no `OPENCODE_SERVER_URL`, and a plain TUI
+  > has no listener at the `serverUrl` its plugins are handed, so every OpenCode session registers as
+  > `unknown` and cannot be woken. The gate above proves the decision, not the delivery; no test posts
+  > to `prompt_async`. Open; the mechanism is a decider question.
+
+  > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, then reproduced through the real
+  > `vox daemon`; fix proposed in #16.** `vox daemon`
+  > decides on `NodeEvent::NewEntry`, which the node emits only for its **own** appends (ADR-021 F13's
+  > evidence), so an urgent message addressed to a session from *another* node would never interrupt
+  > it. The gate above calls the wake decision directly and never runs the daemon's loop, so it could
+  > not see this. Open; remove when an urgent, addressed message posted on one node interrupts a session
+  > registered on another, through `vox daemon`.
+
 - **M19.8 — file exchange. DONE 2026-09-22** (§11). `vox room send` offers a file over a room-bound
   service and posts the signed announcement carrying the name, the size, the SHA-256 and the service
   tag; `vox room get` collects it and **verifies against that hash before the file is usable**. No
@@ -923,6 +954,22 @@ Both unknowns are already spiked; neither remains open.
   cross-machine path — NAT traversal, anchors, circuits — is proved by M17's rehearsal and by
   `service_rehearsal_proof`; what is new here is the composition of sessions, cursors, envelopes and
   the operator, and that composition is host-independent. The two-machine claim is not made.
+
+- **M19.10 — the skill and the CLI agree, by test.** Decided 2026-09-24, not built. Every `vox`
+  verb and flag the shipped agent skill (`vox agent skill`) names **MUST** exist in the CLI, checked by a
+  gate that turns red when the skill names one that does not. (Orca keeps its agent guide honest this
+  way.)
+- **M19.11 — Codex runs the drain hook without the operator trusting it by hand.** Decided 2026-09-24,
+  not built. Codex runs a `hooks.json` entry only once its hash is trusted. Vox installs the entry but
+  grants no trust, so the Codex drain works only where the operator trusted it by hand. Vox **MUST**
+  grant trust the way Codex's own "trust all" does — app-server `hooks/list`, then `config/batchWrite` of
+  the entry's `trusted_hash` — as ctm and Orca both do, and **MUST** re-grant it when a new binary
+  changes the hash.
+- **M19.12 — the Codex mid-turn claim is corrected.** Decided 2026-09-24, not built. §6 and M19.6 say
+  app-server `turn/start` works mid-turn. Orca measured (codex-cli 0.147.0, 0.150.1 and 0.153.4) that a
+  mid-turn `turn/start` is **folded into the running turn**, and ctm delivers mid-turn with `turn/steer`
+  and `expectedTurnId`. The text **MUST** say so, and any Codex wake **MUST** use `turn/steer` for a
+  running turn. Implementing the Codex wake is not decided here.
 
 A TUI view for the operator is explicitly deferred until a real room has misbehaved and shown what
 needs filtering.
