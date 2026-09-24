@@ -8,12 +8,22 @@
 //!
 //! ## Fields (ADR-008, exact order — pinned by [`EntrySkeleton::canonical_body`])
 //! `{ author_id, seq, prev_hash, lipmaa_backlink, channelID, epoch, algo_ids,
-//!    payload_hash, payload_len, end_of_feed_flag }`, a 10-element canonical-CBOR
-//! array (ADR-008 §"Canonical serialization"). `seq` is the per-author sequence,
+//!    payload_hash, payload_len, end_of_feed_flag, claimed_ms, seen }`, a 12-element
+//! canonical-CBOR array (ADR-008 §"Canonical serialization"). `seq` is the per-author sequence,
 //! strictly monotonic from 1. `prev_hash` is the SHA-256 of the seq−1 entry's
 //! canonical bytes; `lipmaa_backlink` is the SHA-256 of the entry at the Bamboo
 //! `lipmaa(seq)` predecessor ([`crate::log::feed`]). The genesis entry (seq 1)
 //! carries all-zero `prev_hash` and `lipmaa_backlink` — there is no predecessor.
+//!
+//! `claimed_ms` and `seen` are the room's one order (ADR-023 decision 1, PRD-001 R13).
+//! `seen` names the heads of **other** authors' feeds the author had applied when it
+//! wrote the entry, so the log is a causal DAG across authors rather than parallel
+//! chains; `claimed_ms` is the author's clock, which only breaks ties between entries
+//! that did not see each other ([`crate::log::dag`]). Both sit in the signed skeleton,
+//! not in the encrypted payload, because the order must be computable by a node that
+//! cannot read an entry: a node without an author's key, or holding a pruned skeleton,
+//! still has to place that entry, or every entry after it lands somewhere else than it
+//! does on a node that can read it.
 //!
 //! ## Authenticator (per entry TYPE, ADR-008 §"Per-entry-type authentication")
 //! The authenticator is computed over `vox/log-entry/v1 ‖ canonical_body`
@@ -49,6 +59,13 @@ pub const MAX_AUTHENTICATOR_LEN: usize = 8 * 1024;
 /// before the entry is even parsed (ADR-008 anti-abuse). It bounds one entry, never
 /// how many an author may write: a room's history has no size limit (PRD-001 R1).
 pub const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
+
+/// At most this many hashes in an entry's `seen` (ADR-023 decision 1). Enforced at
+/// decode, before the hashes are read, and by the author when it picks them.
+pub const MAX_SEEN: usize = 16;
+
+/// The number of elements in the canonical skeleton array.
+const SKELETON_ARITY: usize = 12;
 
 /// Wire discriminant for [`Authenticator::Composite`] (attributable).
 const AUTH_TYPE_COMPOSITE: u64 = 1;
@@ -110,7 +127,7 @@ impl core::fmt::Debug for Authenticator {
 /// The unsigned entry skeleton — every field except the authenticator.
 ///
 /// Held separately so [`EntrySkeleton::signing_input`] is the exact bytes the
-/// author signs and a verifier checks. The 10 fields are in the ADR-008 order.
+/// author signs and a verifier checks. The 12 fields are in the ADR-008 order.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EntrySkeleton {
     /// The author's identity fingerprint (ADR-002 `SHA-256(Ed25519 ‖ ML-DSA)`).
@@ -136,6 +153,16 @@ pub struct EntrySkeleton {
     /// Whether this entry terminates the feed (Bamboo end-of-feed marker): no
     /// entry at `seq + 1` may ever be authored.
     pub end_of_feed: bool,
+    /// The author's clock when it wrote the entry, **milliseconds** since the Unix
+    /// epoch. Only a tie-break between entries that did not see each other: it can
+    /// never place an entry ahead of anything in its `seen` or its own feed
+    /// ([`crate::log::dag`]). The same value the content envelope carries.
+    pub claimed_ms: u64,
+    /// The heads of other authors' feeds the author had applied when it wrote this
+    /// entry, at most [`MAX_SEEN`], strictly ascending (canonical: no duplicates, one
+    /// encoding). May name entries a receiving node does not hold yet; that never
+    /// blocks acceptance (ADR-023 decision 1).
+    pub seen: Vec<Digest32>,
 }
 
 impl core::fmt::Debug for EntrySkeleton {
@@ -147,21 +174,34 @@ impl core::fmt::Debug for EntrySkeleton {
             .field("epoch", &self.epoch)
             .field("payload_len", &self.payload_len)
             .field("end_of_feed", &self.end_of_feed)
+            .field("claimed_ms", &self.claimed_ms)
+            .field("seen", &self.seen.len())
             .finish_non_exhaustive()
     }
 }
 
 impl EntrySkeleton {
-    /// Canonical-CBOR body in the ADR-008 field order: a 10-element array
+    /// Canonical-CBOR body in the ADR-008 field order: a 12-element array
     /// `[author_id, seq, prev_hash, lipmaa_backlink, channelID, epoch,
-    ///   [sign_algo, aead_algo], payload_hash, payload_len, end_of_feed_flag]`.
+    ///   [sign_algo, aead_algo], payload_hash, payload_len, end_of_feed_flag,
+    ///   claimed_ms, [seen…]]`.
     /// `end_of_feed_flag` is a CBOR unsigned integer 0/1 (the codec has no bool;
     /// 0 and 1 are the canonical shortest forms).
     #[must_use]
     pub fn canonical_body(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(10)
-            .bytes(&self.author_id)
+        e.array(SKELETON_ARITY);
+        self.encode_fields(&mut e);
+        e.finish()
+    }
+
+    /// The 12 skeleton fields, in order, into `e`. The one encoder of them: the
+    /// canonical body (what is signed and hashed) and the wire frame (which inlines the
+    /// same fields ahead of the authenticator) both call it, so the two can never
+    /// disagree about a field — which would fail three layers away as "record
+    /// rejected", not here.
+    fn encode_fields(&self, e: &mut Encoder) {
+        e.bytes(&self.author_id)
             .uint(self.seq)
             .bytes(&self.prev_hash)
             .bytes(&self.lipmaa_backlink)
@@ -172,8 +212,12 @@ impl EntrySkeleton {
             .uint(u64::from(self.algo_ids[1]));
         e.bytes(&self.payload_hash)
             .uint(self.payload_len)
-            .uint(u64::from(self.end_of_feed));
-        e.finish()
+            .uint(u64::from(self.end_of_feed))
+            .uint(self.claimed_ms)
+            .array(self.seen.len());
+        for h in &self.seen {
+            e.bytes(h);
+        }
     }
 
     /// The signing/authentication input: `vox/log-entry/v1 ‖ canonical_body`
@@ -193,38 +237,50 @@ impl EntrySkeleton {
         sha256(&self.canonical_body())
     }
 
-    /// Decode a skeleton from its 10-element canonical body, validating arity,
-    /// digest lengths, the algo-id registry membership and classes, and the
-    /// end-of-feed flag domain (0 or 1 only).
-    fn from_canonical_body(body: &[u8]) -> Result<Self> {
-        let mut d = Decoder::new(body);
-        if d.array()? != 10 {
-            return Err(Error::MalformedBundle("log-entry arity"));
-        }
-        let author_id = take_digest(&mut d)?;
+    /// Decode the 12 skeleton fields from `d`, validating digest lengths, the
+    /// algo-id registry membership and classes, the end-of-feed flag domain (0 or 1
+    /// only), and `seen` (at most [`MAX_SEEN`], strictly ascending). The one decoder of
+    /// them, for the same reason [`Self::encode_fields`] is the one encoder.
+    fn decode_fields(d: &mut Decoder<'_>) -> Result<Self> {
+        let author_id = take_digest(d)?;
         let seq = d.uint()?;
         // Bound seq so the lipmaa power-of-three arithmetic stays overflow-free
         // (ADR-008; see `crate::log::feed::MAX_SEQ`).
         if seq > crate::log::feed::MAX_SEQ {
             return Err(Error::SizeLimitExceeded("log-entry seq exceeds MAX_SEQ"));
         }
-        let prev_hash = take_digest(&mut d)?;
-        let lipmaa_backlink = take_digest(&mut d)?;
-        let channel_id = take_digest(&mut d)?;
+        let prev_hash = take_digest(d)?;
+        let lipmaa_backlink = take_digest(d)?;
+        let channel_id = take_digest(d)?;
         let epoch = d.uint()?;
         if d.array()? != 2 {
             return Err(Error::MalformedBundle("log-entry algo_ids arity"));
         }
         let sign_algo = u16_from(d.uint()?)?;
         let aead_algo = u16_from(d.uint()?)?;
-        let payload_hash = take_digest(&mut d)?;
+        let payload_hash = take_digest(d)?;
         let payload_len = d.uint()?;
         let end_of_feed = match d.uint()? {
             0 => false,
             1 => true,
             _ => return Err(Error::MalformedBundle("log-entry end_of_feed flag")),
         };
-        d.finish()?;
+        let claimed_ms = d.uint()?;
+        // The count is checked before anything is read or allocated.
+        let n = d.array()?;
+        if n > MAX_SEEN {
+            return Err(Error::SizeLimitExceeded("log-entry seen"));
+        }
+        let mut seen: Vec<Digest32> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let h = take_digest(d)?;
+            // Strictly ascending: one encoding per set, so two honest authors listing
+            // the same heads sign the same bytes, and a duplicate cannot pad the list.
+            if seen.last().is_some_and(|last| *last >= h) {
+                return Err(Error::MalformedBundle("log-entry seen not canonical"));
+            }
+            seen.push(h);
+        }
 
         // Registry + class guards (ADR-003 type-confusion): the sign slot holds a
         // signature algo and the aead slot an AEAD algo.
@@ -254,6 +310,8 @@ impl EntrySkeleton {
             payload_hash,
             payload_len,
             end_of_feed,
+            claimed_ms,
+            seen,
         })
     }
 }
@@ -396,7 +454,7 @@ impl Entry {
     }
 
     /// Frame the entry for the wire/storage per ADR-008: `tag(2 BE) ‖
-    /// version(1) ‖ canonical_cbor_body`. The body is a flat CBOR array — the 10
+    /// version(1) ‖ canonical_cbor_body`. The body is a flat CBOR array — the 12
     /// skeleton fields, then `auth_type` (1 = composite; 2 was the removed deniable type),
     /// `authenticator_bytes`, `payload_present` (0/1), and the payload byte string
     /// iff present. The skeleton fields are inlined (not a nested array) so the
@@ -404,27 +462,19 @@ impl Entry {
     /// carries the verifiable skeleton + typed authenticator.
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
-        let sk = &self.skeleton;
         let auth = self.authenticator.to_bytes();
         let has_payload = self.payload.is_some();
-        // 10 skeleton fields (algo_ids inner array counts as one element) +
+        // 12 skeleton fields (algo_ids and seen each count as one element) +
         // auth_type + authenticator + payload_present (+ payload).
-        let arity = if has_payload { 14 } else { 13 };
+        let arity = if has_payload {
+            SKELETON_ARITY + 4
+        } else {
+            SKELETON_ARITY + 3
+        };
         let mut e = Encoder::new();
-        e.array(arity)
-            .bytes(&sk.author_id)
-            .uint(sk.seq)
-            .bytes(&sk.prev_hash)
-            .bytes(&sk.lipmaa_backlink)
-            .bytes(&sk.channel_id)
-            .uint(sk.epoch)
-            .array(2)
-            .uint(u64::from(sk.algo_ids[0]))
-            .uint(u64::from(sk.algo_ids[1]));
-        e.bytes(&sk.payload_hash)
-            .uint(sk.payload_len)
-            .uint(u64::from(sk.end_of_feed))
-            .uint(self.authenticator.type_id())
+        e.array(arity);
+        self.skeleton.encode_fields(&mut e);
+        e.uint(self.authenticator.type_id())
             .bytes(&auth)
             .uint(u64::from(has_payload));
         if let Some(p) = &self.payload {
@@ -435,16 +485,16 @@ impl Entry {
 
     /// Parse a framed entry from the wire/storage. Rejects a wrong/unknown
     /// struct tag, unsupported version, arity, an unknown authenticator type, an
-    /// over-limit authenticator/payload length (rejected **before** allocation —
+    /// over-limit authenticator/payload/`seen` length (rejected **before** allocation —
     /// ADR-008 anti-abuse), or a malformed skeleton/authenticator/payload. Does
     /// NOT verify the signature — call [`Entry::verify`]. A retained payload, if
     /// present, is checked against the committed hash/len so a tampered body is
     /// rejected at parse.
     ///
-    /// The 10 skeleton fields are re-encoded into a body-only buffer and decoded
-    /// through the strict skeleton decoder (which enforces the algo classes), so
-    /// the reconstructed signing input is byte-identical to the author's — the
-    /// precondition for signature verification.
+    /// The skeleton fields go through the same strict decoder as the canonical body
+    /// (which enforces the algo classes and `seen`'s canonical form), so the
+    /// re-encoded signing input is byte-identical to the author's — the precondition
+    /// for signature verification.
     pub fn from_wire(bytes: &[u8]) -> Result<Self> {
         let parsed = parse_frame(bytes)?;
         if parsed.tag != StructTag::LogEntry {
@@ -452,28 +502,15 @@ impl Entry {
         }
         let mut d = Decoder::new(parsed.body);
         let arity = d.array()?;
-        if arity != 13 && arity != 14 {
+        if arity != SKELETON_ARITY + 3 && arity != SKELETON_ARITY + 4 {
             return Err(Error::MalformedBundle("log-entry wire arity"));
         }
-        let author_id = take_digest(&mut d)?;
-        let seq = d.uint()?;
-        let prev_hash = take_digest(&mut d)?;
-        let lipmaa_backlink = take_digest(&mut d)?;
-        let channel_id = take_digest(&mut d)?;
-        let epoch = d.uint()?;
-        if d.array()? != 2 {
-            return Err(Error::MalformedBundle("log-entry algo_ids arity"));
-        }
-        let sign_algo = d.uint()?;
-        let aead_algo = d.uint()?;
-        let payload_hash = take_digest(&mut d)?;
-        let payload_len = d.uint()?;
-        let end_of_feed = d.uint()?;
+        let skeleton = EntrySkeleton::decode_fields(&mut d)?;
         let auth_type = d.uint()?;
         let authenticator = decode_authenticator(&mut d, auth_type)?;
         let present = d.uint()?;
-        let payload = match (present, arity) {
-            (1, 14) => {
+        let payload = match (present, arity == SKELETON_ARITY + 4) {
+            (1, true) => {
                 // `d.bytes()` returns a BORROWED slice (length already bounded by
                 // the remaining input — no allocation yet). Check the *actual*
                 // byte-string length against the cap BEFORE `to_vec`, so a hostile
@@ -486,14 +523,14 @@ impl Entry {
                 // The actual byte-string length MUST equal the signed
                 // `payload_len`; otherwise the payload_hash/skeleton binding is
                 // inconsistent (the signature commits to `payload_len`).
-                if slice.len() as u64 != payload_len {
+                if slice.len() as u64 != skeleton.payload_len {
                     return Err(Error::MalformedBundle(
                         "log-entry payload length != signed payload_len",
                     ));
                 }
                 Some(slice.to_vec())
             }
-            (0, 13) => None,
+            (0, false) => None,
             _ => {
                 return Err(Error::MalformedBundle(
                     "log-entry payload presence mismatch",
@@ -501,22 +538,6 @@ impl Entry {
             }
         };
         d.finish()?;
-
-        // Rebuild the 10-field skeleton body and decode strictly (class checks,
-        // end_of_feed domain, digest lengths).
-        let mut be = Encoder::new();
-        be.array(10)
-            .bytes(&author_id)
-            .uint(seq)
-            .bytes(&prev_hash)
-            .bytes(&lipmaa_backlink)
-            .bytes(&channel_id)
-            .uint(epoch)
-            .array(2)
-            .uint(sign_algo)
-            .uint(aead_algo);
-        be.bytes(&payload_hash).uint(payload_len).uint(end_of_feed);
-        let skeleton = EntrySkeleton::from_canonical_body(&be.finish())?;
 
         let entry = Self {
             skeleton,

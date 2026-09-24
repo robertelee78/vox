@@ -56,3 +56,32 @@ pub fn system_millis_clock() -> MillisClock {
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
     })
 }
+
+/// The environment variable [`millis_clock_with_test_skew`] reads. **Test-only.**
+pub const TEST_CLOCK_SKEW_ENV: &str = "VOX_TEST_CLOCK_SKEW_MS";
+
+/// [`system_millis_clock`], shifted by a signed number of milliseconds read once from
+/// [`TEST_CLOCK_SKEW_ENV`]. **Test-only: nothing in a real deployment sets it.**
+///
+/// It exists so a proof can drive the shipped binary with a node whose clock is wrong
+/// — ADR-023 proof 2 posts a reply from a node an hour behind and asserts the reply is
+/// still ordered after what it answered. A proof that pinned the clock inside the
+/// process would not be the binary a person runs. Only the millisecond clock moves:
+/// that is the one that stamps a message's claimed time. The seconds [`Clock`] feeds
+/// record and session lifetimes, and skewing it would make the node unreachable, which
+/// is a different test.
+///
+/// Unset, empty or unparsable is no skew: an operator who never heard of it gets the
+/// system clock.
+#[must_use]
+pub fn millis_clock_with_test_skew() -> MillisClock {
+    let skew: i64 = std::env::var(TEST_CLOCK_SKEW_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let system = system_millis_clock();
+    if skew == 0 {
+        return system;
+    }
+    Arc::new(move || system().saturating_add_signed(skew))
+}

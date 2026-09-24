@@ -324,7 +324,8 @@ impl NodeConfig {
     pub fn new() -> Self {
         Self {
             clock: system_clock(),
-            millis_clock: crate::time::system_millis_clock(),
+            // The system clock unless a proof set the test-only skew (ADR-023 proof 2).
+            millis_clock: crate::time::millis_clock_with_test_skew(),
             argon2: Argon2Profile::default(),
             bind: None,
             pow_params: None,
@@ -5082,6 +5083,7 @@ impl Node {
                 epoch: ch.epoch(),
                 members: ch.members(),
                 timeline: ch.timeline().iter().map(row_of).collect(),
+                order: ch.causal_order(),
                 services: ch
                     .services()
                     .iter()
@@ -5156,6 +5158,8 @@ fn row_of(r: &Rendered) -> MessageRow {
         author: r.author,
         created_millis: r.created_millis,
         text: r.text.clone(),
+        arrival: r.arrival,
+        late: r.late,
     }
 }
 

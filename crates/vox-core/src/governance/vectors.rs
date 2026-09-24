@@ -116,6 +116,8 @@ pub mod harness {
                 payload_hash: sha256(&framed_payload),
                 payload_len: framed_payload.len() as u64,
                 end_of_feed: false,
+                claimed_ms: 0,
+                seen: Vec::new(),
             };
             let entry = Entry::build_signed(author_root, sk, framed_payload).unwrap();
             let entry_hash = entry.entry_hash();

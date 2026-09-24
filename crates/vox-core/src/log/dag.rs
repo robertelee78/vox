@@ -1,28 +1,44 @@
 //! The cross-author causal Merkle-DAG (ADR-008 §Decision) — a CRDT for causal
 //! histories.
 //!
-//! ## Causality model (explicit — the SSB / Hypercore model ADR-008 cites)
-//! Vox uses **per-author causal chains merged as concurrent feeds**, exactly the
-//! Secure-Scuttlebutt / Hypercore structure ADR-008 §Decision names. Concretely:
+//! ## Causality model (ADR-008 as amended by ADR-023 decision 1)
 //! - **Within one author** the feed is a *total order*: `seq` is strictly
 //!   monotonic and each entry hash-links its predecessors (`prev_hash` = seq−1,
 //!   `lipmaa_backlink` = the Bamboo skip predecessor). Entry *n* causally
 //!   precedes *n+1* of the same author.
-//! - **Across authors** entries are **concurrent**: the ADR-008 entry schema has
-//!   **no cross-author parent field**, so M5 records no happens-before edge
-//!   between two different authors' entries. (Any application-level cross-author
-//!   reference lives inside the encrypted, opaque payload and surfaces in later
-//!   milestones; adding a cross-author parent to the *schema* would be an ADR-008
-//!   amendment and is deliberately NOT done here.)
-//! - **Merge = union.** The DAG is the set union of all per-author feeds. Because
-//!   each feed is independently hash-chain-verifiable and there is no cross-author
-//!   edge to reconcile, the union of the same entry set is identical on every
-//!   replica regardless of receipt order — **Strong Eventual Consistency**. This
-//!   is a valid causal CRDT (the Matrix-event-graph convergence result, ADR-008).
+//! - **Across authors** an entry's `seen` names the heads of other authors' feeds
+//!   its author had applied when writing it. Those are real happens-before edges:
+//!   an entry follows everything it saw, and everything those saw. Two entries
+//!   neither of which reaches the other are **concurrent**.
+//! - **Merge = union.** The DAG is the set union of all per-author feeds. The edges
+//!   are signed into each entry, so the same entry set is the same graph on every
+//!   replica, whatever order it arrived in — Strong Eventual Consistency.
 //!
-//! The convergence test exercises *concurrent cross-author* entries: two authors'
-//! feeds delivered to two replicas in different interleavings yield byte-identical
-//! [`Dag::causal_order`] output.
+//! ## The one order (PRD-001 R13)
+//! Every entry gets a **hybrid logical clock**:
+//!
+//! ```text
+//! clock(e) = max( claimed_ms(e), clock(p) + 1 for every parent p this node holds )
+//! parents(e) = { e's own seq−1 } ∪ seen(e)
+//! ```
+//!
+//! and the order is ascending `(clock, entry_hash)`. A parent's clock is strictly
+//! below its child's, so this is a topological order of the DAG; among concurrent
+//! entries it is the authors' claimed milliseconds, then the hash. It is a function
+//! of the entry set alone, so every node holding the same entries computes the
+//! identical sequence. An author's clock can move its entry only among its concurrent
+//! peers: an entry written an hour "early" is still lifted to just after the newest
+//! thing it saw. A clock running ahead drags everything that later sees the entry
+//! along with it — which reorders nothing that entry did not already precede.
+//!
+//! **A `seen` hash this node does not hold never blocks acceptance.** Entries arrive
+//! out of order (a member was offline, a sync session died half-way), and refusing
+//! an entry until its parents arrive would let one lost entry stall a room. The
+//! missing parent simply contributes nothing yet; when it arrives, the clocks of
+//! everything that named it are raised and propagated to their descendants
+//! ([`Dag::reorder_generation`] counts those moves, so a timeline knows to re-sort).
+//! Because a clock only ever rises to what the full set requires, the result is the
+//! same as if everything had arrived in causal order.
 //!
 //! ## What this module owns
 //! - The **store**: feeds keyed by author, plus a content-addressed index by
@@ -44,19 +60,13 @@
 //!   readability; rendering attempts decryption and succeeds only if keys are held
 //!   (the decryptor is M4/M6).
 //!
-//! ## Causal ordering / convergence
-//! [`Dag::causal_order`] returns a topological order: every entry appears after
-//! all of its causal predecessors. The order is made **deterministic** (stable
-//! across replicas) by breaking ties on `(author_id, seq)`, so two replicas with
-//! the same entry set produce the identical sequence — the observable form of
-//! convergence.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
-use crate::log::entry::{Entry, EntryKind};
+use crate::log::entry::{Entry, EntryKind, MAX_SEEN};
 use crate::log::feed::Feed;
 
 /// The set of identities admitted to a `(channelID, epoch)` — the membership
@@ -150,6 +160,19 @@ pub struct Dag {
     /// Authors frozen by an attributable fork proof; their later entries are
     /// refused (ADR-008 — members revoke/rotate to exclude the equivocator).
     frozen: HashMap<Digest32, ForkProof>,
+    /// entry hash -> its hybrid logical clock (module docs).
+    clock: HashMap<Digest32, u64>,
+    /// Every stored entry keyed `(clock, entry_hash)`: iterating it **is** the order.
+    ordered: BTreeSet<(u64, Digest32)>,
+    /// hash -> the stored entries whose `seen` names it. Kept for hashes not held
+    /// yet too: that is how a late parent finds the children it has to lift.
+    seen_by: HashMap<Digest32, Vec<Digest32>>,
+    /// `(author, other author)` -> the highest seq of `other` that one of `author`'s
+    /// entries names in its `seen`. What [`Dag::seen_for`] need not name again.
+    referenced: HashMap<(Digest32, Digest32), u64>,
+    /// Bumped whenever an already-stored entry's clock moves (a late parent arrived),
+    /// so a timeline can tell a re-sort is due without recomputing anything.
+    reorder_generation: u64,
 }
 
 impl Dag {
@@ -309,7 +332,178 @@ impl Dag {
             .append(entry)
             .map_err(Rejected::Feed)?;
         self.by_hash.insert(hash, (author, seq));
+        self.place(hash);
         Ok(hash)
+    }
+
+    /// Give a just-stored entry its clock, record its `seen` edges, and lift every
+    /// stored entry that was waiting for it (module docs, "The one order").
+    fn place(&mut self, hash: Digest32) {
+        let Some(entry) = self.get_by_hash(&hash) else {
+            return;
+        };
+        let author = entry.skeleton.author_id;
+        let seq = entry.skeleton.seq;
+        let seen = entry.skeleton.seen.clone();
+        let mut clock = entry.skeleton.claimed_ms;
+        if seq > 1 {
+            // Feeds are contiguous, so the own predecessor is always held.
+            if let Some(c) = self.clock.get(&entry.skeleton.prev_hash) {
+                clock = clock.max(c.saturating_add(1));
+            }
+        }
+        for parent in &seen {
+            if let Some(c) = self.clock.get(parent) {
+                clock = clock.max(c.saturating_add(1));
+            }
+            if let Some((other, other_seq)) = self.by_hash.get(parent).copied() {
+                let r = self.referenced.entry((author, other)).or_insert(0);
+                *r = (*r).max(other_seq);
+            }
+            self.seen_by.entry(*parent).or_default().push(hash);
+        }
+        self.clock.insert(hash, clock);
+        self.ordered.insert((clock, hash));
+
+        // Children that named this entry before it arrived.
+        let waiting = self.seen_by.get(&hash).cloned().unwrap_or_default();
+        for child in &waiting {
+            if let Some((child_author, _)) = self.by_hash.get(child).copied() {
+                let r = self.referenced.entry((child_author, author)).or_insert(0);
+                *r = (*r).max(seq);
+            }
+        }
+        let mut work: Vec<(Digest32, u64)> = waiting
+            .into_iter()
+            .map(|c| (c, clock.saturating_add(1)))
+            .collect();
+        while let Some((h, floor)) = work.pop() {
+            let Some(old) = self.clock.get(&h).copied() else {
+                continue;
+            };
+            if old >= floor {
+                continue;
+            }
+            self.ordered.remove(&(old, h));
+            self.ordered.insert((floor, h));
+            self.clock.insert(h, floor);
+            self.reorder_generation = self.reorder_generation.wrapping_add(1);
+            let next = floor.saturating_add(1);
+            if let Some((a, s)) = self.by_hash.get(&h).copied() {
+                if let Some(succ) = self.feeds.get(&a).and_then(|f| f.get(s + 1)) {
+                    work.push((succ.entry_hash(), next));
+                }
+            }
+            if let Some(children) = self.seen_by.get(&h) {
+                work.extend(children.iter().map(|c| (*c, next)));
+            }
+        }
+    }
+
+    /// What an entry `author` writes now should list in `seen`: the head of every
+    /// other author's feed that none of `author`'s entries has named yet, at most
+    /// [`MAX_SEEN`], in canonical (ascending) order.
+    ///
+    /// A head `author` already named — or an older entry of that feed — is left out:
+    /// `author`'s own previous entry already follows it, and the feed chain carries
+    /// the rest. When more than [`MAX_SEEN`] feeds moved, the most recent by the order
+    /// are named; the others stay unnamed and are picked up by the next entry, so
+    /// nothing is lost, only deferred.
+    #[must_use]
+    pub fn seen_for(&self, author: &Digest32) -> Vec<Digest32> {
+        let mut heads: Vec<(u64, Digest32)> = self
+            .feeds
+            .iter()
+            .filter(|(other, _)| *other != author)
+            .filter_map(|(other, feed)| {
+                let head = feed.max_seq();
+                let named = self
+                    .referenced
+                    .get(&(*author, *other))
+                    .copied()
+                    .unwrap_or(0);
+                if head == 0 || head <= named {
+                    return None;
+                }
+                let h = feed.get(head)?.entry_hash();
+                Some((self.clock.get(&h).copied().unwrap_or(0), h))
+            })
+            .collect();
+        heads.sort_unstable_by(|a, b| b.cmp(a));
+        heads.truncate(MAX_SEEN);
+        let mut seen: Vec<Digest32> = heads.into_iter().map(|(_, h)| h).collect();
+        seen.sort_unstable();
+        seen
+    }
+
+    /// The entry's position key in [`Dag::causal_order`]: `(clock, entry_hash)`.
+    /// Comparing two keys compares the two entries' places in the room's order.
+    #[must_use]
+    pub fn order_key(&self, hash: &Digest32) -> Option<(u64, Digest32)> {
+        self.clock.get(hash).map(|c| (*c, *hash))
+    }
+
+    /// How many times an already-stored entry has moved in the order (a parent it
+    /// named arrived after it). A consumer that keeps its own sorted copy re-sorts
+    /// when this changes.
+    #[must_use]
+    pub fn reorder_generation(&self) -> u64 {
+        self.reorder_generation
+    }
+
+    /// Whether `a` **happened before** `b`: `a` is a proper causal ancestor of `b`
+    /// through `b`'s own feed and the `seen` edges, as far as this node holds them.
+    ///
+    /// This is the relation claims are to be built on (PRD-001 R17, ADR-020): a claim
+    /// that saw another claim follows it. `false` means concurrent **or** not yet
+    /// known to be ordered — `a` may be an ancestor through an entry this node has not
+    /// received. Neither entry held is `false`.
+    #[must_use]
+    pub fn happened_before(&self, a: &Digest32, b: &Digest32) -> bool {
+        let (Some(ca), Some(cb)) = (self.clock.get(a).copied(), self.clock.get(b).copied()) else {
+            return false;
+        };
+        // An ancestor's clock is strictly below its descendant's.
+        if ca >= cb {
+            return false;
+        }
+        let Some((a_author, a_seq)) = self.by_hash.get(a).copied() else {
+            return false;
+        };
+        let mut visited: HashSet<Digest32> = HashSet::new();
+        let mut stack = vec![*b];
+        while let Some(h) = stack.pop() {
+            if !visited.insert(h) {
+                continue;
+            }
+            let Some(entry) = self.get_by_hash(&h) else {
+                continue;
+            };
+            let sk = &entry.skeleton;
+            // Reaching `a`'s feed at or past `a` means `a` precedes it on that chain.
+            if h != *b && sk.author_id == a_author && sk.seq >= a_seq {
+                return true;
+            }
+            if h == *b && sk.author_id == a_author {
+                return sk.seq > a_seq;
+            }
+            let parents = sk
+                .seen
+                .iter()
+                .copied()
+                .chain((sk.seq > 1).then_some(sk.prev_hash));
+            for p in parents {
+                // Anything at or below `a`'s clock cannot have `a` as an ancestor
+                // (unless it is `a`, which the feed check above catches).
+                if p == *a {
+                    return true;
+                }
+                if self.clock.get(&p).is_some_and(|c| *c > ca) {
+                    stack.push(p);
+                }
+            }
+        }
+        false
     }
 
     /// Build the fork proof for a `(author, seq)` conflict (ADR-008 §"Fork /
@@ -324,30 +518,13 @@ impl Dag {
         }))
     }
 
-    /// A deterministic causal (topological) order of every stored entry: each
-    /// entry appears after all of its causal predecessors (its own feed's earlier
-    /// entries). Ties between concurrent entries are broken on `(author_id, seq)`,
-    /// so two replicas holding the same entry set yield the **identical** order —
-    /// the observable form of Strong Eventual Consistency.
-    ///
-    /// The visible causal edges in M5 are the per-author `seq` chains; cross-author
-    /// causal references travel inside (opaque, encrypted) payloads and surface in
-    /// later milestones, so the merge here is the union of per-author total orders,
-    /// deterministically interleaved.
+    /// The room's one order (PRD-001 R13): every stored entry, ascending by
+    /// `(clock, entry_hash)` — a topological order of the DAG whose ties between
+    /// concurrent entries fall to the authors' claimed milliseconds, then the hash
+    /// (module docs). Identical on every replica holding the same entry set.
     #[must_use]
     pub fn causal_order(&self) -> Vec<Digest32> {
-        // Within an author, seq order is the causal order. Across authors there is
-        // no edge visible to M5, so we interleave deterministically by author id,
-        // emitting all entries in (author_id, seq) lexicographic order. This is a
-        // valid topological order (per-author predecessors precede successors) and
-        // is identical on any replica with the same set.
-        let mut keyed: BTreeMap<(Digest32, u64), Digest32> = BTreeMap::new();
-        for (author, feed) in &self.feeds {
-            for entry in feed.iter() {
-                keyed.insert((*author, entry.skeleton.seq), entry.entry_hash());
-            }
-        }
-        keyed.into_values().collect()
+        self.ordered.iter().map(|(_, h)| *h).collect()
     }
 
     /// Render-gating seam (ADR-008): attempt to decrypt+render the payload of the

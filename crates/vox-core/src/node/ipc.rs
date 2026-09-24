@@ -57,7 +57,10 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// The protocol this build speaks. Bumped when a frame's shape changes in a way
 /// an older client would misread; a client that sees a version it does not know
 /// MUST disconnect rather than guess.
-pub const PROTOCOL_VERSION: u64 = 5;
+///
+/// 6: a row carries where it arrived and whether it arrived late, and `Order` asks
+/// for the room's whole order (ADR-023 decision 1).
+pub const PROTOCOL_VERSION: u64 = 6;
 
 /// Largest frame accepted in either direction.
 ///
@@ -116,6 +119,8 @@ const T_LINK: u64 = 9;
 /// collided with — the decoder then read a trusted list as a bound address and said
 /// "malformed identity bundle", three layers from the cause.
 const T_TRUSTED: u64 = 26;
+/// Protocol 6: the room's whole order, as entry hashes.
+const T_ORDER_ROWS: u64 = 27;
 // Client → node.
 const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
@@ -157,6 +162,10 @@ const T_TRUST_LIST: u64 = 16;
 // Setting a room's retention deletes what is already stored (ADR-023 decision 2), so it is an
 // operator decision like the keyring and carries the identity passphrase the same way.
 const T_RETENTION: u64 = 23;
+// Protocol 6 — every entry the node holds for a room, in the room's one order
+// (PRD-001 R13), readable or not. What "the same order on every node" is checked
+// against, because a node's timeline shows only the rows it holds keys for.
+const T_ORDER: u64 = 24;
 
 /// What a client sends.
 ///
@@ -186,6 +195,12 @@ pub enum Request {
         since: Option<Digest32>,
         /// Cap on rows returned; 0 means no cap.
         limit: u64,
+    },
+    /// Every entry the node holds for a room, in the room's one order (ADR-023
+    /// decision 1): the sequence the timeline is a subsequence of.
+    Order {
+        /// The room.
+        channel_id: Digest32,
     },
     /// The members of a room.
     Roster {
@@ -331,6 +346,9 @@ impl Request {
             }
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
+            }
+            Request::Order { channel_id } => {
+                e.array(2).uint(T_ORDER).bytes(channel_id);
             }
             Request::Rooms => {
                 e.array(1).uint(T_ROOMS_REQ);
@@ -498,6 +516,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
+            }
+            (T_ORDER, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Order { channel_id })
             }
             (T_ROOMS_REQ, 1) => {
                 d.finish()
@@ -683,6 +707,11 @@ pub enum Frame {
         /// The rendered entries.
         rows: Vec<MessageRow>,
     },
+    /// The order a [`Request::Order`] asked for.
+    Order {
+        /// Entry hashes, first to last.
+        hashes: Vec<Digest32>,
+    },
     /// The members a [`Request::Roster`] asked for.
     Members {
         /// Member fingerprints, in the order the node holds them.
@@ -740,11 +769,19 @@ impl Frame {
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
                 for r in rows {
-                    e.array(4)
+                    e.array(6)
                         .bytes(&r.entry_hash)
                         .bytes(&r.author)
                         .uint(r.created_millis)
-                        .text(&r.text);
+                        .text(&r.text)
+                        .uint(r.arrival)
+                        .uint(u64::from(r.late));
+                }
+            }
+            Frame::Order { hashes } => {
+                e.array(2).uint(T_ORDER_ROWS).array(hashes.len());
+                for h in hashes {
+                    e.bytes(h);
                 }
             }
             Frame::Members { members } => {
@@ -803,6 +840,15 @@ fn text(d: &mut Decoder<'_>, what: &'static str) -> Result<String> {
         .to_owned())
 }
 
+/// A 0/1 flag; any other value is malformed rather than read as true.
+fn flag(d: &mut Decoder<'_>, what: &'static str) -> Result<bool> {
+    match d.uint().map_err(|_| Error::MalformedBundle(what))? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(Error::MalformedBundle(what)),
+    }
+}
+
 fn addr(d: &mut Decoder<'_>) -> Result<std::net::SocketAddr> {
     d.text()
         .map_err(|_| Error::MalformedBundle("ipc addr"))?
@@ -813,13 +859,15 @@ fn addr(d: &mut Decoder<'_>) -> Result<std::net::SocketAddr> {
 fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
     match ev {
         NodeEvent::NewEntry { channel_id, row } => {
-            e.array(6)
+            e.array(8)
                 .uint(T_NEW_ENTRY)
                 .bytes(channel_id)
                 .bytes(&row.entry_hash)
                 .bytes(&row.author)
                 .uint(row.created_millis)
-                .text(&row.text);
+                .text(&row.text)
+                .uint(row.arrival)
+                .uint(u64::from(row.late));
         }
         NodeEvent::Unlocked => {
             e.array(1).uint(T_UNLOCKED);
@@ -997,7 +1045,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let mut rows = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let arity = d.array().map_err(|_| Error::MalformedBundle("ipc row"))?;
-                if arity != 4 {
+                if arity != 6 {
                     return Err(Error::MalformedBundle("ipc row arity"));
                 }
                 rows.push(MessageRow {
@@ -1008,9 +1056,21 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                         .text()
                         .map_err(|_| Error::MalformedBundle("ipc text"))?
                         .to_owned(),
+                    arrival: d
+                        .uint()
+                        .map_err(|_| Error::MalformedBundle("ipc arrival"))?,
+                    late: flag(d, "ipc late")?,
                 });
             }
             return Ok(Frame::Rows { rows });
+        }
+        (T_ORDER_ROWS, 2) => {
+            let n = d.array().map_err(|_| Error::MalformedBundle("ipc order"))?;
+            let mut hashes = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                hashes.push(digest(d)?);
+            }
+            return Ok(Frame::Order { hashes });
         }
         (T_MEMBERS, 2) => {
             let n = d
@@ -1074,7 +1134,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Trusted { entries });
         }
-        (T_NEW_ENTRY, 6) => {
+        (T_NEW_ENTRY, 8) => {
             let channel_id = digest(d)?;
             let entry_hash = digest(d)?;
             let author = digest(d)?;
@@ -1083,6 +1143,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .text()
                 .map_err(|_| Error::MalformedBundle("ipc text"))?
                 .to_owned();
+            let arrival = d
+                .uint()
+                .map_err(|_| Error::MalformedBundle("ipc arrival"))?;
+            let late = flag(d, "ipc late")?;
             NodeEvent::NewEntry {
                 channel_id,
                 row: MessageRow {
@@ -1090,6 +1154,8 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     author,
                     created_millis,
                     text,
+                    arrival,
+                    late,
                 },
             }
         }
@@ -1510,27 +1576,59 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     reason: "room not open".into(),
                 };
             };
-            // The cursor is an entry hash the client already has; everything
-            // after it is what it has not seen. A cursor this node does not hold
-            // is an error rather than "from the start", which would silently
+            // The cursor is an entry hash the client already has; everything that
+            // **arrived** after it is what it has not seen. A cursor this node does not
+            // hold is an error rather than "from the start", which would silently
             // re-deliver the whole room.
-            let start = match since {
-                None => 0,
-                Some(cursor) => match detail.timeline.iter().position(|r| r.entry_hash == cursor) {
-                    Some(i) => i + 1,
-                    None => {
+            //
+            // Arrival, not position: the timeline is in the room's order (ADR-023
+            // decision 1), where a late arrival lands *above* rows already shown, and
+            // "everything below the cursor" would skip it for good. So a read from a
+            // cursor is a feed: what this node rendered after the cursor, in the order it
+            // rendered them, which makes the last line always the right next cursor. A
+            // read with no cursor is the room, in the room's order.
+            let mut rows: Vec<MessageRow> = match since {
+                None => detail.timeline.clone(),
+                Some(cursor) => {
+                    let Some(mark) = detail
+                        .timeline
+                        .iter()
+                        .find(|r| r.entry_hash == cursor)
+                        .map(|r| r.arrival)
+                    else {
                         return Frame::Error {
                             reason: "cursor not in this room's timeline".into(),
-                        }
-                    }
-                },
+                        };
+                    };
+                    let mut newer: Vec<MessageRow> = detail
+                        .timeline
+                        .iter()
+                        .filter(|r| r.arrival > mark)
+                        .cloned()
+                        .collect();
+                    newer.sort_by_key(|r| r.arrival);
+                    newer
+                }
             };
-            let mut rows: Vec<MessageRow> =
-                detail.timeline[start.min(detail.timeline.len())..].to_vec();
             if limit > 0 {
                 rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
             }
             Frame::Rows { rows }
+        }
+        Request::Order { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Order {
+                    hashes: detail.order.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
         }
         Request::Roster { channel_id } => {
             let view = handle.view();

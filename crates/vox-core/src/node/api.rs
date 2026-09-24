@@ -59,6 +59,12 @@ pub struct MessageRow {
     pub created_millis: u64,
     /// The text.
     pub text: String,
+    /// When this node rendered it, as a number that only grows; local, and not the
+    /// room's order ([`crate::node::channel::Rendered::arrival`]).
+    pub arrival: u64,
+    /// It took its place above a row this node had already shown: it arrived late
+    /// (ADR-023 decision 1).
+    pub late: bool,
 }
 
 /// An open channel's full state for display.
@@ -74,6 +80,9 @@ pub struct ChannelDetail {
     pub members: Vec<Digest32>,
     /// The render-gated timeline, oldest first.
     pub timeline: Vec<MessageRow>,
+    /// Every entry this node holds for the channel, readable or not, in the room's one
+    /// order (PRD-001 R13). `timeline` is this sequence restricted to rendered rows.
+    pub order: Vec<Digest32>,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,

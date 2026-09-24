@@ -277,6 +277,16 @@ pub struct Rendered {
     pub created_millis: u64,
     /// The text.
     pub text: String,
+    /// When **this node** rendered it: the id of its sealed plaintext cache row, which
+    /// only grows. Local, never shared, and not part of the room's order. It is what
+    /// "new since" means to a reader holding a cursor: a late arrival can land above
+    /// the cursor in the order, and is still after it here.
+    pub arrival: u64,
+    /// This row took its place **above** a row this node had already rendered: it
+    /// arrived late, from a member who was offline or a sync that caught up
+    /// (ADR-023 decision 1). It is shown where it belongs, not at the bottom; the flag
+    /// is how a reader is told something appeared in history.
+    pub late: bool,
 }
 
 /// An open (SEK-unlocked) channel on this device.
@@ -297,7 +307,11 @@ pub struct ChannelState {
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
+    /// Rendered rows in the room's one order ([`Dag::causal_order`]), never in the
+    /// order they arrived (PRD-001 R13).
     timeline: Vec<Rendered>,
+    /// The [`Dag::reorder_generation`] the timeline was last sorted at.
+    timeline_generation: u64,
     /// Accepted governance entries (consent grants and the rest) in acceptance
     /// order — the evaluator's input, rebuilt from the log on open (M14.5).
     gov_entries: Vec<GovEntry>,
@@ -645,7 +659,31 @@ fn parse_cache(bytes: &[u8]) -> Result<Rendered> {
         author,
         created_millis,
         text,
+        arrival: 0,
+        late: false,
     })
+}
+
+/// Sort rendered rows into the room's one order ([`Dag::order_key`]) and mark the late
+/// ones. A row the DAG does not hold cannot be in a timeline (every row is render-gated
+/// by it); it would sort last rather than panic.
+fn sort_timeline(dag: &Dag, timeline: &mut [Rendered]) {
+    timeline.sort_by_cached_key(|r| {
+        dag.order_key(&r.entry_hash)
+            .unwrap_or((u64::MAX, r.entry_hash))
+    });
+    mark_late(timeline);
+}
+
+/// Mark each row that arrived after a row now below it: it was rendered on this node
+/// later than something the order puts after it, so it appeared in history rather than
+/// at the bottom. One pass from the bottom, tracking the earliest arrival seen.
+fn mark_late(timeline: &mut [Rendered]) {
+    let mut earliest_below = u64::MAX;
+    for r in timeline.iter_mut().rev() {
+        r.late = r.arrival > earliest_below;
+        earliest_below = earliest_below.min(r.arrival);
+    }
 }
 
 impl ChannelState {
@@ -801,6 +839,7 @@ impl ChannelState {
             sender,
             next_log_id: 1,
             timeline: Vec::new(),
+            timeline_generation: 0,
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
@@ -923,12 +962,16 @@ impl ChannelState {
         let mut timeline = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::PlaintextCache)? {
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
-            let rendered = parse_cache(&row)?;
+            let mut rendered = parse_cache(&row)?;
+            rendered.arrival = id;
             if retention.get(&rendered.entry_hash).is_some() {
                 retention.rendered(&rendered.entry_hash, rendered.created_millis / 1_000, id);
                 timeline.push(rendered);
             }
         }
+        // The cache is in the order rows were rendered; the timeline is in the room's.
+        sort_timeline(&dag, &mut timeline);
+        let timeline_generation = dag.reorder_generation();
 
         let sender_seg = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_SENDER)?
@@ -1017,6 +1060,7 @@ impl ChannelState {
             sender,
             next_log_id,
             timeline,
+            timeline_generation,
             gov_entries,
             receivers,
             anchors,
@@ -1188,6 +1232,7 @@ impl ChannelState {
             sender,
             next_log_id: 1,
             timeline: Vec::new(),
+            timeline_generation: 0,
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
@@ -2040,6 +2085,7 @@ impl ChannelState {
         }
         let gone: BTreeSet<Digest32> = due.iter().map(|(h, _)| *h).collect();
         self.timeline.retain(|r| !gone.contains(&r.entry_hash));
+        mark_late(&mut self.timeline);
         Ok(due.len())
     }
 
@@ -2093,7 +2139,9 @@ impl ChannelState {
                 "this identity is not an author of the channel",
             ));
         }
-        let skeleton = self.next_skeleton(&me, payload);
+        // Governance is authored on the seconds clock; its place in the order is whole
+        // seconds, which only matters against entries it did not see.
+        let skeleton = self.next_skeleton(&me, payload, now_secs.saturating_mul(1_000));
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let hash = entry.entry_hash();
         let wire = entry.to_wire();
@@ -2257,6 +2305,8 @@ impl ChannelState {
                 }
             }
         }
+        // An entry that arrived may be a parent others named before it: rows move.
+        self.settle_timeline();
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
         match session {
@@ -2423,6 +2473,8 @@ impl ChannelState {
             author,
             created_millis: content.created_millis,
             text: content.text,
+            arrival: self.next_log_id,
+            late: false,
         };
         // The cache row shares the entry's log id space; use a fresh id so it never
         // collides with an authored row.
@@ -2464,8 +2516,50 @@ impl ChannelState {
         self.next_log_id = id.saturating_add(1);
         self.retention
             .rendered(&entry_hash, rendered.created_millis / 1_000, id);
-        self.timeline.push(rendered);
+        self.place_rendered(rendered);
         Ok(true)
+    }
+
+    /// Insert a just-rendered row at its place in the room's order — which is above
+    /// rows already shown when it arrived late (ADR-023 decision 1) — and re-sort first
+    /// if a late parent has moved rows since the last sort.
+    fn place_rendered(&mut self, rendered: Rendered) {
+        self.settle_timeline();
+        let dag = &self.dag;
+        let key = dag.order_key(&rendered.entry_hash);
+        let at = self
+            .timeline
+            .partition_point(|r| dag.order_key(&r.entry_hash) <= key);
+        self.timeline.insert(at, rendered);
+        mark_late(&mut self.timeline);
+    }
+
+    /// Re-sort the timeline if any stored entry moved in the order since it was last
+    /// sorted: a parent named in `seen` arrived after its children and lifted them
+    /// ([`Dag::reorder_generation`]). Cheap when nothing moved, which is nearly always.
+    fn settle_timeline(&mut self) {
+        let generation = self.dag.reorder_generation();
+        if generation != self.timeline_generation {
+            sort_timeline(&self.dag, &mut self.timeline);
+            self.timeline_generation = generation;
+        }
+    }
+
+    /// Whether `a` happened before `b` in this room: `a` is a causal ancestor of `b`
+    /// through `b`'s author's feed and the `seen` edges this node holds
+    /// ([`Dag::happened_before`]). `false` means concurrent or not yet known to be
+    /// ordered. The seam claims are to be built on (PRD-001 R17).
+    #[must_use]
+    pub fn happened_before(&self, a: &Digest32, b: &Digest32) -> bool {
+        self.dag.happened_before(a, b)
+    }
+
+    /// Every entry this node holds for the room — readable or not, body pruned or not —
+    /// in the room's one order (PRD-001 R13). The timeline is this sequence restricted
+    /// to the rows this node can render.
+    #[must_use]
+    pub fn causal_order(&self) -> Vec<Digest32> {
+        self.dag.causal_order()
     }
 
     /// Accept an entry authored by **another** member (M14.5; the bytes arrive from
@@ -2525,6 +2619,8 @@ impl ChannelState {
             return Err(e);
         }
         self.next_log_id = id.saturating_add(1);
+        // It may be a parent rows already shown named before it arrived.
+        self.settle_timeline();
         match gov {
             Some(g) => {
                 self.gov_entries.push(g);
@@ -2594,7 +2690,7 @@ impl ChannelState {
         let msg = self.sender.encrypt(&plaintext)?;
         let payload = msg.to_wire();
 
-        let skeleton = self.next_skeleton(&me, &payload);
+        let skeleton = self.next_skeleton(&me, &payload, now_millis);
         let entry = Entry::build_signed(signer, skeleton, payload)?;
         let entry_hash = entry.entry_hash();
         let wire = entry.to_wire();
@@ -2603,6 +2699,8 @@ impl ChannelState {
             author: me,
             created_millis: now_millis,
             text: content.text,
+            arrival: self.next_log_id,
+            late: false,
         };
 
         let id = self.next_log_id;
@@ -2664,14 +2762,19 @@ impl ChannelState {
                 cache_id: Some(id),
             },
         );
-        self.timeline.push(rendered);
+        // Its `seen` names every head this node holds, so it sorts after all of them;
+        // placed through the same path as any row all the same.
+        self.place_rendered(rendered);
         self.timeline
-            .last()
-            .ok_or(Error::Profile("timeline empty after push"))
+            .iter()
+            .find(|r| r.entry_hash == entry_hash)
+            .ok_or(Error::Profile("timeline lost the appended row"))
     }
 
-    /// The next entry skeleton for `author`'s feed in this DAG.
-    fn next_skeleton(&self, author: &Digest32, payload: &[u8]) -> EntrySkeleton {
+    /// The next entry skeleton for `author`'s feed in this DAG, naming in `seen` the
+    /// other authors' heads this node has applied (ADR-023 decision 1): that is what
+    /// places the entry after everything its author could have read.
+    fn next_skeleton(&self, author: &Digest32, payload: &[u8], claimed_ms: u64) -> EntrySkeleton {
         let feed = self.dag.feed(author);
         let max = feed.map_or(0, |f| f.max_seq());
         let seq = max + 1;
@@ -2700,6 +2803,8 @@ impl ChannelState {
             payload_hash: sha256(payload),
             payload_len: payload.len() as u64,
             end_of_feed: false,
+            claimed_ms,
+            seen: self.dag.seen_for(author),
         }
     }
 

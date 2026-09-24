@@ -649,15 +649,21 @@ pub struct RoomReadArgs {
     pub profile: ProfileArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// Return only what follows this entry hash — the full 64 characters, as the
-    /// first column prints it. Not prefix-matched: a cursor comes from previous
-    /// output, and a prefix that matched the wrong entry would silently skip or
-    /// repeat messages.
+    /// Return only what arrived after this entry hash, in the order it arrived — the
+    /// full 64 characters, as the first column prints it. Arrival, not position: a
+    /// message from a member who was offline takes its place *above* newer ones, and
+    /// is still returned. Not prefix-matched: a cursor comes from previous output, and
+    /// a prefix that matched the wrong entry would silently skip or repeat messages.
     #[arg(long)]
     pub since: Option<String>,
     /// At most this many messages. 0 means no limit.
     #[arg(long, default_value_t = 0)]
     pub limit: u64,
+    /// Print every entry this node holds for the room in the room's order, one hash
+    /// per line — readable or not. The sequence every member's view is a part of,
+    /// and the one that must be identical on every node (PRD-001 R13).
+    #[arg(long, hide = true, conflicts_with_all = ["since", "limit"])]
+    pub hashes: bool,
 }
 
 /// Selecting a room, by the prefix of its channelID as `vox` prints it.
@@ -1190,6 +1196,7 @@ pub fn run() -> ExitCode {
                     RoomCmd::Post(a) => {
                         crate::room_cli::post(&paths, &a.room, a.text.as_deref()).await
                     }
+                    RoomCmd::Read(a) if a.hashes => crate::room_cli::order(&paths, &a.room).await,
                     RoomCmd::Read(a) => {
                         crate::room_cli::read(&paths, &a.room, a.since.as_deref(), a.limit).await
                     }

@@ -73,6 +73,8 @@ fn next_entry(dag: &Dag, r: &SoftwareRootSigner, payload: &[u8]) -> Entry {
         payload_hash: sha256(payload),
         payload_len: payload.len() as u64,
         end_of_feed: false,
+        claimed_ms: 0,
+        seen: Vec::new(),
     };
     Entry::build_signed(r, sk, payload.to_vec()).unwrap()
 }

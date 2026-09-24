@@ -265,6 +265,29 @@ pub async fn read(
     }
 }
 
+/// `vox room read --hashes` — every entry the node holds for the room, one hash per
+/// line, in the room's one order (ADR-023 decision 1).
+///
+/// The timeline shows only rows this node can decrypt, so two members' timelines can
+/// differ for reasons that have nothing to do with order: one holds a key the other
+/// does not yet. This is the sequence underneath both, and the one that must match.
+pub async fn order(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client.request(&Request::Order { channel_id }).await {
+        Ok(Frame::Order { hashes }) => {
+            let mut out = std::io::stdout().lock();
+            for h in hashes {
+                let _ = writeln!(out, "{}", id(&h));
+            }
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
 /// `vox room roster` — who is in the room.
 pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
