@@ -18,8 +18,9 @@
 //!
 //! An address grants no reachability and an advertisement grants no authorization:
 //! receiving an ad means you were sealed a copy *because* you already hold the Dial
-//! capability; the host still enforces that capability at stream setup
-//! ([`crate::tunnel::authz`]).
+//! capability; the host still enforces reach at stream setup
+//! ([`crate::tunnel::session::accept`], which since ADR-017 decision 3 asks the host's
+//! trust keyring rather than any capability).
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -184,7 +185,7 @@ impl ServiceAdvertisement {
 /// authenticated pairwise channel (ADR-004). The host calls this once per member in
 /// the current Dial-grant set; the resulting [`Message`] carries no cleartext on
 /// the log. (The host is responsible for sealing *only* to Dial-grant holders —
-/// that is the discovery-gate; [`crate::tunnel::authz::can_dial`] decides the set.)
+/// that is the discovery-gate, and the caller decides the set.)
 pub fn seal_to_recipient(ad: &ServiceAdvertisement, session: &mut Session) -> Result<Message> {
     session.encrypt(&ad.to_wire())
 }

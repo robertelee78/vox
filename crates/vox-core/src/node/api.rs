@@ -326,9 +326,9 @@ pub enum NodeCommand {
         /// Where to listen. Loopback only; `0` picks a port.
         bind: std::net::SocketAddr,
     },
-    /// Offer a local TCP service to a channel (ADR-013 Bind). Host configuration:
-    /// what a peer may *reach* is the `dial:` capability on the log, granted with
-    /// [`NodeCommand::GrantTunnel`]. Requires `bind:<service_tag>` in that channel.
+    /// Offer a local TCP service to a channel (ADR-013 Bind). Host configuration only:
+    /// who may *reach* it is this node's trust keyring intersected with the room's
+    /// authors (ADR-017 decision 3), never anything on the room's log.
     AddService {
         /// The channel the service is offered in.
         channel_id: Digest32,
@@ -343,21 +343,6 @@ pub enum NodeCommand {
         channel_id: Digest32,
         /// The service tag.
         service_tag: String,
-    },
-    /// Grant a member the capability to dial (and optionally to offer) a service in a
-    /// channel, as an ADR-007 admin certificate on the log — a fact every member
-    /// converges on, not local configuration (ADR-013).
-    GrantTunnel {
-        /// The channel.
-        channel_id: Digest32,
-        /// The member being granted.
-        target: Digest32,
-        /// The service tag.
-        service_tag: String,
-        /// Also grant `bind:<tag>`, so the member may offer the service too.
-        may_bind: bool,
-        /// When the grant stops counting (unix seconds).
-        expiry: u64,
     },
     /// Forward a local TCP port to a member's service over the overlay (ADR-013
     /// Dial). Answers [`NodeEvent::Forwarding`] with the port actually bound.

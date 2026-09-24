@@ -13,8 +13,8 @@
 //!
 //! - a `.vox` **name** — not an address — is what the client sends, and the proxy resolves
 //!   it from the room's genesis alone;
-//! - the **port becomes the service tag**, authorized by a real ADR-007 evaluator against
-//!   the genesis service grant from M17.1, with no certificate issued to anybody;
+//! - the **port becomes the service tag**, authorized by the host's own reacher set
+//!   (ADR-017 decision 3), with no certificate issued to anybody;
 //! - the bytes reach a real TCP service on the host's loopback and come back;
 //! - a name for a room this machine has not joined is refused *at the proxy*, so nothing is
 //!   dialled and no address is learned.
@@ -32,7 +32,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use vox_core::governance::capability::{Capability, CapabilitySet};
-use vox_core::governance::evaluator::Evaluator;
 use vox_core::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
 use vox_core::hash::Digest32;
 use vox_core::identity::composite::{RootSigner, SoftwareRootSigner};
@@ -132,42 +131,23 @@ async fn m17_a_service_is_reached_by_name_through_vox_up() {
     let channel_id = genesis.channel_id();
 
     let guest_signer = signer(9);
-    let guest_fp = RootSigner::public_key(&guest_signer).fingerprint();
-    let authors: std::collections::BTreeMap<_, _> =
-        [(guest_fp, RootSigner::public_key(&guest_signer))]
-            .into_iter()
-            .collect();
-    let evaluator = Arc::new(
-        Evaluator::build_with_members(
-            &genesis,
-            &[],
-            NOW,
-            |id| authors.get(id).cloned(),
-            [guest_fp].into_iter().collect(),
-        )
-        .unwrap(),
-    );
 
     let host_ep = VoxEndpoint::bind(&host_signer, "127.0.0.1:0".parse().unwrap()).unwrap();
     let host_addr = host_ep.local_addr().unwrap();
     let host_id = host_ep.local_id();
     {
-        let evaluator = Arc::clone(&evaluator);
         tokio::spawn(async move {
             while let Ok(Some(conn)) = host_ep.accept(NOW).await {
                 let client = conn.peer_id();
-                let evaluator = Arc::clone(&evaluator);
                 tokio::spawn(async move {
                     while let Ok((kind, send, recv)) = accept_typed(&conn).await {
                         if kind != StreamKind::Tunnel {
                             continue;
                         }
-                        let evaluator = Arc::clone(&evaluator);
                         tokio::spawn(async move {
                             let _ = session::accept(send, recv, &client, |cid, tag| {
                                 (*cid == channel_id && tag == port.to_string()).then_some(
                                     HostService {
-                                        evaluator,
                                         endpoint: echo_addr,
                                         // **The host trusted this client**, which is the
                                         // whole authorization (ADR-017 decision 3, M17.7).

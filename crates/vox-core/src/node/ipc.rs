@@ -130,7 +130,7 @@ const T_ADD_SERVICE: u64 = 6;
 const T_REMOVE_SERVICE: u64 = 7;
 const T_FORWARD: u64 = 8;
 const T_STOP_FORWARD: u64 = 9;
-const T_GRANT: u64 = 10;
+// 10 was `T_GRANT`, the withdrawn `dial:`/`bind:` grant (ADR-017 decision 3). Never reuse it.
 // Protocol 4 — joining and creating a room over the socket (ADR-020 §12).
 // Without these, a room can only be created or joined from the TUI, so an agent on
 // a host with no terminal has a daemon that can *hold* rooms and no way to ever
@@ -276,19 +276,6 @@ pub enum Request {
         /// The identity passphrase.
         identity_passphrase: String,
     },
-    /// Grant a member the capability to dial (and optionally offer) a service.
-    Grant {
-        /// The room.
-        channel_id: Digest32,
-        /// Who is being granted.
-        target: Digest32,
-        /// The service's tag.
-        service_tag: String,
-        /// Whether they may also offer it.
-        may_bind: bool,
-        /// When the grant lapses, in seconds since the Unix epoch.
-        expiry: u64,
-    },
 }
 
 impl Request {
@@ -402,21 +389,6 @@ impl Request {
                 identity_passphrase,
             } => {
                 e.array(2).uint(T_TRUST_LIST).text(identity_passphrase);
-            }
-            Request::Grant {
-                channel_id,
-                target,
-                service_tag,
-                may_bind,
-                expiry,
-            } => {
-                e.array(6)
-                    .uint(T_GRANT)
-                    .bytes(channel_id)
-                    .bytes(target)
-                    .text(service_tag)
-                    .uint(u64::from(*may_bind))
-                    .uint(*expiry);
             }
         }
         e.finish()
@@ -579,25 +551,6 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
-            }
-            (T_GRANT, 6) => {
-                let channel_id = digest(&mut d)?;
-                let target = digest(&mut d)?;
-                let service_tag = text(&mut d, "ipc service tag")?;
-                let may_bind = d
-                    .uint()
-                    .map_err(|_| Error::MalformedBundle("ipc may_bind"))?
-                    != 0;
-                let expiry = d.uint().map_err(|_| Error::MalformedBundle("ipc expiry"))?;
-                d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
-                Ok(Request::Grant {
-                    channel_id,
-                    target,
-                    service_tag,
-                    may_bind,
-                    expiry,
-                })
             }
             _ => Err(Error::MalformedBundle("ipc request unknown tag")),
         }
@@ -1678,27 +1631,6 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             }
         }
-        Request::Grant {
-            channel_id,
-            target,
-            service_tag,
-            may_bind,
-            expiry,
-        } => match handle
-            .apply(crate::node::api::NodeCommand::GrantTunnel {
-                channel_id,
-                target,
-                service_tag,
-                may_bind,
-                expiry,
-            })
-            .await
-        {
-            crate::node::api::Outcome::Done => Frame::Ok,
-            other => Frame::Error {
-                reason: format!("{other:?}"),
-            },
-        },
         Request::Rooms => {
             let view = handle.view();
             Frame::Rooms {

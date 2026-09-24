@@ -3,16 +3,16 @@
 //!
 //! - **Host side** — [`serve`]: an inbound `StreamKind::Tunnel` stream goes to
 //!   [`session::accept`], which reads the request, asks the actor's snapshot about the
-//!   `(channel, service)` it names, and enforces `dial:` against *that channel's*
-//!   evaluator. Nothing here can grant reach: this supplies host configuration and
-//!   the authority to ask, never a decision.
+//!   `(channel, service)` it names, and checks the dialer against *that channel's* live
+//!   reacher set (ADR-017 decision 3). Nothing here can grant reach: this supplies host
+//!   configuration and the live sets, never a decision.
 //! - **Dial side** — [`Forward`]: a local TCP listener. Every accepted connection
 //!   opens its own tunnel stream and splices, so a forward carries as many
 //!   connections as the application makes and a dead one takes nothing else with it
 //!   (ADR-013: one QUIC stream per tunneled TCP connection).
 //!
 //! ## What is dark stays dark
-//! A missing capability, a channel this node does not hold, a service it does not
+//! An untrusted dialer, a channel this node does not hold, a service it does not
 //! offer, and a local service that refuses the connection all end the same way: the
 //! accepted TCP connection closes. `TunnelStatus::Denied` distinguishes none of them,
 //! and neither does this.
@@ -25,7 +25,6 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
-use crate::governance::evaluator::Evaluator;
 use crate::hash::Digest32;
 use crate::node::api::NodeEvent;
 use crate::transport::quic::VoxConnection;
@@ -73,11 +72,9 @@ pub fn publish_reachers(handle: &Reachers, next: BTreeSet<Digest32>) -> bool {
 }
 
 /// One channel's host-side facts, as the actor snapshots them for the serving task:
-/// the authority that decides, and the services this node offers there.
+/// the services this node offers there, and who may reach them.
 #[derive(Clone)]
 pub struct ChannelServices {
-    /// The channel's ADR-007 evaluator.
-    pub evaluator: Arc<Evaluator>,
     /// `service_tag → local address` (this node's Bind configuration).
     pub services: BTreeMap<String, SocketAddr>,
     /// The identities that may reach this node's services **in this channel** (ADR-017
@@ -150,7 +147,6 @@ pub async fn serve_reporting(
             let channel = snapshot.get(channel_id)?;
             let endpoint = *channel.services.get(tag)?;
             Some(HostService {
-                evaluator: Arc::clone(&channel.evaluator),
                 endpoint,
                 reachers: Arc::clone(&channel.reachers),
             })
@@ -173,7 +169,7 @@ pub async fn serve_reporting(
 /// Dropping it stops the listener. Connections already spliced run to their own end:
 /// a forward is a door, not a leash.
 pub struct Forward {
-    /// The channel whose capability this forward claims.
+    /// The channel whose reach this forward uses.
     pub channel_id: Digest32,
     /// The member hosting the service.
     pub host: Digest32,

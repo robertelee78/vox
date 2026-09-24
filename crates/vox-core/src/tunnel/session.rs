@@ -5,10 +5,10 @@
 //!
 //! This is the **primary**, ssh-style port-forward model. A dialer opens a stream
 //! and sends a [`TunnelRequest`] naming a service tag; the host authorizes the
-//! request against the **dial capability** of the *transport-authenticated* peer
-//! (ADR-011 surfaced the peer identity; [`crate::tunnel::authz`] decides), resolves
-//! the service to a local endpoint, replies [`TunnelStatus`], and then both sides
-//! splice bytes between the QUIC stream and the local TCP socket.
+//! *transport-authenticated* peer (ADR-011 surfaced the peer identity) against its own
+//! live reacher set — its trust keyring intersected with the room's authors (ADR-017
+//! decision 3) — resolves the service to a local endpoint, replies [`TunnelStatus`],
+//! and then both sides splice bytes between the QUIC stream and the local TCP socket.
 //!
 //! ## Dark services / default-deny
 //! The host's resolver returns [`Error::TunnelDenied`] for any service the peer is
@@ -25,9 +25,7 @@ use tokio::net::TcpStream;
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
-use crate::governance::evaluator::Evaluator;
 use crate::hash::Digest32;
-use std::sync::Arc;
 
 /// Maximum length of a service tag carried in a tunnel request (matches the
 /// capability-token bound; rejects an oversized field before allocation).
@@ -40,14 +38,14 @@ const MAX_CONTROL_FRAME: usize = 4 + MAX_SERVICE_TAG_LEN + 64;
 /// authorization applies**, and which service to reach.
 ///
 /// The channelID is not decoration. A QUIC connection is per *peer*, not per channel
-/// (ADR-016), and authorization lives in a channel's ADR-007 evaluator — so a host
-/// that was told only a service tag could not know which evaluator to ask, and two
-/// members who share several channels would be ambiguous. The dialer names the
-/// channel it claims the capability under, and the host checks that claim against
-/// that channel's evaluator or refuses uniformly.
+/// (ADR-016), and a service is offered in, and reached through, one channel — so a host
+/// that was told only a service tag could not know which channel's reacher set to ask,
+/// and two members who share several channels would be ambiguous. The dialer names the
+/// channel, and the host checks the dialer against that channel's reachers or refuses
+/// uniformly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TunnelRequest {
-    /// The channel whose evaluator authorizes this dial.
+    /// The channel whose reacher set decides this dial.
     pub channel_id: Digest32,
     /// The service tag to Dial (the `<tag>` of `dial:<tag>`), e.g. `"ssh-hosts"`.
     pub service_tag: String,
@@ -171,14 +169,11 @@ pub async fn dial(
     splice(send, recv, local).await
 }
 
-/// What the host knows about one `(channel, service)` pair a dialer named: the
-/// channel's ADR-007 evaluator — the authority that decides — and where the service
-/// lives locally. Returning one of these says only "I hold that channel and offer
-/// that service"; whether the *peer* may reach it is still
+/// What the host knows about one `(channel, service)` pair a dialer named: where the
+/// service lives locally, and who may reach it. Returning one of these says only "I
+/// hold that channel and offer that service"; whether the *peer* may reach it is still
 /// [`accept`]'s to enforce.
 pub struct HostService {
-    /// The named channel's governance evaluator.
-    pub evaluator: Arc<Evaluator>,
     /// The local address the service listens on.
     pub endpoint: SocketAddr,
     /// The identities this host has decided may reach it: its **trust keyring** entries
@@ -197,8 +192,8 @@ pub struct HostService {
     pub reachers: crate::node::tunnel::Reachers,
 }
 
-/// Host side: accept a tunnel on a fresh inbound stream pair, **enforcing the Dial
-/// capability** of the transport-authenticated peer before any local connection.
+/// Host side: accept a tunnel on a fresh inbound stream pair, **enforcing the host's
+/// reach decision** about the transport-authenticated peer before any local connection.
 ///
 /// `client_id` is the composite-identity fingerprint the QUIC transport
 /// authenticated for this connection (`VoxConnection::peer_id`, ADR-011). The host:
@@ -243,7 +238,7 @@ where
 /// The host needs this because the carried service cannot tell its Vox clients apart:
 /// they all arrive from loopback, so `sshd`'s log says `127.0.0.1` and nothing else
 /// (ADR-017 decision 6). The identity is right here — transport-authenticated and
-/// checked against the room's evaluator — so this is where it can be surfaced.
+/// checked against the room's reacher set — so this is where it can be surfaced.
 ///
 /// `served` is called **only after authorization succeeds**, so it reports grants and
 /// never attempts; a denial is silent to it, exactly as it is to the dialer. It runs
