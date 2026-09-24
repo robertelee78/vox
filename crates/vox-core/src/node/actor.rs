@@ -1800,6 +1800,16 @@ impl Node {
         let mut mirrored_why = String::new();
         for wire in net.board_records(channel_id, epoch) {
             if let Err(e) = client.put(&wire).await {
+                // A board that already holds something newer from that member has fresher news
+                // than the copy we vouch with: nothing was refused that anyone needed. For our
+                // *own* records, above, the same answer is real and still reported.
+                if matches!(
+                    e,
+                    Error::RendezvousRejected(r)
+                        if r == crate::nat::service::RejectReason::Stale.as_str()
+                ) {
+                    continue;
+                }
                 mirrored_refused += 1;
                 if mirrored_why.is_empty() {
                     mirrored_why = e.to_string();
