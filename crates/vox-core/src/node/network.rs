@@ -255,6 +255,16 @@ pub enum Inbound {
         /// The stream's receive half.
         recv: RecvStream,
     },
+    /// An app stream (ADR-022 decision 7): its `AppOpen` has not been read yet, and its
+    /// gate — this node's keyring and the room's authors — is `node::app`'s to run.
+    App {
+        /// The authenticated peer.
+        peer: Digest32,
+        /// The stream's send half.
+        send: SendStream,
+        /// The stream's receive half.
+        recv: RecvStream,
+    },
     /// A stream kind with no handler yet. The stream is dropped (reset), never
     /// silently left open. Every kind ADR-011 defines is served today; this remains
     /// for a kind a newer peer knows and this node does not.
@@ -601,6 +611,7 @@ impl NodeNet {
                 Ok(Inbound::ServedCircuit { peer })
             }
             StreamKind::Tunnel => Ok(Inbound::Tunnel { peer, send, recv }),
+            StreamKind::App => Ok(Inbound::App { peer, send, recv }),
         }
     }
 

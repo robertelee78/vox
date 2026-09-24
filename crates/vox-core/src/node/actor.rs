@@ -208,6 +208,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped => "shutting the network down",
+        NetEvent::AppDial(_) => "reaching a peer for an app stream",
     }
 }
 
@@ -398,6 +399,9 @@ enum SessionTarget {
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
+    /// A program asked, through the app API, to open an app stream to `peer`: reach it
+    /// through the ladder and hand the connection back (ADR-022 decision 7).
+    AppDial(crate::node::app::AppDial),
     /// The ladder's publish side finished: this node now knows what to advertise, and
     /// which mappings a gateway granted (each of which will need renewing).
     AddressesDiscovered {
@@ -945,9 +949,18 @@ pub struct NodeHandle {
     /// The handle's own stream, backing [`NodeHandle::next_event`] — the
     /// single-consumer convenience the TUI and the gates use.
     events: Arc<Mutex<broadcast::Receiver<NodeEvent>>>,
+    /// The app layer (ADR-022 decision 7).
+    app: Arc<crate::node::app::AppHub>,
 }
 
 impl NodeHandle {
+    /// The app API (ADR-022 decision 7): listen for, accept and open app streams to
+    /// programs on other member nodes. The in-process form of IPC protocol 6.
+    #[must_use]
+    pub fn app(&self) -> &Arc<crate::node::app::AppHub> {
+        &self.app
+    }
+
     /// The latest view (cheap clone of the watch value).
     #[must_use]
     pub fn view(&self) -> NodeView {
@@ -1222,6 +1235,8 @@ pub struct Node {
     /// Kept out of `Channel` because it is a *join* of channel state with the node-wide
     /// keyring, and the keyring is not a property of any one room.
     reachers: std::collections::BTreeMap<Digest32, crate::node::tunnel::Reachers>,
+    /// The app layer (ADR-022 decision 7), shared with every [`NodeHandle`].
+    app: Arc<crate::node::app::AppHub>,
 }
 
 impl Node {
@@ -1341,7 +1356,23 @@ impl Node {
             retention_read_at: 0,
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
+            app: Arc::new(crate::node::app::AppHub::default()),
         };
+        // The app layer asks the actor for connections through its own queue, forwarded
+        // onto the network queue so they are served in order with everything else.
+        {
+            let (dial_tx, mut dial_rx) = mpsc::channel(COMMAND_QUEUE);
+            node.app.set_dialer(dial_tx);
+            let net_tx = node.net_tx.clone();
+            tokio::spawn(async move {
+                while let Some(dial) = dial_rx.recv().await {
+                    if net_tx.send(NetEvent::AppDial(dial)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        let app = Arc::clone(&node.app);
         let view_rx = node.view_tx.subscribe();
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
@@ -1361,6 +1392,7 @@ impl Node {
             view_rx,
             event_tx: handle_event_tx,
             events: Arc::new(Mutex::new(event_rx)),
+            app,
         })
     }
 
@@ -2403,6 +2435,18 @@ impl Node {
                     }
                 }
             }
+            NetEvent::AppDial(crate::node::app::AppDial {
+                channel_id,
+                peer,
+                reply,
+            }) => {
+                let endpoints = self
+                    .net
+                    .as_ref()
+                    .map(|net| net.board_endpoints(&channel_id, &peer))
+                    .unwrap_or_default();
+                let _ = reply.send(self.dial(peer, &endpoints).await);
+            }
             NetEvent::Stream { conn, inbound } => {
                 // Held for the whole handler: the connection must outlive the streams
                 // opened on it, or the peer sees it close mid-exchange.
@@ -2445,6 +2489,18 @@ impl Node {
                             )
                             .await;
                         });
+                    }
+                    Inbound::App { peer, send, recv } => {
+                        // The gate is read live by the serving task; refreshing here is the
+                        // same backstop the tunnel path takes on every accept.
+                        self.refresh_reachers().await;
+                        tokio::spawn(crate::node::app::serve_inbound(
+                            Arc::clone(&self.app),
+                            Arc::clone(&_connection),
+                            peer,
+                            send,
+                            recv,
+                        ));
                     }
                     Inbound::NotYetSupported { .. }
                     | Inbound::ServedRendezvous { .. }
@@ -4903,6 +4959,8 @@ impl Node {
             }
             held
         });
+        // The app layer reads the same live sets, for both halves of its gate.
+        self.app.set_reachers(&self.reachers);
     }
 
     /// Set a room's retention, then apply it here at once and push the policy-update to the

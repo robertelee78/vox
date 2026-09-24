@@ -158,10 +158,21 @@ const OPEN_STREAM_PATIENCE: std::time::Duration = std::time::Duration::from_secs
 /// read.
 const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How many bidirectional streams a peer may have open to this node at once.
+///
+/// Set explicitly rather than left at quinn's default of 100 (ADR-022 decision 7). App
+/// streams are opened by other programs, so a peer can hold many of them open while they
+/// wait, and every one of them occupies a slot a `sync` or `join` stream would otherwise
+/// take: at 100, a hundred stalled app streams were enough to stop a room's messages. The
+/// per-peer app limit (`node::app::MAX_APP_STREAMS_PER_PEER`) is what keeps app streams
+/// few; this is the headroom that keeps the node's own streams opening while they are.
+pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 1024;
+
 /// The transport parameters every Vox connection runs with, in both directions.
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
+    cfg.max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_CONCURRENT_BIDI_STREAMS));
     // `From<VarInt>` rather than `try_from(Duration)`: the millisecond value is a compile-
     // time constant inside the varint range, so there is no error case to handle.
     cfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
@@ -674,6 +685,15 @@ impl VoxConnection {
     /// As [`VoxConnection::bind_flow`].
     pub fn bind_forwarding_flow(&self, send: SendStream, recv: RecvStream) -> Result<DatagramFlow> {
         self.router.bind(send, recv, FlowMode::Forward)
+    }
+
+    /// Bind a datagram flow to the stream `send` belongs to, **sharing** it: the stream
+    /// keeps carrying bytes, and the caller must end the flow with the stream by holding
+    /// both in one object (ADR-022 decisions 1 and 7; `node::app::AppStream` is that
+    /// object). Crate-private because that discipline is not one to hand out.
+    pub(crate) fn bind_shared_flow(&self, send: &SendStream) -> Result<DatagramFlow> {
+        self.router
+            .bind_shared(u64::from(send.id()), FlowMode::Packets)
     }
 
     /// This connection's datagram counters: delivered, and dropped by reason.

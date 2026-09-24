@@ -1,6 +1,6 @@
 # ADR-022: Datagram flows — UDP tunnels, relays that behave like UDP, and the app API
 
-**Status**: **M22.1 and M22.2 built; M22.3–M22.5 are not.** 2026-09-24. Each milestone in the plan
+**Status**: **M22.1, M22.2 and M22.5 built; M22.3 and M22.4 are not.** 2026-09-24. Each milestone in the plan
 below is marked `DONE` only with the gate that proved it.
 **Date**: 2026-09-24
 **Deciders**: Robert E. Lee
@@ -60,8 +60,9 @@ The binding **takes** the stream: from then it carries no bytes, and a watcher e
 sides the moment the stream ends in either direction. Nothing else can hold the stream open, so
 unregistering is not something a caller can forget. That fits the `Circuit` and `Tunnel` streams, which carry
 nothing once the flow is up. An `App` stream carries the app's bytes as well as its flow (decision
-7), so M22.5 is to add a binding that shares the stream instead of taking it, and keeps the same rule:
-the flow ends when the stream does.
+7), so M22.5 added a binding that **shares** the stream (`bind_shared_flow`, crate-private) and keeps
+the rule by construction instead: the only caller, `node::app::AppStream`, holds the stream and the
+flow in one object whose drop ends both.
 
 Authorization happens **once, on the stream**, through the gate that stream kind already has. A
 datagram is accepted only for a flow whose stream was authorized, so a datagram cannot reach anything
@@ -195,6 +196,30 @@ What does not change: the relay is still ciphertext-only by construction.
   - app streams get a lower `set_priority` than sync, join and pairwise traffic;
   - `max_concurrent_bidi_streams` is set explicitly, replacing quinn's default of 100.
 
+*Built (M22.5), and where the build had to decide what this left open:*
+
+- **The refusals really are identical, which took a change outside the app layer.** An unknown stream
+  kind used to be *dropped* — finished, and stopped with code 0 — while a forbidden kind was *reset*
+  with the coded rejection. So "the same reset as a forbidden kind" was distinguishable from "no such
+  kind". `accept_typed` now refuses an unknown kind with the same reset (`streams::refuse`), and an
+  untrusted app stream gets it too: all three are `Reset(5)` on read and `Stopped(5)` on write.
+- **A trusted peer that nobody accepts in time is told `refused`**, not reset: only a trusted peer
+  ever reaches a listener, and that tier is told reasons.
+- **`busy` covers both limits** — 16 live app streams per peer, counted at the responder from
+  admission to end, and the open-rate bucket (burst 10, refill 10 a second).
+- **Priority** is `-1`, below the default 0 every other stream runs at. **The stream limit** is 1024.
+- **Teardown** is a guardian per `AppStream` watching the live set; it resets both halves with
+  `APP_WITHDRAWN_CODE` (`0x2207`) so the peer learns it was a decision, and every call on the stream
+  races the same watch.
+- **IPC.** App requests use tags 2201–2212, away from the sequential range; a connection whose first
+  request is one becomes an app connection for life. In the raw splice the node shuts down its write
+  side when the peer finishes and closes the whole connection when the stream fails, and
+  `vox app` tells the two apart with a zero-byte write (it succeeds on a half-closed connection and
+  fails on a closed one), so a cut stream exits non-zero and says so.
+- **The CLI**, `vox app listen <room> <label>` and `vox app open <room> <peer> <label>… [--datagrams]`,
+  pipes stdin and stdout, `nc`-style; with `--datagrams` each stdin line is one datagram and each
+  datagram received is one line.
+
 ### 8. Calls sit on the app API (R32)
 
 A call is an app (label e.g. `call/v1`) using an app stream for signalling and a datagram flow for
@@ -285,4 +310,26 @@ Each proof runs on a direct path **and** on a forced-relay path.
 - **M22.3** UDP tunnels: `vox serve … /udp`, then `vox forward … /udp` (decision 6). Proofs 1–6.
 - **M22.4** SOCKS5 UDP ASSOCIATE in `vox up`.
 - **M22.5** The app API: `StreamKind::App`, both gates, IPC protocol 6, the library API, and the
-  limits and priorities (decision 7). Proofs 7–8.
+  limits and priorities (decision 7) — **DONE** (`node::{app, appipc}`, `vox app`). Proved by
+  `crates/vox-tui/tests/app_api_proof.rs`, the shipped binary against real nodes, each case
+  mutation-checked:
+  - `a_mebibyte_round_trips_and_a_thousand_datagrams_arrive` — 1 MiB through both nodes and back,
+    SHA-256 equal; 1000 of 1000 datagrams intact. Mutation (responder binds no flow): 0 of 1000.
+  - `an_opener_outside_the_responders_ring_reaches_no_listener` — the listener is told of 0 streams.
+    Mutation (responder gate skipped): 1.
+  - `a_target_outside_the_openers_ring_is_refused_locally` — the opener's node refuses; the target sees
+    0 streams. Mutation (opener gate skipped): the open goes out.
+  - `an_untrusted_refusal_is_the_unknown_kind_refusal` — a raw QUIC client with a real member's
+    identity: the untrusted app refusal and an unknown kind are both `Reset(5)`/`Stopped(5)`, after
+    asserting the app stream really reached the app gate; a trusted member is told `no-listener`.
+    Mutation (untrusted told the reason): the bytes differ.
+  - `withdrawing_trust_tears_down_a_live_app_stream` — both ends exit non-zero ~45 ms after the untrust.
+    Mutation (the watch never fires): both still running 5 s later.
+  - `stalled_app_streams_do_not_hold_up_a_room_message` — 200 app streams opened at once to a listener
+    that never accepts: at most 16 wait, the rest are refused `busy`, and a room message sent a second
+    later arrives. Mutation (per-peer limits removed and quinn's default stream limit restored): the
+    message has not arrived after 10 s. **Proof 8's "under 1 s" is not a bound anything can meet:** a
+    local append is pushed within one actor tick (1 s), so the same message takes 30 ms to 1.03 s with
+    no app streams at all (measured). The gate bounds it at 1.5 s.
+
+  Not built: the counters are not in `vox status`.
