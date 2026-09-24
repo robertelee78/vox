@@ -932,6 +932,128 @@ pub async fn trust_add(
     Ok(())
 }
 
+/// `vox up` with no room: the proxy runs inside the node already holding this profile
+/// and carries every room it holds, until ^C (PRD-001 R20).
+pub async fn up_all(paths: &Paths, bind: SocketAddr) -> Result<(), AppError> {
+    let sock = paths.socket_file();
+    let mut up = vox_core::node::nameipc::up(&sock, bind)
+        .await
+        .map_err(|e| {
+            AppError::Usage(format!(
+                "`vox up` without a room runs inside the node holding this profile, and {}: {e}\n\
+             \x20      start one with `vox daemon`, or name a room: `vox up <room>`",
+                sock.display()
+            ))
+        })?;
+    let bound = up.bound;
+    println!("vox up on {bound} — carrying every room this node holds");
+    println!();
+    println!("add this to ~/.ssh/config, once:");
+    println!();
+    for line in vox_core::node::up::ssh_config_hint(bound).lines() {
+        println!("    {line}");
+    }
+    println!();
+    println!("then:  ssh user@<node>.<room>.vox   (the names you gave them: `vox trust list`)");
+    println!("other tools:  ALL_PROXY=socks5h://{bound}");
+    println!("Ctrl-C to stop");
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            note = up.next_note() => match note {
+                Some(note) => eprintln!("vox: {note}"),
+                None => {
+                    return Err(AppError::Usage("the node stopped, and the proxy with it".into()));
+                }
+            },
+        }
+    }
+    println!("vox: stopping the proxy");
+    Ok(())
+}
+
+/// `vox forward <node>.<room>.vox <service> [<local>]`: resolved and carried by the node
+/// already holding this profile, until ^C (PRD-001 R20).
+pub async fn forward_named(
+    paths: &Paths,
+    name: &str,
+    service: &str,
+    local: &str,
+) -> Result<(), AppError> {
+    let sock = paths.socket_file();
+    let (channel_id, host) = vox_core::node::nameipc::resolve(&sock, name)
+        .await
+        .map_err(|e| AppError::Usage(format!("{name}: {e}")))?;
+    // A bare port means loopback; `127.0.0.1:0` picks one.
+    let local = match local.parse::<u16>() {
+        Ok(port) => format!("127.0.0.1:{port}"),
+        Err(_) => local.to_owned(),
+    };
+    let mut client = vox_core::node::ipc::IpcClient::open(&sock)
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    let bound = match client
+        .request(&vox_core::node::ipc::Request::Forward {
+            channel_id,
+            host,
+            service_tag: service.to_owned(),
+            local,
+        })
+        .await
+    {
+        Ok(vox_core::node::ipc::Frame::Bound { local }) => local,
+        Ok(vox_core::node::ipc::Frame::Error { reason }) => {
+            return Err(AppError::Usage(format!("{name}: {reason}")))
+        }
+        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    println!(
+        "vox: forwarding {bound} to {service} on {name} ({})",
+        short(&host)
+    );
+    println!("Ctrl-C to stop");
+    let _ = tokio::signal::ctrl_c().await;
+    let _ = client
+        .request(&vox_core::node::ipc::Request::StopForward { local: bound })
+        .await;
+    Ok(())
+}
+
+/// `vox trust rename` — change the name this node calls a trusted identity.
+///
+/// Only an identity already in the ring: renaming must never be a way to trust.
+pub async fn trust_rename(
+    node: &NodeHandle,
+    fingerprint: &str,
+    name: &str,
+) -> Result<(), AppError> {
+    let target = resolve_trust_target(node, fingerprint)?;
+    if !node.view().trusted.iter().any(|(fp, _)| *fp == target) {
+        return Err(AppError::Usage(format!(
+            "{} is not trusted, so it has no name to change — `vox trust add` it first",
+            short(&target)
+        )));
+    }
+    let out = node
+        .apply(NodeCommand::Trust {
+            fingerprint: target,
+            petname: name.to_owned(),
+        })
+        .await;
+    if !out.is_done() {
+        return Err(AppError::Usage(format!(
+            "cannot rename that identity: {out:?}"
+        )));
+    }
+    println!(
+        "vox: {} is now {name:?} — reachable as {}.<room>.vox",
+        short(&target),
+        vox_core::node::resolver::label_of(name)
+    );
+    Ok(())
+}
+
 /// `vox trust remove` — stop trusting an identity, and change the lock.
 ///
 /// Removes the ring entry, then rotates this identity's sender key and re-keys everyone

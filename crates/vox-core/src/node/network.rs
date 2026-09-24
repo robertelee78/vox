@@ -938,6 +938,27 @@ impl NodeNet {
             .collect()
     }
 
+    /// [`NodeNet::board_endpoints`] from whichever room's board has a live record for
+    /// `member` — for a dial that names a member but not a room (`vox up` across every
+    /// room, PRD-001 R20).
+    #[must_use]
+    pub fn board_endpoints_any(&self, member: &Digest32) -> EndpointList {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .channels_with_genesis()
+            .iter()
+            .find_map(|cid| {
+                guard
+                    .current_members(cid, 0, now)
+                    .into_iter()
+                    .find(|r| r.author_id == *member)
+                    .map(|r| r.endpoints.clone())
+            })
+            .unwrap_or_default()
+    }
+
     /// The endpoints this node's board advertises for `member` in `channel_id` — the
     /// dial hints any reach starts from (the identity is pinned, so a wrong hint only
     /// fails).

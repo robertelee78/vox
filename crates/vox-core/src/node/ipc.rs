@@ -1273,6 +1273,13 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         let Some(body) = read_frame(&mut stream).await? else {
             return Ok(());
         };
+        // PRD-001 R20: resolving a `.vox` name serves on; `vox up` holds the connection.
+        if let Some(req) = crate::node::nameipc::NameRequest::parse(&body) {
+            if crate::node::nameipc::serve(&mut stream, &handle, req).await? {
+                continue;
+            }
+            return Ok(());
+        }
         // PRD-001 R35: `vox status`. Answered, and the connection serves on.
         if crate::node::status::is_request(&body) {
             crate::node::status::serve(&mut stream, &handle).await?;

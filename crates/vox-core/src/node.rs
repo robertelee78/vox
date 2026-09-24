@@ -36,6 +36,7 @@ pub mod headless;
 pub mod ipc;
 pub mod joinstream;
 pub mod link;
+pub mod nameipc;
 pub mod net;
 pub mod network;
 pub mod pairwise_stream;

@@ -206,6 +206,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Stopped => "shutting the network down",
         NetEvent::AppDial(_) => "reaching a peer for an app stream",
         NetEvent::Status(_) => "reporting status",
+        NetEvent::Names(_) => "resolving a .vox name",
+        NetEvent::UpAll { .. } => "bringing the proxy up for every room",
     }
 }
 
@@ -402,6 +404,17 @@ enum NetEvent {
     /// `vox status` or the metrics endpoint asked what this node is doing (PRD-001 R35,
     /// R38): read state, answer, change nothing.
     Status(oneshot::Sender<crate::node::status::StatusReport>),
+    /// A `.vox` name is being resolved (PRD-001 R20): answer with a snapshot of this
+    /// node's rooms and keyring names.
+    Names(oneshot::Sender<crate::node::resolver::VoxResolver>),
+    /// Bring the SOCKS proxy up across every room this node holds, for a `vox up` that
+    /// asked over the control socket; refusals and cut sessions go to `report`.
+    UpAll {
+        bind: std::net::SocketAddr,
+        report: mpsc::UnboundedSender<String>,
+        reply:
+            oneshot::Sender<crate::error::Result<(std::net::SocketAddr, tokio::task::AbortHandle)>>,
+    },
     /// The ladder's publish side finished: this node now knows what to advertise, and
     /// which mappings a gateway granted (each of which will need renewing).
     AddressesDiscovered {
@@ -936,6 +949,9 @@ pub struct NodeHandle {
     app: Arc<crate::node::app::AppHub>,
     /// Where status requests go (PRD-001 R35).
     status_tx: mpsc::Sender<oneshot::Sender<crate::node::status::StatusReport>>,
+    /// The node's network queue, for the requests that go straight onto it: naming and
+    /// the all-rooms proxy.
+    net_tx: mpsc::Sender<NetEvent>,
 }
 
 impl NodeHandle {
@@ -959,6 +975,46 @@ impl NodeHandle {
             .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?;
         rx.await
             .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))
+    }
+
+    /// Resolve a `.vox` name against this node's rooms and keyring (PRD-001 R20): the
+    /// room and the member it leads to, or a sentence saying why it leads nowhere.
+    ///
+    /// # Errors
+    /// The reason, for this machine's operator.
+    pub async fn resolve_name(
+        &self,
+        name: &str,
+    ) -> std::result::Result<crate::node::resolver::ServiceRoom, String> {
+        NodeNames {
+            net_tx: self.net_tx.clone(),
+        }
+        .resolve(name)
+        .await
+    }
+
+    /// Bring the SOCKS proxy up across every room this node holds (`vox up` over the
+    /// control socket, PRD-001 R20). Refusals and cut sessions are sent to `report` as
+    /// sentences; the proxy runs until the returned handle is aborted.
+    ///
+    /// # Errors
+    /// If the address is not loopback, cannot be bound, or the node is not networked.
+    pub async fn up_all(
+        &self,
+        bind: std::net::SocketAddr,
+        report: mpsc::UnboundedSender<String>,
+    ) -> crate::error::Result<(std::net::SocketAddr, tokio::task::AbortHandle)> {
+        let (reply, rx) = oneshot::channel();
+        self.net_tx
+            .send(NetEvent::UpAll {
+                bind,
+                report,
+                reply,
+            })
+            .await
+            .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?;
+        rx.await
+            .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?
     }
 
     /// The latest view (cheap clone of the watch value).
@@ -1380,6 +1436,7 @@ impl Node {
             });
         }
         let app = Arc::clone(&node.app);
+        let handle_net_tx = node.net_tx.clone();
         // Status requests take the same road as app dials: onto the network queue, so
         // they are answered in order with everything else and never race a mutation.
         let (status_tx, mut status_rx) = mpsc::channel::<oneshot::Sender<_>>(COMMAND_QUEUE);
@@ -1414,6 +1471,7 @@ impl Node {
             events: Arc::new(Mutex::new(event_rx)),
             app,
             status_tx,
+            net_tx: handle_net_tx,
         })
     }
 
@@ -2440,6 +2498,16 @@ impl Node {
             }
             NetEvent::Status(reply) => {
                 let _ = reply.send(self.status_report());
+            }
+            NetEvent::Names(reply) => {
+                let _ = reply.send(self.resolver_snapshot().await);
+            }
+            NetEvent::UpAll {
+                bind,
+                report,
+                reply,
+            } => {
+                let _ = reply.send(self.bring_up_all(bind, report).await);
             }
             NetEvent::AppDial(crate::node::app::AppDial {
                 channel_id,
@@ -4700,15 +4768,22 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        let genesis = shared.lock().await.genesis().clone();
-        let mut resolver = crate::node::resolver::VoxResolver::new();
-        if !resolver.insert(&genesis) {
-            // A room with no genesis service grant has no `.vox` name: its host is not
-            // determined by the genesis, so there is nothing to resolve to. Such a room is
-            // reached with `vox forward <member>/<tag>` instead (ADR-017 decision 4).
-            return Outcome::Failed(Fault::Refused);
-        }
-        let hostname = crate::node::link::vox_hostname(channel_id);
+        let (genesis, local_name) = {
+            let ch = shared.lock().await;
+            (ch.genesis().clone(), ch.local_name().to_owned())
+        };
+        // The name to tell the person. A `vox serve` room keeps its `<room-id>.vox` name for
+        // its creator; every room's members are reachable as `<node>.<room>.vox` (ADR-017
+        // decision 7), which is what names resolve against — this node's rooms and keyring,
+        // as they stand when each connection asks.
+        let hostname = if genesis.body.service_grant.is_empty() {
+            format!(
+                "<node>.{}.vox",
+                crate::node::resolver::label_of(&local_name)
+            )
+        } else {
+            crate::node::link::vox_hostname(channel_id)
+        };
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return Outcome::Failed(Fault::NotNetworked);
         };
@@ -4727,13 +4802,15 @@ impl Node {
             Ok(a) => a,
             Err(_) => return Outcome::Failed(Fault::Internal),
         };
-        let resolver = Arc::new(resolver);
+        let resolver = Arc::new(NodeNames {
+            net_tx: self.net_tx.clone(),
+        });
         // No dial here: the host is reached per request (see `up::HostDialer`). Dialling
         // first would refuse to start on a race — a node that has just joined has not read
         // the board — and retrying here would block the actor tick that reads it.
         let dialer = Arc::new(NodeDialer {
             net,
-            channel_id: *channel_id,
+            channel_id: None,
         });
         // The proxy is a library and cannot print, so a session cut by a withdrawal of
         // reach comes back as an event (M17.11). A broadcast send never blocks and drops
@@ -4765,6 +4842,79 @@ impl Node {
             bind: bound,
         });
         Outcome::Done
+    }
+
+    /// A snapshot of every `.vox` name this node can resolve: its open rooms under their
+    /// local names with their members, its keyring's names, and — for the older
+    /// `<room-id>.vox` form — each service room's creator.
+    async fn resolver_snapshot(&self) -> crate::node::resolver::VoxResolver {
+        let mut names = crate::node::resolver::VoxResolver::new();
+        let view = self.view_tx.borrow().clone();
+        for room in &view.open_channels {
+            names.add_room(room.channel_id, &room.local_name, &room.members);
+        }
+        for (fp, petname) in self.trust.iter() {
+            names.name(*fp, petname);
+        }
+        for shared in self.channels.values() {
+            names.insert(shared.lock().await.genesis());
+        }
+        names
+    }
+
+    /// Bring the SOCKS proxy up for every room at once (PRD-001 R20): names resolve
+    /// against the node's rooms and keyring as they are when each connection asks.
+    async fn bring_up_all(
+        &mut self,
+        bind: std::net::SocketAddr,
+        report: mpsc::UnboundedSender<String>,
+    ) -> crate::error::Result<(std::net::SocketAddr, tokio::task::AbortHandle)> {
+        if !bind.ip().is_loopback() {
+            return Err(crate::error::Error::MalformedTunnel(
+                "vox up binds loopback only",
+            ));
+        }
+        let net = self
+            .net
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(crate::error::Error::Unreachable(
+                "the node is not networked",
+            ))?;
+        let listener =
+            tokio::net::TcpListener::bind(bind)
+                .await
+                .map_err(|e| crate::error::Error::Path {
+                    op: "bind the vox up proxy",
+                    detail: format!("{bind}: {e}"),
+                })?;
+        let bound = listener
+            .local_addr()
+            .map_err(|_| crate::error::Error::Unreachable("the proxy listener has no address"))?;
+        let names = Arc::new(NodeNames {
+            net_tx: self.net_tx.clone(),
+        });
+        let dialer = Arc::new(NodeDialer {
+            net,
+            channel_id: None,
+        });
+        let cut = report.clone();
+        let task = tokio::spawn(crate::node::up::serve_reporting(
+            listener,
+            names,
+            dialer,
+            Arc::clone(&self.udp_flows),
+            move |room: &Digest32, port: u16| {
+                let _ = cut.send(format!(
+                    "the host withdrew access to port {port} in room {} — that session was cut",
+                    crate::node::link::b32_encode(room)
+                ));
+            },
+            move |reason: &str| {
+                let _ = report.send(reason.to_owned());
+            },
+        ));
+        Ok((bound, task.abort_handle()))
     }
 
     async fn forward(
@@ -4822,7 +4972,7 @@ impl Node {
         };
         let dialer = Arc::new(NodeDialer {
             net,
-            channel_id: *channel_id,
+            channel_id: Some(*channel_id),
         });
         let events = self.event_tx.clone();
         let report = move |reason: String| {
@@ -5299,8 +5449,9 @@ fn row_of(r: &Rendered) -> MessageRow {
 /// blocked.
 struct NodeDialer {
     net: Arc<NodeNet>,
-    /// The room whose board names the host's endpoints.
-    channel_id: Digest32,
+    /// The room whose board names the host's endpoints; `None` for a proxy across every
+    /// room, which looks the host up on whichever board has it.
+    channel_id: Option<Digest32>,
 }
 
 impl crate::node::up::HostDialer for NodeDialer {
@@ -5309,8 +5460,41 @@ impl crate::node::up::HostDialer for NodeDialer {
         // ADR-012 ladder, so this is both "give me the connection" and "make one". The
         // endpoint hints come from the board, which is also why this must happen per
         // request: a node that has only just joined has not read the board yet.
-        let endpoints = self.net.board_endpoints(&self.channel_id, host);
+        let endpoints = match &self.channel_id {
+            Some(cid) => self.net.board_endpoints(cid, host),
+            None => self.net.board_endpoints_any(host),
+        };
         self.net.reach(*host, &endpoints).await
+    }
+}
+
+/// How the proxy resolves names from a running node: a fresh snapshot of its rooms and
+/// keyring for every lookup, so a room joined or a node renamed a moment ago resolves.
+struct NodeNames {
+    net_tx: mpsc::Sender<NetEvent>,
+}
+
+impl NodeNames {
+    async fn resolve(
+        &self,
+        name: &str,
+    ) -> std::result::Result<crate::node::resolver::ServiceRoom, String> {
+        let (tx, rx) = oneshot::channel();
+        self.net_tx
+            .send(NetEvent::Names(tx))
+            .await
+            .map_err(|_| "the node has stopped".to_owned())?;
+        let names = rx.await.map_err(|_| "the node has stopped".to_owned())?;
+        names.lookup(name)
+    }
+}
+
+impl crate::node::up::Names for NodeNames {
+    async fn lookup(
+        &self,
+        name: &str,
+    ) -> std::result::Result<crate::node::resolver::ServiceRoom, String> {
+        self.resolve(name).await
     }
 }
 
