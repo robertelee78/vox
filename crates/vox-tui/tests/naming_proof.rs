@@ -214,10 +214,11 @@ fn socks(proxy: SocketAddr, host: &str, port: u16) -> Result<TcpStream, u8> {
 fn who_answers(proxy: SocketAddr, name: &str) -> Result<String, u8> {
     let mut s = socks(proxy, name, 22)?;
     s.write_all(b"hello\n").unwrap();
-    let mut buf = [0u8; 64];
-    let n = s.read(&mut buf).unwrap();
-    let got = String::from_utf8_lossy(&buf[..n]).into_owned();
-    Ok(got.split(':').next().unwrap_or("").to_owned())
+    // To the end of the line: one `read` may return only part of the answer, and a
+    // partial `car` would read as a wrong host.
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line).unwrap();
+    Ok(line.split(':').next().unwrap_or("").to_owned())
 }
 
 /// `vox forward <name> 22 0` on alice: whether it bound, and what it said.
