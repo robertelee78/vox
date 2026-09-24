@@ -1,7 +1,7 @@
 # ADR-020: Agent comms — a room-based messaging app on the Vox layer
 
 **Status**: **partly implemented** — 2026-09-21; the claim protocol of §5 corrected and extended by
-ADR-021, built 2026-09-24. Twelve decisions; the plan below marks each
+ADR-021, built 2026-09-24 in PR #14 (not yet on `main`). Twelve decisions; the plan below marks each
 milestone `DONE` with the commit that landed it, or leaves it unmarked. Nothing here is marked done
 that has not passed a gate.
 
@@ -311,7 +311,7 @@ A **suggested work vocabulary** shipped as convention (not enforced): `assign`, 
 `working`, `blocked`, `result`, `failed`, `status`, `ask`, `answer`, `ack`. It is shaped to map onto
 A2A's `TaskState` so a future bridge is mechanical.
 
-> **Amended by ADR-021 (built 2026-09-24).** For any message carrying a work-item reference
+> **Amended by ADR-021 (built 2026-09-24 in PR #14, not yet on `main`).** For any message carrying a work-item reference
 > (`data.work`), ADR-021 §3 gives each of these types a normative meaning. In particular, `result` is an
 > assertion rather than an acceptance verdict, Release ready or Done, and `release` is neither Done nor
 > failure. `blocked` is a Health observation and never a Work phase. ADR-021 also makes a
@@ -338,7 +338,7 @@ Resolution rules, which every node **MUST** apply identically so the answer conv
 This is deliberately a *convention over the open tail* of §4, not new protocol: the log already
 provides the total order and the deterministic tie-break key.
 
-> **Amended by ADR-021 §4–§6 (built 2026-09-24).** The rules above are what the binary did through
+> **Amended by ADR-021 §4–§6 (built 2026-09-24 in PR #14, not yet on `main`).** The rules above are what the binary did through
 > v0.2.7. ADR-021 replaces them with one corrected claim protocol that keeps these type names:
 > - **ownership is `(author fingerprint, session)`**, not the harness key;
 > - **a `handoff` names the recipient's fingerprint** (`data.to_fp`), because a petname is local and
@@ -768,7 +768,7 @@ Both unknowns are already spiked; neither remains open.
 - **M19.4 — CLI and skill. DONE 2026-09-22.** `vox room post|read|tail|roster|list`, and
   `vox agent skill` prints the skill for an operator to install where their harness looks.
 
-  > **Named defect, found and fixed 2026-09-24 (ADR-021 F13) — `tail` never showed another member's
+  > **Named defect, found 2026-09-24 and fixed in PR #14 (ADR-021 F13) — `tail` never showed another member's
   > message.** The node emits `NewEntry` only for its own appends; an entry synced from a peer is
   > announced as `Synced`, which carries no row, and `tail` listened only for `NewEntry`. Every `tail`
   > since this milestone showed the node's own posts and nothing else. `tail` now treats `Synced`,
@@ -854,7 +854,7 @@ Both unknowns are already spiked; neither remains open.
   > `claim::resolve`, which resolves no recipient (`room_cli.rs:409` → `claim.rs:182-184`). A handoff
   > therefore never moves ownership. `work_board_proof.rs` does not exercise handoff, so the gate above
   > stayed green. Resolving by petname would not converge either, because petnames are local. Recorded
-  > as ADR-021 F1–F3, with per-session ownership. **Fixed by ADR-021 M21.2, 2026-09-24:** a handoff
+  > as ADR-021 F1–F3, with per-session ownership. **Fixed by ADR-021 M21.2 in PR #14, 2026-09-24:** a handoff
   > carries the recipient's fingerprint and leaves the resource pending until an eligible session
   > claims it; `work_handoff_proof` runs every handoff case through the binary on two nodes and
   > compares their folded boards.
