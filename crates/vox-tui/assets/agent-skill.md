@@ -44,8 +44,9 @@ echo "port the wire codec" | vox room post "$VOX_ROOM" --type assign --to bob \
 `<scheme>:<id>` — copy it exactly as the tracker gives it (the id may contain `:`).
 Vox checks its shape and never interprets it, and the tracker — not Vox, not you —
 owns the item's phase, health, priority, acceptance and delivery. While you hold the
-claim on an item, your posts about it are stamped with that claim as the attempt;
-you need not name one.
+claim on an item, your posts about it are stamped with the current attempt, and you
+need not name one: the attempt begins at your claim, and after you post `failed` your
+next post begins a new one.
 
 ### What each type means, and does not mean
 

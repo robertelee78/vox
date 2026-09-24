@@ -26,6 +26,9 @@ Revision history:
   **admits `:`**, and the shape is **enforced** by the CLI (F16, found then); `data.attempt` **defaults to
   the holder's claim acquisition** (§3). The adapter from `vox room tail --json` to that tracker belongs
   in the tracker's repository, not in Vox.
+- 2026-09-24 — at the tracker's request: **a `failed` ends the attempt it names, and the holder's next
+  post begins a new one** named by that `failed` entry (§3), so every attempt is bounded; and the
+  adapter's **read cycle** over `board.position` and the stream is documented (§7). No wire change.
 
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, interop, work-tracking, adapter, envelope, claims, versioning, defects
@@ -134,7 +137,7 @@ defects**, not accepted gaps, because each is a thing a user meets.
 | F14 | **A rate limit reaches the user as `Failed(Internal)`.** A member who posts more than 1,000 entries in an hour is refused, correctly, by ADR-008's per-author quota (`log/quota.rs`, `DEFAULT_MAX_ENTRIES_PER_HOUR = 1000` over a sliding `RATE_WINDOW_SECS = 3600`) — but `append_text` replaces `Quota(RateExceeded)` with `Error::Profile("authored entry failed the acceptance predicate")` (`channel.rs`), which surfaces as `vox: Failed(Internal)`. A person or agent cannot tell it is rate-limited, or when it may post again. | Reproduced through the real binary by the `vox` session: one member alone in a room, 1,010 `vox room post` calls — posts 0–999 succeed and every later one fails `Failed(Internal)`, identically on v0.2.6 and v0.2.7. Root cause measured by that session with an instrumented build: rotation at the 1,000th message **succeeds** (`rotate_sender: Ok(1)`); every refusal is `dag.accept … Quota(RateExceeded)`. The refusal is **not permanent** — the window slides. My own two-node reproduction first failed at index 999, most likely one earlier non-content entry counted in the same window. (An earlier version of this entry blamed rotation; that was wrong, and it is corrected here.) | **Retired 2026-09-24.** The decider accepted PRD-001 R3 — the per-author rate quota is **removed** — so there is no refusal left to report; the readable-refusal fix (#15) was closed unmerged. (It had been proved: `quota_refusal_proof`, red against the discarded error.) Before that decision, whether 1,000 entries/hour/author was the right default for agent rooms was a **decider question**, not a defect: it is tunable per channel (`QuotaPolicy`), and other members enforce it too, dropping over-quota entries on receipt. `adapter_stream_proof` keeps each member under 1,000 an hour and says why. Remove this entry when a member who exceeds the quota is told, through the real binary, that it is rate-limited and when it clears. |
 | F15 | **The daemon's interrupt path sees only this node's own posts.** | Found by reading, then **reproduced through the real `vox daemon`** (`remote_interrupt_proof`: an urgent message from another node reached bob's node and woke nobody — `received []`): `vox daemon` wakes a session on `NodeEvent::NewEntry` (`app.rs`), which by F13's evidence is emitted only for local appends, so an urgent message addressed to a session from *another* node would never interrupt it. `interrupt_proof` calls the wake decision directly and never runs that loop, so nothing would catch it. | **Open; fix proposed in #16** (the daemon sweeps on `Synced`/`SenderKeyReceived`/`Lagged`/a tick; `remote_interrupt_proof` green, red against the shipped loop). Remove when that lands: an urgent, addressed message posted on one node interrupts a session registered on another, through `vox daemon`. |
 | F16 | **`data.work`'s shape was specified and never checked, and one spelling skipped the version gate.** | Found reading `post_cmd` against the work-accountability tracker's key format: the CLI refused only an empty `--work`, so any string rode as a reference; and a post that set the reference through `--data '{"work":…}'` instead of `--work` skipped the version gate, which was keyed on the flag rather than on the message. `claim --work` checked nothing either. | **Fixed here**: the reference is checked where it lands in `data`, for every verb, and the gate follows the message (§3). `work_ref_proof` refuses seven malformed references through each of the three spellings with nothing posted, and turns red against each of the removed checks (six mutants, all caught). The gate half — a `--data` reference now passes the version gate — follows by construction (the gate reads the checked reference) and is **not separately proved**; `work_version_proof` drives the gate through `--work` only. |
-| F17 | **An OpenCode session opened by hand can never be interrupted.** | Measured 2026-09-24 against OpenCode 1.18.32, a plain TUI in tmux with a probe plugin: the plugin is handed `serverUrl=http://localhost:4096/` but **nothing listens** (no TCP listener; a request fails), and `OPENCODE_SERVER_URL` is **unset**. With `--port 47123` the TUI does listen and the plugin is handed that URL, but the variable is still unset. `vox agent hook` registers a session as OpenCode — and so wakeable — only from `OPENCODE_SERVER_URL` (`wake.rs`), so every OpenCode session registers as `unknown` and an urgent message waits for the next turn. ADR-020 M19.6 is marked DONE for OpenCode, but no test ever posts to `prompt_async` or sets the variable: the gate proved the wake *decision*, not the delivery. | **Open.** The delivery mechanism is a decider question, being researched (plugin relay through OpenCode's in-process client, as ctm does; the plugin's `serverUrl` when a listener exists; or both). Remove when an urgent, addressed message interrupts a plain, hand-opened `opencode` through `vox daemon` and the real binary. |
+| F17 | **An OpenCode session opened by hand can never be interrupted.** | Measured 2026-09-24 against OpenCode 1.18.32, a plain TUI in tmux with a probe plugin: the plugin is handed `serverUrl=http://localhost:4096/` but **nothing listens** (no TCP listener; a request fails), and `OPENCODE_SERVER_URL` is **unset**. With `--port 47123` the TUI does listen and the plugin is handed that URL, but the variable is still unset. `vox agent hook` registers a session as OpenCode — and so wakeable — only from `OPENCODE_SERVER_URL` (`wake.rs`), so every OpenCode session registers as `unknown` and an urgent message waits for the next turn. ADR-020 M19.6 is marked DONE for OpenCode, but no test ever posts to `prompt_async` or sets the variable: the gate proved the wake *decision*, not the delivery. | **Open; deferred by the decider 2026-09-24.** Researched and measured the same day (OpenCode 1.18.32, a mock model, no paid turns): the TUI talks to its server in-process and starts a listener only with `--port`, `--hostname` or `--mdns`; `4096` is a placeholder. A plugin's in-process client works once init is over — `promptAsync` from a plain TUI returned 204 and showed on screen. `prompt_async` during a turn is **not** rejected: it is picked up at the next step boundary (after the running tool), shown as QUEUED, exactly as typing while busy. Aborting orphans a queued prompt, so an interrupt must not abort first. `--port` exposes an unauthenticated server whose CORS admits any localhost origin. The candidates are a plugin-owned private socket relayed through the in-process client (ctm's shape), `--port` HTTP, or both; the decider has not chosen. Remove when an urgent, addressed message interrupts a plain, hand-opened `opencode` through `vox daemon` and the real binary. |
 
 ## Decision
 
@@ -192,13 +195,23 @@ A message about a work item **MUST** carry the reference in `data.work`:
   Vox checks the shape only; it never interprets the id or looks it up.
 - **`data.attempt`** names one execution attempt, so a tracker can tell a retry from the original. Vox
   treats it as opaque. **When the caller names none, a work-bound post from the session that holds the
-  claim on that item carries the claim's acquisition** (the claim entry's hash, as `board --json` shows
-  it). A claim is where an attempt begins and a release, lapse or handoff is where it ends, so every
-  claim is a new attempt and an agent never has to mint ids. A post from a session that does not hold
-  the claim carries no attempt unless it names one. A retried `--op` keeps the attempt its first post
-  carried, so a claim re-taken between the two does not turn the retry into a conflict. A `failed` and a
-  later retry *under the same claim* therefore share an attempt; an agent that wants them separate names
-  one with `--attempt`, or releases and claims again. (Decided 2026-09-24.)
+  claim on that item carries the current attempt**, defined by the log alone:
+  - an attempt **begins** at the holder's claim on the item, or at the holder's own latest `failed` for
+    the item since that claim, in canonical order;
+  - it **ends** at the next `failed`, or at a release, lapse or handoff of the claim;
+  - its id is the hash of the entry that began it — the claim's acquisition (as `board --json` shows
+    it) or that `failed` entry. So every attempt is bounded, a tracker can reconstruct each one from the
+    stream, and an agent never mints an id. A `failed` names the attempt that failed; the holder's next
+    work-bound post begins the next one.
+  - A `failed` whose operation is void (§6) begins nothing; a retried `failed` is its first entry.
+    (`work_ref_proof` proves the rest of this rule against five mutants; these two exclusions are
+    by reading only — no proof yet posts a voided or duplicated `failed`.)
+  - A post from a session that does not hold the claim carries no attempt unless it names one; an
+    explicit `--attempt` always wins. A retried `--op` keeps the attempt its first post carried, so a
+    claim renewed, re-taken or failed between the two does not turn the retry into a conflict.
+
+  (Decided 2026-09-24: first "the claim is the attempt"; the same day, at the work-accountability
+  tracker's request for bounded attempts, **a `failed` ends the attempt and the retry is a new one**.)
 - **`data.op`** is the operation id (§6). **`data.vox`** is the version stamp (§5).
 - **`data.evidence`** is OPTIONAL: a list of `{kind, ref, sha256?}`, opaque to Vox. Bytes that must
   move between hosts use ADR-020 §11's file exchange, whose announcement can itself carry `data.work`.
@@ -508,6 +521,30 @@ all over the existing control socket, and no new socket request**:
    operation conflict (§6).
 
    The tracker records ownership from this and never reimplements the fold.
+
+   **The adapter's read cycle** (added 2026-09-24 at the work-accountability tracker's request; it
+   describes the built behaviour and adds no rule to it):
+   - **Read the stream and the board from the same node.** Local order is per node: it is the order in
+     which *this* node's timeline received the rows. It is append-only and survives a restart — the
+     timeline is rebuilt from the sealed plaintext cache in ascending segment order, which is the order
+     it was written (`channel.rs`, `store.rs`) — so an entry hash names a fixed prefix of it. That is read
+     from the code; no proof restarts a node and compares the order, and one should before an adapter
+     depends on it across node restarts.
+   - `board.position` names the prefix the board was folded from: `last` is the entry hash of its final
+     row and `entries` its length. `tail` emits the same rows in the same order.
+   - To attach an ownership snapshot to the event ledger: take `board --json`, let `L = position.last`.
+     If `L` is already in the ledger, the snapshot describes ownership **as of that row** — record it
+     there — and, if the ledger holds the log from its first row, check that `position.entries` equals
+     the number of rows up to and including `L`. If `L`
+     is not yet in the ledger, the board is ahead of the stream: keep consuming `tail` until `L` arrives,
+     then record it. Never attach a snapshot to a prefix it was not folded from. A mismatch in `entries`
+     is a defect to report, not a case to smooth over.
+   - **Ownership also changes with no row.** A lapse is a function of `now_millis`, not of the log, so
+     two boards at the same position can differ. Take a fresh board at or after the earliest
+     `expires_millis` or `deadline_millis` it reports, not only when a row arrives.
+   - Late conflicts need no special reading: the board at `L` already folds every conflict among the
+     rows up to `L`, and the stream re-emits the rows of a group that becomes a conflict later (item 2 above).
+   - `coordination: refused` in the board, or exit 3 from any verb, stops the adapter (§5).
 4. **Structured posting**: `vox room post ROOM --type T [--work REF] [--attempt A] [--op ID] [--to
    NAME…] [--urgent] [--data JSON] -`, with the body on stdin.
    - It fills `from` and `at` (F4). `at` comes from the git state of the working directory.

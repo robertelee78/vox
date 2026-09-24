@@ -16,8 +16,11 @@
 //!    `--data`, and by `claim --work`;
 //! 3. the holder's post carries the acquisition the board shows; a session that does not
 //!    hold the claim gets no attempt; an explicit `--attempt` wins;
-//! 4. release and claim again is a **new** attempt;
-//! 5. retrying an `--op` after the claim was re-taken is still the same message — it
+//! 4. a `failed` ends the attempt it names: the holder's next post begins a new one,
+//!    named by that `failed` entry, and so on for every failure — every attempt is
+//!    bounded and derivable from the log;
+//! 5. release and claim again is a **new** attempt;
+//! 6. retrying an `--op` after the claim was re-taken is still the same message — it
 //!    keeps the attempt its first post carried, instead of turning into a conflict.
 
 #![cfg(unix)]
@@ -39,7 +42,11 @@ fn rows(w: &Worker, r: &str) -> Vec<serde_json::Value> {
 }
 
 fn post(w: &Worker, session: &str, r: &str, extra: &[&str], body: &str) -> Out {
-    let mut args = vec!["room", "post", r, "--type", "working", "--json"];
+    post_as(w, session, r, "working", extra, body)
+}
+
+fn post_as(w: &Worker, session: &str, r: &str, kind: &str, extra: &[&str], body: &str) -> Out {
+    let mut args = vec!["room", "post", r, "--type", kind, "--json"];
     args.extend_from_slice(extra);
     args.push("-");
     w.vox_in(Some(session), &args, Some(body))
@@ -161,7 +168,51 @@ fn a_work_reference_has_one_shape_and_an_attempt_is_where_a_claim_began() {
         "an explicit --attempt wins"
     );
 
-    // ---- (4) release and claim again: a new attempt ----
+    // ---- (4) a `failed` ends the attempt it names; the retry is a new one ----
+    let failed = post_as(
+        alice,
+        "holder",
+        r,
+        "failed",
+        &["--work", KEY, "--data", r#"{"reason":"tests red"}"#],
+        "first try failed",
+    );
+    assert!(failed.ok, "{failed:?}");
+    assert_eq!(
+        data_of(alice, r, &failed)["attempt"],
+        first.as_str(),
+        "a `failed` must name the attempt that failed"
+    );
+    let retry1 = post(alice, "holder", r, &["--work", KEY], "trying again");
+    assert!(retry1.ok, "{retry1:?}");
+    assert_eq!(
+        data_of(alice, r, &retry1)["attempt"],
+        failed.json()["entry_hash"],
+        "after a `failed`, the holder's next post must begin a NEW attempt, named by that failure"
+    );
+    let failed2 = post_as(
+        alice,
+        "holder",
+        r,
+        "failed",
+        &["--work", KEY, "--data", r#"{"reason":"still red"}"#],
+        "second try failed",
+    );
+    assert!(failed2.ok, "{failed2:?}");
+    assert_eq!(
+        data_of(alice, r, &failed2)["attempt"],
+        failed.json()["entry_hash"],
+        "the second `failed` names the second attempt"
+    );
+    let retry2 = post(alice, "holder", r, &["--work", KEY], "third try");
+    assert!(retry2.ok, "{retry2:?}");
+    assert_eq!(
+        data_of(alice, r, &retry2)["attempt"],
+        failed2.json()["entry_hash"],
+        "every failure begins the next attempt, not only the first"
+    );
+
+    // ---- (5) release and claim again: a new attempt ----
     let released = alice.vox(Some("holder"), &["room", "release", r, KEY]);
     assert!(released.ok, "{released:?}");
     let again = alice.vox(Some("holder"), &["room", "claim", r, "--work", KEY]);
@@ -176,7 +227,7 @@ fn a_work_reference_has_one_shape_and_an_attempt_is_where_a_claim_began() {
         "a post after re-claiming must name the NEW attempt"
     );
 
-    // ---- (5) an --op retried after the re-claim is still the same message ----
+    // ---- (6) an --op retried after the re-claim is still the same message ----
     let retry = post(
         alice,
         "holder",

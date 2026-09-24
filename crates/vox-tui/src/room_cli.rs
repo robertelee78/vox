@@ -381,28 +381,30 @@ pub async fn post_cmd(
     } else {
         coord::snapshot(&mut client, cid).await?
     };
-    // **The attempt, when the caller did not name one** (ADR-021 §3): the acquisition
-    // of this session's claim on the work item. A claim is where an attempt begins and
-    // a release or lapse is where it ends, so every claim is a new attempt and a tracker
-    // can tell a retry from a continuation without asking the agent to mint ids. A
-    // retried `--op` keeps the attempt its first post carried — the claim may have been
-    // renewed or re-taken since, and a different attempt would make the retry a
-    // conflict rather than the same message.
+    // **The attempt, when the caller did not name one** (ADR-021 §3). An attempt begins
+    // at this session's claim on the work item, or at its own latest `failed` for that
+    // item since the claim — a `failed` ends the attempt it names, so the retry after it
+    // is a new, bounded attempt — and it ends at the next `failed`, a release, a lapse
+    // or a handoff. Its id is the hash of the entry that began it, so a tracker can
+    // derive every attempt from the log and an agent never mints one. A retried `--op`
+    // keeps the attempt its first post carried — the claim may have been renewed,
+    // re-taken or failed since, and a different attempt would make the retry a conflict
+    // rather than the same message.
     if let (Some(w), None) = (&work, data.get("attempt")) {
         let earlier = snap
             .posted
             .iter()
             .find(|p| p.author == snap.me && vox_agentcomms::ops::op_of(&p.envelope) == Some(&op))
             .and_then(|p| p.envelope.data.get("attempt").cloned());
-        let held = match snap.fold.resources.get(w) {
+        let current = match snap.fold.resources.get(w) {
             Some(State::Held {
                 owner, acquisition, ..
             }) if owner.author == snap.me && owner.session == session => {
-                Some(serde_json::Value::from(claim::b32(acquisition)))
+                Some(current_attempt(&snap, w, &session, *acquisition))
             }
             _ => None,
         };
-        if let Some(a) = earlier.or(held) {
+        if let Some(a) = earlier.or(current.map(|h| claim::b32(&h).into())) {
             data.insert("attempt".into(), a);
         }
     }
@@ -430,6 +432,40 @@ pub async fn post_cmd(
         );
     }
     Ok(())
+}
+
+/// The entry that began the holder's current attempt on `work`: its claim's
+/// acquisition, or its own latest `failed` for `work` after it, in canonical order
+/// `(created_millis, entry_hash)`. A `failed` whose operation is void (a conflict, §6)
+/// never happened, so it begins nothing; a retried one is its first entry, not the retry.
+fn current_attempt(
+    snap: &coord::Snapshot,
+    work: &str,
+    session: &str,
+    acquisition: [u8; 32],
+) -> [u8; 32] {
+    let Some(start) = snap.posted.iter().find(|p| p.entry_hash == acquisition) else {
+        return acquisition;
+    };
+    let ops = snap.ops();
+    snap.posted
+        .iter()
+        .filter(|p| {
+            p.author == snap.me
+                && p.envelope.from == session
+                && p.envelope.kind == vox_agentcomms::envelope::work::FAILED
+                && coord::work_of(&p.envelope) == Some(work)
+                && (p.created_millis, p.entry_hash) > (start.created_millis, start.entry_hash)
+                && !matches!(
+                    ops.verdict(p.author, &p.envelope, p.entry_hash),
+                    Some(
+                        vox_agentcomms::ops::Verdict::Conflict { .. }
+                            | vox_agentcomms::ops::Verdict::Duplicate { .. }
+                    )
+                )
+        })
+        .max_by_key(|p| (p.created_millis, p.entry_hash))
+        .map_or(acquisition, |p| p.entry_hash)
 }
 
 /// One row as `vox.room.row/1` NDJSON (ADR-021 §7).

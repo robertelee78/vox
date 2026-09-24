@@ -504,8 +504,10 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
   **MUST NOT** auto-reply to `status`, `hello`, `bye` or `ack` at all.
 - `hops` **MUST** be decremented on relay and the message dropped at zero. The default **MUST** be 8
   (ruflo ADR-097's value, whose default "alone closes the recursion-loop class").
-- A sender **SHOULD** be rate-limited to one message per second, and identical repeats within a short
-  window **SHOULD** be dropped.
+- Identical repeats from the same `(author, session)` within a short window **MAY** be dropped. There is
+  **no rate cap**: the decider's product principle is no rate limits (2026-09-24), and loop prevention
+  rests on `hops`, on addressing, and on the rules above and below. (This said a sender "SHOULD be
+  rate-limited to one message per second"; nothing ever enforced it, and it is withdrawn.)
 - A terminal acknowledgement **MUST NOT** generate another terminal acknowledgement.
 - `status` **SHOULD** supersede the previous `status` from the same `(author, session, thread)` in a
   rendered view rather than appending a new line.
