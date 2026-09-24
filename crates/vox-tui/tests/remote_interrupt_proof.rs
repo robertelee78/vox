@@ -288,6 +288,49 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         1,
         "one urgent message wakes the session once: {woken:?}"
     );
+
+    // ---- (4) a wedged session must not stall anybody else's wake ----
+    // An OpenCode endpoint that accepts and never answers: its wake would wait for ever.
+    let wedge = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let wedge_addr = wedge.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in wedge.incoming().flatten() {
+            held.push(s); // accepted, never read, never answered
+        }
+    });
+    std::fs::write(
+        b_paths.session_file("session-wedged"),
+        serde_json::to_vec(&serde_json::json!({
+            "session": "session-wedged", "harness": "opencode", "room": room, "name": "bob",
+            "endpoint": format!("http://{wedge_addr}"), "token": "",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for n in 1..=2 {
+        rt.block_on(post(
+            &alice,
+            cid,
+            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: WEDGE-TEST-N"}"#
+                .replace('N', &n.to_string())
+                .as_str(),
+        ));
+    }
+    let mut got = String::new();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline
+        && !(got.contains("WEDGE-TEST-1") && got.contains("WEDGE-TEST-2"))
+    {
+        if let Ok(frames) = inbox.recv_timeout(Duration::from_millis(500)) {
+            eprintln!("[receipt] bob's session received: {frames}");
+            got.push_str(&frames);
+        }
+    }
+    assert!(
+        got.contains("WEDGE-TEST-1") && got.contains("WEDGE-TEST-2"),
+        "a wedged session stalled another session's wakes; received: {got}"
+    );
     drop(alice);
 }
 
