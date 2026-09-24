@@ -1438,6 +1438,14 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
+                // Said in words, because a person or an agent has to act on it: it is a
+                // limit that clears by itself, not a failure (ADR-021 F14).
+                crate::node::api::Outcome::Failed(crate::node::api::Fault::RateLimited {
+                    per_hour,
+                    clears_at_secs,
+                }) => Frame::Error {
+                    reason: rate_limited_reason(per_hour, clears_at_secs),
+                },
                 other => Frame::Error {
                     reason: format!("{other:?}"),
                 },
@@ -1816,4 +1824,22 @@ impl IpcClient {
             None => Ok(None),
         }
     }
+}
+
+/// A rate-quota refusal as a person reads it: what the limit is, that it is a rolling
+/// hour, and when posting will work again — both how long from now and the absolute
+/// time, so it is actionable now and still right when pasted into a report.
+fn rate_limited_reason(per_hour: u32, clears_at_secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let wait = clears_at_secs.saturating_sub(now);
+    format!(
+        "rate limited: this identity has posted {per_hour} entries in the last hour, the \
+         most ADR-008's per-author quota allows. It is not an error and not a ban — the \
+         window is a rolling hour, and posting works again in {}m{:02}s (at unix time \
+         {clears_at_secs}).",
+        wait / 60,
+        wait % 60
+    )
 }

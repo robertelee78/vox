@@ -5113,6 +5113,13 @@ fn fault_of(e: &Error) -> Fault {
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,
         Error::AtRestLocked => Fault::Locked,
         Error::SizeLimitExceeded(_) => Fault::TooLong,
+        Error::RateLimited {
+            per_hour,
+            clears_at_secs,
+        } => Fault::RateLimited {
+            per_hour: *per_hour,
+            clears_at_secs: *clears_at_secs,
+        },
         Error::MalformedLink(_) | Error::MalformedAnchor(_) => Fault::BadLink,
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,

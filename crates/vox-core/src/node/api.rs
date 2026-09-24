@@ -436,6 +436,15 @@ pub enum Fault {
     /// network can reach would hand that membership to whoever reaches the port
     /// (ADR-013; the same rule `vox up` enforces).
     NotLoopback,
+    /// This identity has authored as many entries in the last rolling hour as ADR-008's
+    /// per-author quota allows. Not a fault and not a ban: the window slides, and it may
+    /// post again at `clears_at_secs` (ADR-021 F14).
+    RateLimited {
+        /// The per-author entries-per-hour cap in force.
+        per_hour: u32,
+        /// When it may post again, in seconds since the Unix epoch.
+        clears_at_secs: u64,
+    },
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }

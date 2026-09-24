@@ -1883,7 +1883,7 @@ impl ChannelState {
                 &self.admission,
                 now_secs,
             )
-            .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
+            .map_err(|r| authored_refusal(&self.dag, &me, r))?;
         if let Err(e) =
             profile
                 .store()
@@ -2394,7 +2394,7 @@ impl ChannelState {
         let key = signer.public_key();
         self.dag
             .accept(entry, EntryKind::Content, &key, &self.admission, now_secs)
-            .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
+            .map_err(|r| authored_refusal(&self.dag, &me, r))?;
         let persisted = (|| -> Result<()> {
             let mut batch = profile.store().batch()?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
@@ -2559,5 +2559,29 @@ impl ChannelState {
     #[must_use]
     pub fn can_answer_join(&self) -> bool {
         !self.passphrase.is_empty()
+    }
+}
+
+/// Why this identity's **own** entry was refused by the acceptance predicate.
+///
+/// A rate-quota refusal is kept as [`Error::RateLimited`], carrying the cap and when
+/// the window clears, because it is the one refusal a person or agent can act on: it
+/// is not a fault, and it ends on its own. Every other refusal of an entry this node
+/// authored itself is a bug, and stays the generic error it was. Discarding the quota
+/// reason is what made a rate limit reach the user as `Failed(Internal)`
+/// (ADR-021 F14).
+fn authored_refusal(
+    dag: &crate::log::dag::Dag,
+    me: &Digest32,
+    rejected: crate::log::dag::Rejected,
+) -> Error {
+    match rejected {
+        crate::log::dag::Rejected::Quota(crate::log::quota::QuotaReject::RateExceeded) => {
+            Error::RateLimited {
+                per_hour: dag.quota_policy().max_entries_per_hour,
+                clears_at_secs: dag.rate_clears_at(me).unwrap_or(0),
+            }
+        }
+        _ => Error::Profile("authored entry failed the acceptance predicate"),
     }
 }

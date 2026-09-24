@@ -133,6 +133,20 @@ impl QuotaTracker {
         Ok(())
     }
 
+    /// When `author` may next be admitted by the rate cap, as seconds on the quota clock:
+    /// the moment the oldest entry still counted in its rolling hour leaves the window.
+    /// `None` when the author has no counted entries (and so is not rate-limited).
+    ///
+    /// This is what a refused author needs to be told: the refusal is a sliding
+    /// window, not a ban, and it clears on its own at this time.
+    #[must_use]
+    pub fn rate_clears_at(&self, author: &Digest32) -> Option<u64> {
+        self.rate
+            .get(author)
+            .and_then(VecDeque::front)
+            .map(|oldest| oldest.saturating_add(RATE_WINDOW_SECS))
+    }
+
     /// The bytes counted so far for `(author, epoch)`.
     #[must_use]
     pub fn bytes_used(&self, author: &Digest32, epoch: u64) -> u64 {

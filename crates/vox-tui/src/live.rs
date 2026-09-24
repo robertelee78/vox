@@ -253,6 +253,8 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::Refused => UiError::Refused,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
+        // A rate limit is not an internal fault; it clears on its own (ADR-021 F14).
+        Fault::RateLimited { .. } => UiError::QuotaExceeded,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
     }

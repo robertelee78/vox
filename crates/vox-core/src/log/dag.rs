@@ -205,6 +205,19 @@ impl Dag {
         }
     }
 
+    /// The per-author quota policy in force.
+    #[must_use]
+    pub fn quota_policy(&self) -> crate::log::quota::QuotaPolicy {
+        self.quota.policy()
+    }
+
+    /// When `author` may next be admitted by the rate cap (see
+    /// [`QuotaTracker::rate_clears_at`]).
+    #[must_use]
+    pub fn rate_clears_at(&self, author: &Digest32) -> Option<u64> {
+        self.quota.rate_clears_at(author)
+    }
+
     /// The number of entries stored across all authors.
     #[must_use]
     pub fn len(&self) -> usize {

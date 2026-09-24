@@ -139,6 +139,19 @@ pub enum Error {
     #[error("declared size exceeds hard limit: {0}")]
     SizeLimitExceeded(&'static str),
 
+    /// This identity's own entry was refused by ADR-008's per-author rate quota: it has
+    /// authored `per_hour` entries in the last rolling hour. Not a ban — the window
+    /// slides, and it may author again at `clears_at_secs` (seconds, the quota clock).
+    /// Kept as its own variant so the refusal reaches the person as what it is rather
+    /// than as an internal fault (ADR-021 F14).
+    #[error("rate limited: {per_hour} entries in the last hour; clears at {clears_at_secs}")]
+    RateLimited {
+        /// The per-author cap in force.
+        per_hour: u32,
+        /// When the oldest counted entry leaves the window, in seconds since the epoch.
+        clears_at_secs: u64,
+    },
+
     /// A governance capability token was not in the closed ADR-007 vocabulary.
     /// The evaluator's domain is closed: an unknown capability is a hard
     /// verification failure, never silently ignored (ADR-007 §"Capability
