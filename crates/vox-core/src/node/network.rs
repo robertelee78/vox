@@ -589,6 +589,7 @@ impl NodeNet {
                 let manager = Arc::clone(&self.manager);
                 circuitstream::serve_circuit(
                     peer,
+                    conn,
                     &|p| self.classify(p),
                     send,
                     recv,
