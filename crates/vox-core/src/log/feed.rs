@@ -170,6 +170,17 @@ impl Feed {
         self.entries.values()
     }
 
+    /// The entries this feed **holds** with `from <= seq <= to`, in ascending seq
+    /// order. The cost is bounded by what is stored, never by the numbers asked
+    /// for: a peer's `WANT (author, 1, u64::MAX)` walks this feed's entries, not
+    /// eighteen quintillion lookups (PRD-001 R4). An inverted range is empty.
+    pub fn range(&self, from: u64, to: u64) -> impl Iterator<Item = &Entry> {
+        (from <= to)
+            .then(|| self.entries.range(from..=to).map(|(_, e)| e))
+            .into_iter()
+            .flatten()
+    }
+
     /// Append `entry` as the next contiguous entry, validating it links correctly.
     ///
     /// Enforces, in order: single author; `seq == max_seq + 1` (contiguous,
