@@ -128,7 +128,13 @@ pub const MAX_SERVICES: usize = 64;
 /// Manifest encoding version.
 const MANIFEST_VERSION: u64 = 1;
 /// Plaintext-cache row encoding version.
-const CACHE_VERSION: u64 = 1;
+/// Version of the plaintext rendering cache. **2 stores the timestamp in milliseconds; 1 stored
+/// seconds.** Same arity, so the two differ only in the discriminant and the unit — see
+/// `node::content` for why the unit changed and why the shape deliberately did not.
+const CACHE_VERSION: u64 = 2;
+/// Version 1 of the cache, whose timestamp is **seconds**. Still read: these rows are already on
+/// disk, and a cache that refused them would silently blank every existing room's history.
+const CACHE_VERSION_SECONDS: u64 = 1;
 
 /// At-rest version of the admitted-authors segment.
 const AUTHORS_VERSION: u64 = 1;
@@ -243,8 +249,12 @@ pub struct Rendered {
     pub entry_hash: Digest32,
     /// The author's identity fingerprint.
     pub author: Digest32,
-    /// The author's recorded send time (seconds).
-    pub created_secs: u64,
+    /// The author's recorded send time, **milliseconds** since the Unix epoch.
+    ///
+    /// Carried at full precision from the content envelope to whatever orders it — the ADR-020
+    /// work board sorts on this, and whole seconds put two racing agents in one bucket where a
+    /// hash tie-break, not causality, picked the winner. Display divides by 1000.
+    pub created_millis: u64,
     /// The text.
     pub text: String,
 }
@@ -578,7 +588,7 @@ fn cache_bytes(r: &Rendered) -> Vec<u8> {
         .uint(CACHE_VERSION)
         .bytes(&r.entry_hash)
         .bytes(&r.author)
-        .uint(r.created_secs)
+        .uint(r.created_millis)
         .text(&r.text);
     e.finish()
 }
@@ -588,9 +598,12 @@ fn parse_cache(bytes: &[u8]) -> Result<Rendered> {
     if d.array()? != 5 {
         return Err(Error::MalformedAtRest("plaintext cache arity"));
     }
-    if d.uint()? != CACHE_VERSION {
-        return Err(Error::MalformedAtRest("plaintext cache version"));
-    }
+    // Both versions read, and the unit normalised here, so nothing above sees two units.
+    let scale = match d.uint()? {
+        CACHE_VERSION => 1,
+        CACHE_VERSION_SECONDS => 1_000,
+        _ => return Err(Error::MalformedAtRest("plaintext cache version")),
+    };
     let entry_hash: Digest32 = d
         .bytes()?
         .try_into()
@@ -599,13 +612,13 @@ fn parse_cache(bytes: &[u8]) -> Result<Rendered> {
         .bytes()?
         .try_into()
         .map_err(|_| Error::MalformedAtRest("plaintext cache author"))?;
-    let created_secs = d.uint()?;
+    let created_millis = d.uint()?.saturating_mul(scale);
     let text = d.text()?.to_owned();
     d.finish()?;
     Ok(Rendered {
         entry_hash,
         author,
-        created_secs,
+        created_millis,
         text,
     })
 }
@@ -2161,7 +2174,7 @@ impl ChannelState {
         let rendered = Rendered {
             entry_hash,
             author,
-            created_secs: content.created_secs,
+            created_millis: content.created_millis,
             text: content.text,
         };
         // The cache row shares the entry's log id space; use a fresh id so it never
@@ -2307,8 +2320,16 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         text: &str,
-        now_secs: u64,
+        // **Milliseconds**, from one read of one clock. Renamed from `now_secs` rather than
+        // converted at the call site: this value becomes half the ADR-020 claim ordering key, and a
+        // caller still thinking in seconds should fail to compile rather than stamp 1970.
+        now_millis: u64,
     ) -> Result<&Rendered> {
+        // Admission and quota are specified in whole seconds (ADR-007), so they get seconds —
+        // derived from the same value rather than passed alongside it, so the two can never
+        // disagree about when "now" was. That disagreement is the defect that made the first
+        // version of this change wrong: a timestamp composed from two separate clock reads.
+        let now_secs = now_millis / 1_000;
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
@@ -2321,7 +2342,7 @@ impl ChannelState {
                 "this identity is not an author of the channel",
             ));
         }
-        let content = Content::text(now_secs, text)?;
+        let content = Content::text(now_millis, text)?;
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
         let payload = msg.to_wire();
@@ -2333,7 +2354,7 @@ impl ChannelState {
         let rendered = Rendered {
             entry_hash,
             author: me,
-            created_secs: now_secs,
+            created_millis: now_millis,
             text: content.text,
         };
 

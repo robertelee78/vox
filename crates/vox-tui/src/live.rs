@@ -215,7 +215,8 @@ impl LiveCore {
                             } else {
                                 short_id(&r.author)
                             },
-                            timestamp: r.created_secs,
+                            // Displayed as a time of day, so seconds; the full precision is kept for ordering.
+                            timestamp: r.created_millis / 1_000,
                             body: Some(r.text.clone()),
                         })
                         .collect(),

@@ -707,7 +707,7 @@ impl Frame {
                     e.array(4)
                         .bytes(&r.entry_hash)
                         .bytes(&r.author)
-                        .uint(r.created_secs)
+                        .uint(r.created_millis)
                         .text(&r.text);
                 }
             }
@@ -782,7 +782,7 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .bytes(channel_id)
                 .bytes(&row.entry_hash)
                 .bytes(&row.author)
-                .uint(row.created_secs)
+                .uint(row.created_millis)
                 .text(&row.text);
         }
         NodeEvent::Unlocked => {
@@ -967,7 +967,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 rows.push(MessageRow {
                     entry_hash: digest(d)?,
                     author: digest(d)?,
-                    created_secs: d.uint().map_err(|_| Error::MalformedBundle("ipc secs"))?,
+                    created_millis: d.uint().map_err(|_| Error::MalformedBundle("ipc millis"))?,
                     text: d
                         .text()
                         .map_err(|_| Error::MalformedBundle("ipc text"))?
@@ -1042,7 +1042,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let channel_id = digest(d)?;
             let entry_hash = digest(d)?;
             let author = digest(d)?;
-            let created_secs = d.uint().map_err(|_| Error::MalformedBundle("ipc secs"))?;
+            let created_millis = d.uint().map_err(|_| Error::MalformedBundle("ipc millis"))?;
             let text = d
                 .text()
                 .map_err(|_| Error::MalformedBundle("ipc text"))?
@@ -1052,7 +1052,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 row: MessageRow {
                     entry_hash,
                     author,
-                    created_secs,
+                    created_millis,
                     text,
                 },
             }
