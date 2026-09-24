@@ -493,7 +493,9 @@ all over the existing control socket, and no new socket request**:
    NAME…] [--urgent] [--data JSON] -`, with the body on stdin.
    - It fills `from` and `at` (F4). `at` comes from the git state of the working directory.
    - `from` is **the session id**: `--session`, else `VOX_SESSION`, else what the harness puts in every
-     tool process's environment — Claude Code's `CLAUDE_CODE_SESSION_ID` and Codex's `CODEX_THREAD_ID`.
+     tool process's environment — Claude Code's `CLAUDE_CODE_SESSION_ID` (measured: it equals the hook's
+     `session_id`) and Codex's `CODEX_THREAD_ID` (read from the Codex 0.156 binary; **not yet measured**
+     against a live Codex hook).
      OpenCode puts nothing there, so its plugin exports `VOX_SESSION` to every shell it runs, through
      the `shell.env` hook (measured against OpenCode 1.18.32: its shell tool triggers `shell.env` with
      `{cwd, sessionID, callID}` and merges the result into the child's environment). These are the same
