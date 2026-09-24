@@ -48,7 +48,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::governance::capability::CapabilitySet;
-use crate::governance::cert::AdminCert;
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::entry::GovEntry;
 use crate::governance::evaluator::Evaluator;
@@ -56,7 +55,6 @@ use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, Histor
 use crate::governance::membership::{
     issue_consent_grant, issue_consent_revocation, MembershipView,
 };
-use crate::governance::servicegrant::ServiceGrantExclusion;
 use crate::group::history::OriginKeyStore;
 use crate::group::message::GroupMessage;
 use crate::group::skdm::Skdm;
@@ -673,8 +671,7 @@ impl ChannelState {
     ///
     /// The grant is immutable, being part of the genesis and therefore of the
     /// channelID — a room cannot silently *become* an access list, and one created as
-    /// an access list cannot stop being one. Taking it back from a single member is
-    /// [`ChannelState::exclude_from_service_grant`].
+    /// an access list cannot stop being one.
     pub fn create_with_grant(
         profile: &Profile,
         local_name: &str,
@@ -1755,96 +1752,10 @@ impl ChannelState {
         Ok(())
     }
 
-    /// Grant `target` a set of **tunnel capabilities** (ADR-013 authorization over the
-    /// single ADR-007 evaluator): issue an [`AdminCert`] delegating exactly those
-    /// capabilities, append it as a governance entry, and fold it into the evaluator,
-    /// so the grant is a log fact every member converges on rather than local
-    /// configuration.
-    ///
-    /// The caller must hold the capabilities being delegated — the evaluator enforces
-    /// `is_within` on the issuer's own set, so this cannot widen anyone's reach — and
-    /// `expiry` is the certificate's, after which the grant simply stops counting.
-    ///
-    /// Chat and tunnel axes stay independent (ADR-013): this grants no message
-    /// consent, and consent grants no tunnel reach.
-    pub fn grant_capabilities(
-        &mut self,
-        profile: &Profile,
-        target: &CompositePublicKey,
-        capabilities: CapabilitySet,
-        expiry: u64,
-        now_secs: u64,
-    ) -> Result<AdminCert> {
-        if capabilities.is_empty() {
-            return Err(Error::MalformedGovernance("a grant with no capabilities"));
-        }
-        let signer = profile.signer()?;
-        let cert = AdminCert::build(
-            signer,
-            &self.channel_id,
-            self.epoch,
-            target.clone(),
-            capabilities,
-            expiry,
-        )?;
-        self.append_governance(profile, &cert.to_wire(), now_secs)?;
-        Ok(cert)
-    }
-
-    /// Withdraw the genesis service grant from `member` (ADR-017 decision 3): append
-    /// the signed [`ServiceGrantExclusion`] and fold it into the evaluator, so the
-    /// member stops holding what membership alone conferred.
-    ///
-    /// This is the counterpart a capability-bearing room needs. A genesis grant issues
-    /// nobody a certificate, so there is no delegation for ADR-007's
-    /// admin-delegation-revocation to name — without this, adding a genesis grant
-    /// would take away the per-member control the channel already had.
-    ///
-    /// It suppresses **only** the genesis-conferred capabilities: an explicit
-    /// [`AdminCert`] issued to the same identity is governed by its own revocation, so
-    /// an admin who excludes a member and then deliberately certifies them again has
-    /// done exactly that. The caller must hold `delegate` — the evaluator checks it
-    /// from the entry's strict causal past, so an unauthorized exclusion is simply
-    /// inert rather than rejected here.
-    pub fn exclude_from_service_grant(
-        &mut self,
-        profile: &Profile,
-        member: Digest32,
-        now_secs: u64,
-    ) -> Result<ServiceGrantExclusion> {
-        if self.genesis.body.service_grant.is_empty() {
-            return Err(Error::MalformedGovernance(
-                "channel has no genesis service grant to exclude from",
-            ));
-        }
-        if member == self.me() {
-            return Err(Error::MalformedGovernance(
-                "an identity cannot exclude itself from the service grant",
-            ));
-        }
-        let signer = profile.signer()?;
-        let exclusion = ServiceGrantExclusion::build(signer, &self.channel_id, self.epoch, member)?;
-        self.append_governance(profile, &exclusion.to_wire(), now_secs)?;
-        Ok(exclusion)
-    }
-
     /// The capabilities this channel's genesis confers on every member (ADR-017).
     #[must_use]
     pub fn service_grant(&self) -> &CapabilitySet {
         &self.genesis.body.service_grant
-    }
-
-    /// Whether `member` may **dial** `service_tag` in this channel, by this node's
-    /// evaluator (ADR-013 `dial:` capability).
-    #[must_use]
-    pub fn can_dial(&self, member: &Digest32, service_tag: &str) -> bool {
-        crate::tunnel::authz::can_dial(&self.evaluator, member, service_tag)
-    }
-
-    /// Whether `member` may **bind** (offer) `service_tag` in this channel.
-    #[must_use]
-    pub fn can_bind(&self, member: &Digest32, service_tag: &str) -> bool {
-        crate::tunnel::authz::can_bind(&self.evaluator, member, service_tag)
     }
 
     /// Append an already-built governance struct as a signed log entry.

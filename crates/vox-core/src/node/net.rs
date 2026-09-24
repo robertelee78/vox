@@ -362,6 +362,9 @@ impl ConnectionManager {
     ///   is relayed — **replaces** it, and the old one is retired: kept open for
     ///   [`RETIRE_GRACE_SECS`], and beyond it for as long as anything is still carried on
     ///   it, so a tunnel that took the old path is not cut when a better one appears;
+    /// - so does a direct newcomer from a **different direct address** than the held
+    ///   direct connection: the peer moved (restarted, or its path changed), and the held
+    ///   one is the stale one (PRD-001 R24);
     /// - otherwise the held one is kept and the newcomer closed with a clean code (a
     ///   simultaneous dial from both sides lands here).
     ///
@@ -407,7 +410,21 @@ impl ConnectionManager {
         if let Some(existing) = map.get(&peer) {
             if is_live(existing) {
                 let existing = Arc::clone(existing);
-                if path_class(&self.endpoint, &conn) <= path_class(&self.endpoint, &existing) {
+                // **A peer that turns up at a different direct address has moved** — it
+                // restarted, or its path changed — and the connection held for it is the one
+                // that is about to go quiet (PRD-001 R24). Keeping the held one on a tie
+                // meant that an anchor, asked to relay to a host that had just restarted,
+                // kept the dead connection it would only learn was dead after the 60s idle
+                // timeout, retired the live one, and then closed it after the grace: the
+                // relay "could not reach the peer" for minutes, and a `vox forward` through
+                // it failed for as long. A simultaneous dial from both sides arrives from the
+                // *same* address, so the tie-break that case needs is unchanged.
+                let moved = path_class(&self.endpoint, &conn) == PathClass::Direct
+                    && path_class(&self.endpoint, &existing) == PathClass::Direct
+                    && conn.quinn().remote_address() != existing.quinn().remote_address();
+                if !moved
+                    && path_class(&self.endpoint, &conn) <= path_class(&self.endpoint, &existing)
+                {
                     drop(map);
                     if !serve_loser {
                         conn.close(WireError::AuthenticatorInvalid);
