@@ -504,6 +504,17 @@ because the counters name every peer and room the node talks to. Proved by
 room has an always-on member (not recorded until ADR-023), and whether a direct path was dialled
 or hole-punched (the ladder does not keep which rung won).
 
+*Notifications (PRD-001 R37).* A running `vox daemon` checks its own status every 5 s and raises a
+desktop notification when an unhealthy condition **starts** and when it **clears** — never again
+while it holds. Each condition carries a stable key (`peer-unreachable:<room>:<peer>`,
+`room-stale:<room>`) so continuing is told apart from starting; the stale-sync rule counts from the
+node's start when a room has not synced yet, so a daemon does not alarm on every start. Delivery:
+`VOX_NOTIFY_COMMAND <title> <body>` when set, else `osascript` on macOS, `notify-send` on Linux when
+installed, and always a line on the daemon's stderr. `notify = off` in the profile's `config` file
+turns it off. Proved by `crates/vox-tui/tests/notify_proof.rs` through the command override; the
+`osascript` and `notify-send` paths are not exercised by any gate, since no test can see a desktop.
+**Phone push is out of scope:** it needs a push service to send through, and Vox runs none.
+
 ### 8. The agent-facing surface is a CLI plus a skill
 
 Agents **MUST** be served by CLI verbs — `vox room post` (JSON on stdin, so no shell-quoting hazard),

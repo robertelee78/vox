@@ -24,6 +24,7 @@ pub mod app;
 pub mod app_cli;
 pub mod cli;
 pub mod live;
+pub mod notify;
 pub mod qr;
 pub mod room_cli;
 pub mod shell;

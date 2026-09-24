@@ -1382,6 +1382,8 @@ impl Node {
             app: Arc::new(crate::node::app::AppHub::default()),
             status: crate::node::status::StatusBook::default(),
         };
+        let mut node = node;
+        node.status.started = (node.clock)();
         // The app layer asks the actor for connections through its own queue, forwarded
         // onto the network queue so they are served in order with everything else.
         {
@@ -5022,6 +5024,7 @@ impl Node {
             .unwrap_or_default();
         let mut report = StatusReport {
             now,
+            started: self.status.started,
             identity: me,
             networked: self.net.is_some(),
             listening: view.listening.clone(),
