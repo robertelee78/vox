@@ -6,21 +6,22 @@ work state: an external tracker owns it. **Three open defects** found while buil
 boundary and are recorded rather than accepted — F12 and F14 in `vox-core`, F15 in the daemon's
 interrupt path; F14 also carries a decider question, the default agent-room quota. Statements about the tree before this change describe `main` at `96c47ed` (v0.2.7).
 **Date**: 2026-09-23
-**Updated**: 2026-09-23 — the decider's decisions on a review of the first version:
-- an **enforced, exact version match** among workers replaces any mixed-version support (§5);
-- one claim protocol with **pending handoffs** and **renewal bound to one acquisition** (§4);
-- **caller-supplied operation ids**, where a conflict is explicit and monotone (§6);
-- self-posts are identified by **author and session** (§7);
-- the hands-free guidance says what **replay cannot recover** (§8).
+**Updated**: 2026-09-24 — implemented; see the revision history below.
 
-**Updated**: 2026-09-24 — tracker vocabulary and ownership were clarified without changing the wire
-format: Vox observations remain optional inputs to a client-independent external tracker.
+Revision history:
 
-**Updated**: 2026-09-24 — **implemented**, with three amendments forced by the tree and each recorded in
-place: a handoff's recipient is resolved against the room roster, not the keyring (§4); a participating
-verb announces before it checks, and a worker excludes itself from the version table (§5); and `from` is
-the session id, never `VOX_AGENT_NAME` (§7). Implementation also found F13 — `tail` had never delivered
-another member's message — and fixed it, and found F12, F14 and F15, which are open.
+- 2026-09-23 — the decider's decisions on a review of the first version: an **enforced, exact version
+  match** among workers replaces any mixed-version support (§5); one claim protocol with **pending
+  handoffs** and **renewal bound to one acquisition** (§4); **caller-supplied operation ids**, where a
+  conflict is explicit and monotone (§6); self-posts are identified by **author and session** (§7); the
+  hands-free guidance says what **replay cannot recover** (§8).
+- 2026-09-24 — tracker vocabulary and ownership were clarified without changing the wire format: Vox
+  observations remain optional inputs to a client-independent external tracker.
+- 2026-09-24 — **implemented**, with three amendments forced by the tree and each recorded in place: a
+  handoff's recipient is resolved against the room roster, not the keyring (§4); a participating verb
+  announces before it checks, and a worker excludes itself from the version table (§5); and `from` is the
+  session id, never `VOX_AGENT_NAME` (§7). Implementation also found F13 — `tail` had never delivered
+  another member's message — and fixed it, and found F12, F14 and F15, which are open.
 
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, interop, work-tracking, adapter, envelope, claims, versioning, defects
