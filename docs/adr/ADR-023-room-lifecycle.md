@@ -206,10 +206,16 @@ covers only the approver's own messages, as consent always has.
 
 - **M23.1** Reload and sync accept pruned entries; retention policy and sweep (decision 2).
   Proofs 3–4.
-- **M23.2** `seen` and the deterministic causal order (decision 1). Proofs 1–2. Coordinate with
-  vox-96's R17.
-- **M23.3** `key-package` log entries and R14 pruning (decision 4). Proof 5. Coordinate with
-  vox-96's F12 key delivery, which is in flight.
+- **M23.2** `seen` and the deterministic causal order (decision 1). Proofs 1–2. R17's
+  takeover-after-silence does not need it. Hard-lock claims (PRD-001 §7 Q5) are to be designed on it
+  if the decider answers "wait for certainty".
+- **M23.3** `key-package` log entries and R14 pruning (decision 4). Proof 5. This replaces F12's
+  delivery mechanism: F12 is a narrow v0.2.8 fix of SKDMs sent over pairwise sessions, covering the
+  simultaneous-initiation race and trust-before-join. F12's proofs are to be kept as regression
+  gates:
+  - joiner↔joiner in a 3-member room;
+  - creator→joiner across processes through an anchor;
+  - trust-before-join.
 - **M23.4** Per-grant history (decision 5).
 - **M23.5** Delete the anchor log (decision 6). Rewrite `node_m15_anchor_gate`. Proof 6.
 - **M23.6** Checkpoints (decision 3), if open question 2 says now.
