@@ -451,6 +451,27 @@ fn after_cursor(
     }
 }
 
+/// One row as `vox room read` and `tail` print it: `<entry-hash> <author-prefix> <text>`.
+///
+/// **No message can forge a row** (PRD-001 R19). A row starts at the beginning of a line,
+/// so a message carrying a newline followed by `<hash> <author> …` would otherwise print a
+/// second row attributed to someone else — and agents read this output. Every continuation
+/// line is therefore indented with `  | `, which no row begins with, and every other
+/// control character (a carriage return, an escape sequence) is shown escaped rather than
+/// passed to the terminal. `--json` needs none of this: each row is one JSON-escaped line.
+fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
+    let mut text = String::with_capacity(r.text.len());
+    for c in r.text.chars() {
+        match c {
+            '\n' => text.push_str("\n  | "),
+            '\t' => text.push('\t'),
+            c if c.is_control() => text.push_str(&c.escape_unicode().to_string()),
+            c => text.push(c),
+        }
+    }
+    format!("{} {} {}", id(&r.entry_hash), short(&r.author), text)
+}
+
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
 ///
 /// Each line is `<entry-hash> <author-prefix> <text>`; with `--json`, one
@@ -479,7 +500,7 @@ pub async fn read(
             usize::try_from(limit).unwrap_or(usize::MAX)
         };
         for r in rows.iter().take(take) {
-            let _ = writeln!(out, "{} {} {}", id(&r.entry_hash), short(&r.author), r.text);
+            let _ = writeln!(out, "{}", plain_row(r));
         }
         return Ok(());
     }
@@ -665,7 +686,7 @@ fn emit_row(
     let line = if json {
         row_json(room_key, r, ops, status)
     } else {
-        format!("{} {} {}", id(&r.entry_hash), short(&r.author), r.text)
+        plain_row(r)
     };
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
