@@ -955,6 +955,22 @@ Both unknowns are already spiked; neither remains open.
   `service_rehearsal_proof`; what is new here is the composition of sessions, cursors, envelopes and
   the operator, and that composition is host-independent. The two-machine claim is not made.
 
+- **M19.10 — the skill and the CLI agree, by test.** Decided 2026-09-24, not built. Every `vox`
+  verb and flag the shipped agent skill (`vox agent skill`) names **MUST** exist in the CLI, checked by a
+  gate that turns red when the skill names one that does not. (Orca keeps its agent guide honest this
+  way.)
+- **M19.11 — Codex runs the drain hook without the operator trusting it by hand.** Decided 2026-09-24,
+  not built. Codex runs a `hooks.json` entry only once its hash is trusted. Vox installs the entry but
+  grants no trust, so the Codex drain works only where the operator trusted it by hand. Vox **MUST**
+  grant trust the way Codex's own "trust all" does — app-server `hooks/list`, then `config/batchWrite` of
+  the entry's `trusted_hash` — as ctm and Orca both do, and **MUST** re-grant it when a new binary
+  changes the hash.
+- **M19.12 — the Codex mid-turn claim is corrected.** Decided 2026-09-24, not built. §6 and M19.6 say
+  app-server `turn/start` works mid-turn. Orca measured (codex-cli 0.147.0, 0.150.1 and 0.153.4) that a
+  mid-turn `turn/start` is **folded into the running turn**, and ctm delivers mid-turn with `turn/steer`
+  and `expectedTurnId`. The text **MUST** say so, and any Codex wake **MUST** use `turn/steer` for a
+  running turn. Implementing the Codex wake is not decided here.
+
 A TUI view for the operator is explicitly deferred until a real room has misbehaved and shown what
 needs filtering.
 

@@ -72,8 +72,8 @@ QUIC/DCUtR, NAT/IPv6, deniable authentication).
 | 017 | implemented (M17.1–M17.3) | room-bound services: genesis service grant, `vox serve`/`vox connect`, `.vox` names resolved by the `vox up` SOCKS5 entry point |
 | 018 | accepted — **in force** | quality bar: unit tests removed (M18.2 ✓), distribution proved as built (M18.2a ✓), the node/edge/journey harness outstanding (M18.3) |
 | 019 | proposed — not started | pure-Rust TLS crypto provider |
-| 020 | partly implemented | agent comms: `crates/vox-agentcomms` over the `vox-core` IPC/event fan-out and the trust keyring; M19.1–M19.9 done. Its claim protocol is corrected by ADR-021; open defects F12, F14, F15 recorded there. No wire change. |
-| 021 | implemented (M21.1–M21.8) | work-item interop: session-scoped claims, pending handoffs, bound renewals, op ids, the exact-version gate, a gapless `tail --json`, `board --json`, structured `post`. Vox holds no work state; an external tracker owns it. No wire change. |
+| 020 | partly implemented | agent comms: `crates/vox-agentcomms` over the `vox-core` IPC/event fan-out and the trust keyring; M19.1–M19.9 done, M19.10–M19.12 decided and not built. Its claim protocol is corrected by ADR-021; open defects F12, F15 and F17 recorded there. No wire change. |
+| 021 | implemented on PR #14, not yet on `main` (M21.1–M21.8); M21.9–M21.10 decided | work-item interop: session-scoped claims, pending handoffs, bound renewals, op ids, the exact-version gate, a gapless `tail --json`, `board --json`, structured `post`. Vox holds no work state; an external tracker owns it. No wire change. |
 
 **The node runtime that composes the layers is in.** ADR-016 landed through M15 — join, per-sender
 consent and log sync run between separate hosts over QUIC, through the full NAT ladder, relayed by an

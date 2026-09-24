@@ -1,10 +1,13 @@
 # ADR-021: Work-item interop — the contract Vox exposes to an external work tracker
 
-**Status**: **implemented** — 2026-09-24, M21.1–M21.8, each proved through the shipped `vox` binary and
-mutation-checked; the plan below names the proof, its mutations and the commit for each. Vox holds no
-work state: an external tracker owns it. **Three open defects** found while building this sit outside its
-boundary and are recorded rather than accepted — F12 and F14 in `vox-core`, F15 in the daemon's
-interrupt path; F14 also carries a decider question, the default agent-room quota. Statements about the tree before this change describe `main` at `96c47ed` (v0.2.7).
+**Status**: **implemented on `feat/adr021-work-interop` (PR #14), not yet merged to `main`** —
+2026-09-24, M21.1–M21.8, each proved through the shipped `vox` binary and mutation-checked; the plan below
+names the proof, its mutations and the commit for each. **M21.9 and M21.10 are decided (2026-09-24) and
+not built.** Vox holds no work state: an external tracker owns it. Open defects found while building this
+sit outside its boundary and are recorded rather than accepted — F12 in `vox-core` key distribution (half
+fixed in PR #20), F15 in the daemon's interrupt path (fix in PR #16) and F17, OpenCode delivery (deferred
+by the decider); F14 is retired. Statements about the tree before this change describe `main` at `96c47ed`
+(v0.2.7).
 **Date**: 2026-09-23
 **Updated**: 2026-09-24 — implemented; see the revision history below.
 
@@ -29,6 +32,10 @@ Revision history:
 - 2026-09-24 — at the tracker's request: **a `failed` ends the attempt it names, and the holder's next
   post begins a new one** named by that `failed` entry (§3), so every attempt is bounded; and the
   adapter's **read cycle** over `board.position` and the stream is documented (§7). No wire change.
+- 2026-09-24 — the decider's answers on ideas from a review of Orca: **M21.9** (the drain says when a
+  claim was lost) and **M21.10** (a `result` warns about unread addressed messages) are decided and not
+  built; grouped addresses (`@claude`, `@idle`) are **declined** — `to` stays explicit names. The status
+  now says where the implementation lives, so the text is true on `main` before PR #14 merges.
 
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, interop, work-tracking, adapter, envelope, claims, versioning, defects
@@ -829,6 +836,23 @@ that proves it.**
   > red at the first claim: without the plugin no session reached the model's shell, and the model
   > improvised one (`w1`), which the proof rejected. Two earlier red runs of the control were
   > **discarded**: a stray OpenCode process left by an interrupted run was contending with them.
+
+
+- **M21.9 — the drain says when a claim was lost.** Decided 2026-09-24, not built. A lapse, takeover or
+  completed handoff ends a session's ownership without a message addressed to it, so a busy holder can
+  keep working on something it no longer owns. The per-turn drain **MUST** tell a session, once, on the
+  first turn after the change, when it no longer holds a claim it held at its previous drain, naming the
+  resource and why (lapsed, taken over, handed off). A turn on which nothing changed adds nothing.
+
+  *Proof*: through the shipped binary, a session whose claim lapses between two drains is told exactly
+  once, and a session whose claims did not change is told nothing.
+- **M21.10 — a `result` warns about unread addressed messages.** Decided 2026-09-24, not built. A
+  redirect addressed to a session can arrive after its last drain and before it reports. `vox room post
+  --type result` **MUST** still post, and **MUST** print to the caller every message addressed to that
+  session that it has not yet drained, so it can follow up. It does not refuse.
+
+  *Proof*: through the shipped binary, a `result` posted with an addressed message unread posts and
+  names that message; with nothing unread it prints no warning.
 
 ## Links
 
