@@ -740,11 +740,31 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
     // what to actually do. A paragraph is not a better error message than a sentence —
     // the first version of this fix was four lines of prose and read like documentation
     // at exactly the moment somebody is stuck.
-    let advice = match out {
-        Outcome::Failed(Fault::WrongPassphrase) => {
+    let advice = join_advice(match out {
+        Outcome::Failed(fault) => Some(fault),
+        Outcome::Done => None,
+    });
+
+    if said.is_empty() {
+        format!("cannot join: {advice}")
+    } else {
+        format!("cannot join: {} — {advice}", said.join("; "))
+    }
+}
+
+/// What to tell a person whose join failed, chosen by the fault the node reported.
+///
+/// Shared by `vox connect` (which runs its own node) and `vox room join` (which asks a running
+/// daemon over its socket). The second printed the bare `Outcome` — `cannot join:
+/// Failed(Refused)` — for a wrong passphrase, until the real-binary proof that replaced
+/// `node_m14_gate` typed a wrong passphrase and read what came back. One function, so the two
+/// verbs cannot drift apart again.
+pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
+    match fault {
+        Some(Fault::WrongPassphrase) => {
             "the room passphrase is wrong\n       the address is not in question — this is the passphrase alone"
         }
-        Outcome::Failed(Fault::BadLink) => {
+        Some(Fault::BadLink) => {
             "that address will not parse, or names a room this node cannot use\n       this one IS the address — check you copied all of it"
         }
         // **Do not claim the passphrase is fine here.** Nobody answered, so nobody
@@ -752,7 +772,7 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
         // branch. The first version of this fix said "NOT the address or the
         // passphrase", which is the same false confidence as the sentence it replaced,
         // pointed the other way. Say what was and was not established.
-        Outcome::Failed(Fault::Unreachable) => {
+        Some(Fault::Unreachable) => {
             "nobody who can answer for this room could be reached\n       so your passphrase was never checked — this is not a verdict on it\n       every member the board knows is offline: ask one to come online, or check\n       `vox node` on the anchor shows more than `1m` for this room"
         }
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
@@ -761,23 +781,33 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
         // the thing to chase" was true and useless at the one moment a person most
         // needs a suggestion. Name the likely cause first, without pretending it is the
         // only one.
-        Outcome::Failed(Fault::Refused) => {
+        Some(Fault::Refused) => {
             "a member answered and refused the join\n       usually the room passphrase is wrong — it is checked by them, not by you,\n       so a typo arrives here rather than as a passphrase error\n       if you are sure of it, they may have revoked you, or be on a different room"
         }
-        Outcome::Failed(Fault::NotNetworked) => {
+        Some(Fault::NotNetworked) => {
             "this node is not networked, or its identity is locked\n       nothing about the room is in question"
         }
-        Outcome::Failed(Fault::Locked | Fault::NoIdentity) => {
+        Some(Fault::Locked | Fault::NoIdentity) => {
             "this profile has no unlocked identity, so there is nobody to join as\n       run `vox id` to make one"
         }
         _ => "the node did not say why, which is itself worth reporting",
-    };
-
-    if said.is_empty() {
-        format!("cannot join: {advice}")
-    } else {
-        format!("cannot join: {} — {advice}", said.join("; "))
     }
+}
+
+/// The fault named in a daemon's reply to a join (`"Failed(Refused)"`), for the verbs that reach
+/// the node over its control socket, where only the outcome's name crosses the wire.
+pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
+    let name = reason.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
+    Some(match name {
+        "WrongPassphrase" => Fault::WrongPassphrase,
+        "BadLink" => Fault::BadLink,
+        "Unreachable" => Fault::Unreachable,
+        "Refused" => Fault::Refused,
+        "NotNetworked" => Fault::NotNetworked,
+        "Locked" => Fault::Locked,
+        "NoIdentity" => Fault::NoIdentity,
+        _ => return None,
+    })
 }
 
 /// [`short`], reachable from the other CLI modules that report a peer.

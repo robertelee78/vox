@@ -947,7 +947,17 @@ pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), App
             println!("     you can read this room; whether anyone can read YOU is their decision");
             Ok(())
         }
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot join: {reason}"))),
+        // The daemon sends the outcome's name; turn it into the same guidance `vox connect`
+        // gives, so a wrong passphrase is not reported as `Failed(Refused)`.
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(
+            match crate::tunnel_cli::fault_named(&reason) {
+                Some(fault) => format!(
+                    "cannot join: {}",
+                    crate::tunnel_cli::join_advice(Some(fault))
+                ),
+                None => format!("cannot join: {reason}"),
+            },
+        )),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
