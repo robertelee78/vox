@@ -21,6 +21,8 @@
 //!   dropped its QUIC send half on the error path, and quinn *finishes* a dropped stream, so
 //!   a backend that crashed mid-reply reached the client as an orderly EOF after a truncated
 //!   reply — a lie a client cannot detect.
+//! - **Removing a service cuts the sessions it is carrying** (R22). Only untrusting a
+//!   member used to; removing the service changed the stored offer and nothing else.
 //!
 //! ## Why it is `#[ignore]`d
 //!
@@ -36,13 +38,13 @@ mod watchdog;
 #[path = "support/world.rs"]
 mod world;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use world::{
-    echo_service, read_to_end_within, resetting_service, round_trip, socks5_connect, Ending, World,
-    PARTIAL,
+    args, echo_service, read_to_end_within, resetting_service, round_trip, socks5_connect,
+    vox_once, Ending, World, PARTIAL,
 };
 
 #[test]
@@ -96,6 +98,62 @@ fn a_forward_carries_a_new_connection_after_its_host_restarts() {
         "the forward process must still be the one that started"
     );
     drop(fwd);
+    drop(w);
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+fn removing_a_service_cuts_its_live_sessions_within_a_second() {
+    watchdog::arm();
+    let mut w = World::new(echo_service(), true);
+    // The host has to be a running node that `vox service remove` can ask, which `vox serve`
+    // is not (it serves no control socket). A daemon holding the same room is.
+    w.restart_host_as_daemon();
+    let guest_dir = w.guest_dir.clone();
+    let (_fwd, at) = w.forward("forward", &guest_dir);
+
+    // Step 1: a live session carrying bytes both ways.
+    let mut s = TcpStream::connect(at).expect("connect to the forward");
+    s.set_read_timeout(Some(
+        vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
+    ))
+    .unwrap();
+    s.write_all(b"are you there").unwrap();
+    let mut back = [0u8; 13];
+    s.read_exact(&mut back)
+        .expect("the session must be live before the removal");
+    assert_eq!(&back, b"are you there");
+    eprintln!("[test] step 1: live session echoed {} bytes", back.len());
+
+    // Step 2: the host's operator removes the service, from the command line.
+    let (ok, out, err) = vox_once(
+        &w.host_dir,
+        &args(&["service", "remove", &w.room, &w.service_port.to_string()]),
+    );
+    let removed_at = Instant::now();
+    assert!(
+        ok,
+        "`vox service remove` must reach the running host.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    eprintln!("[test] step 2: {}", out.trim());
+
+    // Step 3: the live session is cut, within a second, and not by a quiet EOF.
+    let (tail, ending) = read_to_end_within(&mut s, Duration::from_secs(1));
+    let elapsed = removed_at.elapsed();
+    eprintln!(
+        "[test] step 3: session ended {ending:?} after {elapsed:?}, {} stray bytes",
+        tail.len()
+    );
+    assert_eq!(
+        ending,
+        Ending::Reset,
+        "removing a service must cut its live sessions immediately (PRD-001 R22), and say so \
+         with a reset; it ended {ending:?} within {elapsed:?}"
+    );
+    assert!(
+        tail.is_empty(),
+        "nothing should arrive after the cut: {tail:?}"
+    );
     drop(w);
 }
 

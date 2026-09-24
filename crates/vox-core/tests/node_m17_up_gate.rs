@@ -149,6 +149,9 @@ async fn m17_a_service_is_reached_by_name_through_vox_up() {
                                 (*cid == channel_id && tag == port.to_string()).then_some(
                                     HostService {
                                         endpoint: echo_addr,
+                                        offered: Arc::new(tokio::sync::watch::Sender::new(
+                                            [(port.to_string(), echo_addr)].into_iter().collect(),
+                                        )),
                                         // **The host trusted this client**, which is the
                                         // whole authorization (ADR-017 decision 3, M17.7).
                                         // This gate previously supplied only an evaluator
