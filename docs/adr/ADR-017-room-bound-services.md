@@ -7,6 +7,7 @@ and is now genuinely built, with a real-binary proof. Decisions 1, 3, 4, 8, 9,
 10 and 11 are **proposed and not built**; what ships today implements the withdrawn model and is a live
 vulnerability until M17.6–M17.13 land.
 **Date**: 2026-09-21
+**Updated**: 2026-09-24 — PRD-001: forwards survive a host restart (ADR-013 "Tunnel honesty").
 **Updated**: 2026-09-21 (third revision, then revised again the same day after independent review) —
 **capability-bearing rooms are withdrawn.** Decision 3 held that *"'may this member dial it' and 'is this
 person a member' are the same question, asked once."* That is refuted: admission to a room is passphrase +

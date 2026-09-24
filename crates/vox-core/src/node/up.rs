@@ -133,8 +133,14 @@ where
         return Err(Error::MalformedTunnel("vox up binds loopback only"));
     }
     loop {
-        let Ok((stream, from)) = listener.accept().await else {
-            continue;
+        let (stream, from) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            // Back off rather than spin: a failed accept is almost always `EMFILE`, and
+            // retrying at once fails again at once (see `tunnel::ACCEPT_BACKOFF`).
+            Err(_) => {
+                tokio::time::sleep(crate::node::tunnel::ACCEPT_BACKOFF).await;
+                continue;
+            }
         };
         if !from.ip().is_loopback() {
             continue;
@@ -218,6 +224,46 @@ async fn reach_host_with_patience<D: HostDialer>(
             return Err(last);
         }
         tokio::time::sleep(HOST_POLL).await;
+    }
+}
+
+/// Reach `host` and open a tunnel to `service_tag` in `channel_id`, returning the stream
+/// pair **once the host has accepted** — so a caller can tell its application the truth.
+///
+/// Patient in the same way and for the same reasons as [`reach_host_with_patience`], and
+/// patient about the *path* too: an attempt that fails before the host answered — the
+/// connection was stale because the host restarted, or the path changed under it — is
+/// retried on whatever connection reaches the host now, until [`HOST_PATIENCE`] runs out
+/// (PRD-001 R24). A **refusal** is never retried: the host has decided, and asking again
+/// would only make a refused application wait five minutes to be told so.
+///
+/// # Errors
+/// [`Error::TunnelDenied`] when the host refused; otherwise the last reason the host could
+/// not be reached.
+pub async fn open_tunnel<D: HostDialer>(
+    dialer: &D,
+    host: &Digest32,
+    channel_id: &Digest32,
+    service_tag: &str,
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
+    loop {
+        let attempt = async {
+            let conn = reach_host_with_patience(dialer, host).await?;
+            let (mut send, mut recv) = crate::transport::streams::open_typed(
+                &conn,
+                crate::transport::streams::StreamKind::Tunnel,
+            )
+            .await?;
+            crate::tunnel::session::request(&mut send, &mut recv, channel_id, service_tag).await?;
+            Ok::<_, Error>((send, recv))
+        };
+        match attempt.await {
+            Ok(streams) => return Ok(streams),
+            Err(e @ Error::TunnelDenied(_)) => return Err(e),
+            Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
+            Err(_) => tokio::time::sleep(HOST_POLL).await,
+        }
     }
 }
 
