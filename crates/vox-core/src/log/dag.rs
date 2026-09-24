@@ -232,6 +232,18 @@ impl Dag {
         self.feeds.get(author).and_then(|f| f.get(*seq))
     }
 
+    /// Drop the payload body of the stored entry `hash`, keeping its signed skeleton
+    /// (ADR-010 retention). A peer that asks for it afterwards is served the skeleton.
+    /// Returns whether a body was dropped.
+    pub fn prune_payload(&mut self, hash: &Digest32) -> bool {
+        let Some((author, seq)) = self.by_hash.get(hash).copied() else {
+            return false;
+        };
+        self.feeds
+            .get_mut(&author)
+            .is_some_and(|f| f.prune_payload(seq))
+    }
+
     /// Whether an entry with this hash is stored.
     #[must_use]
     pub fn contains(&self, hash: &Digest32) -> bool {

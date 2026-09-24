@@ -170,6 +170,13 @@ impl Feed {
         self.entries.values()
     }
 
+    /// Drop the payload body of the entry at `seq`, keeping its signed skeleton
+    /// (authenticated pruning, ADR-008/ADR-010). The feed's hash chain is over the
+    /// skeletons, so it stays verifiable. Returns whether a body was dropped.
+    pub fn prune_payload(&mut self, seq: u64) -> bool {
+        self.entries.get_mut(&seq).is_some_and(Entry::prune_payload)
+    }
+
     /// Append `entry` as the next contiguous entry, validating it links correctly.
     ///
     /// Enforces, in order: single author; `seq == max_seq + 1` (contiguous,

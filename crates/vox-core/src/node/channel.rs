@@ -72,6 +72,7 @@ use crate::nat::bootstrap::BootstrapSet;
 use crate::nat::record::Admission;
 use crate::node::content::Content;
 use crate::node::profile::Profile;
+use crate::node::retention::{RetentionIndex, Tracked};
 use crate::node::store::Store;
 use crate::suite::{algo, SuiteFloor};
 
@@ -118,6 +119,26 @@ const SEG_DELIVERED: u64 = 7;
 /// bundle at all, and would fall off every board — the same reason `SEG_ANCHORS`
 /// exists.
 const SEG_ADMISSION: u64 = 8;
+
+/// Version of an entry's retention record: the `Index` segment sharing its `LogDb` id,
+/// `[version, first_seen_secs]` (ADR-023 decision 2).
+const FIRST_SEEN_VERSION: u64 = 1;
+
+fn first_seen_bytes(first_seen: u64) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(FIRST_SEEN_VERSION).uint(first_seen);
+    e.finish()
+}
+
+fn parse_first_seen(bytes: &[u8]) -> Result<u64> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 || d.uint()? != FIRST_SEEN_VERSION {
+        return Err(Error::MalformedAtRest("retention record"));
+    }
+    let t = d.uint()?;
+    d.finish()?;
+    Ok(t)
+}
 
 /// At-rest version of the delivery-ledger segment.
 const DELIVERED_VERSION: u64 = 1;
@@ -319,6 +340,11 @@ pub struct ChannelState {
     /// written to disk, and never crosses the client boundary (no view, event or
     /// `Debug` output carries it).
     passphrase: Zeroizing<Vec<u8>>,
+    /// Every content entry still holding its body, by age (ADR-023 decision 2).
+    retention: RetentionIndex,
+    /// This node's own retention for the room, seconds; `0` is no node limit. Set by the
+    /// actor from the node's config; the room's own lives in the evaluator's policy.
+    node_retention: u64,
     poisoned: bool,
 }
 
@@ -785,6 +811,8 @@ impl ChannelState {
             own_admission: Some(Admission::Creator),
             origins,
             delivered: BTreeMap::new(),
+            retention: RetentionIndex::default(),
+            node_retention: 0,
             poisoned: false,
         })
     }
@@ -844,6 +872,7 @@ impl ChannelState {
         let mut dag = Dag::new();
         let mut next_log_id = 1u64;
         let mut gov_entries = Vec::new();
+        let mut retention = RetentionIndex::default();
         for (id, seg) in store.segments(channel_id, SegmentKind::LogDb)? {
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
             let entry = Entry::from_wire(&wire)?;
@@ -851,11 +880,32 @@ impl ChannelState {
                 .get(&entry.skeleton.author_id)
                 .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?
                 .clone();
-            let payload = entry
-                .payload
-                .as_deref()
-                .ok_or(Error::MalformedAtRest("stored entry payload pruned"))?;
-            let kind = classify_payload(payload)?;
+            // **A pruned entry is a kept entry** (ADR-023 decision 2). Retention drops a content
+            // body and keeps the signed skeleton, which still verifies and still links the feed —
+            // refusing it here made a room with one expired message impossible to open.
+            // Governance is never pruned, so a body-less entry is content.
+            let kind = match entry.payload.as_deref() {
+                Some(payload) => classify_payload(payload)?,
+                None => EntryKind::Content,
+            };
+            if kind == EntryKind::Content && entry.payload.is_some() {
+                let first_seen = match store.get_segment(channel_id, SegmentKind::Index, id)? {
+                    Some(seg) => {
+                        parse_first_seen(&open_segment(&sek, SegmentKind::Index, id, &seg)?)?
+                    }
+                    // No record: aged from now, which can only keep it longer, never shorter.
+                    None => now_secs,
+                };
+                retention.track(
+                    entry.entry_hash(),
+                    Tracked {
+                        log_id: id,
+                        first_seen,
+                        claimed: None,
+                        cache_id: None,
+                    },
+                );
+            }
             if kind == EntryKind::Governance {
                 gov_entries.push(GovEntry::from_verified_log_entry(
                     &entry,
@@ -869,12 +919,14 @@ impl ChannelState {
             next_log_id = id.saturating_add(1);
         }
 
-        // Timeline from the sealed plaintext cache, render-gated by the DAG.
+        // Timeline from the sealed plaintext cache, render-gated by the DAG — and by
+        // retention: a row whose body is gone is not shown, whatever the cache says.
         let mut timeline = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::PlaintextCache)? {
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
             let rendered = parse_cache(&row)?;
-            if dag.contains(&rendered.entry_hash) {
+            if retention.get(&rendered.entry_hash).is_some() {
+                retention.rendered(&rendered.entry_hash, rendered.created_millis / 1_000, id);
                 timeline.push(rendered);
             }
         }
@@ -973,6 +1025,8 @@ impl ChannelState {
             own_admission,
             origins,
             delivered,
+            retention,
+            node_retention: 0,
             poisoned: false,
         })
     }
@@ -1143,6 +1197,8 @@ impl ChannelState {
             own_admission: None,
             origins,
             delivered: BTreeMap::new(),
+            retention: RetentionIndex::default(),
+            node_retention: 0,
             poisoned: false,
         })
     }
@@ -1846,6 +1902,179 @@ impl ChannelState {
         crate::tunnel::authz::can_bind(&self.evaluator, member, service_tag)
     }
 
+    /// The room's retention, seconds (`0` = forever): the ADR-007 policy-update `ttl` in
+    /// force, as the evaluator folds it from the log.
+    #[must_use]
+    pub fn room_retention(&self) -> u64 {
+        self.evaluator.policy().ttl
+    }
+
+    /// The retention this node applies to the room: the shorter of the room's and its own
+    /// (ADR-023 decision 2, PRD-001 R9). `0` is forever.
+    #[must_use]
+    pub fn effective_retention(&self) -> u64 {
+        crate::node::retention::shortest(self.room_retention(), self.node_retention)
+    }
+
+    /// Set this node's own retention for the room (from its config; `0` = no node limit).
+    /// Takes effect at the next [`ChannelState::sweep_retention`].
+    pub fn set_node_retention(&mut self, secs: u64) {
+        self.node_retention = secs;
+    }
+
+    /// Set the **room's** retention (PRD-001 R7): append an ADR-007 policy-update carrying
+    /// `ttl` seconds (`0` = forever). Only a holder of the `policy` capability may — the
+    /// room's admin; anyone else is refused here rather than writing an entry every other
+    /// node would ignore. It applies to what is already stored, at the next sweep (R8).
+    pub fn set_retention(&mut self, profile: &Profile, ttl: u64, now_secs: u64) -> Result<()> {
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        if !self
+            .evaluator
+            .grants(&me, &crate::governance::capability::Capability::Policy)
+            .is_granted()
+        {
+            return Err(Error::MalformedGovernance(
+                "only the room's admin may set its retention",
+            ));
+        }
+        let update = crate::governance::policy::PolicyUpdate::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            None,
+            Some(ttl),
+            None,
+        )?;
+        self.append_governance(profile, &update.to_wire(), now_secs)?;
+        Ok(())
+    }
+
+    /// Prune every content entry older than the effective retention (ADR-023 decision 2):
+    /// drop its body, delete its plaintext cache row, keep the signed skeleton, and take it
+    /// out of the timeline. Retroactive by construction — it looks only at what is held now
+    /// against the policy in force now. Returns how many entries were pruned.
+    ///
+    /// Costs what it prunes, not what the room holds: the index is ordered by age.
+    pub fn sweep_retention(&mut self, store: &Store, now_secs: u64) -> Result<usize> {
+        let ttl = self.effective_retention();
+        if ttl == 0 || self.poisoned {
+            return Ok(0);
+        }
+        let due = self.retention.take_due(now_secs.saturating_sub(ttl));
+        self.prune(store, &due, false)
+    }
+
+    /// Whether an entry this node is about to render has already outlived the effective
+    /// retention — a late arrival of a message that is expired everywhere else.
+    fn already_expired(&self, entry_hash: &Digest32, claimed: u64, now_secs: u64) -> bool {
+        let ttl = self.effective_retention();
+        if ttl == 0 {
+            return false;
+        }
+        let first_seen = self
+            .retention
+            .get(entry_hash)
+            .map_or(now_secs, |t| t.first_seen);
+        claimed.min(first_seen) <= now_secs.saturating_sub(ttl)
+    }
+
+    /// Drop the bodies of `due`: rewrite each log page with the skeleton alone, delete its
+    /// cache row and its retention record, in one batch. `with_receivers` also persists the
+    /// receiver chains, for a caller that has just advanced one (a render that decrypted and
+    /// then found the message expired must still record that the key was used).
+    fn prune(
+        &mut self,
+        store: &Store,
+        due: &[(Digest32, Tracked)],
+        with_receivers: bool,
+    ) -> Result<usize> {
+        if due.is_empty() && !with_receivers {
+            return Ok(0);
+        }
+        let mut pages = Vec::with_capacity(due.len());
+        for (hash, t) in due {
+            self.dag.prune_payload(hash);
+            let wire = self
+                .dag
+                .get_by_hash(hash)
+                .ok_or(Error::MalformedGovernance("pruned entry vanished"))?
+                .to_wire();
+            pages.push((
+                t.log_id,
+                t.cache_id,
+                seal_segment(&self.sek, SegmentKind::LogDb, t.log_id, &wire)?,
+            ));
+        }
+        let receivers_seg = if with_receivers {
+            Some(seal_segment(
+                &self.sek,
+                SegmentKind::KeyMaterial,
+                SEG_RECEIVERS,
+                &receivers_bytes(&self.receivers),
+            )?)
+        } else {
+            None
+        };
+        let persisted = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            for (log_id, cache_id, page) in &pages {
+                batch.put_segment(&self.channel_id, SegmentKind::LogDb, *log_id, page)?;
+                batch.delete_segment(&self.channel_id, SegmentKind::Index, *log_id)?;
+                if let Some(c) = cache_id {
+                    batch.delete_segment(&self.channel_id, SegmentKind::PlaintextCache, *c)?;
+                }
+            }
+            if let Some(seg) = &receivers_seg {
+                batch.put_segment(
+                    &self.channel_id,
+                    SegmentKind::KeyMaterial,
+                    SEG_RECEIVERS,
+                    seg,
+                )?;
+            }
+            batch.commit()
+        })();
+        if let Err(e) = persisted {
+            self.poisoned = true;
+            return Err(e);
+        }
+        let gone: BTreeSet<Digest32> = due.iter().map(|(h, _)| *h).collect();
+        self.timeline.retain(|r| !gone.contains(&r.entry_hash));
+        Ok(due.len())
+    }
+
+    /// Start tracking a content body just stored under `log_id`, first seen `now_secs`, and
+    /// record that time durably beside it.
+    fn track_body(
+        &mut self,
+        store: &Store,
+        entry_hash: Digest32,
+        log_id: u64,
+        now_secs: u64,
+    ) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::Index,
+            log_id,
+            &first_seen_bytes(now_secs),
+        )?;
+        if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::Index, log_id, &seg) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.retention.track(
+            entry_hash,
+            Tracked {
+                log_id,
+                first_seen: now_secs,
+                claimed: None,
+                cache_id: None,
+            },
+        );
+        Ok(())
+    }
+
     /// Append an already-built governance struct as a signed log entry.
     fn append_governance(
         &mut self,
@@ -1958,17 +2187,16 @@ impl ChannelState {
 
         // Collect what arrived, in per-author sequence order, before touching the
         // store (the borrow of `self.dag` ends here).
-        let mut arrived: Vec<(Digest32, Digest32, Vec<u8>)> = Vec::new();
+        // A skeleton without its body — pruned at the peer — is stored too: the feed must
+        // stay contiguous on disk or the next reopen breaks at the gap (ADR-023 decision 2).
+        let mut arrived: Vec<(Digest32, Digest32, Option<Vec<u8>>)> = Vec::new();
         for (author, head) in &before {
             let Some(feed) = self.dag.feed(author) else {
                 continue;
             };
             for seq in (head + 1)..=feed.max_seq() {
                 if let Some(entry) = feed.get(seq) {
-                    let Some(payload) = entry.payload.clone() else {
-                        continue;
-                    };
-                    arrived.push((*author, entry.entry_hash(), payload));
+                    arrived.push((*author, entry.entry_hash(), entry.payload.clone()));
                 }
             }
         }
@@ -1997,6 +2225,9 @@ impl ChannelState {
                 return Err(e);
             }
             self.next_log_id = id.saturating_add(1);
+            let Some(payload) = payload else {
+                continue; // a skeleton: stored, never rendered
+            };
             match classify_payload(&payload)? {
                 EntryKind::Governance => {
                     let entry = self
@@ -2020,6 +2251,7 @@ impl ChannelState {
                     out.governance += 1;
                 }
                 EntryKind::Content => {
+                    self.track_body(store, entry_hash, id, now_secs)?;
                     if self.render_content(store, author, entry_hash, &payload, now_secs)? {
                         out.rendered += 1;
                     }
@@ -2174,6 +2406,19 @@ impl ChannelState {
         let Ok(content) = Content::from_canonical_slice(&plaintext) else {
             return Ok(false);
         };
+        // **A late arrival of an expired message never renders** (ADR-023 decision 2). Its key
+        // has been used, so the chain is persisted all the same; the body goes as any other
+        // expired body does.
+        if self.already_expired(&entry_hash, content.created_millis / 1_000, now_secs) {
+            let due: Vec<(Digest32, Tracked)> = self
+                .retention
+                .forget(&entry_hash)
+                .map(|t| (entry_hash, t))
+                .into_iter()
+                .collect();
+            self.prune(store, &due, true)?;
+            return Ok(false);
+        }
         let rendered = Rendered {
             entry_hash,
             author,
@@ -2218,8 +2463,9 @@ impl ChannelState {
             return Err(e);
         }
         self.next_log_id = id.saturating_add(1);
+        self.retention
+            .rendered(&entry_hash, rendered.created_millis / 1_000, id);
         self.timeline.push(rendered);
-        let _ = now_secs;
         Ok(true)
     }
 
@@ -2252,11 +2498,12 @@ impl ChannelState {
                 "entry from an unadmitted author",
             ))?
             .clone();
-        let payload = entry
-            .payload
-            .as_deref()
-            .ok_or(Error::MalformedGovernance("entry payload pruned"))?;
-        let kind = classify_payload(payload)?;
+        // A pruned entry is a skeleton the peer no longer holds a body for: stored, so the
+        // feed stays whole, and never rendered (ADR-023 decision 2).
+        let kind = match entry.payload.as_deref() {
+            Some(payload) => classify_payload(payload)?,
+            None => EntryKind::Content,
+        };
         let gov = if kind == EntryKind::Governance {
             Some(GovEntry::from_verified_log_entry(
                 &entry,
@@ -2294,11 +2541,14 @@ impl ChannelState {
             // has consented to us; otherwise it stays stored as ciphertext
             // (ADR-007 step 3) until an SKDM arrives and backfills it.
             None => {
-                let payload = self
+                let Some(payload) = self
                     .dag
                     .get_by_hash(&entry_hash)
                     .and_then(|e| e.payload.clone())
-                    .ok_or(Error::MalformedGovernance("accepted entry payload missing"))?;
+                else {
+                    return Ok(Accepted::ContentNotReadable);
+                };
+                self.track_body(store, entry_hash, id, now_secs)?;
                 if self.render_content(store, author, entry_hash, &payload, now_secs)? {
                     Ok(Accepted::Rendered)
                 } else {
@@ -2370,6 +2620,12 @@ impl ChannelState {
             SEG_SENDER,
             &self.sender.to_state(),
         )?;
+        let seen_seg = seal_segment(
+            &self.sek,
+            SegmentKind::Index,
+            id,
+            &first_seen_bytes(now_millis / 1_000),
+        )?;
 
         // Validate against the DAG first (structural), then persist, then commit
         // to memory. A persist failure poisons the channel (see module docs).
@@ -2392,6 +2648,7 @@ impl ChannelState {
                 SEG_SENDER,
                 &sender_seg,
             )?;
+            batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen_seg)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -2399,6 +2656,15 @@ impl ChannelState {
             return Err(e);
         }
         self.next_log_id = id.saturating_add(1);
+        self.retention.track(
+            entry_hash,
+            Tracked {
+                log_id: id,
+                first_seen: now_millis / 1_000,
+                claimed: Some(now_millis / 1_000),
+                cache_id: Some(id),
+            },
+        );
         self.timeline.push(rendered);
         self.timeline
             .last()

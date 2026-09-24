@@ -87,6 +87,10 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// on the network.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How often the node re-reads its retention file (ADR-023 decision 2: the sweep runs at
+/// least every minute; the file is read on the same cadence).
+const RETENTION_REREAD_SECS: u64 = 60;
+
 /// How often a peer reached over a relay is retried for a direct path.
 ///
 /// A relayed path works, so nothing forces a retry — but it costs a third party's bandwidth
@@ -1189,6 +1193,11 @@ pub struct Node {
     /// The ADR-020 §3 trust keyring, loaded on unlock and empty while locked
     /// (it is sealed under the identity, so there is nothing to hold locked).
     trust: crate::node::trust::Keyring,
+    /// This node's own retention (ADR-023 decision 2), re-read from the config directory
+    /// at most every [`RETENTION_REREAD_SECS`] so an edit takes effect without a restart.
+    node_retention: crate::node::retention::RetentionConfig,
+    /// When `node_retention` was last read; `0` before the first read.
+    retention_read_at: u64,
     /// When each peer was last tried for a better path, so a relayed connection is retried
     /// on a schedule rather than only at the moment it was made.
     last_upgrade: std::collections::BTreeMap<Digest32, u64>,
@@ -1311,6 +1320,8 @@ impl Node {
             view_tx: watch::Sender::new(NodeView::default()),
             event_tx,
             trust: crate::node::trust::Keyring::new(),
+            node_retention: crate::node::retention::RetentionConfig::default(),
+            retention_read_at: 0,
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
         };
@@ -1389,6 +1400,11 @@ impl Node {
                     // ago is picked up as soon as it can be reached (ADR-020 §3).
                     self.deliver_owed_consents().await;
                     if self.run_due_syncs().await {
+                        self.publish().await;
+                    }
+                    // Retention on every tick: the index is ordered by age, so a pass that
+                    // prunes nothing costs one comparison per open room.
+                    if self.sweep_retention().await {
                         self.publish().await;
                     }
                 }
@@ -1525,6 +1541,9 @@ impl Node {
                 }
             }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
+            NodeCommand::SetRetention { channel_id, ttl } => {
+                self.set_retention(&channel_id, ttl).await
+            }
             NodeCommand::Shutdown => Outcome::Done,
         }
     }
@@ -4859,6 +4878,58 @@ impl Node {
         });
     }
 
+    /// Set a room's retention, then apply it here at once and push the policy-update to the
+    /// other members, whose own sweeps apply it as it arrives (ADR-023 decision 2).
+    async fn set_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        if let Err(e) = shared.lock().await.set_retention(profile, ttl, now) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.note_local_append(channel_id);
+        self.retention_read_at = 0; // re-read the node's own file too: an explicit act
+        self.sweep_retention().await;
+        Outcome::Done
+    }
+
+    /// Prune every open room to its effective retention — the shorter of the room's policy and
+    /// this node's own (ADR-023 decision 2). `true` when anything was pruned, so the view is
+    /// republished and `vox room read` stops showing it.
+    async fn sweep_retention(&mut self) -> bool {
+        let now = self.now();
+        if self.retention_read_at == 0
+            || now.saturating_sub(self.retention_read_at) >= RETENTION_REREAD_SECS
+        {
+            // An unreadable file keeps the last policy read rather than dropping to "no node
+            // limit", which would keep more than the operator asked for.
+            if let Ok(cfg) =
+                crate::node::retention::RetentionConfig::load(&self.paths.retention_file())
+            {
+                self.node_retention = cfg;
+            }
+            self.retention_read_at = now.max(1);
+        }
+        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+            return false;
+        };
+        let mut pruned = 0usize;
+        for (cid, shared) in &self.channels {
+            // A room mid-session is skipped, not waited for: the actor must not park behind a
+            // sync, and the next tick comes round in a second.
+            let Ok(mut ch) = shared.try_lock() else {
+                continue;
+            };
+            ch.set_node_retention(self.node_retention.for_room(cid));
+            pruned += ch.sweep_retention(&store, now).unwrap_or(0);
+        }
+        pruned > 0
+    }
+
     async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
@@ -5186,6 +5257,8 @@ fn fault_of(e: &Error) -> Fault {
         Error::MalformedLink(_) | Error::MalformedAnchor(_) => Fault::BadLink,
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
+        // Retention is the admin's to set; anyone else is refused, not failed.
+        Error::MalformedGovernance("only the room's admin may set its retention") => Fault::Refused,
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,
         // A join refused before the challenge (the responder does not hold that
         // channel open) reaches the joiner as a malformed exchange; report it as the

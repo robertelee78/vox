@@ -978,6 +978,65 @@ pub async fn create(paths: &Paths, local_name: &str) -> Result<(), AppError> {
     }
 }
 
+/// `vox room retention` — set how long the room keeps messages (ADR-023 decision 2).
+///
+/// # Errors
+/// An unparseable duration, an unreachable node, an unknown room, a wrong identity
+/// passphrase, or a caller who is not the room's admin.
+pub async fn retention(
+    paths: &Paths,
+    room: &str,
+    duration: &str,
+    identity_passphrase: &str,
+) -> Result<(), AppError> {
+    let ttl = vox_core::node::retention::parse_duration(duration).ok_or_else(|| {
+        AppError::Usage(format!(
+            "{duration:?} is not a retention: use 1h, 1w, 1m (a month), a number of seconds, \
+             or forever"
+        ))
+    })?;
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client
+        .request(&Request::SetRetention {
+            channel_id,
+            ttl,
+            identity_passphrase: identity_passphrase.to_owned(),
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!(
+                "vox: {} keeps messages {}",
+                short(&channel_id),
+                match ttl {
+                    0 => "forever".to_owned(),
+                    t => format!("for {}", vox_core::node::retention::describe(t)),
+                }
+            );
+            if ttl > 0 {
+                println!(
+                    "     older messages are removed now, on every member as this reaches them"
+                );
+                println!(
+                    "     a modified node can keep everything: this is not a security property"
+                );
+            }
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+            "cannot set retention: {reason}{}",
+            if reason.contains("Refused") {
+                " — only the room's admin may"
+            } else {
+                ""
+            }
+        ))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
 /// `vox room invite` — print a room's address for someone else to join with.
 ///
 /// The address is rendezvous information, not a credential: it names the room and
