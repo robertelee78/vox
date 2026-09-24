@@ -453,6 +453,63 @@ pub fn run_node(
     Ok(())
 }
 
+/// How often a daemon re-reads its anchor configuration and re-resolves it.
+///
+/// Short enough that a moved anchor is followed within a minute, long enough that it is
+/// not a resolver load: the node only acts when something actually changed, because
+/// merging an address it already holds is a no-op.
+const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long one wake may take before it is abandoned.
+const WAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The interrupt decision for one entry that just landed in `channel_id`: wake every
+/// session registered for that room that this message both addresses and marks urgent
+/// (ADR-020 §6). Everything else waits for the session's next turn.
+async fn judge(
+    paths: &vox_core::node::paths::Paths,
+    channel_id: &vox_core::hash::Digest32,
+    text: &str,
+) {
+    let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(text) else {
+        return;
+    };
+    let room = vox_core::node::link::b32_encode(channel_id);
+    for session in crate::wake::registered(paths) {
+        if session.room != room || session.name.is_empty() {
+            continue;
+        }
+        if !envelope.may_interrupt(&session.name) {
+            continue;
+        }
+        let text = format!(
+            "Urgent message for you in Vox room {}:\n\n{}",
+            &room[..12.min(room.len())],
+            envelope.body.trim()
+        );
+        // **One wedged session must not stall every other wake.** Each is its own task,
+        // bounded by a deadline: a session endpoint that accepts and never reads would
+        // otherwise hold this loop — and so every later interrupt — indefinitely.
+        tokio::spawn(async move {
+            match tokio::time::timeout(WAKE_DEADLINE, crate::wake::wake(&session, &text)).await {
+                Ok(Ok(())) => {}
+                // Reported, never fatal: an agent that cannot be interrupted still reads the
+                // message on its next turn, which is the whole point of queueing always.
+                Ok(Err(e)) => eprintln!(
+                    "vox daemon: could not interrupt session {}: {e}",
+                    session.session
+                ),
+                Err(_) => eprintln!(
+                    "vox daemon: interrupting session {} took longer than {}s; gave up — it \
+                     reads the message on its next turn",
+                    session.session,
+                    WAKE_DEADLINE.as_secs()
+                ),
+            }
+        });
+    }
+}
+
 /// Run this profile's node **without a terminal**, so agent sessions can attach
 /// (ADR-020 §12).
 ///
@@ -497,13 +554,6 @@ pub fn run_node(
 /// or wrong, a named room is unknown or its passphrase is refused, or the control
 /// socket cannot be bound — the last of which **is** fatal here, unlike in the TUI,
 /// because serving that socket is this command's entire purpose.
-/// How often a daemon re-reads its anchor configuration and re-resolves it.
-///
-/// Short enough that a moved anchor is followed within a minute, long enough that it is
-/// not a resolver load: the node only acts when something actually changed, because
-/// merging an address it already holds is a no-op.
-const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
-
 pub fn run_daemon(
     paths: Paths,
     listen: std::net::SocketAddr,
@@ -786,50 +836,77 @@ pub fn run_daemon(
     // narrow: a message interrupts only if it names this agent *and* is marked
     // urgent. Everything else waits for the next turn, because an interrupt that
     // fires on everything is a queue with worse manners.
+    //
+    // **An event is a wake, never the data** (ADR-020 §6; ADR-021 F15). The node emits
+    // `NewEntry` only for its OWN appends. An entry that arrives from another member is
+    // announced as `Synced`, and one made readable by a sender key as
+    // `SenderKeyReceived` — neither carries the row. This loop used to act on `NewEntry`
+    // alone, so an urgent message from an agent on ANOTHER machine — the case the
+    // interrupt path exists for — could never interrupt anybody. So every room is swept
+    // for rows this loop has not yet judged: on those events, on `Lagged`, and on a
+    // two-second tick, so a view that had not yet published a row when its event arrived
+    // is caught on the next sweep rather than missed for good.
     {
         let node = node.clone();
         let paths = paths.clone();
         rt.spawn(async move {
             let mut events = node.subscribe();
-            while let Some(item) = events.next().await {
-                let vox_core::node::actor::EventStreamItem::Event(ev) = item else {
-                    continue;
+            // Everything already in a room when the daemon starts is history, not news:
+            // an interrupt is for what lands while the daemon is running.
+            let mut seen: std::collections::HashSet<vox_core::hash::Digest32> = node
+                .view()
+                .open_channels
+                .iter()
+                .flat_map(|d| d.timeline.iter().map(|r| r.entry_hash))
+                .collect();
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                let sweep = tokio::select! {
+                    item = events.next() => match item {
+                        None => break,
+                        Some(vox_core::node::actor::EventStreamItem::Lagged(n)) => {
+                            eprintln!("vox daemon: fell behind the node's events by {n}; re-reading every room");
+                            true
+                        }
+                        Some(vox_core::node::actor::EventStreamItem::Event(ev)) => {
+                            // **A daemon is the node nobody is watching, so it has to say
+                            // things out loud** — unreachable peers, refused publishes,
+                            // stalls — which `vox node` has always reported.
+                            crate::tunnel_cli::say_if_it_explains_a_failure(&ev);
+                            match ev {
+                                vox_core::node::api::NodeEvent::NewEntry { channel_id, row } => {
+                                    if seen.insert(row.entry_hash) {
+                                        judge(&paths, &channel_id, &row.text).await;
+                                    }
+                                    false
+                                }
+                                vox_core::node::api::NodeEvent::Synced { .. }
+                                | vox_core::node::api::NodeEvent::SenderKeyReceived { .. } => true,
+                                _ => false,
+                            }
+                        }
+                    },
+                    _ = tick.tick() => true,
                 };
-                // **A daemon is the node nobody is watching, so it has to say things out
-                // loud.** This loop existed for the interrupt path and discarded every other
-                // event with a `continue`, which meant the one host a person runs unattended —
-                // their always-on node, the anchor their other devices reach through — reported
-                // no unreachable peer, no refused publish, no stall, ever. `vox node` has
-                // reported these all along; the daemon swallowing them is why a room that
-                // silently stopped converging looked like patience from every side.
-                crate::tunnel_cli::say_if_it_explains_a_failure(&ev);
-                let vox_core::node::api::NodeEvent::NewEntry { channel_id, row } = ev else {
-                    continue;
-                };
-                let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
-                    continue;
-                };
-                let room = vox_core::node::link::b32_encode(&channel_id);
-                for session in crate::wake::registered(&paths) {
-                    if session.room != room || session.name.is_empty() {
-                        continue;
-                    }
-                    if !envelope.may_interrupt(&session.name) {
-                        continue;
-                    }
-                    let text = format!(
-                        "Urgent message for you in Vox room {}:\n\n{}",
-                        &room[..12.min(room.len())],
-                        envelope.body.trim()
-                    );
-                    if let Err(e) = crate::wake::wake(&session, &text).await {
-                        // Reported, never fatal: an agent that cannot be interrupted
-                        // still reads the message on its next turn, which is the
-                        // whole point of queueing always.
-                        eprintln!(
-                            "vox daemon: could not interrupt session {}: {e}",
-                            session.session
-                        );
+                if sweep {
+                    let fresh: Vec<(vox_core::hash::Digest32, String)> = node
+                        .view()
+                        .open_channels
+                        .iter()
+                        .flat_map(|d| {
+                            d.timeline
+                                .iter()
+                                .filter(|r| !seen.contains(&r.entry_hash))
+                                .map(move |r| (d.channel_id, r.clone()))
+                        })
+                        .map(|(cid, r)| (cid, r.entry_hash, r.text))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .filter(|(_, h, _)| seen.insert(*h))
+                        .map(|(cid, _, text)| (cid, text))
+                        .collect();
+                    for (cid, text) in fresh {
+                        judge(&paths, &cid, &text).await;
                     }
                 }
             }
