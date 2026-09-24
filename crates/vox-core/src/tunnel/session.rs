@@ -26,6 +26,7 @@ use tokio::net::TcpStream;
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
+use std::sync::Arc;
 
 /// Maximum length of a service tag carried in a tunnel request (matches the
 /// capability-token bound; rejects an oversized field before allocation).
@@ -260,7 +261,48 @@ pub async fn accept<F>(
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
 {
-    accept_reporting(send, recv, client_id, resolve, |_, _| {}).await
+    accept_reporting(send, recv, client_id, resolve, |_, _| {}, None).await
+}
+
+/// What a host needs to serve a UDP service (ADR-022 decision 6): the connection the
+/// stream arrived on, to bind the flow to, and the node's flow table, to bound it.
+/// Without it a `udp/<port>` request is refused like any other service the host cannot
+/// carry.
+pub struct UdpHost<'a> {
+    /// The connection the tunnel stream arrived on.
+    pub conn: &'a crate::transport::quic::VoxConnection,
+    /// Every UDP flow this node holds.
+    pub flows: Arc<crate::tunnel::udp::UdpFlows>,
+}
+
+/// Serve a UDP request that has passed the gate: a socket connected to the service, the
+/// `Accepted` status, then the stream bound as the flow and pumped until it ends.
+async fn accept_udp(
+    mut send: SendStream,
+    recv: RecvStream,
+    udp: UdpHost<'_>,
+    client_id: &Digest32,
+    target: SocketAddr,
+    label: &str,
+    cut: impl core::future::Future<Output = ()>,
+) -> Result<()> {
+    use crate::tunnel::udp;
+    // Admitted before anything is bound: a full table refuses exactly as an unknown
+    // service does, so it tells the dialer nothing it could not already guess.
+    let (Some(guard), Ok(sock)) = (
+        udp.flows.admit(*client_id, label),
+        udp::connect_service(target).await,
+    ) else {
+        write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
+        let _ = send.finish();
+        return Err(Error::TunnelDenied("udp flow refused"));
+    };
+    write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
+    let flow = udp.conn.bind_flow(send, recv)?;
+    // Whatever ends the pump, dropping the flow ends the stream, which ends the flow at
+    // the dialer too — untrust and service removal included (R22).
+    udp::host_pump(flow, sock, guard, cut).await;
+    Ok(())
 }
 
 /// [`accept`], reporting each authorized request to `served` before the local connect.
@@ -275,12 +317,15 @@ where
 /// inside the accept path, so it must not block: the intended use is to hand an event
 /// to a queue. It is informational for a live client, *not* an audit log — a durable,
 /// signed record of session establishment is ADR-013's own open item.
+///
+/// `udp` lets it serve `udp/<port>` services (ADR-022 decision 6); `None` refuses them.
 pub async fn accept_reporting<F, S>(
     mut send: SendStream,
     mut recv: RecvStream,
     client_id: &Digest32,
     resolve: F,
     served: S,
+    udp: Option<UdpHost<'_>>,
 ) -> Result<()>
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
@@ -322,6 +367,16 @@ where
     // Authorized, and not before: the host learns who reached what, and learns nothing
     // about a refusal it did not grant.
     served(&req.channel_id, &req.service_tag);
+
+    if crate::tunnel::udp::is_udp(&req.service_tag) {
+        let cut = withdrawn(reachers, offered, *client_id, req.service_tag.clone());
+        let Some(udp) = udp else {
+            write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
+            let _ = send.finish();
+            return Err(Error::TunnelDenied("udp not served here"));
+        };
+        return accept_udp(send, recv, udp, client_id, target, &req.service_tag, cut).await;
+    }
 
     let tcp = match TcpStream::connect(target).await {
         Ok(t) => t,

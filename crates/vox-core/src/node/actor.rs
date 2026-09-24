@@ -1196,6 +1196,9 @@ pub struct Node {
     /// Kept out of `Channel` because it is a *join* of channel state with the node-wide
     /// keyring, and the keyring is not a property of any one room.
     reachers: std::collections::BTreeMap<Digest32, crate::node::tunnel::Reachers>,
+    /// Every UDP flow this node holds, as host or dialer (ADR-022 decision 6): what bounds
+    /// them per peer and in all.
+    udp_flows: Arc<crate::tunnel::udp::UdpFlows>,
     /// Each channel's live offer of services (PRD-001 R22), kept beside `reachers` and for
     /// the same reason: serving tasks hold these handles, so removing a service reaches
     /// the sessions it is carrying.
@@ -1317,6 +1320,7 @@ impl Node {
             trust: crate::node::trust::Keyring::new(),
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
+            udp_flows: Arc::new(crate::tunnel::udp::UdpFlows::default()),
             offered: std::collections::BTreeMap::new(),
         };
         let view_rx = node.view_tx.subscribe();
@@ -1492,8 +1496,12 @@ impl Node {
                 local_name,
                 passphrase,
                 port,
+                udp,
                 at,
-            } => self.serve_room(&local_name, &passphrase, port, at).await,
+            } => {
+                self.serve_room(&local_name, &passphrase, port, udp, at)
+                    .await
+            }
             NodeCommand::Up { channel_id, bind } => self.bring_up(&channel_id, bind).await,
             NodeCommand::AddService {
                 channel_id,
@@ -2378,6 +2386,10 @@ impl Node {
                         self.answer_punch(peer, coordinator, send, recv);
                     }
                     Inbound::Tunnel { peer, send, recv } => {
+                        // A UDP service binds its flow to this connection, so the task
+                        // holds it for the flow's life.
+                        let conn = Arc::clone(&_connection);
+                        let flows = Arc::clone(&self.udp_flows);
                         // The snapshot is taken here (only the actor reads channel
                         // state) and the tunnel runs on its own task: it lives as long
                         // as the TCP connection it carries, which may be hours.
@@ -2392,6 +2404,7 @@ impl Node {
                                 recv,
                                 snapshot,
                                 Some(events),
+                                Some(crate::tunnel::session::UdpHost { conn: &conn, flows }),
                             )
                             .await;
                         });
@@ -4392,15 +4405,22 @@ impl Node {
         local_name: &str,
         passphrase: &Secret,
         port: u16,
+        udp: bool,
         at: Option<SocketAddr>,
     ) -> Outcome {
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        let tag = port.to_string();
+        // The genesis grant only names the room (it is retained on the wire, M17.13, and
+        // grants nothing); the service label is what the host's gate is asked about.
+        let tag = if udp {
+            format!("udp/{port}")
+        } else {
+            port.to_string()
+        };
         let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)));
-        let grant = CapabilitySet::from_iter_caps([Capability::dial(tag.clone())]);
+        let grant = CapabilitySet::from_iter_caps([Capability::dial(port.to_string())]);
         let mut channel = match ChannelState::create_with_grant(
             profile,
             local_name,
@@ -4587,6 +4607,7 @@ impl Node {
             listener,
             resolver,
             dialer,
+            Arc::clone(&self.udp_flows),
             {
                 let events = events.clone();
                 move |room: &Digest32, port: u16| {
@@ -4668,18 +4689,32 @@ impl Node {
             channel_id: *channel_id,
         });
         let events = self.event_tx.clone();
-        match crate::node::tunnel::Forward::bind(
-            dialer,
-            *host,
-            *channel_id,
-            service_tag.to_owned(),
-            local,
-            move |reason: String| {
-                let _ = events.send(NodeEvent::ProxyRefused { reason });
-            },
-        )
-        .await
-        {
+        let report = move |reason: String| {
+            let _ = events.send(NodeEvent::ProxyRefused { reason });
+        };
+        let bound = if crate::tunnel::udp::is_udp(service_tag) {
+            crate::node::tunnel::Forward::bind_udp(
+                dialer,
+                *host,
+                *channel_id,
+                service_tag.to_owned(),
+                local,
+                Arc::clone(&self.udp_flows),
+                report,
+            )
+            .await
+        } else {
+            crate::node::tunnel::Forward::bind(
+                dialer,
+                *host,
+                *channel_id,
+                service_tag.to_owned(),
+                local,
+                report,
+            )
+            .await
+        };
+        match bound {
             Ok(fwd) => {
                 let (channel_id, host, service_tag, bound) =
                     (fwd.channel_id, fwd.host, fwd.service_tag.clone(), fwd.local);
@@ -4941,6 +4976,7 @@ impl Node {
                     .iter()
                     .map(|(tag, addr)| (tag.clone(), *addr))
                     .collect(),
+                creator: ch.genesis().creator_pubkey().fingerprint(),
             });
         }
         let (relayed_peers, relaying) = self.path_view();

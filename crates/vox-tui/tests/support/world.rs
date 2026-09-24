@@ -118,6 +118,33 @@ impl VoxProc {
         self.seen.join("\n")
     }
 
+    /// The first line matching `pred` within `within`, or `None` if the process exits or
+    /// the time runs out first — for a caller that has something better to do than fail.
+    pub fn wait_for(&mut self, within: Duration, pred: impl Fn(&str) -> bool) -> Option<String> {
+        if let Some(line) = self.seen.iter().find(|l| pred(l)) {
+            return Some(line.clone());
+        }
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            match self.lines.recv_timeout(left) {
+                Ok(line) => {
+                    eprintln!("[{}] {line}", self.name);
+                    let hit = pred(&line);
+                    self.seen.push(line.clone());
+                    if hit {
+                        return Some(line);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => return None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+
     pub fn expect_line(&mut self, what: &str, pred: impl Fn(&str) -> bool) -> String {
         self.expect_within(LINE_TIMEOUT, what, pred)
     }
@@ -219,19 +246,165 @@ pub fn resetting_service() -> u16 {
     port
 }
 
+/// The path a world forces between its guest and its host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathKind {
+    /// Everyone on IPv4 loopback: the guest dials the host straight.
+    Direct,
+    /// The host on IPv6 loopback, the guest on IPv4, the anchor on both: nothing but a
+    /// relay circuit through the anchor can join them.
+    Relayed,
+}
+
+impl PathKind {
+    /// Where the host listens.
+    #[must_use]
+    pub fn host_listen(self) -> &'static str {
+        match self {
+            PathKind::Direct => "127.0.0.1:0",
+            PathKind::Relayed => "[::1]:0",
+        }
+    }
+}
+
+/// How a [`World`] is built.
+pub struct Setup {
+    /// What the host serves: `<port>`, `<port>/udp`, …
+    pub specs: Vec<String>,
+    /// Whether the host trusts the guest.
+    pub trusted: bool,
+    /// The path between them.
+    pub path: PathKind,
+    /// Put something between the guest and the anchor: given the anchor's IPv4 address,
+    /// return the address the guest should use instead (a lossy proxy, say).
+    #[allow(clippy::type_complexity)]
+    pub guest_leg: Option<Box<dyn Fn(SocketAddr) -> Option<SocketAddr>>>,
+}
+
+/// A UDP port free on the dual-stack wildcard, for an anchor that must be reachable over
+/// both IPv4 and IPv6 loopback.
+#[must_use]
+pub fn free_dual_stack_port() -> u16 {
+    let s = std::net::UdpSocket::bind("[::]:0").expect("bind [::]:0");
+    s.local_addr().unwrap().port()
+}
+
+/// The socket address in an `--anchor` spec (`<fp>@/ip4/<ip>/udp/<port>`).
+#[must_use]
+pub fn spec_addr(spec: &str) -> SocketAddr {
+    let parts: Vec<&str> = spec.split('/').collect();
+    let port: u16 = parts[parts.len() - 1].parse().expect("a port in the spec");
+    let ip: std::net::IpAddr = parts[parts.len() - 3].parse().expect("an ip in the spec");
+    SocketAddr::new(ip, port)
+}
+
+/// `spec` with its address replaced by `addr`.
+#[must_use]
+pub fn respec(spec: &str, addr: SocketAddr) -> String {
+    let fp = spec.split('@').next().unwrap();
+    match addr {
+        SocketAddr::V4(a) => format!("{fp}@/ip4/{}/udp/{}", a.ip(), a.port()),
+        SocketAddr::V6(a) => format!("{fp}@/ip6/{}/udp/{}", a.ip(), a.port()),
+    }
+}
+
+/// A UDP proxy on IPv4 loopback in front of `upstream`: every datagram crosses it after
+/// `delay`, and while `drop_every` is non-zero every `drop_every`-th one from the client
+/// side is lost. Returns its address, the count of datagrams it dropped, and the knob —
+/// so a proof can let setup through clean and switch the loss on for the measurement. One
+/// upstream socket per client address, as a NAT would.
+#[must_use]
+pub fn lossy_proxy(
+    upstream: SocketAddr,
+    delay: Duration,
+) -> (
+    SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    let front = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = front.local_addr().unwrap();
+    front.set_nonblocking(true).unwrap();
+    let dropped = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&dropped);
+    let knob = Arc::new(AtomicU64::new(0));
+    let every = Arc::clone(&knob);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let front = Arc::new(tokio::net::UdpSocket::from_std(front).unwrap());
+            let mut backs: std::collections::HashMap<SocketAddr, Arc<tokio::net::UdpSocket>> =
+                std::collections::HashMap::new();
+            let mut seen = 0u64;
+            let mut buf = vec![0u8; 65_535];
+            loop {
+                let Ok((n, client)) = front.recv_from(&mut buf).await else {
+                    continue;
+                };
+                let back = if let Some(b) = backs.get(&client) {
+                    Arc::clone(b)
+                } else {
+                    let b = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                    b.connect(upstream).await.unwrap();
+                    backs.insert(client, Arc::clone(&b));
+                    // The return leg: delayed, never dropped.
+                    let (b2, front2) = (Arc::clone(&b), Arc::clone(&front));
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65_535];
+                        while let Ok(n) = b2.recv(&mut buf).await {
+                            let d = buf[..n].to_vec();
+                            let f = Arc::clone(&front2);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                let _ = f.send_to(&d, client).await;
+                            });
+                        }
+                    });
+                    b
+                };
+                seen += 1;
+                let drop_every = every.load(Ordering::Relaxed);
+                if drop_every > 0 && seen.is_multiple_of(drop_every) {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let d = buf[..n].to_vec();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = back.send(&d).await;
+                });
+            }
+        });
+    });
+    (addr, dropped, knob)
+}
+
 /// The host's handshake bound (`HANDSHAKE_TIMEOUT`, 30 s) with a margin. See [`World::new`].
 pub const ACCEPT_WINDOW: Duration = Duration::from_secs(35);
 
 /// One host, one anchor, one guest who has joined the host's `vox serve` room.
 pub struct World {
     pub tmp: tempfile::TempDir,
-    /// Held for its lifetime: the anchor must outlive everything that reaches through it.
-    pub _anchor: VoxProc,
-    pub anchor_spec: String,
+    /// The anchor, held for the world's lifetime: it must outlive everything that reaches
+    /// through it. Its status lines say how many circuits it carries.
+    pub anchor: VoxProc,
+    /// The anchor spec the host uses.
+    pub host_anchor: String,
+    /// The anchor spec every guest uses — the same as the host's on a direct path.
+    pub guest_anchor: String,
+    /// The path the world forces between guest and host.
+    pub path: PathKind,
     pub host_dir: PathBuf,
     pub guest_dir: PathBuf,
     pub host: Option<VoxProc>,
     pub host_fp: String,
+    /// The guest's fingerprint, for the host to trust or untrust.
+    pub guest_fp: String,
     pub room: String,
     pub address: String,
     pub passphrase: String,
@@ -242,26 +415,80 @@ impl World {
     /// Anchor, host serving `service_port`, and a guest joined — trusted by the host only if
     /// `trusted`, which is the whole authorization (ADR-017 decision 3).
     pub fn new(service_port: u16, trusted: bool) -> Self {
+        Self::build(&Setup {
+            specs: vec![service_port.to_string()],
+            trusted,
+            path: PathKind::Direct,
+            guest_leg: None,
+        })
+    }
+
+    /// A world serving `setup.specs` (`<port>`, `<port>/udp`) on the path `setup.path`.
+    pub fn build(setup: &Setup) -> Self {
+        let trusted = setup.trusted;
         let tmp = tempfile::tempdir().unwrap();
         let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
         let anchor_dir = tmp.path().join("anchor");
         for d in [&anchor_dir, &host_dir, &guest_dir] {
             std::fs::create_dir_all(d.join("cfg")).unwrap();
         }
-        let mut anchor = VoxProc::spawn(
-            "anchor",
-            &anchor_dir,
-            &args(&["node", "--listen", "127.0.0.1:0"]),
-        );
-        let anchor_spec = anchor
-            .expect_line("an --anchor spec", |l| {
-                !l.starts_with("! ")
-                    && l.trim_start().contains('@')
-                    && l.trim_start().starts_with(|c: char| c.is_alphanumeric())
-            })
-            .trim()
-            .to_owned();
-
+        let (anchor, host_anchor, guest_anchor) = match setup.path {
+            PathKind::Direct => {
+                let mut anchor = VoxProc::spawn(
+                    "anchor",
+                    &anchor_dir,
+                    &args(&["node", "--listen", "127.0.0.1:0"]),
+                );
+                let spec = anchor
+                    .expect_line("an --anchor spec", |l| {
+                        !l.starts_with("! ")
+                            && l.trim_start().contains('@')
+                            && l.trim_start().starts_with(|c: char| c.is_alphanumeric())
+                    })
+                    .trim()
+                    .to_owned();
+                let guest = match &setup.guest_leg {
+                    Some(leg) => leg(spec_addr(&spec)).map_or(spec.clone(), |a| respec(&spec, a)),
+                    None => spec.clone(),
+                };
+                (anchor, spec, guest)
+            }
+            PathKind::Relayed => {
+                // **A relay forced without touching the product.** The anchor listens
+                // dual-stack; the host lives on IPv6 loopback only and the guest on IPv4
+                // loopback only, so each reaches the anchor and neither can send a single
+                // packet to the other. Every direct rung fails by construction and the
+                // only path between them is a circuit the anchor carries.
+                // The port is picked free and then released, so another process can take
+                // it first; a few fresh tries cover that race.
+                let (port, anchor, id) = (0..5)
+                    .find_map(|_| {
+                        let port = free_dual_stack_port();
+                        let mut anchor = VoxProc::spawn(
+                            "anchor",
+                            &anchor_dir,
+                            &args(&["node", "--listen", &format!("[::]:{port}")]),
+                        );
+                        let id = anchor
+                            .wait_for(LINE_TIMEOUT, |l| l.starts_with("vox node: identity "))?;
+                        Some((port, anchor, id))
+                    })
+                    .expect("an anchor on a free dual-stack port");
+                let fp = id.split_whitespace().last().unwrap().to_owned();
+                let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+                let guest_addr = setup
+                    .guest_leg
+                    .as_ref()
+                    .and_then(|leg| leg(v4))
+                    .unwrap_or(v4);
+                let guest = match guest_addr {
+                    SocketAddr::V4(a) => format!("{fp}@/ip4/{}/udp/{}", a.ip(), a.port()),
+                    SocketAddr::V6(a) => format!("{fp}@/ip6/{}/udp/{}", a.ip(), a.port()),
+                };
+                (anchor, format!("{fp}@/ip6/::1/udp/{port}"), guest)
+            }
+        };
+        let anchor_spec = host_anchor.clone();
         let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
         assert!(ok, "vox id (guest): {err}");
         let guest_fp = guest_fp.trim().to_owned();
@@ -284,14 +511,17 @@ impl World {
         let mut host = VoxProc::spawn(
             "host",
             &host_dir,
-            &args(&[
-                "serve",
-                &service_port.to_string(),
-                "--anchor",
-                &anchor_spec,
-                "--listen",
-                "127.0.0.1:0",
-            ]),
+            &[
+                vec!["serve".to_owned()],
+                setup.specs.clone(),
+                args(&[
+                    "--anchor",
+                    &anchor_spec,
+                    "--listen",
+                    setup.path.host_listen(),
+                ]),
+            ]
+            .concat(),
         );
         let room = after_label(
             &host.expect_line("room", |l| l.starts_with("room ")),
@@ -307,16 +537,24 @@ impl World {
         );
         let w = Self {
             tmp,
-            _anchor: anchor,
-            anchor_spec,
+            anchor,
+            host_anchor,
+            guest_anchor,
+            path: setup.path,
             host_dir,
             guest_dir,
             host: Some(host),
             host_fp,
+            guest_fp,
             room,
             address,
             passphrase,
-            service_port,
+            service_port: setup
+                .specs
+                .first()
+                .and_then(|s| s.split('/').next())
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(0),
         };
         let (ok, _, out, err) = w.join(&w.guest_dir);
         assert!(ok, "vox connect failed.\nstdout:\n{out}\nstderr:\n{err}");
@@ -344,7 +582,7 @@ impl World {
                 "--passphrase",
                 &self.passphrase,
                 "--anchor",
-                &self.anchor_spec,
+                &self.guest_anchor,
                 "--listen",
                 "127.0.0.1:0",
             ]),
@@ -371,9 +609,9 @@ impl World {
                 "--passphrase-file",
                 pass_file.to_str().unwrap(),
                 "--anchor",
-                &self.anchor_spec,
+                &self.host_anchor,
                 "--listen",
-                "127.0.0.1:0",
+                self.path.host_listen(),
             ]),
         );
         let room = self.room.clone();
@@ -381,6 +619,37 @@ impl World {
             l.starts_with("vox daemon: holding room") && l.contains(&room)
         });
         self.host = Some(daemon);
+    }
+
+    /// `vox forward <room>.vox <spec> 0` from `dir` — the `.vox` form ADR-022 names, where
+    /// the name gives the room and its host — returning it and the address it bound.
+    pub fn forward_vox(&self, name: &str, dir: &Path, spec: &str) -> (VoxProc, SocketAddr) {
+        let mut fwd = VoxProc::spawn(
+            name,
+            dir,
+            &args(&[
+                "forward",
+                &format!("{}.vox", self.room),
+                spec,
+                "0",
+                "--passphrase",
+                &self.passphrase,
+                "--anchor",
+                &self.guest_anchor,
+                "--listen",
+                "127.0.0.1:0",
+            ]),
+        );
+        let line = fwd.expect_line("the forward's bound address", |l| {
+            l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+        });
+        let bound: SocketAddr = line
+            .split_whitespace()
+            .nth(1)
+            .expect("an address")
+            .parse()
+            .expect("a socket address");
+        (fwd, bound)
     }
 
     /// `vox up <room>` from `dir`; returns it and the SOCKS address it bound.
@@ -396,7 +665,7 @@ impl World {
                 "--bind",
                 "127.0.0.1:0",
                 "--anchor",
-                &self.anchor_spec,
+                &self.guest_anchor,
                 "--listen",
                 "127.0.0.1:0",
             ]),
@@ -425,7 +694,7 @@ impl World {
                 "--passphrase",
                 &self.passphrase,
                 "--anchor",
-                &self.anchor_spec,
+                &self.guest_anchor,
                 "--listen",
                 "127.0.0.1:0",
             ]),

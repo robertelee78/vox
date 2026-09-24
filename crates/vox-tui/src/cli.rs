@@ -247,6 +247,12 @@ fn node_answers(profile: &ProfileArgs) -> bool {
     rt.block_on(crate::room_cli::node_is_running(&paths))
 }
 
+/// The service label a person's spec names: `53/udp` is `udp/53` (ADR-022 decision 6), and
+/// anything that is not a port spec is used as the tag it already is.
+fn label_of(spec: &str) -> String {
+    vox_core::tunnel::udp::service_label(spec).unwrap_or_else(|| spec.to_owned())
+}
+
 /// Whether a node is already serving this profile, so a trust verb should ask it.
 fn trust_over_socket(sub: &TrustCmd) -> bool {
     let profile = match sub {
@@ -776,9 +782,11 @@ pub struct TrustRemoveArgs {
 pub struct ForwardArgs {
     #[command(flatten)]
     pub room: RoomArgs,
-    /// The member hosting the service (its fingerprint, or a unique prefix).
+    /// The member hosting the service (its fingerprint, or a unique prefix). When the room
+    /// is given as `<name>.vox` the host is the name's, and this is the service instead.
     pub host: String,
-    /// The service tag to reach.
+    /// The service to reach: `<port>`, `<port>/udp`, or any tag the host serves. With a
+    /// `<name>.vox` room, the local port to listen on.
     pub tag: String,
     /// Where to listen locally; port 0 picks one.
     #[arg(default_value = "127.0.0.1:0")]
@@ -790,9 +798,11 @@ pub struct ForwardArgs {
 pub struct ServeArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
-    /// The local TCP port to offer. It is also the service's name: guests reach it at
-    /// this port of the room's `.vox` hostname.
-    pub port: u16,
+    /// The ports to offer: `<port>` (TCP), `<port>/tcp` or `<port>/udp`. The port is also
+    /// the service's name: guests reach it at this port of the room's `.vox` hostname.
+    /// The first creates the room; `vox serve 53 53/udp` serves both.
+    #[arg(required = true, num_args = 1..)]
+    pub ports: Vec<String>,
     /// The local endpoint to carry connections to, when it is not `127.0.0.1:<port>`.
     #[arg(long)]
     pub at: Option<SocketAddr>,
@@ -1065,7 +1075,7 @@ pub fn run() -> ExitCode {
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, anchors| async move {
-                    crate::tunnel_cli::serve(&node, &anchors, &a.name, a.port, a.at).await
+                    crate::tunnel_cli::serve(&node, &anchors, &a.name, &a.ports, a.at).await
                 },
             )
         }
@@ -1294,7 +1304,7 @@ pub fn run() -> ExitCode {
             match rt.block_on(crate::room_cli::service_remove(
                 &paths,
                 &r.room.room,
-                &r.tag,
+                &label_of(&r.tag),
             )) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -1308,10 +1318,10 @@ pub fn run() -> ExitCode {
             async move {
                 match &sub {
                     ServiceCmd::Add(a) => {
-                        crate::tunnel_cli::service_add(&node, cid, &a.tag, a.local).await
+                        crate::tunnel_cli::service_add(&node, cid, &label_of(&a.tag), a.local).await
                     }
                     ServiceCmd::Remove(r) => {
-                        crate::tunnel_cli::service_remove(&node, cid, &r.tag).await
+                        crate::tunnel_cli::service_remove(&node, cid, &label_of(&r.tag)).await
                     }
                     ServiceCmd::List(_) => {
                         crate::tunnel_cli::service_list(&node, cid);
@@ -1417,9 +1427,39 @@ pub fn run() -> ExitCode {
             })
         }
         Cmd::Forward(args) => {
-            let a = args.clone();
-            run_tunnel_verb(args.room.clone(), move |node, cid| async move {
-                crate::tunnel_cli::forward(&node, cid, &a.host, &a.tag, a.local).await
+            // Two shapes. `vox forward <room> <host> <service> [local]`, and the `.vox` one
+            // ADR-022 names: `vox forward <name>.vox <service> [<local-port>]`, where the
+            // name gives both the room and its host (the genesis creator, ADR-017), so the
+            // positionals shift left by one.
+            let mut room = args.room.clone();
+            let (host, tag, local) = if room.room.trim().ends_with(".vox") {
+                let cid = match vox_core::node::link::channel_of_hostname(&room.room) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("vox: {}: {e}", room.room);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                room.room = vox_core::node::link::b32_encode(&cid);
+                let local = match args.tag.parse::<u16>() {
+                    Ok(port) => SocketAddr::from(([127, 0, 0, 1], port)),
+                    Err(_) => match args.tag.parse::<SocketAddr>() {
+                        Ok(a) => a,
+                        Err(_) => {
+                            eprintln!(
+                                "vox: {:?} is not a local port or address to listen on",
+                                args.tag
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                };
+                (None, args.host.clone(), local)
+            } else {
+                (Some(args.host.clone()), args.tag.clone(), args.local)
+            };
+            run_tunnel_verb(room, move |node, cid| async move {
+                crate::tunnel_cli::forward(&node, cid, host.as_deref(), &tag, local).await
             })
         }
         Cmd::ShellSetup { remove } => crate::shell::run(remove),

@@ -1,6 +1,6 @@
 # ADR-022: Datagram flows — UDP tunnels, relays that behave like UDP, and the app API
 
-**Status**: **M22.1 and M22.2 built; M22.3–M22.5 are not.** 2026-09-24. Each milestone in the plan
+**Status**: **M22.1, M22.2, M22.3 and M22.4 built; M22.5 is not (on this branch).** 2026-09-24. Each milestone in the plan
 below is marked `DONE` only with the gate that proved it.
 **Date**: 2026-09-24
 **Deciders**: Robert E. Lee
@@ -159,6 +159,31 @@ What does not change: the relay is still ciphertext-only by construction.
   when the send buffer is full, so a stalled flow cannot stall its reader. Congestion control stays
   on (RFC 9298 forbids disabling it on the outer connection).
 
+*Built (M22.3, M22.4), and where the build had to decide what this left open:*
+
+- **Code.** `tunnel::udp` (labels, the flow table, both pumps); `tunnel::session::accept_reporting`
+  serves a `udp/<port>` request after the unchanged gate by binding the stream as the flow on the
+  connection it arrived on (`UdpHost`); `node::up::open_flow` is the dialer's side;
+  `node::tunnel::Forward::bind_udp`; SOCKS5 `UDP ASSOCIATE` in `node::up`.
+- **The surfaces differ from the list above in syntax, not in shape.** `vox serve` still creates the
+  room (ADR-017's `vox serve <room>` is unbuilt), so it takes port specs: `vox serve 53/udp`, or
+  `vox serve 53 53/udp` for TCP and UDP on one port, with `--at` applying to every spec. On an existing
+  room, `vox service add <room> 53/udp <addr>`. The dialer's form is as written,
+  `vox forward <name>.vox 53/udp <local-port>`: the `.vox` name gives the room and its host (the
+  genesis creator), so the positionals shift left by one.
+- **At `FLOWS_TOTAL` a new flow is refused, not given another's place.** Per peer, the longest-idle
+  flow is evicted as decided above; across peers, eviction would let one peer empty the table for the
+  rest. A refusal is the uniform `Denied`. The table is one per node and counts flows in both roles.
+- **Teardown** is the TCP tunnel's watch (`withdrawn`: the reacher set and the live offer); when it
+  fires the pump returns and dropping the flow ends the stream, which ends the flow at the dialer.
+  quinn finishes a dropped stream rather than resetting it; for a flow that carries no bytes the two
+  are the same event.
+- **Per-flow counters** (to the peer, from the peer, dropped) live on each flow and are read with
+  `UdpFlows::snapshot`. They are not yet surfaced in `vox status`.
+- **Not proved by a gate:** the 120 s idle close, the 32-per-peer eviction and the 256 total, and a UDP
+  flow cut by *service removal* (the same watch as untrust, which is proved; service removal is proved
+  for TCP by `tunnel_honesty_proof`).
+
 ### 7. The app API (R29–R30)
 
 - **New stream kind `App = 8`.**
@@ -282,7 +307,49 @@ Each proof runs on a direct path **and** on a forced-relay path.
   `service_rehearsal_proof` failed on this branch and on the base with the same messages (the stranger's
   `vox connect` failing, line 490; the first CONNECT refused, line 437 — the latter is ADR-012's open
   finding of 2026-09-22). Both are to be investigated as their own defects.
-- **M22.3** UDP tunnels: `vox serve … /udp`, then `vox forward … /udp` (decision 6). Proofs 1–6.
-- **M22.4** SOCKS5 UDP ASSOCIATE in `vox up`.
+- **M22.3** UDP tunnels: `vox serve … /udp`, then `vox forward … /udp` (decision 6) — **DONE**.
+- **M22.4** SOCKS5 UDP ASSOCIATE in `vox up` — **DONE**.
+
+  Both proved by `crates/vox-tui/tests/udp_tunnel_proof.rs`: the shipped binary, a real `dig`, and
+  real UDP sockets, on a **direct** path (everyone on IPv4 loopback) and a **forced-relay** path (the
+  host on IPv6 loopback only, the guest on IPv4 only, the anchor dual-stack, so only a circuit can
+  join them; the gate checks the host advertises IPv6 addresses only). No real DNS server or `iperf3`
+  is installed, so the DNS responder and proof 5's blaster and sink are in the test. Seven tests, 3 of 3
+  runs green (7/7 each) at the end; every mutation below was run and went red for the reason named.
+  - **1 DNS.** `dig` through `vox forward <room>.vox <port>/udp` gets `10.53.0.1`, then 5 of 5 further
+    queries. Direct: the first answer after 2 asks (~4.8 s, the first flow waiting on its tunnel);
+    relayed: first ask, 6–28 ms. Mutation (host drops what the flow delivers): no answer in 40 asks
+    over 120 s, the responder saw 0 packets.
+  - **2 Denied.** An untrusted joiner: 5 `dig`s, no answer, the service saw 0 packets, and the forward
+    printed `the host refused udp/<port>`. Mutation (the gate and the teardown watch both skipped):
+    answered on the first `dig`. *(Skipping the gate alone stayed quiet: the teardown watch then cut
+    the flow at once, since the dialer is not in the reacher set. Both layers deny.)*
+  - **3 Revocation.** A query every 50 ms on one flow: 194–522 answers before `vox trust remove`, **0**
+    after it returned. The command takes ~0.3 s (it checks the identity passphrase), and answers stop
+    while it runs. Mutation (the teardown watch never fires): 133 340 answers after, the last 3.0 s
+    later.
+  - **4 Oversize.** 1400- and 4000-byte payloads through `UDP ASSOCIATE`, echoed byte for byte on both
+    paths. Mutation (fragmentation disabled): the 1400-byte payload still crosses the loopback path
+    whole, the 4000-byte one does not arrive.
+  - **5 Relay drops, not stalls.** Relayed path only: a proxy on the guest's leg to the anchor, 20 ms
+    each way, dropping every 10th datagram once setup is done; 3 s of unmeasured traffic for congestion
+    control to settle, then 400 numbered datagrams every 10 ms. Every run lost what the leg dropped
+    (41–61 lost for 47–51 dropped) — nothing retransmitted, so nothing could wait behind a
+    retransmission. Mutation (the pre-ADR-022 stream carriage restored): **400 of 400** arrive, 0 lost
+    for 38 dropped (and 0 of 43 and 0 of 47 in two earlier mutation runs); latency p99 82–309 ms.
+    **Recorded, not bounded:** across the final runs the longest gap was 21, 115 and 132 ms. In the two
+    long ones arrivals also bunched (median gap ~5 µs, against ~10 ms, the sender's pace, in the
+    third) — outer and inner congestion control at their floor holding and releasing datagrams, the
+    cost this ADR's *Negative* section already records. It is not a stream: the loss shows nothing
+    was recovered.
+  - **6 TCP and UDP on the same port.** `vox serve P P/udp` over one service bound on both: through one
+    `vox up`, CONNECT gets `TCP:…` and `UDP ASSOCIATE` gets `UDP:…`. Mutation (ASSOCIATE asks for the
+    bare port): no UDP answer.
+  - **M22.4.** A `FRAG=1` datagram reaches the service 0 times (mutation: 1); after the control
+    connection closes the service sees 0 packets and nothing answers (mutation: the service saw the
+    datagram and the client got a reply).
+  - **Setup fragility, not these properties:** early versions of proof 5 applied the loss from the
+    start and failed 2 of 2 in parallel runs at `vox connect`, with the joining node's actor busy 30 s
+    (ADR-018's open joining defect). The loss is now switched on after setup.
 - **M22.5** The app API: `StreamKind::App`, both gates, IPC protocol 6, the library API, and the
   limits and priorities (decision 7). Proofs 7–8.

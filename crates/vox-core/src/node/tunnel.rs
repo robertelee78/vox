@@ -146,7 +146,7 @@ pub async fn serve(
     recv: quinn::RecvStream,
     snapshot: HostSnapshot,
 ) -> Result<()> {
-    serve_reporting(client, send, recv, snapshot, None).await
+    serve_reporting(client, send, recv, snapshot, None, None).await
 }
 
 /// [`serve`], emitting [`NodeEvent::TunnelServed`] for each authorized request.
@@ -167,6 +167,7 @@ pub async fn serve_reporting(
     recv: quinn::RecvStream,
     snapshot: HostSnapshot,
     events: Option<tokio::sync::broadcast::Sender<NodeEvent>>,
+    udp: Option<session::UdpHost<'_>>,
 ) -> Result<()> {
     session::accept_reporting(
         send,
@@ -192,6 +193,7 @@ pub async fn serve_reporting(
                 });
             }
         },
+        udp,
     )
     .await
 }
@@ -238,6 +240,130 @@ impl Drop for Forward {
 pub(crate) const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Forward {
+    /// Bind a loopback UDP socket at `local` and carry what arrives on it to the UDP
+    /// service `label` (`udp/<port>`) on `host` (ADR-022 decision 6).
+    ///
+    /// **One flow per client source address**, as a NAT would: every local application
+    /// gets its own flow, so replies go back to the socket that asked, and one client's
+    /// flow ending takes nothing from another's. A client's first packet opens its flow
+    /// through the same [`up::open_flow`] a TCP forward uses, so a host that restarted is
+    /// reached again; packets that arrive meanwhile queue, up to
+    /// [`udp::CLIENT_QUEUE`](crate::tunnel::udp::CLIENT_QUEUE), and past that are dropped.
+    /// Every flow counts against `flows`.
+    ///
+    /// # Errors
+    /// If `local` is not loopback or cannot be bound.
+    pub async fn bind_udp<D, F>(
+        dialer: Arc<D>,
+        host: Digest32,
+        channel_id: Digest32,
+        label: String,
+        local: SocketAddr,
+        flows: Arc<crate::tunnel::udp::UdpFlows>,
+        report: F,
+    ) -> Result<Self>
+    where
+        D: up::HostDialer + 'static,
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        use crate::tunnel::udp;
+        use std::collections::HashMap;
+        if !local.ip().is_loopback() {
+            return Err(Error::MalformedTunnel("a forward binds loopback only"));
+        }
+        let sock = Arc::new(
+            tokio::net::UdpSocket::bind(local)
+                .await
+                .map_err(|_| Error::TunnelDenied("forward: cannot bind the local port"))?,
+        );
+        let bound = sock
+            .local_addr()
+            .map_err(|_| Error::TunnelDenied("forward: bound port unknown"))?;
+        let report = Arc::new(report);
+        let tag = label.clone();
+        let task = tokio::spawn(async move {
+            type Clients = HashMap<SocketAddr, (u64, tokio::sync::mpsc::Sender<Vec<u8>>)>;
+            let clients: Arc<std::sync::Mutex<Clients>> = Arc::default();
+            let mut generation = 0u64;
+            let mut buf = vec![0u8; udp::MAX_UDP];
+            loop {
+                let (n, src) = match sock.recv_from(&mut buf).await {
+                    Ok(got) => got,
+                    // Includes an ICMP error from a client that went away. Back off rather
+                    // than spin on a socket that keeps failing.
+                    Err(_) => {
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                };
+                if !src.ip().is_loopback() {
+                    continue;
+                }
+                let lock = |c: &std::sync::Mutex<Clients>| {
+                    c.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&src)
+                        .map(|(_, tx)| tx.clone())
+                };
+                let tx = if let Some(tx) = lock(&clients) {
+                    tx
+                } else {
+                    // A new client: a new flow, if the table has room for one.
+                    let Some(guard) = flows.admit(host, &tag) else {
+                        continue;
+                    };
+                    let (tx, rx) = tokio::sync::mpsc::channel(udp::CLIENT_QUEUE);
+                    generation += 1;
+                    let mine = generation;
+                    clients
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(src, (mine, tx.clone()));
+                    let (dialer, report, sock, clients, tag) = (
+                        Arc::clone(&dialer),
+                        Arc::clone(&report),
+                        Arc::clone(&sock),
+                        Arc::clone(&clients),
+                        tag.clone(),
+                    );
+                    tokio::spawn(async move {
+                        match up::open_flow(dialer.as_ref(), &host, &channel_id, &tag).await {
+                            Ok(flow) => {
+                                let to_client = |p: &[u8]| sock.try_send_to(p, src).is_ok();
+                                if udp::client_pump(flow, rx, to_client, guard).await
+                                    == udp::Ended::Flow
+                                {
+                                    // The host ended it: withdrawn, removed, or gone. Said
+                                    // once per flow, not per packet.
+                                    report(format!("the host ended the {tag} flow from {src}"));
+                                }
+                            }
+                            Err(e) => report(up::refusal(&e, &tag)),
+                        }
+                        // Only this flow's entry: a newer flow for the same client may
+                        // already have replaced it.
+                        let mut map = clients
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if map.get(&src).is_some_and(|(g, _)| *g == mine) {
+                            map.remove(&src);
+                        }
+                    });
+                    tx
+                };
+                // Never waits: a full queue drops this packet, as a full link would.
+                let _ = tx.try_send(buf[..n].to_vec());
+            }
+        });
+        Ok(Self {
+            channel_id,
+            host,
+            service_tag: label,
+            local: bound,
+            listener: task,
+        })
+    }
+
     /// Bind `local` and forward every connection to `service_tag` on `host`, reaching the
     /// host through `dialer` — **per connection**.
     ///

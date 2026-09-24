@@ -77,6 +77,9 @@ pub struct ChannelDetail {
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
+    /// The room's genesis creator: the host its `.vox` name reaches (ADR-017), which is
+    /// what `vox forward <name>.vox …` dials.
+    pub creator: Digest32,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -305,6 +308,9 @@ pub enum NodeCommand {
         /// The service's port, which is also its tag (ADR-017: the port names the
         /// service).
         port: u16,
+        /// Whether the service is UDP: served as `udp/<port>` rather than `<port>`
+        /// (ADR-022 decision 6). The room's `.vox` name is the same either way.
+        udp: bool,
         /// The local endpoint to carry connections to. Defaults to
         /// `127.0.0.1:<port>` — the same port, which is the case worth optimising.
         at: Option<std::net::SocketAddr>,

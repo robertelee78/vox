@@ -171,6 +171,7 @@ fn m17_a_service_room_is_reached_after_one_decision_about_a_person() {
                 local_name: "infra".into(),
                 passphrase: secret("generated passphrase"),
                 port,
+                udp: false,
                 at: Some(service_addr),
             })
             .await;
