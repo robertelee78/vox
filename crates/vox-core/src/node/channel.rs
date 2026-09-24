@@ -2170,7 +2170,23 @@ impl ChannelState {
             Ok(p) => Zeroizing::new(p),
             Err(_) => return Ok(false),
         };
-        let content = Content::from_canonical_slice(&plaintext)?;
+        // **Skipped, not propagated** — matching the three `Ok(false)` paths above it.
+        //
+        // An entry this node cannot render is one entry it cannot show, and every other reason for
+        // that here already degrades: an unreadable group message, a missing receiver chain, a
+        // failed decrypt. Only the content decode used `?`, which returns out of a function whose
+        // three callers invoke it with `?` **inside a loop over pending entries** — so one
+        // undecodable envelope did not hide one message, it aborted the render pass and took every
+        // later entry in it along.
+        //
+        // That was unreachable while every envelope in existence was version 1. Bumping the
+        // envelope to version 2 is exactly what makes it reachable, and reachable on nodes already
+        // in the field that this change cannot fix. It cannot help those; it means the next format
+        // change degrades to "that one message did not render" instead of "the room stopped
+        // rendering". Found in review by the other session, not by me, and not by a test.
+        let Ok(content) = Content::from_canonical_slice(&plaintext) else {
+            return Ok(false);
+        };
         let rendered = Rendered {
             entry_hash,
             author,
