@@ -258,8 +258,11 @@ Two supporting facts follow from moving it:
   tunnel or stream through the anchor when both direct and punched paths fail) remains ADR-013's
   mechanism and is a named later capability; ADR-012's availability model does not need it —
   a channel's log reaches an offline member through the anchor's *store*, not through a live relay.
-- **Sync scheduling (ADR-008).** On every new connection, a frontier session for each channel both
-  peers hold; every 30 seconds while connected; and a push immediately after a local append. Range
+- **Sync scheduling (ADR-008).** An inbound session for a room is answered only for a peer that is
+  an admitted author of that room or one of its anchors — checked after the stream-kind gate, because
+  the room is only named in the stream's preamble (ADR-008 §"Who is served", PRD-001 R5). Sessions
+  this node starts are not yet checked. On every new connection, a frontier session for each channel
+  both peers hold; every 30 seconds while connected; and a push immediately after a local append. Range
   reconciliation (`range_reconcile_exchange`) is wired over `QuicStreamTransport` and selected when a
   channel exceeds 100 authors, as the ADR requires at scale. The anchor participates as an ordinary
   peer whose `AuthorResolver` is built from the channel's genesis, admin certificates and the

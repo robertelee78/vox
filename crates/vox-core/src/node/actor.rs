@@ -2311,8 +2311,9 @@ impl Node {
                 send,
                 recv,
             } => {
-                let _ = (&conn, peer);
-                self.run_sync_session(channel_id, epoch, send, recv).await;
+                let _ = &conn;
+                self.run_sync_session(peer, channel_id, epoch, send, recv)
+                    .await;
             }
             NetEvent::AddressesDiscovered { mappings } => {
                 // Re-publish every open channel's records: the addresses in them were
@@ -3801,44 +3802,47 @@ impl Node {
             //
             // Done only on a connect, not every tick: this reads the board and admits authors, which
             // is exactly the work a new connection warrants and would be waste on the interval.
-            for (cid, shared) in &self.channels {
+            // Candidates first, decided after: the membership test below needs `&mut self` (it may
+            // admit a member from this node's own board), which the maps cannot be borrowed across.
+            let mut member_rooms: Vec<Digest32> = Vec::new();
+            for cid in self.channels.keys() {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
                     continue;
                 }
-                // Checked **before** the `is_author` lock below: a session holds this room's
-                // mutex for its whole run, so taking it here would park the actor behind it.
                 if self.syncing.contains(cid) {
                     owed.push(*cid);
                     continue;
                 }
-                // **A fresh connection is never filtered out.**
-                //
-                // The `is_author` test below is the right question on an interval pass and the wrong
-                // one here: a peer that has *just joined* is by definition not yet an author in this
-                // node's view, so the node holding the evidence that it belongs skipped it for not
-                // belonging. Worse, the code that admits it — `learn_members`, reading the bundle
-                // records off this node's own board — runs inside `sync_one`, which only executes for
-                // channels that already passed this filter. The precondition sat behind the check it
-                // was the precondition for.
-                //
-                // So on a connect, reconcile every open channel with the peer and let the ADR-008
-                // session decide: it verifies authorship per entry and hard-fails on an author it
-                // cannot verify, which is a real answer. Silently skipping is not — measured as a
-                // user, a message posted seconds after somebody joined was lost, not delayed.
-                if trigger == SyncTrigger::Connected
-                    || peer_is_anchor
-                    || shared.lock().await.is_author(&peer)
-                {
-                    channels.push(*cid);
+                member_rooms.push(*cid);
+            }
+            // **A room goes only to a peer that belongs to it.** On a fresh connection this pushed
+            // *every* open room to the peer — the inbound half of D5 refuses a non-member's request,
+            // and this was the outbound half handing the same log over unasked. The bypass existed
+            // because a peer that has just joined is not yet an author in this node's view;
+            // `may_sync` covers that case properly, by admitting the peer from this node's own board
+            // before deciding, which is the evidence the bypass was standing in for. This node's own
+            // anchors still get every room: holding the log for whoever is away is what they are for.
+            for cid in member_rooms {
+                let belongs = if peer_is_anchor {
+                    true
+                } else {
+                    let Some(epoch) = (match self.channels.get(&cid) {
+                        Some(shared) => Some(shared.lock().await.epoch()),
+                        None => None,
+                    }) else {
+                        continue;
+                    };
+                    self.may_sync(&cid, &peer, epoch).await
+                };
+                if belongs {
+                    channels.push(cid);
                 }
             }
-            // An anchor reconciles every channel it keeps with each of that channel's
-            // known members.
-            for (cid, state) in &self.anchored {
-                // An anchored room takes part in a push: this skipped them on the reasoning that an
-                // anchor never appends locally — true, and beside the point, because an anchor is
-                // exactly the node that must forward what it was just given. The push trigger is now
-                // set by entries arriving as well as by a local append.
+            // An anchor forwards a room it keeps only to that room's authors — read fresh off its
+            // own board first, so a member that has just been vouched for is not skipped. It used to
+            // forward every kept room to any peer that connected or pushed.
+            let mut kept_rooms: Vec<Digest32> = Vec::new();
+            for cid in self.anchored.keys() {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
                     continue;
                 }
@@ -3846,23 +3850,15 @@ impl Node {
                     owed.push(*cid);
                     continue;
                 }
-                // **An anchor does not filter out the member it is forwarding to.**
-                //
-                // `is_author` is the right question on an interval pass and the wrong one here, for
-                // the same reason it was wrong for an open room: a member that has just joined is not
-                // yet an author in this anchor's view, so the node whose entire job is holding the
-                // log for whoever is away declined to hand it over. Measured, timestamped on both
-                // sides: the anchor took the entry at **1s** and the member could not read it until
-                // **31s** — `SYNC_INTERVAL_SECS`, i.e. it arrived by the member's own periodic pull
-                // because the anchor never pushed. Not slow: not sent.
-                //
-                // On a connect or a push, reconcile and let the session decide — it verifies
-                // authorship per entry and hard-fails on one it cannot verify, which is an answer.
-                // The interval pass keeps the filter, where it costs nothing and bounds the work.
-                let forwarding =
-                    matches!(trigger, SyncTrigger::Connected | SyncTrigger::LocalAppend);
-                if forwarding || state.lock().await.is_author(&peer) {
-                    channels.push(*cid);
+                kept_rooms.push(*cid);
+            }
+            for cid in kept_rooms {
+                self.refresh_anchored_authors(&cid).await;
+                let Some(state) = self.anchored.get(&cid).map(Arc::clone) else {
+                    continue;
+                };
+                if state.lock().await.is_author(&peer) {
+                    channels.push(cid);
                 }
             }
             for channel_id in channels {
@@ -4143,8 +4139,15 @@ impl Node {
     /// actor is the only writer of channel state and anything it awaits inline stops the whole
     /// node, so it must never wait on an untrusted peer to speak. What it does here is local
     /// and ordered, which is what the single-task design is for.
+    /// **Only a member of *this* room is served its log** (PRD-001 R5). The stream-kind gate
+    /// in `node::net` asks whether the peer may open a sync stream *at all*, which any member
+    /// of any room this node holds may — and the preamble then names whichever channel the
+    /// peer likes. Nothing here checked the two against each other, so a member of room A who
+    /// had ever seen room B's `.vox` name was handed B's whole log (PRD-001 D5). See
+    /// [`Self::may_sync`] for who counts.
     async fn run_sync_session(
         &mut self,
+        peer: Digest32,
         channel_id: Digest32,
         epoch: u64,
         send: quinn::SendStream,
@@ -4186,8 +4189,66 @@ impl Node {
         if !matches_epoch {
             return;
         }
+        if !self.may_sync(&channel_id, &peer, epoch).await {
+            // Refused explicitly, with the same coded reset as a stream kind the peer may not
+            // open, rather than left to read for a frame that never comes.
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream(&mut send, &mut recv);
+            return;
+        }
         let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
         self.start_session(channel_id, transport);
+    }
+
+    /// Whether `peer` may reconcile `channel_id`'s log with this node.
+    ///
+    /// - An **admitted author** of that room. If it is not one yet, this node's own board is
+    ///   consulted first — local, so cheap — because a member that joined through somebody
+    ///   else is on the board before it is in this node's author table, and refusing it for
+    ///   that would be the "precondition behind its own check" defect `run_due_syncs` documents.
+    ///   Admission there takes the same M17.6 evidence as everywhere else.
+    /// - An **anchor of that room** — in the room's own anchor set, which holds this node's
+    ///   configured anchors and those the room's link named. It keeps the room's ciphertext by
+    ///   design (ADR-016 M15.2b) for members who are away. An anchor named only by *another*
+    ///   room's link is not an anchor of this one.
+    ///
+    /// For a room this node only anchors, the peer must be an author the board knows.
+    async fn may_sync(&mut self, channel_id: &Digest32, peer: &Digest32, epoch: u64) -> bool {
+        if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
+            {
+                let channel = shared.lock().await;
+                if channel.is_author(peer)
+                    || channel.anchors().nodes().iter().any(|a| a.id == *peer)
+                {
+                    return true;
+                }
+            }
+            let (Some(net), Some(store)) = (
+                self.net.as_ref().map(Arc::clone),
+                self.profile.as_ref().map(Profile::store_handle),
+            ) else {
+                return false;
+            };
+            let bundles = net.board_bundles(channel_id, epoch);
+            if !bundles.iter().any(|b| b.author_id == *peer) {
+                return false;
+            }
+            let now = self.now();
+            let mut channel = shared.lock().await;
+            let _ = admit_board_records(
+                &mut channel,
+                &store,
+                &bundles,
+                ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+                now,
+            )
+            .await;
+            return channel.is_author(peer);
+        }
+        if let Some(state) = self.anchored.get(channel_id) {
+            return state.lock().await.is_author(peer);
+        }
+        false
     }
 
     /// Accept an inbound [`PairwiseFrame::Hello`], establishing the responder half of
