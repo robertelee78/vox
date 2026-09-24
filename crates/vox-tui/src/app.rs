@@ -554,6 +554,9 @@ async fn judge(
 /// or wrong, a named room is unknown or its passphrase is refused, or the control
 /// socket cannot be bound — the last of which **is** fatal here, unlike in the TUI,
 /// because serving that socket is this command's entire purpose.
+/// How long `vox daemon` keeps retrying a profile another vox is in the middle of closing.
+const PROFILE_RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn run_daemon(
     paths: Paths,
     listen: std::net::SocketAddr,
@@ -610,10 +613,30 @@ pub fn run_daemon(
         .worker_threads(2)
         .enable_all()
         .build()?;
-    let cfg = vox_core::node::actor::NodeConfig::new()
-        .bind(vox_core::node::actor::Bind::Addr(listen))
-        .anchors(anchors);
-    let node = rt.block_on(async { Node::spawn_config(paths.clone(), cfg) })?;
+    // **Wait briefly for a profile that is being closed.** redb allows one process per
+    // store, and a daemon started the moment another vox finished with the profile could
+    // still find the file open: it failed at once with "another vox already has this
+    // profile open" and never retried. Measured in `remote_interrupt_proof`, which hands a
+    // profile from an in-process node to `vox daemon`: once handshakes became concurrent
+    // (v0.2.8) it lost that race in most runs — even in a run where the old node's `Store`
+    // had already been dropped before the daemon was spawned. What held the file those last
+    // milliseconds is not identified; this does not claim to know. It makes the daemon
+    // tolerant of the window. A few seconds of retrying costs a person nothing, and a vox
+    // that genuinely holds the profile still gets the same message after the wait.
+    let started = std::time::Instant::now();
+    let node = loop {
+        let cfg = vox_core::node::actor::NodeConfig::new()
+            .bind(vox_core::node::actor::Bind::Addr(listen))
+            .anchors(anchors.clone());
+        match rt.block_on(async { Node::spawn_config(paths.clone(), cfg) }) {
+            Err(vox_core::error::Error::ProfileBusy)
+                if started.elapsed() < PROFILE_RELEASE_PATIENCE =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            other => break other?,
+        }
+    };
 
     rt.block_on(async {
         let outcome = node
