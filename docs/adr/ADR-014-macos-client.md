@@ -1,6 +1,6 @@
 # ADR-014: macOS Client
 
-**Status**: proposed — not started (the Rust TUI client, ADR-015, landed first as the initial client surface)
+**Status**: proposed — the app is not started; **its FFI foundation is built** (`crates/vox-ffi`, 2026-09-25: the embedded node over UniFFI, an XCFramework for macOS and iOS, proved from Swift — see §"The embedded node (built)"). The Rust TUI client, ADR-015, landed first as the initial client surface.
 **Date**: 2026-06-19
 **Updated**: 2026-09-19 — wording reconciled: the TUI is the first client; this ADR is the first *native GUI* surface.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -233,6 +233,42 @@ reason to withhold the surface or ship it incomplete.
 - **Disappearing messages** tied to admin TTL (default never-expire, so off by default; ADR-010).
 - **Screen-security:** hide message previews in notifications by default; deter screenshots where the
   OS permits.
+
+### The embedded node (built, 2026-09-25 — PRD-001 R30/R31)
+
+The FFI contract above is built as `crates/vox-ffi`: UniFFI proc-macro bindings over the node, so an
+app runs the node **in its own process** — which is the only option on iOS, where an app cannot run a
+daemon beside itself.
+
+- **What crosses.** In: a profile directory, passphrases (consumed by the core, never returned), room
+  links, text, app-stream labels and bytes. Out: fingerprints and room ids as base32, rendered
+  messages, event notices, app-stream bytes and datagrams. No key material.
+- **Surface.** `VoxNode.start(dataDir, passphrase, listen)` creates the identity on first use and
+  unlocks it after; `stop`; `rooms`, `createRoom`, `openRoom`, `joinRoom(link)`, `invite`, `post`,
+  `read`; `subscribe(EventListener)`; `trust`/`untrust`; and the app API (ADR-022 decision 7):
+  `appListen` → `AppListener.next/accept`, `appOpen` → `AppStream.read/write/finish/sendDatagram/
+  recvDatagram`. No tunnels.
+- **Never blocking.** Every call that waits is Swift `async`; the work runs on the node's own tokio
+  runtime and the Swift side only awaits it.
+- **Every readable message is delivered once**, including others' as sync brings them in or a sender
+  key makes them readable. The node's own `NewEntry` event covers local posts only, so the listener
+  compares the open rooms' timelines with what it has delivered whenever an event arrives or the view
+  changes. (Found by the proof: the first version delivered only the app's own posts.)
+- **Packaging.** `scripts/build-xcframework.sh` builds `VoxFFI.xcframework` — `ios-arm64`,
+  `ios-arm64-simulator`, and one `macos-arm64_x86_64` slice, each a static library — and generates
+  the Swift bindings from the built library, so they cannot drift from it.
+- **Proved** by `crates/vox-tui/tests/ffi_swift_proof.rs`: the script is run, a Swift program is
+  compiled with `swiftc` against the macOS slice, and it embeds the node, joins a room a real `vox
+  daemon` created, posts what the daemon's `vox room read` shows, receives the daemon's post through
+  its `EventListener`, and round-trips 1 MiB (SHA-256 equal) and 100 datagrams with `vox app listen`
+  on the daemon. Mutation: the listener's `on_message` never called → the daemon's post never
+  arrives, red.
+- **iOS, stated exactly.** `scripts/ios-sim-smoke.sh` links the `ios-arm64-simulator` slice into a
+  Swift program and runs it in an iOS simulator with `xcrun simctl spawn`: it starts the node, creates
+  a room, posts and reads the post back (run 2026-09-25 on an iPhone 17 simulator, iOS 26.5). The
+  `ios-arm64` device slice is **linked** into the same program with `swiftc -target
+  arm64-apple-ios15.0` and **not run**: no device was available. No iOS run has reached another node,
+  and nothing has been built as an app bundle with `xcodebuild`.
 
 ## Consequences
 

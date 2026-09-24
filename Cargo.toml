@@ -4,7 +4,7 @@
 # Rust clients over it. Crates are added to `members` as milestones land.
 [workspace]
 resolver = "2"
-members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms"]
+members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms", "crates/vox-ffi"]
 
 [workspace.package]
 version = "0.2.7"
@@ -17,6 +17,9 @@ repository = "https://github.com/robertelee78/vox"
 # Dependencies shared across crates are pinned here so every crate signs/verifies
 # with the exact same primitive versions (ADR-003: deterministic, agile crypto).
 [workspace.dependencies]
+# The FFI boundary for the native apps (ADR-014: SwiftUI over the Rust core via UniFFI;
+# PRD-001 R30/R31). One pin, so the scaffolding and the bindgen agree.
+uniffi = { version = "0.32.2" }
 sha2 = "0.10"
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }
