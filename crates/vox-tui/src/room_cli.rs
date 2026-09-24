@@ -600,23 +600,38 @@ pub async fn tail(paths: &Paths, room: &str, since: Option<&str>, json: bool) ->
         *last = Some(r.entry_hash);
     };
 
+    // **An event is a wake, never the data** (ADR-020 §6). Only this node's own posts
+    // arrive as `NewEntry`; an entry that arrives from another member by sync is
+    // announced as `Synced`, and one that becomes readable when a sender key arrives as
+    // `SenderKeyReceived` — neither carries the row. So on any of them, and on
+    // `Lagged`, the room is re-read and whatever this stream has not emitted is emitted.
+    // A full re-read rather than `since <last>`, because an entry rendered late (its key
+    // arrived after it did) is not guaranteed to sit after the last one emitted.
     loop {
-        match stream.next().await {
+        let reread = match stream.next().await {
             Ok(Some(Frame::Event(vox_core::node::api::NodeEvent::NewEntry {
                 channel_id: c,
                 row,
-            }))) if c == channel_id => deliver(row, &mut out, &mut ops, &mut last),
-            Ok(Some(Frame::Lagged { .. })) => {
-                // The node dropped events for us. The log is the truth: re-read from the
-                // last entry we emitted, and let `seen` drop what we already have.
-                let rows = coord::read_all(&mut lookup, channel_id, last).await?;
-                for r in rows {
-                    deliver(r, &mut out, &mut ops, &mut last);
-                }
+            }))) if c == channel_id => {
+                deliver(row, &mut out, &mut ops, &mut last);
+                false
             }
-            Ok(Some(_)) => {}
+            Ok(Some(Frame::Event(
+                vox_core::node::api::NodeEvent::Synced { channel_id: c, .. }
+                | vox_core::node::api::NodeEvent::SenderKeyReceived { channel_id: c, .. },
+            ))) => c == channel_id,
+            Ok(Some(Frame::Lagged { missed })) => {
+                eprintln!("vox: this stream fell behind by {missed} events; re-reading the room");
+                true
+            }
+            Ok(Some(_)) => false,
             Ok(None) => return Ok(()), // the node stopped
             Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
+        if reread {
+            for r in coord::read_all(&mut lookup, channel_id, None).await? {
+                deliver(r, &mut out, &mut ops, &mut last);
+            }
         }
     }
 }
