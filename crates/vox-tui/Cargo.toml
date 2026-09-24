@@ -54,5 +54,9 @@ rustix.workspace = true
 # ADR-021 §6: a minted operation id is 128 bits of OS randomness.
 getrandom.workspace = true
 
-# No `[dev-dependencies]`: `tempfile` is a normal dependency above and is in scope for the
-# integration proofs too.
+# `tempfile` is a normal dependency above and is in scope for the integration proofs too.
+# The only dev-dependencies are what it takes to drive the TUI on a real terminal; the
+# workspace manifest says why each is there.
+[dev-dependencies]
+portable-pty.workspace = true
+vt100.workspace = true
