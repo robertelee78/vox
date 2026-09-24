@@ -122,7 +122,11 @@ impl Profile {
             detail: format!("{}: {e}", vault_path.display()),
         })?;
         let vault = IdentityVault::from_canonical_slice(&bytes)?;
-        let store = std::sync::Arc::new(Store::open(&paths.store_file())?);
+        // **Read-only while locked.** A locked profile only reads its public facts, and opening
+        // the store writable writes to it — so a command refused for a wrong passphrase used to
+        // leave the profile changed. It becomes writable in `unlock`, once the passphrase is
+        // proved (see `store::Backing`).
+        let store = std::sync::Arc::new(Store::open_read_only(&paths.store_file())?);
         let fingerprint: Digest32 = store
             .get_meta(META_FINGERPRINT)?
             .and_then(|v| v.as_slice().try_into().ok())
@@ -155,6 +159,8 @@ impl Profile {
             // than silently adopt either.
             return Err(Error::Profile("vault identity does not match the store"));
         }
+        // Only now, with the passphrase proved, may the profile be written.
+        self.store.make_writable()?;
         self.unlocked = Some(Arc::new(signer));
         Ok(())
     }
