@@ -49,9 +49,9 @@ pub const MAX_AUTHENTICATOR_LEN: usize = 8 * 1024;
 
 /// Hard upper bound on a retained payload body (bytes) accepted from a single
 /// framed entry, enforced **before** `to_vec`. This is a per-*entry* structural
-/// ceiling so a hostile frame cannot force a multi-megabyte allocation before the
-/// per-author byte quota ([`crate::log::quota`]) is even consulted; the quota is
-/// the policy limit, this is the pre-allocation guard (ADR-008 anti-abuse).
+/// ceiling so a hostile frame cannot force an allocation larger than any real entry
+/// before the entry is even parsed (ADR-008 anti-abuse). It bounds one entry, never
+/// how many an author may write: a room's history has no size limit (PRD-001 R1).
 pub const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
 /// Wire discriminant for [`Authenticator::Composite`] (attributable).

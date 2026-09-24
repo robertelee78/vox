@@ -119,7 +119,7 @@ impl AnchorState {
 
     /// Reopen an anchored channel from `store`: the metadata, then every stored
     /// entry re-passes the acceptance predicate under the authors on file.
-    pub fn open(store: &Store, sek: Sek, channel_id: &Digest32, now_secs: u64) -> Result<Self> {
+    pub fn open(store: &Store, sek: Sek, channel_id: &Digest32) -> Result<Self> {
         let meta_seg = store
             .get_segment(channel_id, SegmentKind::AnchorMeta, SEG_META)?
             .ok_or(Error::Profile("channel is not anchored here"))?;
@@ -156,7 +156,7 @@ impl AnchorState {
             let kind = classify_payload(payload)?;
             state
                 .dag
-                .accept(entry, kind, &key, &state.admission, now_secs)
+                .accept(entry, kind, &key, &state.admission)
                 .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
             state.next_log_id = id.saturating_add(1);
         }
@@ -243,7 +243,6 @@ impl AnchorState {
         &mut self,
         store: &Store,
         transport: &mut T,
-        now_secs: u64,
     ) -> Result<SyncOutcome> {
         if self.poisoned {
             return Err(Error::Profile(
@@ -256,13 +255,7 @@ impl AnchorState {
             .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
             .collect();
         let resolver = ChannelAuthors::new(self.authors.clone());
-        let session = frontier_session_peer(
-            transport,
-            &mut self.dag,
-            &resolver,
-            &self.admission,
-            now_secs,
-        );
+        let session = frontier_session_peer(transport, &mut self.dag, &resolver, &self.admission);
         let mut arrived: Vec<Digest32> = Vec::new();
         for (author, head) in &before {
             let Some(feed) = self.dag.feed(author) else {

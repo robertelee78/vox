@@ -287,7 +287,7 @@ fn deniable_content_accepted_by_dag_with_epoch_verifier() {
     // EpochVerifier against the per-epoch epk (separate from this static key).
     let root = author.static_id.public_key();
     let hash = dag
-        .accept_with_deniable(entry, EntryKind::Content, &root, &adm, 0, Some(&verifier))
+        .accept_with_deniable(entry, EntryKind::Content, &root, &adm, Some(&verifier))
         .unwrap();
     assert!(dag.contains(&hash));
 }
@@ -319,7 +319,7 @@ fn deniable_content_fork_raises_alarm_does_not_freeze() {
     let mut dag = Dag::new();
     // First deniable content entry stores.
     let e1 = next_deniable(&dag, author_id, author.member.signing_key(), b"first");
-    dag.accept_with_deniable(e1, EntryKind::Content, &root, &adm, 0, Some(&verifier))
+    dag.accept_with_deniable(e1, EntryKind::Content, &root, &adm, Some(&verifier))
         .unwrap();
 
     // A second, DIFFERENT deniable entry at seq 1 (built against an empty view).
@@ -330,7 +330,7 @@ fn deniable_content_fork_raises_alarm_does_not_freeze() {
         author.member.signing_key(),
         b"second-equivocation",
     );
-    match dag.accept_with_deniable(e2, EntryKind::Content, &root, &adm, 0, Some(&verifier)) {
+    match dag.accept_with_deniable(e2, EntryKind::Content, &root, &adm, Some(&verifier)) {
         Err(Rejected::Fork(ForkOutcome::DeniableAlarm { author_id: a, seq })) => {
             assert_eq!(a, author_id);
             assert_eq!(seq, 1);
@@ -362,7 +362,7 @@ fn governance_must_stay_attributable_in_deniable_channel() {
         b"gov-deniable",
     );
     assert!(matches!(
-        dag.accept_with_deniable(e, EntryKind::Governance, &root, &adm, 0, Some(&verifier)),
+        dag.accept_with_deniable(e, EntryKind::Governance, &root, &adm, Some(&verifier)),
         Err(Rejected::GovernanceNotAttributable)
     ));
 }
@@ -398,7 +398,7 @@ fn dgka_setup_envelope_is_attributable_static_signed() {
     let entry = crate::log::entry::Entry::build_signed(&signer, sk, payload.to_vec()).unwrap();
     assert!(entry.authenticator.is_attributable());
     let mut dag = Dag::new();
-    dag.accept(entry, EntryKind::Governance, &signer.public_key(), &adm, 0)
+    dag.accept(entry, EntryKind::Governance, &signer.public_key(), &adm)
         .unwrap();
 }
 
