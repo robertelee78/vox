@@ -553,6 +553,54 @@ or `failed` observation with `data.work`. Hooks are one optional convenience for
 tracker requirement. Vox guarantees something narrower and complete: **whatever was posted is
 delivered, in a form a program can consume, without gaps.**
 
+### 9. PRD-001 R15 and R17: fingerprint addressing, hard locks and takeover (design, 2026-09-24)
+
+> **Design only — nothing in this section is built.** It answers PRD-001 (draft, `671527a`) §3.4 R15
+> and R17, tracked as #18 and #19. Each open decision is named as the decider's, with the proposal this
+> design will build unless told otherwise.
+
+**R15 — `to` carries fingerprints; people and agents see their own names.**
+
+- On the wire, every `to` entry **MUST** be a full 52-character base32 fingerprint. A petname is local
+  to whoever typed it (ADR-020 §3), so two nodes that name a member differently would address different
+  things; a fingerprint is the same everywhere. This is ADR-021's handoff rule (§4) applied to
+  addressing.
+- The CLI accepts `--to` as a fingerprint or a unique prefix of a room member's, resolved once by the
+  sender against the roster — as `handoff --to` already does — and writes the full fingerprint.
+- A message is **addressed to a node** when its fingerprint is in `to`, and so to every session of that
+  node registered in the room. `may_interrupt` compares fingerprints, never names; `VOX_AGENT_NAME` stops
+  being an addressing key (it remains a display label for the session).
+- An envelope from before this change carries petnames in `to`. Workers must run one version (§5), so a
+  mixed room is refused rather than interpreted; an old non-fingerprint `to` entry addresses nobody.
+- **Display** — every surface a person or agent reads (`read`, `tail`, the drain hook, the TUI) shows
+  the reader's own keyring name for each fingerprint, and the fingerprint's 12-character prefix when
+  it has none. **Decision for the decider (D-R15):** the keyring's names are readable over the control
+  socket today only through `TrustList`, which requires the identity passphrase, and an agent session
+  never holds it. *Proposed:* a read-only, ungated `Petnames` request that returns fingerprint→name and
+  nothing else. The socket's only boundary is its `0600` file mode (ADR-020 §7), and that uid can
+  already read `vault.cbor`; names are display labels, and the mutating verbs stay gated. The
+  alternative — agents see fingerprints only — is safe and less readable.
+
+**R17 — the filer can hard-lock an item; only the holder releases; a silent holder can be taken over.**
+
+- **Hard lock.** Whoever files a work item may mark its resource hard-locked with a `lock` operation
+  (`data.resource`, `data.mode: "hard"`), posted before or with its `assign`. Unmarked items keep today's
+  rule and **may race**: the first claim in canonical order wins, and a claimant learns it lost by
+  reading the board back. **Decision for the decider (D-R17a, PRD-001 §7 Q5):** what "hard" buys when
+  there is no global clock. *Proposed:* a claim on a hard-locked item is reported as won only after a
+  **settle window** (default 10 s) in which no earlier-sorting claim has arrived — the CLI blocks for
+  that window and re-reads. It narrows, but cannot close, the partition case; the design says so.
+- **Only the holder releases** — already true (§4 rule 2).
+- **Takeover.** A member may post `takeover` for a `Held` resource. It records a **pending takeover**
+  `{holder, requester, deadline}`; any claim-protocol operation by the exact holder on that resource
+  before the deadline — `renew`, `release`, or an explicit `keep` — answers it, and the holder keeps the
+  item (or releases it). With no answer by the deadline the resource transfers to the requester as a new
+  acquisition. Only one takeover may be pending per resource; later requests lose, as later claims do.
+  **Decision for the decider (D-R17b, PRD-001 §7 Q4):** the window's default and who sets it.
+  *Proposed:* the filer may set it on the `lock` operation (`data.takeover_secs`); otherwise 600 s.
+- `lock`, `takeover` and `keep` are claim-protocol operations: stamped, session-owned, op-id'd and
+  version-gated exactly as §4–§6 require.
+
 ## Non-goals
 
 - **Vox as the tracker.** It holds no epic, story, priority, rank, dependency, Work phase, Health,
