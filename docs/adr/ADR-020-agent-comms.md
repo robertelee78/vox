@@ -312,7 +312,8 @@ A2A's `TaskState` so a future bridge is mechanical.
 
 > **Amended by ADR-021 (proposed 2026-09-23, not built).** For any message carrying a work-item reference
 > (`data.work`), ADR-021 §3 gives each of these types a normative meaning. In particular, `result` is an
-> assertion and not completion, and `release` is neither completion nor failure. ADR-021 also makes a
+> assertion rather than an acceptance verdict, Release ready or Done, and `release` is neither Done nor
+> failure. `blocked` is a Health observation and never a Work phase. ADR-021 also makes a
 > worker's Vox version a session-static fact that rides `hello` (`data.vox`, §5). `status` appears in
 > this list but not yet in the code (ADR-021 F7).
 
