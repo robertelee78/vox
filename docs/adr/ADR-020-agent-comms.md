@@ -907,6 +907,12 @@ Both unknowns are already spiked; neither remains open.
   that it cannot, and the message waits for the session's next turn. That is the correct
   degradation, because queueing always is the default and the interrupt is the optimisation.
 
+  > **Named defect, 2026-09-24 (ADR-021 F17) — measured: the OpenCode half of this milestone never
+  > worked for a hand-opened session.** OpenCode 1.18.32 sets no `OPENCODE_SERVER_URL`, and a plain TUI
+  > has no listener at the `serverUrl` its plugins are handed, so every OpenCode session registers as
+  > `unknown` and cannot be woken. The gate above proves the decision, not the delivery; no test posts
+  > to `prompt_async`. Open; the mechanism is a decider question.
+
   > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, then reproduced through the real
   > `vox daemon`; fix proposed in #16.** `vox daemon`
   > decides on `NodeEvent::NewEntry`, which the node emits only for its **own** appends (ADR-021 F13's
