@@ -474,7 +474,11 @@ pub struct GetFileArgs {
     pub room: String,
     /// The file's name, or a prefix of its SHA-256, or its service tag.
     pub file: String,
-    /// Where to write it. Defaults to the announced name in the current directory.
+    /// The directory to put it in, under the sender's name made safe. Defaults to the
+    /// directory named in the profile's `downloads` config file, else `~/Downloads`.
+    #[arg(long, conflicts_with = "out")]
+    pub dir: Option<PathBuf>,
+    /// An exact path to write it to instead. Refused if something is already there.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
@@ -1367,7 +1371,14 @@ pub fn run() -> ExitCode {
                     RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
                     RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
                     RoomCmd::Get(a) => {
-                        crate::room_cli::get_file(&paths, &a.room, &a.file, a.out.as_deref()).await
+                        crate::room_cli::get_file(
+                            &paths,
+                            &a.room,
+                            &a.file,
+                            a.dir.as_deref(),
+                            a.out.as_deref(),
+                        )
+                        .await
                     }
                 }
             });

@@ -574,6 +574,17 @@ and over Vox the address becomes a `.vox` name. So:
 - A receiver **MUST** verify the stream against that hash before using the file. This is the one
   thing the `nc` idiom never gave anyone: `cat | nc` **truncates silently** — the connection drops,
   the receiver gets a partial file and `nc` exits 0. The hash turns that into a loud failure.
+- **Where the file lands is the receiver's decision, never the sender's** (PRD-001 R18, D4). The
+  announced name is text another member wrote. `vox room get` **MUST** put the file in a download
+  directory — `--dir`, else the profile's `downloads` config file, else `~/Downloads` — under that
+  name reduced to a bare file name (no directory part, no leading dots, no control characters), or
+  at an exact `--out` path. It **MUST NOT** overwrite anything: a taken name gets ` (1)`, ` (2)` …,
+  and an existing `--out` is refused. The bytes go to a hidden `.part` file and are linked into place
+  only after the SHA-256 **and** the size match; a transfer that stalls (30 s per read), sends more
+  than it announced, or does not match leaves nothing behind and touches nothing that was there.
+  Before 2026-09-24 the name was used as the path as written — `../../x` and absolute paths were
+  honoured — the destination was truncated before a byte was verified, and a mismatch then
+  deleted it.
 - `StructTag::ChunkManifest` **remains reserved and unimplemented**. ADR-014's in-log chunking is
   chat's concern, not agent comms'.
 - **No new wire format.** No struct tag, no codec, nothing added to the CBOR field checklist.
@@ -943,9 +954,16 @@ Both unknowns are already spiked; neither remains open.
   *Gate, met*: a 300 KB file crosses between two networked nodes with two identities, driven as real
   binaries, and arrives byte-for-byte. Then the offered file is **shortened on disk after it was
   announced**, so the sender serves fewer bytes than it signed for — exactly what a dropped
-  `cat | nc` does — and the collector refuses it, says why, and **removes the partial file** rather
-  than leaving something that looks complete. Asking for a file nobody offered says so rather than
-  hanging or writing an empty file.
+  `cat | nc` does — and the collector refuses it, says why, and leaves nothing that looks complete.
+  Asking for a file nobody offered says so rather than hanging or writing an empty file.
+
+  *Destination gate, met 2026-09-24* (PRD-001 D4, same proof): with no `--dir` or `--out` the file
+  lands in `~/Downloads`; a file already there keeps its bytes and the collected one becomes
+  `artifact (1).bin`; announcements naming `../../x` and an absolute path land as `x` and as the
+  bare file name inside the download directory and nowhere else; a short transfer onto a name that
+  exists leaves that file byte-identical and the directory listing unchanged; an existing `--out`
+  is refused. Mutation-checked: using the announced name as the path (the old handling) and
+  renaming over a taken name each turn it red.
 
   This needed the control socket extended (**protocol 3**): `AddService`, `RemoveService`,
   `Forward`, `StopForward`, `Grant`, and a `Frame::Bound` because a forward asked for port 0 is

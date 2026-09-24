@@ -108,12 +108,14 @@ it runs until you stop it, because the bytes are served live.
 
 ```bash
 vox room send "$VOX_ROOM" ./target/debug/report.json   # runs until interrupted
-vox room get "$VOX_ROOM" report.json --out ./report.json
+vox room get "$VOX_ROOM" report.json --dir ./incoming   # or --out ./report.json
 ```
 
-`get` verifies against the announced hash and **refuses a transfer that does not
-match**, deleting the partial file. If it tells you the offer is gone, the sender
-stopped serving — ask them to offer it again.
+Without `--dir` or `--out`, `get` puts the file in `~/Downloads`. It never
+overwrites anything: a taken name becomes `report (1).json`, and an `--out` that
+exists is refused. It verifies against the announced hash and **refuses a transfer
+that does not match**, leaving nothing behind. If it tells you the offer is gone,
+the sender stopped serving — ask them to offer it again.
 
 ## Manners
 
