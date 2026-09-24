@@ -613,6 +613,26 @@ Confidentiality needs no step of its own. The decider's habit of `gpg`-encryptin
 sending it is unnecessary here: the overlay supplies confidentiality and the peer is a pinned key
 with consent-bound reach.
 
+*`vox share` (PRD-001 R18, built 2026-09-25).* The pull model, over HTTP so any tool can collect:
+`vox share <room> <file|dir> [--count N] [--for 10m]` serves the file on a room-bound service whose
+port is derived from the content hash and is its service tag, and announces name, size, SHA-256,
+tag and `http: true` in the `file` envelope. A folder is served as one deterministic tar (sorted,
+zero timestamps), so it has one hash. The receiver pulls with `curl --socks5-hostname <proxy>
+http://<name>.<room>.vox:<port>/<file>` through `vox up`, or with `vox room get`, which now:
+- lands the file in the downloads directory (`downloads = <dir>` in the profile's `config`, else
+  `~/Downloads`) unless `--out` says otherwise;
+- takes only the last component of the sender's name, strips leading dots and characters a
+  filesystem treats specially, and adds ` (1)`, ` (2)`… rather than overwrite anything;
+- writes to a hidden `.part` file and renames it into place only after the hash verifies, so no file
+  that looks complete exists until it is.
+
+The share stops after `--count` completed fetches, after `--for`, or on ^C. Proved by
+`crates/vox-tui/tests/share_proof.rs`: curl through `vox up` gets identical bytes; `vox room get`
+lands them in the downloads directory; an untrusted member's curl and `vox room get` both get
+nothing and neither counts as a fetch; the share ends itself after `--count 2`; a folder arrives as a
+valid tar. Mutation-checked: an HTTP-unaware `get`, a get that ignores the downloads directory, a
+`--count` that never ends, and a host whose reach gate is removed each turn it red.
+
 **Nobody is granted anything, and that is a consequence rather than a convenience.** Reach is gated
 on the *offering* node's trust keyring together with authorship of the bound room; reading the
 announcement requires exactly the same ring entry. So **the audience of the announcement is the

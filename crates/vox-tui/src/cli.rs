@@ -601,6 +601,23 @@ pub struct DaemonArgs {
     pub metrics: Option<SocketAddr>,
 }
 
+/// `vox share`
+#[derive(Args, Debug, Clone)]
+pub struct ShareArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The file or folder to share. A folder is served as one tar.
+    pub path: PathBuf,
+    /// Stop after this many completed fetches.
+    #[arg(long)]
+    pub count: Option<u64>,
+    /// Stop after this long: `90s`, `10m`, `2h`.
+    #[arg(long = "for")]
+    pub for_: Option<String>,
+}
+
 /// `vox status`
 #[derive(Args, Debug, Clone)]
 pub struct StatusArgs {
@@ -1267,6 +1284,11 @@ enum Cmd {
     /// peer must be a member of the room.
     #[command(subcommand)]
     App(AppCmd),
+    /// Share a file or a folder with a room: served over HTTP as a room-bound service,
+    /// announced with its name, size and SHA-256 (PRD-001 R18). Members you trust pull
+    /// it with `vox room get`, or with curl through `vox up`. Stops after `--count`
+    /// fetches, after `--for`, or on ^C.
+    Share(ShareArgs),
     /// What the running node is doing, and what needs attention (PRD-001 R35): rooms and
     /// their sync, peers and their paths, tunnels, datagram and app counters.
     Status(StatusArgs),
@@ -1572,6 +1594,30 @@ pub fn run() -> ExitCode {
                     e.exit_code()
                 }
             }
+        }
+        Cmd::Share(args) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let for_ = match args
+                .for_
+                .as_deref()
+                .map(crate::share_cli::parse_for)
+                .transpose()
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("vox: --for {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            run_attached(async move {
+                crate::share_cli::share(&paths, &args.room, &args.path, args.count, for_).await
+            })
         }
         Cmd::Status(args) => {
             let paths = match args.profile.paths() {

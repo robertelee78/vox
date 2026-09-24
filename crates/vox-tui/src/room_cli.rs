@@ -39,7 +39,7 @@ use crate::tunnel_cli::resolve_prefix;
 /// holds no room and serves no control socket, so following the advice produced this
 /// same message again, verbatim. `vox daemon` is what holds a profile's rooms and
 /// serves this socket.
-async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
+pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
     let sock = paths.socket_file();
     if !sock.exists() {
         return Err(AppError::Usage(format!(
@@ -142,7 +142,7 @@ fn held_since(since_secs: u64) -> String {
 ///
 /// A closed room is reported as closed rather than "unknown": the two are
 /// different problems and an operator fixes them differently.
-async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
+pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
     let rooms = rooms_of(client).await?;
     if rooms.is_empty() {
         return Err(AppError::Usage(
@@ -208,7 +208,7 @@ fn body_of(text: Option<&str>) -> Result<String, AppError> {
 
 /// Append raw text, exactly as given. The internal path for verbs that build their
 /// own envelope (a file offer), and what `vox room post` does with no structured flag.
-async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Result<(), AppError> {
+pub(crate) async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Result<(), AppError> {
     let body = body_of(text)?;
     if body.trim().is_empty() {
         return Err(AppError::Usage("refusing to post an empty message".into()));
@@ -1639,10 +1639,10 @@ pub async fn board(
 // 0. Verifying against a hash the sender signed turns that into a loud failure.
 
 /// The envelope type an offer is announced with.
-const FILE: &str = "file";
+pub(crate) const FILE: &str = "file";
 
 /// Read a file and return its SHA-256 and length.
-fn digest_file(path: &std::path::Path) -> Result<(String, u64), AppError> {
+pub(crate) fn digest_file(path: &std::path::Path) -> Result<(String, u64), AppError> {
     use sha2::{Digest as _, Sha256};
     let mut f = std::fs::File::open(path)
         .map_err(|e| AppError::Usage(format!("opening {}: {e}", path.display())))?;
@@ -1661,7 +1661,7 @@ fn digest_file(path: &std::path::Path) -> Result<(String, u64), AppError> {
     Ok((hex(&hasher.finalize()), total))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         use std::fmt::Write as _;
@@ -1795,6 +1795,68 @@ struct Offer {
     size: u64,
     sha256: String,
     tag: String,
+    /// Served over HTTP (`vox share`) rather than as raw bytes (`vox room send`).
+    http: bool,
+}
+
+/// Where collected files land (PRD-001 R18): `downloads = <dir>` in the profile's
+/// `config` file, else `~/Downloads`.
+pub(crate) fn downloads_dir(paths: &Paths) -> std::path::PathBuf {
+    let configured = std::fs::read_to_string(paths.config_file())
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| l.split_once('='))
+                .find(|(k, _)| k.trim() == "downloads")
+                .map(|(_, v)| std::path::PathBuf::from(v.trim()))
+        });
+    configured.unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from)
+            .join("Downloads")
+    })
+}
+
+/// The sender's name made safe to write: its last path component only, no leading
+/// dots, nothing a filesystem treats specially. A sender does not choose where a file
+/// lands, and cannot name one `../../.bashrc`.
+fn sanitize(name: &str) -> String {
+    let leaf = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let clean: String = leaf
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let clean = clean.trim_start_matches('.').trim().to_owned();
+    if clean.is_empty() {
+        "download".to_owned()
+    } else {
+        clean
+    }
+}
+
+/// `dir/name`, or `dir/name (1)`, `dir/name (2)`… — the first that does not exist, so a
+/// collected file never overwrites anything.
+fn unique_in(dir: &Path, name: &str) -> std::path::PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_owned(), format!(".{e}")),
+        _ => (name.to_owned(), String::new()),
+    };
+    (1..)
+        .map(|i| dir.join(format!("{stem} ({i}){ext}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
 }
 
 /// `vox room get` — collect an offered file and verify it.
@@ -1839,12 +1901,17 @@ pub async fn get_file(
             let sha256 = d.get("sha256")?.as_str()?.to_owned();
             let tag = d.get("tag")?.as_str()?.to_owned();
             let size = d.get("size")?.as_u64()?;
+            let http = d
+                .get("http")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             (name == selector || sha256.starts_with(selector) || tag == selector).then_some(Offer {
                 author: r.author,
                 name,
                 size,
                 sha256,
                 tag,
+                http,
             })
         })
         .next()
@@ -1855,7 +1922,17 @@ pub async fn get_file(
             ))
         })?;
 
-    let dest = out.map_or_else(|| std::path::PathBuf::from(&offer.name), Path::to_owned);
+    // An explicit `--out` is the person's own choice. Otherwise the downloads
+    // directory, under the sender's name made safe, never over an existing file.
+    let dest = match out {
+        Some(p) => p.to_owned(),
+        None => {
+            let dir = downloads_dir(paths);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| AppError::Usage(format!("creating {}: {e}", dir.display())))?;
+            unique_in(&dir, &sanitize(&offer.name))
+        }
+    };
 
     let bound = match client
         .request(&Request::Forward {
@@ -1894,11 +1971,58 @@ async fn collect(bound: &str, dest: &std::path::Path, offer: &Offer) -> Result<(
     let mut sock = tokio::net::TcpStream::connect(bound)
         .await
         .map_err(|e| AppError::Usage(format!("connecting to the forward: {e}")))?;
-    let mut file = std::fs::File::create(dest)
-        .map_err(|e| AppError::Usage(format!("creating {}: {e}", dest.display())))?;
+    // Written beside the destination under a hidden name, and renamed into place only
+    // once it verifies: nothing that looks like the file exists until it is the file.
+    let part = dest.with_file_name(format!(
+        ".{}.vox-part",
+        dest.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    let mut file = std::fs::File::create(&part)
+        .map_err(|e| AppError::Usage(format!("creating {}: {e}", part.display())))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
+    if offer.http {
+        use tokio::io::AsyncWriteExt as _;
+        let req = format!(
+            "GET /{} HTTP/1.1\r\nHost: vox\r\nConnection: close\r\n\r\n",
+            offer.name
+        );
+        sock.write_all(req.as_bytes())
+            .await
+            .map_err(|e| AppError::Usage(format!("asking for the file: {e}")))?;
+        // Skip the response head; whatever follows it is the body.
+        let mut head = Vec::new();
+        let body_start = loop {
+            let n = sock
+                .read(&mut buf)
+                .await
+                .map_err(|e| AppError::Usage(format!("reading the reply: {e}")))?;
+            if n == 0 {
+                let _ = std::fs::remove_file(&part);
+                return Err(AppError::Usage("the sharer closed before answering".into()));
+            }
+            head.extend_from_slice(&buf[..n]);
+            if let Some(i) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            if head.len() > 16 * 1024 {
+                let _ = std::fs::remove_file(&part);
+                return Err(AppError::Usage("the sharer's reply is not HTTP".into()));
+            }
+        };
+        if !head.starts_with(b"HTTP/1.1 200") && !head.starts_with(b"HTTP/1.0 200") {
+            let _ = std::fs::remove_file(&part);
+            return Err(AppError::Usage("the sharer refused the request".into()));
+        }
+        let rest = &head[body_start..];
+        hasher.update(rest);
+        std::io::Write::write_all(&mut file, rest)
+            .map_err(|e| AppError::Usage(format!("writing {}: {e}", part.display())))?;
+        total += rest.len() as u64;
+    }
     loop {
         let n = sock
             .read(&mut buf)
@@ -1909,11 +2033,11 @@ async fn collect(bound: &str, dest: &std::path::Path, offer: &Offer) -> Result<(
         }
         hasher.update(&buf[..n]);
         std::io::Write::write_all(&mut file, &buf[..n])
-            .map_err(|e| AppError::Usage(format!("writing {}: {e}", dest.display())))?;
+            .map_err(|e| AppError::Usage(format!("writing {}: {e}", part.display())))?;
         total += n as u64;
     }
     std::io::Write::flush(&mut file)
-        .map_err(|e| AppError::Usage(format!("flushing {}: {e}", dest.display())))?;
+        .map_err(|e| AppError::Usage(format!("flushing {}: {e}", part.display())))?;
     drop(file);
 
     let got = hex(&hasher.finalize());
@@ -1921,13 +2045,15 @@ async fn collect(bound: &str, dest: &std::path::Path, offer: &Offer) -> Result<(
         // **The partial file is removed.** `cat | nc` truncating silently is the
         // classic way this idiom bites; leaving a file that looks complete and is
         // not would reproduce exactly that failure with extra steps.
-        let _ = std::fs::remove_file(dest);
+        let _ = std::fs::remove_file(&part);
         return Err(AppError::Usage(format!(
             "the transfer does not match what was announced — expected sha256 {} over {} bytes, \
              got {got} over {total}. The partial file was removed.",
             offer.sha256, offer.size
         )));
     }
+    std::fs::rename(&part, dest)
+        .map_err(|e| AppError::Usage(format!("moving the verified file into place: {e}")))?;
     println!("vox: {} ({total} bytes) verified", dest.display());
     Ok(())
 }
