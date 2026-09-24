@@ -221,6 +221,26 @@ pub fn path_class(endpoint: &VoxEndpoint, conn: &VoxConnection) -> PathClass {
     }
 }
 
+/// An ordering key for one connection that **both ends compute identically**: 16 bytes of
+/// the TLS 1.3 exporter (RFC 5705 / RFC 8446 §7.5) under a Vox-specific label. Two
+/// duplicate connections on an equal path are resolved by it, so the two ends agree on
+/// which one survives regardless of the order either end filed them in.
+///
+/// If the exporter is unavailable the key is all-ones, which sorts last: a connection that
+/// cannot produce one never displaces a held connection that can, and two that both cannot
+/// fall back to "the held one wins" — the old behaviour, and no worse than it was.
+fn tie_key(conn: &VoxConnection) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    if conn
+        .quinn()
+        .export_keying_material(&mut key, b"vox/connection-tie-break/v1", b"")
+        .is_err()
+    {
+        key = [0xff; 16];
+    }
+    key
+}
+
 /// How long a connection displaced by a better one stays open before it is closed:
 /// long enough for anything in flight on it — a join exchange, a sync session (whose
 /// frames are bounded at 20 s) — to finish, because the peer's streams do not move.
@@ -362,12 +382,24 @@ impl ConnectionManager {
     ///   is relayed — **replaces** it, and the old one is retired: kept open for
     ///   [`RETIRE_GRACE_SECS`], and beyond it for as long as anything is still carried on
     ///   it, so a tunnel that took the old path is not cut when a better one appears;
-    /// - otherwise the held one is kept and the newcomer closed with a clean code (a
-    ///   simultaneous dial from both sides lands here).
+    /// - on an **equal** path, the one with the lower [`tie_key`] is kept and the other is
+    ///   the loser (a simultaneous dial from both sides, or two dials from one side, lands
+    ///   here).
     ///
     /// Both ends apply the same rule, which is what lets an upgrade land without a
     /// protocol: the side that punched files the direct connection as an improvement,
     /// and the side that accepted it does too.
+    ///
+    /// **The equal-path case must not depend on arrival order**, and it used to: "the held
+    /// one wins". That agreed across the two ends only while the accept loop handled one
+    /// handshake at a time, so both ends filed a pair in the same order. With handshakes
+    /// concurrent (v0.2.8) the acceptor could file a node's second dial first. Measured
+    /// with both ends logging the same connection's exporter tag: the dialer kept `6352…`
+    /// and closed `97c8…` while the anchor kept `97c8…` — a dead connection it went on
+    /// using, with the dialer seeing a live one and never redialling. Relaying to that
+    /// node then failed ("relay cannot reach the peer") until the grace ran out. This is
+    /// the "cross-connection interaction in circuit establishment" ADR-017 recorded as
+    /// unidentified: the serial loop was hiding an order-dependent tie-break.
     fn file(&self, conn: VoxConnection) -> Arc<VoxConnection> {
         // **Closes the loser, because this caller will not serve it.** Retiring a duplicate is only
         // safe where somebody keeps reading it; retiring it here and dropping the handle would
@@ -407,7 +439,13 @@ impl ConnectionManager {
         if let Some(existing) = map.get(&peer) {
             if is_live(existing) {
                 let existing = Arc::clone(existing);
-                if path_class(&self.endpoint, &conn) <= path_class(&self.endpoint, &existing) {
+                let (new_class, held_class) = (
+                    path_class(&self.endpoint, &conn),
+                    path_class(&self.endpoint, &existing),
+                );
+                let newcomer_loses = new_class < held_class
+                    || (new_class == held_class && tie_key(&conn) >= tie_key(&existing));
+                if newcomer_loses {
                     drop(map);
                     if !serve_loser {
                         conn.close(WireError::AuthenticatorInvalid);
