@@ -11,6 +11,16 @@
 //!   bound. Here the host's `vox serve` is killed and the same room brought back by
 //!   `vox daemon` on a **different port**, and the *same* forward must carry a new
 //!   connection.
+//! - **A refused SOCKS CONNECT is refused in the reply, and says why** (R23, D6). `vox up`
+//!   replied "succeeded" before it had asked the host, so a refusal looked like a
+//!   connection that died.
+//! - **A refused forward resets the application's connection and says why** (R23). The
+//!   application's `connect` succeeded before the host was asked, so a quiet close read as
+//!   "connected, then the server hung up"; and the reason died in a dropped `Result`.
+//! - **A backend's reset reaches the far client as a reset** (R22/R23, D11). The splice
+//!   dropped its QUIC send half on the error path, and quinn *finishes* a dropped stream, so
+//!   a backend that crashed mid-reply reached the client as an orderly EOF after a truncated
+//!   reply — a lie a client cannot detect.
 //!
 //! ## Why it is `#[ignore]`d
 //!
@@ -26,9 +36,14 @@ mod watchdog;
 #[path = "support/world.rs"]
 mod world;
 
+use std::io::Write;
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use world::{echo_service, round_trip, World};
+use world::{
+    echo_service, read_to_end_within, resetting_service, round_trip, socks5_connect, Ending, World,
+    PARTIAL,
+};
 
 #[test]
 #[ignore = "production Argon2id profiles + a real PoW + a QUIC idle timeout, driving the real binary; CI runs it in release"]
@@ -82,4 +97,117 @@ fn a_forward_carries_a_new_connection_after_its_host_restarts() {
     );
     drop(fwd);
     drop(w);
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+fn a_backend_reset_reaches_the_far_client_as_a_reset() {
+    watchdog::arm();
+    let w = World::new(resetting_service(), true);
+    let guest_dir = w.guest_dir.clone();
+    let (_fwd, at) = w.forward("forward", &guest_dir);
+
+    let mut s = TcpStream::connect(at).expect("connect to the forward");
+    s.write_all(b"GET /").unwrap();
+    // The first read may wait for the forward to reach its host.
+    let (got, ending) = read_to_end_within(
+        &mut s,
+        vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
+    );
+    eprintln!(
+        "[test] client read {} of {} bytes, then {ending:?}",
+        got.len(),
+        PARTIAL.len()
+    );
+    // Step 1: the path works — the partial reply crossed — so the ending is the backend's.
+    assert_eq!(
+        got, PARTIAL,
+        "the partial reply must cross before the reset, or this measures a broken path"
+    );
+    // Step 2: the backend's reset is a reset at the far end, not a clean EOF.
+    assert_eq!(
+        ending,
+        Ending::Reset,
+        "a backend that reset its connection must reach the client as a reset, not as a clean \
+         EOF after a truncated reply (PRD-001 D11)"
+    );
+    drop(w);
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+fn a_refused_forward_resets_the_application_and_says_why() {
+    watchdog::arm();
+    // The guest joined with the address and the passphrase and was never trusted.
+    let w = World::new(echo_service(), false);
+    let guest_dir = w.guest_dir.clone();
+    let (mut fwd, at) = w.forward("stranger-forward", &guest_dir);
+
+    let t0 = Instant::now();
+    let mut s = TcpStream::connect(at).expect("connect to the forward");
+    // **Nothing is written.** A socket closed with unread data in its receive buffer is
+    // reset by the kernel whatever the closer intended, so writing first made a quiet close
+    // look like a reset and this proof pass against the defect — its first mutation check
+    // stayed green for exactly that reason. A server-speaks-first client (`ssh`) is the case
+    // that matters anyway: it reads before it writes.
+    let (got, ending) = read_to_end_within(
+        &mut s,
+        vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
+    );
+    let waited = t0.elapsed();
+    eprintln!(
+        "[test] the untrusted forward's application saw {ending:?} after {waited:?}, {} bytes",
+        got.len()
+    );
+    assert!(
+        got.is_empty(),
+        "an untrusted joiner must carry no bytes: {got:?}"
+    );
+    assert_eq!(
+        ending,
+        Ending::Reset,
+        "a refused forward must fail the application's connection as a reset — a quiet close \
+         reads as `connected, then the server hung up` (PRD-001 R23)"
+    );
+    // And this node, which is the operator's own, says why.
+    let why = fwd.expect_within(Duration::from_secs(10), "the reason, on stderr", |l| {
+        l.starts_with("! ") && l.contains("the host refused")
+    });
+    eprintln!("[test] the forward said: {why}");
+    drop(fwd);
+    drop(w);
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+fn a_refused_socks_connect_is_refused_in_the_reply_and_says_why() {
+    watchdog::arm();
+    // The guest joined with the address and the passphrase and was never trusted.
+    let w = World::new(echo_service(), false);
+    let guest_dir = w.guest_dir.clone();
+    let (mut up, at) = w.up("stranger-up", &guest_dir);
+    let hostname = format!("{}.vox", w.room);
+
+    // **The reply is the host's answer** (PRD-001 R23, D6). The proxy used to say
+    // "succeeded" before it had asked, so a refusal looked like a connection that died.
+    let t0 = Instant::now();
+    let (code, mut s) = socks5_connect(at, &hostname, w.service_port);
+    let waited = t0.elapsed();
+    eprintln!("[test] the untrusted CONNECT got SOCKS reply code {code} after {waited:?}");
+    assert_eq!(
+        code, 0x02,
+        "an untrusted joiner's CONNECT must be refused in the SOCKS reply itself — code 2, \
+         not allowed — not told it succeeded"
+    );
+    let (got, ending) = read_to_end_within(&mut s, Duration::from_secs(5));
+    assert!(
+        got.is_empty(),
+        "a refused CONNECT must carry nothing: {got:?}"
+    );
+    eprintln!("[test] and the socket then ended {ending:?}");
+    // And this node, the operator's own, says why.
+    let why = up.expect_within(Duration::from_secs(10), "the reason, on stderr", |l| {
+        l.starts_with("! ") && l.contains("the host refused")
+    });
+    eprintln!("[test] vox up said: {why}");
 }

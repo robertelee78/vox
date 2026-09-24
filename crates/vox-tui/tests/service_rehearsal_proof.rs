@@ -78,6 +78,7 @@ impl VoxProc {
             .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
         let out = child.stdout.take().expect("stdout");
         let (tx, rx) = mpsc::channel();
+        let tx_err = tx.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 if tx.send(line).is_err() {
@@ -85,13 +86,16 @@ impl VoxProc {
                 }
             }
         });
-        // Stderr is drained too, and kept out of the event stream: a full pipe would
-        // block the child, which is a hang rather than a failure (ADR-018 §6).
+        // Stderr is drained too — a full pipe would block the child, which is a hang rather
+        // than a failure (ADR-018 §6) — and joins the stream prefixed `! `, because the
+        // reasons a person is shown (a refusal, above all) are printed there. The prefix
+        // keeps every stdout pattern below from matching one by accident.
         if let Some(err) = child.stderr.take() {
-            let name_owned = name.to_owned();
             std::thread::spawn(move || {
                 for line in BufReader::new(err).lines().map_while(Result::ok) {
-                    eprintln!("[{name_owned} stderr] {line}");
+                    if tx_err.send(format!("! {line}")).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -269,7 +273,9 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         &["node".into(), "--listen".into(), "127.0.0.1:0".into()],
     );
     let spec_line = anchor.expect_line("an --anchor spec", |l| {
-        l.trim_start().contains('@') && l.trim_start().starts_with(|c: char| c.is_alphanumeric())
+        !l.starts_with("! ")
+            && l.trim_start().contains('@')
+            && l.trim_start().starts_with(|c: char| c.is_alphanumeric())
     });
     let anchor_spec = spec_line.trim().to_owned();
     assert!(
@@ -456,7 +462,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     // And the host reports who reached it, which is the only place attribution can come
     // from: the service itself sees every Vox client as 127.0.0.1 (ADR-017 decision 6).
     let reached = host.expect_line("the host to report a client reaching the service", |l| {
-        l.contains("reached")
+        !l.starts_with("! ") && l.contains("reached")
     });
     assert!(
         reached.contains(&service_port.to_string()),
@@ -517,27 +523,33 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         .expect("an address")
         .parse()
         .expect("a socket address");
-    // The proxy waits up to `HOST_PATIENCE` for a *connection* and then the host refuses the
-    // dial, so this is allowed to take a while — what must not happen is a carried byte.
-    match socks5_connect(s_bound, &hostname, service_port) {
-        Err(e) => eprintln!("[test] the untrusted joiner was refused, as it must be: {e}"),
-        Ok(mut s) => {
-            // A SOCKS success is not yet a failure of the gate: the proxy replies before the
-            // tunnel is dialled, deliberately, so `ssh` does not deadlock. The gate's verdict
-            // shows as the stream carrying nothing.
-            use std::io::{Read as _, Write as _};
-            s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-            let _ = s.write_all(b"can I reach you");
-            let mut buf = [0u8; 16];
-            let got = s.read(&mut buf);
+    // **The reply is the host's answer** (PRD-001 R23, D6). The proxy used to reply
+    // "succeeded" before it had asked the host, so this control had to accept a success and
+    // then look for a stream that carried nothing — which is to say it asserted the defect.
+    // The host answers before a single byte flows, so the refusal must be the SOCKS reply
+    // itself: code 2, "connection not allowed by ruleset".
+    let t0 = Instant::now();
+    let refused = socks5_connect(s_bound, &hostname, service_port);
+    let waited = t0.elapsed();
+    match refused {
+        Ok(_) => panic!(
+            "an untrusted joiner holding the address AND the passphrase was told its CONNECT \
+             succeeded — the proxy must answer with the host's refusal (PRD-001 R23)"
+        ),
+        Err(e) => {
+            eprintln!("[test] the untrusted joiner was refused after {waited:?}: {e}");
             assert!(
-                matches!(&got, Err(_) | Ok(0)),
-                "an untrusted joiner holding the address AND the passphrase must carry no \
-                 bytes — this is verified finding #1. It read {got:?}"
+                e.to_string().contains("SOCKS reply code 2"),
+                "the refusal must be SOCKS code 2 (not allowed), not a transport error: {e}"
             );
-            eprintln!("[test] the untrusted joiner's tunnel carried nothing, as it must");
         }
     }
+    // And the stranger's own node says why, on its own terminal — the remote side learns
+    // nothing it did not already say.
+    let why = stranger_up.expect_line("the refusal's reason on the stranger's terminal", |l| {
+        l.starts_with("! ") && l.contains("the host refused")
+    });
+    eprintln!("[test] the stranger's vox up said: {why}");
 
     drop(stranger_up);
     drop(host);
