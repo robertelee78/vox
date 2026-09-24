@@ -213,10 +213,11 @@ pub async fn run(
     // The same order `vox room` uses to name the session, so that what this hook
     // recognises as "my own message" is exactly what that session's verbs wrote
     // (ADR-021 §7): the flag, then `VOX_SESSION`, then what the harness sent.
-    if let Some(s) = session
-        .map(str::to_owned)
-        .or_else(|| std::env::var("VOX_SESSION").ok().filter(|s| !s.trim().is_empty()))
-    {
+    if let Some(s) = session.map(str::to_owned).or_else(|| {
+        std::env::var("VOX_SESSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    }) {
         input.session_id = s.trim().to_owned();
     }
 

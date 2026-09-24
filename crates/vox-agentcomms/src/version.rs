@@ -203,7 +203,8 @@ pub fn version_table(
         }
     }
 
-    let mut latest: std::collections::BTreeMap<[u8; 32], &Posted> = std::collections::BTreeMap::new();
+    let mut latest: std::collections::BTreeMap<[u8; 32], &Posted> =
+        std::collections::BTreeMap::new();
     for m in messages.iter().filter(|m| counts(&m.envelope)) {
         let newer = latest.get(&m.author).is_none_or(|cur| {
             (m.created_millis, m.entry_hash) > (cur.created_millis, cur.entry_hash)

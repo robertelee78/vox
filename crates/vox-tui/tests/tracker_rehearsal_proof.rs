@@ -33,10 +33,10 @@
 
 #![cfg(unix)]
 
-#[path = "../../vox-core/tests/support/watchdog.rs"]
-mod watchdog;
 #[path = "support/room.rs"]
 mod support;
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
 
 use std::collections::BTreeMap;
 use std::io::BufRead as _;
@@ -47,17 +47,27 @@ use std::time::Duration;
 use support::{until, Out, Worker, HARNESS_SESSION_VARS, VOX};
 
 fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN").unwrap_or_default().split(',').any(|s| s.trim().eq_ignore_ascii_case(name))
+    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
+        .unwrap_or_default()
+        .split(',')
+        .any(|s| s.trim().eq_ignore_ascii_case(name))
 }
 fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file())
 }
 fn auth_present() -> bool {
-    std::env::var_os("HOME").is_some_and(|h| Path::new(&h).join(".local/share/opencode/auth.json").is_file())
+    std::env::var_os("HOME").is_some_and(|h| {
+        Path::new(&h)
+            .join(".local/share/opencode/auth.json")
+            .is_file()
+    })
 }
 fn model() -> String {
-    std::env::var("VOX_PROOF_OPENCODE_MODEL").unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
+    std::env::var("VOX_PROOF_OPENCODE_MODEL")
+        .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
 }
 
 // ------------------------------------------------------------------ the stub tracker
@@ -110,10 +120,24 @@ impl Tracker {
             .map(|r| {
                 // Ready is the TRACKER's fact (design approved), recorded here — never
                 // derived from anything in the room.
-                ((*r).to_owned(), Item { phase: Phase::Ready, health: Health::OnTrack, owner: None, attempts: vec![], candidate: None, history: vec![Phase::Ready] })
+                (
+                    (*r).to_owned(),
+                    Item {
+                        phase: Phase::Ready,
+                        health: Health::OnTrack,
+                        owner: None,
+                        attempts: vec![],
+                        candidate: None,
+                        history: vec![Phase::Ready],
+                    },
+                )
             })
             .collect();
-        Self { items, cursor: None, rows_seen: 0 }
+        Self {
+            items,
+            cursor: None,
+            rows_seen: 0,
+        }
     }
 
     fn set(item: &mut Item, p: Phase) {
@@ -125,22 +149,33 @@ impl Tracker {
 
     /// Apply one `vox.room.row/1` observation, per the tracker's event-to-state rules.
     fn observe(&mut self, row: &serde_json::Value) {
-        assert_eq!(row["schema"], "vox.room.row/1", "the adapter refuses any other schema");
+        assert_eq!(
+            row["schema"], "vox.room.row/1",
+            "the adapter refuses any other schema"
+        );
         self.cursor = row["entry_hash"].as_str().map(str::to_owned);
         self.rows_seen += 1;
         if row["op"]["status"] == "conflict" || row["op"]["status"] == "duplicate" {
             return; // a void or repeated operation is not an observation
         }
         let env = &row["envelope"];
-        let Some(work) = env["data"]["work"].as_str() else { return };
-        let Some(item) = self.items.get_mut(work) else { return };
+        let Some(work) = env["data"]["work"].as_str() else {
+            return;
+        };
+        let Some(item) = self.items.get_mut(work) else {
+            return;
+        };
         let session = env["from"].as_str().unwrap_or("").to_owned();
         let attempt = env["data"]["attempt"].as_str().unwrap_or("").to_owned();
         match env["type"].as_str().unwrap_or("") {
             // A work-key-bound attempt start moves Ready to Executing.
             "working" => {
                 if !item.attempts.iter().any(|a| a.id == attempt) {
-                    item.attempts.push(Attempt { id: attempt, session, outcome: None });
+                    item.attempts.push(Attempt {
+                        id: attempt,
+                        session,
+                        outcome: None,
+                    });
                 }
                 item.health = Health::OnTrack;
                 if item.phase == Phase::Ready {
@@ -182,10 +217,22 @@ impl Tracker {
     /// An attempt whose owner is gone without a `result` or `failed` has ended by
     /// release or expiry; the item is retryable.
     fn board(&mut self, board: &serde_json::Value) {
-        assert_ne!(board["coordination"], "refused", "the adapter records no owner under a refusal");
+        assert_ne!(
+            board["coordination"], "refused",
+            "the adapter records no owner under a refusal"
+        );
         for (work, item) in &mut self.items {
-            let held = board["resources"].as_array().unwrap().iter().find(|r| r["resource"] == *work && r["state"] == "held");
-            item.owner = held.map(|h| (h["owner_fp"].as_str().unwrap().to_owned(), h["owner_session"].as_str().unwrap().to_owned()));
+            let held = board["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["resource"] == *work && r["state"] == "held");
+            item.owner = held.map(|h| {
+                (
+                    h["owner_fp"].as_str().unwrap().to_owned(),
+                    h["owner_session"].as_str().unwrap().to_owned(),
+                )
+            });
             if item.owner.is_none() && item.phase == Phase::Executing {
                 if let Some(a) = item.attempts.iter_mut().rev().find(|a| a.outcome.is_none()) {
                     a.outcome = Some("expired or released");
@@ -198,7 +245,8 @@ impl Tracker {
     fn never_past_acceptance(&self) {
         for (k, item) in &self.items {
             assert!(
-                !item.history.contains(&Phase::ReleaseReady) && !item.history.contains(&Phase::Done),
+                !item.history.contains(&Phase::ReleaseReady)
+                    && !item.history.contains(&Phase::Done),
                 "{k}: an observation moved an item past Acceptance: {:?}",
                 item.history
             );
@@ -258,7 +306,14 @@ struct Agent<'a> {
 
 impl Agent<'_> {
     /// One real model turn, continuing this agent's own session after the first.
-    fn turn(&mut self, oc_cfg: &Path, bin_dir: &Path, room: &str, prompt: &str, kill_after: Option<Duration>) -> String {
+    fn turn(
+        &mut self,
+        oc_cfg: &Path,
+        bin_dir: &Path,
+        room: &str,
+        prompt: &str,
+        kill_after: Option<Duration>,
+    ) -> String {
         let mut cmd = Command::new("opencode");
         cmd.env_clear();
         for key in ["HOME", "SHELL", "LANG", "TMPDIR", "USER"] {
@@ -275,7 +330,14 @@ impl Agent<'_> {
         args.push(prompt.to_owned());
         cmd.current_dir(&self.project)
             .args(&args)
-            .env("PATH", format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default()))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .env("XDG_CONFIG_HOME", oc_cfg)
             .env("VOX_DATA_DIR", &self.worker.data)
             .env("VOX_CONFIG_DIR", &self.worker.cfg)
@@ -298,9 +360,16 @@ impl Agent<'_> {
         }
         let out = child.wait_with_output().unwrap();
         if timed_out && kill_after.is_none() {
-            eprintln!("[receipt] {} turn TIMED OUT after 240 s and was killed", self.name);
+            eprintln!(
+                "[receipt] {} turn TIMED OUT after 240 s and was killed",
+                self.name
+            );
         }
-        let s = format!("{}\n--- stderr ---\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let s = format!(
+            "{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         eprintln!("[receipt] {} turn {prompt:?}\n{s}", self.name);
         s
     }
@@ -311,7 +380,11 @@ fn instructions(steps: &[&str]) -> String {
         "You are a worker in a shared Vox room ($VOX_ROOM). Use your shell to run each of \
          these commands exactly, in order, substituting nothing except where told, and then \
          reply DONE:\n{}",
-        steps.iter().map(|s| format!("  {s}")).collect::<Vec<_>>().join("\n")
+        steps
+            .iter()
+            .map(|s| format!("  {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     )
 }
 
@@ -323,7 +396,11 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         assert!(allow_unproven("opencode"), "UNPROVEN: the rehearsal needs `opencode` and a credential. Set VOX_PROOF_ALLOW_UNPROVEN=opencode to accept that gap deliberately.");
         return;
     }
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
@@ -351,22 +428,60 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         } else {
             std::fs::write(&plugin, vox_tui::agent_hook::OPENCODE_PLUGIN).unwrap();
         }
-        agents.push(Agent { worker: w, name, project, session: None });
+        agents.push(Agent {
+            worker: w,
+            name,
+            project,
+            session: None,
+        });
     }
     for a in &mut agents {
-        let _ = a.turn(&oc_cfg, &bin_dir, &r, "Reply with exactly: READY", None); // warm
+        let _ = a.turn(&oc_cfg, &bin_dir, &r, "Reply with exactly: READY", None);
+        // warm
     }
 
     // ---- the tracker mints two references and assigns them — its only posts ----
     let (item1, item2) = ("wl:rehearsal#1", "wl:rehearsal#2");
     let mut tracker = Tracker::new(&[item1, item2]);
-    let start = bob.vox(None, &["room", "read", &r, "--json"]).ndjson().last().map(|x| x["entry_hash"].as_str().unwrap().to_owned());
+    let start = bob
+        .vox(None, &["room", "read", &r, "--json"])
+        .ndjson()
+        .last()
+        .map(|x| x["entry_hash"].as_str().unwrap().to_owned());
     for (item, to) in [(item1, "w1"), (item2, "w2")] {
-        let o = bob.vox_in(Some("tracker"), &["room", "post", &r, "--type", "assign", "--work", item, "--to", to, "--op", &format!("op-assign-{}", item.replace([':', '#'], "-")), "-"], Some(&format!("please take {item}")));
+        let o = bob.vox_in(
+            Some("tracker"),
+            &[
+                "room",
+                "post",
+                &r,
+                "--type",
+                "assign",
+                "--work",
+                item,
+                "--to",
+                to,
+                "--op",
+                &format!("op-assign-{}", item.replace([':', '#'], "-")),
+                "-",
+            ],
+            Some(&format!("please take {item}")),
+        );
         assert!(o.ok, "the tracker could not assign: {o:?}");
     }
-    until(alice, None, "the assignments to reach alice", &["room", "read", &r], |o: &Out| o.stdout.contains(item2));
-    let start = start.unwrap_or_else(|| bob.vox(None, &["room", "read", &r, "--json"]).ndjson()[0]["entry_hash"].as_str().unwrap().to_owned());
+    until(
+        alice,
+        None,
+        "the assignments to reach alice",
+        &["room", "read", &r],
+        |o: &Out| o.stdout.contains(item2),
+    );
+    let start = start.unwrap_or_else(|| {
+        bob.vox(None, &["room", "read", &r, "--json"]).ndjson()[0]["entry_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    });
     let adapter = Adapter::start(bob, &r, &start);
 
     // w1 takes item 1 and starts an attempt.
@@ -376,12 +491,21 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         "vox room claim \"$VOX_ROOM\" --work 'wl:rehearsal#1' --ttl 45",
         "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#1' --attempt att-1 starting",
     ]), None);
-    let w1_session = until(bob, None, "w1's claim to reach the tracker's node", &["room", "board", &r, "--json"], |o: &Out| {
-        o.ok && support::resource(&o.json(), item1).is_some()
-    })
+    let w1_session = until(
+        bob,
+        None,
+        "w1's claim to reach the tracker's node",
+        &["room", "board", &r, "--json"],
+        |o: &Out| o.ok && support::resource(&o.json(), item1).is_some(),
+    )
     .json();
-    w1.session = support::resource(&w1_session, item1).and_then(|x| x["owner_session"].as_str()).map(str::to_owned);
-    assert!(w1.session.as_deref().is_some_and(|s| s.starts_with("ses")), "w1's claim must carry its OpenCode session: {w1_session}");
+    w1.session = support::resource(&w1_session, item1)
+        .and_then(|x| x["owner_session"].as_str())
+        .map(str::to_owned);
+    assert!(
+        w1.session.as_deref().is_some_and(|s| s.starts_with("ses")),
+        "w1's claim must carry its OpenCode session: {w1_session}"
+    );
 
     // w2 takes item 2, starts, and is blocked.
     let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
@@ -389,9 +513,24 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#2' --attempt att-2 starting",
         "vox room post \"$VOX_ROOM\" --type blocked --work 'wl:rehearsal#2' --attempt att-2 --data '{\"reason\":\"waiting on the schema\"}' blocked",
     ]), None);
-    let b = until(bob, None, "w2's claim", &["room", "board", &r, "--json"], |o: &Out| o.ok && support::resource(&o.json(), item2).is_some()).json();
-    w2.session = support::resource(&b, item2).and_then(|x| x["owner_session"].as_str()).map(str::to_owned);
-    until(bob, None, "w2's blocked", &["room", "read", &r], |o: &Out| o.stdout.contains("waiting on the schema"));
+    let b = until(
+        bob,
+        None,
+        "w2's claim",
+        &["room", "board", &r, "--json"],
+        |o: &Out| o.ok && support::resource(&o.json(), item2).is_some(),
+    )
+    .json();
+    w2.session = support::resource(&b, item2)
+        .and_then(|x| x["owner_session"].as_str())
+        .map(str::to_owned);
+    until(
+        bob,
+        None,
+        "w2's blocked",
+        &["room", "read", &r],
+        |o: &Out| o.stdout.contains("waiting on the schema"),
+    );
     adapter.pump(&mut tracker);
     tracker.board(&bob.vox(None, &["room", "board", &r, "--json"]).json());
 
@@ -410,8 +549,20 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         "vox room release \"$VOX_ROOM\" 'wl:rehearsal#2'",
     ]), None);
     // (3) w1 dies mid-attempt: its turn is killed and it never renews.
-    let _ = w1.turn(&oc_cfg, &bin_dir, &r, &instructions(&["sleep 300"]), Some(Duration::from_secs(8)));
-    until(bob, None, "w2's failure while the tracker is down", &["room", "read", &r], |o: &Out| o.stdout.contains("the schema never came"));
+    let _ = w1.turn(
+        &oc_cfg,
+        &bin_dir,
+        &r,
+        &instructions(&["sleep 300"]),
+        Some(Duration::from_secs(8)),
+    );
+    until(
+        bob,
+        None,
+        "w2's failure while the tracker is down",
+        &["room", "read", &r],
+        |o: &Out| o.stdout.contains("the schema never came"),
+    );
     std::thread::sleep(Duration::from_secs(45)); // w1's 45 s lease lapses with nobody acting
 
     // The tracker comes back, from its persisted cursor.
@@ -420,13 +571,28 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     tracker.board(&bob.vox(None, &["room", "board", &r, "--json"]).json());
     let (i1, i2) = (&tracker.items[item1], &tracker.items[item2]);
     // ---- (2) failed leaves the item retryable ----
-    assert_eq!(i2.phase, Phase::Ready, "a failed attempt must leave the item retryable: {i2:?}");
-    assert_eq!(i2.attempts.first().and_then(|a| a.outcome), Some("work failure"), "{i2:?}");
+    assert_eq!(
+        i2.phase,
+        Phase::Ready,
+        "a failed attempt must leave the item retryable: {i2:?}"
+    );
+    assert_eq!(
+        i2.attempts.first().and_then(|a| a.outcome),
+        Some("work failure"),
+        "{i2:?}"
+    );
     assert!(i2.owner.is_none(), "{i2:?}");
     // ---- (3) the killed worker's item is retryable, not failed, not done ----
     assert_eq!(i1.phase, Phase::Ready, "{i1:?}");
-    assert_eq!(i1.attempts.first().and_then(|a| a.outcome), Some("expired or released"), "{i1:?}");
-    eprintln!("[proof] checkpoint 2 (after the tracker's absence): {:?}", tracker.items);
+    assert_eq!(
+        i1.attempts.first().and_then(|a| a.outcome),
+        Some("expired or released"),
+        "{i1:?}"
+    );
+    eprintln!(
+        "[proof] checkpoint 2 (after the tracker's absence): {:?}",
+        tracker.items
+    );
 
     // ---- (4) a retry submits a candidate: Acceptance at most ----
     let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
@@ -434,31 +600,70 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#2' --attempt att-3 retrying",
         "vox room post \"$VOX_ROOM\" --type result --work 'wl:rehearsal#2' --attempt att-3 --data '{\"evidence\":[{\"kind\":\"commit\",\"ref\":\"9f3c2e1a\"}]}' candidate-ready",
     ]), None);
-    until(bob, None, "w2's result", &["room", "read", &r], |o: &Out| o.stdout.contains("9f3c2e1a"));
+    until(
+        bob,
+        None,
+        "w2's result",
+        &["room", "read", &r],
+        |o: &Out| o.stdout.contains("9f3c2e1a"),
+    );
     adapter.pump(&mut tracker);
     tracker.board(&bob.vox(None, &["room", "board", &r, "--json"]).json());
-    assert_eq!(tracker.items[item2].phase, Phase::Acceptance, "{:?}", tracker.items[item2]);
+    assert_eq!(
+        tracker.items[item2].phase,
+        Phase::Acceptance,
+        "{:?}",
+        tracker.items[item2]
+    );
     assert_eq!(tracker.items[item2].candidate.as_deref(), Some("9f3c2e1a"));
 
     // ---- (5) release never means Done ----
-    let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&["vox room release \"$VOX_ROOM\" 'wl:rehearsal#2'"]), None);
-    until(bob, None, "w2's release", &["room", "board", &r, "--json"], |o: &Out| o.ok && support::resource(&o.json(), item2).is_none());
+    let _ = w2.turn(
+        &oc_cfg,
+        &bin_dir,
+        &r,
+        &instructions(&["vox room release \"$VOX_ROOM\" 'wl:rehearsal#2'"]),
+        None,
+    );
+    until(
+        bob,
+        None,
+        "w2's release",
+        &["room", "board", &r, "--json"],
+        |o: &Out| o.ok && support::resource(&o.json(), item2).is_none(),
+    );
     adapter.pump(&mut tracker);
     tracker.board(&bob.vox(None, &["room", "board", &r, "--json"]).json());
-    assert_eq!(tracker.items[item2].phase, Phase::Acceptance, "release must not mean Done: {:?}", tracker.items[item2]);
+    assert_eq!(
+        tracker.items[item2].phase,
+        Phase::Acceptance,
+        "release must not mean Done: {:?}",
+        tracker.items[item2]
+    );
     tracker.never_past_acceptance();
     adapter.stop();
     eprintln!("[proof] final: {:?}", tracker.items);
 
     // ---- (7) zero operator commands ----
     let rows = bob.vox(None, &["room", "read", &r, "--json"]).ndjson();
-    let sessions: Vec<String> = [w1.session.clone(), w2.session.clone()].into_iter().flatten().collect();
-    for row in rows.iter().filter(|x| x["envelope"]["data"]["work"].is_string() || x["envelope"]["data"]["resource"].is_string()) {
-        let (kind, from) = (row["envelope"]["type"].as_str().unwrap(), row["envelope"]["from"].as_str().unwrap_or(""));
+    let sessions: Vec<String> = [w1.session.clone(), w2.session.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+    for row in rows.iter().filter(|x| {
+        x["envelope"]["data"]["work"].is_string() || x["envelope"]["data"]["resource"].is_string()
+    }) {
+        let (kind, from) = (
+            row["envelope"]["type"].as_str().unwrap(),
+            row["envelope"]["from"].as_str().unwrap_or(""),
+        );
         if kind == "assign" {
             assert_eq!(from, "tracker", "only the tracker assigns: {row}");
         } else {
-            assert!(sessions.iter().any(|s| s == from), "a work observation not written by a model's own session: {row}");
+            assert!(
+                sessions.iter().any(|s| s == from),
+                "a work observation not written by a model's own session: {row}"
+            );
         }
     }
     assert!(tracker.rows_seen > 0);

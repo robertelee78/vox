@@ -26,10 +26,10 @@
 
 #![cfg(unix)]
 
-#[path = "../../vox-core/tests/support/watchdog.rs"]
-mod watchdog;
 #[path = "support/room.rs"]
 mod support;
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
 
 use support::{post_raw, until, Out, Worker};
 
@@ -62,7 +62,10 @@ fn published_vox() -> Option<std::path::PathBuf> {
         return Some(bin);
     }
     std::fs::create_dir_all(&dir).ok()?;
-    let base = format!("https://github.com/{REPO}/releases/download/v{PUBLISHED}/vox-{}", triple());
+    let base = format!(
+        "https://github.com/{REPO}/releases/download/v{PUBLISHED}/vox-{}",
+        triple()
+    );
     let fetch = |url: &str, out: &std::path::Path| {
         std::process::Command::new("curl")
             .args(["-fsSL", "-o"])
@@ -76,13 +79,23 @@ fn published_vox() -> Option<std::path::PathBuf> {
     if !fetch(&base, &part) || !fetch(&format!("{base}.sha256"), &sum) {
         return None;
     }
-    let want = std::fs::read_to_string(&sum).ok()?.split_whitespace().next()?.to_owned();
+    let want = std::fs::read_to_string(&sum)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .to_owned();
     let got = {
         use sha2::{Digest as _, Sha256};
         let bytes = std::fs::read(&part).ok()?;
-        Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect::<String>()
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
-    assert_eq!(got, want, "the published v{PUBLISHED} binary does not match its published SHA-256");
+    assert_eq!(
+        got, want,
+        "the published v{PUBLISHED} binary does not match its published SHA-256"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -95,7 +108,11 @@ fn published_vox() -> Option<std::path::PathBuf> {
 fn refused_naming(o: &Out, who: &Worker, what: &str) {
     assert_eq!(o.code, Some(3), "a version refusal must exit 3: {o:?}");
     for needle in [&who.b32()[..12], what, &format!("required {VERSION}")] {
-        assert!(o.stderr.contains(needle), "the refusal must name {needle:?}: {}", o.stderr);
+        assert!(
+            o.stderr.contains(needle),
+            "the refusal must name {needle:?}: {}",
+            o.stderr
+        );
     }
 }
 
@@ -122,11 +139,24 @@ fn a_worker_on_another_version_is_refused_by_name() {
         return;
     };
     let old = old.to_string_lossy().into_owned();
-    let v = std::process::Command::new(&old).arg("--version").output().expect("old vox runs");
-    eprintln!("[receipt] {old} --version -> {}", String::from_utf8_lossy(&v.stdout).trim());
-    assert!(String::from_utf8_lossy(&v.stdout).contains(PUBLISHED), "not the published binary");
+    let v = std::process::Command::new(&old)
+        .arg("--version")
+        .output()
+        .expect("old vox runs");
+    eprintln!(
+        "[receipt] {old} --version -> {}",
+        String::from_utf8_lossy(&v.stdout).trim()
+    );
+    assert!(
+        String::from_utf8_lossy(&v.stdout).contains(PUBLISHED),
+        "not the published binary"
+    );
 
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
@@ -134,27 +164,85 @@ fn a_worker_on_another_version_is_refused_by_name() {
 
     // ---- (1) missing: the published v0.2.6 claims, and a fresh current worker is refused ----
     let o = bob.vox_bin(&old, None, &["room", "claim", r, "old-work"], None);
-    eprintln!("[receipt] published v{PUBLISHED} claim -> exit {:?}", o.code);
-    until(alice, None, "the old worker's claim to reach alice", &["room", "read", r, "--json"], |o: &Out| {
-        o.ok && o.ndjson().iter().any(|x| x["envelope"]["type"] == "claim" && x["envelope"]["data"]["vox"].is_null())
-    });
-    assert_eq!(claims_by(alice, alice, r), 0, "precondition: alice has never claimed");
+    eprintln!(
+        "[receipt] published v{PUBLISHED} claim -> exit {:?}",
+        o.code
+    );
+    until(
+        alice,
+        None,
+        "the old worker's claim to reach alice",
+        &["room", "read", r, "--json"],
+        |o: &Out| {
+            o.ok && o
+                .ndjson()
+                .iter()
+                .any(|x| x["envelope"]["type"] == "claim" && x["envelope"]["data"]["vox"].is_null())
+        },
+    );
+    assert_eq!(
+        claims_by(alice, alice, r),
+        0,
+        "precondition: alice has never claimed"
+    );
     let o = alice.vox(Some("a1"), &["room", "claim", r, "new-work"]);
     refused_naming(&o, bob, "no version");
-    assert_eq!(claims_by(alice, alice, r), 0, "a refused claim must never be posted");
+    assert_eq!(
+        claims_by(alice, alice, r),
+        0,
+        "a refused claim must never be posted"
+    );
 
     // ---- (3) post --work, board --json and the drain hook all refuse ----
-    let o = alice.vox_in(Some("a1"), &["room", "post", r, "--type", "working", "--work", "gh:IOMachines/repo-to-cve#1237", "-"], Some("starting"));
+    let o = alice.vox_in(
+        Some("a1"),
+        &[
+            "room",
+            "post",
+            r,
+            "--type",
+            "working",
+            "--work",
+            "gh:IOMachines/repo-to-cve#1237",
+            "-",
+        ],
+        Some("starting"),
+    );
     refused_naming(&o, bob, "no version");
-    let b = alice.vox(Some("a1"), &["room", "board", r, "--json"]).json();
+    let b = alice
+        .vox(Some("a1"), &["room", "board", r, "--json"])
+        .json();
     assert_eq!(b["coordination"], "refused", "{b}");
-    let p = b["participants"].as_array().unwrap().iter().find(|p| p["author"] == bob.b32()).expect("bob in the table");
+    let p = b["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["author"] == bob.b32())
+        .expect("bob in the table");
     assert_eq!(p["stamp"], "missing", "{b}");
-    let hook = alice.vox(Some("a1"), &["agent", "hook", "--room", r, "--format", "text", "--session", "a1"]);
-    assert!(hook.stdout.contains("work coordination refused") && hook.stdout.contains(&bob.b32()[..12]), "the drain hook must say it plainly: {hook:?}");
+    let hook = alice.vox(
+        Some("a1"),
+        &[
+            "agent",
+            "hook",
+            "--room",
+            r,
+            "--format",
+            "text",
+            "--session",
+            "a1",
+        ],
+    );
+    assert!(
+        hook.stdout.contains("work coordination refused") && hook.stdout.contains(&bob.b32()[..12]),
+        "the drain hook must say it plainly: {hook:?}"
+    );
 
     // ---- (4) conversation survives ----
-    let o = alice.vox(Some("a1"), &["room", "post", r, "who is still on the old vox?"]);
+    let o = alice.vox(
+        Some("a1"),
+        &["room", "post", r, "who is still on the old vox?"],
+    );
     assert!(o.ok, "plain conversation must never be refused: {o:?}");
 
     // ---- (2) unknown, then different ----
@@ -165,17 +253,32 @@ fn a_worker_on_another_version_is_refused_by_name() {
         })
         .to_string();
         rt.block_on(post_raw(bob, room.cid, &hello));
-        let o = until(alice, Some("a1"), "alice to see the foreign stamp", &["room", "claim", r, "new-work"], |o: &Out| {
-            o.code == Some(3) && o.stderr.contains(named)
-        });
+        let o = until(
+            alice,
+            Some("a1"),
+            "alice to see the foreign stamp",
+            &["room", "claim", r, "new-work"],
+            |o: &Out| o.code == Some(3) && o.stderr.contains(named),
+        );
         refused_naming(&o, bob, named);
     }
 
     // ---- (5) recovery: the stale worker runs the current binary ----
     let o = bob.vox(Some("b1"), &["room", "claim", r, "bob-work"]);
-    assert!(o.ok && o.stdout.contains("you hold bob-work"), "a current worker among current workers coordinates: {o:?}");
-    let o = until(alice, Some("a1"), "coordination to resume for alice", &["room", "claim", r, "new-work"], |o: &Out| o.ok);
+    assert!(
+        o.ok && o.stdout.contains("you hold bob-work"),
+        "a current worker among current workers coordinates: {o:?}"
+    );
+    let o = until(
+        alice,
+        Some("a1"),
+        "coordination to resume for alice",
+        &["room", "claim", r, "new-work"],
+        |o: &Out| o.ok,
+    );
     assert!(o.stdout.contains("you hold new-work"), "{o:?}");
-    let b = alice.vox(Some("a1"), &["room", "board", r, "--json"]).json();
+    let b = alice
+        .vox(Some("a1"), &["room", "board", r, "--json"])
+        .json();
     assert_eq!(b["coordination"], "ok", "{b}");
 }

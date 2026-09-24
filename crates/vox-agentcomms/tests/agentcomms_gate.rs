@@ -25,7 +25,14 @@ const BOB: [u8; 32] = [2u8; 32];
 const CAROL: [u8; 32] = [3u8; 32];
 
 /// One claim-protocol message, stamped with [`V`], from `author`'s session `s`.
-fn op(author: [u8; 32], s: &str, hash: u8, secs: u64, kind: &str, data: serde_json::Value) -> Posted {
+fn op(
+    author: [u8; 32],
+    s: &str,
+    hash: u8,
+    secs: u64,
+    kind: &str,
+    data: serde_json::Value,
+) -> Posted {
     let mut env = Envelope::new(kind, "");
     env.from = s.to_owned();
     let mut data = data;
@@ -43,7 +50,14 @@ fn op(author: [u8; 32], s: &str, hash: u8, secs: u64, kind: &str, data: serde_js
 }
 
 fn claim(author: [u8; 32], s: &str, hash: u8, secs: u64, resource: &str) -> Posted {
-    op(author, s, hash, secs, CLAIM, serde_json::json!({ "resource": resource }))
+    op(
+        author,
+        s,
+        hash,
+        secs,
+        CLAIM,
+        serde_json::json!({ "resource": resource }),
+    )
 }
 
 fn owner(f: &Fold, r: &str) -> Option<Owner> {
@@ -111,12 +125,18 @@ fn the_fold_converges_in_every_order() {
 /// A tie on time is broken by entry hash, not by arrival.
 #[test]
 fn a_dead_heat_is_broken_deterministically_by_entry_hash() {
-    let msgs = vec![claim(ALICE, "a", 0xF0, 500, "build"), claim(BOB, "b", 0x0F, 500, "build")];
+    let msgs = vec![
+        claim(ALICE, "a", 0xF0, 500, "build"),
+        claim(BOB, "b", 0x0F, 500, "build"),
+    ];
     let mut backwards = msgs.clone();
     backwards.reverse();
     assert_eq!(fold(&msgs, V, 1_000_000), fold(&backwards, V, 1_000_000));
     // 0x0F < 0xF0, so Bob's entry sorts first and Bob wins.
-    assert_eq!(owner(&fold(&msgs, V, 1_000_000), "build"), Some(who(BOB, "b")));
+    assert_eq!(
+        owner(&fold(&msgs, V, 1_000_000), "build"),
+        Some(who(BOB, "b"))
+    );
 }
 
 /// Two sessions on one harness are two owners (ADR-021 F3).
@@ -125,12 +145,22 @@ fn ownership_is_per_session_not_per_harness() {
     let msgs = vec![
         claim(ALICE, "s1", 0x01, 100, "db"),
         claim(ALICE, "s2", 0x02, 101, "db"),
-        op(ALICE, "s2", 0x03, 102, RELEASE, serde_json::json!({"resource": "db"})),
+        op(
+            ALICE,
+            "s2",
+            0x03,
+            102,
+            RELEASE,
+            serde_json::json!({"resource": "db"}),
+        ),
     ];
     let f = fold(&msgs, V, 1_000_000);
     assert_eq!(owner(&f, "db"), Some(who(ALICE, "s1")));
     assert_eq!(f.outcomes.get(&[0x02; 32]), Some(&Outcome::Lost));
-    assert!(matches!(f.outcomes.get(&[0x03; 32]), Some(Outcome::NoEffect(_))));
+    assert!(matches!(
+        f.outcomes.get(&[0x03; 32]),
+        Some(Outcome::NoEffect(_))
+    ));
 }
 
 /// An operation from another version, or with no stamp, changes nothing (ADR-021 §5).
@@ -142,7 +172,10 @@ fn another_versions_operation_changes_nothing() {
     other.envelope.data["vox"] = serde_json::json!("0.2.9");
     let f = fold(&[old, other], V, 1_000_000);
     assert!(f.resources.is_empty());
-    assert_eq!(f.outcomes.get(&[0x01; 32]), Some(&Outcome::OtherVersion(Stamp::Missing)));
+    assert_eq!(
+        f.outcomes.get(&[0x01; 32]),
+        Some(&Outcome::OtherVersion(Stamp::Missing))
+    );
     assert_eq!(
         f.outcomes.get(&[0x02; 32]),
         Some(&Outcome::OtherVersion(Stamp::Other("0.2.9".into())))
@@ -156,14 +189,34 @@ fn a_targeted_handoff_is_completed_only_by_its_session_and_lapses() {
     let to = vox_agentcomms::claim::b32(&BOB);
     let msgs = vec![
         claim(ALICE, "a", 0x01, 100, "t"),
-        op(ALICE, "a", 0x02, 110, HANDOFF, serde_json::json!({"resource": "t", "to_fp": to, "to_session": "b2", "ttl_secs": 30})),
+        op(
+            ALICE,
+            "a",
+            0x02,
+            110,
+            HANDOFF,
+            serde_json::json!({"resource": "t", "to_fp": to, "to_session": "b2", "ttl_secs": 30}),
+        ),
         claim(BOB, "b1", 0x03, 120, "t"),
-        op(BOB, "b1", 0x04, 121, work::DECLINE, serde_json::json!({"resource": "t"})),
+        op(
+            BOB,
+            "b1",
+            0x04,
+            121,
+            work::DECLINE,
+            serde_json::json!({"resource": "t"}),
+        ),
     ];
     let f = fold(&msgs, V, 125_000);
-    assert!(matches!(f.resources.get("t"), Some(State::Pending { .. })), "{f:?}");
+    assert!(
+        matches!(f.resources.get("t"), Some(State::Pending { .. })),
+        "{f:?}"
+    );
     assert_eq!(f.outcomes.get(&[0x03; 32]), Some(&Outcome::Lost));
-    assert!(matches!(f.outcomes.get(&[0x04; 32]), Some(Outcome::NoEffect(_))));
+    assert!(matches!(
+        f.outcomes.get(&[0x04; 32]),
+        Some(Outcome::NoEffect(_))
+    ));
     // Past the handoff's own deadline (110 + 30), it is free.
     assert!(fold(&msgs, V, 141_000).resources.is_empty());
     // The targeted session completes it.
@@ -177,8 +230,22 @@ fn a_targeted_handoff_is_completed_only_by_its_session_and_lapses() {
 fn a_decline_frees_rather_than_returns() {
     let msgs = vec![
         claim(ALICE, "a", 0x01, 100, "t"),
-        op(ALICE, "a", 0x02, 110, HANDOFF, serde_json::json!({"resource": "t", "to_fp": vox_agentcomms::claim::b32(&BOB), "ttl_secs": 300})),
-        op(BOB, "b", 0x03, 120, work::DECLINE, serde_json::json!({"resource": "t"})),
+        op(
+            ALICE,
+            "a",
+            0x02,
+            110,
+            HANDOFF,
+            serde_json::json!({"resource": "t", "to_fp": vox_agentcomms::claim::b32(&BOB), "ttl_secs": 300}),
+        ),
+        op(
+            BOB,
+            "b",
+            0x03,
+            120,
+            work::DECLINE,
+            serde_json::json!({"resource": "t"}),
+        ),
     ];
     assert!(fold(&msgs, V, 130_000).resources.is_empty());
 }
@@ -187,22 +254,66 @@ fn a_decline_frees_rather_than_returns() {
 #[test]
 fn a_renewal_is_bound_to_one_acquisition() {
     let acq = vox_agentcomms::claim::b32(&[0x01; 32]);
-    let base = op(ALICE, "a", 0x01, 100, CLAIM, serde_json::json!({"resource": "r", "ttl_secs": 10}));
-    let renew = op(ALICE, "a", 0x02, 105, RENEW, serde_json::json!({"resource": "r", "acquisition": acq}));
+    let base = op(
+        ALICE,
+        "a",
+        0x01,
+        100,
+        CLAIM,
+        serde_json::json!({"resource": "r", "ttl_secs": 10}),
+    );
+    let renew = op(
+        ALICE,
+        "a",
+        0x02,
+        105,
+        RENEW,
+        serde_json::json!({"resource": "r", "acquisition": acq}),
+    );
     let f = fold(&[base.clone(), renew], V, 112_000);
-    assert!(owner(&f, "r").is_some(), "renewed at 105 for 10s, so held at 112");
+    assert!(
+        owner(&f, "r").is_some(),
+        "renewed at 105 for 10s, so held at 112"
+    );
 
     // Posted after the holding lapsed at 110: revives nothing.
-    let late = op(ALICE, "a", 0x03, 111, RENEW, serde_json::json!({"resource": "r", "acquisition": acq}));
+    let late = op(
+        ALICE,
+        "a",
+        0x03,
+        111,
+        RENEW,
+        serde_json::json!({"resource": "r", "acquisition": acq}),
+    );
     let f = fold(&[base.clone(), late], V, 112_000);
     assert!(f.resources.is_empty());
 
     // A re-claim at 120 is a new acquisition; renewing the OLD one does not extend it.
-    let reclaim = op(ALICE, "a", 0x04, 120, CLAIM, serde_json::json!({"resource": "r", "ttl_secs": 10}));
-    let stale = op(ALICE, "a", 0x05, 125, RENEW, serde_json::json!({"resource": "r", "acquisition": acq}));
+    let reclaim = op(
+        ALICE,
+        "a",
+        0x04,
+        120,
+        CLAIM,
+        serde_json::json!({"resource": "r", "ttl_secs": 10}),
+    );
+    let stale = op(
+        ALICE,
+        "a",
+        0x05,
+        125,
+        RENEW,
+        serde_json::json!({"resource": "r", "acquisition": acq}),
+    );
     let f = fold(&[base, reclaim, stale], V, 131_000);
-    assert!(f.resources.is_empty(), "the old acquisition's renewal extended the new one");
-    assert!(matches!(f.outcomes.get(&[0x05; 32]), Some(Outcome::NoEffect(_))));
+    assert!(
+        f.resources.is_empty(),
+        "the old acquisition's renewal extended the new one"
+    );
+    assert!(matches!(
+        f.outcomes.get(&[0x05; 32]),
+        Some(Outcome::NoEffect(_))
+    ));
 }
 
 /// A retry is one operation; a conflicting reuse voids every entry of it, whatever
@@ -216,14 +327,23 @@ fn a_retry_is_one_operation_and_a_conflict_voids_it() {
     b.envelope.body = "reworded body is still the same operation".into();
     let f = fold(&[b.clone(), a.clone()], V, 1_000_000);
     assert_eq!(owner(&f, "x"), Some(who(ALICE, "a")));
-    assert_eq!(f.outcomes.get(&[0x02; 32]), Some(&Outcome::Duplicate { of: [0x01; 32] }));
+    assert_eq!(
+        f.outcomes.get(&[0x02; 32]),
+        Some(&Outcome::Duplicate { of: [0x01; 32] })
+    );
 
     let mut c = claim(ALICE, "a", 0x03, 99, "y");
     c.envelope.data["op"] = serde_json::json!("same-op-id");
     for order in permutations(&[a, b, c]) {
         let f = fold(&order, V, 1_000_000);
-        assert!(f.resources.is_empty(), "a conflicted operation had an effect");
-        assert!(f.outcomes.values().all(|o| matches!(o, Outcome::Conflict { .. })));
+        assert!(
+            f.resources.is_empty(),
+            "a conflicted operation had an effect"
+        );
+        assert!(f
+            .outcomes
+            .values()
+            .all(|o| matches!(o, Outcome::Conflict { .. })));
     }
 }
 
@@ -232,13 +352,28 @@ fn a_retry_is_one_operation_and_a_conflict_voids_it() {
 fn an_operation_missing_a_required_field_is_invalid() {
     let mut no_session = claim(ALICE, "a", 0x01, 100, "x");
     no_session.envelope.from.clear();
-    let mut handoff_no_ttl = op(ALICE, "a", 0x02, 100, HANDOFF, serde_json::json!({"resource": "x", "to_fp": vox_agentcomms::claim::b32(&BOB)}));
-    handoff_no_ttl.envelope.data.as_object_mut().unwrap().remove("ttl_secs");
+    let mut handoff_no_ttl = op(
+        ALICE,
+        "a",
+        0x02,
+        100,
+        HANDOFF,
+        serde_json::json!({"resource": "x", "to_fp": vox_agentcomms::claim::b32(&BOB)}),
+    );
+    handoff_no_ttl
+        .envelope
+        .data
+        .as_object_mut()
+        .unwrap()
+        .remove("ttl_secs");
     assert!(parse_op(&no_session.envelope).is_err());
     assert!(parse_op(&handoff_no_ttl.envelope).is_err());
     let f = fold(&[no_session], V, 1_000_000);
     assert!(f.resources.is_empty());
-    assert!(matches!(f.outcomes.get(&[0x01; 32]), Some(Outcome::Invalid(_))));
+    assert!(matches!(
+        f.outcomes.get(&[0x01; 32]),
+        Some(Outcome::Invalid(_))
+    ));
 }
 
 // ---- the envelope ----------------------------------------------------------

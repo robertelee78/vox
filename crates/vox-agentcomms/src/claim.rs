@@ -361,7 +361,8 @@ pub fn fold(messages: &[Posted], mine: &str, now_millis: u64) -> Fold {
                 ours.push(m);
             }
             other => {
-                out.outcomes.insert(m.entry_hash, Outcome::OtherVersion(other));
+                out.outcomes
+                    .insert(m.entry_hash, Outcome::OtherVersion(other));
             }
         }
     }
@@ -375,7 +376,8 @@ pub fn fold(messages: &[Posted], mine: &str, now_millis: u64) -> Fold {
         let op = match parse_op(&posted.envelope) {
             Ok(op) => op,
             Err(why) => {
-                out.outcomes.insert(posted.entry_hash, Outcome::Invalid(why));
+                out.outcomes
+                    .insert(posted.entry_hash, Outcome::Invalid(why));
                 continue;
             }
         };
@@ -421,7 +423,8 @@ fn apply(resources: &mut BTreeMap<String, State>, posted: &Posted, op: ClaimOp) 
         session: posted.envelope.from.clone(),
     };
     let at = posted.created_millis;
-    let held_by_who = |s: Option<&State>| matches!(s, Some(State::Held { owner, .. }) if *owner == who);
+    let held_by_who =
+        |s: Option<&State>| matches!(s, Some(State::Held { owner, .. }) if *owner == who);
     match op {
         ClaimOp::Claim { resource, ttl_secs } => {
             let take = match resources.get(&resource) {
@@ -497,27 +500,38 @@ fn apply(resources: &mut BTreeMap<String, State>, posted: &Posted, op: ClaimOp) 
         ClaimOp::Renew {
             resource,
             acquisition,
-        } => match resources.get_mut(&resource) {
-            Some(State::Held {
-                owner,
-                acquisition: current,
-                ttl_secs: Some(ttl),
-                expires_millis,
-                ..
-            }) if *owner == who && *current == acquisition => {
-                *expires_millis = Some(at.saturating_add(ttl.saturating_mul(1_000)));
-                Outcome::Applied
-            }
-            Some(State::Held {
-                owner,
-                acquisition: current,
-                ttl_secs: None,
-                ..
-            }) if *owner == who && *current == acquisition => {
-                Outcome::NoEffect("the holding has no TTL to extend")
-            }
-            _ => Outcome::NoEffect("stale renewal: not the current acquisition of this session"),
-        },
+        } => renew(resources, &resource, &who, acquisition, at),
+    }
+}
+
+/// Rule 5: extend exactly one acquisition, for exactly its session, if it has a TTL.
+fn renew(
+    resources: &mut BTreeMap<String, State>,
+    resource: &str,
+    who: &Owner,
+    acquisition: [u8; 32],
+    at: u64,
+) -> Outcome {
+    match resources.get_mut(resource) {
+        Some(State::Held {
+            owner,
+            acquisition: current,
+            ttl_secs: Some(ttl),
+            expires_millis,
+            ..
+        }) if owner == who && *current == acquisition => {
+            *expires_millis = Some(at.saturating_add(ttl.saturating_mul(1_000)));
+            Outcome::Applied
+        }
+        Some(State::Held {
+            owner,
+            acquisition: current,
+            ttl_secs: None,
+            ..
+        }) if owner == who && *current == acquisition => {
+            Outcome::NoEffect("the holding has no TTL to extend")
+        }
+        _ => Outcome::NoEffect("stale renewal: not the current acquisition of this session"),
     }
 }
 

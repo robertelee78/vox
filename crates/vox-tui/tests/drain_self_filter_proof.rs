@@ -27,10 +27,10 @@
 
 #![cfg(unix)]
 
-#[path = "../../vox-core/tests/support/watchdog.rs"]
-mod watchdog;
 #[path = "support/room.rs"]
 mod support;
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
 
 use std::path::Path;
 use std::process::Command;
@@ -46,15 +46,22 @@ fn allow_unproven(name: &str) -> bool {
 
 fn which(bin: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file())
 }
 
 fn auth_present() -> bool {
-    std::env::var_os("HOME").is_some_and(|h| Path::new(&h).join(".local/share/opencode/auth.json").is_file())
+    std::env::var_os("HOME").is_some_and(|h| {
+        Path::new(&h)
+            .join(".local/share/opencode/auth.json")
+            .is_file()
+    })
 }
 
 fn model() -> String {
-    std::env::var("VOX_PROOF_OPENCODE_MODEL").unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
+    std::env::var("VOX_PROOF_OPENCODE_MODEL")
+        .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
 }
 
 /// What `vox agent hook` injects for `session` on `w`, exactly as a harness runs it.
@@ -62,14 +69,20 @@ fn drain(w: &Worker, r: &str, session: &str) -> String {
     let o = w.vox_in(
         None,
         &["agent", "hook", "--room", r, "--format", "text"],
-        Some(&format!("{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"{session}\"}}")),
+        Some(&format!(
+            "{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"{session}\"}}"
+        )),
     );
     assert!(o.ok, "a drain hook always exits 0: {o:?}");
     o.stdout
 }
 
 fn post(w: &Worker, r: &str, session: &str, body: &str) {
-    let o = w.vox_in(Some(session), &["room", "post", r, "--type", "status", "-"], Some(body));
+    let o = w.vox_in(
+        Some(session),
+        &["room", "post", r, "--type", "status", "-"],
+        Some(body),
+    );
     assert!(o.ok, "{o:?}");
 }
 
@@ -77,7 +90,11 @@ fn post(w: &Worker, r: &str, session: &str, body: &str) {
 #[ignore = "two networked nodes with production Argon2id and a live model turn; CI runs it in release"]
 fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     watchdog::arm();
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let room = rt.block_on(support::room(tmp.path(), &["h", "h-prime"]));
     let (h, hp) = (&room.workers[0], &room.workers[1]);
@@ -88,18 +105,41 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     post(h, r, "B", "SIBLING-B-ON-H");
     post(hp, r, "A", "SAME-NAME-A-ON-H-PRIME");
     for w in [h, hp] {
-        until(w, None, "all three posts everywhere", &["room", "read", r], |o: &Out| {
-            ["OWN-A-ON-H", "SIBLING-B-ON-H", "SAME-NAME-A-ON-H-PRIME"].iter().all(|m| o.stdout.contains(m))
-        });
+        until(
+            w,
+            None,
+            "all three posts everywhere",
+            &["room", "read", r],
+            |o: &Out| {
+                ["OWN-A-ON-H", "SIBLING-B-ON-H", "SAME-NAME-A-ON-H-PRIME"]
+                    .iter()
+                    .all(|m| o.stdout.contains(m))
+            },
+        );
     }
     let a = drain(h, r, "A");
-    assert!(!a.contains("OWN-A-ON-H"), "A's drain re-injected A's own post: {a}");
-    assert!(a.contains("SIBLING-B-ON-H"), "A's drain dropped another session of the same harness: {a}");
-    assert!(a.contains("SAME-NAME-A-ON-H-PRIME"), "A's drain dropped a DIFFERENT harness that uses the same session name: {a}");
+    assert!(
+        !a.contains("OWN-A-ON-H"),
+        "A's drain re-injected A's own post: {a}"
+    );
+    assert!(
+        a.contains("SIBLING-B-ON-H"),
+        "A's drain dropped another session of the same harness: {a}"
+    );
+    assert!(
+        a.contains("SAME-NAME-A-ON-H-PRIME"),
+        "A's drain dropped a DIFFERENT harness that uses the same session name: {a}"
+    );
     let b = drain(h, r, "B");
-    assert!(!b.contains("SIBLING-B-ON-H") && b.contains("OWN-A-ON-H"), "B's drain: {b}");
+    assert!(
+        !b.contains("SIBLING-B-ON-H") && b.contains("OWN-A-ON-H"),
+        "B's drain: {b}"
+    );
     let ap = drain(hp, r, "A");
-    assert!(!ap.contains("SAME-NAME-A-ON-H-PRIME") && ap.contains("OWN-A-ON-H"), "H′'s A drain: {ap}");
+    assert!(
+        !ap.contains("SAME-NAME-A-ON-H-PRIME") && ap.contains("OWN-A-ON-H"),
+        "H′'s A drain: {ap}"
+    );
 
     // ---- live half ----
     if which("opencode").is_none() || !auth_present() {
@@ -117,7 +157,11 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     let oc_cfg = fixture.join("config");
     std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
     std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
-    std::fs::write(project.join(".opencode/plugin/vox.js"), vox_tui::agent_hook::OPENCODE_PLUGIN).unwrap();
+    std::fs::write(
+        project.join(".opencode/plugin/vox.js"),
+        vox_tui::agent_hook::OPENCODE_PLUGIN,
+    )
+    .unwrap();
     let bin_dir = fixture.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let link = bin_dir.join("vox");
@@ -134,7 +178,11 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
                 cmd.env(key, v);
             }
         }
-        let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let out = cmd
             .current_dir(&project)
             .args(["run", "--auto", "-m", &model(), prompt])
@@ -146,8 +194,15 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
             .env("VOX_BIN", VOX)
             .output()
             .expect("run opencode");
-        let s = format!("{}\n--- stderr ---\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        eprintln!("[receipt] opencode run --auto -m {} {prompt:?}\n{s}", model());
+        let s = format!(
+            "{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!(
+            "[receipt] opencode run --auto -m {} {prompt:?}\n{s}",
+            model()
+        );
         s
     };
     let _ = turn("Reply with exactly: READY"); // warm: the first turn in a fresh directory installs
@@ -157,11 +212,18 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
         "Run exactly this shell command and nothing else, then reply DONE: \
          vox room post \"$VOX_ROOM\" --type status {codeword}"
     ));
-    let rows = until(h, None, "the model's post to land", &["room", "read", r, "--json"], |o: &Out| {
-        o.ok && o.stdout.contains(&codeword)
-    })
+    let rows = until(
+        h,
+        None,
+        "the model's post to land",
+        &["room", "read", r, "--json"],
+        |o: &Out| o.ok && o.stdout.contains(&codeword),
+    )
     .ndjson();
-    let mine = rows.iter().find(|x| x["text"].as_str().is_some_and(|t| t.contains(&codeword))).unwrap();
+    let mine = rows
+        .iter()
+        .find(|x| x["text"].as_str().is_some_and(|t| t.contains(&codeword)))
+        .unwrap();
     let session = mine["envelope"]["from"].as_str().unwrap_or("").to_owned();
     assert!(
         session.starts_with("ses"),
@@ -170,8 +232,20 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     );
 
     post(hp, r, "A", "FROM-H-PRIME-AFTER");
-    until(h, None, "H′'s later post to reach H", &["room", "read", r], |o: &Out| o.stdout.contains("FROM-H-PRIME-AFTER"));
+    until(
+        h,
+        None,
+        "H′'s later post to reach H",
+        &["room", "read", r],
+        |o: &Out| o.stdout.contains("FROM-H-PRIME-AFTER"),
+    );
     let d = drain(h, r, &session);
-    assert!(!d.contains(&codeword), "the session's drain re-injected the model's own post: {d}");
-    assert!(d.contains("FROM-H-PRIME-AFTER"), "the session's drain dropped another harness's message: {d}");
+    assert!(
+        !d.contains(&codeword),
+        "the session's drain re-injected the model's own post: {d}"
+    );
+    assert!(
+        d.contains("FROM-H-PRIME-AFTER"),
+        "the session's drain dropped another harness's message: {d}"
+    );
 }

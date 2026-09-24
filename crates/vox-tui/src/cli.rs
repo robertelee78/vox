@@ -1321,16 +1321,31 @@ pub fn run() -> ExitCode {
                         .await
                     }
                     RoomCmd::Release(a) => {
-                        crate::room_cli::release_resource(&paths, &a.room, &a.resource, &a.coord.opts())
-                            .await
+                        crate::room_cli::release_resource(
+                            &paths,
+                            &a.room,
+                            &a.resource,
+                            &a.coord.opts(),
+                        )
+                        .await
                     }
                     RoomCmd::Decline(a) => {
-                        crate::room_cli::decline_resource(&paths, &a.room, &a.resource, &a.coord.opts())
-                            .await
+                        crate::room_cli::decline_resource(
+                            &paths,
+                            &a.room,
+                            &a.resource,
+                            &a.coord.opts(),
+                        )
+                        .await
                     }
                     RoomCmd::Renew(a) => {
-                        crate::room_cli::renew_resource(&paths, &a.room, &a.resource, &a.coord.opts())
-                            .await
+                        crate::room_cli::renew_resource(
+                            &paths,
+                            &a.room,
+                            &a.resource,
+                            &a.coord.opts(),
+                        )
+                        .await
                     }
                     RoomCmd::Handoff(a) => {
                         crate::room_cli::handoff_resource(

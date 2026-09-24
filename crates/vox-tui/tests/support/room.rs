@@ -53,7 +53,9 @@ impl Out {
         self.stdout
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad NDJSON line ({e}): {l}")))
+            .map(|l| {
+                serde_json::from_str(l).unwrap_or_else(|e| panic!("bad NDJSON line ({e}): {l}"))
+            })
             .collect()
     }
 }
@@ -81,13 +83,23 @@ impl Worker {
 
     /// Run a given `vox` binary — the one under test, or a published release — as this
     /// worker.
-    pub fn vox_bin(&self, bin: &str, session: Option<&str>, args: &[&str], stdin: Option<&str>) -> Out {
+    pub fn vox_bin(
+        &self,
+        bin: &str,
+        session: Option<&str>,
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Out {
         use std::io::Write as _;
         let mut cmd = Command::new(bin);
         cmd.args(args)
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
-            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for v in HARNESS_SESSION_VARS {
@@ -113,7 +125,9 @@ impl Worker {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             argv: format!(
                 "{}VOX_DATA_DIR=<{}> {bin} {}",
-                session.map(|s| format!("VOX_SESSION={s} ")).unwrap_or_default(),
+                session
+                    .map(|s| format!("VOX_SESSION={s} "))
+                    .unwrap_or_default(),
                 self.name,
                 args.join(" ")
             ),
@@ -237,14 +251,19 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
     // One wait per worker for the WHOLE set of peers: events are consumed as they are
     // read, so waiting for one peer at a time would discard the event for the next.
     for a in &workers {
-        let mut owed: std::collections::BTreeSet<[u8; 32]> =
-            workers.iter().map(|b| b.fp).filter(|fp| *fp != a.fp).collect();
+        let mut owed: std::collections::BTreeSet<[u8; 32]> = workers
+            .iter()
+            .map(|b| b.fp)
+            .filter(|fp| *fp != a.fp)
+            .collect();
         let names: std::collections::BTreeMap<[u8; 32], String> =
             workers.iter().map(|w| (w.fp, w.name.clone())).collect();
         let waited = tokio::time::timeout(TIMEOUT, async {
             loop {
                 match a.node.next_event().await {
-                    Some(NodeEvent::SenderKeyReceived { channel_id, peer, .. }) if channel_id == cid => {
+                    Some(NodeEvent::SenderKeyReceived {
+                        channel_id, peer, ..
+                    }) if channel_id == cid => {
                         owed.remove(&peer);
                         if owed.is_empty() {
                             return;
@@ -278,7 +297,13 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
 /// Poll a `vox` invocation until its output satisfies `ok`, or fail naming what it
 /// last said. Something posted on one node reaches another through the log, so "has
 /// it arrived yet" has no synchronous answer.
-pub fn until(w: &Worker, session: Option<&str>, what: &str, args: &[&str], ok: impl Fn(&Out) -> bool) -> Out {
+pub fn until(
+    w: &Worker,
+    session: Option<&str>,
+    what: &str,
+    args: &[&str],
+    ok: impl Fn(&Out) -> bool,
+) -> Out {
     let deadline = Instant::now() + TIMEOUT;
     let mut last = None;
     while Instant::now() < deadline {

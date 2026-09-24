@@ -192,7 +192,12 @@ impl OpIndex {
     /// The canonical verdict on one entry, or `None` if it carries no operation id or
     /// was never inserted.
     #[must_use]
-    pub fn verdict(&self, author: [u8; 32], env: &Envelope, entry_hash: [u8; 32]) -> Option<Verdict> {
+    pub fn verdict(
+        &self,
+        author: [u8; 32],
+        env: &Envelope,
+        entry_hash: [u8; 32],
+    ) -> Option<Verdict> {
         let op = op_of(env)?;
         let group = self.groups.get(&(author, op.to_owned()))?;
         if !group.iter().any(|m| m.entry_hash == entry_hash) {

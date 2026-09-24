@@ -111,7 +111,9 @@ pub fn context() -> Context {
         repo,
         worktree,
         branch,
-        cwd: std::env::current_dir().ok().map(|d| d.display().to_string()),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|d| d.display().to_string()),
     }
 }
 
@@ -255,12 +257,19 @@ pub async fn snapshot(client: &mut IpcClient, channel_id: Digest32) -> Result<Sn
 /// The refusal, naming every incompatible worker, its version and the required one.
 #[must_use]
 pub fn refusal(room: &str, table: &VersionTable) -> AppError {
-    let mut msg = format!("work coordination refused in room {}", &room[..12.min(room.len())]);
+    let mut msg = format!(
+        "work coordination refused in room {}",
+        &room[..12.min(room.len())]
+    );
     for p in table.mismatched() {
         msg.push_str(&format!(
             "\n  worker {} session {} runs vox {}; required {}",
             &b32_encode(&p.author)[..12],
-            if p.session.is_empty() { "(none)" } else { &p.session },
+            if p.session.is_empty() {
+                "(none)"
+            } else {
+                &p.session
+            },
             p.stamp.describe(&table.mine),
             table.mine
         ));
@@ -365,7 +374,10 @@ pub async fn post_once(
                 after,
             });
         }
-        return Err(conflict(op, &prior.iter().map(|p| p.entry_hash).collect::<Vec<_>>()));
+        return Err(conflict(
+            op,
+            &prior.iter().map(|p| p.entry_hash).collect::<Vec<_>>(),
+        ));
     }
 
     match ask(

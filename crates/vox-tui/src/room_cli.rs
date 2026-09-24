@@ -313,7 +313,10 @@ pub async fn post_cmd(
             _ => return Err(AppError::Usage("--data must be a JSON object".into())),
         },
     };
-    for reserved in [vox_agentcomms::version::VOX_KEY, vox_agentcomms::ops::OP_KEY] {
+    for reserved in [
+        vox_agentcomms::version::VOX_KEY,
+        vox_agentcomms::ops::OP_KEY,
+    ] {
         if data.contains_key(reserved) {
             return Err(AppError::Usage(format!(
                 "--data may not set {reserved:?}: this binary sets it (use --op for the \
@@ -394,14 +397,19 @@ fn row_json(
 ) -> String {
     let parsed = Envelope::parse(&r.text);
     let (envelope, parse_error) = match &parsed {
-        Ok(e) => (serde_json::to_value(e).unwrap_or(serde_json::Value::Null), None),
+        Ok(e) => (
+            serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
+            None,
+        ),
         Err(e) => (serde_json::Value::Null, Some(e.to_string())),
     };
     let op = parsed.as_ref().ok().and_then(|e| {
         let id = vox_agentcomms::ops::op_of(e)?;
         let (status, group) = match ops.verdict(r.author, e, r.entry_hash) {
             Some(vox_agentcomms::ops::Verdict::Conflict { group }) => ("conflict", group),
-            Some(vox_agentcomms::ops::Verdict::Duplicate { .. }) => ("duplicate", ops.group_of(r.author, e)),
+            Some(vox_agentcomms::ops::Verdict::Duplicate { .. }) => {
+                ("duplicate", ops.group_of(r.author, e))
+            }
             _ => ("ok", ops.group_of(r.author, e)),
         };
         Some(serde_json::json!({
@@ -438,10 +446,7 @@ fn after_cursor(
             .position(|r| r.entry_hash == c)
             .map(|i| i + 1)
             .ok_or_else(|| {
-                AppError::Usage(format!(
-                    "cursor {} is not in this room's timeline",
-                    id(&c)
-                ))
+                AppError::Usage(format!("cursor {} is not in this room's timeline", id(&c)))
             }),
     }
 }
@@ -468,7 +473,11 @@ pub async fn read(
     if !json {
         let rows = coord::read_all(&mut client, channel_id, since).await?;
         let mut out = std::io::stdout().lock();
-        let take = if limit == 0 { rows.len() } else { usize::try_from(limit).unwrap_or(usize::MAX) };
+        let take = if limit == 0 {
+            rows.len()
+        } else {
+            usize::try_from(limit).unwrap_or(usize::MAX)
+        };
         for r in rows.iter().take(take) {
             let _ = writeln!(out, "{} {} {}", id(&r.entry_hash), short(&r.author), r.text);
         }
@@ -482,7 +491,11 @@ pub async fn read(
     for p in coord::posted_of(&all) {
         ops.insert(p.entry_hash, p.author, p.created_millis, &p.envelope);
     }
-    let take = if limit == 0 { usize::MAX } else { usize::try_from(limit).unwrap_or(usize::MAX) };
+    let take = if limit == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX)
+    };
     let mut out = std::io::stdout().lock();
     for r in all[from..].iter().take(take) {
         let _ = writeln!(out, "{}", row_json(&room_key, r, &ops, None));
@@ -528,7 +541,12 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the cursor is not in it.
-pub async fn tail(paths: &Paths, room: &str, since: Option<&str>, json: bool) -> Result<(), AppError> {
+pub async fn tail(
+    paths: &Paths,
+    room: &str,
+    since: Option<&str>,
+    json: bool,
+) -> Result<(), AppError> {
     let (mut lookup, channel_id, room_key) = open_room(paths, room).await?;
     let cursor = match since {
         None => None,
@@ -757,7 +775,12 @@ async fn run_op(
         ..Draft::default()
     };
     let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;
-    let outcome = posting.after.fold.outcomes.get(&posting.entry_hash).cloned();
+    let outcome = posting
+        .after
+        .fold
+        .outcomes
+        .get(&posting.entry_hash)
+        .cloned();
     Ok(Done {
         posting,
         outcome,
@@ -832,7 +855,14 @@ fn outcome_json(o: Option<&Outcome>) -> serde_json::Value {
 
 /// Report a coordinating verb: JSON for a program, a sentence for a person, and the
 /// exit status that is the machine-readable half of whether it did what was asked.
-fn report(done: &Done, kind: &str, resource: &str, opts: &CoordOpts, ok: bool, said: &str) -> Result<(), AppError> {
+fn report(
+    done: &Done,
+    kind: &str,
+    resource: &str,
+    opts: &CoordOpts,
+    ok: bool,
+    said: &str,
+) -> Result<(), AppError> {
     let me = Owner {
         author: done.posting.after.me,
         session: done.session.clone(),
@@ -912,7 +942,15 @@ pub async fn claim_resource(
     if let Some(t) = ttl_secs {
         data.insert("ttl_secs".into(), t.into());
     }
-    let done = run_op(paths, room, opts, claim::CLAIM, data, format!("claiming {resource}")).await?;
+    let done = run_op(
+        paths,
+        room,
+        opts,
+        claim::CLAIM,
+        data,
+        format!("claiming {resource}"),
+    )
+    .await?;
     let me = Owner {
         author: done.posting.after.me,
         session: done.session.clone(),
@@ -924,7 +962,9 @@ pub async fn claim_resource(
     let (ok, said) = match done.posting.after.fold.resources.get(&resource) {
         Some(State::Held { owner, .. }) if *owner == me => (true, format!("you hold {resource}")),
         Some(State::Held {
-            owner, since_millis, ..
+            owner,
+            since_millis,
+            ..
         }) => (
             false,
             format!(
@@ -940,7 +980,10 @@ pub async fn claim_resource(
             format!(
                 "{resource} is reserved by a handoff for {}{} — you did not get it",
                 &claim::b32(to_fp)[..12],
-                to_session.as_ref().map(|s| format!("/{s}")).unwrap_or_default()
+                to_session
+                    .as_ref()
+                    .map(|s| format!("/{s}"))
+                    .unwrap_or_default()
             ),
         ),
         None => (
@@ -970,7 +1013,15 @@ pub async fn release_resource(
     }
     let mut data = serde_json::Map::new();
     data.insert("resource".into(), resource.into());
-    let done = run_op(paths, room, opts, claim::RELEASE, data, format!("releasing {resource}")).await?;
+    let done = run_op(
+        paths,
+        room,
+        opts,
+        claim::RELEASE,
+        data,
+        format!("releasing {resource}"),
+    )
+    .await?;
     let (ok, said) = match &done.outcome {
         Some(Outcome::Applied) => (true, format!("released {resource}")),
         Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not released: {why}")),
@@ -1083,7 +1134,14 @@ pub async fn decline_resource(
         Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not declined: {why}")),
         other => (false, format!("{resource} was not declined: {other:?}")),
     };
-    report(&done, vox_agentcomms::envelope::work::DECLINE, resource, opts, ok, &said)
+    report(
+        &done,
+        vox_agentcomms::envelope::work::DECLINE,
+        resource,
+        opts,
+        ok,
+        &said,
+    )
 }
 
 /// `vox room renew` — extend this session's current holding of a resource.
@@ -1123,11 +1181,29 @@ pub async fn renew_resource(
     let mut data = serde_json::Map::new();
     data.insert("resource".into(), resource.into());
     data.insert("acquisition".into(), claim::b32(&acquisition).into());
-    let done = run_op(paths, room, opts, claim::RENEW, data, format!("renewing {resource}")).await?;
-    let (ok, said) = match (&done.outcome, done.posting.after.fold.resources.get(resource)) {
-        (Some(Outcome::Applied), Some(State::Held { expires_millis: Some(e), .. })) => {
-            (true, format!("renewed {resource} until {}", millis_as_time(*e)))
-        }
+    let done = run_op(
+        paths,
+        room,
+        opts,
+        claim::RENEW,
+        data,
+        format!("renewing {resource}"),
+    )
+    .await?;
+    let (ok, said) = match (
+        &done.outcome,
+        done.posting.after.fold.resources.get(resource),
+    ) {
+        (
+            Some(Outcome::Applied),
+            Some(State::Held {
+                expires_millis: Some(e),
+                ..
+            }),
+        ) => (
+            true,
+            format!("renewed {resource} until {}", millis_as_time(*e)),
+        ),
         (Some(Outcome::NoEffect(why)), _) => (false, format!("{resource} was not renewed: {why}")),
         (other, _) => (false, format!("{resource} was not renewed: {other:?}")),
     };
@@ -1142,7 +1218,12 @@ pub async fn renew_resource(
 ///
 /// # Errors
 /// If the node cannot be reached or the room is unknown.
-pub async fn board(paths: &Paths, room: &str, json: bool, session: Option<&str>) -> Result<(), AppError> {
+pub async fn board(
+    paths: &Paths,
+    room: &str,
+    json: bool,
+    session: Option<&str>,
+) -> Result<(), AppError> {
     let (mut client, cid, room_key) = open_room(paths, room).await?;
     let snap = coord::snapshot(&mut client, cid).await?;
     let session = coord::session(session).unwrap_or_default();
@@ -1248,9 +1329,18 @@ pub async fn board(paths: &Paths, room: &str, json: bool, session: Option<&str>)
                 "{resource}\tpending handoff from {} to {}{}{} (lapses in {}s)",
                 who(from),
                 &claim::b32(to_fp)[..12],
-                to_session.as_ref().map(|s| format!("/{s}")).unwrap_or_default(),
-                if s.is_eligible(&me) { " — you may claim or decline it" } else { "" },
-                deadline_millis.saturating_sub(snap.now_millis).div_ceil(1_000)
+                to_session
+                    .as_ref()
+                    .map(|s| format!("/{s}"))
+                    .unwrap_or_default(),
+                if s.is_eligible(&me) {
+                    " — you may claim or decline it"
+                } else {
+                    ""
+                },
+                deadline_millis
+                    .saturating_sub(snap.now_millis)
+                    .div_ceil(1_000)
             ),
         };
         writeln!(out, "{line}").map_err(AppError::Io)?;

@@ -24,10 +24,10 @@
 
 #![cfg(unix)]
 
-#[path = "../../vox-core/tests/support/watchdog.rs"]
-mod watchdog;
 #[path = "support/room.rs"]
 mod support;
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
 
 use std::time::Duration;
 
@@ -56,24 +56,40 @@ fn renew_text(session: &str, res: &str, acquisition: &str, op: &str) -> String {
 
 fn wait_entries(a: &Worker, b: &Worker, r: &str) {
     let n = board(a, r)["position"]["entries"].clone();
-    until(b, None, "the other node to catch up", &["room", "board", r, "--json"], |o: &Out| {
-        o.ok && o.json()["position"]["entries"] == n
-    });
+    until(
+        b,
+        None,
+        "the other node to catch up",
+        &["room", "board", r, "--json"],
+        |o: &Out| o.ok && o.json()["position"]["entries"] == n,
+    );
 }
 
 #[test]
 #[ignore = "two networked nodes with production Argon2id; CI runs it in release"]
 fn a_renewal_extends_exactly_one_acquisition() {
     watchdog::arm();
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
 
     // ---- (1) renewed outlives its TTL; unrenewed lapses ----
-    assert!(alice.vox(Some("a1"), &["room", "claim", r, "kept", "--ttl", "4"]).ok);
-    assert!(alice.vox(Some("a1"), &["room", "claim", r, "dropped", "--ttl", "4"]).ok);
+    assert!(
+        alice
+            .vox(Some("a1"), &["room", "claim", r, "kept", "--ttl", "4"])
+            .ok
+    );
+    assert!(
+        alice
+            .vox(Some("a1"), &["room", "claim", r, "dropped", "--ttl", "4"])
+            .ok
+    );
     std::thread::sleep(Duration::from_secs(2));
     let o = alice.vox(Some("a1"), &["room", "renew", r, "kept", "--json"]);
     assert!(o.ok, "{o:?}");
@@ -82,49 +98,114 @@ fn a_renewal_extends_exactly_one_acquisition() {
     wait_entries(alice, bob, r);
     for w in [alice, bob] {
         let b = board(w, r);
-        assert!(held(&b, "kept").is_some(), "{}: a renewed claim must outlive its TTL: {b}", w.name);
-        assert!(resource(&b, "dropped").is_none(), "{}: an unrenewed claim must lapse: {b}", w.name);
+        assert!(
+            held(&b, "kept").is_some(),
+            "{}: a renewed claim must outlive its TTL: {b}",
+            w.name
+        );
+        assert!(
+            resource(&b, "dropped").is_none(),
+            "{}: an unrenewed claim must lapse: {b}",
+            w.name
+        );
     }
 
     // ---- (4) another session of the same harness cannot renew ----
     let o = alice.vox(Some("a2"), &["room", "renew", r, "kept"]);
-    assert_eq!(o.code, Some(1), "the CLI must refuse to renew what this session does not hold: {o:?}");
-    let acq_kept = held(&board(alice, r), "kept").unwrap()["acquisition"].as_str().unwrap().to_owned();
-    rt.block_on(post_raw(alice, room.cid, &renew_text("a2", "kept", &acq_kept, "op-a2-renew-kept")));
+    assert_eq!(
+        o.code,
+        Some(1),
+        "the CLI must refuse to renew what this session does not hold: {o:?}"
+    );
+    let acq_kept = held(&board(alice, r), "kept").unwrap()["acquisition"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    rt.block_on(post_raw(
+        alice,
+        room.cid,
+        &renew_text("a2", "kept", &acq_kept, "op-a2-renew-kept"),
+    ));
 
     // ---- (2) a renewal after expiry revives nothing ----
-    assert!(alice.vox(Some("a1"), &["room", "claim", r, "late", "--ttl", "2"]).ok);
-    let acq_late = held(&board(alice, r), "late").unwrap()["acquisition"].as_str().unwrap().to_owned();
+    assert!(
+        alice
+            .vox(Some("a1"), &["room", "claim", r, "late", "--ttl", "2"])
+            .ok
+    );
+    let acq_late = held(&board(alice, r), "late").unwrap()["acquisition"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     std::thread::sleep(Duration::from_secs(3));
-    rt.block_on(post_raw(alice, room.cid, &renew_text("a1", "late", &acq_late, "op-a1-renew-late-1")));
+    rt.block_on(post_raw(
+        alice,
+        room.cid,
+        &renew_text("a1", "late", &acq_late, "op-a1-renew-late-1"),
+    ));
 
     // ---- (3) a renewal of a previous acquisition does not extend the new one ----
-    assert!(alice.vox(Some("a1"), &["room", "claim", r, "again", "--ttl", "8"]).ok);
-    let acq_old = held(&board(alice, r), "again").unwrap()["acquisition"].as_str().unwrap().to_owned();
+    assert!(
+        alice
+            .vox(Some("a1"), &["room", "claim", r, "again", "--ttl", "8"])
+            .ok
+    );
+    let acq_old = held(&board(alice, r), "again").unwrap()["acquisition"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert!(alice.vox(Some("a1"), &["room", "release", r, "again"]).ok);
-    assert!(alice.vox(Some("a1"), &["room", "claim", r, "again", "--ttl", "8"]).ok);
-    let acq_new = held(&board(alice, r), "again").unwrap()["acquisition"].as_str().unwrap().to_owned();
+    assert!(
+        alice
+            .vox(Some("a1"), &["room", "claim", r, "again", "--ttl", "8"])
+            .ok
+    );
+    let acq_new = held(&board(alice, r), "again").unwrap()["acquisition"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert_ne!(acq_old, acq_new, "a re-claim is a new acquisition");
     let before = held(&board(alice, r), "again").unwrap()["expires_millis"].clone();
-    rt.block_on(post_raw(alice, room.cid, &renew_text("a1", "again", &acq_old, "op-a1-renew-old")));
+    rt.block_on(post_raw(
+        alice,
+        room.cid,
+        &renew_text("a1", "again", &acq_old, "op-a1-renew-old"),
+    ));
 
     wait_entries(alice, bob, r);
     let rows = alice.vox(None, &["room", "read", r, "--json"]);
     for row in rows.ndjson() {
-        eprintln!("[row] {} {} {} op={}", row["envelope"]["type"], row["envelope"]["from"], row["envelope"]["data"], row["op"]);
+        eprintln!(
+            "[row] {} {} {} op={}",
+            row["envelope"]["type"], row["envelope"]["from"], row["envelope"]["data"], row["op"]
+        );
     }
     for w in [alice, bob] {
         let b = board(w, r);
-        assert!(resource(&b, "late").is_none(), "{}: a renewal after expiry revived it: {b}", w.name);
-        let again = held(&b, "again").unwrap_or_else(|| panic!("{}: `again` should still be held: {b}", w.name));
-        assert_eq!(again["expires_millis"], before, "{}: a stale renewal extended a later acquisition: {b}", w.name);
+        assert!(
+            resource(&b, "late").is_none(),
+            "{}: a renewal after expiry revived it: {b}",
+            w.name
+        );
+        let again = held(&b, "again")
+            .unwrap_or_else(|| panic!("{}: `again` should still be held: {b}", w.name));
+        assert_eq!(
+            again["expires_millis"], before,
+            "{}: a stale renewal extended a later acquisition: {b}",
+            w.name
+        );
         let stale: Vec<&serde_json::Value> = b["violations"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|v| v["type"] == "renew" && v["outcome"]["no_effect"].is_string())
             .collect();
-        assert_eq!(stale.len(), 3, "{}: the three rejected renewals must each be reported: {b}", w.name);
+        assert_eq!(
+            stale.len(),
+            3,
+            "{}: the three rejected renewals must each be reported: {b}",
+            w.name
+        );
     }
     // …and the new acquisition still lapses on its own clock.
     std::thread::sleep(Duration::from_secs(9));
