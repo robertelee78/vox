@@ -163,32 +163,6 @@ pub struct GovEntry {
 }
 
 impl GovEntry {
-    /// Construct a positioned governance entry from **caller-supplied, unverified**
-    /// coordinates. This is crate-private precisely because it trusts its inputs:
-    /// forged `entry_hash` / `author_id` / `seq` would corrupt the evaluator's
-    /// canonical order and tie-breaks. Production callers MUST use
-    /// [`GovEntry::from_verified_log_entry`], which recomputes every coordinate from
-    /// a verified M5 [`Entry`]. The crate's own builders (e.g. the golden-vector
-    /// harness) use this directly because they construct the entries from trusted,
-    /// freshly-signed data.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn from_parts(
-        body: GovBody,
-        entry_hash: Digest32,
-        author_id: Digest32,
-        seq: u64,
-        causal_predecessors: BTreeSet<Digest32>,
-    ) -> Self {
-        Self {
-            body,
-            entry_hash,
-            author_id,
-            seq,
-            causal_predecessors,
-        }
-    }
-
     /// Build a positioned governance entry from a **verified** M5 log entry — the
     /// only production-trusted construction path (closes the forged-coordinate
     /// vector).

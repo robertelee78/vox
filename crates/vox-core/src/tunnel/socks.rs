@@ -10,9 +10,9 @@
 //! via the Dial capability, ADR-013), and only the **CONNECT** command is
 //! supported (TCP tunneling).
 //!
-//! The protocol codec is exercised both by byte-level unit tests and an in-memory
-//! duplex handshake test; the functions are generic over the stream so they work
-//! with a real `TcpStream` and with [`tokio::io::duplex`].
+//! The functions are generic over the stream, so they work with a real
+//! `TcpStream`; the codec is proven through the shipped binary by
+//! `service_rehearsal_proof`, a real SOCKS5 client through a real `vox up`.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 

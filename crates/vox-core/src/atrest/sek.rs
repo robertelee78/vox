@@ -23,19 +23,17 @@
 //! ## Argon2id profiles — production const vs reduced test (the M3-Equihash lesson)
 //! Production `factor_pass` is **memory-hard on purpose**: ADR-010 mandates
 //! Argon2id ≥256 MiB, ≥3 passes ([`ADR_MIN_M_COST_KIB`], [`ADR_MIN_T_COST`]).
-//! Running that in a unit test would burn seconds and a quarter-gig of RSS per
-//! call. So [`Argon2Profile::PRODUCTION`] carries the real parameters and **is
-//! the default** ([`Argon2Profile::default`]); this crate's own unit tests use a
-//! `#[cfg(test)]`-only reduced profile (tiny memory, one pass). The production
-//! profile is checked against the floor at **compile time** (a `const` assertion,
+//! [`Argon2Profile::PRODUCTION`] carries the real parameters and **is the
+//! default** ([`Argon2Profile::default`]). It is checked against the floor at
+//! **compile time** (a `const` assertion,
 //! so it can never silently regress), exactly as M3 asserts the real Equihash
 //! `(200,9)` parameters without solving them.
 //!
 //! The floor is **structural**, not a runtime check: [`Argon2Profile`]'s fields
 //! are private, so the only profiles a production build can construct or resolve
-//! (`from_id`) are the floor-meeting constants. The reduced profile does not exist
-//! outside `cfg(test)` — a wrap naming its id is simply un-openable in production
-//! (2026-09-19 review: it used to resolve, letting an 8 KiB/1-pass wrap unlock).
+//! (`from_id`) are the floor-meeting constants. A wrap naming the retired reduced
+//! profile's id is simply un-openable (2026-09-19 review: it used to resolve,
+//! letting an 8 KiB/1-pass wrap unlock).
 //!
 //! ## KDF-profile version → transparent re-wrap
 //! The wrap records its profile *id*, so a future build can raise the Argon2id
@@ -107,15 +105,15 @@ pub struct Argon2Profile {
 impl Argon2Profile {
     /// Profile id of [`Argon2Profile::PRODUCTION`].
     pub const PRODUCTION_ID: u8 = 1;
-    /// Profile id of the `#[cfg(test)]`-only reduced profile. Kept as a public
-    /// constant so the id stays reserved and documented; a production build does
-    /// not resolve it.
+    /// Profile id of a retired reduced profile (8 KiB, 1 pass) that only unit
+    /// tests used. Kept as a public constant so the id stays reserved and is never
+    /// reassigned; no build resolves it.
     pub const REDUCED_ID: u8 = 2;
 
     /// The **production** passphrase-factor profile (ADR-010 §"Post-quantum
     /// strength of the at-rest factors"): Argon2id, **256 MiB, 3 passes,
     /// parallelism 1**. This is the [`Argon2Profile::default`] used by real
-    /// builds. It is intentionally expensive; do not run it in unit tests.
+    /// builds. It is intentionally expensive.
     pub const PRODUCTION: Argon2Profile = Argon2Profile {
         id: Self::PRODUCTION_ID,
         m_cost_kib: 256 * 1024, // 256 MiB
@@ -123,27 +121,13 @@ impl Argon2Profile {
         p_cost: 1,
     };
 
-    /// A **reduced** profile for this crate's unit tests only: 8 KiB, 1 pass. Fast
-    /// and tiny so the double-lock crypto can be exercised without minutes of CPU
-    /// or hundreds of MiB of RSS. It does not exist in a non-test build, so it can
-    /// be neither sealed under nor resolved from a stored id there.
-    #[cfg(test)]
-    pub const REDUCED: Argon2Profile = Argon2Profile {
-        id: Self::REDUCED_ID,
-        m_cost_kib: 8,
-        t_cost: 1,
-        p_cost: 1,
-    };
-
     /// Resolve a profile from its stored id. Unknown ids are rejected so a wrap
     /// cannot name a profile this build does not understand — and every id a
     /// production build *does* understand meets the ADR-010 floor by
-    /// construction (the reduced test profile resolves only under `cfg(test)`).
+    /// construction.
     pub fn from_id(id: u8) -> Result<Self> {
         match id {
             Self::PRODUCTION_ID => Ok(Self::PRODUCTION),
-            #[cfg(test)]
-            Self::REDUCED_ID => Ok(Self::REDUCED),
             _ => Err(Error::MalformedAtRest("unknown argon2 profile id")),
         }
     }
@@ -186,7 +170,7 @@ impl Argon2Profile {
 
 impl Default for Argon2Profile {
     /// The production profile is the default — the hardened parameters ship by
-    /// default; only this crate's unit tests opt down to the reduced profile.
+    /// default, and no weaker profile exists.
     fn default() -> Self {
         Self::PRODUCTION
     }
@@ -507,18 +491,5 @@ impl SekWrap {
             nonce,
             ciphertext,
         })
-    }
-}
-
-#[cfg(test)]
-mod production_timing_spike {
-    //! Not a regular test: run with `cargo test --release -- --ignored production_kdf_timing`.
-    use super::*;
-    #[test]
-    #[ignore = "timing spike for the production Argon2id profile"]
-    fn production_kdf_timing() {
-        let t = std::time::Instant::now();
-        let _ = factor_pass(b"pp", &[7u8; SALT_LEN], Argon2Profile::PRODUCTION).unwrap();
-        eprintln!("production argon2id: {:?}", t.elapsed());
     }
 }
