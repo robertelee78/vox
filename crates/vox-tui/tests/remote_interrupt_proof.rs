@@ -114,7 +114,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     let b_paths = Paths::resolve("default", Some(&b_data), Some(&b_cfg)).unwrap();
 
     // ---- alice (stays in-process) and bob (in-process only to join and trust) ----
-    let (alice, cid, _a_sock) = rt.block_on(async {
+    let (alice, cid, _a_sock, a_fp, b_fp) = rt.block_on(async {
         let alice = Node::spawn_networked(a_paths.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
         let bob = Node::spawn_networked(b_paths.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
         for n in [&alice, &bob] {
@@ -176,9 +176,14 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         }
         let _ = bob.apply(NodeCommand::Shutdown).await;
         let sock = vox_core::node::ipc::bind(alice.clone(), &a_paths).expect("alice socket");
-        (alice, cid, sock)
+        (alice, cid, sock, a_fp, b_fp)
     });
     let room = vox_core::node::link::b32_encode(&cid);
+    // PRD-001 R15: `to` carries fingerprints on the wire.
+    let (bob_fp, alice_fp) = (
+        vox_core::node::link::b32_encode(&b_fp),
+        vox_core::node::link::b32_encode(&a_fp),
+    );
 
     // ---- bob is now the real `vox daemon`, holding the room ----
     let err_path = tmp.path().join("daemon.err");
@@ -231,19 +236,25 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     rt.block_on(post(
         &alice,
         cid,
-        r#"{"v":1,"type":"ask","to":["carol"],"urgent":true,"body":"carol: OTHER-ADDRESSEE"}"#,
+        &format!(r#"{{"v":1,"type":"ask","to":["{alice_fp}"],"urgent":true,"body":"alice: OTHER-ADDRESSEE"}}"#),
     ));
     // ---- (3) addressed to bob, not urgent: nothing ----
     rt.block_on(post(
         &alice,
         cid,
-        r#"{"v":1,"type":"ask","to":["bob"],"body":"bob: NOT-URGENT"}"#,
+        &format!(r#"{{"v":1,"type":"ask","to":["{bob_fp}"],"body":"bob: NOT-URGENT"}}"#),
     ));
     // ---- (1) addressed to bob and urgent: woken ----
     rt.block_on(post(
         &alice,
         cid,
-        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: WAKE-UP-FROM-ALICE"}"#,
+        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: BY-PETNAME-ONLY"}"#,
+    ));
+    // ---- (1) addressed to bob's FINGERPRINT and urgent: woken ----
+    rt.block_on(post(
+        &alice,
+        cid,
+        &format!(r#"{{"v":1,"type":"ask","to":["{bob_fp}"],"urgent":true,"body":"bob: WAKE-UP-FROM-ALICE"}}"#),
     ));
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -277,6 +288,10 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         "a message addressed to another agent must not interrupt bob"
     );
     assert!(
+        !all.contains("BY-PETNAME-ONLY"),
+        "a petname in `to` addresses nobody: addressing is by fingerprint (PRD-001 R15)"
+    );
+    assert!(
         !all.contains("NOT-URGENT"),
         "an addressed message that is not urgent must wait for the next turn"
     );
@@ -287,6 +302,51 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
             .count(),
         1,
         "one urgent message wakes the session once: {woken:?}"
+    );
+
+    // ---- (4) through the CLI: `--to` takes a fingerprint PREFIX and writes it in full ----
+    let out = Command::new(VOX)
+        .args([
+            "room",
+            "post",
+            &room,
+            "--type",
+            "ask",
+            "--urgent",
+            "--to",
+            &bob_fp[..10],
+            "-",
+        ])
+        .env("VOX_DATA_DIR", &a_data)
+        .env("VOX_CONFIG_DIR", &a_cfg)
+        .env("VOX_SESSION", "alice-cli")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            c.stdin.take().unwrap().write_all(b"bob: VIA-THE-CLI")?;
+            c.wait_with_output()
+        })
+        .expect("vox room post");
+    assert!(
+        out.status.success(),
+        "vox room post --to <prefix>: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut via_cli = false;
+    while Instant::now() < deadline && !via_cli {
+        if let Ok(frames) = inbox.recv_timeout(Duration::from_millis(500)) {
+            eprintln!("[receipt] bob's session received: {frames}");
+            via_cli = frames.contains("VIA-THE-CLI");
+        }
+    }
+    assert!(
+        via_cli,
+        "`vox room post --to <fingerprint prefix> --urgent` must wake the addressee"
     );
     drop(alice);
 }

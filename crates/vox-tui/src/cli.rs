@@ -718,7 +718,8 @@ pub struct RoomPostArgs {
     /// The attempt, carried opaquely in `data.attempt`.
     #[arg(long)]
     pub attempt: Option<String>,
-    /// Address a session by petname; repeat for several.
+    /// Address a room member by fingerprint, or a unique prefix of one as `vox room
+    /// roster` prints it; repeat for several. Written in full on the wire (PRD-001 R15).
     #[arg(long)]
     pub to: Vec<String>,
     /// May interrupt an addressed session mid-turn.

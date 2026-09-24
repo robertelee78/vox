@@ -482,10 +482,13 @@ pub fn run_node(
 const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The interrupt decision for one entry that just landed in `channel_id`: wake every
-/// session registered for that room that this message both addresses and marks urgent
-/// (ADR-020 §6). Everything else waits for the session's next turn.
+/// session of this node registered for that room, when the message is urgent and its `to`
+/// names **this node's fingerprint** (ADR-020 §6; PRD-001 R15, ADR-021 §9). A petname is
+/// local to whoever typed it, so addressing is by fingerprint on the wire; a session's
+/// `VOX_AGENT_NAME` is a display label and no longer an addressing key.
 async fn judge(
     paths: &vox_core::node::paths::Paths,
+    me: &str,
     channel_id: &vox_core::hash::Digest32,
     text: &str,
 ) {
@@ -494,10 +497,10 @@ async fn judge(
     };
     let room = vox_core::node::link::b32_encode(channel_id);
     for session in crate::wake::registered(paths) {
-        if session.room != room || session.name.is_empty() {
+        if session.room != room {
             continue;
         }
-        if !envelope.may_interrupt(&session.name) {
+        if !envelope.may_interrupt(me) {
             continue;
         }
         let text = format!(
@@ -866,6 +869,12 @@ pub fn run_daemon(
                 .flat_map(|d| d.timeline.iter().map(|r| r.entry_hash))
                 .collect();
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            // This node's own fingerprint: what an addressed message names in `to`.
+            let me = node
+                .view()
+                .identity
+                .map(|i| vox_core::node::link::b32_encode(&i.fingerprint))
+                .unwrap_or_default();
             loop {
                 let sweep = tokio::select! {
                     item = events.next() => match item {
@@ -879,7 +888,7 @@ pub fn run_daemon(
                             match ev {
                                 vox_core::node::api::NodeEvent::NewEntry { channel_id, row } => {
                                     if seen.insert(row.entry_hash) {
-                                        judge(&paths, &channel_id, &row.text).await;
+                                        judge(&paths, &me, &channel_id, &row.text).await;
                                     }
                                     false
                                 }
@@ -909,7 +918,7 @@ pub fn run_daemon(
                         .map(|(cid, _, text)| (cid, text))
                         .collect();
                     for (cid, text) in fresh {
-                        judge(&paths, &cid, &text).await;
+                        judge(&paths, &me, &cid, &text).await;
                     }
                 }
             }

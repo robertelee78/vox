@@ -353,6 +353,30 @@ pub async fn post_cmd(
         None => coord::new_op()?,
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
+    // **Addressing is by fingerprint on the wire** (PRD-001 R15, ADR-021 §9): a petname is
+    // local to whoever typed it, so `--to` takes a room member's fingerprint or a unique
+    // prefix of one, resolved here, once, and written in full.
+    let to = if opts.to.is_empty() {
+        Vec::new()
+    } else {
+        let members = match client.request(&Request::Roster { channel_id: cid }).await {
+            Ok(Frame::Members { members }) => members,
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
+        let mut out = Vec::new();
+        for t in &opts.to {
+            let fp = resolve_prefix(t, &members).map_err(|e| {
+                AppError::Usage(format!(
+                    "--to {t:?}: name a room member by fingerprint, or a unique prefix of one \
+                     as `vox room roster` prints it ({e})"
+                ))
+            })?;
+            out.push(id(&fp));
+        }
+        out
+    };
     let snap = if opts.work.is_some() {
         coord::participate(&mut client, cid, &room_key, &session).await?
     } else {
@@ -360,7 +384,7 @@ pub async fn post_cmd(
     };
     let draft = Draft {
         kind,
-        to: opts.to.clone(),
+        to,
         urgent: opts.urgent,
         re: opts.re.clone(),
         thread: opts.thread.clone(),
