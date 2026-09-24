@@ -132,8 +132,8 @@
 //!   leaf carries the Vox composite identity (ADR-002) in a custom X.509 extension
 //!   plus a composite proof-of-possession over `"vox-tls-handshake:" ‖
 //!   cert_public_key`, which the verifier recovers and matches against the expected
-//!   peer (mismatch → wire error `0x05`). 0-RTT is disabled; datagrams carry a
-//!   64-bit sequence + a DTLS-style sliding anti-replay window (default 1024); the
+//!   peer (mismatch → wire error `0x05`). 0-RTT is disabled; datagrams travel on
+//!   stream-bound flows routed by one reader per connection (ADR-022); the
 //!   negotiated suite/group is recorded in a session-establishment entry (tag
 //!   `0x0011`) for end-to-end downgrade auditability. M5's [`log::sync::Transport`]
 //!   gets a real quinn-backed implementation so anti-entropy sync runs over QUIC.
