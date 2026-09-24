@@ -1,5 +1,5 @@
-//! The one-shot tunnel verbs (ADR-013, M16.1): `vox service add|remove|list`,
-//! `vox grant`, `vox forward`.
+//! The one-shot tunnel verbs (ADR-013, M16.1): `vox service add|remove|list` and
+//! `vox forward`.
 //!
 //! Each one spawns the node, unlocks the identity, opens the room, does its work and
 //! leaves — except `forward`, which serves until interrupted, because a forwarded port
@@ -149,7 +149,7 @@ pub fn identity_passphrase_for(
 /// What to say when another `vox` already holds this profile.
 ///
 /// Shared by both spawn paths: the first version of this covered `open_profile` only, so
-/// `serve`, `connect`, `service`, `forward`, `grant` and `up` — which go through
+/// `serve`, `connect`, `service`, `forward` and `up` — which go through
 /// `open_room` — still got the bare "another vox already has this profile open" with no
 /// remedy, which is the message the fix existed to replace.
 fn profile_busy(socket: &std::path::Path) -> AppError {
@@ -313,46 +313,6 @@ pub fn service_list(node: &NodeHandle, channel_id: Digest32) {
     for (tag, addr) in &detail.services {
         println!("  {tag}  →  {addr}");
     }
-}
-
-/// `vox grant`
-pub async fn grant(
-    node: &NodeHandle,
-    channel_id: Digest32,
-    member_prefix: &str,
-    tag: &str,
-    may_bind: bool,
-    days: u64,
-    now: u64,
-) -> Result<(), AppError> {
-    let view = node.view();
-    let members: Vec<Digest32> = view
-        .open_channels
-        .iter()
-        .find(|d| d.channel_id == channel_id)
-        .map(|d| d.members.clone())
-        .unwrap_or_default();
-    let target = resolve_prefix(member_prefix, &members)?;
-    let expiry = now.saturating_add(days.saturating_mul(86_400));
-    let out = node
-        .apply(NodeCommand::GrantTunnel {
-            channel_id,
-            target,
-            service_tag: tag.to_owned(),
-            may_bind,
-            expiry,
-        })
-        .await;
-    if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot grant: {out:?}")));
-    }
-    println!(
-        "vox: {} may now dial {tag:?}{}",
-        short(&target),
-        if may_bind { " (and offer it)" } else { "" }
-    );
-    println!("     the grant is on the room's log; every member converges on it");
-    Ok(())
 }
 
 /// `vox forward` — serves until interrupted.

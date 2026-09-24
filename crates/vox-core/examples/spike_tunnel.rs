@@ -1,6 +1,6 @@
 //! Manual spike (ADR-013/ADR-015 "verified-actually-working"): real TCP carried
-//! through a real Vox QUIC tunnel between two separate OS processes, with the Dial
-//! capability enforced by a real ADR-007 evaluator.
+//! through a real Vox QUIC tunnel between two separate OS processes, with reach
+//! enforced by the host's reacher set (ADR-017 decision 3).
 //!
 //!   spike_tunnel host                  # echo service behind a dark tunnel; prints ADDR/ID
 //!   spike_tunnel client <addr> <id>    # forwards a local port through the tunnel, round-trips
@@ -13,7 +13,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use vox_core::governance::evaluator::Evaluator;
 use vox_core::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
 use vox_core::hash::Digest32;
 use vox_core::identity::composite::SoftwareRootSigner;
@@ -85,9 +84,8 @@ async fn host() {
     // two processes must derive the *same* one or the dial names a channel the host
     // does not serve.
     let genesis = Genesis::create_with_nonce(&admin, GENESIS_CREATED, policy(), [9u8; 16]).unwrap();
-    // The dialer names this channel; the host checks the claim against its evaluator.
+    // The dialer names this channel; the host checks the dialer against its reachers.
     let channel_id = genesis.channel_id();
-    let evaluator = std::sync::Arc::new(Evaluator::build(&genesis, &[], now(), |_| None).unwrap());
 
     let host_signer = SoftwareRootSigner::from_component_seeds(&[1u8; 32], &[2u8; 32]).unwrap();
     let ep = VoxEndpoint::bind(&host_signer, "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -104,7 +102,6 @@ async fn host() {
     // to enforce `dial:echo` from the capability lattice; that model is withdrawn.
     match session::accept(send, recv, &client_id, |cid, tag| {
         (*cid == channel_id && tag == "echo").then_some(session::HostService {
-            evaluator: std::sync::Arc::clone(&evaluator),
             endpoint: echo_addr,
             reachers: std::sync::Arc::new(tokio::sync::watch::Sender::new(
                 [client_id].into_iter().collect(),

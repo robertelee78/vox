@@ -112,7 +112,7 @@ where
     // **Not `passphrase_or_prompt`.** Removing clap's `env` from the flag — so a flag
     // could be refused while the variable still worked — left this caller reading the
     // flag only, and the flag is now always `None`. So `VOX_IDENTITY_PASSPHRASE` stopped
-    // working for every tunnel verb (`service`, `forward`, `grant`, `up`) and they
+    // working for every tunnel verb (`service`, `forward`, `up`) and they
     // answered `Failed(WrongPassphrase)`, which sends a person to check a passphrase that
     // was never read. One helper reads the flag, the file, the variable and the prompt,
     // in that order; every caller uses it.
@@ -785,23 +785,6 @@ pub struct ForwardArgs {
     pub local: SocketAddr,
 }
 
-/// `vox grant`
-#[derive(Args, Debug, Clone)]
-pub struct GrantArgs {
-    #[command(flatten)]
-    pub room: RoomArgs,
-    /// The member being granted (fingerprint or unique prefix).
-    pub member: String,
-    /// The service tag they may dial.
-    pub tag: String,
-    /// Also let them offer the service themselves.
-    #[arg(long)]
-    pub may_bind: bool,
-    /// How long the grant lasts, in days.
-    #[arg(long, default_value_t = 365)]
-    pub days: u64,
-}
-
 /// `vox serve`
 #[derive(Args, Debug, Clone)]
 pub struct ServeArgs {
@@ -968,22 +951,6 @@ enum Cmd {
     /// Forward a local port to a member's service over the overlay — `ssh` over Vox
     /// (ADR-013). Runs until interrupted.
     Forward(ForwardArgs),
-    /// **Withdrawn.** Refuses, and says what to run instead.
-    ///
-    /// It issued `dial:` and `bind:` capabilities as facts on the room's log. ADR-017's
-    /// third revision withdrew that whole model — the genesis service grant, `0x0013`,
-    /// `bind:` and this verb — and nothing has consulted those capabilities since M17.7:
-    /// a service's reach is `reachers`, the intersection of the host's trust keyring with
-    /// the room's authors. `vox service --help` has said `vox grant` is withdrawn for some
-    /// time while this verb went on accepting arguments and reporting success.
-    ///
-    /// That is worse than a stale help string, because it is an act. A person granted a
-    /// colleague ssh, was told it worked, and it granted nothing — and they had no reason
-    /// to look for the `vox trust add` that would have.
-    ///
-    /// Kept in the parser so that anything scripted against it fails with a message naming
-    /// the replacement, rather than failing to parse..
-    Grant(GrantArgs),
     /// Print this profile's own identity fingerprint — what to send someone so they can
     /// trust you (ADR-002).
     ///
@@ -1410,25 +1377,6 @@ pub fn run() -> ExitCode {
                     crate::tunnel_cli::trust_remove(&node, &a.fingerprint).await
                 },
             )
-        }
-        // Refused, not run. It wrote `dial:`/`bind:` capability facts that nothing has
-        // consulted since M17.7 — and reported success, so a person believed they had
-        // granted reach they had not. Unlocking the profile to do nothing would also make
-        // it fail differently depending on whether a daemon happened to be running, which
-        // is the wrong thing to vary on.
-        Cmd::Grant(args) => {
-            eprintln!(
-                "vox: `vox grant` is withdrawn, and granted nothing for some time before \
-                 this said so.\n\
-                 \x20      It issued a `dial:` capability on the room's log; a service's \
-                 reach has been the host's trust keyring since M17.7 (ADR-017 decision 3), \
-                 and the capability was never consulted.\n\
-                 \x20      To let {} reach your services:  vox trust add {}\n\
-                 \x20      That decides who may read you and reach you, in every room you \
-                 share — it is not per-service and not per-room.",
-                args.member, args.member
-            );
-            ExitCode::FAILURE
         }
         Cmd::Up(args) => {
             let bind = args.bind;

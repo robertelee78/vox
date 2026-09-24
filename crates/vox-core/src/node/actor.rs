@@ -1516,16 +1516,6 @@ impl Node {
                 channel_id,
                 service_tag,
             } => self.remove_service(&channel_id, &service_tag).await,
-            NodeCommand::GrantTunnel {
-                channel_id,
-                target,
-                service_tag,
-                may_bind,
-                expiry,
-            } => {
-                self.grant_tunnel(&channel_id, &target, &service_tag, may_bind, expiry)
-                    .await
-            }
             NodeCommand::Forward {
                 channel_id,
                 host,
@@ -4623,51 +4613,6 @@ impl Node {
         }
     }
 
-    /// Grant a member `dial:<tag>` (and optionally `bind:<tag>`) in a channel, as an
-    /// ADR-007 certificate on the log. The grant is pushed to peers like any other
-    /// local append, so it converges without anyone being told.
-    async fn grant_tunnel(
-        &mut self,
-        channel_id: &Digest32,
-        target: &Digest32,
-        service_tag: &str,
-        may_bind: bool,
-        expiry: u64,
-    ) -> Outcome {
-        use crate::governance::capability::{Capability, CapabilitySet};
-        let now = self.now();
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return Outcome::Failed(Fault::ChannelNotOpen);
-        };
-        let mut caps = CapabilitySet::from_iter_caps([Capability::dial(service_tag)]);
-        if may_bind {
-            caps.insert(Capability::bind(service_tag));
-        }
-        let outcome = {
-            let mut channel = shared.lock().await;
-            // The target must be an admitted author: a certificate naming an identity
-            // the channel does not know could never be verified by anyone.
-            let Some(key) = channel
-                .author_keys()
-                .into_iter()
-                .find(|k| k.fingerprint() == *target)
-            else {
-                return Outcome::Failed(Fault::UnknownChannel);
-            };
-            channel.grant_capabilities(profile, &key, caps, expiry, now)
-        };
-        match outcome {
-            Ok(_) => {
-                self.note_local_append(channel_id);
-                Outcome::Done
-            }
-            Err(e) => Outcome::Failed(fault_of(&e)),
-        }
-    }
-
     /// Forward a local port to a member's service (ADR-013 Dial, M16.1): reach the
     /// member through the whole ADR-012 ladder, then bind the port.
     /// Bring up the SOCKS5 entry point for one room (ADR-017 decision 5).
@@ -4829,7 +4774,6 @@ impl Node {
             out.insert(
                 *cid,
                 crate::node::tunnel::ChannelServices {
-                    evaluator: ch.evaluator_handle(),
                     services: ch.services().clone(),
                     reachers: Arc::clone(reachers),
                 },

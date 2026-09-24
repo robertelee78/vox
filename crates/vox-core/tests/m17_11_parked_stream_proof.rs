@@ -52,7 +52,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
 use vox_core::governance::capability::CapabilitySet;
-use vox_core::governance::evaluator::Evaluator;
 use vox_core::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
 use vox_core::identity::composite::{RootSigner, SoftwareRootSigner};
 use vox_core::transport::quic::VoxEndpoint;
@@ -99,7 +98,7 @@ async fn park_across_withdrawal() -> (u8, usize) {
     let client_fp = RootSigner::public_key(&client_signer).fingerprint();
 
     // A room with no service grant of any kind: since M17.7 the genesis does not decide
-    // reach, the host's ring does. The evaluator is here because a tunnel is still served
+    // reach, the host's ring does. The genesis is here because a tunnel is still served
     // under a channel, not because it authorizes anybody.
     let genesis = Genesis::create_with_nonce_and_grant(
         &host_signer,
@@ -110,20 +109,6 @@ async fn park_across_withdrawal() -> (u8, usize) {
     )
     .unwrap();
     let channel_id = genesis.channel_id();
-    let authors: std::collections::BTreeMap<_, _> =
-        [(client_fp, RootSigner::public_key(&client_signer))]
-            .into_iter()
-            .collect();
-    let evaluator = Arc::new(
-        Evaluator::build_with_members(
-            &genesis,
-            &[],
-            NOW,
-            |id| authors.get(id).cloned(),
-            [client_fp].into_iter().collect(),
-        )
-        .unwrap(),
-    );
 
     // The live reacher set the actor owns (`node::tunnel::Reachers`). The client starts in
     // it: at the moment it opens its stream it is trusted and a current author, which is
@@ -138,13 +123,11 @@ async fn park_across_withdrawal() -> (u8, usize) {
     let host_id = host_ep.local_id();
     let served = Arc::new(tokio::sync::Notify::new());
     {
-        let evaluator = Arc::clone(&evaluator);
         let reachers = Arc::clone(&reachers);
         let served = Arc::clone(&served);
         tokio::spawn(async move {
             while let Ok(Some(conn)) = host_ep.accept(NOW).await {
                 let peer = conn.peer_id();
-                let evaluator = Arc::clone(&evaluator);
                 let reachers = Arc::clone(&reachers);
                 let served = Arc::clone(&served);
                 tokio::spawn(async move {
@@ -152,7 +135,6 @@ async fn park_across_withdrawal() -> (u8, usize) {
                         if kind != StreamKind::Tunnel {
                             continue;
                         }
-                        let evaluator = Arc::clone(&evaluator);
                         let reachers = Arc::clone(&reachers);
                         // The snapshot is taken HERE — when the stream opens, before a
                         // single byte of the request has been read. That is the actor's
@@ -162,7 +144,6 @@ async fn park_across_withdrawal() -> (u8, usize) {
                         tokio::spawn(async move {
                             let _ = session::accept(send, recv, &peer, |cid, _tag| {
                                 (*cid == channel_id).then_some(HostService {
-                                    evaluator,
                                     endpoint: echo_addr,
                                     reachers,
                                 })
@@ -268,20 +249,6 @@ async fn m17_11_a_live_session_is_cut_when_reach_is_withdrawn() {
     )
     .unwrap();
     let channel_id = genesis.channel_id();
-    let authors: std::collections::BTreeMap<_, _> =
-        [(client_fp, RootSigner::public_key(&client_signer))]
-            .into_iter()
-            .collect();
-    let evaluator = Arc::new(
-        Evaluator::build_with_members(
-            &genesis,
-            &[],
-            NOW,
-            |id| authors.get(id).cloned(),
-            [client_fp].into_iter().collect(),
-        )
-        .unwrap(),
-    );
     let reachers: vox_core::node::tunnel::Reachers = Arc::new(tokio::sync::watch::Sender::new(
         [client_fp].into_iter().collect::<BTreeSet<_>>(),
     ));
@@ -294,19 +261,16 @@ async fn m17_11_a_live_session_is_cut_when_reach_is_withdrawn() {
         tokio::spawn(async move {
             while let Ok(Some(conn)) = host_ep.accept(NOW).await {
                 let peer = conn.peer_id();
-                let evaluator = Arc::clone(&evaluator);
                 let reachers = Arc::clone(&reachers);
                 tokio::spawn(async move {
                     while let Ok((kind, send, recv)) = accept_typed(&conn).await {
                         if kind != StreamKind::Tunnel {
                             continue;
                         }
-                        let evaluator = Arc::clone(&evaluator);
                         let reachers = Arc::clone(&reachers);
                         tokio::spawn(async move {
                             let _ = session::accept(send, recv, &peer, |cid, _tag| {
                                 (*cid == channel_id).then_some(HostService {
-                                    evaluator,
                                     endpoint: echo_addr,
                                     reachers,
                                 })
