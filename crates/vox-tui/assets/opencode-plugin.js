@@ -70,6 +70,26 @@ function log(line) {
 export default async function vox({ $ }) {
   log("plugin loaded (cwd=" + process.cwd() + ")")
   return {
+    // **Name the session to every shell this session runs** (ADR-021 §4, §7).
+    // Claude Code and Codex put their session id in every tool's environment
+    // (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`); OpenCode does not. So without
+    // this, `vox room claim` run by the model could not say which session owns the
+    // work, and this plugin's drain — which passes the same `sessionID` as
+    // `--session` — could not recognise that session's own posts.
+    //
+    // Measured against OpenCode 1.18.32: its shell tool triggers `shell.env` with
+    // `{ cwd, sessionID, callID }` and merges `output.env` into the child's
+    // environment.
+    "shell.env": async (input, output) => {
+      try {
+        if (input?.sessionID && output?.env) {
+          output.env.VOX_SESSION = input.sessionID
+          log("shell.env: VOX_SESSION=" + input.sessionID)
+        }
+      } catch (e) {
+        log("shell.env: threw: " + e)
+      }
+    },
     "chat.message": async (input, output) => {
       try {
         const sessionID = output.message?.sessionID || input.sessionID

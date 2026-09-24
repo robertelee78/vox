@@ -2700,6 +2700,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "crossterm",
+ "getrandom 0.3.4",
  "qrcode",
  "ratatui",
  "reqwest",

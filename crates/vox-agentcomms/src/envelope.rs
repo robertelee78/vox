@@ -24,6 +24,11 @@ pub const DEFAULT_HOPS: u32 = 8;
 /// Longest petname accepted in [`Envelope::to`], matching the keyring's bound.
 pub const MAX_NAME: usize = 64;
 
+/// The data key naming the work item a message is about (ADR-021 §2). Opaque: carried,
+/// compared byte for byte and filtered by — never interpreted, never validated against
+/// any tracker.
+pub const WORK_KEY: &str = "work";
+
 /// The suggested work vocabulary, shipped as convention rather than enforced.
 ///
 /// Shaped to map onto A2A's `TaskState` so a bridge is mechanical later. Nothing
@@ -38,11 +43,15 @@ pub mod work {
     pub const DECLINE: &str = "decline";
     /// In progress.
     pub const WORKING: &str = "working";
-    /// Stuck, and why.
+    /// Stuck, and why. A Health observation for a tracker — never a Work phase.
     pub const BLOCKED: &str = "blocked";
-    /// Finished, with the outcome.
+    /// A progress note. Supersedes the same `(author, from, data.work)`'s previous
+    /// `status` in any rendering; it changes no state (ADR-020 §9, ADR-021 §3).
+    pub const STATUS: &str = "status";
+    /// A candidate exists, and the sender **asserts** it meets the item's criteria.
+    /// An assertion, not an acceptance verdict (ADR-021 §3).
     pub const RESULT: &str = "result";
-    /// Failed, with the reason.
+    /// This attempt ended without success. The work item stays retryable.
     pub const FAILED: &str = "failed";
     /// A question put to someone.
     pub const ASK: &str = "ask";

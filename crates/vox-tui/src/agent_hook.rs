@@ -95,6 +95,14 @@ fn save_cursor(paths: &Paths, room: &str, session: &str, at: &Digest32) -> std::
     .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
+/// Whether `row` is this very session's own message: the same author fingerprint
+/// **and** the same session.
+fn is_own(row: &vox_core::node::api::MessageRow, me: Option<Digest32>, session: &str) -> bool {
+    me == Some(row.author)
+        && vox_agentcomms::envelope::Envelope::parse(&row.text)
+            .is_ok_and(|e| !e.from.is_empty() && e.from == session)
+}
+
 /// Render the messages an agent has not seen, for injection into its context.
 ///
 /// Deliberately plain and compact. This lands in a model's context every turn, so
@@ -202,8 +210,14 @@ pub async fn run(
         let _ = std::io::stdin().read_to_string(&mut raw);
     }
     let mut input = parse_input(&raw);
-    if let Some(s) = session {
-        input.session_id = s.to_owned();
+    // The same order `vox room` uses to name the session, so that what this hook
+    // recognises as "my own message" is exactly what that session's verbs wrote
+    // (ADR-021 §7): the flag, then `VOX_SESSION`, then what the harness sent.
+    if let Some(s) = session
+        .map(str::to_owned)
+        .or_else(|| std::env::var("VOX_SESSION").ok().filter(|s| !s.trim().is_empty()))
+    {
+        input.session_id = s.trim().to_owned();
     }
 
     let Some(room_arg) = room_arg
@@ -288,14 +302,47 @@ async fn drain(
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
 
-    if rows.is_empty() {
+    // **This session's own messages are not news to it** (ADR-021 F8) — but only when
+    // BOTH the author and the session match. The author alone would drop every other
+    // session on this harness; the session name alone would drop a different harness
+    // that happens to use the same name. Either mistake silently loses a message
+    // meant for this agent.
+    let me = client.me();
+    let fresh: Vec<vox_core::node::api::MessageRow> = rows
+        .iter()
+        .filter(|r| !is_own(r, me, &input.session_id))
+        .cloned()
+        .collect();
+
+    // **Coordination refused is said plainly, every turn it holds** (ADR-021 §5): a
+    // session that cannot claim work should learn why before it tries, not from an
+    // exit status in the middle of a task.
+    let refused = match crate::coord::snapshot(&mut client, channel_id).await {
+        Ok(snap) if snap.table.refused() => Some(crate::coord::refusal(&room_key, &snap.table)),
+        _ => None,
+    };
+
+    if fresh.is_empty() && refused.is_none() {
         // Nothing new: emit nothing at all rather than "no new messages". An
         // agent's context is not the place for a heartbeat, and a quiet room
         // should cost zero tokens per turn.
+        if let Some(last) = rows.last() {
+            let _ = save_cursor(paths, &room_key, &input.session_id, &last.entry_hash);
+        }
         return Ok(());
     }
 
-    emit(format, raw_input, &input.event, &render(&label, &rows));
+    let mut context = String::new();
+    if let Some(r) = &refused {
+        context.push_str(&format!(
+            "{r}\nUntil then `vox room claim|renew|handoff|release|decline` and \
+             `vox room post --work` exit 3.\n\n"
+        ));
+    }
+    if !fresh.is_empty() {
+        context.push_str(&render(&label, &fresh));
+    }
+    emit(format, raw_input, &input.event, &context);
 
     if let Some(last) = rows.last() {
         if let Err(e) = save_cursor(paths, &room_key, &input.session_id, &last.entry_hash) {

@@ -22,6 +22,7 @@
 pub mod agent_hook;
 pub mod app;
 pub mod cli;
+pub mod coord;
 pub mod live;
 pub mod qr;
 pub mod room_cli;

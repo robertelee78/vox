@@ -64,6 +64,27 @@ pub enum AppError {
     /// a room that is not here, an ambiguous id, a capability they do not hold.
     #[error("{0}")]
     Usage(String),
+    /// Refused on purpose, with the exit status that says why — so a program can tell
+    /// a version refusal (3) or an operation conflict (4) from any other failure
+    /// without parsing prose (ADR-021 §5, §6).
+    #[error("{message}")]
+    Refused {
+        /// The process exit status.
+        code: u8,
+        /// For the person.
+        message: String,
+    },
+}
+
+impl AppError {
+    /// The process exit status this error should end the process with.
+    #[must_use]
+    pub fn exit_code(&self) -> std::process::ExitCode {
+        match self {
+            AppError::Refused { code, .. } => std::process::ExitCode::from(*code),
+            _ => std::process::ExitCode::FAILURE,
+        }
+    }
 }
 
 /// The contract the loop uses to talk to the running core: it provides the current

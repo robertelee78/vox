@@ -51,6 +51,8 @@ serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
 rustix.workspace = true
+# ADR-021 §6: a minted operation id is 128 bits of OS randomness.
+getrandom.workspace = true
 
 # No `[dev-dependencies]`: `tempfile` is a normal dependency above and is in scope for the
 # integration proofs too.
