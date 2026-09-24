@@ -674,6 +674,12 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         NodeEvent::JoinFailed { reason } => {
             eprintln!("vox: a join did not complete — {reason}");
         }
+        NodeEvent::JoinSteps { joined, steps } => {
+            eprintln!(
+                "vox: join {} — {steps}",
+                if *joined { "got in" } else { "did not get in" }
+            );
+        }
         NodeEvent::PublishRefused {
             channel_id,
             what,

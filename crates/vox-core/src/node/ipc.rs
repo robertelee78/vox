@@ -104,6 +104,8 @@ const T_STALLED: u64 = 1715;
 const T_PEER_UNREACHABLE: u64 = 1716;
 /// `NodeEvent::PublishRefused`. Additive, and deliberately away from the sequential range.
 const T_PUBLISH_REFUSED: u64 = 1717;
+/// [`NodeEvent::JoinSteps`]: where a join's time went.
+const T_JOIN_STEPS: u64 = 1718;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -844,6 +846,12 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::JoinFailed { reason } => {
             e.array(2).uint(T_JOIN_FAILED).text(reason);
         }
+        NodeEvent::JoinSteps { joined, steps } => {
+            e.array(3)
+                .uint(T_JOIN_STEPS)
+                .uint(u64::from(*joined))
+                .text(steps);
+        }
         NodeEvent::StillRelayed { peer, reason } => {
             e.array(3).uint(T_STILL_RELAYED).bytes(peer).text(reason);
         }
@@ -1102,6 +1110,17 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             why: d
                 .text()
                 .map_err(|_| Error::MalformedBundle("ipc publish why"))?
+                .to_owned(),
+        },
+        (T_JOIN_STEPS, 3) => NodeEvent::JoinSteps {
+            joined: match d.uint()? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::MalformedBundle("ipc join steps flag")),
+            },
+            steps: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc join steps"))?
                 .to_owned(),
         },
         (T_JOIN_FAILED, 2) => NodeEvent::JoinFailed {

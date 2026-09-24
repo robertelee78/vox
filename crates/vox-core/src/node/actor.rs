@@ -1003,12 +1003,15 @@ struct JoinerWon {
     set: crate::nat::service::RecordSet,
     genesis: crate::governance::genesis::Genesis,
     sealed: (crate::atrest::sek::Sek, crate::atrest::SekWrap),
+    /// How long each step took: see `JoinSteps`.
+    steps: JoinSteps,
 }
 
 /// A join that did not: the fault to answer with, and each responder's reason.
 struct JoinerLost {
     fault: Fault,
     why: Vec<String>,
+    steps: JoinSteps,
 }
 
 impl JoinerLost {
@@ -1016,7 +1019,27 @@ impl JoinerLost {
         Self {
             fault,
             why: Vec::new(),
+            steps: JoinSteps::default(),
         }
+    }
+}
+
+/// How long each step of a join took, carried on the join's own outcome so a join that failed —
+/// or took 30s — says where its time went. The join ranged 1.3–33.6s end to end with the node
+/// answering throughout, and "somewhere in the join" is not a diagnosis.
+#[derive(Default)]
+struct JoinSteps(Vec<String>);
+
+impl JoinSteps {
+    fn took(&mut self, what: &str, since: std::time::Instant) {
+        self.0
+            .push(format!("{what} {:.2}s", since.elapsed().as_secs_f64()));
+    }
+    fn note(&mut self, what: String) {
+        self.0.push(what);
+    }
+    fn render(&self) -> String {
+        self.0.join(", ")
     }
 }
 
@@ -1059,15 +1082,35 @@ impl Joiner {
     /// The network half of a join, and the room key's seal: the old inline `join_channel` from
     /// reaching a board to the end of the exchange, unchanged in order and in its refusals.
     async fn run(self) -> std::result::Result<JoinerWon, JoinerLost> {
+        let mut steps = JoinSteps::default();
+        let result = self.run_steps(&mut steps).await;
+        match result {
+            Ok(mut won) => {
+                won.steps = steps;
+                Ok(won)
+            }
+            Err(mut lost) => {
+                lost.steps = steps;
+                Err(lost)
+            }
+        }
+    }
+
+    async fn run_steps(&self, steps: &mut JoinSteps) -> std::result::Result<JoinerWon, JoinerLost> {
         let parsed = &self.parsed;
         let net = Arc::clone(&self.net);
+        let t = std::time::Instant::now();
         let Some(board) = self.reach_a_board().await else {
+            steps.took("board (unreached)", t);
             return Err(JoinerLost::of(Fault::Unreachable));
         };
+        steps.took("board", t);
+        let t = std::time::Instant::now();
         let mut set = net
             .fetch_channel(&board, &parsed.channel_id, 0)
             .await
             .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        steps.took("fetch", t);
         let Some(genesis) = set.genesis.clone() else {
             return Err(JoinerLost::of(Fault::BadLink));
         };
@@ -1137,9 +1180,13 @@ impl Joiner {
                 .find(|r| r.author_id == responder)
                 .map(|r| r.endpoints.clone())
                 .unwrap_or_default();
+            let short = crate::node::network::short_id(responder);
             if responder_endpoints.is_empty() && board.peer_id() != responder {
+                let t = std::time::Instant::now();
+                let mut polls = 0u32;
                 let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
                 while tokio::time::Instant::now() < deadline {
+                    polls += 1;
                     tokio::time::sleep(JOIN_ADDRESS_POLL).await;
                     let Ok(fresh) = net.fetch_channel(&board, &parsed.channel_id, 0).await else {
                         continue;
@@ -1156,11 +1203,23 @@ impl Joiner {
                         break;
                     }
                 }
+                steps.note(format!(
+                    "{short}: address poll ×{polls} {:.2}s{}",
+                    t.elapsed().as_secs_f64(),
+                    if responder_endpoints.is_empty() {
+                        " (none)"
+                    } else {
+                        ""
+                    }
+                ));
             }
             let conn = if board.peer_id() == responder {
                 Arc::clone(&board)
             } else {
-                match self.dial(responder, &responder_endpoints, false).await {
+                let t = std::time::Instant::now();
+                let dialled = self.dial(responder, &responder_endpoints, false).await;
+                steps.took(&format!("{short}: dial"), t);
+                match dialled {
                     Ok(c) => {
                         if let Err(e) = announce(&c, &prejoin_wire).await {
                             last_fault = fault_of(&e);
@@ -1168,6 +1227,7 @@ impl Joiner {
                                 return Err(JoinerLost {
                                     fault: last_fault,
                                     why,
+                                    steps: JoinSteps::default(),
                                 });
                             }
                             continue;
@@ -1184,6 +1244,7 @@ impl Joiner {
                             return Err(JoinerLost {
                                 fault: last_fault,
                                 why,
+                                steps: JoinSteps::default(),
                             });
                         }
                         continue;
@@ -1198,10 +1259,12 @@ impl Joiner {
                 ctx.pow_params = pow;
             }
             let ik = crate::identity::keyagreement::X25519IdentityKey::from_secret_bytes(dh);
-            match net
+            let t = std::time::Instant::now();
+            let exchanged = net
                 .start_join(&conn, ctx, &self.passphrase, signer, &ik)
-                .await
-            {
+                .await;
+            steps.took(&format!("{short}: exchange (incl. solve)"), t);
+            match exchanged {
                 Ok(o) => {
                     joined_outcome = Some((o, responder, conn));
                     break;
@@ -1212,6 +1275,7 @@ impl Joiner {
                         return Err(JoinerLost {
                             fault: last_fault,
                             why,
+                            steps: JoinSteps::default(),
                         });
                     }
                 }
@@ -1221,6 +1285,7 @@ impl Joiner {
             return Err(JoinerLost {
                 fault: last_fault,
                 why,
+                steps: JoinSteps::default(),
             });
         };
         // The room key, sealed under the passphrase with production Argon2id — seconds of CPU,
@@ -1232,6 +1297,7 @@ impl Joiner {
             self.passphrase.clone(),
             self.argon2,
         );
+        let t = std::time::Instant::now();
         let sealed = tokio::task::spawn_blocking(move || {
             let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
             sek.seal(&factor, &channel_id, &passphrase, argon2)
@@ -1240,6 +1306,7 @@ impl Joiner {
         .await
         .unwrap_or(Err(Error::Argon2Failed))
         .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        steps.took("seal", t);
         Ok(JoinerWon {
             joined,
             responder,
@@ -1247,6 +1314,7 @@ impl Joiner {
             set,
             genesis,
             sealed,
+            steps: JoinSteps::default(),
         })
     }
 }
@@ -2753,10 +2821,18 @@ impl Node {
             } => {
                 let outcome = match *result {
                     Ok(won) => {
+                        let _ = self.event_tx.send(NodeEvent::JoinSteps {
+                            joined: true,
+                            steps: won.steps.render(),
+                        });
                         self.finish_join_channel(*parsed, local_name, passphrase, now, me, won)
                             .await
                     }
                     Err(lost) => {
+                        let _ = self.event_tx.send(NodeEvent::JoinSteps {
+                            joined: false,
+                            steps: lost.steps.render(),
+                        });
                         if !lost.why.is_empty() {
                             self.say_why_the_join_failed(&lost.why);
                         }
@@ -3566,6 +3642,7 @@ impl Node {
             set,
             genesis,
             sealed,
+            steps: _,
         } = won;
         let channel = {
             let Some(profile) = self.profile.as_ref() else {

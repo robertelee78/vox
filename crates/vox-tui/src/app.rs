@@ -402,6 +402,12 @@ pub fn run_node(
                                 vox_core::node::api::NodeEvent::JoinFailed { reason } => {
                                     eprintln!("vox node: a join did not complete — {reason}");
                                 }
+                                vox_core::node::api::NodeEvent::JoinSteps { joined, steps } => {
+                                    eprintln!(
+                                        "vox node: join {} — {steps}",
+                                        if joined { "got in" } else { "did not get in" }
+                                    );
+                                }
                                 vox_core::node::api::NodeEvent::PublishRefused {
                                     channel_id,
                                     what,
