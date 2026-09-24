@@ -57,7 +57,7 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// The protocol this build speaks. Bumped when a frame's shape changes in a way
 /// an older client would misread; a client that sees a version it does not know
 /// MUST disconnect rather than guess.
-pub const PROTOCOL_VERSION: u64 = 5;
+pub const PROTOCOL_VERSION: u64 = 6;
 
 /// Largest frame accepted in either direction.
 ///
@@ -1320,6 +1320,23 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         let Some(body) = read_frame(&mut stream).await? else {
             return Ok(());
         };
+        // Protocol 6: an app request turns the connection into an app connection for
+        // the rest of its life (ADR-022 decision 7, `node::appipc`).
+        if let Some(app) = crate::node::appipc::AppRequest::parse(&body) {
+            return match app {
+                Ok(app) => crate::node::appipc::serve(stream, handle, app).await,
+                Err(e) => {
+                    write_frame(
+                        &mut stream,
+                        &Frame::Error {
+                            reason: e.to_string(),
+                        }
+                        .to_bytes(),
+                    )
+                    .await
+                }
+            };
+        }
         let request = match Request::from_bytes(&body) {
             Ok(r) => r,
             Err(e) => {

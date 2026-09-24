@@ -21,6 +21,7 @@
 
 pub mod agent_hook;
 pub mod app;
+pub mod app_cli;
 pub mod cli;
 pub mod live;
 pub mod qr;

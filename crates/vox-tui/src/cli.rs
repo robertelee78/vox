@@ -343,6 +343,46 @@ enum ServiceCmd {
     List(RoomArgs),
 }
 
+/// `vox app` — app streams from a shell, over a running node.
+#[derive(Subcommand, Debug, Clone)]
+enum AppCmd {
+    /// Wait for one app stream speaking `label` in `room`, accept it, and pipe it to
+    /// stdin and stdout.
+    Listen(AppListenArgs),
+    /// Open an app stream to `peer`, speaking the first of the labels it listens for,
+    /// and pipe it to stdin and stdout.
+    Open(AppOpenArgs),
+}
+
+/// `vox app listen`
+#[derive(Args, Debug, Clone)]
+pub struct AppListenArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The label to listen for, `name/vN`.
+    pub label: String,
+}
+
+/// `vox app open`
+#[derive(Args, Debug, Clone)]
+pub struct AppOpenArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The member to open to (fingerprint, or a unique prefix).
+    pub peer: String,
+    /// The labels to offer, in preference order (at most 8).
+    #[arg(required = true)]
+    pub labels: Vec<String>,
+    /// Also bind a datagram flow: each stdin line goes as one datagram, and each
+    /// datagram received is printed as one line.
+    #[arg(long)]
+    pub datagrams: bool,
+}
+
 /// `vox room` — the agent-comms verbs, over a running node.
 #[derive(Subcommand, Debug, Clone)]
 enum RoomCmd {
@@ -954,6 +994,13 @@ enum Cmd {
     /// takes a passphrase, and nothing here creates, joins or leaves a room.
     #[command(subcommand)]
     Room(RoomCmd),
+    /// Open or accept an app stream to a program on another member's node (ADR-022).
+    ///
+    /// The shape of `nc`, over a running node: `listen` waits for one stream speaking a
+    /// label and pipes it; `open` opens one. Both sides must trust each other, and the
+    /// peer must be a member of the room.
+    #[command(subcommand)]
+    App(AppCmd),
     /// Wire an agent session into a room (ADR-020) — harness-agnostic.
     #[command(subcommand)]
     Agent(AgentCmd),
@@ -1188,6 +1235,55 @@ pub fn run() -> ExitCode {
                     }
                 }
             });
+            match outcome {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::App(sub) => {
+            let profile = match &sub {
+                AppCmd::Listen(a) => &a.profile,
+                AppCmd::Open(a) => &a.profile,
+            };
+            let paths = match profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let outcome = rt.block_on(async {
+                match &sub {
+                    AppCmd::Listen(a) => crate::app_cli::listen(&paths, &a.room, &a.label).await,
+                    AppCmd::Open(a) => {
+                        crate::app_cli::open(
+                            &paths,
+                            &a.room,
+                            &a.peer,
+                            a.labels.clone(),
+                            a.datagrams,
+                        )
+                        .await
+                    }
+                }
+            });
+            // Not `rt` dropping: stdin's reader thread may still be blocked in a read, and
+            // the runtime would wait for it.
+            rt.shutdown_background();
             match outcome {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

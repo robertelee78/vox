@@ -26,6 +26,8 @@
 pub mod actor;
 pub mod anchor;
 pub mod api;
+pub mod app;
+pub mod appipc;
 pub mod channel;
 pub mod circuitstream;
 pub mod content;
