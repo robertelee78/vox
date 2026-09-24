@@ -63,9 +63,13 @@ a skeleton whose body was pruned — or every entry after them lands somewhere e
 can read them. The cost is that anyone holding skeletons sees the claimed send time, as they already
 see arrival time.
 
-The **room's order** is a hybrid logical clock over that DAG: `clock(e) = max(claimed_ms(e),
-clock(p) + 1 for every held parent p)`, parents being the author's own seq−1 and `seen`, and entries
-sort ascending by `(clock, entry_hash)`. A parent's clock is below its child's, so this is a
+The **room's order** is a hybrid logical clock over that DAG: `clock(e) = max(min(claimed_ms(e),
+latest(e) + MAX_LEAD_MS), latest(e) + 1)`, where `latest(e)` is the highest clock of the held parents
+(the author's own seq−1 and `seen`), or the room's genesis time for an entry with none, and
+`MAX_LEAD_MS` is ten minutes. Entries sort ascending by `(clock, entry_hash)`. The cap is relative to
+the parents, never to the receiving node's clock (which would differ per node and break the one
+order). It stops one member pinning the room's clocks forward: a post claiming tomorrow moves them
+ten minutes, not a day (ADR-023 decision 1). A parent's clock is below its child's, so this is a
 topological order; ties between concurrent entries fall to the claimed milliseconds and then the hash.
 It is a function of the entry set alone, so every node holding the same entries shows the same
 sequence: a total order **derived** from the causal DAG, with no consensus and no coordination —

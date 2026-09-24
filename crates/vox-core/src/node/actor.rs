@@ -5110,7 +5110,7 @@ impl Node {
                 epoch: ch.epoch(),
                 members: ch.members(),
                 timeline: ch.timeline().iter().map(row_of).collect(),
-                order: ch.causal_order(),
+                order: ch.order_keys(),
                 services: ch
                     .services()
                     .iter()

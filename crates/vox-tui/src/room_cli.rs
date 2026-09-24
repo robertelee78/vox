@@ -265,8 +265,9 @@ pub async fn read(
     }
 }
 
-/// `vox room read --hashes` — every entry the node holds for the room, one hash per
-/// line, in the room's one order (ADR-023 decision 1).
+/// `vox room read --hashes` — every entry the node holds for the room, one per line as
+/// `<entry-hash> <clock-ms>`, in the room's one order (ADR-023 decision 1). The clock is the
+/// key that placed the entry: its claimed time, capped and lifted by what it saw.
 ///
 /// The timeline shows only rows this node can decrypt, so two members' timelines can
 /// differ for reasons that have nothing to do with order: one holds a key the other
@@ -275,10 +276,10 @@ pub async fn order(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client.request(&Request::Order { channel_id }).await {
-        Ok(Frame::Order { hashes }) => {
+        Ok(Frame::Order { entries }) => {
             let mut out = std::io::stdout().lock();
-            for h in hashes {
-                let _ = writeln!(out, "{}", id(&h));
+            for (h, clock) in entries {
+                let _ = writeln!(out, "{} {clock}", id(&h));
             }
             Ok(())
         }

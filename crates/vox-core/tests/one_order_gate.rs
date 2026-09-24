@@ -259,8 +259,10 @@ fn three_nodes_one_offline_for_a_while_hold_one_order() {
         let started = Instant::now();
         let mut stable = 0;
         let orders: Vec<Vec<Digest32>> = loop {
-            let orders: Vec<Vec<Digest32>> =
-                nodes.iter().map(|(h, _)| detail(h, cid).order).collect();
+            let orders: Vec<Vec<Digest32>> = nodes
+                .iter()
+                .map(|(h, _)| detail(h, cid).order.into_iter().map(|(e, _)| e).collect())
+                .collect();
             let sets: Vec<BTreeSet<&Digest32>> =
                 orders.iter().map(|o| o.iter().collect()).collect();
             let alice_reads = detail(&alice, cid)

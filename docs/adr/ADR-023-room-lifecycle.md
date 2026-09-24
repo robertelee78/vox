@@ -62,6 +62,31 @@ What the code does today (`origin/main` 671527a):
   broken by `(author's claimed ms, entry_hash)`. Every node holding the same entry set computes the
   identical order. The author's clock can only move an entry among its concurrent peers, never ahead
   of anything it saw.
+- **Correction (2026-09-24, found building M23.2): the claimed time is in the skeleton too.**
+  The first version of this decision took the claimed ms from the content envelope, which is
+  encrypted. A node that cannot decrypt an ancestor (it holds no key for that author yet, or the body
+  was pruned) then cannot place it. Every entry after it lands somewhere other than on a node that
+  can decrypt it, so the order is not one order. The skeleton therefore carries `claimed_ms` beside
+  `seen`, the same value the envelope carries.
+  - **Cost:** the claimed send time is visible to anyone holding skeletons. Members already see
+    arrival time. Under R34, non-member anchors are to hold nothing (M23.5), so after M23.5 no
+    non-member holds skeletons.
+  - **The order is a hybrid logical clock.** `clock(e) = max(min(claimed_ms(e), latest(e) + 10 min),
+    latest(e) + 1)`, where `latest(e)` is the highest clock among the parents this node holds (its
+    own seq−1 and `seen`), or the room's genesis time if it has none. Entries sort by
+    `(clock, entry_hash)`. This is the topological sort with the `(claimed ms, hash)` tie-break
+    described above, computed incrementally.
+- **A claimed time far in the future is capped, relative to the entry's parents.** Without a cap,
+  one member posting "tomorrow" would lift every entry that later sees it to tomorrow.
+  - **Not against "now":** a cap on the receiving node's clock would differ from node to node, and
+    so would the order. The cap is ten minutes past the entry's latest parent (or past the genesis
+    for an entry naming none, which closes a crafted parentless entry).
+  - **What it costs an attacker:** one post moves the room's clocks at most ten minutes. Moving them
+    a day takes 144 posts, each visible and attributable.
+  - **Why ten minutes:** honest clocks drift by seconds to minutes, so honest entries are almost
+    never capped. When one is (the first post after a quiet spell), the cap moves it only among
+    entries it did not see, which is all the claimed time decides.
+  - **One lever remains:** the creator's genesis time, which only the creator signs, only once.
 - **Late arrivals.** An entry from a member who was offline takes its causal position, which may
   be earlier than rows already shown. The UI inserts it there and marks it as arriving late. It
   does not move to the bottom.
@@ -212,40 +237,54 @@ covers only the approver's own messages, as consent always has.
   pruned body gets the skeleton" (the code path exists; nothing measures it alone).
 - **M23.2** `seen` and the deterministic causal order (decision 1). Proofs 1–2. R17's
   takeover-after-silence does not need it. Hard-lock claims (PRD-001 §7 Q5) are to be designed on it
-  if the decider answers "wait for certainty". **Built on `prd1/causal-order`; proof 2 DONE, proof 1
-  DONE on in-process nodes and red through three daemons for a cause below the log.**
-  - The skeleton carries `seen` (≤16 heads of other authors' feeds, strictly ascending) **and
-    `claimed_ms`**. The ms had to move into the signed skeleton: a node must place entries it cannot
-    decrypt (no key yet, body pruned), or rows after them land elsewhere than on a node that can.
-    ADR-008 §"Cross-author edges and the one order" has the rule.
-  - The order is a hybrid logical clock, `clock(e) = max(claimed_ms, clock(parent)+1)` over the
-    own-feed predecessor and `seen`, sorted by `(clock, entry_hash)`. An unknown `seen` hash never
-    blocks acceptance. When it arrives, what named it is lifted and the timeline re-sorts.
-  - The timeline is kept in that order, and a late row is inserted at its place and flagged `late`.
-    The flag means "rendered here after a row now below it", so ordinary concurrency sets it too, not
-    only an offline member's return. `vox room read --since` became arrival-based: a late row lands
-    above the cursor and a positional read would skip it forever. `vox room read --hashes` (hidden)
-    prints the whole order, readable or not.
-  - `Dag::happened_before(a, b)` / `ChannelState::happened_before` is the relation for claims (R17);
-    nothing consumes it yet.
+  if the decider answers "wait for certainty". **Built on `prd1/causal-order` (on v0.2.8). Proofs 2
+  and 3 DONE through the shipped binary. Proof 1 DONE on in-process nodes; through three daemons it
+  is intermittently red for a connectivity defect below the log, so it is NOT marked done there.**
+  - The skeleton carries `seen` (≤16 heads of other authors' feeds, strictly ascending) and
+    `claimed_ms` (decision 1, correction).
+  - **The order:** the hybrid logical clock with the ten-minute cap, sorted by `(clock, hash)`. An
+    unknown `seen` hash never blocks acceptance. When it arrives, what named it is recomputed, and
+    whatever moved takes its descendants along.
+  - **The timeline:** kept in that order. A late row is inserted at its place and flagged `late`.
+    The flag means "rendered here after a row now below it", so ordinary concurrency sets it too,
+    not only an offline member's return.
+  - **`vox room read --since` is arrival-based:** a late row lands above the cursor, and a
+    positional read would skip it forever.
+  - **`vox room read --hashes` (hidden):** prints `<hash> <clock-ms>` for every held entry, in
+    order.
+  - **For claims:** `Dag::happened_before(a, b)` and `ChannelState::happened_before` are the
+    relation R17 is to use; nothing consumes them yet.
   - **Proof 2 DONE:** `crates/vox-tui/tests/causal_order_proof.rs`
-    `a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind`, shipped binary, bob's clock
-    skewed −1 h by the test-only `VOX_TEST_CLOCK_SKEW_MS`. The answer's stored claimed time was read
-    back 59 min before the question's. On all three nodes the answer came after the question
-    (question 11, answer 13 of 14; one SHA-256 across the three). With `seen` ignored in the sort:
-    red, "alice orders the answer (1) before the question it answered (9)".
-  - **Proof 1 DONE in-process:** `crates/vox-core/tests/one_order_gate.rs`, three networked `Node`s.
-    One is shut down for a round and restarted on the same store and address. All three end with 54
-    entries and one SHA-256, and each timeline (48/36/30 readable rows) is an ordered subsequence of
-    it. Two mutations, each red: arrival order ("bob's order differs from alice's (first difference at
-    Some(0))", three different SHA-256s), and the timeline appended in arrival order ("alice's timeline
-    shows \"one bob 1\" out of the room's order").
-  - **Proof 1 through the shipped binary is red today, and not for the order.**
-    `three_members_one_offline_for_a_while_show_one_order` (same file as proof 2) never converges: the
-    second joiner's records are refused by the boards and no session with it runs. This reproduces on
-    dc868cf without M23.2: over 315 s the second joiner rendered 0 of the other two's posts, and they 0
-    of its. Replaying the stopped stores through `ChannelState::sync_over` converged them at once.
-    Where the three daemons did overlap, their sequences agreed.
+    `a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind`, shipped binary.
+    - Bob's clock is −1 h (test-only `VOX_TEST_CLOCK_SKEW_MS`). The answer's stored claimed time is
+      59 min before the question's.
+    - On all three nodes the answer follows the question (11 → 13 of 14, one SHA-256).
+    - Mutation, `seen` ignored in the sort: red, "alice orders the answer (1) before the question it
+      answered (9)".
+  - **Proof 3 (the cap) DONE:** same file,
+    `a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward`.
+    - Bob's clock is +1 day, and his stored claim is 1439 min ahead.
+    - Alice's post after reading his is placed 9 min ahead of when she wrote it, still after his,
+      on both nodes.
+    - Mutation, cap removed: red, "placed 1439 min ahead of when it was written".
+  - **Proof 1 DONE in-process:** `crates/vox-core/tests/one_order_gate.rs`, three networked `Node`s,
+    one shut down for a round and restarted.
+    - All three end with 54 entries and one SHA-256. Each timeline (48/36/30 readable rows) is an
+      ordered subsequence of it.
+    - Mutation, arrival order: red, "bob's order differs from alice's (first difference at
+      Some(0))", three different SHA-256s.
+    - Mutation, the timeline appended in arrival order: red, "alice's timeline shows 'one bob 1' out
+      of the room's order".
+  - **Proof 1 through the shipped binary:**
+    `three_members_one_offline_for_a_while_show_one_order`, 4 green and 5 red of 9 on v0.2.8.
+    - Green runs: 58/58/58 and 57/57/57 entries, one SHA-256 each time.
+    - Every red has the same signature: the second joiner is cut off from the first post onward (e.g.
+      alice 49, bob 49, carol 25). In the four whose logs were captured, its restarted daemon logs "a board would not take our address …
+      rejected: the board holds a newer record from that author".
+    - The defect is not M23.2's: 1 of 4 red on 3cac220 without it, same signature. Replaying the
+      stopped stores through `ChannelState::sync_over` converges them at once.
+    - It is skipped by name in release.yml and ci.yml with this cause, and reported as a v0.2.9
+      defect.
 - **M23.3** `key-package` log entries and R14 pruning (decision 4). Proof 5. This replaces F12's
   delivery mechanism: F12 is a narrow v0.2.8 fix of SKDMs sent over pairwise sessions, covering the
   simultaneous-initiation race and trust-before-join. F12's proofs are to be kept as regression

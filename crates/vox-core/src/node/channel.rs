@@ -823,6 +823,7 @@ impl ChannelState {
 
         let mut admission = AdmissionPolicy::new();
         admission.admit(channel_id, epoch, me);
+        let origin_ms = genesis.body.created.saturating_mul(1_000);
         let evaluator = Arc::new(Self::build_evaluator(&genesis, &authors, &[], now_secs)?);
         Ok(Self {
             channel_id,
@@ -834,7 +835,7 @@ impl ChannelState {
             sek,
             authors,
             admission,
-            dag: Dag::new(),
+            dag: Dag::for_room(origin_ms),
             evaluator,
             sender,
             next_log_id: 1,
@@ -907,7 +908,7 @@ impl ChannelState {
         // Rebuild the DAG: every stored entry re-passes the acceptance predicate,
         // classified by its payload so governance entries are not re-admitted as
         // content.
-        let mut dag = Dag::new();
+        let mut dag = Dag::for_room(genesis.body.created.saturating_mul(1_000));
         let mut next_log_id = 1u64;
         let mut gov_entries = Vec::new();
         let mut retention = RetentionIndex::default();
@@ -1227,7 +1228,7 @@ impl ChannelState {
             sek,
             authors,
             admission,
-            dag: Dag::new(),
+            dag: Dag::for_room(genesis.body.created.saturating_mul(1_000)),
             evaluator,
             sender,
             next_log_id: 1,
@@ -2560,6 +2561,12 @@ impl ChannelState {
     #[must_use]
     pub fn causal_order(&self) -> Vec<Digest32> {
         self.dag.causal_order()
+    }
+
+    /// [`ChannelState::causal_order`] with each entry's clock (ms): the key that placed it.
+    #[must_use]
+    pub fn order_keys(&self) -> Vec<(Digest32, u64)> {
+        self.dag.order_keys()
     }
 
     /// Accept an entry authored by **another** member (M14.5; the bytes arrive from

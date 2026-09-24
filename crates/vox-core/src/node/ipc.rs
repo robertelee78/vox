@@ -119,7 +119,7 @@ const T_LINK: u64 = 9;
 /// collided with — the decoder then read a trusted list as a bound address and said
 /// "malformed identity bundle", three layers from the cause.
 const T_TRUSTED: u64 = 26;
-/// Protocol 6: the room's whole order, as entry hashes.
+/// Protocol 6: the room's whole order, as `(entry hash, clock)` pairs.
 const T_ORDER_ROWS: u64 = 27;
 // Client → node.
 const T_SUBSCRIBE: u64 = 1;
@@ -709,8 +709,8 @@ pub enum Frame {
     },
     /// The order a [`Request::Order`] asked for.
     Order {
-        /// Entry hashes, first to last.
-        hashes: Vec<Digest32>,
+        /// `(entry hash, clock in ms)`, first to last.
+        entries: Vec<(Digest32, u64)>,
     },
     /// The members a [`Request::Roster`] asked for.
     Members {
@@ -778,10 +778,10 @@ impl Frame {
                         .uint(u64::from(r.late));
                 }
             }
-            Frame::Order { hashes } => {
-                e.array(2).uint(T_ORDER_ROWS).array(hashes.len());
-                for h in hashes {
-                    e.bytes(h);
+            Frame::Order { entries } => {
+                e.array(2).uint(T_ORDER_ROWS).array(entries.len());
+                for (h, clock) in entries {
+                    e.array(2).bytes(h).uint(*clock);
                 }
             }
             Frame::Members { members } => {
@@ -1066,11 +1066,21 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         }
         (T_ORDER_ROWS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedBundle("ipc order"))?;
-            let mut hashes = Vec::with_capacity(n.min(1024));
+            let mut entries = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
-                hashes.push(digest(d)?);
+                if d.array()
+                    .map_err(|_| Error::MalformedBundle("ipc order entry"))?
+                    != 2
+                {
+                    return Err(Error::MalformedBundle("ipc order entry arity"));
+                }
+                let h = digest(d)?;
+                let clock = d
+                    .uint()
+                    .map_err(|_| Error::MalformedBundle("ipc order clock"))?;
+                entries.push((h, clock));
             }
-            return Ok(Frame::Order { hashes });
+            return Ok(Frame::Order { entries });
         }
         (T_MEMBERS, 2) => {
             let n = d
@@ -1623,7 +1633,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 .find(|d| d.channel_id == channel_id)
             {
                 Some(detail) => Frame::Order {
-                    hashes: detail.order.clone(),
+                    entries: detail.order.clone(),
                 },
                 None => Frame::Error {
                     reason: "room not open".into(),

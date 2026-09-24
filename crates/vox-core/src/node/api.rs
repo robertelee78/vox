@@ -81,8 +81,9 @@ pub struct ChannelDetail {
     /// The render-gated timeline, oldest first.
     pub timeline: Vec<MessageRow>,
     /// Every entry this node holds for the channel, readable or not, in the room's one
-    /// order (PRD-001 R13). `timeline` is this sequence restricted to rendered rows.
-    pub order: Vec<Digest32>,
+    /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
+    /// sequence restricted to rendered rows.
+    pub order: Vec<(Digest32, u64)>,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,

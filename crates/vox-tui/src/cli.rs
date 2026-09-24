@@ -659,8 +659,8 @@ pub struct RoomReadArgs {
     /// At most this many messages. 0 means no limit.
     #[arg(long, default_value_t = 0)]
     pub limit: u64,
-    /// Print every entry this node holds for the room in the room's order, one hash
-    /// per line — readable or not. The sequence every member's view is a part of,
+    /// Print every entry this node holds for the room in the room's order, one per
+    /// line as `<entry-hash> <clock-ms>` — readable or not. The sequence every member's view is a part of,
     /// and the one that must be identical on every node (PRD-001 R13).
     #[arg(long, hide = true, conflicts_with_all = ["since", "limit"])]
     pub hashes: bool,

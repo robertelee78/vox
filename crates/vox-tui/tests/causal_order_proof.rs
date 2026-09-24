@@ -20,17 +20,23 @@
 //! question — although its claimed time is an hour earlier, which the gate reads back from the
 //! replier's own store so the skew is proven to have reached the entry.
 //!
-//! Mutations (each run, each red): the order taken from arrival; `seen` ignored when ordering.
+//! **Proof 3 (a clock far ahead):** a member's clock is a day ahead. It posts; another member
+//! reads that post and then writes. The later post names the day-ahead one in `seen`, so without a
+//! cap it would be placed a day in the future, and so would everything after it. The gate reads
+//! each entry's placing clock from `vox room read --hashes`. It asserts the later post is placed
+//! less than 15 minutes ahead of when it was written, still after what it saw. It also reads the
+//! day-ahead claim back from the author's store.
 //!
-//! **Proof 1 is red today, and not for the order.** Three `vox daemon`s (a creator and two
-//! joiners, no anchor) do not converge: the second joiner's records are refused by the boards and
-//! no sync session with it runs, so it neither receives nor delivers anything after the join. That
-//! reproduces on the base without M23.2 (dc868cf: 315 s, the second joiner rendered 0 of 36 posts
-//! from the other two and they 0 of its 12), and replaying the stopped stores through
-//! `ChannelState::sync_over` converges them at once. Where the three did overlap, their sequences
-//! agreed. The same claim is proven green on three in-process networked nodes by
-//! `crates/vox-core/tests/one_order_gate.rs`, which reads the identical `order` this proof reads
-//! through `vox room read --hashes`.
+//! Mutations (each run, each red): `seen` ignored when ordering (proof 2); the cap removed
+//! (proof 3). Arrival order is the in-process gate's mutation (`one_order_gate`).
+//!
+//! **Proof 1 is intermittently red on v0.2.8, and not for the order.** In about half of runs the
+//! second joiner of three daemons is cut off from the first post onward: 5 red of 9 with M23.2,
+//! and 1 of 4 on 3cac220 without it, with the same signature. In each of the four reds whose logs were captured, the second joiner's
+//! restarted daemon logs "the board holds a newer record from that author". Whenever the three
+//! converged, their orders were identical (e.g. 58/58/58 entries, one SHA-256). CI skips it by name
+//! with this cause (release.yml, ci.yml). The order is proven in the blocking set by
+//! `crates/vox-core/tests/one_order_gate.rs` and by proofs 2 and 3.
 
 #![cfg(unix)]
 
@@ -50,6 +56,8 @@ const ROOMPASS: &str = "the room passphrase";
 const PER_ROUND: usize = 6;
 /// An hour, in milliseconds, behind.
 const HOUR_BEHIND: i64 = -3_600_000;
+/// A day, in milliseconds, ahead.
+const DAY_AHEAD: i64 = 86_400_000;
 
 /// A `vox daemon`, killed by its own PID when dropped.
 struct Daemon(Child);
@@ -146,15 +154,6 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
     )
 }
 
-/// A loopback UDP port nothing holds right now, so a daemon that restarts can come back on the
-/// address its peers already have for it.
-fn free_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free port")
-        .port()
-}
-
 /// Start `vox daemon` on `dir` at `listen`, optionally with its millisecond clock skewed
 /// (test-only).
 fn daemon(dir: &Path, tag: &str, listen: &str, stdin_lines: &str, skew_ms: Option<i64>) -> Daemon {
@@ -214,9 +213,32 @@ fn read(dir: &Path, room: &str) -> Vec<(String, String)> {
 
 /// `vox room read --hashes`: every entry the node holds, in the room's order.
 fn order(dir: &Path, room: &str) -> Vec<String> {
+    order_clocks(dir, room)
+        .into_iter()
+        .map(|(h, _)| h)
+        .collect()
+}
+
+/// `vox room read --hashes` with the clock that placed each entry: `(hash, clock ms)`.
+fn order_clocks(dir: &Path, room: &str) -> Vec<(String, u64)> {
     let (ok, out, err) = vox(dir, &["room", "read", room, "--hashes"], None);
     assert!(ok, "vox room read --hashes: {err}");
-    out.lines().map(str::to_owned).collect()
+    out.lines()
+        .map(|l| {
+            let (h, c) = l.split_once(' ').expect("`<hash> <clock>`");
+            (h.to_owned(), c.parse().expect("a clock"))
+        })
+        .collect()
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
 }
 
 fn texts(rows: &[(String, String)]) -> Vec<&str> {
@@ -331,16 +353,40 @@ fn converge(
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {what}; entries held: {}",
+            "timed out waiting for {what}; entries held: {}\n{}",
             nodes
                 .iter()
                 .zip(&orders)
                 .map(|((_, who), o)| format!("{who} {}", o.len()))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            daemon_logs(nodes)
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Every daemon's stderr for these nodes, so a red that is not about the order says what the
+/// daemons saw.
+fn daemon_logs(nodes: &[(&Path, &str)]) -> String {
+    let mut out = String::new();
+    for (dir, who) in nodes {
+        let mut logs: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default();
+        logs.retain(|p| p.extension().is_some_and(|x| x == "err"));
+        logs.sort();
+        for p in logs {
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            out.push_str(&format!("--- {who} {name} ---\n{text}"));
+        }
+    }
+    out
 }
 
 fn digest(seq: &[String]) -> String {
@@ -370,8 +416,8 @@ fn is_ordered_subsequence(who: &str, rows: &[(String, String)], seq: &[String]) 
 }
 
 #[test]
-#[ignore = "three real vox daemons (about two minutes); RED today for a cause below the log — see \
-            the module docs — with `crates/vox-core/tests/one_order_gate.rs` carrying the claim"]
+#[ignore = "three real vox daemons (about two minutes); intermittently red on v0.2.8 for a cause \
+            below the log (module docs); CI skips it by name"]
 fn three_members_one_offline_for_a_while_show_one_order() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
@@ -387,10 +433,15 @@ fn three_members_one_offline_for_a_while_show_one_order() {
     attached(alice, "alice");
     let bob_d = daemon(bob, "bob", "127.0.0.1:0", &format!("{IDENTITY}\n"), None);
     attached(bob, "bob");
-    // Carol goes down and comes back, on the same address, so what is measured is the order of
-    // what she missed, not whether her peers can still find her.
-    let carol_at = format!("127.0.0.1:{}", free_port());
-    let carol_d = daemon(carol, "carol", &carol_at, &format!("{IDENTITY}\n"), None);
+    // Carol goes down and comes back on whatever port she gets, as a person's restarted node
+    // does: finding her again is part of converging.
+    let carol_d = daemon(
+        carol,
+        "carol",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n"),
+        None,
+    );
     attached(carol, "carol");
     let room = room(alice, &[bob, carol]);
     let nodes = [
@@ -420,7 +471,7 @@ fn three_members_one_offline_for_a_while_show_one_order() {
     let carol_d = daemon(
         carol,
         "carol-2",
-        &carol_at,
+        "127.0.0.1:0",
         &format!("{IDENTITY}\n{ROOMPASS}\n"),
         None,
     );
@@ -432,7 +483,7 @@ fn three_members_one_offline_for_a_while_show_one_order() {
     );
     let posted = PER_ROUND * 8;
     // Converged: one entry set everywhere, and alice (who reads everyone) shows every post.
-    let orders = converge(&nodes, &room, "the three to converge", 420, |_| {
+    let orders = converge(&nodes, &room, "the three to converge", 180, |_| {
         let t = read(alice, &room);
         texts(&t)
             .iter()
@@ -566,4 +617,98 @@ fn a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind() {
          skew did not reach the entry, so this run proved nothing about clocks"
     );
     stop_all(vec![alice_d, carol_d]);
+}
+
+#[test]
+#[ignore = "two real vox daemons (about a minute); CI runs it in release"]
+fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = members(tmp.path(), &["alice", "bob"]);
+    let (alice, bob) = (&dirs[0], &dirs[1]);
+    let alice_d = daemon(
+        alice,
+        "alice",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n"),
+        None,
+    );
+    attached(alice, "alice");
+    // Bob's clock is a day ahead.
+    let bob_d = daemon(
+        bob,
+        "bob",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n"),
+        Some(DAY_AHEAD),
+    );
+    attached(bob, "bob");
+    let room = room(alice, &[bob]);
+
+    post(bob, &room, "from tomorrow");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let tomorrow = loop {
+        if let Some((h, _)) = read(alice, &room)
+            .into_iter()
+            .find(|(_, t)| t == "from tomorrow")
+        {
+            break h;
+        }
+        assert!(Instant::now() < deadline, "alice never read bob's post");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    // Alice has seen it; what she writes next names it in `seen`.
+    let posted_at = now_ms();
+    post(alice, &room, "after it");
+    let after = read(alice, &room)
+        .into_iter()
+        .find(|(_, t)| t == "after it")
+        .expect("alice shows her post")
+        .0;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let clocks = loop {
+        let a = order_clocks(alice, &room);
+        let b = order_clocks(bob, &room);
+        if b.iter().any(|(h, _)| *h == after) {
+            break [("alice", a), ("bob", b)];
+        }
+        assert!(Instant::now() < deadline, "bob never received alice's post");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let minutes = |ms: u64| (ms as i64 - posted_at as i64) / 60_000;
+    for (who, seq) in &clocks {
+        let ti = seq.iter().position(|(h, _)| *h == tomorrow).unwrap();
+        let ai = seq.iter().position(|(h, _)| *h == after).unwrap();
+        let (t_clock, a_clock) = (seq[ti].1, seq[ai].1);
+        println!(
+            "{who}: `from tomorrow` placed at {} min from now, `after it` at {} min (positions \
+             {ti} and {ai} of {})",
+            minutes(t_clock),
+            minutes(a_clock),
+            seq.len()
+        );
+        assert!(ti < ai, "{who}: the post that saw it must still follow it");
+        assert!(
+            a_clock < posted_at + 15 * 60_000,
+            "{who}: a post written after seeing a day-ahead post was placed {} min ahead of \
+             when it was written — one member dragged the room's clock forward",
+            minutes(a_clock)
+        );
+    }
+
+    // The skew really reached the entry: bob's stored claimed time is a day ahead.
+    stop_all(vec![bob_d]);
+    let (t_ms, a_ms) = claimed_times(bob, &tomorrow, &after);
+    println!(
+        "bob's store: `from tomorrow` claims {} min from when `after it` was written, `after it` \
+         {} min",
+        minutes(t_ms),
+        minutes(a_ms)
+    );
+    assert!(
+        t_ms > posted_at + 20 * 3_600_000,
+        "`from tomorrow` does not claim a time a day ahead ({t_ms} vs {posted_at}): the skew \
+         did not reach the entry, so this run proved nothing about clocks"
+    );
+    stop_all(vec![alice_d]);
 }

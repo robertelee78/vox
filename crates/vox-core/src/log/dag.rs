@@ -18,7 +18,8 @@
 //! Every entry gets a **hybrid logical clock**:
 //!
 //! ```text
-//! clock(e) = max( claimed_ms(e), clock(p) + 1 for every parent p this node holds )
+//! latest(e)  = max clock(p) over the parents p this node holds (or the room's genesis time)
+//! clock(e)   = max( min(claimed_ms(e), latest(e) + MAX_LEAD_MS), latest(e) + 1 )
 //! parents(e) = { e's own seq−1 } ∪ seen(e)
 //! ```
 //!
@@ -28,8 +29,8 @@
 //! of the entry set alone, so every node holding the same entries computes the
 //! identical sequence. An author's clock can move its entry only among its concurrent
 //! peers: an entry written an hour "early" is still lifted to just after the newest
-//! thing it saw. A clock running ahead drags everything that later sees the entry
-//! along with it — which reorders nothing that entry did not already precede.
+//! thing it saw. A clock running *ahead* is capped at [`MAX_LEAD_MS`] past the
+//! entry's latest parent, so one member cannot drag everyone's clocks into the future.
 //!
 //! **A `seen` hash this node does not hold never blocks acceptance.** Entries arrive
 //! out of order (a member was offline, a sync session died half-way), and refusing
@@ -67,6 +68,22 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::log::entry::{Entry, EntryKind, MAX_SEEN};
+
+/// How far an entry's claimed time may run ahead of the latest entry it names (or of the room's
+/// genesis, if it names none) before it is capped: ten minutes.
+///
+/// Without a cap one member could pin everyone's clocks forward: an entry claiming "tomorrow"
+/// lifts every entry that later sees it to tomorrow too, and everything concurrent with those
+/// then sorts before them for a day. The cap is computed from the entry's parents, never from
+/// the receiving node's clock, because a cap on "now" would differ between nodes and so would the
+/// order. With it, one post can move the room's clocks at most ten minutes, and moving them a day
+/// takes 144 posts, each visible and attributable.
+///
+/// Why ten minutes: honest clocks without time sync drift by seconds to a few minutes, so an
+/// honest entry is almost never capped; when it is (after a quiet spell of more than ten
+/// minutes), capping moves it only among entries it did not see, which is all the claimed time
+/// is ever used for. A larger bound would be a larger lever for a dishonest one.
+pub const MAX_LEAD_MS: u64 = 10 * 60 * 1_000;
 use crate::log::feed::Feed;
 
 /// The set of identities admitted to a `(channelID, epoch)` — the membership
@@ -173,6 +190,9 @@ pub struct Dag {
     /// Bumped whenever an already-stored entry's clock moves (a late parent arrived),
     /// so a timeline can tell a re-sort is due without recomputing anything.
     reorder_generation: u64,
+    /// The room's genesis time in ms, the anchor for an entry with no parent
+    /// ([`Dag::for_room`]).
+    origin_ms: Option<u64>,
 }
 
 impl Dag {
@@ -180,6 +200,18 @@ impl Dag {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty DAG for a room created at `origin_ms` (its genesis time): an entry with no
+    /// parent is capped at [`MAX_LEAD_MS`] past it, as every other entry is capped past its
+    /// latest parent. Without an origin such an entry's claimed time stands uncapped, which is
+    /// right only where nothing is shown from the order (an anchor's ciphertext copy).
+    #[must_use]
+    pub fn for_room(origin_ms: u64) -> Self {
+        Self {
+            origin_ms: Some(origin_ms),
+            ..Self::default()
+        }
     }
 
     /// The number of entries stored across all authors.
@@ -345,27 +377,19 @@ impl Dag {
         let author = entry.skeleton.author_id;
         let seq = entry.skeleton.seq;
         let seen = entry.skeleton.seen.clone();
-        let mut clock = entry.skeleton.claimed_ms;
-        if seq > 1 {
-            // Feeds are contiguous, so the own predecessor is always held.
-            if let Some(c) = self.clock.get(&entry.skeleton.prev_hash) {
-                clock = clock.max(c.saturating_add(1));
-            }
-        }
         for parent in &seen {
-            if let Some(c) = self.clock.get(parent) {
-                clock = clock.max(c.saturating_add(1));
-            }
             if let Some((other, other_seq)) = self.by_hash.get(parent).copied() {
                 let r = self.referenced.entry((author, other)).or_insert(0);
                 *r = (*r).max(other_seq);
             }
             self.seen_by.entry(*parent).or_default().push(hash);
         }
+        let clock = self.clock_of(&hash);
         self.clock.insert(hash, clock);
         self.ordered.insert((clock, hash));
 
-        // Children that named this entry before it arrived.
+        // Children that named this entry before it arrived: their clocks are recomputed with
+        // it held, and whatever moves takes its descendants along.
         let waiting = self.seen_by.get(&hash).cloned().unwrap_or_default();
         for child in &waiting {
             if let Some((child_author, _)) = self.by_hash.get(child).copied() {
@@ -373,30 +397,51 @@ impl Dag {
                 *r = (*r).max(seq);
             }
         }
-        let mut work: Vec<(Digest32, u64)> = waiting
-            .into_iter()
-            .map(|c| (c, clock.saturating_add(1)))
-            .collect();
-        while let Some((h, floor)) = work.pop() {
+        let mut work = waiting;
+        while let Some(h) = work.pop() {
             let Some(old) = self.clock.get(&h).copied() else {
                 continue;
             };
-            if old >= floor {
+            let new = self.clock_of(&h);
+            if new <= old {
                 continue;
             }
             self.ordered.remove(&(old, h));
-            self.ordered.insert((floor, h));
-            self.clock.insert(h, floor);
+            self.ordered.insert((new, h));
+            self.clock.insert(h, new);
             self.reorder_generation = self.reorder_generation.wrapping_add(1);
-            let next = floor.saturating_add(1);
             if let Some((a, s)) = self.by_hash.get(&h).copied() {
                 if let Some(succ) = self.feeds.get(&a).and_then(|f| f.get(s + 1)) {
-                    work.push((succ.entry_hash(), next));
+                    work.push(succ.entry_hash());
                 }
             }
             if let Some(children) = self.seen_by.get(&h) {
-                work.extend(children.iter().map(|c| (*c, next)));
+                work.extend(children.iter().copied());
             }
+        }
+    }
+
+    /// An entry's clock from its parents' clocks as currently held (module docs, "The one
+    /// order"): its claimed time, capped at [`MAX_LEAD_MS`] past the latest parent — or past
+    /// the room's origin when it has none — and never below one past any parent.
+    ///
+    /// Monotone in the parents' clocks, so recomputing a child when a parent rises only ever
+    /// raises it, and the fixpoint is the same whatever order entries arrived in.
+    fn clock_of(&self, hash: &Digest32) -> u64 {
+        let Some(entry) = self.get_by_hash(hash) else {
+            return 0;
+        };
+        let sk = &entry.skeleton;
+        let parents = sk.seen.iter().chain((sk.seq > 1).then_some(&sk.prev_hash));
+        let latest_parent = parents.filter_map(|p| self.clock.get(p).copied()).max();
+        let anchor = latest_parent.or(self.origin_ms);
+        let claimed = match anchor {
+            Some(a) => sk.claimed_ms.min(a.saturating_add(MAX_LEAD_MS)),
+            None => sk.claimed_ms,
+        };
+        match latest_parent {
+            Some(p) => claimed.max(p.saturating_add(1)),
+            None => claimed,
         }
     }
 
@@ -525,6 +570,12 @@ impl Dag {
     #[must_use]
     pub fn causal_order(&self) -> Vec<Digest32> {
         self.ordered.iter().map(|(_, h)| *h).collect()
+    }
+
+    /// [`Dag::causal_order`] with each entry's clock: `(entry_hash, clock_ms)`, first to last.
+    #[must_use]
+    pub fn order_keys(&self) -> Vec<(Digest32, u64)> {
+        self.ordered.iter().map(|(c, h)| (*h, *c)).collect()
     }
 
     /// Render-gating seam (ADR-008): attempt to decrypt+render the payload of the
