@@ -26,6 +26,8 @@
 pub mod actor;
 pub mod anchor;
 pub mod api;
+pub mod app;
+pub mod appipc;
 pub mod channel;
 pub mod circuitstream;
 pub mod content;
@@ -42,6 +44,7 @@ pub mod paths;
 pub mod prekeys;
 pub mod profile;
 pub mod resolver;
+pub mod status;
 pub mod store;
 pub mod syncstream;
 pub mod trust;

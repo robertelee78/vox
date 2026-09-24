@@ -230,9 +230,34 @@ impl DatagramRouter {
             id,
             router: Arc::clone(self),
             inbox: rx,
-            next_packet: AtomicU64::new(0),
+            next_packet: Arc::new(AtomicU64::new(0)),
             cap: None,
-            watcher,
+            watcher: Some(watcher),
+        })
+    }
+
+    /// Bind a flow to the stream `id` **without** taking the stream, for a stream that
+    /// goes on carrying bytes of its own (an `App` stream, ADR-022 decision 7).
+    ///
+    /// Nothing watches the stream here, so the flow's lifetime is the caller's to tie
+    /// to it: the only caller keeps the flow and the stream in one object whose drop
+    /// ends both (`node::app::AppStream`).
+    pub(crate) fn bind_shared(self: &Arc<Self>, id: u64, mode: FlowMode) -> Result<DatagramFlow> {
+        let (tx, rx) = mpsc::channel(FLOW_INBOX);
+        {
+            let mut t = self.table();
+            if t.reader.is_none() || t.flows.contains_key(&id) {
+                return Err(Error::Unreachable("datagram flow: cannot bind"));
+            }
+            t.flows.insert(id, Entry { tx, mode });
+        }
+        Ok(DatagramFlow {
+            id,
+            router: Arc::clone(self),
+            inbox: rx,
+            next_packet: Arc::new(AtomicU64::new(0)),
+            cap: None,
+            watcher: None,
         })
     }
 
@@ -360,11 +385,44 @@ pub struct DatagramFlow {
     id: u64,
     router: Arc<DatagramRouter>,
     inbox: mpsc::Receiver<Vec<u8>>,
-    next_packet: AtomicU64,
+    next_packet: Arc<AtomicU64>,
     /// The largest datagram this flow sends, when smaller than the path's; see
     /// [`DatagramFlow::cap_datagrams`].
     cap: Option<usize>,
-    watcher: AbortHandle,
+    /// The task that ends the flow when its stream ends; `None` for a flow bound
+    /// without taking its stream ([`DatagramRouter::bind_shared`]).
+    watcher: Option<AbortHandle>,
+}
+
+/// The sending half of a [`DatagramFlow`], cloneable, so one task can send while
+/// another waits in [`DatagramFlow::recv`]. It sends only while the flow is open.
+#[derive(Clone)]
+pub struct FlowSender {
+    id: u64,
+    router: Arc<DatagramRouter>,
+    next_packet: Arc<AtomicU64>,
+    cap: Option<usize>,
+}
+
+impl std::fmt::Debug for FlowSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FlowSender({})", self.id)
+    }
+}
+
+impl FlowSender {
+    /// As [`DatagramFlow::send`].
+    ///
+    /// # Errors
+    /// If the flow has ended.
+    pub fn send(&self, packet: &[u8]) -> Result<()> {
+        if !self.router.is_open(self.id) {
+            return Err(Error::Unreachable("datagram flow closed"));
+        }
+        self.router
+            .send_packet(self.id, &self.next_packet, self.cap, packet);
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for DatagramFlow {
@@ -406,6 +464,17 @@ impl DatagramFlow {
     /// known to.
     pub fn cap_datagrams(&mut self, max: usize) {
         self.cap = Some(max);
+    }
+
+    /// A cloneable sending half, sharing this flow's packet counter and cap.
+    #[must_use]
+    pub fn sender(&self) -> FlowSender {
+        FlowSender {
+            id: self.id,
+            router: Arc::clone(&self.router),
+            next_packet: Arc::clone(&self.next_packet),
+            cap: self.cap,
+        }
     }
 
     /// Send one packet, fragmenting it if it does not fit one datagram.
@@ -453,7 +522,9 @@ impl Drop for DatagramFlow {
     fn drop(&mut self) {
         // Aborting the watcher drops the stream it owns, which finishes it: the peer's
         // watcher sees the end and ends the peer's side of the flow.
-        self.watcher.abort();
+        if let Some(watcher) = &self.watcher {
+            watcher.abort();
+        }
         self.router.unregister(self.id);
     }
 }

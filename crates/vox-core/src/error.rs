@@ -350,4 +350,10 @@ pub enum Error {
         /// The underlying OS message.
         detail: String,
     },
+
+    /// A node refused an app-API request over its control socket (ADR-022 decision 7),
+    /// carrying the node's own reason — `no-listener`, not in the keyring, and so on —
+    /// because the program asking has no other way to learn it.
+    #[error("{0}")]
+    AppRefused(String),
 }

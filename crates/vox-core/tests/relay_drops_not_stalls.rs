@@ -155,6 +155,14 @@ struct Measured {
     /// Datagrams the relay took off A's leg and put on B's.
     relay_in: u64,
     relay_out: u64,
+    /// Why a long gap happened, for the assertion to say: datagrams after the warm-up
+    /// that arrived more than 15 ms over the fastest one's latency (a stall makes these
+    /// late; a loss does not), the last late sequence number (past `WARMUP` means the
+    /// congestion settling the warm-up excludes ran long), and the sender's own longest
+    /// gap between two sends (a gap B saw because A did not send on time).
+    late_after_warmup: usize,
+    last_late: Option<u32>,
+    max_send_gap: Duration,
 }
 
 fn rt() -> tokio::runtime::Runtime {
@@ -299,10 +307,12 @@ async fn measure(seed: u8) -> Measured {
         arrivals
     });
     let mut tick = tokio::time::interval(INTERVAL);
+    let mut sent_at = Vec::with_capacity((WARMUP + COUNT) as usize);
     for seq in 0..WARMUP + COUNT {
         tick.tick().await;
         let mut d = seq.to_be_bytes().to_vec();
         d.resize(PAYLOAD, 0xAB);
+        sent_at.push(Instant::now());
         a_flow.send(&d).unwrap();
     }
     let (warmup, arrivals): (Vec<_>, Vec<_>) = receiver
@@ -315,6 +325,45 @@ async fn measure(seed: u8) -> Measured {
         .map(|w| w[1].1.duration_since(w[0].1))
         .max()
         .unwrap_or_default();
+    // One-way latency per datagram, sender and receiver sharing this process's clock. A
+    // gap at B is a stall only if the datagrams after it were *late*; a gap the sender
+    // itself left (its task not scheduled on time) shows as a send gap instead. Printed
+    // so a red names which it was.
+    let latency = |seq: u32, at: Instant| at.duration_since(sent_at[seq as usize]);
+    let mut lat: Vec<(Duration, u32)> = warmup
+        .iter()
+        .chain(arrivals.iter())
+        .map(|(seq, at)| (latency(*seq, *at), *seq))
+        .collect();
+    let floor = lat.iter().map(|l| l.0).min().unwrap_or_default();
+    let late_after_warmup = lat
+        .iter()
+        .filter(|(l, seq)| *seq >= WARMUP && *l > floor + Duration::from_millis(15))
+        .count();
+    let last_late = lat
+        .iter()
+        .filter(|(l, _)| *l > floor + Duration::from_millis(15))
+        .map(|(_, seq)| *seq)
+        .max();
+    lat.sort();
+    let warmup_gap_at = warmup
+        .windows(2)
+        .max_by_key(|w| w[1].1.duration_since(w[0].1))
+        .map(|w| (w[0].0, w[1].0));
+    let send_gap = |a: u32, b: u32| sent_at[b as usize].duration_since(sent_at[a as usize]);
+    let max_send_gap = sent_at
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]))
+        .max()
+        .unwrap_or_default();
+    eprintln!(
+        "latency: floor {floor:?}, median {:?}, max {:?}; datagrams >15 ms over the floor \
+         after the warm-up: {late_after_warmup}; last such seq {last_late:?}; warm-up's \
+         longest gap between seqs {warmup_gap_at:?}; the sender's longest gap between two \
+         sends {max_send_gap:?}",
+        lat.get(lat.len() / 2).map(|l| l.0),
+        lat.last().map(|l| l.0),
+    );
     // Every gap between consecutive arrivals, with the sequence numbers either side, so
     // a failure shows whether the long gap spans a loss (seq jumps) or a stall (it does
     // not).
@@ -324,6 +373,17 @@ async fn measure(seed: u8) -> Measured {
         .collect();
     gaps.sort_by(|x, y| y.0.cmp(&x.0));
     gaps.truncate(5);
+    for (gap, a, b) in &gaps {
+        let after = arrivals
+            .iter()
+            .find(|(s, _)| s == b)
+            .map(|(s, at)| latency(*s, *at));
+        eprintln!(
+            "  gap {gap:?} between seq {a} and {b}: the sender left {:?} between them; seq \
+             {b} took {after:?}",
+            send_gap(*a, *b)
+        );
+    }
     let inner = conn.quinn().stats().path;
     let relay_leg_a = c
         .manager()
@@ -347,6 +407,9 @@ async fn measure(seed: u8) -> Measured {
         lost_outer: net.lost() - lost_before,
         relay_in: relay_leg_a.delivered,
         relay_out: relay_leg_b.sent,
+        late_after_warmup,
+        last_late,
+        max_send_gap,
     }
 }
 
@@ -379,11 +442,16 @@ fn a_lossy_relay_leg_loses_packets_instead_of_stalling_them() {
     assert!(
         m.max_gap < MAX_GAP,
         "B waited {:?} between two arrivals — a stall behind a retransmission, not a loss \
-         ({}/{} received, {} outer datagrams lost)",
+         ({}/{} received, {} outer datagrams lost). {} datagrams after the warm-up were \
+         late (last late seq {:?}; the warm-up ends at {WARMUP}); the sender's own longest \
+         gap was {:?}",
         m.max_gap,
         m.received,
         m.sent,
-        m.lost_outer
+        m.lost_outer,
+        m.late_after_warmup,
+        m.last_late,
+        m.max_send_gap
     );
     assert!(
         lost > 0,

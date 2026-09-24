@@ -46,7 +46,7 @@ use crate::hash::Digest32;
 use crate::nat::multiaddr::EndpointList;
 use crate::nat::reachability::{connect_direct, direct_candidates};
 use crate::time::Clock;
-use crate::transport::quic::{close_code, Admission, VoxConnection, VoxEndpoint};
+use crate::transport::quic::{Admission, VoxConnection, VoxEndpoint};
 use crate::transport::streams::{accept_typed, StreamKind};
 use crate::wire::WireError;
 
@@ -579,7 +579,5 @@ pub async fn accept_authorized(
 /// Reset both halves of a stream with the coded rejection — the same code an
 /// unauthenticated peer gets, so probing stream kinds reveals nothing.
 pub fn refuse_stream(send: &mut SendStream, recv: &mut RecvStream) {
-    let code = close_code(WireError::AuthenticatorInvalid);
-    let _ = send.reset(code);
-    let _ = recv.stop(code);
+    crate::transport::streams::refuse(send, recv);
 }

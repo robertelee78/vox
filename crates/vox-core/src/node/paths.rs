@@ -34,6 +34,9 @@ const SUN_PATH_BUDGET: usize = 100;
 /// configuration a person edits, not state the node owns — and it carries no secret: an
 /// anchor spec is a public identity and a public address.
 pub const ANCHORS_FILE: &str = "anchors";
+/// The profile's settings file in the config directory: `key = value` lines, `#`
+/// comments. Its first setting is `notify = off` (PRD-001 R37).
+pub const CONFIG_FILE: &str = "config";
 /// Directory of per-session read cursors inside a profile.
 pub const CURSOR_DIR: &str = "cursors";
 /// Where a harness session records how it can be woken (ADR-020 §6).
@@ -135,6 +138,12 @@ impl Paths {
         }
         name.push_str(".sock");
         std::env::temp_dir().join(name)
+    }
+
+    /// The settings file for this profile ([`CONFIG_FILE`]).
+    #[must_use]
+    pub fn config_file(&self) -> PathBuf {
+        self.config_dir.join(CONFIG_FILE)
     }
 
     /// The anchors file for this profile ([`ANCHORS_FILE`]).
