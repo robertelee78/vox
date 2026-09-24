@@ -907,7 +907,8 @@ Both unknowns are already spiked; neither remains open.
   that it cannot, and the message waits for the session's next turn. That is the correct
   degradation, because queueing always is the default and the interrupt is the optimisation.
 
-  > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, not reproduced.** `vox daemon`
+  > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, then reproduced through the real
+  > `vox daemon`; fix proposed in #16.** `vox daemon`
   > decides on `NodeEvent::NewEntry`, which the node emits only for its **own** appends (ADR-021 F13's
   > evidence), so an urgent message addressed to a session from *another* node would never interrupt
   > it. The gate above calls the wake decision directly and never runs the daemon's loop, so it could
