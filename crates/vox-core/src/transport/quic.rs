@@ -315,8 +315,11 @@ impl VoxEndpoint {
     /// its own verifier output slot), so `bind` itself only stores the local leaf
     /// + the provider's supported-signature algorithms.
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
-        let socket = std::net::UdpSocket::bind(addr)
-            .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
+        let socket = std::net::UdpSocket::bind(addr).map_err(|e| Error::LocalBind {
+            addr,
+            in_use: e.kind() == std::io::ErrorKind::AddrInUse,
+            reason: e.to_string(),
+        })?;
         let effective = {
             let sock = socket2::SockRef::from(&socket);
             let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);

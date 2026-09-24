@@ -253,6 +253,8 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::Refused => UiError::Refused,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
+        Fault::AddressInUse => UiError::AddressInUse,
+        Fault::AlreadyMember => UiError::AlreadyMember,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
     }

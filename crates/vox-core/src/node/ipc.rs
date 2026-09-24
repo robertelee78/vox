@@ -1407,7 +1407,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             },
         },
@@ -1424,7 +1424,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             },
         },
@@ -1443,7 +1443,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1534,7 +1534,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1550,7 +1550,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         {
             crate::node::api::Outcome::Done => Frame::Ok,
             other => Frame::Error {
-                reason: format!("{other:?}"),
+                reason: other.to_string(),
             },
         },
         Request::Forward {
@@ -1579,7 +1579,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 crate::node::api::Outcome::Done => {}
                 other => {
                     return Frame::Error {
-                        reason: format!("{other:?}"),
+                        reason: other.to_string(),
                     }
                 }
             }
@@ -1620,7 +1620,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1640,6 +1640,8 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             // The outcome is named, not reduced to "it failed". `Unreachable` and a
             // refused passphrase call for completely different responses from whoever
             // is holding the link, and this is the only place that knows which it was.
+            // The fault's name, which `vox room join` turns into the same guidance `vox
+            // connect` gives (`tunnel_cli::join_advice`, V29-12).
             other => Frame::Error {
                 reason: format!("{other:?}"),
             },
@@ -1656,7 +1658,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         {
             crate::node::api::Outcome::Done => Frame::Ok,
             other => Frame::Error {
-                reason: format!("{other:?}"),
+                reason: other.to_string(),
             },
         },
         Request::Invite { channel_id } => {
@@ -1670,7 +1672,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 crate::node::api::Outcome::Done => {}
                 other => {
                     return Frame::Error {
-                        reason: format!("{other:?}"),
+                        reason: other.to_string(),
                     }
                 }
             }
