@@ -936,6 +936,7 @@ const fn worth_another_responder(fault: Fault) -> bool {
             | Fault::ShuttingDown
             | Fault::NotNetworked
             | Fault::IdentityExists
+            | Fault::AlreadyMember
     )
 }
 
@@ -2543,7 +2544,23 @@ impl Node {
                             tokio::pin!(serving);
                             loop {
                                 tokio::select! {
-                                    _ = &mut serving => break,
+                                    // The result used to be dropped here, so a host refusing a
+                                    // member — untrusted, no such service, its own service down
+                                    // — said nothing anywhere (PRD-001 R36).
+                                    served = &mut serving => {
+                                        // Refusals only: a session that ends in an error
+                                        // after it was accepted is a disconnect, not a no.
+                                        if let Err(e @ crate::error::Error::TunnelDenied(_)) = served {
+                                            let who: String = crate::node::link::b32_encode(&peer)
+                                                .chars()
+                                                .take(12)
+                                                .collect();
+                                            let _ = events.send(NodeEvent::ProxyRefused {
+                                                reason: format!("refused {who} a tunnel: {e}"),
+                                            });
+                                        }
+                                        break;
+                                    }
                                     ev = served_rx.recv() => {
                                         let Ok(ev) = ev else { continue };
                                         if let NodeEvent::TunnelServed {
@@ -3120,7 +3137,7 @@ impl Node {
             return Outcome::Failed(Fault::NotNetworked);
         };
         if self.channels.contains_key(&parsed.channel_id) {
-            return Outcome::Failed(Fault::IdentityExists);
+            return Outcome::Failed(Fault::AlreadyMember);
         }
         let now = self.now();
         let me = net.local_id();
@@ -4840,7 +4857,7 @@ impl Node {
             // A room with no genesis service grant has no `.vox` name: its host is not
             // determined by the genesis, so there is nothing to resolve to. Such a room is
             // reached with `vox forward <member>/<tag>` instead (ADR-017 decision 4).
-            return Outcome::Failed(Fault::Refused);
+            return Outcome::Failed(Fault::NotAServiceRoom);
         }
         let hostname = crate::node::link::vox_hostname(channel_id);
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
@@ -4853,9 +4870,11 @@ impl Node {
         // in between, with `serve`'s failure invisible because its task's `Result` is
         // dropped. A bound socket accepts into the kernel's backlog immediately, so
         // handing it over makes the announcement truthful the moment it is made.
+        // A port that cannot be bound is the person's to fix, and it said `Unreachable` — which
+        // sent them to check a host that was never contacted (PRD-001 R36).
         let listener = match tokio::net::TcpListener::bind(bind).await {
             Ok(l) => l,
-            Err(_) => return Outcome::Failed(Fault::Unreachable),
+            Err(_) => return Outcome::Failed(Fault::AddressInUse),
         };
         let bound = match listener.local_addr() {
             Ok(a) => a,
@@ -4923,6 +4942,14 @@ impl Node {
         }
         // The member's advertised endpoints, from this node's board — the same hints
         // any dial uses; the ladder does the rest.
+        // **The local port before the network.** A forward bound its port only after the dial,
+        // so a port already in use was never reported: the dial failed first on a host that
+        // was not up yet, and `vox forward` sat "waiting for a path" for five minutes about a
+        // problem on this machine (PRD-001 R36). Probed and released; `Forward::bind` still
+        // binds for real, and still reports if the port was taken in between.
+        if local.port() != 0 && std::net::TcpListener::bind(local).is_err() {
+            return Outcome::Failed(Fault::AddressInUse);
+        }
         let endpoints = self
             .net
             .as_ref()
@@ -4945,8 +4972,22 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         };
-        match crate::node::tunnel::Forward::bind(conn, *channel_id, service_tag.to_owned(), local)
-            .await
+        let events = self.event_tx.clone();
+        let host_id = *host;
+        let refused: crate::node::tunnel::OnRefused =
+            Arc::new(move |tag: &str, e: &crate::error::Error| {
+                let _ = events.send(NodeEvent::ProxyRefused {
+                    reason: forward_refusal(&host_id, tag, e),
+                });
+            });
+        match crate::node::tunnel::Forward::bind(
+            conn,
+            *channel_id,
+            service_tag.to_owned(),
+            local,
+            refused,
+        )
+        .await
         {
             Ok(fwd) => {
                 let (channel_id, host, service_tag, bound) =
@@ -5510,11 +5551,31 @@ async fn admit_board_records(
     admitted
 }
 
+/// What a person is told when a connection through their forward did not get through.
+///
+/// The host deliberately says nothing about *why* it refused (dark services), so neither
+/// can this; what it can say is which of the two things only the host decides is the likely
+/// cause, and that everything on this side worked.
+fn forward_refusal(host: &Digest32, tag: &str, e: &Error) -> String {
+    let who: String = crate::node::link::b32_encode(host)
+        .chars()
+        .take(12)
+        .collect();
+    match e {
+        Error::TunnelDenied(_) | Error::TunnelRevoked(_) => format!(
+            "{who} refused a connection to {tag:?}: they are not offering it, or have not run \
+             `vox trust add` on you — only they can change either"
+        ),
+        other => format!("a connection to {tag:?} on {who} failed: {other}"),
+    }
+}
+
 fn fault_of(e: &Error) -> Fault {
     match e {
         // A ladder that tried every rung and got nowhere is unreachable, not an internal
         // fault: falling through to `Internal` made the join walk stop after one responder.
         Error::LadderExhausted(_) => Fault::Unreachable,
+        Error::LocalBind { .. } => Fault::AddressInUse,
         Error::Profile("no identity in this profile") => Fault::NoIdentity,
         Error::Profile("identity already exists in this profile") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,

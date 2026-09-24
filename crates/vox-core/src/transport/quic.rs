@@ -208,8 +208,11 @@ impl VoxEndpoint {
     /// its own verifier output slot), so `bind` itself only stores the local leaf
     /// + the provider's supported-signature algorithms.
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
-        let socket = std::net::UdpSocket::bind(addr)
-            .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
+        let socket = std::net::UdpSocket::bind(addr).map_err(|e| Error::LocalBind {
+            addr,
+            in_use: e.kind() == std::io::ErrorKind::AddrInUse,
+            reason: e.to_string(),
+        })?;
         let wrapped = quinn::TokioRuntime
             .wrap_udp_socket(socket)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;

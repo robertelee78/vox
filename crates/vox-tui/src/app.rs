@@ -676,7 +676,16 @@ pub fn run_daemon(
                      `vox daemon` is the identity passphrase; lines after it open rooms."
                         .to_owned()
                 }
-                other => format!("could not unlock this profile's identity: {other:?}"),
+                // Unlocking also brings the node onto the network, so a `--listen` port that
+                // is taken fails here. It said `Failed(Internal)` — a bug report for an
+                // occupied port (PRD-001 R36).
+                Outcome::Failed(Fault::AddressInUse) => format!(
+                    "cannot listen on {listen}: something else already holds that UDP port\n\
+                     \x20      Pick another with --listen, or stop whatever holds it \
+                     (`lsof -i :{}` names it).",
+                    listen.port()
+                ),
+                other => format!("could not unlock this profile's identity: {other}"),
             }));
         }
         // Then the second lock. `vox room post|read|board` all need the room OPEN,
@@ -766,7 +775,7 @@ pub fn run_daemon(
                 // An operator who mistyped one passphrase wants the other rooms served and
                 // a line telling them which one failed — not a process that refuses to
                 // start.
-                eprintln!("vox daemon: could not open that room: {outcome:?}");
+                eprintln!("vox daemon: could not open that room: {outcome}");
                 continue;
             }
             // Neither form opened anything. Nothing to undo — a room this did not open

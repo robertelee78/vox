@@ -168,6 +168,10 @@ pub async fn serve_reporting(
     .await
 }
 
+/// What a forward does with a connection that did not get through: told the service tag and
+/// why, so the node can say so.
+pub type OnRefused = Arc<dyn Fn(&str, &Error) + Send + Sync>;
+
 /// A live local port forwarded to a member's service over the overlay.
 ///
 /// Dropping it stops the listener. Connections already spliced run to their own end:
@@ -218,13 +222,18 @@ impl Forward {
         channel_id: Digest32,
         service_tag: String,
         local: SocketAddr,
+        refused: OnRefused,
     ) -> Result<Self> {
         if !local.ip().is_loopback() {
             return Err(Error::MalformedTunnel("a forward binds loopback only"));
         }
         let listener = TcpListener::bind(local)
             .await
-            .map_err(|_| Error::TunnelDenied("forward: cannot bind the local port"))?;
+            .map_err(|e| Error::LocalBind {
+                addr: local,
+                in_use: e.kind() == std::io::ErrorKind::AddrInUse,
+                reason: e.to_string(),
+            })?;
         let bound = listener
             .local_addr()
             .map_err(|_| Error::TunnelDenied("forward: bound port unknown"))?;
@@ -234,11 +243,18 @@ impl Forward {
             while let Ok((app, _)) = listener.accept().await {
                 let conn = Arc::clone(&conn);
                 let tag = tag.clone();
+                let refused = refused.clone();
                 tokio::spawn(async move {
-                    // One stream per connection. A refusal closes this connection and
-                    // says nothing about why (dark services).
-                    if let Ok((send, recv)) = open_typed(&conn, StreamKind::Tunnel).await {
-                        let _ = session::dial(send, recv, &channel_id, &tag, app).await;
+                    // One stream per connection. The HOST says nothing about why it refused
+                    // (dark services) — but this side knows it was refused, and a person whose
+                    // `ssh` got a reset was told nothing at all (PRD-001 R36). Saying "the
+                    // host refused" reveals nothing the reset did not.
+                    let outcome = match open_typed(&conn, StreamKind::Tunnel).await {
+                        Ok((send, recv)) => session::dial(send, recv, &channel_id, &tag, app).await,
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = outcome {
+                        refused(&tag, &e);
                     }
                 });
             }

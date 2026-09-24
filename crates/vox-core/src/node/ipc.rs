@@ -1461,7 +1461,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             },
         },
@@ -1477,7 +1477,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             },
         },
@@ -1494,7 +1494,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             },
         },
@@ -1513,7 +1513,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1589,7 +1589,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1605,7 +1605,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         {
             crate::node::api::Outcome::Done => Frame::Ok,
             other => Frame::Error {
-                reason: format!("{other:?}"),
+                reason: other.to_string(),
             },
         },
         Request::Forward {
@@ -1634,7 +1634,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 crate::node::api::Outcome::Done => {}
                 other => {
                     return Frame::Error {
-                        reason: format!("{other:?}"),
+                        reason: other.to_string(),
                     }
                 }
             }
@@ -1675,7 +1675,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1695,8 +1695,8 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             // The outcome is named, not reduced to "it failed". `Unreachable` and a
             // refused passphrase call for completely different responses from whoever
             // is holding the link, and this is the only place that knows which it was.
-            other => Frame::Error {
-                reason: format!("{other:?}"),
+            crate::node::api::Outcome::Failed(fault) => Frame::Error {
+                reason: fault.explain_join().to_owned(),
             },
         },
         Request::Create {
@@ -1711,7 +1711,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         {
             crate::node::api::Outcome::Done => Frame::Ok,
             other => Frame::Error {
-                reason: format!("{other:?}"),
+                reason: other.to_string(),
             },
         },
         Request::Invite { channel_id } => {
@@ -1725,7 +1725,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 crate::node::api::Outcome::Done => {}
                 other => {
                     return Frame::Error {
-                        reason: format!("{other:?}"),
+                        reason: other.to_string(),
                     }
                 }
             }
@@ -1770,7 +1770,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         {
             crate::node::api::Outcome::Done => Frame::Ok,
             other => Frame::Error {
-                reason: format!("{other:?}"),
+                reason: other.to_string(),
             },
         },
         Request::Rooms => {

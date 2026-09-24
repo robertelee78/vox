@@ -191,7 +191,7 @@ pub async fn open_profile(
     };
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot open this profile's identity: {out:?}"
+            "cannot open this profile's identity: {out}"
         )));
     }
     Ok(node)
@@ -220,7 +220,7 @@ async fn open_room(
         .await;
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot unlock this profile: {out:?}"
+            "cannot unlock this profile: {out}"
         )));
     }
     let known: Vec<Digest32> = node.view().channels.iter().map(|c| c.channel_id).collect();
@@ -235,7 +235,7 @@ async fn open_room(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot open that room: {out:?}")));
+        return Err(AppError::Usage(format!("cannot open that room: {out}")));
     }
     Ok((node, channel_id))
 }
@@ -255,9 +255,7 @@ pub async fn service_add(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!(
-            "cannot offer {tag:?}: {out:?} — you need bind:{tag} in this room"
-        )));
+        return Err(AppError::Usage(format!("cannot offer {tag:?}: {out}")));
     }
     println!(
         "vox: offering {tag:?} at {local} in room {}",
@@ -344,7 +342,7 @@ pub async fn grant(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot grant: {out:?}")));
+        return Err(AppError::Usage(format!("cannot grant: {out}")));
     }
     println!(
         "vox: {} may now dial {tag:?}{}",
@@ -397,7 +395,13 @@ pub async fn forward(
                 local,
             })
             .await;
-        if out.is_done() || Instant::now() >= deadline {
+        // Only a missing path is worth waiting out. A port in use, a closed room or a
+        // non-loopback address is this machine's to fix, and five minutes of "waiting for a
+        // path" hid it (PRD-001 R36).
+        if out.is_done()
+            || Instant::now() >= deadline
+            || !matches!(out, Outcome::Failed(Fault::Unreachable))
+        {
             break out;
         }
         // Drain whatever the node has to say about the attempt that just failed, so a person
@@ -424,8 +428,11 @@ pub async fn forward(
         // and cannot be granted — `vox grant`, the only thing that issued it, is
         // withdrawn too. What actually decides is the host's keyring, and the host is
         // the only one who can change it.
+        if !matches!(out, Outcome::Failed(Fault::Unreachable | Fault::Refused)) {
+            return Err(AppError::Usage(format!("cannot forward to {local}: {out}")));
+        }
         return Err(AppError::Usage(format!(
-            "cannot forward: {out:?}\n       Two things it could be: {} is not reachable \
+            "cannot forward: {out}\n       Two things it could be: {} is not reachable \
              right now, or they have not run `vox trust add` on you.\n       Reach is \
              the HOST's decision (ADR-017 decision 3) — there is nothing you can grant \
              yourself.",
@@ -443,7 +450,17 @@ pub async fn forward(
     println!("vox: {bound} → {tag:?} on {}", short(&host));
     println!("     e.g.  ssh -p {} user@{}", bound.port(), bound.ip());
     println!("     Ctrl-C to stop");
-    let _ = tokio::signal::ctrl_c().await;
+    // Keep saying what the node says while the forward runs: a connection the host refuses
+    // arrives as an event, and a person whose `ssh` was reset has nowhere else to learn why.
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            ev = node.next_event() => match ev {
+                Some(ref ev) => say_if_it_explains_a_failure(ev),
+                None => break,
+            },
+        }
+    }
     println!("vox: stopping the forward");
     let _ = node.apply(NodeCommand::StopForward { local: bound }).await;
     let _ = node.apply(NodeCommand::Shutdown).await;
@@ -500,9 +517,7 @@ pub async fn serve(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!(
-            "cannot serve port {port}: {out:?}"
-        )));
+        return Err(AppError::Usage(format!("cannot serve port {port}: {out}")));
     }
     let channel_id = node
         .view()
@@ -514,7 +529,7 @@ pub async fn serve(
 
     let out = node.apply(NodeCommand::Invite { channel_id }).await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot mint an address: {out:?}")));
+        return Err(AppError::Usage(format!("cannot mint an address: {out}")));
     }
     let url = loop {
         match node.next_event().await {
@@ -614,7 +629,7 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     let out = node.apply(NodeCommand::Up { channel_id, bind }).await;
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot bring the proxy up: {out:?} — is the room a `vox serve` room, and is its host reachable?"
+            "cannot bring the proxy up on {bind}: {out}"
         )));
     }
     let (hostname, bound) = loop {
@@ -735,36 +750,8 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
     // the first version of this fix was four lines of prose and read like documentation
     // at exactly the moment somebody is stuck.
     let advice = match out {
-        Outcome::Failed(Fault::WrongPassphrase) => {
-            "the room passphrase is wrong\n       the address is not in question — this is the passphrase alone"
-        }
-        Outcome::Failed(Fault::BadLink) => {
-            "that address will not parse, or names a room this node cannot use\n       this one IS the address — check you copied all of it"
-        }
-        // **Do not claim the passphrase is fine here.** Nobody answered, so nobody
-        // checked it — a wrong passphrase against an offline room reaches exactly this
-        // branch. The first version of this fix said "NOT the address or the
-        // passphrase", which is the same false confidence as the sentence it replaced,
-        // pointed the other way. Say what was and was not established.
-        Outcome::Failed(Fault::Unreachable) => {
-            "nobody who can answer for this room could be reached\n       so your passphrase was never checked — this is not a verdict on it\n       every member the board knows is offline: ask one to come online, or check\n       `vox node` on the anchor shows more than `1m` for this room"
-        }
-        // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
-        // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
-        // responder, so it is the responder that says no. Leading with "the refusal is
-        // the thing to chase" was true and useless at the one moment a person most
-        // needs a suggestion. Name the likely cause first, without pretending it is the
-        // only one.
-        Outcome::Failed(Fault::Refused) => {
-            "a member answered and refused the join\n       usually the room passphrase is wrong — it is checked by them, not by you,\n       so a typo arrives here rather than as a passphrase error\n       if you are sure of it, they may have revoked you, or be on a different room"
-        }
-        Outcome::Failed(Fault::NotNetworked) => {
-            "this node is not networked, or its identity is locked\n       nothing about the room is in question"
-        }
-        Outcome::Failed(Fault::Locked | Fault::NoIdentity) => {
-            "this profile has no unlocked identity, so there is nobody to join as\n       run `vox id` to make one"
-        }
-        _ => "the node did not say why, which is itself worth reporting",
+        Outcome::Failed(fault) => fault.explain_join(),
+        Outcome::Done => "the node did not say why, which is itself worth reporting",
     };
 
     if said.is_empty() {
@@ -899,7 +886,7 @@ pub async fn trust_add(
         .await;
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot trust that identity: {out:?}"
+            "cannot trust that identity: {out}"
         )));
     }
     println!("vox: trusting {} as {petname:?}", short(&target));
@@ -923,9 +910,15 @@ pub async fn trust_remove(node: &NodeHandle, fingerprint: &str) -> Result<(), Ap
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!(
-            "cannot stop trusting that identity: {out:?}"
-        )));
+        // `NotConsented` from `Untrust` has one meaning: the identity is not in the ring.
+        return Err(AppError::Usage(match out {
+            Outcome::Failed(Fault::NotConsented) => format!(
+                "{} is not in your trust keyring, so there is nothing to remove\n       \
+                 `vox trust list` shows who is",
+                short(&target)
+            ),
+            other => format!("cannot stop trusting that identity: {other}"),
+        }));
     }
     println!("vox: no longer trusting {}", short(&target));
     println!("     it reads nothing you write from now on, in any room you share");
