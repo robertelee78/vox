@@ -40,6 +40,11 @@ pub const CONFIG_FILE: &str = "config";
 
 /// The node's retention policy file (ADR-023 decision 2), in the config directory.
 pub const RETENTION_FILE: &str = "retention";
+
+/// The download-directory file inside a profile's **config** directory (PRD-001 R18): one
+/// line naming where `vox room get` puts a collected file when no `--dir` or `--out` is
+/// given. A leading `~/` means the home directory. Absent, it is `~/Downloads`.
+pub const DOWNLOADS_FILE: &str = "downloads";
 /// Directory of per-session read cursors inside a profile.
 pub const CURSOR_DIR: &str = "cursors";
 /// Where a harness session records how it can be woken (ADR-020 §6).
@@ -160,6 +165,12 @@ impl Paths {
     #[must_use]
     pub fn retention_file(&self) -> PathBuf {
         self.config_dir.join(RETENTION_FILE)
+    }
+
+    /// The download-directory file for this profile ([`DOWNLOADS_FILE`]).
+    #[must_use]
+    pub fn downloads_file(&self) -> PathBuf {
+        self.config_dir.join(DOWNLOADS_FILE)
     }
 
     /// Where an agent session's read cursor for one room is kept

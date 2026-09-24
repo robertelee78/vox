@@ -1799,76 +1799,32 @@ struct Offer {
     http: bool,
 }
 
-/// Where collected files land (PRD-001 R18): `downloads = <dir>` in the profile's
-/// `config` file, else `~/Downloads`.
-pub(crate) fn downloads_dir(paths: &Paths) -> std::path::PathBuf {
-    let configured = std::fs::read_to_string(paths.config_file())
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.starts_with('#'))
-                .filter_map(|l| l.split_once('='))
-                .find(|(k, _)| k.trim() == "downloads")
-                .map(|(_, v)| std::path::PathBuf::from(v.trim()))
-        });
-    configured.unwrap_or_else(|| {
-        std::env::var_os("HOME")
-            .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from)
-            .join("Downloads")
-    })
-}
-
-/// The sender's name made safe to write: its last path component only, no leading
-/// dots, nothing a filesystem treats specially. A sender does not choose where a file
-/// lands, and cannot name one `../../.bashrc`.
-fn sanitize(name: &str) -> String {
-    let leaf = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let clean: String = leaf
-        .chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let clean = clean.trim_start_matches('.').trim().to_owned();
-    if clean.is_empty() {
-        "download".to_owned()
-    } else {
-        clean
-    }
-}
-
-/// `dir/name`, or `dir/name (1)`, `dir/name (2)`… — the first that does not exist, so a
-/// collected file never overwrites anything.
-fn unique_in(dir: &Path, name: &str) -> std::path::PathBuf {
-    let first = dir.join(name);
-    if !first.exists() {
-        return first;
-    }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s.to_owned(), format!(".{e}")),
-        _ => (name.to_owned(), String::new()),
-    };
-    (1..)
-        .map(|i| dir.join(format!("{stem} ({i}){ext}")))
-        .find(|p| !p.exists())
-        .unwrap_or(first)
-}
-
 /// `vox room get` — collect an offered file and verify it.
 ///
+/// **Where it lands is the receiver's decision, never the sender's** (PRD-001 R18, D4). The
+/// offer's `name` is text another member wrote, and it used to become the path as written:
+/// `../../.ssh/authorized_keys` or `/etc/…` was honoured, `File::create` truncated whatever was
+/// there before a single byte was verified, and a mismatch then *deleted* it. Now:
+///
+/// - the file goes into a download directory — `--dir`, else the profile's `downloads` config
+///   file, else `~/Downloads` — under the sender's name reduced to a bare file name
+///   ([`safe_file_name`]); `--out` names an exact path instead;
+/// - **nothing that exists is ever overwritten**: a taken name gets a ` (1)`, ` (2)` … suffix,
+///   and an `--out` that exists is refused;
+/// - the bytes go to a hidden `.part` file beside it, and only a transfer whose SHA-256 and size
+///   match the announcement is linked into place; anything else removes the `.part` and nothing
+///   else.
+///
 /// # Errors
-/// If the node cannot be reached, the room is unknown, no matching offer exists,
-/// the transfer cannot be established, or **the bytes do not match the announced
-/// hash**, in which case the partial file is removed.
+/// If the node cannot be reached, the room is unknown, no matching offer exists, the
+/// destination is unusable, the transfer cannot be established, stalls, sends more than was
+/// announced, or **does not match the announced hash** — in every one of which nothing is left
+/// behind and nothing that was there before is touched.
 pub async fn get_file(
     paths: &Paths,
     room: &str,
     selector: &str,
+    dir: Option<&std::path::Path>,
     out: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
@@ -1922,15 +1878,26 @@ pub async fn get_file(
             ))
         })?;
 
-    // An explicit `--out` is the person's own choice. Otherwise the downloads
-    // directory, under the sender's name made safe, never over an existing file.
     let dest = match out {
-        Some(p) => p.to_owned(),
+        Some(exact) => {
+            if exact.symlink_metadata().is_ok() {
+                return Err(AppError::Usage(format!(
+                    "{} already exists; `vox room get` never overwrites a file — choose \
+                     another --out, or leave it out to use the download directory",
+                    exact.display()
+                )));
+            }
+            Destination::Exact(exact.to_owned())
+        }
         None => {
-            let dir = downloads_dir(paths);
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| AppError::Usage(format!("creating {}: {e}", dir.display())))?;
-            unique_in(&dir, &sanitize(&offer.name))
+            let dir = match dir {
+                Some(d) => d.to_owned(),
+                None => download_dir(paths)?,
+            };
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                AppError::Usage(format!("cannot use {} for downloads: {e}", dir.display()))
+            })?;
+            Destination::Into(dir, safe_file_name(&offer.name))
         }
     };
 
@@ -1963,24 +1930,204 @@ pub async fn get_file(
     result
 }
 
-/// Stream the offered bytes to `dest`, verifying as we go.
-async fn collect(bound: &str, dest: &std::path::Path, offer: &Offer) -> Result<(), AppError> {
+/// Where a collected file is to land.
+enum Destination {
+    /// Into this directory, under this (already safe) name or the first free variant of it.
+    Into(std::path::PathBuf, String),
+    /// Exactly here, and only if nothing is.
+    Exact(std::path::PathBuf),
+}
+
+impl Destination {
+    /// The directory the `.part` file goes in: beside the destination, so the final step is
+    /// a link on one filesystem and never a copy.
+    fn dir(&self) -> std::path::PathBuf {
+        match self {
+            Destination::Into(dir, _) => dir.clone(),
+            Destination::Exact(p) => p
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .map_or_else(|| std::path::PathBuf::from("."), Path::to_owned),
+        }
+    }
+
+    /// A name for the `.part` file.
+    fn stem(&self) -> String {
+        match self {
+            Destination::Into(_, name) => name.clone(),
+            Destination::Exact(p) => p.file_name().map_or_else(
+                || "download".to_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+        }
+    }
+}
+
+/// The directory a collected file goes in when `--dir` and `--out` are both absent: the
+/// profile's `downloads` config file if it names one, else `~/Downloads`.
+fn download_dir(paths: &Paths) -> Result<std::path::PathBuf, AppError> {
+    let home = || {
+        std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                AppError::Usage("HOME is not set, so there is no ~/Downloads; pass --dir".into())
+            })
+    };
+    let expand = |line: &str| -> Result<std::path::PathBuf, AppError> {
+        Ok(match line.strip_prefix("~/") {
+            Some(rest) => home()?.join(rest),
+            None => std::path::PathBuf::from(line),
+        })
+    };
+    if let Ok(text) = std::fs::read_to_string(paths.downloads_file()) {
+        if let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
+            return expand(line);
+        }
+    }
+    // Or `downloads = <dir>` in the profile's settings file (`vox share`'s form, PRD-001 R18
+    // and R37): the two changes that built R18 chose different files, and both are honoured.
+    if let Ok(text) = std::fs::read_to_string(paths.config_file()) {
+        let set = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .find(|(k, _)| k.trim() == "downloads")
+            .map(|(_, v)| v.trim().to_owned());
+        if let Some(dir) = set.filter(|d| !d.is_empty()) {
+            return expand(&dir);
+        }
+    }
+    Ok(home()?.join("Downloads"))
+}
+
+/// The sender's file name reduced to a **bare file name** that cannot leave the directory it
+/// is put in.
+///
+/// Everything up to the last `/` or `\` is dropped, so `../../x`, `/etc/passwd` and
+/// `..\\x` all become their last component. Control characters go, leading dots go (no
+/// `..`, and no file hidden from a listing by a name somebody else chose), and the result is
+/// cut to 200 bytes. Whatever is left empty becomes `download`.
+#[must_use]
+pub fn safe_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = last.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim().trim_start_matches('.').trim();
+    let mut out = String::new();
+    for c in trimmed.chars() {
+        if out.len() + c.len_utf8() > 200 {
+            break;
+        }
+        out.push(c);
+    }
+    if out.is_empty() {
+        "download".to_owned()
+    } else {
+        out
+    }
+}
+
+/// `name`, then `name (1)`, `name (2)` … with the number before the extension.
+fn numbered(name: &str, n: usize) -> String {
+    if n == 0 {
+        return name.to_owned();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
+    }
+}
+
+/// How long one read of the transfer may wait before the transfer is abandoned. A sender
+/// that has gone quiet must not hold the collector for ever.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Stream the offered bytes to a `.part` file beside `dest`, verify them, and only then link
+/// them into place under a name nothing else holds.
+async fn collect(bound: &str, dest: &Destination, offer: &Offer) -> Result<(), AppError> {
+    let dir = dest.dir();
+    // `create_new`, so the temporary file is never somebody else's either.
+    let (part, file) = (0..1000)
+        .find_map(|n| {
+            let p = dir.join(format!(".{}.{}-{n}.part", dest.stem(), std::process::id()));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&p)
+                .ok()
+                .map(|f| (p, f))
+        })
+        .ok_or_else(|| {
+            AppError::Usage(format!(
+                "cannot create a temporary file in {}",
+                dir.display()
+            ))
+        })?;
+    let result = receive(bound, file, offer).await;
+    let total = match result {
+        Ok(total) => total,
+        Err(e) => {
+            // **Only the `.part` is removed.** It is the one file this collector created;
+            // whatever was in the directory before is not its to delete.
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+    };
+    let placed = place(&part, dest);
+    let _ = std::fs::remove_file(&part);
+    let placed = placed?;
+    println!("vox: {} ({total} bytes) verified", placed.display());
+    Ok(())
+}
+
+/// Link a verified `.part` into place without replacing anything.
+///
+/// A hard link fails if the name is taken, which makes "is it free" and "take it" one step
+/// — a rename would silently replace whatever appeared in between.
+fn place(part: &Path, dest: &Destination) -> Result<std::path::PathBuf, AppError> {
+    match dest {
+        Destination::Exact(p) => std::fs::hard_link(part, p)
+            .map(|()| p.clone())
+            .map_err(|e| {
+                AppError::Usage(format!(
+                    "cannot put the file at {}: {e}; nothing was overwritten",
+                    p.display()
+                ))
+            }),
+        Destination::Into(dir, name) => {
+            for n in 0..1000 {
+                let candidate = dir.join(numbered(name, n));
+                match std::fs::hard_link(part, &candidate) {
+                    Ok(()) => return Ok(candidate),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => {
+                        return Err(AppError::Usage(format!(
+                            "cannot put the file at {}: {e}",
+                            candidate.display()
+                        )))
+                    }
+                }
+            }
+            Err(AppError::Usage(format!(
+                "every name from {name} to {} is taken in {}",
+                numbered(name, 999),
+                dir.display()
+            )))
+        }
+    }
+}
+
+/// Read the transfer into `file`, refusing more bytes than were announced, a stall, and any
+/// result whose SHA-256 is not the announced one. Returns the byte count.
+async fn receive(bound: &str, mut file: std::fs::File, offer: &Offer) -> Result<u64, AppError> {
     use sha2::{Digest as _, Sha256};
     use tokio::io::AsyncReadExt as _;
 
-    let mut sock = tokio::net::TcpStream::connect(bound)
+    let mut sock = tokio::time::timeout(READ_TIMEOUT, tokio::net::TcpStream::connect(bound))
         .await
+        .map_err(|_| AppError::Usage("the forward did not answer".into()))?
         .map_err(|e| AppError::Usage(format!("connecting to the forward: {e}")))?;
-    // Written beside the destination under a hidden name, and renamed into place only
-    // once it verifies: nothing that looks like the file exists until it is the file.
-    let part = dest.with_file_name(format!(
-        ".{}.vox-part",
-        dest.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
-    let mut file = std::fs::File::create(&part)
-        .map_err(|e| AppError::Usage(format!("creating {}: {e}", part.display())))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
@@ -2001,7 +2148,6 @@ async fn collect(bound: &str, dest: &std::path::Path, offer: &Offer) -> Result<(
                 .await
                 .map_err(|e| AppError::Usage(format!("reading the reply: {e}")))?;
             if n == 0 {
-                let _ = std::fs::remove_file(&part);
                 return Err(AppError::Usage("the sharer closed before answering".into()));
             }
             head.extend_from_slice(&buf[..n]);
@@ -2009,53 +2155,59 @@ async fn collect(bound: &str, dest: &std::path::Path, offer: &Offer) -> Result<(
                 break i + 4;
             }
             if head.len() > 16 * 1024 {
-                let _ = std::fs::remove_file(&part);
                 return Err(AppError::Usage("the sharer's reply is not HTTP".into()));
             }
         };
         if !head.starts_with(b"HTTP/1.1 200") && !head.starts_with(b"HTTP/1.0 200") {
-            let _ = std::fs::remove_file(&part);
             return Err(AppError::Usage("the sharer refused the request".into()));
         }
         let rest = &head[body_start..];
         hasher.update(rest);
         std::io::Write::write_all(&mut file, rest)
-            .map_err(|e| AppError::Usage(format!("writing {}: {e}", part.display())))?;
+            .map_err(|e| AppError::Usage(format!("writing the download: {e}")))?;
         total += rest.len() as u64;
     }
     loop {
-        let n = sock
-            .read(&mut buf)
+        let n = tokio::time::timeout(READ_TIMEOUT, sock.read(&mut buf))
             .await
+            .map_err(|_| {
+                AppError::Usage(format!(
+                    "the transfer stalled for {}s after {total} of {} bytes; nothing was kept",
+                    READ_TIMEOUT.as_secs(),
+                    offer.size
+                ))
+            })?
             .map_err(|e| AppError::Usage(format!("reading the transfer: {e}")))?;
         if n == 0 {
             break;
         }
+        total += n as u64;
+        if total > offer.size {
+            return Err(AppError::Usage(format!(
+                "the sender sent more than the {} bytes it announced; nothing was kept",
+                offer.size
+            )));
+        }
         hasher.update(&buf[..n]);
         std::io::Write::write_all(&mut file, &buf[..n])
-            .map_err(|e| AppError::Usage(format!("writing {}: {e}", part.display())))?;
-        total += n as u64;
+            .map_err(|e| AppError::Usage(format!("writing the download: {e}")))?;
     }
-    std::io::Write::flush(&mut file)
-        .map_err(|e| AppError::Usage(format!("flushing {}: {e}", part.display())))?;
+    file.sync_all()
+        .map_err(|e| AppError::Usage(format!("flushing the download: {e}")))?;
     drop(file);
 
     let got = hex(&hasher.finalize());
-    if got != offer.sha256 {
-        // **The partial file is removed.** `cat | nc` truncating silently is the
-        // classic way this idiom bites; leaving a file that looks complete and is
-        // not would reproduce exactly that failure with extra steps.
-        let _ = std::fs::remove_file(&part);
+    if got != offer.sha256 || total != offer.size {
+        // **Nothing is kept.** `cat | nc` truncating silently is the classic way this idiom
+        // bites; a file that looks complete and is not would reproduce exactly that failure
+        // with extra steps. The caller removes the `.part`, which is all there is.
         return Err(AppError::Usage(format!(
             "the transfer does not match what was announced — expected sha256 {} over {} bytes, \
-             got {got} over {total}. The partial file was removed.",
+             got {got} over {total}. Nothing was kept.",
             offer.sha256, offer.size
         )));
     }
-    std::fs::rename(&part, dest)
-        .map_err(|e| AppError::Usage(format!("moving the verified file into place: {e}")))?;
-    println!("vox: {} ({total} bytes) verified", dest.display());
-    Ok(())
+    Ok(total)
 }
 
 /// Read a passphrase from stdin, stripping exactly one trailing newline.
