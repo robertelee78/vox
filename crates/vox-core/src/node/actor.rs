@@ -212,6 +212,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::PushRetry { .. } => "retrying a push that failed",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
+        NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped => "shutting the network down",
     }
@@ -549,6 +550,22 @@ enum NetEvent {
         /// Answered once the admission is applied, which releases the acceptance frame. A dropped
         /// sender answers too — the slot must never wait on an actor that has moved on.
         ack: tokio::sync::oneshot::Sender<()>,
+    },
+    /// A room's key was sealed under its passphrase on a blocking thread (the slow part of
+    /// creating a room): finish the room and answer the command that asked for it.
+    ChannelSealed {
+        /// The `CreateChannel` command's reply, answered once the room exists.
+        reply: oneshot::Sender<Outcome>,
+        /// The room's local name.
+        local_name: String,
+        /// The passphrase, kept by the room's state.
+        passphrase: Secret,
+        /// The genesis made before the seal.
+        genesis: Box<crate::governance::genesis::Genesis>,
+        /// When the room was begun.
+        now: u64,
+        /// The room key and its sealed wrap, or why sealing failed.
+        sealed: crate::error::Result<(crate::atrest::sek::Sek, crate::atrest::SekWrap)>,
     },
     /// A record by another author was admitted to this node's board, so what this node can
     /// vouch for has grown and its anchors do not know it yet.
@@ -1408,6 +1425,20 @@ impl Node {
                     let shutdown = matches!(command, NodeCommand::Shutdown);
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
+                    // **Answered later, not here.** Creating a room seals its key under the
+                    // passphrase with production Argon2id — seconds of CPU — and this task answers
+                    // nothing while it runs. So the seal goes to a blocking thread and the reply
+                    // travels with it; `NetEvent::ChannelSealed` finishes the room and answers.
+                    if let NodeCommand::CreateChannel {
+                        local_name,
+                        passphrase,
+                    } = command
+                    {
+                        self.begin_create_channel(local_name, passphrase, reply).await;
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
+                        continue;
+                    }
                     let outcome = self.handle(command).await;
                     self.note_if_stalled(name, started);
                     self.publish().await;
@@ -2362,6 +2393,34 @@ impl Node {
                 // stream because the room closed or this node has no profile. It will find out from
                 // the join's own outcome, which is the right place for it to learn.
                 let _ = ack.send(());
+            }
+            NetEvent::ChannelSealed {
+                reply,
+                local_name,
+                passphrase,
+                genesis,
+                now,
+                sealed,
+            } => {
+                let outcome = match sealed {
+                    Err(e) => Outcome::Failed(fault_of(&e)),
+                    Ok((sek, wrap)) => match self.profile.as_ref() {
+                        None => Outcome::Failed(Fault::NoIdentity),
+                        Some(profile) => match ChannelState::create_from_sealed(
+                            profile,
+                            &local_name,
+                            &passphrase,
+                            *genesis,
+                            sek,
+                            &wrap,
+                            now,
+                        ) {
+                            Ok(ch) => self.finish_create_channel(ch).await,
+                            Err(e) => Outcome::Failed(fault_of(&e)),
+                        },
+                    },
+                };
+                let _ = reply.send(outcome);
             }
             NetEvent::BoardGrew { channel_id } => {
                 // Pass it on, which for a member means its anchors. A node that is not a member of
@@ -4703,21 +4762,81 @@ impl Node {
             return Outcome::Failed(Fault::NoIdentity);
         };
         match ChannelState::create_with_profile(profile, local_name, passphrase, now, self.argon2) {
-            Ok(ch) => {
-                let id = ch.channel_id();
-                self.channels
-                    .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
-                self.adopt_channel_anchors(&id, None).await;
-                self.refresh_network_view().await;
-                self.publish_channel_locally(&id).await;
-                self.publish_channel_to_anchors(&id).await;
-                let _ = self
-                    .event_tx
-                    .send(NodeEvent::ChannelOpened { channel_id: id });
-                Outcome::Done
-            }
+            Ok(ch) => self.finish_create_channel(ch).await,
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
+    }
+
+    /// Everything after a room exists: hold it, give it anchors, publish it, say so.
+    async fn finish_create_channel(&mut self, ch: ChannelState) -> Outcome {
+        let id = ch.channel_id();
+        self.channels
+            .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
+        self.adopt_channel_anchors(&id, None).await;
+        self.refresh_network_view().await;
+        self.publish_channel_locally(&id).await;
+        self.publish_channel_to_anchors(&id).await;
+        let _ = self
+            .event_tx
+            .send(NodeEvent::ChannelOpened { channel_id: id });
+        Outcome::Done
+    }
+
+    /// Begin creating a room: the genesis here, the Argon2id seal on a blocking thread, and the
+    /// reply carried to `NetEvent::ChannelSealed`. Any failure before the seal answers at once.
+    async fn begin_create_channel(
+        &mut self,
+        local_name: String,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
+            return;
+        };
+        let (genesis, sek) = match ChannelState::create_genesis(
+            profile,
+            &local_name,
+            crate::governance::capability::CapabilitySet::new(),
+            now,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                return;
+            }
+        };
+        let signer = match profile.signer_arc() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                return;
+            }
+        };
+        let argon2 = self.argon2;
+        let tx = self.net_tx.clone();
+        let channel_id = genesis.channel_id();
+        let seal_passphrase = passphrase.clone();
+        tokio::spawn(async move {
+            let sealed = tokio::task::spawn_blocking(move || {
+                let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
+                sek.seal(&factor, &channel_id, &seal_passphrase, argon2)
+                    .map(|wrap| (sek, wrap))
+            })
+            .await
+            .unwrap_or(Err(Error::Argon2Failed));
+            let _ = tx
+                .send(NetEvent::ChannelSealed {
+                    reply,
+                    local_name,
+                    passphrase,
+                    genesis: Box::new(genesis),
+                    now,
+                    sealed,
+                })
+                .await;
+        });
     }
 
     /// Create a service room and offer its one service, atomically (ADR-017).
