@@ -87,6 +87,11 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// on the network.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How many failed sessions in a row a `(room, peer)` push is retried on the next tick before it is
+/// left to the periodic interval. Enough to ride out a collision (both sides pushing at once); few
+/// enough that a peer whose sessions always fail cannot hold the room.
+const MAX_PUSH_RETRIES: u32 = 3;
+
 /// How often a peer reached over a relay is retried for a direct path.
 ///
 /// A relayed path works, so nothing forces a retry — but it costs a third party's bandwidth
@@ -200,6 +205,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AnchorConnected { .. } => "publishing every room to an anchor that answered",
         NetEvent::AddressesDiscovered { .. } => "publishing every room at a new address",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
+        NetEvent::PushRetry { .. } => "retrying a push that failed",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
@@ -486,8 +492,18 @@ enum NetEvent {
     SyncDone {
         /// The channel that was reconciled.
         channel_id: Digest32,
+        /// The peer it was reconciled with.
+        peer: Digest32,
         /// What the session did, or why it failed.
         outcome: crate::error::Result<crate::node::channel::SyncOutcome>,
+    },
+    /// A push whose session failed is due again for that peer — sent after a short random wait by
+    /// the `SyncDone` handler, so two ends that collided do not retry together.
+    PushRetry {
+        /// The room.
+        channel_id: Digest32,
+        /// The peer the push failed to.
+        peer: Digest32,
     },
     /// A join exchange finished on its own task and is handing back what the actor must
     /// apply: the admission, the session, and the event a person sees.
@@ -1160,6 +1176,11 @@ pub struct Node {
     /// A local append (or a finished session with pushes still owed) wants `run_due_syncs` now
     /// rather than at the next tick. See `push_if_owed`.
     push_now: bool,
+    /// Consecutive failed sessions per `(room, peer)`; see `MAX_PUSH_RETRIES`.
+    push_failures: BTreeMap<(Digest32, Digest32), u32>,
+    /// Peers that were skipped behind a busy room or had a push re-owed: served first on the next
+    /// pass, so a peer that always takes the room cannot always go first.
+    owed_first: std::collections::BTreeSet<Digest32>,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012).
     record_seq: BTreeMap<Digest32, u64>,
@@ -1306,6 +1327,8 @@ impl Node {
             join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
             push_now: false,
+            push_failures: BTreeMap::new(),
+            owed_first: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
             prekeys: None,
@@ -2284,8 +2307,9 @@ impl Node {
                 send,
                 recv,
             } => {
-                let _ = (&conn, peer);
-                self.run_sync_session(channel_id, epoch, send, recv).await;
+                let _ = &conn;
+                self.run_sync_session(peer, channel_id, epoch, send, recv)
+                    .await;
             }
             NetEvent::AddressesDiscovered { mappings } => {
                 // Re-publish every open channel's records: the addresses in them were
@@ -2323,8 +2347,17 @@ impl Node {
                     .entry(peer)
                     .or_insert_with(SyncSchedule::connected);
             }
+            NetEvent::PushRetry { channel_id, peer } => {
+                self.pending_push.insert(channel_id);
+                if let Some(schedule) = self.schedules.get_mut(&peer) {
+                    schedule.note_local_append();
+                }
+                self.owed_first.insert(peer);
+                self.push_now = true;
+            }
             NetEvent::SyncDone {
                 channel_id,
+                peer,
                 outcome,
             } => {
                 self.syncing.remove(&channel_id);
@@ -2337,12 +2370,41 @@ impl Node {
                 // at exactly 30s (p95 29.7–30.0s) — the collisions an immediate push makes more
                 // likely. Owed again, retried on the *next tick* and not at once: a peer that keeps
                 // refusing must not be answered with a tight loop.
+                //
+                // **Owed to that peer only, and not for ever.** The first version re-owed the room to
+                // *every* peer, every time any session failed. A peer whose sessions always fail —
+                // an anchor that keeps no log for the room refuses every one — was then re-owed
+                // every tick, sorted ahead of the member it shared the room with, took the room each
+                // pass, and the member's owed push lost every round: the independent verdict
+                // measured 2–3 relayed runs in 10 losing a message for 120s (vox-bc, #41). Now the
+                // retry goes to the peer that failed, at most `MAX_PUSH_RETRIES` times running; past
+                // that the pair waits for the periodic interval like any other.
+                //
+                // **After a short random wait, not the next tick.** The commonest failure is a
+                // collision: both ends push on the same event, each refuses the other because its
+                // own session for the room is running, and both fail. Retried on the tick, the two
+                // retries landed together again and a message took up to a second (median 364–531ms
+                // in 3 of 10 relayed runs, measured). A random 20–100ms wait desynchronises them.
                 if outcome.is_err() {
-                    self.pending_push.insert(channel_id);
-                    for schedule in self.schedules.values_mut() {
-                        schedule.note_local_append();
+                    let failures = self.push_failures.entry((channel_id, peer)).or_insert(0);
+                    *failures = failures.saturating_add(1);
+                    if *failures <= MAX_PUSH_RETRIES {
+                        let jitter = crate::identity::rng::random_array::<1>().map_or(0, |b| b[0]);
+                        let wait = Duration::from_millis(20 + u64::from(jitter) * 80 / 255);
+                        let tx = self.net_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(wait).await;
+                            let _ = tx.send(NetEvent::PushRetry { channel_id, peer }).await;
+                        });
                     }
-                } else if !self.pending_push.is_empty() {
+                } else {
+                    self.push_failures.remove(&(channel_id, peer));
+                }
+                // The room is free now **whatever the outcome**: a push that found it mid-session
+                // is owed and goes at once. Gating this on success left an owed push waiting for the
+                // tick whenever the session that held the room failed — which a log-less anchor's
+                // always does — and put a 1.00s ceiling on exactly the messages it delayed.
+                if !self.pending_push.is_empty() {
                     // A push that found this room mid-session is owed; the room is free now.
                     self.push_now = true;
                 }
@@ -3740,11 +3802,18 @@ impl Node {
             return false;
         };
         let now = self.now();
-        let due: Vec<(Digest32, SyncTrigger)> = self
+        let mut due: Vec<(Digest32, SyncTrigger)> = self
             .schedules
             .iter()
             .filter_map(|(peer, s)| s.due(now).map(|t| (*peer, t)))
             .collect();
+        // **Owed peers first.** `schedules` is keyed by fingerprint, so without this every pass
+        // visited peers in the same order, and one that sorted first and took the room each time
+        // left the rest skipped each time. A stable sort keeps fingerprint order within each group.
+        due.sort_by_key(|(peer, _)| !self.owed_first.contains(peer));
+        for (peer, _) in &due {
+            self.owed_first.remove(peer);
+        }
         if due.is_empty() {
             return false;
         }
@@ -3883,6 +3952,7 @@ impl Node {
                 if !owed.is_empty() {
                     owed_rooms.extend(owed.iter().copied());
                     schedule.note_local_append();
+                    self.owed_first.insert(peer);
                 }
             }
         }
@@ -4010,6 +4080,7 @@ impl Node {
                         let _ = tx
                             .send(NetEvent::SyncDone {
                                 channel_id: cid,
+                                peer,
                                 outcome: Err(e),
                             })
                             .await;
@@ -4038,6 +4109,7 @@ impl Node {
             let _ = tx
                 .send(NetEvent::SyncDone {
                     channel_id: cid,
+                    peer,
                     outcome,
                 })
                 .await;
@@ -4050,6 +4122,7 @@ impl Node {
     fn start_session(
         &mut self,
         channel_id: Digest32,
+        peer: Digest32,
         transport: crate::transport::quic::QuicStreamTransport,
     ) {
         let Some(store) = self.log_store() else {
@@ -4090,6 +4163,7 @@ impl Node {
             let _ = tx
                 .send(NetEvent::SyncDone {
                     channel_id,
+                    peer,
                     outcome,
                 })
                 .await;
@@ -4132,6 +4206,7 @@ impl Node {
     /// and ordered, which is what the single-task design is for.
     async fn run_sync_session(
         &mut self,
+        peer: Digest32,
         channel_id: Digest32,
         epoch: u64,
         send: quinn::SendStream,
@@ -4174,7 +4249,7 @@ impl Node {
             return;
         }
         let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
-        self.start_session(channel_id, transport);
+        self.start_session(channel_id, peer, transport);
     }
 
     /// Accept an inbound [`PairwiseFrame::Hello`], establishing the responder half of
@@ -4996,7 +5071,18 @@ impl Node {
         self.view_tx.send_replace(view);
     }
 
+    /// The node's view, built **without waiting on any room a session holds.**
+    ///
+    /// `publish()` runs this after every command and every event, and it took each room's lock in
+    /// turn — the lock a sync session holds for its whole run, across its network waits. So while
+    /// any session was waiting on a peer, nearly every event left the actor parked here. When both
+    /// ends pushed at once, each actor parked on its own room while its session waited for the other
+    /// actor to answer, until the 20s frame timeout (the independent verdict on #41 traced it: an
+    /// actor silent 19.9s, both sessions ending `sync failed: transport` at exactly the timeout). A
+    /// room that is held now keeps its entry from the view already published — at most one event old
+    /// — and is refreshed on the next publish after the session hands it back.
     async fn view_of(&self) -> NodeView {
+        let prev = self.view_tx.borrow().clone();
         let identity = self.profile.as_ref().map(|p| IdentityInfo {
             fingerprint: p.fingerprint(),
             created: p.created(),
@@ -5020,21 +5106,38 @@ impl Node {
             .unwrap_or_default();
         for a in &mut anchoring {
             if let Some(state) = self.anchored.get(&a.channel_id) {
-                a.entries = Some(state.lock().await.entries() as u64);
+                a.entries = match state.try_lock() {
+                    Ok(st) => Some(st.entries() as u64),
+                    Err(_) => prev
+                        .anchoring
+                        .iter()
+                        .find(|p| p.channel_id == a.channel_id)
+                        .and_then(|p| p.entries),
+                };
             }
         }
         let mut channels = Vec::with_capacity(known.len());
         for id in &known {
             channels.push(match self.channels.get(id) {
-                Some(shared) => {
-                    let ch = shared.lock().await;
-                    ChannelSummary {
+                Some(shared) => match shared.try_lock() {
+                    Ok(ch) => ChannelSummary {
                         channel_id: *id,
                         local_name: Some(ch.local_name().to_owned()),
                         open: true,
                         entries: ch.entry_count() as u64,
-                    }
-                }
+                    },
+                    Err(_) => prev
+                        .channels
+                        .iter()
+                        .find(|c| c.channel_id == *id)
+                        .cloned()
+                        .unwrap_or(ChannelSummary {
+                            channel_id: *id,
+                            local_name: None,
+                            open: true,
+                            entries: 0,
+                        }),
+                },
                 None => ChannelSummary {
                     channel_id: *id,
                     local_name: None,
@@ -5045,8 +5148,14 @@ impl Node {
         }
         let mut open_channels = Vec::with_capacity(self.channels.len());
         let mut mlock_active = true;
-        for shared in self.channels.values() {
-            let ch = shared.lock().await;
+        for (id, shared) in &self.channels {
+            let Ok(ch) = shared.try_lock() else {
+                if let Some(d) = prev.open_channels.iter().find(|d| d.channel_id == *id) {
+                    open_channels.push(d.clone());
+                }
+                mlock_active &= prev.mlock_active;
+                continue;
+            };
             mlock_active &= ch.mlock_active();
             open_channels.push(ChannelDetail {
                 channel_id: ch.channel_id(),
