@@ -682,6 +682,36 @@ impl ChannelState {
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
+        let (genesis, sek) = Self::create_genesis(profile, local_name, service_grant, now_secs)?;
+        let signer = profile.signer()?;
+        let factor = SignatureIdentityFactor::new(signer);
+        let wrap = sek.seal(&factor, &genesis.channel_id(), channel_passphrase, argon2)?;
+        Self::create_from_sealed(
+            profile,
+            local_name,
+            channel_passphrase,
+            genesis,
+            sek,
+            &wrap,
+            now_secs,
+        )
+    }
+
+    /// The fast first step of creating a room: its genesis and a fresh room key.
+    ///
+    /// Split from [`ChannelState::create_with_grant`] so the slow middle step — sealing the room
+    /// key under the passphrase with production Argon2id, seconds of CPU — can run off the node's
+    /// actor, which answers nothing while it works. [`ChannelState::create_from_sealed`] is the
+    /// last step.
+    ///
+    /// # Errors
+    /// A local name over the limit, no unlocked signer, or a genesis or key that cannot be made.
+    pub fn create_genesis(
+        profile: &Profile,
+        local_name: &str,
+        service_grant: CapabilitySet,
+        now_secs: u64,
+    ) -> Result<(Genesis, Sek)> {
         if local_name.len() > MAX_LOCAL_NAME_LEN {
             return Err(Error::SizeLimitExceeded("channel local name"));
         }
@@ -693,13 +723,27 @@ impl ChannelState {
             min_suite: SuiteFloor::DAY_ONE.id(),
         };
         let genesis = Genesis::create_with_grant(signer, now_secs, policy, service_grant)?;
+        Ok((genesis, Sek::generate()?))
+    }
+
+    /// The last step of creating a room, from a genesis and a room key already sealed under the
+    /// passphrase. See [`ChannelState::create_genesis`].
+    ///
+    /// # Errors
+    /// No unlocked signer, a segment that cannot be sealed, or a store write that fails.
+    pub fn create_from_sealed(
+        profile: &Profile,
+        local_name: &str,
+        channel_passphrase: &[u8],
+        genesis: Genesis,
+        sek: Sek,
+        wrap: &crate::atrest::SekWrap,
+        now_secs: u64,
+    ) -> Result<Self> {
+        let signer = profile.signer()?;
         let channel_id = genesis.channel_id();
         let epoch = 0u64;
         let me = signer.fingerprint();
-
-        let sek = Sek::generate()?;
-        let factor = SignatureIdentityFactor::new(signer);
-        let wrap = sek.seal(&factor, &channel_id, channel_passphrase, argon2)?;
         let sender = SenderChain::new(&channel_id, epoch, &me, 0, now_secs)?;
         // Retain generation 0's origin at the moment it is minted: once the live
         // chain ratchets past iteration 0 the origin is unrecoverable, so it is kept
@@ -731,7 +775,7 @@ impl ChannelState {
         )?;
 
         let mut batch = profile.store().batch()?;
-        batch.put_sek_wrap(&channel_id, &wrap)?;
+        batch.put_sek_wrap(&channel_id, wrap)?;
         batch.put_segment(
             &channel_id,
             SegmentKind::KeyMaterial,
