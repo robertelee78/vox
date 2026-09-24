@@ -7,7 +7,7 @@ and is now genuinely built, with a real-binary proof. Decisions 1, 3, 4, 8, 9,
 10 and 11 are **proposed and not built**; what ships today implements the withdrawn model and is a live
 vulnerability until M17.6–M17.13 land.
 **Date**: 2026-09-21
-**Updated**: 2026-09-24 — PRD-001: refusals through `vox up`/`vox forward` are honest, and forwards survive a host restart (ADR-013 "Tunnel honesty").
+**Updated**: 2026-09-24 — PRD-001: refusals through `vox up`/`vox forward` are honest, removing a service cuts its live sessions, and forwards survive a host restart (ADR-013 "Tunnel honesty").
 **Updated**: 2026-09-21 (third revision, then revised again the same day after independent review) —
 **capability-bearing rooms are withdrawn.** Decision 3 held that *"'may this member dial it' and 'is this
 person a member' are the same question, asked once."* That is refuted: admission to a room is passphrase +
@@ -1208,7 +1208,8 @@ New work, in dependency order:
     (`tunnel::session::accept_reporting`), so a stream parked across the withdrawal is refused.
   - **A live session** is cut: the serving task selects between the byte copy and the watch, and
     leaves the moment the client is no longer in the set. *(Since 2026-09-24 the function is
-    `session::splice_until`; ADR-013 "Tunnel honesty".)* The QUIC stream is **reset** with
+    `session::splice_until`, and it also watches the live service offer, so removing the service cuts the
+    session too — PRD-001 R22; ADR-013 "Tunnel honesty".)* The QUIC stream is **reset** with
     `REACH_WITHDRAWN_CODE` (`0x1711`), not finished, because a clean close is indistinguishable from the
     carried service hanging up.
   - **The reason reaches the far end.** The dialer maps that reset code to `Error::TunnelRevoked`; the proxy

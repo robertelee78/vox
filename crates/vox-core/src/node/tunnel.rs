@@ -71,12 +71,41 @@ pub fn publish_reachers(handle: &Reachers, next: BTreeSet<Digest32>) -> bool {
     })
 }
 
+/// The services a host offers in one channel, `service_tag → local address`, shared live
+/// between the actor (which writes) and the serving tasks (which read) — the same shape,
+/// and for the same reason, as [`Reachers`].
+///
+/// Live because removing a service has to reach the sessions it is already carrying
+/// (PRD-001 R22). A copy taken when the stream opened would keep serving a port the host
+/// has stopped offering for as long as the session lasted, which for `ssh` is hours.
+pub type Offered = Arc<tokio::sync::watch::Sender<BTreeMap<String, SocketAddr>>>;
+
+/// A fresh, empty offer: the state that serves nothing.
+#[must_use]
+pub fn empty_offered() -> Offered {
+    Arc::new(tokio::sync::watch::Sender::new(BTreeMap::new()))
+}
+
+/// Publish a newly computed offer, waking the serving tasks **only if it changed** — the
+/// rule [`publish_reachers`] states, for the same reason: every wake re-evaluates whether
+/// to tear a live session down.
+pub fn publish_offered(handle: &Offered, next: BTreeMap<String, SocketAddr>) -> bool {
+    handle.send_if_modified(|current| {
+        if *current == next {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    })
+}
+
 /// One channel's host-side facts, as the actor snapshots them for the serving task:
 /// the services this node offers there, and who may reach them.
 #[derive(Clone)]
 pub struct ChannelServices {
-    /// `service_tag → local address` (this node's Bind configuration).
-    pub services: BTreeMap<String, SocketAddr>,
+    /// `service_tag → local address` (this node's Bind configuration), live.
+    pub offered: Offered,
     /// The identities that may reach this node's services **in this channel** (ADR-017
     /// decision 3, M17.7): the intersection of this node's trust keyring with this
     /// channel's current author set.
@@ -96,7 +125,7 @@ pub struct ChannelServices {
 impl std::fmt::Debug for ChannelServices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChannelServices")
-            .field("services", &self.services.len())
+            .field("services", &self.offered.borrow().len())
             .finish_non_exhaustive()
     }
 }
@@ -145,10 +174,13 @@ pub async fn serve_reporting(
         &client,
         |channel_id, tag| {
             let channel = snapshot.get(channel_id)?;
-            let endpoint = *channel.services.get(tag)?;
+            // Read from the live offer, not a copy: a service removed while this stream sat
+            // unread is refused like one that was never offered.
+            let endpoint = *channel.offered.borrow().get(tag)?;
             Some(HostService {
                 endpoint,
                 reachers: Arc::clone(&channel.reachers),
+                offered: Arc::clone(&channel.offered),
             })
         },
         |channel_id, tag| {

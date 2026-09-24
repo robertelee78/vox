@@ -103,6 +103,9 @@ async fn host() {
     match session::accept(send, recv, &client_id, |cid, tag| {
         (*cid == channel_id && tag == "echo").then_some(session::HostService {
             endpoint: echo_addr,
+            offered: std::sync::Arc::new(tokio::sync::watch::Sender::new(
+                [("echo".to_owned(), echo_addr)].into_iter().collect(),
+            )),
             reachers: std::sync::Arc::new(tokio::sync::watch::Sender::new(
                 [client_id].into_iter().collect(),
             )),

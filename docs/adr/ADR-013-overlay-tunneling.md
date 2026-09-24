@@ -2,7 +2,7 @@
 
 **Status**: implemented and **reachable** — the per-stream port-forward model runs end to end through the node (`crates/vox-core/src/{tunnel,node/tunnel}.rs`, `crates/vox-tui` `service`/`grant`/`forward`), gated by a release test that reaches a TCP service between two symmetric-NAT clients through an anchor; SOCKS front-end, signed session events, the SSH-CA binding and the TUN datapath remain (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-24 — **a tunnel tells the truth about how it ended** (PRD-001 R22–R24): a SOCKS reply is the host's answer, a refused or cut forward resets the application's socket, an abortive close is carried as one, and a forward reaches its host afresh per connection; `tunnel::authz`, `grant_capabilities`, `NodeCommand::GrantTunnel`, IPC `T_GRANT` and the `vox grant` verb are removed. See "Tunnel honesty" under Implementation notes. 2026-09-21 (later the same day) — **tunnel authorization is per-sender consent, not a per-member capability.** ADR-017's third revision withdraws the genesis service grant, `0x0013` and `vox grant`; this ADR's invariant that *"tunnel capabilities are never inherited from membership"* is restored **unqualified**, and its claim that message consent and tunnel access are *orthogonal* is **reversed** — they are one axis. See the Authorization model bullets and the `node_m15_anchor_gate` note. 2026-09-21 — the **SOCKS5 front-end is built and is the person-facing entry point** (`node::up`, ADR-017 decision 5 / M17.3): it resolves `.vox` names and needs no privilege, which is what this ADR listed as primary from the start. The TUN model stays optional and unbuilt. (A brief revision promoting TUN to the primary path was reverted the same day — see ADR-017 decision 5.) 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
+**Updated**: 2026-09-24 — **a tunnel tells the truth about how it ended** (PRD-001 R22–R24): a SOCKS reply is the host's answer, a refused or cut forward resets the application's socket, an abortive close is carried as one, removing a service cuts its live sessions, and a forward reaches its host afresh per connection; `tunnel::authz`, `grant_capabilities`, `NodeCommand::GrantTunnel`, IPC `T_GRANT` and the `vox grant` verb are removed. See "Tunnel honesty" under Implementation notes. 2026-09-21 (later the same day) — **tunnel authorization is per-sender consent, not a per-member capability.** ADR-017's third revision withdraws the genesis service grant, `0x0013` and `vox grant`; this ADR's invariant that *"tunnel capabilities are never inherited from membership"* is restored **unqualified**, and its claim that message consent and tunnel access are *orthogonal* is **reversed** — they are one axis. See the Authorization model bullets and the `node_m15_anchor_gate` note. 2026-09-21 — the **SOCKS5 front-end is built and is the person-facing entry point** (`node::up`, ADR-017 decision 5 / M17.3): it resolves `.vox` names and needs no privilege, which is what this ADR listed as primary from the start. The TUN model stays optional and unbuilt. (A brief revision promoting TUN to the primary path was reverted the same day — see ADR-017 decision 5.) 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: tunneling, tcp, ssh, tun, socks, authorization, zero-trust
 
@@ -253,6 +253,8 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     read from a pipe when stdin is not a terminal, so nothing lands in shell history. **`vox grant` is
     removed** (2026-09-24): it had been reduced to a refusal stub, and before that it wrote capabilities
     nothing consulted. Approving a reader (`vox trust add`) is the grant (ADR-017 decision 3, revised).
+    `vox service remove` asks the running node over its control socket when one holds the profile, so a
+    service can be withdrawn from a live host (PRD-001 R22).
   - **Gate** (`node_m15_anchor_gate.rs`, release): Alice offers a localhost TCP service in a room, Bob
     joins through the anchor, and **before any grant his forward binds but carries nothing** — the service
     is dark to a member. Alice grants `dial:ssh`; the grant reaches Bob by ordinary sync, with nobody
@@ -267,7 +269,7 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     holds the passphrase and paid the proof of work. Both clients are behind symmetric NATs, so the path is a relayed circuit and the anchor
     carried packets it cannot read. A second connection over the same forward works too. `ssh` over Vox is
     this test with `sshd` in place of the echo, which is why the echo is enough.
-- **Tunnel honesty (2026-09-24, PRD-001 R23, R24; defects D6, D7, D11).** Each fixed property below
+- **Tunnel honesty (2026-09-24, PRD-001 R22–R24; defects D6, D7, D11).** Each fixed property below
   is proved by a shipped-binary gate that was mutation-checked red on the defect. The `tunnel_honesty_proof`
   harness waits 35 s after its guest joins before dialling the host, to step around D8 (the inline accept
   loop's 30 s deafness after a one-shot `vox connect`); that wait is to be removed once the loop is split.
@@ -291,6 +293,10 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     the local socket with zero linger, so the kernel sends RST. Previously the error path dropped the
     `SendStream`, which quinn finishes, so a backend reset reached the client as a clean EOF after a
     truncated reply. Gate: `tunnel_honesty_proof::a_backend_reset_reaches_the_far_client_as_a_reset`.
+  - **Removing a service cuts its live sessions (R22).** The actor keeps a live `Offered` watch per
+    channel beside `Reachers`; each serving task ends its session, reset with `REACH_WITHDRAWN_CODE`, the
+    moment its tag leaves it. Gate: `tunnel_honesty_proof::
+    removing_a_service_cuts_its_live_sessions_within_a_second`.
   - **A forward survives its host restarting (R24, D7).** `Forward::bind` takes a `HostDialer` instead of
     one `VoxConnection` and reaches the host per accepted connection through `up::open_tunnel`, which
     retries a path failure on a fresh connection within `HOST_PATIENCE` and never retries a refusal. A

@@ -145,6 +145,9 @@ async fn park_across_withdrawal() -> (u8, usize) {
                             let _ = session::accept(send, recv, &peer, |cid, _tag| {
                                 (*cid == channel_id).then_some(HostService {
                                     endpoint: echo_addr,
+                                    offered: Arc::new(tokio::sync::watch::Sender::new(
+                                        [("22".to_owned(), echo_addr)].into_iter().collect(),
+                                    )),
                                     reachers,
                                 })
                             })
@@ -272,6 +275,9 @@ async fn m17_11_a_live_session_is_cut_when_reach_is_withdrawn() {
                             let _ = session::accept(send, recv, &peer, |cid, _tag| {
                                 (*cid == channel_id).then_some(HostService {
                                     endpoint: echo_addr,
+                                    offered: Arc::new(tokio::sync::watch::Sender::new(
+                                        [("22".to_owned(), echo_addr)].into_iter().collect(),
+                                    )),
                                     reachers,
                                 })
                             })

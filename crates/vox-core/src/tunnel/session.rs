@@ -216,6 +216,10 @@ pub struct HostService {
     /// ring — which is local, current, and the host's own decision — means the epoch
     /// question never reaches this gate at all. Found by review before any code.
     pub reachers: crate::node::tunnel::Reachers,
+    /// The services this host offers in the channel, live. A session ends the moment its
+    /// service leaves this map (PRD-001 R22), exactly as it ends when its dialer leaves
+    /// `reachers`.
+    pub offered: crate::node::tunnel::Offered,
 }
 
 /// Host side: accept a tunnel on a fresh inbound stream pair, **enforcing the host's
@@ -232,7 +236,7 @@ pub struct HostService {
 ///    M17.7). The gate lives here, not in the caller, so a misconfigured resolver
 ///    cannot grant reach;
 /// 4. connects the local endpoint and splices bytes, leaving the moment `client_id`
-///    stops being a reacher (M17.11).
+///    stops being a reacher (M17.11) or the service stops being offered (PRD-001 R22).
 ///
 /// `service_tag` is **not** an authorization input. It was, as `dial:<tag>` against the
 /// channel's evaluator, but that capability came from a genesis grant conferred on every
@@ -307,7 +311,7 @@ where
     let Some(HostService {
         endpoint: target,
         reachers,
-        ..
+        offered,
     }) = host
     else {
         // Finish the stream so the status reaches the dialer before we drop it.
@@ -328,12 +332,13 @@ where
         }
     };
     write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
-    let cut = withdrawn(reachers, *client_id);
+    let cut = withdrawn(reachers, offered, *client_id, req.service_tag);
     splice_until(send, recv, tcp, cut).await
 }
 
 /// The QUIC application error code a host resets a tunnel stream with when it withdraws
-/// the dialer's reach mid-session (ADR-017 M17.11).
+/// the dialer's reach mid-session (ADR-017 M17.11) — by untrusting the dialer, or by no
+/// longer offering the service (PRD-001 R22).
 ///
 /// A code rather than an in-band message: once splicing starts the stream carries the
 /// carried protocol's own bytes, so anything Vox wrote into it would corrupt them. QUIC's
@@ -351,21 +356,31 @@ pub const REACH_WITHDRAWN_CODE: u32 = 0x1711;
 /// finishes it — so the reset has to be explicit.
 pub const TUNNEL_ABORT_CODE: u32 = 0x1712;
 
-/// Resolves when `client` is no longer in the host's reacher set.
+/// Resolves when `client` may no longer reach `tag`: it has left the host's reacher set,
+/// or the host has stopped offering the service.
 ///
 /// Withdrawing reach has to reach sessions that are **already running** — an `ssh` login
 /// opened an hour ago is precisely what the operator means to cut — and the serving task
-/// cannot ask the actor, so it watches the same live set the dial gate read.
-async fn withdrawn(reachers: crate::node::tunnel::Reachers, client: Digest32) {
+/// cannot ask the actor, so it watches the same live sets the dial gate read. Removing a
+/// service is the same decision made about a port rather than a person, and used to cut
+/// nothing: the offer went, and every session already carried on it stayed up (R22).
+async fn withdrawn(
+    reachers: crate::node::tunnel::Reachers,
+    offered: crate::node::tunnel::Offered,
+    client: Digest32,
+    tag: String,
+) {
     let mut who = reachers.subscribe();
+    let mut what = offered.subscribe();
     loop {
-        if !reachers.borrow().contains(&client) {
+        if !reachers.borrow().contains(&client) || !offered.borrow().contains_key(&tag) {
             return;
         }
-        // The sender is held by the actor's map *and* by this task, so a `changed` error
-        // would mean neither exists any more; treat it as withdrawn rather than spin.
-        if who.changed().await.is_err() {
-            return;
+        // The senders are held by the actor's maps *and* by this task, so a `changed`
+        // error would mean neither exists any more; treat it as withdrawn rather than spin.
+        tokio::select! {
+            res = who.changed() => if res.is_err() { return },
+            res = what.changed() => if res.is_err() { return },
         }
     }
 }

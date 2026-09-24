@@ -1271,6 +1271,38 @@ pub fn run() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Ask the running node when there is one, like `vox trust`: the profile is not ours to
+        // open while it runs, and a running host is the case R22 is about.
+        Cmd::Service(ServiceCmd::Remove(r)) if node_answers(&r.room.profile) => {
+            let paths = match r.room.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(crate::room_cli::service_remove(
+                &paths,
+                &r.room.room,
+                &r.tag,
+            )) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
             let sub = sub.clone();
             async move {
