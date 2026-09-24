@@ -319,11 +319,17 @@ Each proof runs on a direct path **and** on a forced-relay path.
 - **M22.2** Relay circuits on datagram flows (decision 5) — **DONE**. Proved by
   `crates/vox-core/tests/relay_drops_not_stalls.rs`:
   `a_lossy_relay_leg_loses_packets_instead_of_stalling_them` (proof 5's property on real node network
-  surfaces over a forced relay, 20 ms per link and every 10th datagram on one leg lost: datagrams are
-  lost, and once the loss rate is established the longest gap between arrivals stays one lost
-  datagram's, 21–32 ms over 8 runs; mutation — the stream carriage restored — flips it: 400/400
-  arrive and the longest gap is 64–69 ms. In the first second after loss begins the outer congestion
-  window falling to its floor holds datagrams once for up to ~80 ms; that is reported, not bounded) and `a_circuit_crosses_legs_of_different_datagram_sizes` (mutation — the
+  surfaces over a forced relay, 20 ms per link and about one datagram in ten on one leg lost at
+  random: datagrams are lost, and once the loss rate is established no datagram arrives more than
+  40 ms later than the fastest — a retransmission cannot cost less than that round trip. 3.4–32.8 ms
+  over 40 runs at load 93–256; mutation — the stream carriage restored — flips it: 400/400 arrive,
+  105–170 ms late, 177–193 datagrams late. In the first second after loss begins the outer congestion
+  window falling to its floor holds datagrams once for up to ~80 ms; that is reported, not bounded.
+  *Corrected 2026-09-25:* the gate first bounded the gap between arrivals and lost every 10th
+  datagram exactly. It went red 2 runs in 40 because that period phase-locked with the packet mix —
+  63 outer datagrams lost, all of them acknowledgements, 400/400 app datagrams delivered — and once
+  loss was random, consecutive losses made 30–35 ms gaps that are losses, not stalls. Loss is now
+  random with a fixed seed and the bound is on lateness, which is what a stall is) and `a_circuit_crosses_legs_of_different_datagram_sizes` (mutation — the
   `CIRCUIT_DATAGRAM_MAX` cap removed — the inner handshake never completes). The relay gates the
   milestone names stayed green on every run: `relayed_path_is_retried` (4/4),
   `nat_holepunch_through_nat` (8/8, 4 rounds), `mux_circuit_addressing` and

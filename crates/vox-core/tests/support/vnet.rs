@@ -80,7 +80,7 @@ struct Inner {
     delay: Duration,
     /// Where delayed datagrams wait, in the order they were sent.
     delayed: Option<tokio::sync::mpsc::UnboundedSender<Delayed>>,
-    /// (sender's own address, destination) → (drop every Nth, datagrams seen so far).
+    /// (sender's own address, destination) → (drop about one in N, generator state).
     loss: HashMap<(SocketAddr, SocketAddr), (u64, u64)>,
     /// Datagrams dropped by [`VirtualNet::set_loss`].
     lost: u64,
@@ -215,15 +215,22 @@ impl VirtualNet {
         }
     }
 
-    /// Drop every `every`th datagram the host bound at `from` sends to `to` (0 stops
-    /// it). Deterministic, so two runs lose the same datagrams, and never two in a row
-    /// unless `every` is 1.
+    /// Drop about one in `every` of the datagrams the host bound at `from` sends to `to`
+    /// (0 stops it), chosen by a fixed-seed generator.
+    ///
+    /// **Not every `every`th.** It was, and a strict period can phase-lock with the
+    /// traffic it is meant to damage: when the packets on a link fall into a cycle whose
+    /// length shares a factor with the period, every loss lands on the same kind of
+    /// packet. `relay_drops_not_stalls` was red 2 runs in 40 for exactly that — 63 outer
+    /// datagrams lost, every one of them an acknowledgement, and 400 of 400 app datagrams
+    /// delivered. A generator has no period to lock to. The seed is fixed, so a run is
+    /// repeatable given the same traffic.
     pub fn set_loss(&self, from: SocketAddr, to: SocketAddr, every: u64) {
         let mut g = self.lock();
         if every == 0 {
             g.loss.remove(&(from, to));
         } else {
-            g.loss.insert((from, to), (every, 0));
+            g.loss.insert((from, to), (every, 0x9E37_79B9_7F4A_7C15));
         }
     }
 
@@ -265,9 +272,12 @@ impl VirtualNet {
                 g.too_big += 1;
                 return;
             }
-            if let Some((every, seen)) = g.loss.get_mut(&(from, to)) {
-                *seen += 1;
-                if *seen % *every == 0 {
+            if let Some((every, state)) = g.loss.get_mut(&(from, to)) {
+                // xorshift64: small, fixed-seed, and without a short period.
+                *state ^= *state << 13;
+                *state ^= *state >> 7;
+                *state ^= *state << 17;
+                if *state % *every == 0 {
                     g.lost += 1;
                     return;
                 }
