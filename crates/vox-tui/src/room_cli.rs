@@ -848,6 +848,7 @@ fn state_json(resource: &str, s: &State, me: &Owner) -> serde_json::Value {
             since_millis,
             ttl_secs,
             expires_millis,
+            takeover,
         } => serde_json::json!({
             "resource": resource,
             "state": "held",
@@ -858,6 +859,12 @@ fn state_json(resource: &str, s: &State, me: &Owner) -> serde_json::Value {
             "ttl_secs": ttl_secs,
             "expires_millis": expires_millis,
             "mine": owner == me,
+            "takeover": takeover.as_ref().map(|t| serde_json::json!({
+                "requester_fp": claim::b32(&t.requester.author),
+                "requester_session": t.requester.session,
+                "request": claim::b32(&t.request),
+                "deadline_millis": t.deadline_millis,
+            })),
         }),
         State::Pending {
             from,
@@ -1255,6 +1262,122 @@ pub async fn renew_resource(
     report(&done, claim::RENEW, resource, opts, ok, &said)
 }
 
+/// `vox room lock` — mark a resource as its filer (PRD-001 R17): hard-locked, and the
+/// window a silent holder has to answer a takeover request.
+///
+/// # Errors
+/// Exit 1 if it is already marked, 3 on a version refusal, 4 on an op conflict.
+pub async fn lock_resource(
+    paths: &Paths,
+    room: &str,
+    resource: &str,
+    takeover_secs: Option<u64>,
+    opts: &CoordOpts,
+) -> Result<(), AppError> {
+    let mut data = serde_json::Map::new();
+    data.insert("resource".into(), resource.into());
+    data.insert("mode".into(), "hard".into());
+    if let Some(t) = takeover_secs.filter(|t| *t > 0) {
+        data.insert("takeover_secs".into(), t.into());
+    }
+    let done = run_op(
+        paths,
+        room,
+        opts,
+        claim::LOCK,
+        data,
+        format!("marking {resource} hard-locked"),
+    )
+    .await?;
+    let (ok, said) = match &done.outcome {
+        Some(Outcome::Applied) => (true, format!("{resource} is marked hard-locked")),
+        Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not marked: {why}")),
+        other => (false, format!("{resource} was not marked: {other:?}")),
+    };
+    report(&done, claim::LOCK, resource, opts, ok, &said)
+}
+
+/// `vox room takeover` — ask to take over a claim whose holder has gone silent. It
+/// transfers to this session if the holder does not answer within the window.
+///
+/// # Errors
+/// Exit 1 if nothing is held, this session is the holder, or a takeover is already
+/// pending; 3 on a version refusal; 4 on an op conflict.
+pub async fn takeover_resource(
+    paths: &Paths,
+    room: &str,
+    resource: &str,
+    opts: &CoordOpts,
+) -> Result<(), AppError> {
+    let mut data = serde_json::Map::new();
+    data.insert("resource".into(), resource.into());
+    let done = run_op(
+        paths,
+        room,
+        opts,
+        claim::TAKEOVER,
+        data,
+        format!("asking to take over {resource}"),
+    )
+    .await?;
+    let (ok, said) = match (
+        &done.outcome,
+        done.posting.after.fold.resources.get(resource),
+    ) {
+        (
+            Some(Outcome::Applied),
+            Some(State::Held {
+                owner,
+                takeover: Some(t),
+                ..
+            }),
+        ) => (
+            true,
+            format!(
+                "asked {} to hand over {resource}; it transfers to you at {} unless they answer",
+                who(owner),
+                millis_as_time(t.deadline_millis)
+            ),
+        ),
+        (Some(Outcome::Lost), _) => (
+            false,
+            format!("{resource}: another takeover is already pending"),
+        ),
+        (Some(Outcome::NoEffect(why)), _) => (false, format!("{resource}: {why}")),
+        (other, _) => (false, format!("{resource}: {other:?}")),
+    };
+    report(&done, claim::TAKEOVER, resource, opts, ok, &said)
+}
+
+/// `vox room keep` — the holder answers a takeover request and keeps the claim.
+///
+/// # Errors
+/// Exit 1 if this session does not hold it; 3 or 4 as the other verbs.
+pub async fn keep_resource(
+    paths: &Paths,
+    room: &str,
+    resource: &str,
+    opts: &CoordOpts,
+) -> Result<(), AppError> {
+    let mut data = serde_json::Map::new();
+    data.insert("resource".into(), resource.into());
+    let done = run_op(
+        paths,
+        room,
+        opts,
+        claim::KEEP,
+        data,
+        format!("keeping {resource}"),
+    )
+    .await?;
+    let (ok, said) = match &done.outcome {
+        Some(Outcome::Applied) => (true, format!("you keep {resource}")),
+        Some(Outcome::NoEffect(why)) => (false, format!("{resource}: {why}")),
+        other => (false, format!("{resource}: {other:?}")),
+    };
+    report(&done, claim::KEEP, resource, opts, ok, &said)
+}
+
 /// `vox room board` — what is held or pending, by whom, until when; whether
 /// coordination is allowed at all; and every operation that had no effect and why.
 ///
@@ -1362,7 +1485,19 @@ pub async fn board(
                     Some(_) => " expired".to_owned(),
                     None => String::new(),
                 };
-                format!("{resource}\t{}{mine}{expiry}", who(owner))
+                let takeover = match s {
+                    State::Held {
+                        takeover: Some(t), ..
+                    } => format!(
+                        " — takeover requested by {}, transfers in {}s unless answered",
+                        who(&t.requester),
+                        t.deadline_millis
+                            .saturating_sub(snap.now_millis)
+                            .div_ceil(1_000)
+                    ),
+                    _ => String::new(),
+                };
+                format!("{resource}\t{}{mine}{expiry}{takeover}", who(owner))
             }
             State::Pending {
                 from,

@@ -66,6 +66,16 @@ pub const RELEASE: &str = "release";
 pub const HANDOFF: &str = "handoff";
 /// Extend the holder's current acquisition.
 pub const RENEW: &str = "renew";
+/// The filer marks a resource (PRD-001 R17): its mode, and the takeover window.
+pub const LOCK: &str = "lock";
+/// Ask to take over a silent holder's claim (PRD-001 R17).
+pub const TAKEOVER: &str = "takeover";
+/// The holder answers a takeover request and keeps the claim (PRD-001 R17).
+pub const KEEP: &str = "keep";
+
+/// How long a holder has to answer a takeover request when the filer set no window.
+/// A proposal awaiting the decider (ADR-021 §9, D-R17b; PRD-001 §7 Q4).
+pub const DEFAULT_TAKEOVER_SECS: u64 = 600;
 
 /// A pending handoff's deadline when the sender names none, stamped explicitly by the
 /// CLI so the fold never has to assume one. One hour: long enough to wake a session,
@@ -138,6 +148,25 @@ pub enum ClaimOp {
         /// The resource whose handoff is declined.
         resource: String,
     },
+    /// Mark a resource, as its filer.
+    Lock {
+        /// The resource.
+        resource: String,
+        /// `"hard"`, or anything else for an unmarked resource that may race.
+        mode: String,
+        /// The takeover window the filer chose, if any.
+        takeover_secs: Option<u64>,
+    },
+    /// Ask to take over the holder's claim.
+    Takeover {
+        /// The resource.
+        resource: String,
+    },
+    /// The holder keeps the claim, answering a takeover request.
+    Keep {
+        /// The resource.
+        resource: String,
+    },
     /// Extend one acquisition.
     Renew {
         /// What is being renewed.
@@ -156,7 +185,10 @@ impl ClaimOp {
             | ClaimOp::Release { resource }
             | ClaimOp::Handoff { resource, .. }
             | ClaimOp::Decline { resource }
-            | ClaimOp::Renew { resource, .. } => resource,
+            | ClaimOp::Renew { resource, .. }
+            | ClaimOp::Lock { resource, .. }
+            | ClaimOp::Takeover { resource }
+            | ClaimOp::Keep { resource } => resource,
         }
     }
 }
@@ -169,7 +201,7 @@ impl ClaimOp {
 #[must_use]
 pub fn is_claim_protocol(env: &Envelope) -> bool {
     match env.kind.as_str() {
-        CLAIM | RELEASE | HANDOFF | RENEW => true,
+        CLAIM | RELEASE | HANDOFF | RENEW | LOCK | TAKEOVER | KEEP => true,
         k if k == work::DECLINE => env.data.get("resource").is_some(),
         _ => false,
     }
@@ -232,6 +264,18 @@ pub fn parse_op(env: &Envelope) -> Result<ClaimOp, String> {
             })
         }
         k if k == work::DECLINE => Ok(ClaimOp::Decline { resource }),
+        LOCK => Ok(ClaimOp::Lock {
+            resource,
+            mode: env
+                .data
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("hard")
+                .to_owned(),
+            takeover_secs: ttl("takeover_secs").filter(|t| *t > 0),
+        }),
+        TAKEOVER => Ok(ClaimOp::Takeover { resource }),
+        KEEP => Ok(ClaimOp::Keep { resource }),
         RENEW => {
             let acquisition = env
                 .data
@@ -264,6 +308,8 @@ pub enum State {
         ttl_secs: Option<u64>,
         /// When it lapses on its own, if it does.
         expires_millis: Option<u64>,
+        /// A pending request to take it over (PRD-001 R17), if one was made.
+        takeover: Option<Takeover>,
     },
     /// Relinquished by `from` and reserved for a recipient until `deadline_millis`.
     Pending {
@@ -282,6 +328,28 @@ pub enum State {
         /// When the reservation lapses and the resource is free.
         deadline_millis: u64,
     },
+}
+
+/// A pending request to take over a held resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Takeover {
+    /// Who asked.
+    pub requester: Owner,
+    /// The request's entry hash — the new acquisition if it transfers.
+    pub request: [u8; 32],
+    /// When the claim transfers unless the holder has answered.
+    pub deadline_millis: u64,
+}
+
+/// A filer's mark on a resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lock {
+    /// `"hard"`, or another mode.
+    pub mode: String,
+    /// The takeover window the filer chose.
+    pub takeover_secs: Option<u64>,
+    /// Who marked it.
+    pub by: Owner,
 }
 
 impl State {
@@ -341,6 +409,8 @@ pub struct Fold {
     pub resources: BTreeMap<String, State>,
     /// What each claim-protocol entry did, by entry hash.
     pub outcomes: BTreeMap<[u8; 32], Outcome>,
+    /// Filers' marks, by resource: the first `lock` in canonical order wins.
+    pub locks: BTreeMap<String, Lock>,
 }
 
 /// Fold a room's claim-protocol messages into one state per resource, as of
@@ -395,7 +465,36 @@ pub fn fold(messages: &[Posted], mine: &str, now_millis: u64) -> Fold {
             }
         }
         lapse(&mut out.resources, op.resource(), posted.created_millis);
-        let outcome = apply(&mut out.resources, posted, op);
+        let outcome = if let ClaimOp::Lock {
+            resource,
+            mode,
+            takeover_secs,
+        } = op
+        {
+            if out.locks.contains_key(&resource) {
+                Outcome::NoEffect("the resource is already marked")
+            } else {
+                out.locks.insert(
+                    resource,
+                    Lock {
+                        mode,
+                        takeover_secs,
+                        by: Owner {
+                            author: posted.author,
+                            session: posted.envelope.from.clone(),
+                        },
+                    },
+                );
+                Outcome::Applied
+            }
+        } else {
+            let window = out
+                .locks
+                .get(op.resource())
+                .and_then(|l| l.takeover_secs)
+                .unwrap_or(DEFAULT_TAKEOVER_SECS);
+            apply(&mut out.resources, posted, op, window)
+        };
         out.outcomes.insert(posted.entry_hash, outcome);
     }
 
@@ -406,8 +505,34 @@ pub fn fold(messages: &[Posted], mine: &str, now_millis: u64) -> Fold {
     out
 }
 
-/// Free `resource` if its holding or reservation has lapsed by `at_millis`.
+/// Free `resource` if its holding or reservation has lapsed by `at_millis` — or, when a
+/// takeover request's deadline passed first with no answer from the holder, transfer it
+/// to the requester as a new acquisition.
 fn lapse(resources: &mut BTreeMap<String, State>, resource: &str, at_millis: u64) {
+    if let Some(State::Held {
+        takeover: Some(t),
+        expires_millis,
+        ..
+    }) = resources.get(resource)
+    {
+        let transfers =
+            t.deadline_millis <= at_millis && expires_millis.is_none_or(|e| t.deadline_millis < e);
+        if transfers {
+            let t = t.clone();
+            resources.insert(
+                resource.to_owned(),
+                State::Held {
+                    owner: t.requester,
+                    acquisition: t.request,
+                    since_millis: t.deadline_millis,
+                    ttl_secs: None,
+                    expires_millis: None,
+                    takeover: None,
+                },
+            );
+            return;
+        }
+    }
     if resources
         .get(resource)
         .and_then(State::lapses_at)
@@ -417,12 +542,27 @@ fn lapse(resources: &mut BTreeMap<String, State>, resource: &str, at_millis: u64
     }
 }
 
-fn apply(resources: &mut BTreeMap<String, State>, posted: &Posted, op: ClaimOp) -> Outcome {
+fn apply(
+    resources: &mut BTreeMap<String, State>,
+    posted: &Posted,
+    op: ClaimOp,
+    takeover_window_secs: u64,
+) -> Outcome {
     let who = Owner {
         author: posted.author,
         session: posted.envelope.from.clone(),
     };
     let at = posted.created_millis;
+    // **Any operation by the exact holder answers a pending takeover** (PRD-001 R17): a
+    // holder who is not silent keeps the claim, and whatever it asked for then applies.
+    if let Some(State::Held {
+        owner, takeover, ..
+    }) = resources.get_mut(op.resource())
+    {
+        if *owner == who && takeover.is_some() {
+            *takeover = None;
+        }
+    }
     let held_by_who =
         |s: Option<&State>| matches!(s, Some(State::Held { owner, .. }) if *owner == who);
     match op {
@@ -443,6 +583,7 @@ fn apply(resources: &mut BTreeMap<String, State>, posted: &Posted, op: ClaimOp) 
                     since_millis: at,
                     ttl_secs,
                     expires_millis: ttl_secs.map(|t| at.saturating_add(t.saturating_mul(1_000))),
+                    takeover: None,
                 },
             );
             Outcome::Applied
@@ -501,6 +642,35 @@ fn apply(resources: &mut BTreeMap<String, State>, posted: &Posted, op: ClaimOp) 
             resource,
             acquisition,
         } => renew(resources, &resource, &who, acquisition, at),
+        ClaimOp::Keep { resource } => {
+            // The answer was applied above; keeping is only meaningful from the holder.
+            if held_by_who(resources.get(&resource)) {
+                Outcome::Applied
+            } else {
+                Outcome::NoEffect("only the exact holder may keep a claim")
+            }
+        }
+        ClaimOp::Takeover { resource } => match resources.get_mut(&resource) {
+            Some(State::Held { owner, .. }) if *owner == who => {
+                Outcome::NoEffect("the holder cannot take over its own claim")
+            }
+            Some(State::Held {
+                takeover: Some(_), ..
+            }) => Outcome::Lost,
+            Some(State::Held { takeover, .. }) => {
+                *takeover = Some(Takeover {
+                    requester: who,
+                    request: posted.entry_hash,
+                    deadline_millis: at.saturating_add(takeover_window_secs.saturating_mul(1_000)),
+                });
+                Outcome::Applied
+            }
+            Some(State::Pending { .. }) => {
+                Outcome::NoEffect("a handoff is pending; there is no holder to take over from")
+            }
+            None => Outcome::NoEffect("nothing is held; claim it instead"),
+        },
+        ClaimOp::Lock { .. } => unreachable!("a lock is applied by the fold, not here"),
     }
 }
 

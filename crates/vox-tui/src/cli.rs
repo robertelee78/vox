@@ -388,6 +388,14 @@ enum RoomCmd {
     Decline(ResourceArgs),
     /// Extend this session's current holding by its original `--ttl`.
     Renew(ResourceArgs),
+    /// Mark a resource hard-locked, as its filer, and set the window a silent holder
+    /// has to answer a takeover request (PRD-001 R17).
+    Lock(LockArgs),
+    /// Ask to take over a claim whose holder has gone silent: it transfers to this
+    /// session unless the holder answers within the window (PRD-001 R17).
+    Takeover(ResourceArgs),
+    /// Answer a takeover request as the holder, and keep the claim.
+    Keep(ResourceArgs),
     /// Show what is held or pending, by whom, until when — and whether coordination
     /// is refused because a participant runs another vox version.
     Board(RoomBoardArgs),
@@ -548,6 +556,22 @@ pub struct ResourceArgs {
     pub room: String,
     /// The resource.
     pub resource: String,
+    #[command(flatten)]
+    pub coord: CoordArgs,
+}
+
+/// `vox room lock`
+#[derive(Args, Debug, Clone)]
+pub struct LockArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The resource to mark.
+    pub resource: String,
+    /// Seconds a silent holder has to answer a takeover request. Default 600.
+    #[arg(long)]
+    pub takeover_secs: Option<u64>,
     #[command(flatten)]
     pub coord: CoordArgs,
 }
@@ -1260,7 +1284,12 @@ pub fn run() -> ExitCode {
                 RoomCmd::Board(a) => &a.profile,
                 RoomCmd::List(p) => p,
                 RoomCmd::Claim(a) => &a.profile,
-                RoomCmd::Release(a) | RoomCmd::Decline(a) | RoomCmd::Renew(a) => &a.profile,
+                RoomCmd::Release(a)
+                | RoomCmd::Decline(a)
+                | RoomCmd::Renew(a)
+                | RoomCmd::Takeover(a)
+                | RoomCmd::Keep(a) => &a.profile,
+                RoomCmd::Lock(a) => &a.profile,
                 RoomCmd::Handoff(a) => &a.profile,
                 RoomCmd::Send(a) => &a.profile,
                 RoomCmd::Get(a) => &a.profile,
@@ -1332,6 +1361,34 @@ pub fn run() -> ExitCode {
                     }
                     RoomCmd::Decline(a) => {
                         crate::room_cli::decline_resource(
+                            &paths,
+                            &a.room,
+                            &a.resource,
+                            &a.coord.opts(),
+                        )
+                        .await
+                    }
+                    RoomCmd::Lock(a) => {
+                        crate::room_cli::lock_resource(
+                            &paths,
+                            &a.room,
+                            &a.resource,
+                            a.takeover_secs,
+                            &a.coord.opts(),
+                        )
+                        .await
+                    }
+                    RoomCmd::Takeover(a) => {
+                        crate::room_cli::takeover_resource(
+                            &paths,
+                            &a.room,
+                            &a.resource,
+                            &a.coord.opts(),
+                        )
+                        .await
+                    }
+                    RoomCmd::Keep(a) => {
+                        crate::room_cli::keep_resource(
                             &paths,
                             &a.room,
                             &a.resource,
