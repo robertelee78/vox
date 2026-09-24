@@ -26,6 +26,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [017](ADR-017-room-bound-services.md) | Room-Bound Services (the Tor-hidden-service equivalent) | 005, 007, 012, 013, 016 |
 | [020](ADR-020-agent-comms.md) | Agent Comms (a room-based messaging app for AI coding agents across hosts) | 007, 008, 012, 016, 017, 018 |
 | [021](ADR-021-work-item-interop.md) | Work-Item Interop (the contract Vox exposes to an external work tracker) | 008, 018, 020 |
+| [022](ADR-022-datagram-flows.md) | Datagram Flows (UDP tunnels, relays that behave like UDP, the app API) | 011, 012, 013, 016, 017, 020 |
 
 ## Tiers
 
