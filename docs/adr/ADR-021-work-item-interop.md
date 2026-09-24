@@ -11,6 +11,9 @@ the contract describes what is to be built.
 - self-posts are identified by **author and session** (§7);
 - the hands-free guidance says what **replay cannot recover** (§8).
 
+**Updated**: 2026-09-24 — tracker vocabulary and ownership were clarified without changing the wire
+format: Vox observations remain optional inputs to a client-independent external tracker.
+
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, interop, work-tracking, adapter, envelope, claims, versioning, defects
 
@@ -33,10 +36,10 @@ Consequently the following are **not Vox's**, and this ADR does not design them:
 
 - ADR decomposition;
 - epics and stories;
-- priorities and dependencies;
-- durable work state;
-- completion policy;
-- kanban publishing, GitHub included.
+- stable work identity, priorities, rank and dependencies;
+- durable Work phase, Health and Source freshness;
+- attempts, attempt outcomes, acceptance verdicts and release/delivery verdicts;
+- kanban publishing and GitHub projection.
 
 They belong to the tracker. What Vox owes it is the **smallest integration contract** that lets a story
 in the tracker be the same unit of work agents assign, claim, discuss and hand off through a Vox room.
@@ -102,13 +105,15 @@ are small and sit on the same surface.
 
 ### 1. The boundary
 
-**Vox owns communication, delivery, work-item references and live coordination claims. The tracker
-owns work.**
+**Vox owns communication, delivery and live coordination claims. The tracker owns work and mints the
+references that Vox carries opaquely.**
 
 | Concern | Owner |
 |---|---|
-| What a work item *is*: requirements, acceptance criteria, epic, dependencies, priority | tracker |
-| Durable work state and its history; completion policy; publishing | tracker |
+| What a work item *is*: requirements, acceptance criteria, epic, stable identity, dependencies, priority and rank | tracker |
+| Work phase, Health, Source freshness and their history | tracker |
+| Attempts and attempt outcomes recorded from observations | tracker |
+| Acceptance and release/delivery verdicts; publishing and GitHub projection | tracker |
 | The work-item **reference** in a message | the tracker mints it; Vox carries it opaquely |
 | Messages *about* a work item: assign, discuss, report, hand off | Vox room |
 | Live ownership among cooperating workers (claims) | Vox, whose fold (§4) decides it; the tracker **records** the result |
@@ -117,8 +122,17 @@ owns work.**
 Vox **MUST NOT** interpret a work reference beyond carrying it, comparing it byte for byte, and filtering
 by it. Vox **MUST NOT** store work state, validate that a reference exists, or compute progress.
 
-**A `result` is a worker's assertion. Completion is the tracker's decision. Releasing ownership means
-neither completion nor failure.**
+The tracker **MUST** work without Vox and without a particular agent client. A Vox adapter and client
+hooks are optional integrations, not tracker prerequisites.
+
+The canonical Work phases are **Backlog, Designing, Ready, Executing, Acceptance, Release ready and
+Done**. Health is independently **On track, At risk or Blocked**; Blocked is never a Work phase or a
+board column. Source freshness is independently **Current or Reconciliation needed**. Priority, rank,
+ownership, attempts and attempt outcomes are also independent facts.
+
+Every Vox event is an observation. **Acceptance, Release ready and Done are tracker verdicts.** A claim,
+branch, pull request or file overlap, green CI, merge or worker exit does not by itself establish a Work
+phase. Releasing ownership means neither Done nor failure.
 
 ### 2. Stable work-item references
 
@@ -160,15 +174,15 @@ consumer what the others mean. Three things are kept apart, as the decider asked
 | Type | Means | Does **not** mean | Axis |
 |---|---|---|---|
 | `assign` | the sender asks the addressee (`to`) to take the item | ownership, which only `claim` takes | request |
-| `accept` | the addressee agrees and will claim; opens an attempt | ownership, if its `claim` loses | attempt |
-| `claim` | take ownership, or complete a pending handoff (§4) | that work has started | ownership |
+| `accept` | the addressee agrees and intends to claim and open an attempt | ownership or that an attempt actually started | request / attempt intent |
+| `claim` | take ownership, or complete a pending handoff (§4) | that work has started or the item is Executing | ownership |
 | `renew` | extend the holder's current acquisition (§4) | a new acquisition | ownership |
-| `working` | the owner is actively executing this attempt | measurable progress | attempt |
-| `blocked` | the owner cannot proceed; `data.reason` REQUIRED; cleared by the owner's next `working`, `result`, `failed` or `release` | that ownership has lapsed | attempt |
+| `working` | the owner reports active execution of this attempt | a Work phase transition; the tracker decides whether an explicitly work-bound attempt is sufficient to record Executing | attempt observation |
+| `blocked` | the owner reports that it cannot proceed; `data.reason` REQUIRED; cleared by the owner's next `working`, `result`, `failed` or `release` | a Work phase transition or that ownership has lapsed; the tracker decides durable Health and leaves Work phase unchanged | attempt / health observation |
 | `status` | a progress note; supersedes the same `(author, from, data.work)`'s previous `status` in any rendering | a state change | attempt |
-| `result` | the attempt produced something the sender **asserts** meets the item's criteria; `data.evidence` SHOULD be present | **that the item is complete.** Completion is the tracker's decision. | attempt |
+| `result` | the attempt produced something the sender **asserts** meets the item's criteria; it SHOULD name an immutable candidate in `data.evidence`, such as a commit rather than a branch | an acceptance verdict, Release ready or Done; the tracker may use a valid candidate to enter Acceptance | attempt observation |
 | `failed` | this attempt ended without success, with `data.reason` | **that the item failed or is abandoned.** It may be retried. | attempt |
-| `release` | the holder gives up ownership; the attempt ends | **completion, and also not failure.** | ownership |
+| `release` | the holder gives up ownership; the attempt ends | **Done, and also not failure.** | ownership |
 | `handoff` | the holder relinquishes ownership and reserves the item for a named recipient (§4) | that the recipient accepted | ownership |
 | `decline` | with `data.resource`: an eligible recipient refuses a pending handoff, which **frees** the item. Without it: the addressee refuses an `assign`. | that the item is invalid | ownership / request |
 
@@ -284,14 +298,15 @@ participant's version is mismatched, missing or unknown.
   Two workers whose clocks disagree may disagree about a participant right at the horizon's edge. That
   can delay or advance a refusal by that clock difference. It cannot change an owner, because ownership
   comes only from stamped operations of the one version.
-- **When a worker announces itself.** A session announces itself with a stamped `hello` the first time
-  the drain hook runs for that session. It is one message per session, which is what ADR-020 §4 reserves
-  `hello` for, and it is not per-turn chatter. So an upgraded worker clears its own mismatch as soon as
-  it next works, and nobody has to act.
+- **When a worker announces itself.** Before its first claim-protocol operation or work post, a session
+  **MUST** have announced itself with a stamped `hello`. The participating CLI verbs post that `hello`
+  when the session has not announced, so the gate does not depend on a client hook. A drain hook **MAY**
+  announce earlier as a convenience. It is one message per session, which is what ADR-020 §4 reserves
+  `hello` for, and it is not per-turn chatter.
 - **What enforcement means.** When the version table holds any participant that does not match:
   - every claim-protocol verb (`claim`, `renew`, `handoff`, `release`, `decline`) and every `post
     --work` **MUST** refuse before posting and exit with status 3;
-  - `vox work`-style starts in the tracker are built on `claim`, so **no claimed work can begin**;
+  - a tracker's optional Vox adapter cannot acquire a claim, so **no Vox-coordinated work can begin**;
   - the drain hook **MUST** tell the session plainly that coordination is refused and why;
   - `board --json` reports the room as `coordination: refused`, with the table.
 
@@ -408,6 +423,10 @@ all over the existing control socket, and no new socket request**:
    **Raw `vox room post` of a claim-protocol type is refused.** Such an operation would lack the stamp
    and the session that make it valid, and the verbs exist to set them.
 
+An adapter **MUST** refuse visibly and record no owner when `board --json` reports `coordination:
+refused`, or when a row's schema is not exactly `vox.room.row/1`. It must not guess across an
+incompatible contract.
+
 **The drain hook suppresses a session's own messages only when both the author fingerprint and the
 session match** (F8). A row is skipped only if `author == this node's fingerprint` **and** `from ==
 this session`. Another harness using the same session name, or another session on this harness, still
@@ -433,17 +452,16 @@ Vox's part is the durable log and the gapless stream. Two kinds of gap must not 
 what reached the integration branch. It cannot reconstruct an unreported blocker, an assignment or a
 planning decision.
 
-**The tracker and its worker integrations MUST therefore record planning facts through structured
-operations at the moment they happen.** That means `assign`, `blocked`, `decline`, `result` and
-`failed`, all with `data.work`, emitted by the tracker's own tooling and hooks rather than left to a
-model's memory. That responsibility, and the mechanisms that make those operations hard to omit, sit
-outside Vox. What Vox guarantees is narrower and complete: **whatever was posted is delivered, in a
-form a program can consume, without gaps.**
+**The tracker MUST therefore record planning facts in its own store at the moment they happen.** When
+Vox is in use, an integration **SHOULD** also emit the matching `assign`, `blocked`, `decline`, `result`
+or `failed` observation with `data.work`. Hooks are one optional convenience for doing so, not a core
+tracker requirement. Vox guarantees something narrower and complete: **whatever was posted is
+delivered, in a form a program can consume, without gaps.**
 
 ## Non-goals
 
-- **Vox as the tracker.** It holds no epic, story, priority, dependency, verdict or column, and builds
-  no kanban UI.
+- **Vox as the tracker.** It holds no epic, story, priority, rank, dependency, Work phase, Health,
+  Source freshness, verdict or column, and builds no kanban UI.
 - **Mixed-version coordination**, or a second claim vocabulary to accommodate older binaries (§5).
 - **A wire change.** Every addition is in `data` or in the CLI. The envelope stays at `v: 1`, and
   nothing touches struct tags or `Content`.
@@ -585,7 +603,9 @@ that proves it.**
   *Assertions*:
   - the stub's record of each item's owner, pending handoffs and attempt history matches the log at
     every checkpoint;
-  - a `release` is never recorded as completion;
+  - a `release` is never recorded as Done;
+  - a `result` moves an item to Acceptance at most, never to Release ready or Done;
+  - `blocked` may change Health but never Work phase;
   - a `failed` attempt leaves the item retryable;
   - **the operator runs no command.**
 
