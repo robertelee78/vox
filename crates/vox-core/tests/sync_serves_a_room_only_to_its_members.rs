@@ -5,11 +5,9 @@
 //! preamble then names whichever channel the peer likes. Nothing checked the two against each
 //! other — `run_sync_session` received the peer's identity and discarded it — so a member of
 //! room A who knew room B's channel id was handed B's whole log. A channel id is not a secret:
-//! it is the room's `.vox` name.
-//!
-//! **Scope: the inbound direction only.** A session this node *starts* is not checked here — a
-//! fresh connection makes the node push every open room to the peer, and that direction is left
-//! for a later change (it sits in `sync_one`, which this change deliberately does not touch).
+//! it is the room's `.vox` name. The same hole was open in the other direction: a fresh
+//! connection makes the node push **every** room it holds to the peer, and the session serves
+//! whatever the peer then asks for.
 //!
 //! Every step of the escalation is asserted, because a refusal for the wrong reason would make
 //! this gate green against an open node:
@@ -18,10 +16,11 @@
 //! 2. **the control:** the same peer, on the same connection, asks for A and is served A's
 //!    entries — so the harness can receive entries, and a zero for B means a refusal;
 //! 3. it asks for B, repeatedly, and must receive nothing — no `HELLO`, no `HAVE`, no entry;
-//! 4. a member of B still syncs B, in full.
+//! 4. whatever the victim pushes to it on its own must include nothing of B;
+//! 5. a member of B still syncs B, in full.
 //!
 //! Mutation: delete the `may_sync` check in `run_sync_session` and step 3 goes red with B's
-//! entries counted.
+//! entries counted; delete the `allowed` check in `sync_one` and step 4 does.
 
 #[path = "support/raw_sync.rs"]
 mod raw_sync;
@@ -169,7 +168,7 @@ fn a_member_of_one_room_is_served_nothing_of_another() {
         join(&victim, &xavier, a, "alpha").await;
         join(&victim, &yara, b, "bravo").await;
 
-        // ---- 4. a member of B still syncs B, in full --------------------------------------
+        // ---- 5. a member of B still syncs B, in full --------------------------------------
         let b_held = entries(&victim.view(), b);
         assert!(b_held >= POSTS as u64, "the victim holds B's posts: {b_held}");
         let synced = tokio::time::timeout(TIMEOUT, async {
@@ -195,17 +194,45 @@ fn a_member_of_one_room_is_served_nothing_of_another() {
         // ---- 1. the attacker: xavier's own identity, off his own node -----------------------
         assert!(xavier.apply(NodeCommand::Shutdown).await.is_done());
         drop(xavier);
-        let endpoint =
-            raw_sync::endpoint_as_member(&paths(&tmp, "xavier"), IDENTITY.as_bytes()).await;
+        // The victim is restarted so the attacker's connection is a *fresh* one to it. A node
+        // keeps a peer's sync schedule for as long as it runs, and only a first connection
+        // triggers the push of every open room (`SyncTrigger::Connected`) that step 4 is about;
+        // xavier's node already had its first connection, when it joined.
+        assert!(victim.apply(NodeCommand::Shutdown).await.is_done());
+        drop(victim);
+        let victim = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                match Node::spawn_config(paths(&tmp, "victim"), config()) {
+                    Ok(h) => return h,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                }
+            }
+        })
+        .await
+        .expect("the victim restarted");
+        assert!(victim
+            .apply(NodeCommand::Unlock {
+                passphrase: secret(IDENTITY),
+            })
+            .await
+            .is_done());
+        for (cid, name) in [(a, "alpha"), (b, "bravo")] {
+            assert!(victim
+                .apply(NodeCommand::OpenChannel {
+                    channel_id: cid,
+                    passphrase: secret(&format!("{name} passphrase")),
+                })
+                .await
+                .is_done());
+        }
+        let endpoint = raw_sync::endpoint_as_member(&paths(&tmp, "xavier"), IDENTITY.as_bytes()).await;
         let conn = Arc::new(
             endpoint
                 .connect(raw_sync::dial_addr(&victim.view()), victim_id, raw_sync::now())
                 .await
                 .expect("step 1: a member of A connects"),
         );
-        // Answer whatever the victim opens on its own, so a session of its with this peer never
-        // sits holding a room for a frame timeout while the attempts below are made.
-        let _answered = raw_sync::answer_victim(Arc::clone(&conn));
+        let pushed = raw_sync::answer_victim(Arc::clone(&conn));
 
         // ---- 2. the control: A is served --------------------------------------------------
         let a_held = entries(&victim.view(), a);
@@ -241,6 +268,43 @@ fn a_member_of_one_room_is_served_nothing_of_another() {
             (0, 0),
             "a member of A was served room B — {leaked} of its entries over {answered} answered \
              sessions. A node must serve a room's log only to members of that room (PRD-001 R5)"
+        );
+
+        // ---- 4. nothing of B pushed the other way -------------------------------------------
+        // The control for this direction: the victim's own push of A must have reached the
+        // attacker, or a zero for B would only mean the victim never pushed anything.
+        let a_pushed = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let got = pushed.lock().unwrap().clone();
+                if got.iter().any(|(c, y)| *c == a && y.hello) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(
+            a_pushed.is_ok(),
+            "step 4's control FAILED: the victim never pushed room A to its member on a fresh \
+             connection, so nothing below would be measured — {:?}",
+            pushed.lock().unwrap()
+        );
+        // The push covers every open room in one pass; a moment for B's to land if it exists.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let pushed = pushed.lock().unwrap().clone();
+        let pushed_b: usize = pushed.iter().filter(|(c, _)| *c == b).map(|(_, y)| y.entries).sum();
+        let pushed_b_sessions = pushed.iter().filter(|(c, y)| *c == b && y.hello).count();
+        let pushed_a: usize = pushed.iter().filter(|(c, _)| *c == a).map(|(_, y)| y.entries).sum();
+        println!(
+            "victim-initiated sessions: {} total; B: {pushed_b_sessions} sessions / {pushed_b} \
+             entries; A: {pushed_a} entries",
+            pushed.len()
+        );
+        assert_eq!(
+            (pushed_b_sessions, pushed_b),
+            (0, 0),
+            "the victim opened sessions for room B to a member of A only and served it {pushed_b} \
+             entries (PRD-001 R5)"
         );
 
         assert!(yara.apply(NodeCommand::Shutdown).await.is_done());

@@ -3747,44 +3747,47 @@ impl Node {
             //
             // Done only on a connect, not every tick: this reads the board and admits authors, which
             // is exactly the work a new connection warrants and would be waste on the interval.
-            for (cid, shared) in &self.channels {
+            // Candidates first, decided after: the membership test below needs `&mut self` (it may
+            // admit a member from this node's own board), which the maps cannot be borrowed across.
+            let mut member_rooms: Vec<Digest32> = Vec::new();
+            for cid in self.channels.keys() {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
                     continue;
                 }
-                // Checked **before** the `is_author` lock below: a session holds this room's
-                // mutex for its whole run, so taking it here would park the actor behind it.
                 if self.syncing.contains(cid) {
                     owed.push(*cid);
                     continue;
                 }
-                // **A fresh connection is never filtered out.**
-                //
-                // The `is_author` test below is the right question on an interval pass and the wrong
-                // one here: a peer that has *just joined* is by definition not yet an author in this
-                // node's view, so the node holding the evidence that it belongs skipped it for not
-                // belonging. Worse, the code that admits it — `learn_members`, reading the bundle
-                // records off this node's own board — runs inside `sync_one`, which only executes for
-                // channels that already passed this filter. The precondition sat behind the check it
-                // was the precondition for.
-                //
-                // So on a connect, reconcile every open channel with the peer and let the ADR-008
-                // session decide: it verifies authorship per entry and hard-fails on an author it
-                // cannot verify, which is a real answer. Silently skipping is not — measured as a
-                // user, a message posted seconds after somebody joined was lost, not delayed.
-                if trigger == SyncTrigger::Connected
-                    || peer_is_anchor
-                    || shared.lock().await.is_author(&peer)
-                {
-                    channels.push(*cid);
+                member_rooms.push(*cid);
+            }
+            // **A room goes only to a peer that belongs to it.** On a fresh connection this pushed
+            // *every* open room to the peer — the inbound half of D5 refuses a non-member's request,
+            // and this was the outbound half handing the same log over unasked. The bypass existed
+            // because a peer that has just joined is not yet an author in this node's view;
+            // `may_sync` covers that case properly, by admitting the peer from this node's own board
+            // before deciding, which is the evidence the bypass was standing in for. This node's own
+            // anchors still get every room: holding the log for whoever is away is what they are for.
+            for cid in member_rooms {
+                let belongs = if peer_is_anchor {
+                    true
+                } else {
+                    let Some(epoch) = (match self.channels.get(&cid) {
+                        Some(shared) => Some(shared.lock().await.epoch()),
+                        None => None,
+                    }) else {
+                        continue;
+                    };
+                    self.may_sync(&cid, &peer, epoch).await
+                };
+                if belongs {
+                    channels.push(cid);
                 }
             }
-            // An anchor reconciles every channel it keeps with each of that channel's
-            // known members.
-            for (cid, state) in &self.anchored {
-                // An anchored room takes part in a push: this skipped them on the reasoning that an
-                // anchor never appends locally — true, and beside the point, because an anchor is
-                // exactly the node that must forward what it was just given. The push trigger is now
-                // set by entries arriving as well as by a local append.
+            // An anchor forwards a room it keeps only to that room's authors — read fresh off its
+            // own board first, so a member that has just been vouched for is not skipped. It used to
+            // forward every kept room to any peer that connected or pushed.
+            let mut kept_rooms: Vec<Digest32> = Vec::new();
+            for cid in self.anchored.keys() {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
                     continue;
                 }
@@ -3792,23 +3795,15 @@ impl Node {
                     owed.push(*cid);
                     continue;
                 }
-                // **An anchor does not filter out the member it is forwarding to.**
-                //
-                // `is_author` is the right question on an interval pass and the wrong one here, for
-                // the same reason it was wrong for an open room: a member that has just joined is not
-                // yet an author in this anchor's view, so the node whose entire job is holding the
-                // log for whoever is away declined to hand it over. Measured, timestamped on both
-                // sides: the anchor took the entry at **1s** and the member could not read it until
-                // **31s** — `SYNC_INTERVAL_SECS`, i.e. it arrived by the member's own periodic pull
-                // because the anchor never pushed. Not slow: not sent.
-                //
-                // On a connect or a push, reconcile and let the session decide — it verifies
-                // authorship per entry and hard-fails on one it cannot verify, which is an answer.
-                // The interval pass keeps the filter, where it costs nothing and bounds the work.
-                let forwarding =
-                    matches!(trigger, SyncTrigger::Connected | SyncTrigger::LocalAppend);
-                if forwarding || state.lock().await.is_author(&peer) {
-                    channels.push(*cid);
+                kept_rooms.push(*cid);
+            }
+            for cid in kept_rooms {
+                self.refresh_anchored_authors(&cid).await;
+                let Some(state) = self.anchored.get(&cid).map(Arc::clone) else {
+                    continue;
+                };
+                if state.lock().await.is_author(&peer) {
+                    channels.push(cid);
                 }
             }
             for channel_id in channels {
