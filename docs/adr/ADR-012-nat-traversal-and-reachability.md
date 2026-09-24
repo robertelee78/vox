@@ -131,8 +131,8 @@ hostile or absent bootstrap degrades availability but never confidentiality or a
 replaces the earlier "possibly piggyback public DHT" wording, which was a false deferral.)
 
 **Anti-abuse.** Join-attempt abuse is bounded by the layered controls in ADR-005 (per-sender consent
-gate + `(channelID, epoch)`-bound PoW join tokens + identity-bound log acceptance with per-author
-quotas), not by rate-limiting alone. There is no admin admission step (ADR-007).
+gate + `(channelID, epoch)`-bound PoW join tokens + identity-bound log acceptance; the per-author
+quotas once listed here were removed 2026-09-24, PRD-001 R3), not by rate-limiting alone. There is no admin admission step (ADR-007).
 
 **Honest limit (documented).** Two peers both behind CGNAT/symmetric NAT with no IPv6 and no
 reachable coordinator cannot connect. Global joint-IPv6 probability for a random pair is only

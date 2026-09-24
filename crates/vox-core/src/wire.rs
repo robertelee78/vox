@@ -270,9 +270,10 @@ pub enum WireError {
     /// `0x05` — authenticator (signature/MAC) invalid.
     #[error("authenticator invalid")]
     AuthenticatorInvalid = 0x05,
-    /// `0x06` — per-author quota exceeded (ADR-008).
-    #[error("quota exceeded")]
-    QuotaExceeded = 0x06,
+    // `0x06` is RESERVED. It was "per-author quota exceeded" until the quota was
+    // removed (PRD-001 R3): an admitted author has no rate or volume limit, so no
+    // peer ever sends it. It is not reused, so an old peer's `0x06` can never be
+    // read as something else; `from_code` maps it to `None` like any unknown code.
     /// `0x07` — sync mode unsupported / mismatched.
     #[error("sync mode unsupported")]
     SyncModeUnsupported = 0x07,
@@ -304,7 +305,6 @@ impl WireError {
             0x03 => Some(WireError::UnknownStructTag),
             0x04 => Some(WireError::UnknownAlgoId),
             0x05 => Some(WireError::AuthenticatorInvalid),
-            0x06 => Some(WireError::QuotaExceeded),
             0x07 => Some(WireError::SyncModeUnsupported),
             0x08 => Some(WireError::EpochMismatch),
             0x09 => Some(WireError::TransportFailed),

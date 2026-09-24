@@ -1934,7 +1934,7 @@ impl Node {
         };
         let now = self.now();
         let opened =
-            crate::node::anchor::AnchorState::open(&store, sek, channel_id, now).or_else(|_| {
+            crate::node::anchor::AnchorState::open(&store, sek, channel_id).or_else(|_| {
                 let sek = self
                     .anchor_sek(channel_id)
                     .ok_or(Error::Profile("no anchor key"))?;
@@ -1993,12 +1993,11 @@ impl Node {
         let (Some(store), Some(net)) = (self.log_store(), self.net.as_ref().map(Arc::clone)) else {
             return Ok(());
         };
-        let now = self.now();
         for cid in store.anchored_channels()? {
             let Some(sek) = self.anchor_sek(&cid) else {
                 continue;
             };
-            if let Ok(state) = crate::node::anchor::AnchorState::open(&store, sek, &cid, now) {
+            if let Ok(state) = crate::node::anchor::AnchorState::open(&store, sek, &cid) {
                 let _ = net.publish_local(&state.genesis().to_wire());
                 self.anchored
                     .insert(cid, Arc::new(tokio::sync::Mutex::new(state)));
@@ -3984,7 +3983,7 @@ impl Node {
                         shared.blocking_lock().sync_over(&store, &mut t, now)
                     }
                     SessionTarget::Anchored(state) => {
-                        state.blocking_lock().sync_over(&store, &mut t, now)
+                        state.blocking_lock().sync_over(&store, &mut t)
                     }
                 }
             })
@@ -4037,7 +4036,7 @@ impl Node {
                         shared.blocking_lock().sync_over(&store, &mut t, now)
                     }
                     SessionTarget::Anchored(state) => {
-                        state.blocking_lock().sync_over(&store, &mut t, now)
+                        state.blocking_lock().sync_over(&store, &mut t)
                     }
                 }
             })

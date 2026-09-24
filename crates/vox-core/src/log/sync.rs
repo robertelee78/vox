@@ -31,8 +31,8 @@
 //!
 //! ## Acceptance
 //! Received entries pass through the same DAG acceptance predicate as local ones
-//! ([`crate::log::dag::Dag::accept`]): admission, authenticator, quota, feed link,
-//! and fork handling. A peer never trusts an entry merely because it arrived over
+//! ([`crate::log::dag::Dag::accept`]): admission, authenticator, feed link, and
+//! fork handling. A peer never trusts an entry merely because it arrived over
 //! sync.
 
 use std::collections::VecDeque;
@@ -483,7 +483,6 @@ pub fn wire_error_for(err: &Error) -> WireError {
 pub fn wire_error_for_rejected(rej: &Rejected) -> WireError {
     match rej {
         Rejected::NotAdmitted => WireError::EpochMismatch,
-        Rejected::Quota(_) => WireError::QuotaExceeded,
         Rejected::Verification(e) => wire_error_for(e),
         Rejected::Feed(_) => WireError::AuthenticatorInvalid,
         Rejected::Fork(_) => WireError::AuthenticatorInvalid,
@@ -516,7 +515,7 @@ pub enum ApplyOutcome {
 /// Returns [`ApplyOutcome`] for the non-fatal cases (stored / duplicate / fork)
 /// and `Err(WireError)` only for a *hard wire fail* that must close the stream —
 /// mapped to the exact M0 code via [`wire_error_for`] / [`wire_error_for_rejected`]
-/// (unknown tag, unsupported version, unknown algo, authenticator, quota, …). A
+/// (unknown tag, unsupported version, unknown algo, authenticator, …). A
 /// **fork is not a wire fail**: it is surfaced and sync continues, so two
 /// partitions can exchange conflicting heads and form the proof.
 pub fn apply_entry<R: AuthorResolver>(
@@ -524,14 +523,13 @@ pub fn apply_entry<R: AuthorResolver>(
     resolver: &R,
     admission: &AdmissionPolicy,
     entry_wire: &[u8],
-    now_secs: u64,
 ) -> std::result::Result<ApplyOutcome, WireError> {
     let entry = Entry::from_wire(entry_wire).map_err(|e| wire_error_for(&e))?;
     let key = resolver
         .key_for(&entry.skeleton.author_id)
         .ok_or(WireError::AuthenticatorInvalid)?;
     let kind = resolver.kind_for(&entry);
-    match dag.accept(entry, kind, &key, admission, now_secs) {
+    match dag.accept(entry, kind, &key, admission) {
         Ok(_) => Ok(ApplyOutcome::Stored),
         Err(Rejected::Duplicate) => Ok(ApplyOutcome::Duplicate),
         // A fork is recorded by `accept` (freeze / proof) and surfaced; it does
@@ -561,7 +559,6 @@ pub fn frontier_session<TA, TB, R, P>(
     b: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
     pump: P,
 ) -> std::result::Result<(usize, usize), WireError>
 where
@@ -573,7 +570,7 @@ where
     // Centralized fail-and-close: ANY hard fail closes BOTH endpoints with the
     // exact coded reason (ADR-008 §"Abort / error signalling" — never a silent
     // downgrade, never an unclosed stream).
-    match frontier_session_inner(ta, tb, a, b, resolver, admission, now_secs, pump) {
+    match frontier_session_inner(ta, tb, a, b, resolver, admission, pump) {
         Ok(counts) => Ok(counts),
         Err(code) => {
             ta.close(code);
@@ -591,7 +588,6 @@ fn frontier_session_inner<TA, TB, R, P>(
     b: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
     mut pump: P,
 ) -> std::result::Result<(usize, usize), WireError>
 where
@@ -641,8 +637,8 @@ where
     //    here as the conflicting entry is fed into DAG fork handling; an
     //    attributable fork freezes the equivocator (its WireError is the coded
     //    close). Both peers drain independently.
-    let into_a = drain_entries(ta, a, resolver, admission, now_secs)?;
-    let into_b = drain_entries(tb, b, resolver, admission, now_secs)?;
+    let into_a = drain_entries(ta, a, resolver, admission)?;
+    let into_b = drain_entries(tb, b, resolver, admission)?;
     Ok((into_a, into_b))
 }
 
@@ -668,13 +664,12 @@ pub fn frontier_session_peer<T, R>(
     dag: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
 ) -> std::result::Result<usize, WireError>
 where
     T: Transport,
     R: AuthorResolver,
 {
-    match frontier_session_peer_inner(t, dag, resolver, admission, now_secs) {
+    match frontier_session_peer_inner(t, dag, resolver, admission) {
         Ok(applied) => Ok(applied),
         Err(code) => {
             t.close(code);
@@ -688,7 +683,6 @@ fn frontier_session_peer_inner<T, R>(
     dag: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
 ) -> std::result::Result<usize, WireError>
 where
     T: Transport,
@@ -724,7 +718,7 @@ where
 
     // 5. Drain and apply the entries the peer serves us, until the peer's clean
     //    half-close (recv → Ok(None)).
-    drain_entries(t, dag, resolver, admission, now_secs)
+    drain_entries(t, dag, resolver, admission)
 }
 
 /// Read and apply every queued `ENTRY` frame on `t` into `dag`. A hard fail
@@ -738,7 +732,6 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
     dag: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
 ) -> std::result::Result<usize, WireError> {
     let mut applied = 0;
     // **The whole phase is bounded, not just the gap between frames.**
@@ -760,7 +753,7 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
         match decode_frame(&frame) {
             Ok(SyncFrame::Entry(wire)) => {
                 if matches!(
-                    apply_entry(dag, resolver, admission, &wire, now_secs)?,
+                    apply_entry(dag, resolver, admission, &wire)?,
                     ApplyOutcome::Stored
                 ) {
                     applied += 1;
@@ -768,8 +761,8 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
             }
             // **A protocol violation, not something to ignore.** This phase is defined as entries
             // only, and silently accepting anything else is what made the hold above free: a
-            // non-entry frame costs the sender nothing, never reaches `apply_entry`, and therefore
-            // never touches the quota that is supposed to bound this exchange.
+            // non-entry frame costs the sender nothing and never reaches `apply_entry`, so it
+            // would buy the whole budget for free.
             Ok(_) => return Err(WireError::SyncModeUnsupported),
             Err(_) => return Err(WireError::SyncModeUnsupported),
         }
@@ -824,7 +817,6 @@ pub fn range_reconcile_exchange<R: AuthorResolver>(
     b: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
 ) -> std::result::Result<(usize, usize), WireError> {
     let _mode = negotiate_mode(
         SYNC_MODE_FRONTIER | SYNC_MODE_RANGE_RECONCILIATION,
@@ -864,8 +856,8 @@ pub fn range_reconcile_exchange<R: AuthorResolver>(
     }
 
     // Apply: a pulls its `need` from b; b pulls its `need` (= a's `have`) from a.
-    let applied_into_a = apply_hashes(a, b, resolver, admission, &a_need, now_secs)?;
-    let applied_into_b = apply_hashes(b, a, resolver, admission, &a_have, now_secs)?;
+    let applied_into_a = apply_hashes(a, b, resolver, admission, &a_need)?;
+    let applied_into_b = apply_hashes(b, a, resolver, admission, &a_have)?;
     Ok((applied_into_a, applied_into_b))
 }
 
@@ -893,7 +885,6 @@ fn apply_hashes<R: AuthorResolver>(
     resolver: &R,
     admission: &AdmissionPolicy,
     hashes: &[Digest32],
-    now_secs: u64,
 ) -> std::result::Result<usize, WireError> {
     // Gather the source entries, then order by (author, seq) so prev/lipmaa links
     // are satisfiable as they are appended.
@@ -908,7 +899,7 @@ fn apply_hashes<R: AuthorResolver>(
     let mut applied = 0;
     for (_, _, wire) in wires {
         if matches!(
-            apply_entry(dst, resolver, admission, &wire, now_secs)?,
+            apply_entry(dst, resolver, admission, &wire)?,
             ApplyOutcome::Stored
         ) {
             applied += 1;

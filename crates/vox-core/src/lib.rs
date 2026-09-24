@@ -68,9 +68,9 @@
 //!   decrypt-what-you-can); anti-entropy sync over an abstract transport in both
 //!   frontier and Negentropy-v1 range-reconciliation modes (keyed by the full
 //!   32-byte entry hash); attributable fork/equivocation proofs with author
-//!   freeze (and the deniable-alarm seam for ADR-009/M7); per-author abuse-quotas;
-//!   and the personal multi-device self-channel (tag `0x000C`, `K_self` /
-//!   `rendezvous_self` KDFs) that carries received SKDMs across an identity's own
+//!   freeze (and the deniable-alarm seam for ADR-009/M7); and the personal
+//!   multi-device self-channel (tag `0x000C`, `K_self` / `rendezvous_self` KDFs)
+//!   that carries received SKDMs across an identity's own
 //!   devices. The real QUIC transport (M9), the deniable authenticator (M7),
 //!   payload-TTL policy (M8), and admitted-set population (M3/M6) are documented
 //!   seams, not stubs.

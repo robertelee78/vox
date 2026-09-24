@@ -176,7 +176,6 @@ pub(crate) fn sync_failure(code: crate::wire::WireError) -> Error {
         crate::wire::WireError::UnknownStructTag => "sync failed: unknown struct tag",
         crate::wire::WireError::UnknownAlgoId => "sync failed: unknown algo id",
         crate::wire::WireError::AuthenticatorInvalid => "sync failed: authenticator invalid",
-        crate::wire::WireError::QuotaExceeded => "sync failed: quota exceeded",
         crate::wire::WireError::SyncModeUnsupported => "sync failed: sync mode unsupported",
         crate::wire::WireError::EpochMismatch => "sync failed: epoch mismatch",
         crate::wire::WireError::TransportFailed => "sync failed: transport",
@@ -865,7 +864,7 @@ impl ChannelState {
                     Default::default(),
                 )?);
             }
-            dag.accept(entry, kind, &key, &admission, now_secs)
+            dag.accept(entry, kind, &key, &admission)
                 .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
             next_log_id = id.saturating_add(1);
         }
@@ -1876,13 +1875,7 @@ impl ChannelState {
         let gov =
             GovEntry::from_verified_log_entry(&entry, &key, &self.channel_id, self.gov_heads())?;
         self.dag
-            .accept(
-                entry,
-                EntryKind::Governance,
-                &key,
-                &self.admission,
-                now_secs,
-            )
+            .accept(entry, EntryKind::Governance, &key, &self.admission)
             .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
         if let Err(e) =
             profile
@@ -1961,13 +1954,7 @@ impl ChannelState {
             .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
             .collect();
         let resolver = self.resolver();
-        let session = frontier_session_peer(
-            transport,
-            &mut self.dag,
-            &resolver,
-            &self.admission,
-            now_secs,
-        );
+        let session = frontier_session_peer(transport, &mut self.dag, &resolver, &self.admission);
 
         // Collect what arrived, in per-author sequence order, before touching the
         // store (the borrow of `self.dag` ends here).
@@ -2285,7 +2272,7 @@ impl ChannelState {
         let id = self.next_log_id;
         let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
         self.dag
-            .accept(entry, kind, &key, &self.admission, now_secs)
+            .accept(entry, kind, &key, &self.admission)
             .map_err(|_| Error::MalformedGovernance("entry failed the acceptance predicate"))?;
         if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg) {
             self.poisoned = true;
@@ -2341,11 +2328,6 @@ impl ChannelState {
         // caller still thinking in seconds should fail to compile rather than stamp 1970.
         now_millis: u64,
     ) -> Result<&Rendered> {
-        // Admission and quota are specified in whole seconds (ADR-007), so they get seconds —
-        // derived from the same value rather than passed alongside it, so the two can never
-        // disagree about when "now" was. That disagreement is the defect that made the first
-        // version of this change wrong: a timestamp composed from two separate clock reads.
-        let now_secs = now_millis / 1_000;
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
@@ -2393,7 +2375,7 @@ impl ChannelState {
         // to memory. A persist failure poisons the channel (see module docs).
         let key = signer.public_key();
         self.dag
-            .accept(entry, EntryKind::Content, &key, &self.admission, now_secs)
+            .accept(entry, EntryKind::Content, &key, &self.admission)
             .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
         let persisted = (|| -> Result<()> {
             let mut batch = profile.store().batch()?;

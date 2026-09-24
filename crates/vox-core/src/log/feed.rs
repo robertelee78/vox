@@ -193,9 +193,9 @@ impl Feed {
 
     /// Validate that `entry` would be a legal next append — single author,
     /// contiguous monotonic `seq`, no append past end-of-feed, and correct
-    /// `prev_hash`/`lipmaa_backlink` — **without** mutating the feed. The caller
-    /// uses this to gate side effects (e.g. committing quota) before the insert,
-    /// so a later rejection never leaves partial state.
+    /// `prev_hash`/`lipmaa_backlink` — **without** mutating the feed, so a caller
+    /// can gate side effects on it before the insert and a later rejection never
+    /// leaves partial state.
     pub fn validate_next(&self, entry: &Entry) -> Result<()> {
         let seq = entry.skeleton.seq;
 
