@@ -1589,6 +1589,16 @@ pub struct Node {
     /// A local append (or a finished session with pushes still owed) wants `run_due_syncs` now
     /// rather than at the next tick. See `push_if_owed`.
     push_now: bool,
+    /// Rooms this node is joining right now (their join is on a `Joiner` task).
+    joining: std::collections::BTreeSet<Digest32>,
+    /// Pairwise streams for a room still being joined, held until the join reports back: see
+    /// `take_inbound_skdm`.
+    held_pairwise: Vec<(
+        Digest32,
+        Digest32,
+        crate::node::pairwise_stream::PairwiseFrame,
+        quinn::RecvStream,
+    )>,
     /// Rooms whose anchor publish found them mid-session: run when that session's `SyncDone`
     /// lands. See `publish_channel_to_anchors`.
     publish_owed: std::collections::BTreeSet<Digest32>,
@@ -1754,6 +1764,8 @@ impl Node {
             join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
             push_now: false,
+            joining: std::collections::BTreeSet::new(),
+            held_pairwise: Vec::new(),
             publish_owed: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -2811,6 +2823,7 @@ impl Node {
                 me,
                 result,
             } => {
+                let room = parsed.channel_id;
                 let outcome = match *result {
                     Ok(won) => {
                         let _ = self.event_tx.send(NodeEvent::JoinSteps {
@@ -2831,6 +2844,16 @@ impl Node {
                         Outcome::Failed(lost.fault)
                     }
                 };
+                // Whatever arrived for this room while it was being joined, in arrival order — into
+                // the room if the join made one, or discarded as before if it did not.
+                self.joining.remove(&room);
+                let (held, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_pairwise)
+                    .into_iter()
+                    .partition(|(r, ..)| *r == room);
+                self.held_pairwise = kept;
+                for (_, peer, first, recv) in held {
+                    self.handle_pairwise(peer, first, recv).await;
+                }
                 let _ = reply.send(outcome);
             }
             NetEvent::ChannelSealed {
@@ -3547,6 +3570,7 @@ impl Node {
             *entry = entry.saturating_add(1);
             *entry
         };
+        self.joining.insert(parsed.channel_id);
         let job = Joiner {
             net,
             tx: self.net_tx.clone(),
@@ -4942,10 +4966,37 @@ impl Node {
     /// Take an inbound sealed control message: an ADR-006 SKDM, which makes that
     /// author's messages readable and backfills any already held as ciphertext.
     async fn take_inbound_skdm(&mut self, peer: Digest32, mut recv: quinn::RecvStream) {
-        use crate::node::pairwise_stream::{open_skdm, recv_pairwise, PairwiseFrame};
+        use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
         let Ok(Some(first)) = recv_pairwise(&mut recv).await else {
             return;
         };
+        let room = match &first {
+            PairwiseFrame::Skdm { channel_id, .. }
+            | PairwiseFrame::Open { channel_id, .. }
+            | PairwiseFrame::Hello { channel_id, .. } => *channel_id,
+        };
+        // **Held, not dropped, while this node is still joining that room.** The join runs off the
+        // actor now, so the responder's key — sent the moment it admits us — can arrive before the
+        // room and the session to open it exist: the joiner's task reports back only after sealing
+        // the room key, 0.3–1.5s of Argon2id after the exchange. Handled then, it found no session
+        // and was silently discarded, and this node could never read the responder. While the join
+        // ran on the actor the stream waited in the queue until the room existed; this puts that
+        // ordering back. `JoinerDone` replays whatever was held.
+        if self.joining.contains(&room) && !self.channels.contains_key(&room) {
+            self.held_pairwise.push((room, peer, first, recv));
+            return;
+        }
+        self.handle_pairwise(peer, first, recv).await;
+    }
+
+    /// Act on a pairwise stream whose first frame has been read.
+    async fn handle_pairwise(
+        &mut self,
+        peer: Digest32,
+        first: crate::node::pairwise_stream::PairwiseFrame,
+        mut recv: quinn::RecvStream,
+    ) {
+        use crate::node::pairwise_stream::{open_skdm, recv_pairwise, PairwiseFrame};
         // A `Hello` opens a session the join path never created (ADR-016): accept it
         // against our own prekey ring, exactly as the join responder does, then read
         // the SKDM it precedes.
