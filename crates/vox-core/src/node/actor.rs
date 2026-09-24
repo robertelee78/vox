@@ -987,10 +987,23 @@ async fn serve_filed(
         // while anything still holds it, and a stream loop holds its `Arc` for the
         // connection's life — so an unbounded reader would pin the very thing whose
         // purpose is to be let go.
+        //
+        // **Unless it was promoted.** A retired connection becomes the peer's connection when the
+        // one it lost to goes silent (a restarted peer, `SILENCE_IS_DEATH`), and from then on it
+        // is read for its whole life like any other. Held weakly, so this timer is not itself
+        // what keeps the connection "carried".
         let grace = Duration::from_secs(net.manager().retire_grace_secs());
+        let watched = Arc::downgrade(&also);
         let loop_task = spawn_stream_loop(Arc::clone(net), also, tx.clone());
+        let net = Arc::clone(net);
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
+            if watched
+                .upgrade()
+                .is_some_and(|c| net.manager().is_primary(&c))
+            {
+                return;
+            }
             loop_task.abort();
         });
     }
@@ -1997,6 +2010,10 @@ impl Node {
                         // Connections a better path displaced are closed once their
                         // grace is up (M15.1b).
                         net.manager().retire_expired();
+                        // A connection silent past `SILENCE_IS_DEATH` gives way to a live one to
+                        // the same peer — how a restarted peer's connection takes over from the
+                        // dead one it lost the tie-break to.
+                        net.manager().tend_liveness();
                     }
                     self.retry_upgrades_if_due().await;
                     self.renew_mappings_if_due();
