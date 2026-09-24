@@ -450,6 +450,15 @@ Constraints that follow from the evidence:
 - MCP **MUST NOT** be relied on for delivery. On both hosts it is pull-only; a server cannot push into
   model context, and Claude Code's Channels are a research preview with no delivery guarantee.
 
+**What the drain injects is attributed and bounded** (PRD-001 R19). Each message is one row,
+`[<entry> from <author>] …`, whose two fields come from the log, never from the text; every further
+line of the text is indented with `  | `, so no author can begin a line with `[` and put a row in
+another author's name — whatever the line break (`\n`, `\r`, U+2028 …). One turn injects at most 50
+messages and 16 KiB of text, and at most 2 KiB of any one message; what does not fit is **counted
+in a closing line** and delivered on the next turn, because the cursor moves only past what was
+shown. A cursor the node no longer holds restarts from the room's first message **and says so** in
+the injection; it used to do that silently, on any error.
+
 ### 7. The node MUST fan out to several local clients without any of them able to stall it
 
 Measured on `main` (`spike-1`): the actor emits every event with `event_tx.send(..).await` on a
@@ -867,6 +876,17 @@ Both unknowns are already spiked; neither remains open.
   input alone, so one installed command serves both harnesses. The cursor is per `session_id` and is
   written **after** emitting, so a crash re-delivers rather than skips; a quiet room emits nothing at
   all. Proved by `agent_hook_proof.rs` driving the real binary.
+
+  > **Correction, 2026-09-24 (PRD-001 D9).** The injection printed each message's text raw and
+  > unbounded, so a post holding a newline and a fake `[… from …]` row put words in another
+  > author's mouth, and a busy room or a lost cursor injected everything. Now attributed and
+  > bounded as §6 says. *Gate, met*: `agent_hook_proof` compares the whole injection of a message
+  > carrying forged rows after `\n`, `\r\n` and U+2028 **exactly** — one row, its true author, the
+  > forgeries on indented lines; 120 short messages arrive as 50 + 50 + 20 over three turns, in order,
+  > none twice; ten oversized ones inject 15.4 KB (7 shown, 3 counted); a lost cursor says so and
+  > shows 50 of 131. Mutation-checked: printing the text raw turns the exact comparison red;
+  > removing the message bound turns the 50/70 count red; moving the cursor past unshown messages
+  > turns turn two's count red (0 delivered).
 
   **Proved for the shape, not for the reading.** That proof states in its own header that it could
   not confirm a harness actually *shows the model* what it injects: the spike's API key returned 401,
