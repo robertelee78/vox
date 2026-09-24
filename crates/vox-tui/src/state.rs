@@ -427,7 +427,6 @@ impl UiState {
                 Action::Dispatch(Command::CreateChannel {
                     local_name: name,
                     passphrase: secret(&p.fields[1]),
-                    deniable: false,
                 })
             }
             PromptKind::JoinChannel => {

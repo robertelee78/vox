@@ -52,7 +52,7 @@ use crate::governance::cert::AdminCert;
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::entry::GovEntry;
 use crate::governance::evaluator::Evaluator;
-use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+use crate::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use crate::governance::membership::{
     issue_consent_grant, issue_consent_revocation, MembershipView,
 };
@@ -714,7 +714,6 @@ impl ChannelState {
         let signer = profile.signer()?;
         let policy = ChannelPolicy {
             history_mode: HistoryMode::ForwardOnly,
-            deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
             min_suite: SuiteFloor::DAY_ONE.id(),
         };

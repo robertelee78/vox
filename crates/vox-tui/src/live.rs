@@ -286,17 +286,10 @@ impl CoreHandle for LiveCore {
             Command::CreateChannel {
                 local_name,
                 passphrase,
-                deniable,
-            } => {
-                if deniable {
-                    // ADR-009 is implemented but not enabled for shipping.
-                    return CommandStatus::Failed(UiError::NotAvailableYet);
-                }
-                self.send(NodeCommand::CreateChannel {
-                    local_name,
-                    passphrase: Self::secret(&passphrase),
-                })
-            }
+            } => self.send(NodeCommand::CreateChannel {
+                local_name,
+                passphrase: Self::secret(&passphrase),
+            }),
             Command::OpenChannel {
                 channel_id,
                 passphrase,

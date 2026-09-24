@@ -363,8 +363,6 @@ pub enum Command {
         local_name: String,
         /// The channel passphrase (out-of-band; redacted/zeroized).
         passphrase: SecretString,
-        /// Whether authorship is deniable (genesis-immutable; default attributable).
-        deniable: bool,
     },
     /// Join a channel from a `vox://` invite link plus the passphrase, which travels
     /// out of band and is deliberately **not** in the link (ADR-016).
