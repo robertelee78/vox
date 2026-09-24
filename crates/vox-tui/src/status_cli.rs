@@ -67,7 +67,7 @@ fn render(v: &Value) -> String {
     } else {
         let _ = writeln!(o, "UNHEALTHY:");
         for u in unhealthy {
-            let _ = writeln!(o, "  ! {}", u.as_str().unwrap_or(""));
+            let _ = writeln!(o, "  ! {}", s(u, "message"));
         }
     }
     let _ = writeln!(o, "\nrooms");
