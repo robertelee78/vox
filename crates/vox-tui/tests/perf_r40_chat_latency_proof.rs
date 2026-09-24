@@ -23,7 +23,7 @@
 //!
 //! ## Mutation knobs (test-side only; they never touch the product)
 //!
-//! - `VOX_PERF_THRESHOLD_MS` replaces the 1000 ms target, so setting it below the
+//! - `VOX_PERF_THRESHOLD_MS` replaces the 250 ms bar, so setting it below the
 //!   measured minimum must turn this red;
 //! - `VOX_PERF_INJECT_MS` sleeps that long between starting the clock and launching the
 //!   post, so a slower path must turn this red.
@@ -42,8 +42,15 @@ use vox_core::node::ipc::{Frame, IpcClient, Request};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
-/// PRD-001 R40.
-const TARGET: Duration = Duration::from_millis(1000);
+/// The bar this gate holds, which is **tighter than PRD-001 R40's 1 s on purpose.**
+///
+/// At 1 s the gate passed the defect it exists to catch. Pushes paced by the actor's 1 s tick
+/// peaked at 992 ms over 25 samples, under the bar, so a tick-paced regression would have
+/// stayed green. Measured by session `vox` on fix/push-on-append-v2: before, median 428–966 ms
+/// and max 992 ms; after, median 27.5–30.8 ms and max 37.5 ms. 250 ms is far above the fixed
+/// path and far below anything tick-paced, so it tells the two apart; R40's 1 s is still the
+/// product promise.
+const TARGET: Duration = Duration::from_millis(250);
 /// At least 20, per the task that set these gates.
 const SAMPLES: usize = 25;
 /// How often bob's node is read. Well under the target, so resolution is not the story.
