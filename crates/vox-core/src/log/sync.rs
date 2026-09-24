@@ -487,7 +487,6 @@ pub fn wire_error_for_rejected(rej: &Rejected) -> WireError {
         Rejected::Verification(e) => wire_error_for(e),
         Rejected::Feed(_) => WireError::AuthenticatorInvalid,
         Rejected::Fork(_) => WireError::AuthenticatorInvalid,
-        Rejected::GovernanceNotAttributable => WireError::AuthenticatorInvalid,
         // A duplicate is not a hard fail; callers handle it before mapping. If it
         // ever reaches here, treat as a benign authenticator-class rejection.
         Rejected::Duplicate => WireError::AuthenticatorInvalid,

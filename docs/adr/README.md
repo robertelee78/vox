@@ -59,7 +59,7 @@ QUIC/DCUtR, NAT/IPv6, deniable authentication).
 | 006 | implemented | M4 `group/` |
 | 007 | implemented | M6 `governance/` |
 | 008 | implemented | M5 `log/` |
-| 009 | implemented, **not enabled** | M7 `deniable/` — formal analysis + `0x000B` wire codec outstanding |
+| 009 | **withdrawn** 2026-09-24 | code removed (PRD-001 R43); design kept in the ADR |
 | 010 | implemented | M8 `atrest/` (codecs/mechanisms; no persistence layer yet) |
 | 011 | implemented | M9 `transport/` |
 | 012 | implemented | M10 `nat/`, composed into the ladder by ADR-016 M14.8–M14.10 + M15.1c (pinhole → UPnP-IGD → hole punch → anchor relay); real-router UPnP validation still pending |
@@ -107,8 +107,7 @@ debt with a known start date.
   over-attenuation, expiry, revoked links, concurrent-conflict + tie-break) — bit-for-bit agreement gate.
   — **MET in-process**: 28+ vectors incl. order-invariance and exact `DenyReason`s; they are Rust
   assertions, not language-neutral fixtures with pinned hashes, which the "two implementations" reading needs.
-- **Deniability (ADR-009):** **formal analysis of the DGKA+DSKE construction before shipping**; K-derivation
-  and transcript test vectors. — **UNMET** (both); deniable mode is not enabled for shipping.
+- **Deniability (ADR-009):** withdrawn 2026-09-24 and its code removed; no bar applies.
 - **Transport (ADR-011):** cross-version interop matrix (handshake + identity-PoP) as a hard gate. —
   **UNMET**: no second implementation, no matrix, no CI job.
 - **Sync (ADR-008):** frontier + Negentropy-v1 interop vectors; the wire error-code table is honored. —

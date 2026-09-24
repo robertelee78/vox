@@ -414,7 +414,7 @@ mod golden {
     use super::harness::*;
     use crate::governance::capability::{Capability, CapabilitySet};
     use crate::governance::evaluator::{DenyReason, Evaluator, Verdict};
-    use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+    use crate::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
     use crate::hash::Digest32;
     use crate::identity::composite::{RootSigner, SoftwareRootSigner};
     use std::collections::BTreeSet;
@@ -426,7 +426,6 @@ mod golden {
     fn genesis_for(creator: &SoftwareRootSigner) -> Genesis {
         let policy = ChannelPolicy {
             history_mode: HistoryMode::ForwardOnly,
-            deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
             min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
         };
@@ -926,7 +925,6 @@ mod golden {
     fn genesis_with_grant(creator: &SoftwareRootSigner, grant: CapabilitySet) -> Genesis {
         let policy = ChannelPolicy {
             history_mode: HistoryMode::ForwardOnly,
-            deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
             min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
         };
@@ -1178,7 +1176,6 @@ mod golden {
         let creator = root(1, 1);
         let policy = ChannelPolicy {
             history_mode: HistoryMode::ForwardOnly,
-            deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
             min_suite: crate::suite::SuiteFloor::DAY_ONE.id(),
         };
@@ -1202,15 +1199,11 @@ mod golden {
     // ---- Policy vectors. ----
 
     #[test]
-    fn vector_policy_update_changes_history_and_ttl_not_deniability() {
+    fn vector_policy_update_changes_history_and_ttl() {
         let creator = root(1, 1);
         let genesis = genesis_for(&creator);
         let cid = genesis.channel_id();
         assert_eq!(genesis.body.policy.history_mode, HistoryMode::ForwardOnly);
-        assert_eq!(
-            genesis.body.policy.deniability_mode,
-            DeniabilityMode::Attributable
-        );
 
         let mut h = LogBuilder::new(&genesis);
         // Creator (admin → holds policy) updates history+ttl.
@@ -1227,8 +1220,6 @@ mod golden {
         let p = eval.policy();
         assert_eq!(p.history_mode, HistoryMode::FullHistory);
         assert_eq!(p.ttl, 3600);
-        // Deniability is genesis-immutable, unchanged.
-        assert_eq!(p.deniability_mode, DeniabilityMode::Attributable);
     }
 
     #[test]
@@ -1243,7 +1234,6 @@ mod golden {
         // Channel created at the weak floor; the creator raises it to suite-1.
         let policy = ChannelPolicy {
             history_mode: HistoryMode::ForwardOnly,
-            deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
             min_suite: VOX_SUITE_TEST_WEAK.id,
         };

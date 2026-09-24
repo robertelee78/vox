@@ -53,7 +53,7 @@ use tokio::net::TcpListener;
 
 use vox_core::governance::capability::CapabilitySet;
 use vox_core::governance::evaluator::Evaluator;
-use vox_core::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+use vox_core::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use vox_core::identity::composite::{RootSigner, SoftwareRootSigner};
 use vox_core::transport::quic::VoxEndpoint;
 use vox_core::transport::streams::{accept_typed, open_typed, StreamKind};
@@ -68,7 +68,6 @@ fn signer(a: u8) -> SoftwareRootSigner {
 fn policy() -> ChannelPolicy {
     ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
-        deniability_mode: DeniabilityMode::Attributable,
         ttl: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     }
