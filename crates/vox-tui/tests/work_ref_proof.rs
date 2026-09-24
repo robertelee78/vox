@@ -1,5 +1,5 @@
-//! ADR-021 §3 — **a work reference has one shape, and an attempt is where a claim
-//! began**, through the shipped `vox` binary.
+//! ADR-021 §2 — **a work reference has one shape, and an attempt id is seeded from the
+//! log**, through the shipped `vox` binary.
 //!
 //! A tracker keys its items however it keys them; the one it is built for keys them
 //! `OWNER/REPO:SOURCE:ITEM`. A reference is `<scheme>:<id>`, and the id may contain `:`,
@@ -7,19 +7,22 @@
 //! is posted — by whichever flag carried it, because `--data '{"work":…}'` is the same
 //! message as `--work` and must not be a way around the check.
 //!
-//! A tracker needs a named attempt to tell a retry from a continuation, and an agent
-//! should not have to mint one. So a work-bound post from the session that holds the
-//! claim on that item carries the claim's **acquisition** as `data.attempt`:
+//! A tracker correlates the posts of one attempt by id, and an agent should not have to
+//! mint one. So a work-bound post from the session that holds the claim on that item
+//! carries a **seeded id** in `data.attempt` — the claim's acquisition, or the holder's
+//! latest `failed` since it. Seeding starts nothing: an attempt becomes active only on the
+//! holder's `working` (ADR-021 §3), which `tracker_rehearsal_proof` proves with a tracker.
+//! This proof covers the seeding:
 //!
 //! 1. a skill-shaped key is accepted and carried unchanged;
 //! 2. malformed references are refused (exit 1) and nothing is posted — by `--work`, by
 //!    `--data`, and by `claim --work`;
 //! 3. the holder's post carries the acquisition the board shows; a session that does not
-//!    hold the claim gets no attempt; an explicit `--attempt` wins;
-//! 4. a `failed` ends the attempt it names: the holder's next post begins a new one,
-//!    named by that `failed` entry, and so on for every failure — every attempt is
-//!    bounded and derivable from the log;
-//! 5. release and claim again is a **new** attempt;
+//!    hold the claim gets no id; an explicit `--attempt` wins;
+//! 4. a `failed` carries the id it ends, and seeds the next one: the holder's next post
+//!    carries that `failed` entry's hash, and so on for every failure — every retry's id
+//!    is derivable from the log;
+//! 5. release and claim again seeds a **new** id;
 //! 6. retrying an `--op` after the claim was re-taken is still the same message — it
 //!    keeps the attempt its first post carried, instead of turning into a conflict.
 
@@ -74,7 +77,7 @@ fn acquisition(w: &Worker, r: &str, key: &str) -> String {
 
 #[test]
 #[ignore = "two networked nodes with production Argon2id; CI runs it in release"]
-fn a_work_reference_has_one_shape_and_an_attempt_is_where_a_claim_began() {
+fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -168,7 +171,7 @@ fn a_work_reference_has_one_shape_and_an_attempt_is_where_a_claim_began() {
         "an explicit --attempt wins"
     );
 
-    // ---- (4) a `failed` ends the attempt it names; the retry is a new one ----
+    // ---- (4) a `failed` carries the id it ends and seeds the retry's ----
     let failed = post_as(
         alice,
         "holder",
@@ -188,7 +191,7 @@ fn a_work_reference_has_one_shape_and_an_attempt_is_where_a_claim_began() {
     assert_eq!(
         data_of(alice, r, &retry1)["attempt"],
         failed.json()["entry_hash"],
-        "after a `failed`, the holder's next post must begin a NEW attempt, named by that failure"
+        "after a `failed`, the holder's next post must carry a NEW id, seeded by that failure"
     );
     let failed2 = post_as(
         alice,
@@ -209,10 +212,10 @@ fn a_work_reference_has_one_shape_and_an_attempt_is_where_a_claim_began() {
     assert_eq!(
         data_of(alice, r, &retry2)["attempt"],
         failed2.json()["entry_hash"],
-        "every failure begins the next attempt, not only the first"
+        "every failure seeds the next id, not only the first"
     );
 
-    // ---- (5) release and claim again: a new attempt ----
+    // ---- (5) release and claim again: a new id ----
     let released = alice.vox(Some("holder"), &["room", "release", r, KEY]);
     assert!(released.ok, "{released:?}");
     let again = alice.vox(Some("holder"), &["room", "claim", r, "--work", KEY]);
@@ -224,7 +227,7 @@ fn a_work_reference_has_one_shape_and_an_attempt_is_where_a_claim_began() {
     assert_eq!(
         data_of(alice, r, &next)["attempt"],
         second.as_str(),
-        "a post after re-claiming must name the NEW attempt"
+        "a post after re-claiming must carry the NEW id"
     );
 
     // ---- (6) an --op retried after the re-claim is still the same message ----

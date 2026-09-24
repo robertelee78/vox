@@ -716,8 +716,9 @@ pub struct RoomPostArgs {
     /// and passes the version gate.
     #[arg(long)]
     pub work: Option<String>,
-    /// The attempt, carried in `data.attempt`. Defaults, with `--work`, to the
-    /// acquisition of this session's claim on that work item.
+    /// The attempt id, carried in `data.attempt`. Defaults, with `--work`, to an id
+    /// seeded from this session's claim (or its latest `failed`) on that item. An id
+    /// starts nothing: an attempt becomes active on `--type working`.
     #[arg(long)]
     pub attempt: Option<String>,
     /// Address a session by petname; repeat for several.

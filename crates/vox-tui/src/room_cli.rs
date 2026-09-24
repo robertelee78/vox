@@ -381,30 +381,30 @@ pub async fn post_cmd(
     } else {
         coord::snapshot(&mut client, cid).await?
     };
-    // **The attempt, when the caller did not name one** (ADR-021 §3). An attempt begins
-    // at this session's claim on the work item, or at its own latest `failed` for that
-    // item since the claim — a `failed` ends the attempt it names, so the retry after it
-    // is a new, bounded attempt — and it ends at the next `failed`, a release, a lapse
-    // or a handoff. Its id is the hash of the entry that began it, so a tracker can
-    // derive every attempt from the log and an agent never mints one. A retried `--op`
-    // keeps the attempt its first post carried — the claim may have been renewed,
-    // re-taken or failed since, and a different attempt would make the retry a conflict
-    // rather than the same message.
+    // **The attempt id, when the caller did not name one** (ADR-021 §2). It is seeded
+    // from the log alone — the hash of this session's claim on the work item, or of its
+    // own latest `failed` for that item since the claim — so an agent never mints one and
+    // a tracker can correlate every post of one attempt. **Seeding starts nothing**: an
+    // attempt becomes active only when the holder posts `working` (§3), and that entry is
+    // its start evidence; a `failed` seeds the id of a retry that does not exist until the
+    // next `working`. A retried `--op` keeps the id its first post carried — the claim may
+    // have been renewed, re-taken or failed since, and a different id would make the retry
+    // a conflict rather than the same message.
     if let (Some(w), None) = (&work, data.get("attempt")) {
         let earlier = snap
             .posted
             .iter()
             .find(|p| p.author == snap.me && vox_agentcomms::ops::op_of(&p.envelope) == Some(&op))
             .and_then(|p| p.envelope.data.get("attempt").cloned());
-        let current = match snap.fold.resources.get(w) {
+        let seeded = match snap.fold.resources.get(w) {
             Some(State::Held {
                 owner, acquisition, ..
             }) if owner.author == snap.me && owner.session == session => {
-                Some(current_attempt(&snap, w, &session, *acquisition))
+                Some(seeded_attempt_id(&snap, w, &session, *acquisition))
             }
             _ => None,
         };
-        if let Some(a) = earlier.or(current.map(|h| claim::b32(&h).into())) {
+        if let Some(a) = earlier.or(seeded.map(|h| claim::b32(&h).into())) {
             data.insert("attempt".into(), a);
         }
     }
@@ -434,11 +434,11 @@ pub async fn post_cmd(
     Ok(())
 }
 
-/// The entry that began the holder's current attempt on `work`: its claim's
+/// The entry that seeds the holder's default attempt id on `work`: its claim's
 /// acquisition, or its own latest `failed` for `work` after it, in canonical order
 /// `(created_millis, entry_hash)`. A `failed` whose operation is void (a conflict, §6)
-/// never happened, so it begins nothing; a retried one is its first entry, not the retry.
-fn current_attempt(
+/// never happened, so it seeds nothing; a retried one is its first entry, not the retry.
+fn seeded_attempt_id(
     snap: &coord::Snapshot,
     work: &str,
     session: &str,

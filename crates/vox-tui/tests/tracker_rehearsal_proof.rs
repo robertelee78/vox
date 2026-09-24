@@ -15,10 +15,15 @@
 //!
 //! What it asserts, each at the checkpoint where it can first be true:
 //!
+//! 0. **a claim is ownership, not work** — after a claim the item is owned and still
+//!    Ready, with no attempt; **`working` starts the attempt** and moves it to Executing,
+//!    and the attempt's id is the one Vox seeded from the claim;
 //! 1. **`blocked` never changes Work phase** — the item stays Executing and only its
 //!    Health becomes Blocked;
 //! 2. **a failed attempt leaves the item retryable** — Ready again, with the failed
-//!    attempt kept in its history;
+//!    attempt kept in its history — and **a retry exists only from its `working`**: a
+//!    re-claim, a `status` and even a `result` before it start nothing, and that early
+//!    `result` stays an assertion;
 //! 3. **a worker killed mid-attempt** loses the item only by its lease lapsing, and the
 //!    item is retryable, not failed and not done;
 //! 4. **`result` reaches Acceptance at most** — never Release ready, never Done;
@@ -91,6 +96,8 @@ enum Health {
 struct Attempt {
     id: String,
     session: String,
+    /// The `working` entry that started it — the attempt-start evidence.
+    start: String,
     outcome: Option<&'static str>,
 }
 
@@ -101,6 +108,8 @@ struct Item {
     owner: Option<(String, String)>,
     attempts: Vec<Attempt>,
     candidate: Option<String>,
+    /// `result`s seen with no attempt-start observation: assertions, never phase changes.
+    unstarted_results: usize,
     /// Every phase this item has ever been in — so "never Done" is checked over the
     /// whole history, not just the end.
     history: Vec<Phase>,
@@ -128,6 +137,7 @@ impl Tracker {
                         owner: None,
                         attempts: vec![],
                         candidate: None,
+                        unstarted_results: 0,
                         history: vec![Phase::Ready],
                     },
                 )
@@ -167,13 +177,22 @@ impl Tracker {
         };
         let session = env["from"].as_str().unwrap_or("").to_owned();
         let attempt = env["data"]["attempt"].as_str().unwrap_or("").to_owned();
+        let entry = row["entry_hash"].as_str().unwrap_or("").to_owned();
+        let active = |item: &Item| {
+            item.attempts
+                .iter()
+                .position(|a| a.id == attempt && a.outcome.is_none())
+        };
         match env["type"].as_str().unwrap_or("") {
-            // A work-key-bound attempt start moves Ready to Executing.
+            // Only `working` starts an attempt; its entry is the start evidence. A later
+            // `working` with the same id continues it. A work-key-bound attempt start
+            // moves Ready to Executing.
             "working" => {
-                if !item.attempts.iter().any(|a| a.id == attempt) {
+                if active(item).is_none() {
                     item.attempts.push(Attempt {
                         id: attempt,
                         session,
+                        start: entry,
                         outcome: None,
                     });
                 }
@@ -185,30 +204,29 @@ impl Tracker {
             // A blocker changes Health and leaves Work phase unchanged.
             "blocked" => item.health = Health::Blocked,
             // A result naming an immutable candidate moves Executing to Acceptance —
-            // and no further: Release ready needs an independent verdict this tracker
-            // never receives from Vox.
-            "result" => {
-                if let Some(c) = env["data"]["evidence"][0]["ref"].as_str() {
+            // only for an attempt whose `working` was observed, and no further: Release
+            // ready needs an independent verdict this tracker never receives from Vox.
+            "result" => match (active(item), env["data"]["evidence"][0]["ref"].as_str()) {
+                (Some(i), Some(c)) if item.phase == Phase::Executing => {
                     item.candidate = Some(c.to_owned());
-                    if let Some(a) = item.attempts.iter_mut().find(|a| a.id == attempt) {
-                        a.outcome = Some("submitted");
-                    }
+                    item.attempts[i].outcome = Some("submitted");
+                    item.health = Health::OnTrack;
+                    Self::set(item, Phase::Acceptance);
+                }
+                _ => item.unstarted_results += 1,
+            },
+            // A failed attempt ends; the item stays retryable. A retry does not exist
+            // until its own `working`.
+            "failed" => {
+                if let Some(i) = active(item) {
+                    item.attempts[i].outcome = Some("work failure");
                     item.health = Health::OnTrack;
                     if item.phase == Phase::Executing {
-                        Self::set(item, Phase::Acceptance);
+                        Self::set(item, Phase::Ready);
                     }
                 }
             }
-            // A failed attempt ends; the item stays retryable.
-            "failed" => {
-                if let Some(a) = item.attempts.iter_mut().find(|a| a.id == attempt) {
-                    a.outcome = Some("work failure");
-                }
-                item.health = Health::OnTrack;
-                if item.phase == Phase::Executing {
-                    Self::set(item, Phase::Ready);
-                }
-            }
+            // claim, renew, accept, status: ownership or notes — never an attempt.
             _ => {}
         }
     }
@@ -484,13 +502,16 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     });
     let adapter = Adapter::start(bob, &r, &start);
 
-    // w1 takes item 1 and starts an attempt.
+    // w1 takes item 1 — ownership only.
     let (w1, w2) = agents.split_at_mut(1);
     let (w1, w2) = (&mut w1[0], &mut w2[0]);
-    let _ = w1.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
-        "vox room claim \"$VOX_ROOM\" --work 'wl:rehearsal#1' --ttl 45",
-        "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#1' --attempt att-1 starting",
-    ]), None);
+    let _ = w1.turn(
+        &oc_cfg,
+        &bin_dir,
+        &r,
+        &instructions(&["vox room claim \"$VOX_ROOM\" --work 'wl:rehearsal#1' --ttl 45"]),
+        None,
+    );
     let w1_session = until(
         bob,
         None,
@@ -506,12 +527,67 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         w1.session.as_deref().is_some_and(|s| s.starts_with("ses")),
         "w1's claim must carry its OpenCode session: {w1_session}"
     );
+    let w1_acquisition = support::resource(&w1_session, item1).unwrap()["acquisition"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    adapter.pump(&mut tracker);
+    tracker.board(&w1_session);
+    // ---- (0) a claim is ownership, not work ----
+    let i1 = &tracker.items[item1];
+    assert!(
+        i1.owner.is_some(),
+        "the claim must give w1 ownership: {i1:?}"
+    );
+    assert_eq!(
+        i1.phase,
+        Phase::Ready,
+        "a claim must leave the item Ready: {i1:?}"
+    );
+    assert!(
+        i1.attempts.is_empty(),
+        "a claim must start no attempt: {i1:?}"
+    );
+
+    // w1 starts its attempt — `working`, with the id Vox seeds.
+    let _ = w1.turn(
+        &oc_cfg,
+        &bin_dir,
+        &r,
+        &instructions(&[
+            "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#1' starting",
+        ]),
+        None,
+    );
+    until(
+        bob,
+        None,
+        "w1's working",
+        &["room", "read", &r],
+        |o: &Out| o.stdout.contains("starting"),
+    );
+    adapter.pump(&mut tracker);
+    let i1 = &tracker.items[item1];
+    assert_eq!(
+        i1.phase,
+        Phase::Executing,
+        "`working` must start the attempt: {i1:?}"
+    );
+    assert_eq!(
+        i1.attempts
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect::<Vec<_>>(),
+        [w1_acquisition.as_str()],
+        "the attempt's id must be the one Vox seeded from the claim: {i1:?}"
+    );
+    assert!(!i1.attempts[0].start.is_empty(), "{i1:?}");
 
     // w2 takes item 2, starts, and is blocked.
     let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
         "vox room claim \"$VOX_ROOM\" --work 'wl:rehearsal#2' --ttl 600",
-        "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#2' --attempt att-2 starting",
-        "vox room post \"$VOX_ROOM\" --type blocked --work 'wl:rehearsal#2' --attempt att-2 --data '{\"reason\":\"waiting on the schema\"}' blocked",
+        "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#2' starting",
+        "vox room post \"$VOX_ROOM\" --type blocked --work 'wl:rehearsal#2' --data '{\"reason\":\"waiting on the schema\"}' blocked",
     ]), None);
     let b = until(
         bob,
@@ -545,7 +621,7 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     let resume = tracker.cursor.clone().unwrap();
     adapter.stop();
     let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
-        "vox room post \"$VOX_ROOM\" --type failed --work 'wl:rehearsal#2' --attempt att-2 --data '{\"reason\":\"the schema never came\"}' giving-up",
+        "vox room post \"$VOX_ROOM\" --type failed --work 'wl:rehearsal#2' --data '{\"reason\":\"the schema never came\"}' giving-up",
         "vox room release \"$VOX_ROOM\" 'wl:rehearsal#2'",
     ]), None);
     // (3) w1 dies mid-attempt: its turn is killed and it never renews.
@@ -594,11 +670,45 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         tracker.items
     );
 
-    // ---- (4) a retry submits a candidate: Acceptance at most ----
+    // ---- (2, continued) a retry exists only from its `working` ----
+    // w2 re-claims, notes progress and even asserts a result — none of which starts an
+    // attempt.
     let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
         "vox room claim \"$VOX_ROOM\" --work 'wl:rehearsal#2' --ttl 600",
-        "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#2' --attempt att-3 retrying",
-        "vox room post \"$VOX_ROOM\" --type result --work 'wl:rehearsal#2' --attempt att-3 --data '{\"evidence\":[{\"kind\":\"commit\",\"ref\":\"9f3c2e1a\"}]}' candidate-ready",
+        "vox room post \"$VOX_ROOM\" --type status --work 'wl:rehearsal#2' looking-again",
+        "vox room post \"$VOX_ROOM\" --type result --work 'wl:rehearsal#2' --data '{\"evidence\":[{\"kind\":\"commit\",\"ref\":\"1111aaaa\"}]}' premature",
+    ]), None);
+    until(
+        bob,
+        None,
+        "w2's premature result",
+        &["room", "read", &r],
+        |o: &Out| o.stdout.contains("1111aaaa"),
+    );
+    adapter.pump(&mut tracker);
+    tracker.board(&bob.vox(None, &["room", "board", &r, "--json"]).json());
+    let i2 = &tracker.items[item2];
+    assert!(i2.owner.is_some(), "{i2:?}");
+    assert_eq!(
+        i2.phase,
+        Phase::Ready,
+        "re-claim, status and an unstarted result must leave it Ready: {i2:?}"
+    );
+    assert_eq!(
+        i2.attempts.len(),
+        1,
+        "no retry exists before its `working`: {i2:?}"
+    );
+    assert_eq!(
+        i2.candidate, None,
+        "an unstarted result is an assertion, not a candidate: {i2:?}"
+    );
+    assert_eq!(i2.unstarted_results, 1, "{i2:?}");
+
+    // ---- (4) the retry starts, and submits a candidate: Acceptance at most ----
+    let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
+        "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#2' retrying",
+        "vox room post \"$VOX_ROOM\" --type result --work 'wl:rehearsal#2' --data '{\"evidence\":[{\"kind\":\"commit\",\"ref\":\"9f3c2e1a\"}]}' candidate-ready",
     ]), None);
     until(
         bob,
@@ -616,6 +726,16 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         tracker.items[item2]
     );
     assert_eq!(tracker.items[item2].candidate.as_deref(), Some("9f3c2e1a"));
+    let i2 = &tracker.items[item2];
+    assert_eq!(
+        i2.attempts.len(),
+        2,
+        "the retry is a second attempt: {i2:?}"
+    );
+    assert_ne!(
+        i2.attempts[0].id, i2.attempts[1].id,
+        "a retry has its own id: {i2:?}"
+    );
 
     // ---- (5) release never means Done ----
     let _ = w2.turn(
