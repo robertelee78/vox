@@ -528,8 +528,8 @@ pub struct ClaimArgs {
     /// What is being claimed — a file, a milestone, a crate, whatever the room
     /// has agreed to name. Optional with `--work`, which is then the resource.
     pub resource: Option<String>,
-    /// The tracker's reference for the work item, carried opaquely in `data.work`
-    /// and used as the resource (ADR-021 §2).
+    /// The tracker's reference for the work item, `<scheme>:<id>` (the id may
+    /// contain `:`), carried in `data.work` and used as the resource (ADR-021 §2).
     #[arg(long)]
     pub work: Option<String>,
     /// Seconds after which the claim lapses on its own unless renewed.
@@ -711,11 +711,13 @@ pub struct RoomPostArgs {
     /// `status`, …). Any structured flag makes vox build the envelope itself.
     #[arg(long = "type")]
     pub kind: Option<String>,
-    /// The tracker's work-item reference, carried opaquely in `data.work`. A post
-    /// with `--work` takes part in work coordination and passes the version gate.
+    /// The tracker's work-item reference, `<scheme>:<id>` (the id may contain `:`),
+    /// carried in `data.work`. A post with `--work` takes part in work coordination
+    /// and passes the version gate.
     #[arg(long)]
     pub work: Option<String>,
-    /// The attempt, carried opaquely in `data.attempt`.
+    /// The attempt, carried in `data.attempt`. Defaults, with `--work`, to the
+    /// acquisition of this session's claim on that work item.
     #[arg(long)]
     pub attempt: Option<String>,
     /// Address a session by petname; repeat for several.

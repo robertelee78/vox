@@ -24,10 +24,36 @@ pub const DEFAULT_HOPS: u32 = 8;
 /// Longest petname accepted in [`Envelope::to`], matching the keyring's bound.
 pub const MAX_NAME: usize = 64;
 
-/// The data key naming the work item a message is about (ADR-021 §2). Opaque: carried,
-/// compared byte for byte and filtered by — never interpreted, never validated against
-/// any tracker.
+/// The data key naming the work item a message is about (ADR-021 §2). Its **shape** is
+/// checked ([`is_valid_work`]); its meaning never is — carried, compared byte for byte
+/// and filtered by, never interpreted, never looked up in any tracker.
 pub const WORK_KEY: &str = "work";
+
+/// Longest id after the scheme in a work reference.
+pub const MAX_WORK_ID: usize = 112;
+
+/// Whether `s` is a work reference: `<scheme>:<id>`, the scheme matching
+/// `[a-z][a-z0-9-]{0,15}` and the id `[A-Za-z0-9._~/#:-]{1,112}` (ADR-021 §3).
+///
+/// The id may itself contain `:`, so a tracker whose keys are colon-separated (for
+/// example `OWNER/REPO:SOURCE:ITEM`) carries them unchanged; the scheme is everything
+/// before the **first** colon.
+#[must_use]
+pub fn is_valid_work(s: &str) -> bool {
+    let Some((scheme, id)) = s.split_once(':') else {
+        return false;
+    };
+    let mut sb = scheme.bytes();
+    let scheme_ok = matches!(sb.next(), Some(b'a'..=b'z'))
+        && scheme.len() <= 16
+        && sb.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'));
+    let id_ok = !id.is_empty()
+        && id.len() <= MAX_WORK_ID
+        && id.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'/' | b'#' | b':' | b'-')
+        });
+    scheme_ok && id_ok
+}
 
 /// The suggested work vocabulary, shipped as convention rather than enforced.
 ///

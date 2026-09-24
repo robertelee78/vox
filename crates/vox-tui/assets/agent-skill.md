@@ -41,8 +41,11 @@ echo "port the wire codec" | vox room post "$VOX_ROOM" --type assign --to bob \
 ```
 
 `--work` names the work item a message is about. It is the **tracker's** reference,
-carried opaquely: Vox never interprets it, and the tracker — not Vox, not you — owns
-the item's phase, health, priority, acceptance and delivery.
+`<scheme>:<id>` — copy it exactly as the tracker gives it (the id may contain `:`).
+Vox checks its shape and never interprets it, and the tracker — not Vox, not you —
+owns the item's phase, health, priority, acceptance and delivery. While you hold the
+claim on an item, your posts about it are stamped with that claim as the attempt;
+you need not name one.
 
 ### What each type means, and does not mean
 

@@ -22,6 +22,10 @@ Revision history:
   announces before it checks, and a worker excludes itself from the version table (§5); and `from` is the
   session id, never `VOX_AGENT_NAME` (§7). Implementation also found F13 — `tail` had never delivered
   another member's message — and fixed it, and found F12, F14 and F15, which are open.
+- 2026-09-24 — the decider's decisions on fitting the work-accountability tracker: `data.work`'s id
+  **admits `:`**, and the shape is **enforced** by the CLI (F16, found then); `data.attempt` **defaults to
+  the holder's claim acquisition** (§3). The adapter from `vox room tail --json` to that tracker belongs
+  in the tracker's repository, not in Vox.
 
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, interop, work-tracking, adapter, envelope, claims, versioning, defects
@@ -129,6 +133,7 @@ defects**, not accepted gaps, because each is a thing a user meets.
 | F13 | **`vox room tail` never showed another member's message.** | The node emits `NewEntry` only for its own appends; a synced entry is announced as `Synced`, which carries no row, and `tail` listened only for `NewEntry`. Reproduced: bob's `read` count rose while his `tail` printed nothing, in plain mode as well as `--json`. | **Fixed here** (§7 amendment); `adapter_stream_proof` asserts rows synced from another node reach a *live* consumer, and turns red against the old behaviour. |
 | F14 | **A rate limit reaches the user as `Failed(Internal)`.** A member who posts more than 1,000 entries in an hour is refused, correctly, by ADR-008's per-author quota (`log/quota.rs`, `DEFAULT_MAX_ENTRIES_PER_HOUR = 1000` over a sliding `RATE_WINDOW_SECS = 3600`) — but `append_text` replaces `Quota(RateExceeded)` with `Error::Profile("authored entry failed the acceptance predicate")` (`channel.rs`), which surfaces as `vox: Failed(Internal)`. A person or agent cannot tell it is rate-limited, or when it may post again. | Reproduced through the real binary by the `vox` session: one member alone in a room, 1,010 `vox room post` calls — posts 0–999 succeed and every later one fails `Failed(Internal)`, identically on v0.2.6 and v0.2.7. Root cause measured by that session with an instrumented build: rotation at the 1,000th message **succeeds** (`rotate_sender: Ok(1)`); every refusal is `dag.accept … Quota(RateExceeded)`. The refusal is **not permanent** — the window slides. My own two-node reproduction first failed at index 999, most likely one earlier non-content entry counted in the same window. (An earlier version of this entry blamed rotation; that was wrong, and it is corrected here.) | **Retired 2026-09-24.** The decider accepted PRD-001 R3 — the per-author rate quota is **removed** — so there is no refusal left to report; the readable-refusal fix (#15) was closed unmerged. (It had been proved: `quota_refusal_proof`, red against the discarded error.) Before that decision, whether 1,000 entries/hour/author was the right default for agent rooms was a **decider question**, not a defect: it is tunable per channel (`QuotaPolicy`), and other members enforce it too, dropping over-quota entries on receipt. `adapter_stream_proof` keeps each member under 1,000 an hour and says why. Remove this entry when a member who exceeds the quota is told, through the real binary, that it is rate-limited and when it clears. |
 | F15 | **The daemon's interrupt path sees only this node's own posts.** | Found by reading, then **reproduced through the real `vox daemon`** (`remote_interrupt_proof`: an urgent message from another node reached bob's node and woke nobody — `received []`): `vox daemon` wakes a session on `NodeEvent::NewEntry` (`app.rs`), which by F13's evidence is emitted only for local appends, so an urgent message addressed to a session from *another* node would never interrupt it. `interrupt_proof` calls the wake decision directly and never runs that loop, so nothing would catch it. | **Open; fix proposed in #16** (the daemon sweeps on `Synced`/`SenderKeyReceived`/`Lagged`/a tick; `remote_interrupt_proof` green, red against the shipped loop). Remove when that lands: an urgent, addressed message posted on one node interrupts a session registered on another, through `vox daemon`. |
+| F16 | **`data.work`'s shape was specified and never checked, and one spelling skipped the version gate.** | Found reading `post_cmd` against the work-accountability tracker's key format: the CLI refused only an empty `--work`, so any string rode as a reference; and a post that set the reference through `--data '{"work":…}'` instead of `--work` skipped the version gate, which was keyed on the flag rather than on the message. `claim --work` checked nothing either. | **Fixed here**: the reference is checked where it lands in `data`, for every verb, and the gate follows the message (§3). `work_ref_proof` refuses seven malformed references through each of the three spellings with nothing posted, and turns red against each of the removed checks (six mutants, all caught). The gate half — a `--data` reference now passes the version gate — follows by construction (the gate reads the checked reference) and is **not separately proved**; `work_version_proof` drives the gate through `--work` only. |
 
 ## Decision
 
@@ -175,12 +180,24 @@ A message about a work item **MUST** carry the reference in `data.work`:
             "vox": "0.3.0", "evidence": [ { "kind": "commit", "ref": "9f3c2e1" } ] } }
 ```
 
-- **`data.work`** is a string `<scheme>:<id>` matching `[a-z][a-z0-9-]{0,15}:[A-Za-z0-9._~/#-]{1,112}`.
-  The scheme names the tracker, so two trackers, or a migration between them, never collide. The id is
-  the tracker's, and it **MUST** stay stable for the item's life, through renumbering, re-titling and
-  editing of source documents. That stability is the tracker's obligation.
-- **`data.attempt`** is OPTIONAL. It names one execution attempt, so a tracker can tell a retry from the
-  original. Vox treats it as opaque.
+- **`data.work`** is a string `<scheme>:<id>` matching `[a-z][a-z0-9-]{0,15}:[A-Za-z0-9._~/#:-]{1,112}`.
+  The scheme names the tracker, so two trackers, or a migration between them, never collide; it is
+  everything before the **first** colon, and the id **MAY** itself contain `:`, so a tracker whose keys are
+  colon-separated carries them unchanged — the work-accountability tracker's
+  `OWNER/REPO:SOURCE:ITEM` rides as, for example, `gwa:robertelee78/vox:adr-021:m21.3`. The id is the
+  tracker's, and it **MUST** stay stable for the item's life, through renumbering, re-titling and editing
+  of source documents. That stability is the tracker's obligation. **The CLI refuses a reference of any
+  other shape before posting**, whichever flag carried it — `--work`, `--data` or `claim --work` (F16).
+  Vox checks the shape only; it never interprets the id or looks it up.
+- **`data.attempt`** names one execution attempt, so a tracker can tell a retry from the original. Vox
+  treats it as opaque. **When the caller names none, a work-bound post from the session that holds the
+  claim on that item carries the claim's acquisition** (the claim entry's hash, as `board --json` shows
+  it). A claim is where an attempt begins and a release, lapse or handoff is where it ends, so every
+  claim is a new attempt and an agent never has to mint ids. A post from a session that does not hold
+  the claim carries no attempt unless it names one. A retried `--op` keeps the attempt its first post
+  carried, so a claim re-taken between the two does not turn the retry into a conflict. A `failed` and a
+  later retry *under the same claim* therefore share an attempt; an agent that wants them separate names
+  one with `--attempt`, or releases and claims again. (Decided 2026-09-24.)
 - **`data.op`** is the operation id (§6). **`data.vox`** is the version stamp (§5).
 - **`data.evidence`** is OPTIONAL: a list of `{kind, ref, sha256?}`, opaque to Vox. Bytes that must
   move between hosts use ADR-020 §11's file exchange, whose announcement can itself carry `data.work`.

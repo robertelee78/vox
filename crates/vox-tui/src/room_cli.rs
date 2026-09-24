@@ -235,9 +235,9 @@ pub struct PostOpts {
     /// The envelope type. Any structured flag makes the post structured; `say` when
     /// none is given.
     pub kind: Option<String>,
-    /// The work item this is about, carried opaquely in `data.work`.
+    /// The work item this is about, carried in `data.work`; its shape is checked.
     pub work: Option<String>,
-    /// The attempt, carried opaquely in `data.attempt`.
+    /// The attempt, carried in `data.attempt`; defaults to this session's claim.
     pub attempt: Option<String>,
     /// Addressees, by petname.
     pub to: Vec<String>,
@@ -325,11 +325,34 @@ pub async fn post_cmd(
         }
     }
     if let Some(w) = &opts.work {
-        if w.trim().is_empty() {
-            return Err(AppError::Usage("--work may not be empty".into()));
+        match data.get(vox_agentcomms::envelope::WORK_KEY) {
+            Some(d) if d.as_str() != Some(w) => {
+                return Err(AppError::Usage(format!(
+                    "--work {w:?} and --data's work {d} differ; name the work item once"
+                )))
+            }
+            _ => {}
         }
         data.insert(vox_agentcomms::envelope::WORK_KEY.into(), w.clone().into());
     }
+    // **Whichever flag set it.** The work reference is checked where it lands, not
+    // where it was typed: `--data '{"work":…}'` is the same message as `--work`, and
+    // checking only the flag let a malformed reference, and the version gate below,
+    // be skipped by spelling it the other way.
+    let work = match data.get(vox_agentcomms::envelope::WORK_KEY) {
+        None => None,
+        Some(serde_json::Value::String(w)) if vox_agentcomms::envelope::is_valid_work(w) => {
+            Some(w.clone())
+        }
+        Some(bad) => {
+            return Err(AppError::Usage(format!(
+                "{bad} is not a work reference: use <scheme>:<id>, the scheme \
+                 [a-z][a-z0-9-]{{0,15}} and the id 1–{} of [A-Za-z0-9._~/#:-] \
+                 (ADR-021 §3)",
+                vox_agentcomms::envelope::MAX_WORK_ID
+            )))
+        }
+    };
     if let Some(a) = &opts.attempt {
         data.insert("attempt".into(), a.clone().into());
     }
@@ -353,11 +376,36 @@ pub async fn post_cmd(
         None => coord::new_op()?,
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
-    let snap = if opts.work.is_some() {
+    let snap = if work.is_some() {
         coord::participate(&mut client, cid, &room_key, &session).await?
     } else {
         coord::snapshot(&mut client, cid).await?
     };
+    // **The attempt, when the caller did not name one** (ADR-021 §3): the acquisition
+    // of this session's claim on the work item. A claim is where an attempt begins and
+    // a release or lapse is where it ends, so every claim is a new attempt and a tracker
+    // can tell a retry from a continuation without asking the agent to mint ids. A
+    // retried `--op` keeps the attempt its first post carried — the claim may have been
+    // renewed or re-taken since, and a different attempt would make the retry a
+    // conflict rather than the same message.
+    if let (Some(w), None) = (&work, data.get("attempt")) {
+        let earlier = snap
+            .posted
+            .iter()
+            .find(|p| p.author == snap.me && vox_agentcomms::ops::op_of(&p.envelope) == Some(&op))
+            .and_then(|p| p.envelope.data.get("attempt").cloned());
+        let held = match snap.fold.resources.get(w) {
+            Some(State::Held {
+                owner, acquisition, ..
+            }) if owner.author == snap.me && owner.session == session => {
+                Some(serde_json::Value::from(claim::b32(acquisition)))
+            }
+            _ => None,
+        };
+        if let Some(a) = earlier.or(held) {
+            data.insert("attempt".into(), a);
+        }
+    }
     let draft = Draft {
         kind,
         to: opts.to.clone(),
@@ -937,6 +985,13 @@ fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, App
             "the resource {r:?} and --work {w:?} differ; a claim on a work item uses the \
              reference as its resource (ADR-021 §2)"
         ))),
+        (_, Some(w)) if !vox_agentcomms::envelope::is_valid_work(w) => {
+            Err(AppError::Usage(format!(
+                "--work {w:?} is not a work reference: use <scheme>:<id>, the scheme \
+                 [a-z][a-z0-9-]{{0,15}} and the id 1–{} of [A-Za-z0-9._~/#:-] (ADR-021 §3)",
+                vox_agentcomms::envelope::MAX_WORK_ID
+            )))
+        }
         (Some(r), _) | (None, Some(r)) if !r.trim().is_empty() => Ok(r.to_owned()),
         _ => Err(AppError::Usage("name a resource, or pass --work".into())),
     }
