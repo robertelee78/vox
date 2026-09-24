@@ -372,17 +372,40 @@ invisible until the model met a command line:
 
 M19.9 is that work.
 
-**Resolution is deterministic but not causal within one second.** `created_secs` has one-second
-resolution, so a losing `claim` and the `release` that follows it can carry the same timestamp, and
-rule 2's entry-hash tie-break then decides their order. Every node computes the **same** answer —
-that is exactly what the tie-break is for, and it is why this is not the flaw that a client-supplied
-timestamp with no tie-break would be — but the answer need not match the order things happened in.
+**Resolution is deterministic but not causal within one tick, and the tick is now a millisecond
+(2026-09-24).** Rule 2 sorts on a timestamp and breaks ties on the entry hash. Every node computes
+the **same** answer — that is what the tie-break is for, and it is why this is not the flaw a
+client-supplied timestamp with no tie-break would be — but the answer need not match the order
+things happened in. The size of the window where that matters is exactly the timestamp's resolution.
 
-The observable consequence, found by running M19.9's proof rather than by reasoning: an agent
-correctly told "you did not get it" may hold the resource once the current owner releases it,
-because its earlier claim sorts after the release. Neither statement is false — "you did not get it"
-was true when it was said, and the board is the log's converged answer afterwards — so this is
-recorded as a property, not a defect.
+`created_secs` made that window **one second**, which put the tie-break in the ordinary path rather
+than the rare one: a losing `claim` and the `release` that followed it routinely carried the same
+value. The observable consequence, found by running M19.9's proof rather than by reasoning, was that
+an agent correctly told "you did not get it" could hold the resource once the current owner released
+it, because its earlier claim sorted after the release. Agents act in milliseconds, so for the
+feature this ADR exists to build that was the common case, not an edge.
+
+The timestamp is now `created_millis`, which shrinks the window by 1000× and returns the tie-break
+to the rare event it was designed to be. Two actors must now collide inside the same **millisecond**
+to reach it. Measured through the product: `work_board_proof` went from 1 failure in 3 to **6 of 6**
+at loads 4–45, and it is back in the blocking set of the release gate.
+
+**The residue is still a property, not a defect.** A millisecond is smaller, not zero. What a
+`release` guarantees is unchanged and stated below; anything needing the stronger guarantee re-reads
+the board. Closing the window entirely would need a happens-before edge between two authors' entries,
+which ADR-008's schema does not have — `log/dag.rs` records that entries across authors are
+concurrent by design — so it is a schema change, not a tuning change, and it is not proposed here.
+
+**Format: the writer cut over, and there was no compatibility ceremony.** `Content` is written at
+`VERSION = 2` with a millisecond timestamp; version 1 remains **readable** (one match arm, a
+×1000 scale) because the decider's own anchor holds entries written before the cutover and they
+must keep rendering. That is the whole of it — no dual-write, no deprecation window, no coordinated
+upgrade: the project is pre-alpha with one operator, and paying for staged rollouts at this stage
+buys nothing. The cache is versioned alongside (`CACHE_VERSION = 2`) so a stale cache is rebuilt
+rather than misread, an unrepresentable timestamp is refused by `checked_mul` rather than wrapped,
+and an envelope this node cannot decode now **skips that one message** instead of aborting the whole
+render pass — which is what makes a forward-incompatible envelope a missing message rather than an
+empty room.
 
 What a `release` therefore guarantees is that **the releaser no longer holds the resource**, not that
 the resource is unowned. Anything needing the stronger guarantee must re-read the board, which is
@@ -723,14 +746,14 @@ Both unknowns are already spiked; neither remains open.
   lie and freeing the resource would let an unresolvable name silently release it.
   *Gate* `agentcomms_gate` (13 tests, debug — pure, no network or Argon2): claim resolution is run
   over **every permutation** of a contested set and must yield one owner; ties break by
-  `(created_secs, entry_hash)` and not arrival order; only the owner may release or hand off; a
+  `(created_millis, entry_hash)` and not arrival order; only the owner may release or hand off; a
   lapsed TTL frees a resource with nobody saying so; and the room rules hold (interrupt, auto-reply,
   hop exhaustion).
   Mutation-checked twice: removing the canonical sort — caught with "nodes disagreed about the owner
   depending on arrival order" — and removing just the entry-hash tie-break, which the permutation
   test still passes (its claims have distinct times) and the dead-heat test catches. Each test earns
   its place.
-  **Honest limit, recorded in the module**: a dishonest `created_secs` can win a race it should have
+  **Honest limit, recorded in the module**: a dishonest `created_millis` can win a race it should have
   lost. Accepted, and the same trade the ADR-007 evaluator makes for concurrent governance — the
   alternative is a clock nobody has. Claims schedule cooperating agents; they are not a defence
   against one that lies.
@@ -818,6 +841,13 @@ Both unknowns are already spiked; neither remains open.
   > stayed green. Resolving by petname would not converge either, because petnames are local. Recorded
   > as ADR-021 F1–F3, with per-session ownership, and to be fixed by ADR-021 M21.2: a handoff carries
   > the recipient's fingerprint and leaves the resource pending until an eligible session claims it.
+
+  > **Ordering closed, 2026-09-24.** The gate above passed while the ordering underneath it was
+  > wrong one time in three: §5's one-second `created_secs` put the entry-hash tie-break in the
+  > ordinary path, so "the loser is told so" and "a fresh claim succeeds after a release" both
+  > depended on which second two actions landed in. The timestamp is now `created_millis`
+  > (`Content::VERSION = 2`, `CACHE_VERSION = 2`, version 1 still read); `work_board_proof` went
+  > 1-in-3 failing → **6 of 6** at loads 4–45 and is back in the blocking release gate.
 
 - **M19.6 — the interrupt path. DONE 2026-09-22**, for Claude Code and OpenCode; Codex named and not implemented. §6 says queue always and interrupt only when
   *addressed* and *urgent*; the queue half is built and proven, this is the other half. It is the

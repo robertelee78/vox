@@ -1,7 +1,0 @@
-### work_board_proof with the step-3 correction — 5 reps, quiet box
-  rep1 ok    load=11.49
-  rep2 ok    load=24.07
-  rep3 FAIL  load=26.33 :: work_board_proof.rs:328
-  rep4 ok    load=23.91
-  rep5 ok    load=18.90
-### WB2 DONE

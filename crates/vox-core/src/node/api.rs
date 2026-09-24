@@ -51,8 +51,12 @@ pub struct MessageRow {
     pub entry_hash: Digest32,
     /// The author's fingerprint.
     pub author: Digest32,
-    /// The author's recorded send time (seconds).
-    pub created_secs: u64,
+    /// The author's recorded send time, **milliseconds** since the Unix epoch.
+    ///
+    /// Milliseconds because this value orders ADR-020 work-board claims, and whole seconds put
+    /// two agents racing for the same item in the same bucket, where the winner fell to a hash
+    /// tie-break instead of to who asked first. Divide by 1000 for display.
+    pub created_millis: u64,
     /// The text.
     pub text: String,
 }

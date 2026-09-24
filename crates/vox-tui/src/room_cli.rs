@@ -401,7 +401,7 @@ async fn read_board(
             Envelope::parse(&r.text).ok().map(|envelope| Posted {
                 entry_hash: r.entry_hash,
                 author: r.author,
-                created_secs: r.created_secs,
+                created_millis: r.created_millis,
                 envelope,
             })
         })

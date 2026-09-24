@@ -27,7 +27,10 @@ fn posted(author: [u8; 32], hash: u8, secs: u64, kind: &str, data: serde_json::V
     Posted {
         entry_hash: [hash; 32],
         author,
-        created_secs: secs,
+        // These helpers speak seconds because the cases are written in seconds — and several
+        // deliberately give two ops the SAME second to exercise §5's tie-break. Scaling keeps
+        // that: equal seconds are still equal milliseconds, so every tie stays a tie.
+        created_millis: secs.saturating_mul(1_000),
         envelope: env,
     }
 }

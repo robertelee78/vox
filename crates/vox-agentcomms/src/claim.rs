@@ -13,12 +13,12 @@
 //! ops are sorted into a canonical order before they are folded, so the answer is
 //! a function of the *set* of ops, not of arrival order.
 //!
-//! The sort key is `(created_secs, entry_hash)` — the author's recorded time, and
+//! The sort key is `(created_millis, entry_hash)` — the author's recorded time, and
 //! then the entry hash as the tie-break. Never wall-clock-at-receipt and never
 //! arrival order, because those differ per node and would make two agents
 //! disagree about who owns a task while both believe they converged.
 //!
-//! A dishonest `created_secs` can win a race it should have lost. That is
+//! A dishonest `created_millis` can win a race it should have lost. That is
 //! accepted, and it is the same trade the ADR-007 evaluator makes for concurrent
 //! governance: the alternative is a clock nobody has. The claim system schedules
 //! cooperating agents; it is not a defence against one that lies.
@@ -83,10 +83,27 @@ pub struct Posted {
     pub entry_hash: [u8; 32],
     /// The signed author's fingerprint.
     pub author: [u8; 32],
-    /// The author's recorded send time.
-    pub created_secs: u64,
+    /// The author's recorded send time, **milliseconds** since the Unix epoch.
+    ///
+    /// Milliseconds because this is half the sort key below, and whole seconds put two agents
+    /// racing for one resource in the same bucket — where the entry-hash tie-break decided the
+    /// winner instead of who asked first.
+    pub created_millis: u64,
     /// The message.
     pub envelope: Envelope,
+}
+
+impl Posted {
+    /// The send time in whole seconds.
+    ///
+    /// TTLs are a person's unit — `--ttl 2` means two seconds — so lease arithmetic stays in
+    /// seconds while *ordering* uses the full millisecond precision. Truncating is right here: a
+    /// lease that expires at the top of a second should not depend on the millisecond a claim
+    /// happened to be posted within it.
+    #[must_use]
+    pub const fn created_secs(&self) -> u64 {
+        self.created_millis / 1_000
+    }
 }
 
 /// A claim operation, read out of a [`Posted`] message.
@@ -198,8 +215,8 @@ pub fn resolve_with(
         .filter_map(|m| ClaimOp::from_envelope(&m.envelope).map(|op| (m, op)))
         .collect();
     ops.sort_by(|(a, _), (b, _)| {
-        a.created_secs
-            .cmp(&b.created_secs)
+        a.created_millis
+            .cmp(&b.created_millis)
             .then_with(|| a.entry_hash.cmp(&b.entry_hash))
     });
 
@@ -208,7 +225,7 @@ pub fn resolve_with(
         // An expired claim frees the resource before this op is considered, so a
         // later claim succeeds exactly as if a release had been posted.
         if let Some(cur) = owned.get(op.resource()) {
-            if cur.expires_secs.is_some_and(|e| e <= posted.created_secs) {
+            if cur.expires_secs.is_some_and(|e| e <= posted.created_secs()) {
                 owned.remove(op.resource());
             }
         }
@@ -221,8 +238,8 @@ pub fn resolve_with(
                     resource,
                     Ownership {
                         owner: posted.author,
-                        since_secs: posted.created_secs,
-                        expires_secs: ttl_secs.map(|t| posted.created_secs.saturating_add(t)),
+                        since_secs: posted.created_secs(),
+                        expires_secs: ttl_secs.map(|t| posted.created_secs().saturating_add(t)),
                         named: None,
                     },
                 );
@@ -251,7 +268,7 @@ pub fn resolve_with(
                         resource,
                         Ownership {
                             owner: new_owner,
-                            since_secs: posted.created_secs,
+                            since_secs: posted.created_secs(),
                             expires_secs: None,
                             named: Some(to),
                         },

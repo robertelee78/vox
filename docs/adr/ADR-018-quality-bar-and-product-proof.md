@@ -365,7 +365,7 @@ Each item is one branch, red→green, with this ADR updated in the same change (
   `anchor → serve`, `serve → connect`, `connect → up`, `up → ssh`. Gate: each of the three known defects
   is reproduced by the harness when its fix is reverted.
 
-## A third, and a gate that asserted a guarantee the model declines to make (2026-09-24)
+## A third, and a gate that asserted a guarantee the model declines to make (2026-09-24, CLOSED same day)
 
 `work_board_proof::two_agents_split_work_and_only_one_holds_a_contested_resource` is excluded from
 the release gate, by name, with its cause identified. It is worth its own entry because it is the
@@ -414,7 +414,30 @@ claiming the same work item **within one second** can both be wrong about who ho
 fast; two sessions reaching for the same item milliseconds apart is the ordinary case for the feature
 ADR-020 exists to build, not a pathological one. The work board is usable and that limitation is real.
 
-Removing this name must fail until M19.9 lands.
+**CLOSED 2026-09-24, and closed the way a gap entry is supposed to close: by fixing the cause, not
+by re-reading the red.** M19.9's remaining piece landed — `Content` and the claim record carry
+`created_millis`, and `claim::resolve` sorts on it — so the tie-break moved from the common case to
+the rare one it was always meant to be. Two agents now have to collide inside the *same millisecond*
+to reach it.
+
+| tree | result |
+|---|---|
+| before, `main` and v0.2.5's commit | 1 failure in 3 each, quiet box |
+| after, millisecond ordering | **6 of 6**, loads 4-45 |
+
+`work_board_proof` is back in the blocking set of `release.yml` and its warning copy is deleted,
+because a proof that can pass for a reason belongs in the gate. Note which direction the load
+evidence runs: a **quiet** box is the harder condition for this race, because it is what packs a
+claim and the release that follows it into one second — so 6 of 6 spanning loads 4 through 45
+includes the conditions that produced the failures, and is not the usual "it passed because the box
+was busy".
+
+**What this entry is retained for.** The diagnosis above was right and cost two releases anyway,
+because the exclusion comment was allowed to stand as an explanation. The rule this reinforces is
+already written in §"an accepted gap can hide a defect": a gap entry names its own exit condition,
+and the moment the remedy lands somebody must re-run the red rather than re-read the note. The exit
+condition here was one sentence — "removing this name must fail until M19.9 lands" — and it is what
+made the close mechanical.
 
 ## Two proofs are excluded from the release gate, by name (2026-09-23)
 

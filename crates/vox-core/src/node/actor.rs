@@ -270,6 +270,9 @@ impl std::fmt::Debug for Bind {
 pub struct NodeConfig {
     /// The wall clock (tests inject a fixed one).
     pub clock: Clock,
+    /// Milliseconds since the epoch, from one read. Defaults to
+    /// [`crate::time::system_millis_clock`]; pin it in a test that pins [`NodeConfig::clock`].
+    pub millis_clock: crate::time::MillisClock,
     /// The Argon2id profile for every at-rest derivation.
     pub argon2: Argon2Profile,
     /// Where to bind, or `None` for a node that does not network.
@@ -317,6 +320,7 @@ impl NodeConfig {
     pub fn new() -> Self {
         Self {
             clock: system_clock(),
+            millis_clock: crate::time::system_millis_clock(),
             argon2: Argon2Profile::default(),
             bind: None,
             pow_params: None,
@@ -344,6 +348,14 @@ impl NodeConfig {
     #[must_use]
     pub fn clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Pin the millisecond clock. A test that pins [`NodeConfig::clock`] and asserts on message
+    /// timestamps wants this too — they are separate seams on purpose (see the field).
+    #[must_use]
+    pub fn millis_clock(mut self, millis_clock: crate::time::MillisClock) -> Self {
+        self.millis_clock = millis_clock;
         self
     }
 
@@ -1164,6 +1176,13 @@ pub struct Node {
     prekeys: Option<Arc<tokio::sync::Mutex<PrekeyRing>>>,
     channels: BTreeMap<Digest32, SharedChannel>,
     clock: Clock,
+    /// Milliseconds since the epoch, from **one** read — see [`crate::time::MillisClock`].
+    ///
+    /// A second seam rather than a change to `clock`, because ten call sites feed that into TTLs
+    /// specified in seconds. Only the message timestamp uses this, and only because it becomes
+    /// half the ADR-020 claim ordering key, where whole seconds put two racing agents in one
+    /// bucket and let a hash decide.
+    millis_clock: crate::time::MillisClock,
     argon2: Argon2Profile,
     view_tx: watch::Sender<NodeView>,
     event_tx: broadcast::Sender<NodeEvent>,
@@ -1237,6 +1256,7 @@ impl Node {
     pub fn spawn_config(paths: Paths, cfg: NodeConfig) -> crate::error::Result<NodeHandle> {
         let NodeConfig {
             clock,
+            millis_clock,
             argon2,
             bind,
             pow_params,
@@ -1258,6 +1278,7 @@ impl Node {
         let node = Self {
             paths,
             profile,
+            millis_clock,
             net: None,
             net_tx,
             bind,
@@ -4777,7 +4798,11 @@ impl Node {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
         let mut ch = shared.lock().await;
-        let appended = match ch.append_text(profile, text, now) {
+        // One read, in milliseconds. NOT `now * 1000` and not seconds-plus-a-second-read: a value
+        // composed from two clock reads can go backwards across a second boundary, which is the
+        // ordering inversion this change exists to remove.
+        let now_millis = (self.millis_clock)();
+        let appended = match ch.append_text(profile, text, now_millis) {
             Ok(r) => row_of(r),
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
@@ -4988,7 +5013,7 @@ fn row_of(r: &Rendered) -> MessageRow {
     MessageRow {
         entry_hash: r.entry_hash,
         author: r.author,
-        created_secs: r.created_secs,
+        created_millis: r.created_millis,
         text: r.text.clone(),
     }
 }
