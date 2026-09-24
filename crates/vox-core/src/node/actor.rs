@@ -3717,6 +3717,9 @@ impl Node {
             // channels that changed; a connect or interval pass covers every channel
             // shared with this peer.
             let mut channels: Vec<Digest32> = Vec::new();
+            // Rooms this pass wanted with this peer but found **already mid-session**. See the
+            // `owed` handling after the loop: they are retried next tick, not forgotten.
+            let mut owed: Vec<Digest32> = Vec::new();
             // A member reconciles a channel with its co-authors — and with its
             // anchors, which keep the log for whoever is away (M15.2b).
             let peer_is_anchor = self.anchor_ids.contains(&peer);
@@ -3741,6 +3744,12 @@ impl Node {
             // is exactly the work a new connection warrants and would be waste on the interval.
             for (cid, shared) in &self.channels {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
+                    continue;
+                }
+                // Checked **before** the `is_author` lock below: a session holds this room's
+                // mutex for its whole run, so taking it here would park the actor behind it.
+                if self.syncing.contains(cid) {
+                    owed.push(*cid);
                     continue;
                 }
                 // **A fresh connection is never filtered out.**
@@ -3774,6 +3783,10 @@ impl Node {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
                     continue;
                 }
+                if self.syncing.contains(cid) {
+                    owed.push(*cid);
+                    continue;
+                }
                 // **An anchor does not filter out the member it is forwarding to.**
                 //
                 // `is_author` is the right question on an interval pass and the wrong one here, for
@@ -3803,6 +3816,28 @@ impl Node {
             }
             if let Some(schedule) = self.schedules.get_mut(&peer) {
                 schedule.note_synced(now);
+                // **A room skipped because it was mid-session is owed, not synced.**
+                //
+                // The in-flight mark is per room, so when two peers came due for one room in the
+                // same pass the first took it and the second was skipped — and `note_synced` above
+                // then recorded the skipped peer as synced at the same `now` as the first. Both came
+                // due together again, in the same `BTreeMap` order, and the same peer lost again:
+                // **aligned once, aligned forever.** A local append makes every peer due at once, so
+                // the alignment was the default after the first post, and which peer starved came
+                // down to how the fingerprints sorted.
+                //
+                // Measured in `node_m15_anchor_gate` (instrumented, by the other session): in every
+                // red, each member skipped the *other member* nine rounds running while its only
+                // session — with the anchor — failed each time, so the one leg that could carry the
+                // room never ran. Red about half the time in CI since before v0.2.5.
+                //
+                // Owed is not the unconditional retry the note on `pending_push` below warns
+                // against: nothing here takes a lock, and it is retried only while that room is
+                // mid-session, which is milliseconds. The next tick finds the room free.
+                if !owed.is_empty() {
+                    self.pending_push.extend(owed.iter().copied());
+                    schedule.note_local_append();
+                }
             }
         }
         // **Keep what did not go out.** This cleared unconditionally, which discarded the intent to
@@ -3906,12 +3941,25 @@ impl Node {
                 SessionTarget::Anchored(state) => state.lock().await.epoch(),
             };
             // 2. Open the stream. Also a round trip.
+            //
+            // **A stream that will not open still reports.** This returned without a word, and the
+            // only thing that clears `syncing` is `SyncDone` — so one failed open left the room
+            // marked mid-session for good: every later sync of it skipped, every inbound one
+            // refused, and nothing said so. Every exit from this task now sends `SyncDone`.
             let handle = tokio::runtime::Handle::current();
-            let Ok(transport) =
-                crate::node::syncstream::open_sync(&conn, handle, &cid, epoch).await
-            else {
-                return;
-            };
+            let transport =
+                match crate::node::syncstream::open_sync(&conn, handle, &cid, epoch).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = tx
+                            .send(NetEvent::SyncDone {
+                                channel_id: cid,
+                                outcome: Err(e),
+                            })
+                            .await;
+                        return;
+                    }
+                };
             // 3. Run the session. `blocking_lock` is the sanctioned way to take a tokio mutex off a
             //    blocking thread; anything else wanting this room waits for the session rather than
             //    finding it missing.
@@ -3927,14 +3975,16 @@ impl Node {
                 }
             })
             .await;
-            if let Ok(outcome) = joined {
-                let _ = tx
-                    .send(NetEvent::SyncDone {
-                        channel_id: cid,
-                        outcome,
-                    })
-                    .await;
-            }
+            // A session that panicked still hands the room back: `Err` from the join is the panic.
+            let outcome = joined.unwrap_or(Err(crate::error::Error::MalformedGovernance(
+                "sync session panicked",
+            )));
+            let _ = tx
+                .send(NetEvent::SyncDone {
+                    channel_id: cid,
+                    outcome,
+                })
+                .await;
         });
         true
     }
@@ -3957,6 +4007,9 @@ impl Node {
             (None, Some(state)) => SessionTarget::Anchored(state),
             (None, None) => return,
         };
+        // Marked here, past both early returns above, so a session that never starts never
+        // leaves the room marked. Its caller used to mark it first.
+        self.syncing.insert(channel_id);
         let now = self.now();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
@@ -3975,14 +4028,15 @@ impl Node {
                 }
             })
             .await;
-            if let Ok(outcome) = joined {
-                let _ = tx
-                    .send(NetEvent::SyncDone {
-                        channel_id,
-                        outcome,
-                    })
-                    .await;
-            }
+            let outcome = joined.unwrap_or(Err(crate::error::Error::MalformedGovernance(
+                "sync session panicked",
+            )));
+            let _ = tx
+                .send(NetEvent::SyncDone {
+                    channel_id,
+                    outcome,
+                })
+                .await;
         });
     }
 
@@ -4028,6 +4082,22 @@ impl Node {
         recv: quinn::RecvStream,
     ) {
         use crate::node::syncstream::accept_sync;
+        // Answering while our own session holds this room is the other half of the deadlock.
+        //
+        // **Refused explicitly, not by dropping the streams.** Letting them drop leaves the peer
+        // reading for a frame that will never come until `SYNC_FRAME_TIMEOUT` expires — the
+        // silent refusal that reads as a hang, which is the shape of defect this whole change
+        // exists to remove. A reset reaches it on the next read, and its schedule brings it
+        // back in a second.
+        //
+        // **Refused before the lock, not after.** A session holds this room's mutex for its whole
+        // run, and this is the actor: awaiting that lock to read the epoch parked the whole node
+        // behind the very session this check exists to detect.
+        if self.syncing.contains(&channel_id) {
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream(&mut send, &mut recv);
+            return;
+        }
         // Only a channel we hold open at that epoch — or keep as an anchor — can be
         // reconciled. An anchor whose board just received the genesis adopts it here
         // rather than making the member wait for the next tick.
@@ -4047,20 +4117,7 @@ impl Node {
         if !matches_epoch {
             return;
         }
-        if self.syncing.contains(&channel_id) {
-            // Answering while our own session holds this room is the other half of the deadlock.
-            //
-            // **Refused explicitly, not by dropping the streams.** Letting them drop leaves the peer
-            // reading for a frame that will never come until `SYNC_FRAME_TIMEOUT` expires — the
-            // silent refusal that reads as a hang, which is the shape of defect this whole change
-            // exists to remove. A reset reaches it on the next read, and its schedule brings it
-            // back in a second.
-            let (mut send, mut recv) = (send, recv);
-            crate::node::net::refuse_stream(&mut send, &mut recv);
-            return;
-        }
         let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
-        self.syncing.insert(channel_id);
         self.start_session(channel_id, transport);
     }
 
