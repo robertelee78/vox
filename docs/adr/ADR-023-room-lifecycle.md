@@ -205,7 +205,7 @@ covers only the approver's own messages, as consent always has.
 ## Implementation plan
 
 - **M23.1** Reload and sync accept pruned entries; retention policy and sweep (decision 2).
-  Proofs 3–4. **DONE for proofs 3 and 4 and the late-arrival rule** on `prd1/retention`
+  Proofs 3–4. **DONE for proofs 3 and 4 and the late-arrival rule** in 24b4433 on `prd1/retention`
   (`crates/vox-tui/tests/retention_proof.rs`, shipped binary, each mutation-checked red; counts in
   ADR-010 §"Retention / TTL"). Not built within it: a room created with a retention (creation still
   writes `ttl` 0; `vox room retention` sets it after), and a gate isolating "a peer asking for a
