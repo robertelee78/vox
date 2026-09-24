@@ -481,6 +481,9 @@ pub fn run_node(
 /// merging an address it already holds is a no-op.
 const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long one wake may take before it is abandoned.
+const WAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The interrupt decision for one entry that just landed in `channel_id`: wake every
 /// session of this node registered for that room, when the message is urgent and its `to`
 /// names **this node's fingerprint** (ADR-020 §6; PRD-001 R15, ADR-021 §9). A petname is
@@ -508,14 +511,26 @@ async fn judge(
             &room[..12.min(room.len())],
             envelope.body.trim()
         );
-        if let Err(e) = crate::wake::wake(&session, &text).await {
-            // Reported, never fatal: an agent that cannot be interrupted still reads the
-            // message on its next turn, which is the whole point of queueing always.
-            eprintln!(
-                "vox daemon: could not interrupt session {}: {e}",
-                session.session
-            );
-        }
+        // **One wedged session must not stall every other wake.** Each is its own task,
+        // bounded by a deadline: a session endpoint that accepts and never reads would
+        // otherwise hold this loop — and so every later interrupt — indefinitely.
+        tokio::spawn(async move {
+            match tokio::time::timeout(WAKE_DEADLINE, crate::wake::wake(&session, &text)).await {
+                Ok(Ok(())) => {}
+                // Reported, never fatal: an agent that cannot be interrupted still reads the
+                // message on its next turn, which is the whole point of queueing always.
+                Ok(Err(e)) => eprintln!(
+                    "vox daemon: could not interrupt session {}: {e}",
+                    session.session
+                ),
+                Err(_) => eprintln!(
+                    "vox daemon: interrupting session {} took longer than {}s; gave up — it \
+                     reads the message on its next turn",
+                    session.session,
+                    WAKE_DEADLINE.as_secs()
+                ),
+            }
+        });
     }
 }
 
@@ -879,7 +894,10 @@ pub fn run_daemon(
                 let sweep = tokio::select! {
                     item = events.next() => match item {
                         None => break,
-                        Some(vox_core::node::actor::EventStreamItem::Lagged(_)) => true,
+                        Some(vox_core::node::actor::EventStreamItem::Lagged(n)) => {
+                            eprintln!("vox daemon: fell behind the node's events by {n}; re-reading every room");
+                            true
+                        }
                         Some(vox_core::node::actor::EventStreamItem::Event(ev)) => {
                             // **A daemon is the node nobody is watching, so it has to say
                             // things out loud** — unreachable peers, refused publishes,
