@@ -686,104 +686,70 @@ fn spawn_stream_loop(
 /// Accept connections and their streams forever, forwarding to the actor the ones
 /// that need channel state. The board is served inside `accept_stream`.
 ///
-/// **Each connection's handshake runs on its own task** (M17.17). This loop used to call
-/// `accept`, which performs the TLS handshake inline, so the loop serialised on handshakes:
-/// one peer that opened a connection and then stalled its handshake blocked **every** other
-/// inbound connection — with no credential at all, because authentication had not happened
-/// yet. A pre-authentication denial of service, and worst against the node most likely to be
-/// always-on and public, which is an anchor. The loop's own comment claimed a slow peer could
-/// not stall the others; that was true only of the stream loop, after the handshake.
-/// The node's inbound accept loop.
+/// **Each connection's handshake runs on its own task, bounded, and the accept loop
+/// never waits for one.** Phase two (`finish_incoming`: the TLS handshake and admission,
+/// itself bounded at `HANDSHAKE_TIMEOUT`) is spawned per attempt, which is quinn's own
+/// documented shape — `finish_incoming` says "Spawn this; do not await it in an accept
+/// loop".
 ///
-/// **This performs each handshake inline, and that is a known denial-of-service gap**
-/// (finding #3): one peer that opens a connection and then stalls its TLS handshake blocks
-/// every other inbound connection, with no credential of any kind, because authentication
-/// has not happened yet. It matters most for an always-on node, which is what an anchor is.
+/// # What awaiting it inline cost
+/// Until v0.2.8 this loop awaited phase two, so it handled one handshake at a time. Two
+/// consequences, both measured:
 ///
-/// The two-phase API that fixes it exists and is tested — [`ConnectionManager::accept_incoming`]
-/// and [`ConnectionManager::finish_incoming`], the handshake bounded at 30 seconds — but it is
-/// **deliberately not wired in here yet.** Spawning phase two per attempt makes
-/// `m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor` and
-/// `m16_a_tcp_service_is_reached_across_the_overlay_between_two_nated_clients` time out, while
-/// `m15_members_never_online_together_converge_through_the_anchor` keeps passing. Measured, not
-/// suspected: serialising this loop again and changing nothing else turns both back green, and
-/// clean upstream passes all three in 40s.
+/// - **A pre-authentication denial of service.** One peer that opened a connection and
+///   stalled its handshake blocked every other inbound connection for up to 30s, with no
+///   credential of any kind. Worst against an anchor, the node most likely to be public.
+/// - **The same stall with no attacker at all.** `vox connect` exits the moment it has
+///   joined, which leaves the host mid-handshake, so a second person joining right after
+///   the first was locked out for 30s. `order4.sh` (a host and two back-to-back joiners)
+///   locked the second joiner out 5 of 5 on a quiet box, and the stranger's join in
+///   `service_rehearsal_proof` failed the same way.
 ///
-/// The two that break both carry a **relayed circuit** between peers behind symmetric NATs,
-/// where no punch is possible; the one that survives converges through the anchor without a
-/// live circuit. So something in circuit establishment depends on the ordering this loop
-/// currently imposes, and the mechanism is not yet understood.
+/// # Why it stayed inline so long
+/// ADR-017 recorded the split as tried and reverted: `m15_two_clients_behind_symmetric_
+/// nats…` timed out at 247s with it and passed serialised. That 247s was **not** the split.
+/// It was sync starvation — a room's in-flight mark let a failing anchor session take the
+/// room first every round, so the direct member session never ran — and it hit the
+/// serialised loop too, in 9 of ~15 CI runs on `main`. The evidence against the split was
+/// a different defect with the same signature.
 ///
-/// Shipping the split would trade a pre-authentication DoS for an overlay that cannot form a
-/// swarm through an anchor, which is a worse product. The ordering is deliberate: an
-/// authorization bypass outranks a DoS, and a DoS outranks not working. Those two NAT gates are
-/// now the acceptance test for the real fix.
+/// With that fixed (the owed-room change in `run_due_syncs`) the split exposed one real
+/// dependency on the serial order, and it was not in this loop: `ConnectionManager`'s
+/// duplicate tie-break was "the held connection wins", which the two ends of a pair only
+/// agree on if they file the pair in the same order. Concurrent handshakes broke that, and a
+/// node could be left holding a connection its peer had closed (see `tie_key` in
+/// `node::net`). Measured with both ends logging each connection's exporter tag: 2 of 5
+/// duplicate pairs disagreed before the tie-break became order-independent, 0 of 28 after.
+///
+/// # The bound, and what a flood costs
+/// At most [`HANDSHAKES_IN_FLIGHT`] handshakes run at once. At the cap an attempt is never
+/// queued — queueing would put the wait back into this loop:
+///
+/// - an attempt whose source address is **not yet validated** gets `retry()`, a QUIC Retry
+///   packet that makes the client prove it can receive at the address it claims before
+///   anything is allocated. A spoofed flood cannot answer one; a real peer pays one round
+///   trip. Before this, one spoofed packet cost an attacker a packet and cost the node a
+///   handshake slot.
+/// - an attempt that **is** validated gets `refuse()`, because for a peer that has proven
+///   itself the honest answer is "not now", not another round trip.
+///
+/// **Residual, stated rather than implied:** 64 *validated* handshakes that stall still
+/// deny service for up to `HANDSHAKE_TIMEOUT` each. Bounded, and far better than a single
+/// slot, but not nothing.
 fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     tokio::spawn(async move {
-        // **Experiment scaffolding, to be removed once ADR-017's open gap is settled.**
-        //
-        // `VOX_SPLIT_ACCEPT=1` runs phase two on its own task instead of inline. Both
-        // shapes exist in one binary **on purpose**: the measurement that reverted the
-        // split compared runs taken at different times, and the whole question is whether
-        // the 68s/140s/247s spread belongs to the split or to a flaky long tail. One
-        // binary lets the arms be interleaved A/B/A/B in a single window, which is the
-        // only way to control for the box drifting underneath — this machine has carried
-        // 324 orphaned processes and a wedged compiler cache in one evening.
-        //
-        // Whichever arm wins, this switch goes and the loser's code goes with it. A
-        // permanent environment variable choosing between two security-relevant shapes is
-        // a configuration bug waiting to happen.
-        let split = std::env::var("VOX_SPLIT_ACCEPT").is_ok_and(|v| v == "1");
-        // Bounded, because "spawn per connection" without a ceiling is the DoS the
-        // serialised loop was protecting against by accident. At the cap an attempt is
-        // **refused**, not queued: queueing would put the wait back in the accept path and
-        // reintroduce exactly the stall being removed.
         let gate = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_IN_FLIGHT));
         loop {
             let Some(incoming) = net.manager().accept_incoming().await else {
                 break;
             };
-            if !split {
-                // **Awaited here, not spawned — ADR-017's recorded decision.** Spawning phase
-                // two is quinn's own documented shape (`finish_incoming` says "Spawn this; do
-                // not await it in an accept loop") and removes a 30s serialisation window, but
-                // ADR-017 "Open proof gap" records it measured: serialised 40-52s consistently
-                // green on `m15_two_clients_behind_symmetric_nats`, split 68s, 140s and a
-                // timeout at 247s. The unbounded case is gone either way: `finish_incoming`
-                // bounds the handshake at `HANDSHAKE_TIMEOUT`.
-                if let Some(filed) = finish_one(&net, incoming).await {
-                    if !serve_filed(&net, &tx, filed).await {
-                        break;
-                    }
-                }
-                continue;
-            }
             let Ok(permit) = Arc::clone(&gate).try_acquire_owned() else {
-                // **At capacity, and what we do here decides what a flood costs.**
-                //
-                // This codebase has never used quinn's address-validation tools —
-                // `retry`, `refuse`, `ignore` and `remote_address_validated` appear
-                // nowhere else — so today a spoofed source address costs an attacker one
-                // packet and costs us a whole handshake slot. Refusing at the cap keeps
-                // that property: 64 spoofed packets and every real peer is turned away.
-                //
-                // `retry` sends a Retry packet, which makes the client prove it can
-                // receive at the address it claims before we allocate anything. A spoofed
-                // flood cannot answer one; a real peer pays a single round trip. So the
-                // cost inverts, using quinn's own anti-amplification mechanism rather
-                // than something invented here.
-                //
-                // An already-validated peer gets `refuse` instead, because for them the
-                // honest answer is "not now" rather than another round trip.
-                //
-                // **The residual, stated rather than implied:** 64 *validated* handshakes
-                // that stall still deny service for up to `HANDSHAKE_TIMEOUT` each. That
-                // is bounded and far better than a single slot, and it is not nothing.
                 if incoming.remote_address_validated() {
                     incoming.refuse();
-                } else if incoming.retry().is_err() {
-                    // Already a retried attempt; validating it again would loop.
-                    continue;
+                } else {
+                    // `Err` means this attempt is already a retried one; retrying it again
+                    // would loop, so it is simply dropped.
+                    let _ = incoming.retry();
                 }
                 continue;
             };
@@ -800,11 +766,11 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     });
 }
 
-/// How many inbound handshakes may run at once when the accept loop is split.
+/// How many inbound handshakes may run at once.
 ///
-/// The serialised loop's ceiling is one, which is the defect. This is the same bound in
-/// spirit as [`JOINS_IN_FLIGHT`]: enough that ordinary use never reaches it, small enough
-/// that an attacker cannot make a node hold unbounded state.
+/// Inline, the ceiling was one, which was the defect. This is the same bound in spirit as
+/// [`JOINS_IN_FLIGHT`]: enough that ordinary use never reaches it, small enough that an
+/// attacker cannot make a node hold unbounded state.
 const HANDSHAKES_IN_FLIGHT: usize = 64;
 
 /// Phase two for one connection: complete the handshake and admission, or drop it.
@@ -3709,6 +3675,10 @@ impl Node {
         let mut ran = false;
         // Which channels a local-append push actually got out. Everything else stays owed.
         let mut pushed: std::collections::BTreeSet<Digest32> = std::collections::BTreeSet::new();
+        // Rooms any peer was skipped for because they were mid-session. Added to `pending_push`
+        // only **after** the `retain` below — see there.
+        let mut owed_rooms: std::collections::BTreeSet<Digest32> =
+            std::collections::BTreeSet::new();
         for (peer, trigger) in due {
             if net.manager().existing(&peer).is_none() {
                 continue;
@@ -3717,6 +3687,9 @@ impl Node {
             // channels that changed; a connect or interval pass covers every channel
             // shared with this peer.
             let mut channels: Vec<Digest32> = Vec::new();
+            // Rooms this pass wanted with this peer but found **already mid-session**. See the
+            // `owed` handling after the loop: they are retried next tick, not forgotten.
+            let mut owed: Vec<Digest32> = Vec::new();
             // A member reconciles a channel with its co-authors — and with its
             // anchors, which keep the log for whoever is away (M15.2b).
             let peer_is_anchor = self.anchor_ids.contains(&peer);
@@ -3741,6 +3714,12 @@ impl Node {
             // is exactly the work a new connection warrants and would be waste on the interval.
             for (cid, shared) in &self.channels {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
+                    continue;
+                }
+                // Checked **before** the `is_author` lock below: a session holds this room's
+                // mutex for its whole run, so taking it here would park the actor behind it.
+                if self.syncing.contains(cid) {
+                    owed.push(*cid);
                     continue;
                 }
                 // **A fresh connection is never filtered out.**
@@ -3774,6 +3753,10 @@ impl Node {
                 if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
                     continue;
                 }
+                if self.syncing.contains(cid) {
+                    owed.push(*cid);
+                    continue;
+                }
                 // **An anchor does not filter out the member it is forwarding to.**
                 //
                 // `is_author` is the right question on an interval pass and the wrong one here, for
@@ -3803,6 +3786,28 @@ impl Node {
             }
             if let Some(schedule) = self.schedules.get_mut(&peer) {
                 schedule.note_synced(now);
+                // **A room skipped because it was mid-session is owed, not synced.**
+                //
+                // The in-flight mark is per room, so when two peers came due for one room in the
+                // same pass the first took it and the second was skipped — and `note_synced` above
+                // then recorded the skipped peer as synced at the same `now` as the first. Both came
+                // due together again, in the same `BTreeMap` order, and the same peer lost again:
+                // **aligned once, aligned forever.** A local append makes every peer due at once, so
+                // the alignment was the default after the first post, and which peer starved came
+                // down to how the fingerprints sorted.
+                //
+                // Measured in `node_m15_anchor_gate` (instrumented, by the other session): in every
+                // red, each member skipped the *other member* nine rounds running while its only
+                // session — with the anchor — failed each time, so the one leg that could carry the
+                // room never ran. Red about half the time in CI since before v0.2.5.
+                //
+                // Owed is not the unconditional retry the note on `pending_push` below warns
+                // against: nothing here takes a lock, and it is retried only while that room is
+                // mid-session, which is milliseconds. The next tick finds the room free.
+                if !owed.is_empty() {
+                    owed_rooms.extend(owed.iter().copied());
+                    schedule.note_local_append();
+                }
             }
         }
         // **Keep what did not go out.** This cleared unconditionally, which discarded the intent to
@@ -3821,6 +3826,16 @@ impl Node {
         // room's lock. Measured: that took the same proof from 4 of 6 to 3 of 8. The backoff must
         // hold on failure; what must survive is the work owed, which is this line.
         self.pending_push.retain(|cid| !pushed.contains(cid));
+        // **After** the retain, or it undoes this. The skip happens in exactly the pass where the
+        // room *was* pushed — to whichever peer took it first — so an owed room added inside the loop
+        // was then removed here as "pushed", and the skipped peer's retry next tick found nothing
+        // owed and dropped the push. It still arrived, on the next interval: up to 30s late instead
+        // of immediately, and invisible to any gate that only asks whether it arrived. Found in
+        // review by the other session.
+        //
+        // Known and not fixed here: `pushed` means a session *started*, not that it delivered, so a
+        // push to a peer whose session then fails is counted as done.
+        self.pending_push.extend(owed_rooms);
         ran
     }
 
@@ -3906,12 +3921,25 @@ impl Node {
                 SessionTarget::Anchored(state) => state.lock().await.epoch(),
             };
             // 2. Open the stream. Also a round trip.
+            //
+            // **A stream that will not open still reports.** This returned without a word, and the
+            // only thing that clears `syncing` is `SyncDone` — so one failed open left the room
+            // marked mid-session for good: every later sync of it skipped, every inbound one
+            // refused, and nothing said so. Every exit from this task now sends `SyncDone`.
             let handle = tokio::runtime::Handle::current();
-            let Ok(transport) =
-                crate::node::syncstream::open_sync(&conn, handle, &cid, epoch).await
-            else {
-                return;
-            };
+            let transport =
+                match crate::node::syncstream::open_sync(&conn, handle, &cid, epoch).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = tx
+                            .send(NetEvent::SyncDone {
+                                channel_id: cid,
+                                outcome: Err(e),
+                            })
+                            .await;
+                        return;
+                    }
+                };
             // 3. Run the session. `blocking_lock` is the sanctioned way to take a tokio mutex off a
             //    blocking thread; anything else wanting this room waits for the session rather than
             //    finding it missing.
@@ -3927,14 +3955,16 @@ impl Node {
                 }
             })
             .await;
-            if let Ok(outcome) = joined {
-                let _ = tx
-                    .send(NetEvent::SyncDone {
-                        channel_id: cid,
-                        outcome,
-                    })
-                    .await;
-            }
+            // A session that panicked still hands the room back: `Err` from the join is the panic.
+            let outcome = joined.unwrap_or(Err(crate::error::Error::MalformedGovernance(
+                "sync session panicked",
+            )));
+            let _ = tx
+                .send(NetEvent::SyncDone {
+                    channel_id: cid,
+                    outcome,
+                })
+                .await;
         });
         true
     }
@@ -3957,6 +3987,9 @@ impl Node {
             (None, Some(state)) => SessionTarget::Anchored(state),
             (None, None) => return,
         };
+        // Marked here, past both early returns above, so a session that never starts never
+        // leaves the room marked. Its caller used to mark it first.
+        self.syncing.insert(channel_id);
         let now = self.now();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
@@ -3975,14 +4008,15 @@ impl Node {
                 }
             })
             .await;
-            if let Ok(outcome) = joined {
-                let _ = tx
-                    .send(NetEvent::SyncDone {
-                        channel_id,
-                        outcome,
-                    })
-                    .await;
-            }
+            let outcome = joined.unwrap_or(Err(crate::error::Error::MalformedGovernance(
+                "sync session panicked",
+            )));
+            let _ = tx
+                .send(NetEvent::SyncDone {
+                    channel_id,
+                    outcome,
+                })
+                .await;
         });
     }
 
@@ -4028,6 +4062,22 @@ impl Node {
         recv: quinn::RecvStream,
     ) {
         use crate::node::syncstream::accept_sync;
+        // Answering while our own session holds this room is the other half of the deadlock.
+        //
+        // **Refused explicitly, not by dropping the streams.** Letting them drop leaves the peer
+        // reading for a frame that will never come until `SYNC_FRAME_TIMEOUT` expires — the
+        // silent refusal that reads as a hang, which is the shape of defect this whole change
+        // exists to remove. A reset reaches it on the next read, and its schedule brings it
+        // back in a second.
+        //
+        // **Refused before the lock, not after.** A session holds this room's mutex for its whole
+        // run, and this is the actor: awaiting that lock to read the epoch parked the whole node
+        // behind the very session this check exists to detect.
+        if self.syncing.contains(&channel_id) {
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream(&mut send, &mut recv);
+            return;
+        }
         // Only a channel we hold open at that epoch — or keep as an anchor — can be
         // reconciled. An anchor whose board just received the genesis adopts it here
         // rather than making the member wait for the next tick.
@@ -4047,20 +4097,7 @@ impl Node {
         if !matches_epoch {
             return;
         }
-        if self.syncing.contains(&channel_id) {
-            // Answering while our own session holds this room is the other half of the deadlock.
-            //
-            // **Refused explicitly, not by dropping the streams.** Letting them drop leaves the peer
-            // reading for a frame that will never come until `SYNC_FRAME_TIMEOUT` expires — the
-            // silent refusal that reads as a hang, which is the shape of defect this whole change
-            // exists to remove. A reset reaches it on the next read, and its schedule brings it
-            // back in a second.
-            let (mut send, mut recv) = (send, recv);
-            crate::node::net::refuse_stream(&mut send, &mut recv);
-            return;
-        }
         let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
-        self.syncing.insert(channel_id);
         self.start_session(channel_id, transport);
     }
 
