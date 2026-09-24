@@ -352,7 +352,32 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   replaces the held connection, and the displaced one is **retired**, not closed: kept open for
   `RETIRE_GRACE_SECS` (60 s) so whatever is in flight on it — a join exchange, a sync session with its
   20 s frame bound — finishes, then closed by the node's tick. A worse newcomer is closed as before, which
-  is also what settles a simultaneous dial. Both ends apply the same rule, so the upgrade lands with no
+  is also what settles a simultaneous dial. *(Amended 2026-09-25, v0.2.9 #6 — **a dead connection is
+  decided by silence, never by address**. On an equal path the survivor is the lower `tie_key` (16 bytes
+  of the TLS exporter, identical at both ends, v0.2.8), with one exception: a held connection that has
+  received nothing for `SILENCE_IS_DEATH` (1.5 × the 20 s keep-alive = 30 s) is dead, so a newcomer
+  replaces it and it is closed; and when the held connection crosses that line later, a retired
+  connection to the same peer that is still being heard from is promoted in its place — by the node's
+  tick (`tend_liveness`) or on the next lookup (`existing`). That second half is what a restart needs: the
+  restarted process's connection usually arrives while the old one has been silent only seconds, so it
+  goes to the tie-break and loses it half the time. Liveness is the count of datagrams quinn has routed
+  to the connection, sampled every tick. A live connection cannot cross the line: quinn re-arms its
+  keep-alive on every received packet, so each end of an idle live connection hears the other at most
+  about 20 s apart, and the 10 s margin covers a round trip, a lost PING and the 1 s tick. A dead one
+  cannot vote, so both ends agree without a protocol: the restarted end holds only the new connection.
+  An address rule — "a direct newcomer from a different address than the held one means the peer moved"
+  — was proposed and **withdrawn**: NAT rebinding under a live process gives a live duplicate a new
+  port that only the receiving end sees, so the two ends keep different connections; a restart on a
+  fixed port gives the same address; a restart onto another network a different one. Proved by
+  `a_restarted_host_is_reached_through_its_anchor` (a host crash-restarted three times on the same
+  address and three times on a new one, behind symmetric NATs, reached by a relayed client through the
+  anchor: in three runs, 18 of 18 restarts were reachable again within 33.7 s of the crash, the ones where
+  the new connection won the tie-break within 1–6 s; with the rule off, 4 of 6 restarts took 63.3–63.6 s,
+  QUIC's idle timeout, or never came back) and
+  `a_live_duplicate_is_decided_alike` (a member whose NAT rebinds dials the anchor twice: 0 of 24
+  trials disagree; with the address rule, 12 of 24). Residual: the datagram count is taken before
+  authentication, so an on-path attacker that knows a connection ID can keep a dead connection looking
+  alive — which returns the node to the 60 s idle timeout, no worse than before.)* Both ends apply the same rule, so the upgrade lands with no
   protocol: the side that punched files the direct connection as an improvement, and the side that
   accepted it does too. A circuit attempt abandoned because another rung won tears itself down on drop
   (its driver is aborted, the port detaches, the stream closes, and the relay and the far side let go).

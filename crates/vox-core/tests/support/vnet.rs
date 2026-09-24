@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
@@ -118,6 +119,7 @@ impl VirtualNet {
             addr,
             net: Arc::clone(self),
             inbox: Mutex::new(Inbox::default()),
+            severed: AtomicBool::new(false),
         });
         let mut g = self.lock();
         g.hosts.insert(addr, Arc::downgrade(&socket));
@@ -140,6 +142,50 @@ impl VirtualNet {
         if let Some(nat) = g.nats.get_mut(at) {
             nat.kind = kind;
         }
+    }
+
+    /// Cut `socket` off the network for good: nothing it sends is carried and nothing is
+    /// delivered to it. This is a **crashed process**, as the rest of the network sees one — its
+    /// last words (a QUIC close on shutdown) never leave the box, so every peer is left holding a
+    /// connection to something that is no longer there. A graceful shutdown would tell them, and
+    /// a restart test that let it would prove nothing about restarts.
+    pub fn sever(&self, socket: &VirtualSocket) {
+        socket.severed.store(true, Ordering::SeqCst);
+    }
+
+    /// A new socket at `addr`, where a severed one used to be — the same host coming back **on
+    /// the same address and port**, behind the same NAT if it had one. The NAT's mappings are
+    /// the NAT's, not the process's, so they survive: a peer sees the restarted process at
+    /// exactly the external address it saw the old one at. That is the case an address rule
+    /// gets wrong in the "same address, must be the old connection" direction.
+    #[must_use]
+    pub fn replug(self: &Arc<Self>, addr: SocketAddr) -> Arc<VirtualSocket> {
+        self.add(addr, None)
+    }
+
+    /// Make a host's NAT **rebind**: drop every mapping it holds for the host at inner address
+    /// `host`, so its next datagram to any destination leaves from a fresh external port, and
+    /// the old external ports route nowhere. What a home router does when a mapping times out or
+    /// the router reboots — the process behind it is alive throughout and never knows.
+    ///
+    /// Without this a symmetric mapping is keyed by (host, destination) for ever, so a live
+    /// process could never appear at a new port, and the case an address rule gets wrong in the
+    /// "new port, must be a new process" direction could not be staged. Returns how many
+    /// mappings were dropped, so a test can assert it staged something.
+    pub fn rebind(&self, host: SocketAddr) -> usize {
+        let mut g = self.lock();
+        let dropped: Vec<SocketAddr> = g
+            .mappings
+            .iter()
+            .filter(|((_, inner, _), _)| *inner == host)
+            .map(|(_, ext)| *ext)
+            .collect();
+        g.mappings.retain(|(_, inner, _), _| *inner != host);
+        for ext in &dropped {
+            g.external.remove(ext);
+        }
+        g.filters.retain(|(ext, _)| !dropped.contains(ext));
+        dropped.len()
     }
 
     /// How many datagrams a NAT has dropped for want of a mapping or filter. A
@@ -184,6 +230,9 @@ impl VirtualNet {
         };
         // The waker runs outside the network lock: a woken task may send immediately.
         if let Some((socket, src)) = delivery {
+            if socket.severed.load(Ordering::SeqCst) {
+                return; // a crashed process receives nothing
+            }
             let waker = {
                 let mut inbox = socket.inbox.lock().expect("inbox mutex");
                 inbox.queue.push_back((src, payload.to_vec()));
@@ -275,6 +324,8 @@ pub struct VirtualSocket {
     addr: SocketAddr,
     net: Arc<VirtualNet>,
     inbox: Mutex<Inbox>,
+    /// Set by [`VirtualNet::sever`]: the process behind this socket has crashed.
+    severed: AtomicBool,
 }
 
 impl std::fmt::Debug for VirtualSocket {
@@ -300,6 +351,9 @@ impl AsyncUdpSocket for VirtualSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        if self.severed.load(Ordering::SeqCst) {
+            return Ok(()); // a crashed process's last words never leave the box
+        }
         // `max_transmit_segments` is 1, so quinn never batches; a segmented transmit
         // is still split rather than silently sent as one oversized datagram.
         match transmit.segment_size {
