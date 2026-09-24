@@ -12,11 +12,10 @@
 //!   local path (`NewEntry`) and the synced path (`Synced`, which carries no row) are
 //!   exercised, the second being the one `tail` used to drop entirely.
 //!
-//!   Not 2,000 as ADR-021 first planned, and the reason is a defect, not a choice:
-//!   **a member's posts fail with `Failed(Internal)` from its ~1,000th message in a
-//!   room onward** (ADR-021 open defect F14, reproduced on one node with no network —
-//!   posts 0–998 succeed, 999–1099 all fail). 900 per member stays below it. When
-//!   F14 is fixed this burst goes back to 2,000;
+//!   Not 2,000 as ADR-021 first planned: ADR-008's per-author quota admits at most
+//!   1,000 entries per member per sliding hour (`log/quota.rs`), and refuses the rest —
+//!   reported, wrongly, as `Failed(Internal)`, which is ADR-021 open defect F14. 900 per
+//!   member stays under the quota with room for the set-up entries;
 //! - a consumer that **stops reading its pipe** while all 900 of bob's own appends
 //!   land — about twice what the node's 256-event buffer plus the pipe and socket
 //!   buffers hold — so it is told it lagged; and the proof fails if that never
