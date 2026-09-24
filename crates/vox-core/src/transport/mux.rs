@@ -116,6 +116,9 @@ pub struct MuxSocket {
     /// Which address each peer's live circuit stands at. The addresses are random, so
     /// this is the only way to get from a peer to its circuit.
     by_peer: Mutex<HashMap<Digest32, SocketAddr>>,
+    /// Which relay carries each circuit, by its address, when the caller said
+    /// ([`MuxSocket::attach_via`]) — for `vox status`, which names the relay.
+    relays: Mutex<HashMap<SocketAddr, Digest32>>,
     inbox: Mutex<Inbox>,
 }
 
@@ -201,6 +204,7 @@ impl MuxSocket {
             inner,
             circuits: Mutex::new(HashMap::new()),
             by_peer: Mutex::new(HashMap::new()),
+            relays: Mutex::new(HashMap::new()),
             inbox: Mutex::new(Inbox::default()),
         })
     }
@@ -261,7 +265,35 @@ impl MuxSocket {
         self.circuits().len()
     }
 
+    /// [`MuxSocket::attach`], recording that `relay` carries the circuit.
+    ///
+    /// # Errors
+    /// As [`MuxSocket::attach`].
+    pub fn attach_via(self: &Arc<Self>, peer: &Digest32, relay: &Digest32) -> Result<CircuitPort> {
+        let port = self.attach(peer)?;
+        self.relays
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(port.addr(), *relay);
+        Ok(port)
+    }
+
+    /// The relay carrying `peer`'s live circuit, if it has one and it was recorded.
+    #[must_use]
+    pub fn circuit_relay_of(&self, peer: &Digest32) -> Option<Digest32> {
+        let addr = self.circuit_addr_of(peer)?;
+        self.relays
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&addr)
+            .copied()
+    }
+
     fn detach(&self, addr: SocketAddr) {
+        self.relays
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&addr);
         self.circuits().remove(&addr);
         self.by_peer().retain(|_, a| *a != addr);
     }

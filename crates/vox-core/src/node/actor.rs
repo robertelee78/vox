@@ -209,6 +209,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped => "shutting the network down",
         NetEvent::AppDial(_) => "reaching a peer for an app stream",
+        NetEvent::Status(_) => "reporting status",
     }
 }
 
@@ -402,6 +403,9 @@ enum NetEvent {
     /// A program asked, through the app API, to open an app stream to `peer`: reach it
     /// through the ladder and hand the connection back (ADR-022 decision 7).
     AppDial(crate::node::app::AppDial),
+    /// `vox status` or the metrics endpoint asked what this node is doing (PRD-001 R35,
+    /// R38): read state, answer, change nothing.
+    Status(oneshot::Sender<crate::node::status::StatusReport>),
     /// The ladder's publish side finished: this node now knows what to advertise, and
     /// which mappings a gateway granted (each of which will need renewing).
     AddressesDiscovered {
@@ -951,6 +955,8 @@ pub struct NodeHandle {
     events: Arc<Mutex<broadcast::Receiver<NodeEvent>>>,
     /// The app layer (ADR-022 decision 7).
     app: Arc<crate::node::app::AppHub>,
+    /// Where status requests go (PRD-001 R35).
+    status_tx: mpsc::Sender<oneshot::Sender<crate::node::status::StatusReport>>,
 }
 
 impl NodeHandle {
@@ -959,6 +965,21 @@ impl NodeHandle {
     #[must_use]
     pub fn app(&self) -> &Arc<crate::node::app::AppHub> {
         &self.app
+    }
+
+    /// What the node is doing and whether it is well (PRD-001 R35): rooms, peers and
+    /// their paths, tunnels, datagram and app counters, and what needs attention.
+    ///
+    /// # Errors
+    /// If the node has stopped.
+    pub async fn status(&self) -> crate::error::Result<crate::node::status::StatusReport> {
+        let (tx, rx) = oneshot::channel();
+        self.status_tx
+            .send(tx)
+            .await
+            .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?;
+        rx.await
+            .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))
     }
 
     /// The latest view (cheap clone of the watch value).
@@ -1237,6 +1258,8 @@ pub struct Node {
     reachers: std::collections::BTreeMap<Digest32, crate::node::tunnel::Reachers>,
     /// The app layer (ADR-022 decision 7), shared with every [`NodeHandle`].
     app: Arc<crate::node::app::AppHub>,
+    /// What `vox status` keeps beside the node's own state (PRD-001 R35).
+    status: crate::node::status::StatusBook,
 }
 
 impl Node {
@@ -1357,6 +1380,7 @@ impl Node {
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
             app: Arc::new(crate::node::app::AppHub::default()),
+            status: crate::node::status::StatusBook::default(),
         };
         // The app layer asks the actor for connections through its own queue, forwarded
         // onto the network queue so they are served in order with everything else.
@@ -1373,6 +1397,19 @@ impl Node {
             });
         }
         let app = Arc::clone(&node.app);
+        // Status requests take the same road as app dials: onto the network queue, so
+        // they are answered in order with everything else and never race a mutation.
+        let (status_tx, mut status_rx) = mpsc::channel::<oneshot::Sender<_>>(COMMAND_QUEUE);
+        {
+            let net_tx = node.net_tx.clone();
+            tokio::spawn(async move {
+                while let Some(reply) = status_rx.recv().await {
+                    if net_tx.send(NetEvent::Status(reply)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
         let view_rx = node.view_tx.subscribe();
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
@@ -1393,6 +1430,7 @@ impl Node {
             event_tx: handle_event_tx,
             events: Arc::new(Mutex::new(event_rx)),
             app,
+            status_tx,
         })
     }
 
@@ -1436,6 +1474,7 @@ impl Node {
                         // grace is up (M15.1b).
                         net.manager().retire_expired();
                     }
+                    self.note_peers_seen();
                     self.retry_upgrades_if_due().await;
                     self.renew_mappings_if_due();
                     self.adopt_anchored_from_board().await;
@@ -2400,6 +2439,10 @@ impl Node {
             } => {
                 self.syncing.remove(&channel_id);
                 self.refresh_network_view().await;
+                if outcome.is_ok() {
+                    let now = self.now();
+                    self.status.room_synced.insert(channel_id, now);
+                }
                 if let Ok(o) = outcome {
                     // **Event, not interval.** Propagation was event-driven in one direction only:
                     // an append here pushed at once, but a sync that *brought entries in* marked
@@ -2434,6 +2477,9 @@ impl Node {
                         });
                     }
                 }
+            }
+            NetEvent::Status(reply) => {
+                let _ = reply.send(self.status_report());
             }
             NetEvent::AppDial(crate::node::app::AppDial {
                 channel_id,
@@ -2479,15 +2525,47 @@ impl Node {
                         // The host is told who reached what, because the carried
                         // service only ever sees loopback (ADR-017 decision 6).
                         let events = self.event_tx.clone();
+                        // `vox status` lists the tunnel while it is served: the report
+                        // arrives on a private channel, is filed, and is passed on.
+                        let guard = self.status.tunnel();
+                        let (served_tx, mut served_rx) = broadcast::channel(4);
+                        let clock = Arc::clone(&self.clock);
                         tokio::spawn(async move {
-                            let _ = crate::node::tunnel::serve_reporting(
+                            let serving = crate::node::tunnel::serve_reporting(
                                 peer,
                                 send,
                                 recv,
                                 snapshot,
-                                Some(events),
-                            )
-                            .await;
+                                Some(served_tx),
+                            );
+                            tokio::pin!(serving);
+                            loop {
+                                tokio::select! {
+                                    _ = &mut serving => break,
+                                    ev = served_rx.recv() => {
+                                        let Ok(ev) = ev else { continue };
+                                        if let NodeEvent::TunnelServed {
+                                            channel_id,
+                                            client,
+                                            service_tag,
+                                        } = &ev
+                                        {
+                                            guard.serving(crate::node::status::ServedTunnel {
+                                                client: *client,
+                                                channel_id: *channel_id,
+                                                service_tag: service_tag.clone(),
+                                                since: clock(),
+                                            });
+                                        }
+                                        let _ = events.send(ev);
+                                    }
+                                }
+                            }
+                            // A report that raced the end is still passed on.
+                            while let Ok(ev) = served_rx.try_recv() {
+                                let _ = events.send(ev);
+                            }
+                            drop(guard);
                         });
                     }
                     Inbound::App { peer, send, recv } => {
@@ -4910,6 +4988,108 @@ impl Node {
             );
         }
         out
+    }
+
+    /// File every peer this node is connected to as seen now, for `vox status`'s
+    /// last-seen column and its unreachable flag.
+    fn note_peers_seen(&mut self) {
+        let Some(net) = self.net.as_ref() else { return };
+        let now = self.now();
+        for peer in net.manager().peers() {
+            self.status.last_seen.insert(peer, now);
+        }
+    }
+
+    /// The status report (PRD-001 R35): read from the published view, the connection
+    /// manager, the sync schedules, the app layer and the ledgers in [`StatusBook`],
+    /// changing none of them.
+    ///
+    /// [`StatusBook`]: crate::node::status::StatusBook
+    fn status_report(&mut self) -> crate::node::status::StatusReport {
+        use crate::node::status::{
+            add_stats, DialedTunnel, MemberStatus, PeerStatus, RoomStatus, StatusReport,
+        };
+        self.note_peers_seen();
+        let now = self.now();
+        let view = self.view_tx.borrow().clone();
+        let me = view.identity.as_ref().map(|i| i.fingerprint);
+        let trusted: std::collections::BTreeSet<Digest32> =
+            view.trusted.iter().map(|(fp, _)| *fp).collect();
+        let connected: std::collections::BTreeSet<Digest32> = self
+            .net
+            .as_ref()
+            .map(|n| n.manager().peers().into_iter().collect())
+            .unwrap_or_default();
+        let mut report = StatusReport {
+            now,
+            identity: me,
+            networked: self.net.is_some(),
+            listening: view.listening.clone(),
+            relaying: view.relaying,
+            app: self.app.stats(),
+            ..StatusReport::default()
+        };
+        for room in &view.open_channels {
+            let members = room
+                .members
+                .iter()
+                .map(|m| MemberStatus {
+                    id: *m,
+                    me: Some(*m) == me,
+                    trusted: trusted.contains(m),
+                    connected: connected.contains(m),
+                    last_seen: self.status.last_seen.get(m).copied(),
+                    last_sync: self
+                        .schedules
+                        .get(m)
+                        .map(SyncSchedule::last_sync)
+                        .filter(|t| *t > 0),
+                })
+                .collect();
+            report.rooms.push(RoomStatus {
+                id: room.channel_id,
+                name: room.local_name.clone(),
+                epoch: room.epoch,
+                last_sync: self.status.room_synced.get(&room.channel_id).copied(),
+                members,
+            });
+        }
+        if let Some(net) = self.net.as_ref() {
+            let endpoint = net.manager().endpoint();
+            for peer in &connected {
+                let Some(conn) = net.manager().existing(peer) else {
+                    continue;
+                };
+                let relayed = crate::node::net::path_class(endpoint, &conn)
+                    == crate::node::net::PathClass::Relayed;
+                let datagrams = conn.datagram_stats();
+                add_stats(&mut report.datagrams, &datagrams);
+                report.peers.push(PeerStatus {
+                    id: *peer,
+                    path: if relayed { "relayed" } else { "direct" },
+                    relay: if relayed {
+                        endpoint.circuit_relay_of(peer)
+                    } else {
+                        None
+                    },
+                    rtt_ms: u64::try_from(conn.quinn().rtt().as_millis()).unwrap_or(u64::MAX),
+                    datagrams,
+                });
+            }
+        }
+        report.tunnels_served = self.status.served_now();
+        report.tunnels_dialed = view
+            .forwards
+            .iter()
+            .map(|f| DialedTunnel {
+                channel_id: f.channel_id,
+                host: f.host,
+                service_tag: f.service_tag.clone(),
+                local: f.local,
+            })
+            .collect();
+        report.diagnose();
+        report
     }
 
     /// Recompute every channel's live reacher set in place.
