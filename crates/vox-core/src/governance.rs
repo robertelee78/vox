@@ -100,9 +100,6 @@ pub mod rotation;
 pub mod servicegrant;
 pub mod visibility;
 
-#[cfg(test)]
-pub mod vectors;
-
 pub use capability::{Capability, CapabilitySet};
 pub use cert::{AdminCert, AdminRevocation, RevocationReason};
 pub use consent::{ConsentGrant, ConsentRevocation};

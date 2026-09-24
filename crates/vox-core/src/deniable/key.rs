@@ -61,13 +61,6 @@ impl EpochKey {
         Ok(Self { bytes: okm })
     }
 
-    /// Whether two epoch keys are byte-equal (test/diagnostic).
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn equals(&self, other: &EpochKey) -> bool {
-        self.bytes == other.bytes
-    }
-
     /// Derive the confirmation sub-key `K_confirm = HKDF(K, info=confirm-label ‖
     /// channelID ‖ epoch)`. Separating the confirmation key from `K` ensures the
     /// confirmation MAC never leaks `K` (standard AKE key-confirmation hygiene).

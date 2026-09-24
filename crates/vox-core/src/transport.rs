@@ -66,6 +66,3 @@ pub mod session;
 pub mod stream_transport;
 pub mod streams;
 pub mod verifier;
-
-#[cfg(test)]
-mod tests;

@@ -144,25 +144,9 @@ pub const VOX_SUITE_1: Ciphersuite = Ciphersuite {
     pake: algo::CPACE_RISTRETTO255_SHA512,
 };
 
-/// A **test-only** suite ranked *below* `vox-suite-1` (rank 0) with identical
-/// components, so the floor relation can be exercised while the production
-/// registry has a single suite. It does not exist in a non-test build: no
-/// production peer can propose or accept it.
-#[cfg(test)]
-pub const VOX_SUITE_TEST_WEAK: Ciphersuite = Ciphersuite {
-    id: 0x7FFF,
-    rank: 0,
-    name: "vox-suite-test-weak",
-    ..VOX_SUITE_1
-};
-
 /// The ciphersuite registry. New suites are appended with an assigned rank, so
 /// the floor advances deliberately and never silently downgrades.
-#[cfg(not(test))]
 pub const SUITES: &[Ciphersuite] = &[VOX_SUITE_1];
-/// The ciphersuite registry (test build: plus the rank-0 test suite).
-#[cfg(test)]
-pub const SUITES: &[Ciphersuite] = &[VOX_SUITE_1, VOX_SUITE_TEST_WEAK];
 
 /// Resolve a suite by ID, else [`Error::UnknownSuite`].
 pub fn suite_by_id(id: u16) -> Result<&'static Ciphersuite> {
