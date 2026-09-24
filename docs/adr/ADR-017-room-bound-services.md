@@ -1299,6 +1299,22 @@ depended on M17.7 and shipped with it. M17.8 is independent of all of it.
 
 ## Open proof gap: the residual 30-second serialisation is unproven
 
+> **CLOSED 2026-09-24 (v0.2.8).** `spawn_accept_loop` now spawns each handshake on its own task,
+> bounded at `HANDSHAKES_IN_FLIGHT` (64); at the cap an unvalidated attempt gets a QUIC `retry()` and
+> a validated one `refuse()`, never a queue. The revert recorded below was taken on evidence that
+> belonged to a different defect: the 247s `m15_two_clients…` timeout was sync starvation (a room's
+> in-flight mark let a failing anchor session take the room every round), which also hit the serial
+> loop in 9 of ~15 CI runs on `main`. With that fixed, the split exposed the one real dependency on
+> the serial order — and it was not in the accept loop but in `ConnectionManager`'s duplicate
+> tie-break, "the held connection wins", which two ends agree on only if they file a pair in the same
+> order. It is now an order-independent TLS-exporter key (`tie_key`). Measured with both ends logging
+> each connection's exporter tag: 2 of 5 duplicate pairs disagreed before, 0 of 28 after.
+>
+> Acceptance, real binaries and the release proofs: `order4.sh` (a host and two back-to-back
+> joiners) J2 in 5/5, against 0/5 on pristine `main`; `service_rehearsal_proof` 3/3, back in the
+> blocking gate; `node_m15_anchor_gate` whole binary 6/6 runs (18/18 tests); `node_m14_gate` 3/3.
+> The text below is kept as the record of how it was reached.
+
 **M17.17 (verified finding #3) is PARTLY fixed and the remainder is NOT proved.** Recorded here rather than left
 implied, because ADR-018 §4 is explicit that absent evidence must not read as success — and because a
 green test that does not discriminate is worse than no test.

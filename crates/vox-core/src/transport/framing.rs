@@ -18,10 +18,10 @@ pub async fn write_frame(send: &mut SendStream, frame: &[u8]) -> Result<()> {
         .map_err(|_| Error::SizeLimitExceeded("quic stream frame length"))?;
     send.write_all(&len.to_be_bytes())
         .await
-        .map_err(|_| Error::MalformedBundle("quic stream write len"))?;
+        .map_err(|_| Error::Unreachable("quic stream: closed before the frame was written"))?;
     send.write_all(frame)
         .await
-        .map_err(|_| Error::MalformedBundle("quic stream write body"))?;
+        .map_err(|_| Error::Unreachable("quic stream: closed before the frame was written"))?;
     Ok(())
 }
 
@@ -56,7 +56,7 @@ pub async fn read_frame_within(
     match tokio::time::timeout(patience, recv.read_exact(&mut len_buf)).await {
         Ok(Ok(())) => {}
         Ok(Err(quinn::ReadExactError::FinishedEarly(0))) => return Ok(None),
-        Ok(Err(_)) => return Err(Error::MalformedBundle("quic stream read len")),
+        Ok(Err(_)) => return Err(Error::Unreachable("quic stream: closed by the peer")),
         Err(_) => {
             return Err(Error::Unreachable(
                 "quic stream: peer sent no frame in time",
@@ -70,7 +70,7 @@ pub async fn read_frame_within(
     let mut body = vec![0u8; len];
     match tokio::time::timeout(patience, recv.read_exact(&mut body)).await {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => return Err(Error::MalformedBundle("quic stream read body")),
+        Ok(Err(_)) => return Err(Error::Unreachable("quic stream: closed by the peer")),
         Err(_) => {
             return Err(Error::Unreachable(
                 "quic stream: peer stopped partway through a frame",
