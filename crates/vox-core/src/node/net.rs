@@ -382,12 +382,11 @@ impl ConnectionManager {
     ///   is relayed — **replaces** it, and the old one is retired: kept open for
     ///   [`RETIRE_GRACE_SECS`], and beyond it for as long as anything is still carried on
     ///   it, so a tunnel that took the old path is not cut when a better one appears;
-    /// - so does a direct newcomer from the **same IP on a different port** than the held
-    ///   direct connection: the peer restarted (a new process, a new socket), and the held one
-    ///   is the stale one (PRD-001 R24);
-    /// - otherwise, on an **equal** path, the one with the lower [`tie_key`] is kept and the
-    ///   other is the loser (a simultaneous dial from both sides, or two dials from one side,
-    ///   lands here).
+    /// - on an **equal** path, the one with the lower [`tie_key`] is kept and the other is
+    ///   the loser (a simultaneous dial from both sides, or two dials from one side, lands
+    ///   here). A restarted peer is a *liveness* question, not a tie-break — addresses are not
+    ///   evidence of a restart (a NAT rebinding a live process's port looks the same) — and is
+    ///   not decided here.
     ///
     /// Both ends apply the same rule, which is what lets an upgrade land without a
     /// protocol: the side that punched files the direct connection as an improvement,
@@ -442,31 +441,12 @@ impl ConnectionManager {
         if let Some(existing) = map.get(&peer) {
             if is_live(existing) {
                 let existing = Arc::clone(existing);
-                // **A peer that turns up from the same IP on a different port has restarted**
-                // (PRD-001 R24): a new process has a new socket and a new ephemeral port, and the
-                // connection held for it is about to go quiet. Keeping the held one meant an anchor
-                // asked to relay to a just-restarted host kept the dead connection until the 60s
-                // idle timeout, retired the live one, and the relay "could not reach the peer" for
-                // minutes. Narrower than "any different address" on purpose: one live process that
-                // reaches this node over two routes (loopback and LAN) arrives from two *IPs*, and
-                // calling that a move would have this end keep one connection while the other end,
-                // deciding by `tie_key`, keeps the other — the mismatch `tie_key` exists to prevent.
-                // Two dials from one live process share its socket, so its port.
                 let (new_class, held_class) = (
                     path_class(&self.endpoint, &conn),
                     path_class(&self.endpoint, &existing),
                 );
-                let (new_addr, held_addr) = (
-                    conn.quinn().remote_address(),
-                    existing.quinn().remote_address(),
-                );
-                let restarted = new_class == PathClass::Direct
-                    && held_class == PathClass::Direct
-                    && new_addr.ip() == held_addr.ip()
-                    && new_addr.port() != held_addr.port();
-                let newcomer_loses = !restarted
-                    && (new_class < held_class
-                        || (new_class == held_class && tie_key(&conn) >= tie_key(&existing)));
+                let newcomer_loses = new_class < held_class
+                    || (new_class == held_class && tie_key(&conn) >= tie_key(&existing));
                 if newcomer_loses {
                     drop(map);
                     if !serve_loser {
