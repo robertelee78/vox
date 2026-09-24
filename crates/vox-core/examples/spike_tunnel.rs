@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use vox_core::governance::evaluator::Evaluator;
-use vox_core::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+use vox_core::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use vox_core::hash::Digest32;
 use vox_core::identity::composite::SoftwareRootSigner;
 use vox_core::transport::quic::VoxEndpoint;
@@ -50,7 +50,6 @@ fn parse_id(s: &str) -> Digest32 {
 fn policy() -> ChannelPolicy {
     ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
-        deniability_mode: DeniabilityMode::Attributable,
         ttl: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     }

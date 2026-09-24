@@ -154,6 +154,9 @@ const T_INVITE: u64 = 13;
 const T_TRUST: u64 = 14;
 const T_UNTRUST: u64 = 15;
 const T_TRUST_LIST: u64 = 16;
+// Setting a room's retention deletes what is already stored (ADR-023 decision 2), so it is an
+// operator decision like the keyring and carries the identity passphrase the same way.
+const T_RETENTION: u64 = 23;
 
 /// What a client sends.
 ///
@@ -261,6 +264,16 @@ pub enum Request {
         target: Digest32,
         /// The petname to file it under.
         petname: String,
+        /// The identity passphrase, proving this is the operator and not an agent.
+        identity_passphrase: String,
+    },
+    /// Set a room's retention (ADR-023 decision 2). Requires the identity passphrase:
+    /// shortening it deletes stored history, which is not an agent's call.
+    SetRetention {
+        /// The room.
+        channel_id: Digest32,
+        /// Seconds a message body is kept; `0` keeps it forever.
+        ttl: u64,
         /// The identity passphrase, proving this is the operator and not an agent.
         identity_passphrase: String,
     },
@@ -389,6 +402,17 @@ impl Request {
                     .text(petname)
                     .text(identity_passphrase);
             }
+            Request::SetRetention {
+                channel_id,
+                ttl,
+                identity_passphrase,
+            } => {
+                e.array(4)
+                    .uint(T_RETENTION)
+                    .bytes(channel_id)
+                    .uint(*ttl)
+                    .text(identity_passphrase);
+            }
             Request::Untrust {
                 target,
                 identity_passphrase,
@@ -489,6 +513,18 @@ impl Request {
                 Ok(Request::Trust {
                     target,
                     petname,
+                    identity_passphrase,
+                })
+            }
+            (T_RETENTION, 4) => {
+                let channel_id = digest(&mut d)?;
+                let ttl = d.uint().map_err(|_| Error::MalformedBundle("ipc ttl"))?;
+                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::SetRetention {
+                    channel_id,
+                    ttl,
                     identity_passphrase,
                 })
             }
@@ -1399,6 +1435,22 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     fingerprint: target,
                     petname,
                 })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: format!("{other:?}"),
+                },
+            },
+        },
+        Request::SetRetention {
+            channel_id,
+            ttl,
+            identity_passphrase,
+        } => match verify_operator(handle, identity_passphrase).await {
+            Err(f) => f,
+            Ok(()) => match handle
+                .apply(crate::node::api::NodeCommand::SetRetention { channel_id, ttl })
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,

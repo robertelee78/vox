@@ -209,8 +209,6 @@ pub enum UiError {
     Unreachable,
     /// The channel epoch advanced (passphrase rotation); re-sync needed.
     EpochMismatch,
-    /// A per-author quota was exceeded.
-    QuotaExceeded,
     /// A member's key changed and must be re-verified before trust.
     KeyChanged,
     /// You have no consent from a member yet ("you'll see them once they consent").
@@ -252,7 +250,6 @@ impl UiError {
     pub fn from_wire_code(code: u8) -> Self {
         match code {
             0x05 => UiError::JoinProofMismatch,
-            0x06 => UiError::QuotaExceeded,
             0x07 => UiError::EpochMismatch,
             _ => UiError::Malformed,
         }
@@ -267,7 +264,6 @@ impl UiError {
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — both must be online (or run your node)",
             UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
-            UiError::QuotaExceeded => "rate/quota exceeded — try again shortly",
             UiError::KeyChanged => "a member's key changed — re-verify before trusting",
             UiError::MissingConsent => "you'll see this member once they consent to you",
             UiError::Malformed => "received a malformed entry (ignored)",
@@ -367,8 +363,6 @@ pub enum Command {
         local_name: String,
         /// The channel passphrase (out-of-band; redacted/zeroized).
         passphrase: SecretString,
-        /// Whether authorship is deniable (genesis-immutable; default attributable).
-        deniable: bool,
     },
     /// Join a channel from a `vox://` invite link plus the passphrase, which travels
     /// out of band and is deliberately **not** in the link (ADR-016).

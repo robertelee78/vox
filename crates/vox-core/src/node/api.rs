@@ -376,6 +376,15 @@ pub enum NodeCommand {
         /// The local address the forward is listening on.
         local: std::net::SocketAddr,
     },
+    /// Set a room's retention (PRD-001 R7, ADR-023 decision 2): `ttl` seconds, `0` for
+    /// forever, as an ADR-007 policy-update. Only the room's admin may; it applies to what is
+    /// already stored.
+    SetRetention {
+        /// The channel.
+        channel_id: Digest32,
+        /// Seconds a message body is kept; `0` keeps it forever.
+        ttl: u64,
+    },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).
     Sync {

@@ -33,7 +33,7 @@
 
 use vox_core::governance::capability::{Capability, CapabilitySet};
 use vox_core::governance::evaluator::{Evaluator, Verdict};
-use vox_core::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+use vox_core::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use vox_core::identity::composite::{RootSigner, SoftwareRootSigner};
 
 /// Captured from a build of the **v0.1.0 tag**, not from this tree.
@@ -55,7 +55,6 @@ fn the_same_genesis() -> Genesis {
     let signer = SoftwareRootSigner::from_component_seeds(&[0xA7; 32], &[0x58; 32]).unwrap();
     let policy = ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
-        deniability_mode: DeniabilityMode::Attributable,
         ttl: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     };

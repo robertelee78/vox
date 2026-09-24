@@ -10,7 +10,7 @@
 //! ## The trust anchor
 //! - [`genesis`] — the channel genesis record (tag `0x000D`, domain
 //!   `vox/genesis/v1`): the pinned, self-signed struct whose `SHA-256` **is** the
-//!   channelID. It carries the channel policy (history / deniability / TTL) and the
+//!   channelID. It carries the channel policy (history / TTL / suite floor) and the
 //!   creator's composite key (the root admin). M3's
 //!   [`crate::join::channelid::channel_id`] hashes the *same* canonical bytes
 //!   [`genesis::Genesis::channel_id`] produces — the two milestones derive the
@@ -31,8 +31,7 @@
 //! - [`cert`] — admin-delegation cert (`0x0003`) + admin-delegation revocation
 //!   (`0x000E`).
 //! - [`consent`] — consent grant (`0x0004`) + consent revocation (`0x0005`).
-//! - [`policy`] — policy-update (`0x0006`, kind = policy-update); never carries
-//!   `deniability_mode` (genesis-immutable, enforced at the schema level).
+//! - [`policy`] — policy-update (`0x0006`, kind = policy-update): history mode and TTL.
 //! - [`rotation`] — passphrase-rotation / epoch bump (`0x0006`, kind = rotation):
 //!   the only admin-side (bulk) removal.
 //!
@@ -108,7 +107,7 @@ pub use cert::{AdminCert, AdminRevocation, RevocationReason};
 pub use consent::{ConsentGrant, ConsentRevocation};
 pub use entry::{GovBody, GovEntry};
 pub use evaluator::{DenyReason, Evaluator, Verdict};
-pub use genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+pub use genesis::{ChannelPolicy, Genesis, HistoryMode};
 pub use invite::{Invite, InviteMode};
 pub use membership::MembershipView;
 pub use policy::PolicyUpdate;

@@ -68,10 +68,9 @@
 //!   decrypt-what-you-can); anti-entropy sync over an abstract transport in both
 //!   frontier and Negentropy-v1 range-reconciliation modes (keyed by the full
 //!   32-byte entry hash); attributable fork/equivocation proofs with author
-//!   freeze (and the deniable-alarm seam for ADR-009/M7); per-author abuse-quotas;
-//!   and the personal multi-device self-channel (tag `0x000C`, `K_self` /
+//!   freeze; and the personal multi-device self-channel (tag `0x000C`, `K_self` /
 //!   `rendezvous_self` KDFs) that carries received SKDMs across an identity's own
-//!   devices. The real QUIC transport (M9), the deniable authenticator (M7),
+//!   devices. The real QUIC transport (M9),
 //!   payload-TTL policy (M8), and admitted-set population (M3/M6) are documented
 //!   seams, not stubs.
 //!
@@ -96,28 +95,8 @@
 //!   passphrase re-key on rotation (M3/M5), and TTL erasure (M8) are documented
 //!   seams, not stubs.
 //!
-//! Built on M1 + M4 + M5 + M6, milestone **M7** adds:
-//!
-//! - [`deniable`] — per-channel **deniability mode** (ADR-009), filling the
-//!   [`log::entry::DeniableVerifier`] seam M5 defined. Content authorship becomes
-//!   repudiable while governance/membership stay attributable (mpENC **weak**
-//!   deniability). The pieces: the per-epoch ephemeral composite (Ed25519+ML-DSA)
-//!   signing key `(esk_i, epk_i)` that signs content (never the static key); the
-//!   **4-round Deniable GKA + DSKE** (commit → reveal → DSKE-bind → confirm) whose
-//!   broadcasts ride the log as root-signed `dgka-setup` governance entries (tag
-//!   `0x000B`); the classical **Burmester–Desmedt** combiner over Ristretto255
-//!   ephemeral shares for the confirmation-only epoch key `K`; the
-//!   [`deniable::EpochVerifier`] that verifies deniable content against the
-//!   per-epoch `epk` *released* by per-sender consent (ADR-007); the incremental
-//!   DSKE re-key for a mid-epoch join; and the epoch-end **ESK publication** (tag
-//!   `0x0010`) that, by publishing `esk_i` after the epoch closes, makes that
-//!   epoch's content forgeable-by-anyone — the deniability mechanism. Confidentiality
-//!   (PQ Sender Keys, M4) and live origin auth (PQ composite ephemeral key) are PQ;
-//!   `K` is classical (confirmation-only) by design. The optional *live*
-//!   non-transferability upgrade (PQ designated-verifier, UDMVS/MDVRS) is out of
-//!   scope; the attributable-content path is M4/M6. **Ship prerequisite:** ADR-009
-//!   requires a formal analysis of the DGKA+DSKE construction before deniable mode
-//!   is enabled in a release (see [`deniable`]).
+//! Milestone **M7** built ADR-009 deniable rooms; they were removed (PRD-001 R43) and
+//! the design is kept in ADR-009.
 //!
 //! Built on M0 + M1 + M5, milestone **M8** adds:
 //!
@@ -179,7 +158,6 @@
 
 pub mod atrest;
 pub mod cbor;
-pub mod deniable;
 pub mod error;
 pub mod governance;
 pub mod group;

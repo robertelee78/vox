@@ -19,15 +19,12 @@
 //! The authenticator is computed over `vox/log-entry/v1 ‖ canonical_body`
 //! ([`crate::wire::signing_input`]). Governance/control entries are **always**
 //! composite Ed25519+ML-DSA root-signed; message-content entries are
-//! composite-signed in attributable channels and carry the ADR-009 deniable
-//! authenticator in deniable channels. The entry wire carries an **authenticator-
-//! type discriminant** so composite vs deniable is distinguishable and
-//! forward-compatible. M5 builds the **attributable (composite) path fully** and
-//! the **deniable wire seam** ([`Authenticator::Deniable`]) — the deniable
-//! *crypto* is M7 (ADR-009), so [`Entry::verify`] returns a clear boundary error
-//! ([`Error::DeniableVerificationUnavailable`]) for a deniable authenticator
-//! rather than faking verification. Because the authenticator commits to
-//! `payload_hash`, the skeleton verifies whether or not the payload is retained.
+//! composite-signed too: every entry is attributable. The entry wire carries an
+//! **authenticator-type discriminant**, and composite (`1`) is the only value accepted.
+//! Type `2` was the ADR-009 deniable authenticator; deniable rooms were removed
+//! (PRD-001 R43), so an entry carrying it is refused like any unknown type. Because the
+//! authenticator commits to `payload_hash`, the skeleton verifies whether or not the
+//! payload is retained.
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -40,24 +37,21 @@ use crate::wire::{frame, parse_frame, signing_input, StructTag};
 /// `lipmaa_backlink` (there is no predecessor to hash).
 pub const ZERO_HASH: Digest32 = [0u8; DIGEST_LEN];
 
-/// Hard upper bound on a deniable authenticator's serialized length (bytes),
-/// enforced **before** allocation so a hostile `auth_type = Deniable` frame with
-/// a huge declared length cannot force a large copy (ADR-008 anti-abuse). The
-/// composite signature is fixed-length ([`COMPOSITE_SIG_LEN`]); the deniable
-/// authenticator (ADR-009/M7) is bounded generously here and tightened by M7.
+/// Hard upper bound on an authenticator's serialized length (bytes), enforced
+/// **before** allocation so a hostile frame with a huge declared length cannot force a
+/// large copy (ADR-008 anti-abuse). The composite signature is fixed-length
+/// ([`COMPOSITE_SIG_LEN`]); this bound is checked before the length is compared.
 pub const MAX_AUTHENTICATOR_LEN: usize = 8 * 1024;
 
 /// Hard upper bound on a retained payload body (bytes) accepted from a single
 /// framed entry, enforced **before** `to_vec`. This is a per-*entry* structural
-/// ceiling so a hostile frame cannot force a multi-megabyte allocation before the
-/// per-author byte quota ([`crate::log::quota`]) is even consulted; the quota is
-/// the policy limit, this is the pre-allocation guard (ADR-008 anti-abuse).
+/// ceiling so a hostile frame cannot force an allocation larger than any real entry
+/// before the entry is even parsed (ADR-008 anti-abuse). It bounds one entry, never
+/// how many an author may write: a room's history has no size limit (PRD-001 R1).
 pub const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
 /// Wire discriminant for [`Authenticator::Composite`] (attributable).
 const AUTH_TYPE_COMPOSITE: u64 = 1;
-/// Wire discriminant for [`Authenticator::Deniable`] (ADR-009/M7; non-attributable).
-const AUTH_TYPE_DENIABLE: u64 = 2;
 
 /// The kind of entry, which fixes how it is authenticated (ADR-008
 /// §"Per-entry-type authentication"). Authentication is chosen by entry TYPE,
@@ -66,67 +60,41 @@ const AUTH_TYPE_DENIABLE: u64 = 2;
 #[non_exhaustive]
 pub enum EntryKind {
     /// Governance/control: genesis, admin delegations, consent grants/revocations,
-    /// policy/passphrase-rotation, deniable-mode DGKA/DSKE setup. **Always**
+    /// policy/passphrase-rotation. **Always**
     /// root-composite-signed, in every channel (ADR-008). Two validly-signed
     /// conflicting governance entries are a self-authenticating fork proof.
     Governance,
-    /// Message content. In an attributable channel this is root-composite-signed;
-    /// in a deniable channel it carries the ADR-009 forgeable authenticator (M7),
-    /// in which case a conflict is *not* self-authenticating.
+    /// Message content, root-composite-signed like governance.
     Content,
 }
 
 /// The authenticator over an entry's signing input.
 ///
-/// M5 ships the [`Authenticator::Composite`] (attributable) variant in full and
-/// the [`Authenticator::Deniable`] **wire seam** (opaque bytes; ADR-009 crypto is
-/// M7). The enum (rather than always a [`CompositeSignature`]) is what lets the
-/// fork logic distinguish a *self-authenticating* conflict (composite) from a
-/// *forgeable* one (deniable) directly from the authenticator type — no caller
-/// hint — and lets the wire carry a forward-compatible type discriminant.
+/// An enum rather than a bare [`CompositeSignature`] because the wire carries a type
+/// discriminant; composite is the only type there is.
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum Authenticator {
     /// A composite Ed25519+ML-DSA-65 root signature (ADR-002). Attributable: it
     /// genuinely incriminates the author on a fork. Boxed because the composite
-    /// signature is multi-kilobyte while the deniable variant is small, so the
-    /// enum stays compact (clippy `large_enum_variant`).
+    /// signature is multi-kilobyte.
     Composite(Box<CompositeSignature>),
-    /// The ADR-009 **deniable** content authenticator (M7). Held opaquely in M5:
-    /// the bytes round-trip on the wire and are classified non-attributable, but
-    /// M5 does not verify them (the construction is M7). Verification is delegated
-    /// to a [`DeniableVerifier`]; without one, [`Entry::verify`] returns
-    /// [`Error::DeniableVerificationUnavailable`] (an honest boundary, not a stub).
-    Deniable(Vec<u8>),
 }
 
 impl Authenticator {
-    /// Whether this authenticator is attributable (a conflict under it is a
-    /// self-authenticating fork proof). Composite signatures are attributable; the
-    /// deniable authenticator (forgeable by any member, ADR-009) is not.
-    #[must_use]
-    pub fn is_attributable(&self) -> bool {
-        match self {
-            Authenticator::Composite(_) => true,
-            Authenticator::Deniable(_) => false,
-        }
-    }
-
     /// The wire type discriminant for this authenticator.
     fn type_id(&self) -> u64 {
         match self {
             Authenticator::Composite(_) => AUTH_TYPE_COMPOSITE,
-            Authenticator::Deniable(_) => AUTH_TYPE_DENIABLE,
         }
     }
 
     /// The serialized bytes of this authenticator: the composite signature's
-    /// fixed-length encoding, or the opaque deniable bytes verbatim.
+    /// fixed-length encoding.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Authenticator::Composite(sig) => sig.to_bytes().to_vec(),
-            Authenticator::Deniable(bytes) => bytes.clone(),
         }
     }
 }
@@ -135,45 +103,7 @@ impl core::fmt::Debug for Authenticator {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Authenticator::Composite(_) => f.write_str("Authenticator::Composite(..)"),
-            Authenticator::Deniable(b) => write!(f, "Authenticator::Deniable({} bytes)", b.len()),
         }
-    }
-}
-
-/// The verification seam for the ADR-009 **deniable** content authenticator,
-/// implemented by milestone M7. M5 defines the trait so the entry verification
-/// path is type-complete and forward-compatible; M5 itself ships **no**
-/// implementation (the deniable construction is M7) — an [`Entry`] carrying a
-/// deniable authenticator therefore fails verification with
-/// [`Error::DeniableVerificationUnavailable`] until an M7 verifier is supplied.
-///
-/// This is the acyclic 009→008 coupling ADR-008 §Consequences describes: 008
-/// owns the *shape* of the check (the trait + the non-attributable classification
-/// + the alarm fork path); 009/M7 owns the *crypto*.
-pub trait DeniableVerifier {
-    /// Verify a deniable authenticator's `auth_bytes` for `skeleton`. The verifier
-    /// receives the **whole skeleton** (not just a flattened signing input) so it
-    /// can bind the check to the entry's exact `(channel_id, epoch, author_id)` —
-    /// the M7 verifier registers each member's per-epoch ephemeral verification key
-    /// under that triple, and an authenticator only verifies under the key for
-    /// *that* epoch (ADR-009: publishing an epoch's key makes only *that* epoch's
-    /// content forgeable, never a different/future epoch). The verifier derives the
-    /// signing input itself via [`EntrySkeleton::signing_input`]. Returns `Ok(())`
-    /// iff the (forgeable, but per-epoch-author-bound) authenticator is valid.
-    fn verify_deniable(&self, skeleton: &EntrySkeleton, auth_bytes: &[u8]) -> Result<()>;
-}
-
-/// A [`DeniableVerifier`] placeholder used only to name a concrete type for the
-/// `None` case of [`Entry::verify`] (which performs no deniable verification).
-/// Its method is never called — a `None::<&NoDeniableVerifier>` short-circuits to
-/// the boundary error — so it deliberately has no real implementation.
-enum NoDeniableVerifier {}
-
-impl DeniableVerifier for NoDeniableVerifier {
-    fn verify_deniable(&self, _: &EntrySkeleton, _: &[u8]) -> Result<()> {
-        // Unconstructible (empty enum): this arm is unreachable. Returning the
-        // boundary error keeps the function total without a panic.
-        Err(Error::DeniableVerificationUnavailable)
     }
 }
 
@@ -401,30 +331,6 @@ impl Entry {
         })
     }
 
-    /// Construct a **content** entry carrying an opaque ADR-009 *deniable*
-    /// authenticator (the M7 crypto produces `auth_bytes`; M5 only carries them).
-    /// The entry round-trips on the wire and is classified non-attributable; M5
-    /// does not verify it ([`Entry::verify`] returns
-    /// [`Error::DeniableVerificationUnavailable`] without an M7
-    /// [`DeniableVerifier`]). Rejects an over-limit authenticator before storing.
-    /// Governance entries MUST be composite, so this is content-only by contract.
-    pub fn with_deniable_authenticator(
-        skeleton: EntrySkeleton,
-        auth_bytes: Vec<u8>,
-        payload: Option<Vec<u8>>,
-    ) -> Result<Self> {
-        if auth_bytes.len() > MAX_AUTHENTICATOR_LEN {
-            return Err(Error::SizeLimitExceeded("log-entry authenticator"));
-        }
-        let entry = Self {
-            skeleton,
-            authenticator: Authenticator::Deniable(auth_bytes),
-            payload,
-        };
-        entry.verify_payload_binding()?;
-        Ok(entry)
-    }
-
     fn sign_skeleton(
         author_root: &dyn RootSigner,
         skeleton: &EntrySkeleton,
@@ -445,25 +351,7 @@ impl Entry {
     /// (c) any retained payload hashes to `payload_hash` and has `payload_len`
     /// bytes. Any mismatch is a hard failure. Render-gating (ADR-008) is *not*
     /// here: this verifies authorship/integrity; decryption/rendering is M4/M6.
-    ///
-    /// A **deniable** authenticator ([`Authenticator::Deniable`]) cannot be
-    /// verified by M5 (the construction is ADR-009/M7); this returns
-    /// [`Error::DeniableVerificationUnavailable`]. Use
-    /// [`Entry::verify_with_deniable`] with an M7 [`DeniableVerifier`] to verify
-    /// such an entry.
     pub fn verify(&self, author_root: &CompositePublicKey) -> Result<()> {
-        self.verify_with_deniable(author_root, None::<&NoDeniableVerifier>)
-    }
-
-    /// Verify as [`Entry::verify`], but verify a [`Authenticator::Deniable`]
-    /// authenticator with the supplied `deniable` verifier (M7/ADR-009) when one
-    /// is provided. A composite authenticator is verified against `author_root`
-    /// regardless of `deniable`.
-    pub fn verify_with_deniable<V: DeniableVerifier>(
-        &self,
-        author_root: &CompositePublicKey,
-        deniable: Option<&V>,
-    ) -> Result<()> {
         if author_root.fingerprint() != self.skeleton.author_id {
             return Err(Error::MalformedBundle(
                 "log-entry author_id != root fingerprint",
@@ -473,12 +361,6 @@ impl Entry {
             Authenticator::Composite(sig) => {
                 author_root.verify(&self.skeleton.signing_input(), sig)?;
             }
-            Authenticator::Deniable(bytes) => match deniable {
-                Some(v) => {
-                    v.verify_deniable(&self.skeleton, bytes)?;
-                }
-                None => return Err(Error::DeniableVerificationUnavailable),
-            },
         }
         self.verify_payload_binding()
     }
@@ -515,7 +397,7 @@ impl Entry {
 
     /// Frame the entry for the wire/storage per ADR-008: `tag(2 BE) ‖
     /// version(1) ‖ canonical_cbor_body`. The body is a flat CBOR array — the 10
-    /// skeleton fields, then `auth_type` (1 = composite, 2 = deniable),
+    /// skeleton fields, then `auth_type` (1 = composite; 2 was the removed deniable type),
     /// `authenticator_bytes`, `payload_present` (0/1), and the payload byte string
     /// iff present. The skeleton fields are inlined (not a nested array) so the
     /// strict decoder reads them directly; a pruned entry omits the body but still
@@ -670,7 +552,6 @@ fn decode_authenticator(d: &mut Decoder<'_>, auth_type: u64) -> Result<Authentic
                 CompositeSignature::from_bytes(&auth_arr)?,
             )))
         }
-        AUTH_TYPE_DENIABLE => Ok(Authenticator::Deniable(auth_bytes.to_vec())),
         _ => Err(Error::MalformedBundle(
             "log-entry unknown authenticator type",
         )),

@@ -89,7 +89,7 @@ fn fill(dag: &mut Dag, r: &SoftwareRootSigner, n: usize, adm: &AdmissionPolicy) 
     for i in 0..n {
         let p = format!("e{i}");
         let e = next_entry(dag, r, p.as_bytes());
-        dag.accept(e, EntryKind::Content, &r.public_key(), adm, 0)
+        dag.accept(e, EntryKind::Content, &r.public_key(), adm)
             .unwrap();
     }
 }
@@ -399,7 +399,7 @@ fn m5_sync_reconciles_divergent_logs_over_real_quic() {
         let mut t = h1
             .block_on(QuicStreamTransport::open(h1.clone(), &client_conn))
             .unwrap();
-        let applied = frontier_session_peer(&mut t, &mut dag_a, &*res1, &adm1, 0).unwrap();
+        let applied = frontier_session_peer(&mut t, &mut dag_a, &*res1, &adm1).unwrap();
         (applied, dag_a)
     });
 
@@ -410,7 +410,7 @@ fn m5_sync_reconciles_divergent_logs_over_real_quic() {
         let mut t = h2
             .block_on(QuicStreamTransport::accept(h2.clone(), &server_conn))
             .unwrap();
-        let applied = frontier_session_peer(&mut t, &mut dag_b, &*res2, &adm2, 0).unwrap();
+        let applied = frontier_session_peer(&mut t, &mut dag_b, &*res2, &adm2).unwrap();
         (applied, dag_b)
     });
 

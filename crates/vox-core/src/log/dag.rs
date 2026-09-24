@@ -31,13 +31,15 @@
 //! - The **acceptance predicate** (ADR-008 §"Abuse resistance"): an entry is
 //!   accepted only if (a) its author is in the admitted set for `(channelID,
 //!   epoch)` (M3/M6 input), (b) its per-author authenticator verifies, and (c) it
-//!   is within the author's quota ([`crate::log::quota`]).
+//!   links into the author's feed. There is **no rate or volume limit** on an
+//!   admitted author (PRD-001 R1/R3): members are invited and trusted, and a limit
+//!   here was re-applied on every reopen, so a room with more than a thousand
+//!   entries from one author could not be opened at all.
 //! - **Fork / equivocation handling** (ADR-008 §"Fork / equivocation handling"):
 //!   two distinct entries at the same `(author, seq)` with different hashes are an
 //!   equivocation. For **attributable** entries this is a self-authenticating
-//!   fork proof → the author is frozen and the proof recorded. For **deniable**
-//!   content (M7) the authenticator is forgeable, so a conflict raises a
-//!   non-attributable *alarm* and does **not** auto-freeze.
+//!   fork proof → the author is frozen and the proof recorded. Every entry is
+//!   attributable (composite-signed), so every fork is one.
 //! - **Render-gating** ([`Dag::render`]): the store holds ciphertext regardless of
 //!   readability; rendering attempts decryption and succeeds only if keys are held
 //!   (the decryptor is M4/M6).
@@ -54,28 +56,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
-use crate::log::entry::{DeniableVerifier, Entry, EntryKind};
+use crate::log::entry::{Entry, EntryKind};
 use crate::log::feed::Feed;
-use crate::log::quota::{QuotaReject, QuotaTracker};
-
-/// An uninhabited [`DeniableVerifier`] naming the concrete type for the `None`
-/// default in [`Dag::accept`] (which performs no deniable verification). Its
-/// method is unreachable.
-enum NoDeniable {}
-impl DeniableVerifier for NoDeniable {
-    fn verify_deniable(&self, _: &crate::log::entry::EntrySkeleton, _: &[u8]) -> Result<()> {
-        Err(Error::DeniableVerificationUnavailable)
-    }
-}
-/// The typed `None` deniable verifier used by [`Dag::accept`].
-const NO_DENIABLE: Option<&NoDeniable> = None;
 
 /// The set of identities admitted to a `(channelID, epoch)` — the membership
 /// input to the acceptance predicate (ADR-008 §"Abuse resistance"). M5 models
 /// this as an explicit input; the *population* of the set from authenticated join
 /// (CPace, ADR-005/M3) and consent (ADR-007/M6) is those milestones' job. An
 /// entry from an author not admitted for its `(channelID, epoch)` is rejected
-/// before any quota or DAG mutation.
+/// before any DAG mutation.
 #[derive(Debug, Default, Clone)]
 pub struct AdmissionPolicy {
     /// (channel, epoch) -> admitted author fingerprints.
@@ -130,16 +119,6 @@ pub enum ForkOutcome {
     /// proof carries two full entries (each with a multi-kilobyte composite
     /// signature), so it is boxed to keep the common `Ok`/error paths small.
     Attributable(Box<ForkProof>),
-    /// Deniable-content conflict (M7 authenticator): the proof does NOT
-    /// incriminate a specific author (any member could mint it), so this is a
-    /// non-attributable *alarm* — surfaced for manual resolution, **never** an
-    /// auto-freeze (it would be a framing/DoS primitive, ADR-008/ADR-009).
-    DeniableAlarm {
-        /// The author whose `(author, seq)` slot saw a conflict.
-        author_id: Digest32,
-        /// The shared sequence number.
-        seq: u64,
-    },
 }
 
 /// Why an entry was not accepted into the DAG.
@@ -150,25 +129,18 @@ pub enum Rejected {
     NotAdmitted,
     /// The entry's authenticator (or author/structure) failed verification.
     Verification(Error),
-    /// The entry exceeded the author's quota and was dropped (not relayed).
-    Quota(QuotaReject),
     /// The entry conflicts with a stored entry at the same `(author, seq)`
-    /// (equivocation); the [`ForkOutcome`] carries the attributable-vs-deniable
-    /// remedy.
+    /// (equivocation); the [`ForkOutcome`] carries the proof.
     Fork(ForkOutcome),
     /// The entry did not link correctly into the author's feed (bad seq, broken
     /// `prev_hash`/`lipmaa_backlink`, append past end-of-feed).
     Feed(Error),
     /// A duplicate of an already-stored entry (same hash) — idempotently ignored.
     Duplicate,
-    /// A governance/control entry carried a non-attributable (deniable)
-    /// authenticator. Governance MUST be composite-signed in every channel
-    /// (ADR-008), so this is rejected before storage.
-    GovernanceNotAttributable,
 }
 
-/// The replicated log store: per-author feeds, a hash index, frozen authors, and
-/// the quota tracker. One [`Dag`] per channel.
+/// The replicated log store: per-author feeds, a hash index, and frozen authors.
+/// One [`Dag`] per channel.
 #[derive(Debug, Default)]
 pub struct Dag {
     /// author -> feed.
@@ -178,31 +150,13 @@ pub struct Dag {
     /// Authors frozen by an attributable fork proof; their later entries are
     /// refused (ADR-008 — members revoke/rotate to exclude the equivocator).
     frozen: HashMap<Digest32, ForkProof>,
-    /// Per-author quotas.
-    quota: QuotaTracker,
 }
 
 impl Dag {
-    /// An empty DAG with the ADR-008 default quota policy.
+    /// An empty DAG.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            feeds: HashMap::new(),
-            by_hash: HashMap::new(),
-            frozen: HashMap::new(),
-            quota: QuotaTracker::with_defaults(),
-        }
-    }
-
-    /// An empty DAG with an explicit quota tracker (policy from a channel policy).
-    #[must_use]
-    pub fn with_quota(quota: QuotaTracker) -> Self {
-        Self {
-            feeds: HashMap::new(),
-            by_hash: HashMap::new(),
-            frozen: HashMap::new(),
-            quota,
-        }
+        Self::default()
     }
 
     /// The number of entries stored across all authors.
@@ -250,6 +204,18 @@ impl Dag {
         self.feeds.get(author).and_then(|f| f.get(*seq))
     }
 
+    /// Drop the payload body of the stored entry `hash`, keeping its signed skeleton
+    /// (ADR-010 retention). A peer that asks for it afterwards is served the skeleton.
+    /// Returns whether a body was dropped.
+    pub fn prune_payload(&mut self, hash: &Digest32) -> bool {
+        let Some((author, seq)) = self.by_hash.get(hash).copied() else {
+            return false;
+        };
+        self.feeds
+            .get_mut(&author)
+            .is_some_and(|f| f.prune_payload(seq))
+    }
+
     /// Whether an entry with this hash is stored.
     #[must_use]
     pub fn contains(&self, hash: &Digest32) -> bool {
@@ -271,64 +237,32 @@ impl Dag {
     /// 5. Equivocation: a different entry already occupies `(author, seq)` →
     ///    [`Rejected::Fork`]; for an attributable entry the author is frozen.
     /// 6. Feed link: `seq`/`prev_hash`/`lipmaa_backlink`/end-of-feed.
-    /// 7. Quota: within the author's rate/byte budget.
     ///
     /// Equivocation is classified **only after** admission and verification
-    /// (steps 3–4 precede 5). An ADR-008 fork proof must be *self-authenticating*
-    /// and a deniable-content alarm must come from an entry the epoch verifier
-    /// accepts; classifying first would let a peer holding *no* valid key surface
-    /// fork proofs and alarms — a framing / attention-DoS primitive
+    /// (steps 3–4 precede 5). An ADR-008 fork proof must be *self-authenticating*;
+    /// classifying first would let a peer holding *no* valid key surface fork
+    /// proofs — a framing / attention-DoS primitive
     /// (2026-09-19 review, HIGH). A conflicting entry that is unadmitted or fails
     /// verification is therefore rejected as [`Rejected::NotAdmitted`] /
     /// [`Rejected::Verification`], never as a fork.
     ///
-    /// `kind` selects the governance/content rule; fork attributability is then
-    /// determined by the entry's authenticator type (governance is forced
-    /// composite above). `now_secs` feeds the quota clock.
-    ///
-    /// Equivalent to [`Dag::accept_with_deniable`] with no deniable verifier, so a
-    /// **deniable** content entry fails verification with
-    /// [`Error::DeniableVerificationUnavailable`] (the M7 verifier is supplied via
-    /// [`Dag::accept_with_deniable`]) — including a conflicting one, which is
-    /// consequently never classified as an alarm without a verifier.
+    /// `kind` is the entry's classification. The DAG no longer branches on it — every
+    /// entry is composite-signed since deniable rooms were removed — but callers already
+    /// classify each entry, and keeping the argument keeps that classification at the
+    /// seam where a future per-kind rule would go.
     pub fn accept(
         &mut self,
         entry: Entry,
         kind: EntryKind,
         author_root: &CompositePublicKey,
         admission: &AdmissionPolicy,
-        now_secs: u64,
     ) -> std::result::Result<Digest32, Rejected> {
-        self.accept_with_deniable(entry, kind, author_root, admission, now_secs, NO_DENIABLE)
-    }
-
-    /// Accept an entry, verifying a [`crate::log::entry::Authenticator::Deniable`] authenticator with
-    /// the supplied M7 [`DeniableVerifier`] when one is given (ADR-009 crypto is
-    /// M7). The composite path is unaffected. This is the seam M7 fills; M5 callers
-    /// use [`Dag::accept`].
-    pub fn accept_with_deniable<V: DeniableVerifier>(
-        &mut self,
-        entry: Entry,
-        kind: EntryKind,
-        author_root: &CompositePublicKey,
-        admission: &AdmissionPolicy,
-        now_secs: u64,
-        deniable: Option<&V>,
-    ) -> std::result::Result<Digest32, Rejected> {
+        let _ = kind;
         let author = entry.skeleton.author_id;
         let seq = entry.skeleton.seq;
         let channel = entry.skeleton.channel_id;
         let epoch = entry.skeleton.epoch;
         let hash = entry.entry_hash();
-
-        // Governance/control entries MUST be composite (attributable) in EVERY
-        // channel (ADR-008 §"Per-entry-type authentication"): a deniable
-        // authenticator on a governance entry is rejected outright, so the
-        // governance plane — and its fork attribution — stays intact even in
-        // deniable channels.
-        if matches!(kind, EntryKind::Governance) && !entry.authenticator.is_attributable() {
-            return Err(Rejected::GovernanceNotAttributable);
-        }
 
         // A frozen author's further entries are refused outright.
         if self.frozen.contains_key(&author) {
@@ -345,72 +279,49 @@ impl Dag {
             return Err(Rejected::NotAdmitted);
         }
 
-        // Authenticator + structure (deniable verified via the M7 seam if given).
-        // This precedes equivocation classification on purpose: only an entry
-        // that is admitted AND authenticates may surface a fork proof / alarm.
-        entry
-            .verify_with_deniable(author_root, deniable)
-            .map_err(Rejected::Verification)?;
+        // Authenticator + structure. This precedes equivocation classification on
+        // purpose: only an entry that is admitted AND authenticates may surface a
+        // fork proof.
+        entry.verify(author_root).map_err(Rejected::Verification)?;
 
         // Equivocation: a *different* entry already occupies (author, seq)?
         if let Some(feed) = self.feeds.get(&author) {
             if let Some(existing) = feed.get(seq) {
                 // Same seq, different hash (duplicate handled above) ⇒ a fork.
                 let outcome = self.classify_fork(existing.clone(), entry);
-                if let ForkOutcome::Attributable(ref proof) = outcome {
-                    // `conflicting` verified just above. `existing` was verified
-                    // when it was accepted (only this path stores entries); the
-                    // re-check is an invariant guard so the recorded proof is
-                    // self-authenticating regardless of how `existing` arrived.
-                    if existing.verify(author_root).is_ok() {
-                        self.frozen.insert(author, (**proof).clone());
-                    }
+                let ForkOutcome::Attributable(ref proof) = outcome;
+                // `conflicting` verified just above. `existing` was verified
+                // when it was accepted (only this path stores entries); the
+                // re-check is an invariant guard so the recorded proof is
+                // self-authenticating regardless of how `existing` arrived.
+                if existing.verify(author_root).is_ok() {
+                    self.frozen.insert(author, (**proof).clone());
                 }
                 return Err(Rejected::Fork(outcome));
             }
         }
 
-        // Feed link: validate (without mutating) BEFORE committing quota, so a
-        // structural rejection never consumes the author's quota budget. The feed
-        // enforces seq/prev_hash/lipmaa_backlink/end-of-feed.
-        let feed = self.feeds.entry(author).or_default();
-        feed.validate_next(&entry).map_err(Rejected::Feed)?;
-
-        // Quota (drop, do not relay, on breach).
-        self.quota
-            .admit(&author, epoch, entry.skeleton.payload_len, now_secs)
-            .map_err(Rejected::Quota)?;
-
-        // Commit: append (cannot fail — validate_next just succeeded and the feed
-        // was not mutated in between) and index by hash.
-        let feed = self.feeds.entry(author).or_default();
-        feed.append(entry).map_err(Rejected::Feed)?;
+        // Feed link: `append` validates seq/prev_hash/lipmaa_backlink/end-of-feed
+        // and leaves the feed untouched on a rejection. Then index by hash.
+        self.feeds
+            .entry(author)
+            .or_default()
+            .append(entry)
+            .map_err(Rejected::Feed)?;
         self.by_hash.insert(hash, (author, seq));
         Ok(hash)
     }
 
-    /// Classify a `(author, seq)` conflict by the **authenticator type** of the
-    /// conflicting entries (ADR-008 §"Fork / equivocation handling"). A conflict
-    /// is a self-authenticating fork proof only if *both* entries are attributable
-    /// (composite-signed): governance entries are forced composite at acceptance,
-    /// so this rule alone covers them — no caller hint is consulted. If either
-    /// entry carries a forgeable (deniable) authenticator, the conflict is a
-    /// non-attributable alarm (auto-freeze would be a framing/DoS primitive).
+    /// Build the fork proof for a `(author, seq)` conflict (ADR-008 §"Fork /
+    /// equivocation handling"). Every entry is composite-signed, so a conflict
+    /// between two that both verified is always a self-authenticating proof.
     fn classify_fork(&self, existing: Entry, conflicting: Entry) -> ForkOutcome {
-        let author_id = conflicting.skeleton.author_id;
-        let seq = conflicting.skeleton.seq;
-        let attributable =
-            conflicting.authenticator.is_attributable() && existing.authenticator.is_attributable();
-        if attributable {
-            ForkOutcome::Attributable(Box::new(ForkProof {
-                author_id,
-                seq,
-                existing,
-                conflicting,
-            }))
-        } else {
-            ForkOutcome::DeniableAlarm { author_id, seq }
-        }
+        ForkOutcome::Attributable(Box::new(ForkProof {
+            author_id: conflicting.skeleton.author_id,
+            seq: conflicting.skeleton.seq,
+            existing,
+            conflicting,
+        }))
     }
 
     /// A deterministic causal (topological) order of every stored entry: each
