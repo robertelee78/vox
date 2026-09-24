@@ -32,6 +32,14 @@ Revision history:
 - 2026-09-24 — at the tracker's request: **a `failed` ends the attempt it names, and the holder's next
   post begins a new one** named by that `failed` entry (§3), so every attempt is bounded; and the
   adapter's **read cycle** over `board.position` and the stream is documented (§7). No wire change.
+- 2026-09-24 — the decider's correction for the tracker's model: **a claim establishes ownership only;
+  an attempt becomes active only on the holder's `working`**, whose entry is the attempt-start evidence;
+  `failed` seeds a retry's id but no retry exists until the next `working`; a `result` with no observed
+  attempt-start stays an assertion (§2, §3). The seeded default id is unchanged on the wire.
+  `tracker_rehearsal_proof` asserts claim-leaves-Ready, working-enters-Executing, failed-returns-Ready,
+  retry-only-on-working and blocked-is-Health-only through live models, and passed (227 s); **the mutation
+  check of these new checkpoints is pending** — its first runs were uninformative (the live-model warm-up
+  timed out before any checkpoint), not survivors.
 - 2026-09-24 — the decider's answers on ideas from a review of Orca: **M21.9** (the drain says when a
   claim was lost) and **M21.10** (a `result` warns about unread addressed messages) are decided and not
   built; grouped addresses (`@claude`, `@idle`) are **declined** — `to` stays explicit names. The status
@@ -200,25 +208,34 @@ A message about a work item **MUST** carry the reference in `data.work`:
   of source documents. That stability is the tracker's obligation. **The CLI refuses a reference of any
   other shape before posting**, whichever flag carried it — `--work`, `--data` or `claim --work` (F16).
   Vox checks the shape only; it never interprets the id or looks it up.
-- **`data.attempt`** names one execution attempt, so a tracker can tell a retry from the original. Vox
-  treats it as opaque. **When the caller names none, a work-bound post from the session that holds the
-  claim on that item carries the current attempt**, defined by the log alone:
-  - an attempt **begins** at the holder's claim on the item, or at the holder's own latest `failed` for
-    the item since that claim, in canonical order;
-  - it **ends** at the next `failed`, or at a release, lapse or handoff of the claim;
-  - its id is the hash of the entry that began it — the claim's acquisition (as `board --json` shows
-    it) or that `failed` entry. So every attempt is bounded, a tracker can reconstruct each one from the
-    stream, and an agent never mints an id. A `failed` names the attempt that failed; the holder's next
-    work-bound post begins the next one.
-  - A `failed` whose operation is void (§6) begins nothing; a retried `failed` is its first entry.
-    (`work_ref_proof` proves the rest of this rule against five mutants; these two exclusions are
-    by reading only — no proof yet posts a voided or duplicated `failed`.)
-  - A post from a session that does not hold the claim carries no attempt unless it names one; an
-    explicit `--attempt` always wins. A retried `--op` keeps the attempt its first post carried, so a
-    claim renewed, re-taken or failed between the two does not turn the retry into a conflict.
+- **`data.attempt`** is the attempt's **correlation id**, so a tracker can tell a retry from the original.
+  Vox treats it as opaque. **When the caller names none, a work-bound post from the session that holds the
+  claim on that item carries a default id**, seeded from the log alone: the hash of the holder's claim
+  (its acquisition, as `board --json` shows it), or of the holder's own latest `failed` for the item since
+  that claim, whichever is later in canonical order. A `failed` whose operation is void (§6) seeds
+  nothing; a retried `failed` is its first entry. A post from a session that does not hold the claim
+  carries no id unless it names one; an explicit `--attempt` always wins. A retried `--op` keeps the id
+  its first post carried. (`work_ref_proof` proves the seeding against five mutants; the two exclusions
+  are by reading only — no proof yet posts a voided or duplicated `failed`.)
 
-  (Decided 2026-09-24: first "the claim is the attempt"; the same day, at the work-accountability
-  tracker's request for bounded attempts, **a `failed` ends the attempt and the retry is a new one**.)
+  **An id is not an attempt.** Seeding names the attempt that *would* run; it starts nothing. The attempt
+  lifecycle is §3's, and it is the same whether the id was seeded or named:
+  - a `claim` establishes **ownership only**; `claim`, `renew`, `accept`, `blocked` and `status` never
+    start an attempt;
+  - **an attempt becomes active only when the holder posts `working` for that item**, and its
+    attempt-start evidence is **that `working` entry's hash and timestamp**;
+  - `failed` ends the named attempt; the id it seeds belongs to a retry that **does not exist until a
+    later `working`**;
+  - `release`, a lapse and a handoff end an **active** attempt, and do nothing to attempt state when
+    execution never started;
+  - a `result` with no corresponding attempt-start observation remains an assertion and **MUST NOT**
+    advance a tracker's phase.
+
+  (Decided 2026-09-24, in three steps the same day: first "the claim is the attempt"; then, at the
+  work-accountability tracker's request, "a `failed` ends the attempt and the retry is a new one"; then
+  the decider's correction for that tracker's model — **a claim is ownership, and only `working` starts
+  an attempt**. The wire behaviour is unchanged by the last step: the default id is still seeded as
+  above.)
 - **`data.op`** is the operation id (§6). **`data.vox`** is the version stamp (§5).
 - **`data.evidence`** is OPTIONAL: a list of `{kind, ref, sha256?}`, opaque to Vox. Bytes that must
   move between hosts use ADR-020 §11's file exchange, whose announcement can itself carry `data.work`.
@@ -242,14 +259,14 @@ consumer what the others mean. Three things are kept apart, as the decider asked
 |---|---|---|---|
 | `assign` | the sender asks the addressee (`to`) to take the item | ownership, which only `claim` takes | request |
 | `accept` | the addressee agrees and intends to claim and open an attempt | ownership or that an attempt actually started | request / attempt intent |
-| `claim` | take ownership, or complete a pending handoff (§4) | that work has started or the item is Executing | ownership |
+| `claim` | take ownership, or complete a pending handoff (§4) | that work has started, that an attempt is active, or that the item is Executing | ownership |
 | `renew` | extend the holder's current acquisition (§4) | a new acquisition | ownership |
-| `working` | the owner reports active execution of this attempt | a Work phase transition; the tracker decides whether an explicitly work-bound attempt is sufficient to record Executing | attempt observation |
+| `working` | the owner reports active execution of this attempt. **The attempt becomes active here**, and this entry's hash and timestamp are its start evidence; a later `working` with the same id continues it | a Work phase transition by itself; the tracker decides whether this attempt-start is sufficient to record Executing | attempt start / observation |
 | `blocked` | the owner reports that it cannot proceed; `data.reason` REQUIRED; cleared by the owner's next `working`, `result`, `failed` or `release` | a Work phase transition or that ownership has lapsed; the tracker decides durable Health and leaves Work phase unchanged | attempt / health observation |
 | `status` | a progress note; supersedes the same `(author, from, data.work)`'s previous `status` in any rendering | a state change | attempt |
-| `result` | the attempt produced something the sender **asserts** meets the item's criteria; it SHOULD name an immutable candidate in `data.evidence`, such as a commit rather than a branch | an acceptance verdict, Release ready or Done; the tracker may use a valid candidate to enter Acceptance | attempt observation |
-| `failed` | this attempt ended without success, with `data.reason` | **that the item failed or is abandoned.** It may be retried. | attempt |
-| `release` | the holder gives up ownership; the attempt ends | **Done, and also not failure.** | ownership |
+| `result` | the attempt produced something the sender **asserts** meets the item's criteria; it SHOULD name an immutable candidate in `data.evidence`, such as a commit rather than a branch | an acceptance verdict, Release ready or Done. The tracker may use a valid candidate to enter Acceptance **only for an attempt whose `working` it observed**; without one it stays an assertion | attempt observation |
+| `failed` | this attempt ended without success, with `data.reason` | **that the item failed or is abandoned.** It may be retried; the retry begins at the next `working`, not here | attempt end |
+| `release` | the holder gives up ownership; an **active** attempt ends | **Done, and also not failure**; nothing about attempts when none was active | ownership |
 | `handoff` | the holder relinquishes ownership and reserves the item for a named recipient (§4) | that the recipient accepted | ownership |
 | `decline` | with `data.resource`: an eligible recipient refuses a pending handoff, which **frees** the item. Without it: the addressee refuses an `assign`. | that the item is invalid | ownership / request |
 
