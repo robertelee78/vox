@@ -2,7 +2,7 @@
 
 **Status**: implemented (M5, `crates/vox-core/src/log/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6).
+**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6). 2026-09-24 — PRD-001 R5: a node answers a sync session for a room only from that room's members and anchors (§"Who is served").
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
@@ -115,6 +115,12 @@ frontier, bit 1 = range-reconciliation); both peers use the highest bit both set
 - **Frontier mode (default; required of every peer).** `HAVE` lists the feeds a peer holds; the receiver
   replies `WANT` with the missing `(author_id, from_seq..to_seq)` ranges; the holder streams `ENTRY`
   frames (skeleton + any retained payloads) over a reliable QUIC stream (ADR-011).
+- **Who is served (normative, PRD-001 R5).** A node serves a room's log only to that room's
+  **admitted authors** and to **that room's anchors**. The stream-kind gate (ADR-016) only decides
+  whether a peer may open a `sync` stream at all; the room is named afterwards, in the stream's
+  preamble, and must be checked against the peer. *Built so far for sessions the node **answers**; a
+  session the node **starts** — a fresh connection pushes every open room to the peer — is not yet
+  checked and must be.*
 - **Range-reconciliation mode (used when both peers set bit 1; the default *above ~100 active authors*,
   where `HAVE` size dominates).** `NEG` frames carry Negentropy range-based set reconciliation over entry
   hashes (logarithmic rounds). The `NEG` body is **Negentropy v1** keyed by the **full 32-byte SHA-256
@@ -318,6 +324,22 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   have dropped records systematically whenever a sync was in flight — trading a visible stall for a
   silent loss. The fix is for the exchange not to hold the lock across network waits, which is a
   change to this ADR's implementation and not to a constant.
+
+- **An answered sync is bound to the room (2026-09-24, PRD-001 D5/R5).** `run_sync_session`
+  received the peer's identity and discarded it, so any member of any room this node held could name
+  another room's channel id in the preamble and be served its log. It now refuses — with the same coded
+  reset as a stream kind the peer may not open — unless the peer is an admitted author of *that* room
+  or in *that* room's anchor set (`ChannelState::anchors`: the node's configured anchors and those the
+  room's link named); for a room the node only anchors, an author its board knows. Before refusing, the
+  node admits from its own board's bundle records (the M17.6 evidence, as everywhere), so a member who
+  joined through somebody else is not refused for being new. The check is one early return below the
+  in-flight (`syncing`) refusal.
+  **Gate** (`crates/vox-core/tests/sync_serves_a_room_only_to_its_members.rs`, release, `--ignored`):
+  the victim holds rooms A and B; a member of A only, using its own identity over a real connection, is
+  served all 5 of A's entries (the control) and asks for B five times — 0 sessions answered, 0 entries;
+  a member of B still holds all 5 of B's. On 0844943 it is red: 25 of B's entries over 5 answered
+  sessions; with the check removed, the same.
+  **Open:** the outbound direction (a session this node starts) is unchecked; see §"Who is served".
 
 ## Links
 **Depends on**: ADR-002, ADR-006.
