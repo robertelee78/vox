@@ -2328,8 +2328,22 @@ impl Node {
                 outcome,
             } => {
                 self.syncing.remove(&channel_id);
-                // A push that found this room mid-session is owed; the room is free now.
-                if !self.pending_push.is_empty() {
+                // **A session that failed delivered nothing, so its push is owed again.**
+                // `run_due_syncs` counts a push as done when the session *starts*, which is the
+                // only thing it can know then; a session the peer refused — because its own
+                // session for this room was running — or that died on the wire carried nothing, and
+                // the entry waited for the peer's next 30s interval. Measured over a forced relay
+                // once pushes went out at once instead of on the tick: median 40–110ms, and a tail
+                // at exactly 30s (p95 29.7–30.0s) — the collisions an immediate push makes more
+                // likely. Owed again, retried on the *next tick* and not at once: a peer that keeps
+                // refusing must not be answered with a tight loop.
+                if outcome.is_err() {
+                    self.pending_push.insert(channel_id);
+                    for schedule in self.schedules.values_mut() {
+                        schedule.note_local_append();
+                    }
+                } else if !self.pending_push.is_empty() {
+                    // A push that found this room mid-session is owed; the room is free now.
                     self.push_now = true;
                 }
                 self.refresh_network_view().await;
