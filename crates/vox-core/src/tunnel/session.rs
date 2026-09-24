@@ -144,7 +144,9 @@ async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
 /// Dialer side: open a tunnel for `service_tag` on an already-opened QUIC stream
 /// pair, then splice the local `local` TCP socket to it.
 ///
-/// [`request`] then [`splice`].
+/// [`request`] then [`splice`]. A caller that owes somebody an answer *before* bytes flow
+/// — a SOCKS client waiting for its reply — calls the two halves itself, so that the
+/// answer it gives is the host's.
 pub async fn dial(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -152,7 +154,10 @@ pub async fn dial(
     service_tag: &str,
     local: TcpStream,
 ) -> Result<()> {
-    request(&mut send, &mut recv, channel_id, service_tag).await?;
+    if let Err(e) = request(&mut send, &mut recv, channel_id, service_tag).await {
+        abort_local(&local);
+        return Err(e);
+    }
     splice(send, recv, local).await
 }
 
@@ -164,8 +169,12 @@ pub async fn dial(
 /// other error is the path failing before the host answered, which a caller may retry on
 /// a fresh connection; a refusal it must not, because the host has decided.
 ///
-/// Split out of [`dial`] so a caller can tell the host's verdict from the path failing:
-/// a forward that retries a dead connection on a fresh one must never retry a refusal.
+/// Split out of [`dial`] because `vox up` used to tell its SOCKS client "succeeded"
+/// **before** asking, on the belief that the host waited for the client's first bytes and
+/// so a reply held back until the host answered would deadlock against `ssh`, which sends
+/// nothing until it is told the connection is up. The host does no such thing: [`accept`]
+/// writes its status straight after its own local connect. So every refused CONNECT looked
+/// connected and then died, and nothing a person saw said it had been refused (PRD-001 R23).
 pub async fn request(
     send: &mut SendStream,
     recv: &mut RecvStream,
@@ -319,7 +328,8 @@ where
         }
     };
     write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
-    splice_until_withdrawn(send, recv, tcp, &reachers, client_id).await
+    let cut = withdrawn(reachers, *client_id);
+    splice_until(send, recv, tcp, cut).await
 }
 
 /// The QUIC application error code a host resets a tunnel stream with when it withdraws
@@ -330,79 +340,168 @@ where
 /// reset code is the one channel that stays ours.
 pub const REACH_WITHDRAWN_CODE: u32 = 0x1711;
 
-/// Splice, but stop the moment `client_id` leaves `reachers`.
+/// The QUIC application error code either end resets a tunnel stream with when **its own
+/// TCP side ended abortively** — the carried connection was reset, or could no longer be
+/// written — so the far end resets its TCP side too (PRD-001 R22/R23).
+///
+/// Distinct from a clean close because a clean close is a statement: "everything was
+/// sent". A backend that crashes mid-response and resets its socket has said the opposite,
+/// and a tunnel that turns that into an orderly EOF hands the client a truncated reply that
+/// looks complete. That is what quinn does to a `SendStream` dropped on an error path — it
+/// finishes it — so the reset has to be explicit.
+pub const TUNNEL_ABORT_CODE: u32 = 0x1712;
+
+/// Resolves when `client` is no longer in the host's reacher set.
 ///
 /// Withdrawing reach has to reach sessions that are **already running** — an `ssh` login
 /// opened an hour ago is precisely what the operator means to cut — and the serving task
 /// cannot ask the actor, so it watches the same live set the dial gate read.
-async fn splice_until_withdrawn(
-    send: SendStream,
-    recv: RecvStream,
-    tcp: TcpStream,
-    reachers: &crate::node::tunnel::Reachers,
-    client_id: &Digest32,
-) -> Result<()> {
-    let mut changed = reachers.subscribe();
-    let mut quic = tokio::io::join(recv, send);
-    let mut tcp = tcp;
-    let outcome = {
-        let copying = tokio::io::copy_bidirectional(&mut tcp, &mut quic);
-        tokio::pin!(copying);
-        loop {
-            tokio::select! {
-                done = &mut copying => break done
-                    .map(|_| ())
-                    .map_err(|_| Error::MalformedTunnel("tunnel splice")),
-                res = changed.changed() => {
-                    // The sender lives in the actor's map. If it is gone the channel is
-                    // gone, and a channel this node no longer holds reaches nothing.
-                    let still = res.is_ok() && reachers.borrow().contains(client_id);
-                    if !still {
-                        break Err(Error::TunnelRevoked("withdrawn mid-session"));
-                    }
-                }
-            }
+async fn withdrawn(reachers: crate::node::tunnel::Reachers, client: Digest32) {
+    let mut who = reachers.subscribe();
+    loop {
+        if !reachers.borrow().contains(&client) {
+            return;
         }
-    };
-    if matches!(outcome, Err(Error::TunnelRevoked(_))) {
-        // Reset rather than finish: a clean close is indistinguishable from the carried
-        // service hanging up, and the dialer deserves to know this was a decision.
-        let (_recv, mut send) = quic.into_inner();
-        let _ = send.reset(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
+        // The sender is held by the actor's map *and* by this task, so a `changed` error
+        // would mean neither exists any more; treat it as withdrawn rather than spin.
+        if who.changed().await.is_err() {
+            return;
+        }
     }
-    outcome
 }
 
 /// Splice bytes bidirectionally between a QUIC stream pair and a TCP socket until
-/// **both** directions close.
+/// **both** directions close, carrying an **abortive** close as one (PRD-001 R22/R23).
 ///
-/// The QUIC `(recv, send)` pair is adapted into one duplex via [`tokio::io::join`],
-/// then [`tokio::io::copy_bidirectional`] handles half-close propagation correctly:
-/// when one side reaches EOF it shuts down the opposite writer (a quinn `finish`
-/// or a TCP FIN) and drains the other direction before returning, so neither a
-/// one-way close nor an idle reverse path leaks the tunnel.
-pub async fn splice(send: SendStream, recv: RecvStream, mut tcp: TcpStream) -> Result<()> {
-    let mut quic = tokio::io::join(recv, send);
-    match tokio::io::copy_bidirectional(&mut tcp, &mut quic).await {
-        Ok(_) => Ok(()),
-        Err(e) if reset_reason(&e) == Some(REACH_WITHDRAWN_CODE) => Err(Error::TunnelRevoked(
-            "the host withdrew access to this service",
-        )),
-        Err(_) => Err(Error::MalformedTunnel("tunnel splice")),
+/// A clean half-close is carried as one: TCP EOF becomes a QUIC `finish`, a QUIC finish
+/// becomes a TCP FIN, and the other direction drains on. An abortive end on either side —
+/// the local TCP connection reset or unwritable, or the far end resetting the stream —
+/// tears down **both** directions: the stream is reset with [`TUNNEL_ABORT_CODE`], and the
+/// local TCP socket is closed with a zero linger, which the kernel sends as an RST. So a
+/// backend that resets reaches the far client as a reset, not as a clean EOF after a
+/// truncated reply.
+pub async fn splice(send: SendStream, recv: RecvStream, tcp: TcpStream) -> Result<()> {
+    splice_until(send, recv, tcp, std::future::pending()).await
+}
+
+/// How one direction of a splice ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Leg {
+    /// An orderly end of this direction; the other one carries on.
+    Clean,
+    /// This side of the carried connection ended abortively.
+    Abort,
+    /// The host reset the stream with [`REACH_WITHDRAWN_CODE`].
+    Withdrawn,
+}
+
+/// [`splice`], ending early — and abortively, with [`REACH_WITHDRAWN_CODE`] — when `cut`
+/// resolves.
+async fn splice_until(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    mut tcp: TcpStream,
+    cut: impl core::future::Future<Output = ()>,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    const CHUNK: usize = 16 * 1024;
+    let outcome = {
+        let (mut tcp_r, mut tcp_w) = tcp.split();
+        let (send, recv) = (&mut send, &mut recv);
+        // TCP → QUIC.
+        let outbound = async move {
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                match tcp_r.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = send.finish();
+                        return Leg::Clean;
+                    }
+                    Ok(n) => {
+                        if send.write_all(&buf[..n]).await.is_err() {
+                            return Leg::Abort;
+                        }
+                    }
+                    Err(_) => return Leg::Abort,
+                }
+            }
+        };
+        // QUIC → TCP.
+        let inbound = async move {
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                match recv.read(&mut buf).await {
+                    Ok(None) => {
+                        let _ = tcp_w.shutdown().await;
+                        return Leg::Clean;
+                    }
+                    Ok(Some(n)) => {
+                        if tcp_w.write_all(&buf[..n]).await.is_err() {
+                            return Leg::Abort;
+                        }
+                    }
+                    Err(quinn::ReadError::Reset(code))
+                        if code == quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE) =>
+                    {
+                        return Leg::Withdrawn
+                    }
+                    Err(_) => return Leg::Abort,
+                }
+            }
+        };
+        tokio::pin!(outbound, inbound, cut);
+        let (mut out_done, mut in_done) = (false, false);
+        loop {
+            tokio::select! {
+                leg = &mut outbound, if !out_done => match leg {
+                    Leg::Clean => out_done = true,
+                    other => break Some(other),
+                },
+                leg = &mut inbound, if !in_done => match leg {
+                    Leg::Clean => in_done = true,
+                    other => break Some(other),
+                },
+                () = &mut cut => break None,
+            }
+            if out_done && in_done {
+                break Some(Leg::Clean);
+            }
+        }
+    };
+    match outcome {
+        Some(Leg::Clean) => Ok(()),
+        Some(Leg::Abort) => {
+            let code = quinn::VarInt::from_u32(TUNNEL_ABORT_CODE);
+            let _ = send.reset(code);
+            let _ = recv.stop(code);
+            abort_local(&tcp);
+            Err(Error::MalformedTunnel("tunnel splice aborted"))
+        }
+        Some(Leg::Withdrawn) => {
+            let _ = recv.stop(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
+            let _ = send.reset(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
+            abort_local(&tcp);
+            Err(Error::TunnelRevoked(
+                "the host withdrew access to this service",
+            ))
+        }
+        None => {
+            // Reset rather than finish: a clean close is indistinguishable from the carried
+            // service hanging up, and the dialer deserves to know this was a decision.
+            let code = quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE);
+            let _ = send.reset(code);
+            let _ = recv.stop(code);
+            abort_local(&tcp);
+            Err(Error::TunnelRevoked("withdrawn mid-session"))
+        }
     }
 }
 
-/// The QUIC application error code a peer reset this stream with, if that is why the read
-/// failed.
+/// Make the imminent drop of `tcp` an RST rather than a FIN.
 ///
-/// quinn reports a reset by wrapping [`quinn::ReadError`] in an [`std::io::Error`], so the
-/// code survives the `AsyncRead` adapter but only behind a downcast. Any other failure —
-/// a lost connection, a closed socket — returns `None` and stays a generic splice error,
-/// which is the honest reading: those are not decisions anybody took.
-fn reset_reason(e: &std::io::Error) -> Option<u32> {
-    let read = e.get_ref()?.downcast_ref::<quinn::ReadError>()?;
-    match read {
-        quinn::ReadError::Reset(code) => u32::try_from(code.into_inner()).ok(),
-        _ => None,
-    }
+/// A zero linger is the portable way to ask for an abortive close, and it is the only
+/// way a tunnel end can say "this connection failed" to the application holding the other
+/// end of the TCP socket: anything gentler reads as the peer finishing normally.
+pub fn abort_local(tcp: &TcpStream) {
+    let _ = tcp.set_zero_linger();
 }

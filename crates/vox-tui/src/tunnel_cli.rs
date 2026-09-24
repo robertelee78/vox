@@ -403,7 +403,18 @@ pub async fn forward(
     println!("vox: {bound} → {tag:?} on {}", short(&host));
     println!("     e.g.  ssh -p {} user@{}", bound.port(), bound.ip());
     println!("     Ctrl-C to stop");
-    let _ = tokio::signal::ctrl_c().await;
+    // Keep reading events while forwarding, so a connection the host refused or cut says
+    // why here (PRD-001 R23). The application only ever sees its socket reset; waiting on
+    // Ctrl-C alone left the reason in a queue nobody read.
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            ev = node.next_event() => match ev {
+                Some(ref ev) => say_if_it_explains_a_failure(ev),
+                None => break,
+            },
+        }
+    }
     println!("vox: stopping the forward");
     let _ = node.apply(NodeCommand::StopForward { local: bound }).await;
     let _ = node.apply(NodeCommand::Shutdown).await;
@@ -648,7 +659,7 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
             eprintln!("vox: still relayed to {} — {reason}", short(peer));
         }
         NodeEvent::ProxyRefused { reason } => {
-            eprintln!("vox: refused a request — {reason}");
+            eprintln!("vox: tunnel refused or cut — {reason}");
         }
         NodeEvent::Stalled { what, millis } => {
             eprintln!("vox: busy {millis}ms — {what} — nobody could be answered");

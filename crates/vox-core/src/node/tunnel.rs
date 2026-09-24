@@ -14,9 +14,9 @@
 //!
 //! ## What is dark stays dark
 //! An untrusted dialer, a channel this node does not hold, a service it does not offer,
-//! and a local service that refuses the connection all end the same way: the accepted TCP
-//! connection closes. `TunnelStatus::Denied` distinguishes none of them, and neither does
-//! this.
+//! and a local service that refuses the connection all end the same way on the wire:
+//! `TunnelStatus::Denied`, which distinguishes none of them. The dialing node resets the
+//! application's connection and says, locally, that the host refused (PRD-001 R23).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -220,7 +220,9 @@ impl Forward {
     /// while still bound. `vox up` already asked its dialer per request; the forward now
     /// does the same, through the same [`up::open_tunnel`].
     ///
-    /// `report` hears, in words, when the host cut a session this forward was carrying.
+    /// `report` hears, in words, why a connection was refused or cut — the application only
+    /// sees its socket reset, and the host's refusal is uniform on purpose, but this node is
+    /// the operator's own and knows what it was told (PRD-001 R23).
     ///
     /// `local` must be a loopback address. This is the structural backstop for the rule
     /// the node actor enforces on the way in: the socket is created here and nowhere
@@ -263,16 +265,23 @@ impl Forward {
                 let report = Arc::clone(&report);
                 let tag = tag.clone();
                 tokio::spawn(async move {
-                    // One stream per connection, on whatever connection reaches the host now. A
-                    // refusal closes this connection and says nothing about why (dark services).
-                    if let Ok((send, recv)) =
-                        up::open_tunnel(dialer.as_ref(), &host, &channel_id, &tag).await
-                    {
-                        if let Err(Error::TunnelRevoked(_)) = session::splice(send, recv, app).await
-                        {
-                            report(format!(
-                                "the host withdrew access to {tag:?} — that session was cut"
-                            ));
+                    // One stream per connection, on whatever connection reaches the host now.
+                    match up::open_tunnel(dialer.as_ref(), &host, &channel_id, &tag).await {
+                        Ok((send, recv)) => {
+                            if let Err(Error::TunnelRevoked(_)) =
+                                session::splice(send, recv, app).await
+                            {
+                                report(format!(
+                                    "the host withdrew access to {tag:?} — that session was cut"
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            // Reset, not close: an application that sees a clean close after
+                            // its connect succeeded reads it as the service hanging up, and
+                            // retries a thing that will never work.
+                            session::abort_local(&app);
+                            report(up::refusal(&e, &format!("{tag:?}")));
                         }
                     }
                 });
