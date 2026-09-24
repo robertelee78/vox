@@ -2,7 +2,7 @@
 
 **Status**: implemented (M5, `crates/vox-core/src/log/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6).
+**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6). 2026-09-24 — PRD-001 R1/R3/R4/R5: the per-author quota is **removed** (wire code `0x06` reserved); a `WANT` is served clamped to what is held, merged, and bounded per session; a room's log is served only to that room's members and anchors. See §"Abuse resistance" and the 2026-09-24 Implementation notes.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
@@ -114,7 +114,16 @@ frontier, bit 1 = range-reconciliation); both peers use the highest bit both set
   `0x05 NEG {negentropy_msg}` (range-reconciliation payload).
 - **Frontier mode (default; required of every peer).** `HAVE` lists the feeds a peer holds; the receiver
   replies `WANT` with the missing `(author_id, from_seq..to_seq)` ranges; the holder streams `ENTRY`
-  frames (skeleton + any retained payloads) over a reliable QUIC stream (ADR-011).
+  frames (skeleton + any retained payloads) over a reliable QUIC stream (ADR-011). A `WANT` is the
+  peer's to write, so the holder trusts nothing in it for size: each author's ranges are merged and each
+  merged range walks only the entries actually held, and one session serves at most `MAX_SERVE_ENTRIES`
+  (1,024) entries / `MAX_SERVE_BYTES` (64 MiB) within `SERVE_BUDGET` (30 s). That bounds one session,
+  never a history: a requester that applied entries syncs again at once and asks for the rest, so a
+  catch-up of any size completes over as many sessions as it needs.
+- **Who is served (normative).** A node serves a room's log only to that room's **admitted authors**
+  and to **that room's anchors**, in both directions: a session it answers and a session it starts. The
+  stream-kind gate (ADR-016) only decides whether a peer may open a `sync` stream at all; the room is
+  named afterwards, in the stream's preamble, and must be checked against the peer.
 - **Range-reconciliation mode (used when both peers set bit 1; the default *above ~100 active authors*,
   where `HAVE` size dominates).** `NEG` frames carry Negentropy range-based set reconciliation over entry
   hashes (logarithmic rounds). The `NEG` body is **Negentropy v1** keyed by the **full 32-byte SHA-256
@@ -123,11 +132,11 @@ frontier, bit 1 = range-reconciliation); both peers use the highest bit both set
   for scale.
 
 **Abort / error signalling (normative).** Every hard-fail in the wire ADRs (floor-violation, ADR-003;
-unknown struct tag or algo ID; sync mode mismatch; signature/authenticator failure; quota breach) is
+unknown struct tag or algo ID; sync mode mismatch; signature/authenticator failure) is
 surfaced — never silently downgraded — by **closing the QUIC stream (or connection) with a Vox
 application error code**: `0x01` protocol-version-unsupported, `0x02` suite-below-floor (ADR-003),
-`0x03` unknown-struct-tag, `0x04` unknown-algo-id, `0x05` authenticator-invalid, `0x06` quota-exceeded,
-`0x07` sync-mode-unsupported, `0x08` epoch-mismatch, `0x09` transport-failed (the peer went away or the
+`0x03` unknown-struct-tag, `0x04` unknown-algo-id, `0x05` authenticator-invalid, `0x06` **reserved**
+(was quota-exceeded; the quota was removed 2026-09-24 and the code is never reused), `0x07` sync-mode-unsupported, `0x08` epoch-mismatch, `0x09` transport-failed (the peer went away or the
 stream reset — nothing about the protocol was wrong; added 2026-09-20, see Implementation notes). The peer logs the coded reason and surfaces it
 (ADR-014). This is the single wire-error contract referenced by ADR-003/ADR-011.
 
@@ -193,21 +202,27 @@ because automated punishment is only safe when the conflicting entries are *attr
   authority actions (admin grant/revoke) are treated as *provisional* until their causal neighborhood
   reconciles (ADR-007).
 
-**Abuse resistance (quantified).** There is no membership roster or admission gate (ADR-007); the log
+**Abuse resistance.** There is no membership roster or admission gate (ADR-007); the log
 acceptance predicate is instead **identity- and signature-bound**: an entry is accepted only if (a) it
 is authored by an identity that completed the authenticated channel join (CPace, ADR-005) for the
 current `(channelID, epoch)`, (b) it carries a valid per-author authenticator for its entry type
-(governance → root composite signature; content → composite or ADR-009 deniable), and (c) it is within
-that author's quota. Unauthenticated or wrong-epoch floods therefore cannot enter. Replication is
-bounded by **per-author quotas each peer enforces locally** — **defaults (channel-policy-tunable):
-≤ 1000 entries/hour and ≤ 50 MiB/epoch per author**; over-quota entries from that author are dropped
-(not relayed) and the over-quota event is surfaced as an abuse signal (like revocation churn). This
-directly bounds the **render-gating amplification** vector — because every ciphertext replicates to
-all members (§"Render-gating"), a joined author could otherwise force O(members) storage; the
-per-author byte
-cap is what makes that cost finite, and a member may always decline to relay/store beyond a peer's
-own configured ceiling. Pruning is *authenticated*: a payload may be dropped per TTL, but its signed
-skeleton entry remains, so pruning can never silently rewrite history.
+(governance → root composite signature; content → composite or ADR-009 deniable), and (c) it links
+into that author's feed (seq, `prev_hash`, skip-link, no fork). Unauthenticated or wrong-epoch floods
+therefore cannot enter.
+
+**There is no rate or volume limit on an admitted author** (PRD-001 R1/R3, decided 2026-09-24). An
+earlier revision bounded replication by per-author quotas — ≤ 1000 entries/hour and ≤ 50 MiB/epoch —
+and that is withdrawn: invitees are trusted, agents in a room must not be throttled, and the quota as
+built was also *wrong*, because it charged every stored entry again when a room was reopened, so a room
+could not be opened at all once one author had written a thousand entries (PRD-001 D1). The
+consequence is stated plainly: the **render-gating amplification** vector is not bounded by this ADR —
+every ciphertext replicates to all members (§"Render-gating"), so an admitted member can make every
+member store as much as it writes. The remedy for a member who abuses that is membership, not a quota:
+revoke consent and rotate (ADR-007). Agent loop control is out of scope for now (PRD-001 R3).
+What *is* bounded, because it is correctness and not policy, is the cost of a single sync request (§"Sync
+= anti-entropy": a `WANT` is clamped to what is held and each session is bounded) — never the size of a
+history. Pruning is *authenticated*: a payload may be dropped per TTL, but its signed skeleton entry
+remains, so pruning can never silently rewrite history.
 
 ## Consequences
 
@@ -234,8 +249,8 @@ skeleton entry remains, so pruning can never silently rewrite history.
 These record the concrete decisions made building this ADR (`crates/vox-core/src/log/`), so the spec and code stay in lockstep:
 
 - **Acceptance order (`Dag::accept_with_deniable`).** governance-must-be-attributable → frozen-author
-  refusal → duplicate → **admission → authenticator/structure verification → equivocation** → feed link
-  → quota. Equivocation is classified only for an entry that is admitted *and* authenticates, so an
+  refusal → duplicate → **admission → authenticator/structure verification → equivocation** → feed link.
+  (The trailing quota step was removed 2026-09-24.) Equivocation is classified only for an entry that is admitted *and* authenticates, so an
   attributable fork proof is self-authenticating by construction (both entries verified under the
   author's root) and a deniable-content alarm is raised only by an entry the ADR-009 epoch verifier
   accepts. A conflicting entry from an unadmitted author, one whose composite signature does not verify,
@@ -307,7 +322,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
 - **A non-entry frame in the drain phase is now a protocol violation, not something to ignore
   (2026-09-23).** This phase is defined as entries only, and tolerating anything else is what made
   the hold above free: a non-entry frame costs the sender nothing, never reaches `apply_entry`, and
-  so never touches the quota meant to bound the exchange. This is a **wire-visible behaviour
+  so never touches the quota that then bounded the exchange (since removed). This is a **wire-visible behaviour
   change**, recorded as such: a sender that emits a non-entry frame mid-drain now has the session
   failed rather than the frame skipped. Unknown frame *ids* are still rejected separately by
   `decode_frame`, so this is not the RFC 9000 §12.4 "ignore what you do not know" case.
@@ -318,6 +333,48 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   have dropped records systematically whenever a sync was in flight — trading a visible stall for a
   silent loss. The fix is for the exchange not to hold the lock across network waits, which is a
   change to this ADR's implementation and not to a constant.
+
+- **The per-author quota is removed (2026-09-24, PRD-001 D1/R1/R3).** `log/quota.rs` is deleted, both
+  its limits with it: the 1,000-entries-per-hour rate *and* the 50 MiB-per-epoch byte total, because the
+  byte total was a cumulative per-author cap on history within an epoch — a lifetime limit, which R1
+  forbids. `Dag::accept` no longer takes a clock. `WireError::QuotaExceeded` is gone and `0x06` is
+  reserved: `from_code(0x06)` is `None`, like any unknown code. The defect it closes was worse than
+  throttling: replaying a room's stored log on open charged every entry to the quota in one burst, so a
+  room with more than a thousand entries from one author failed to open with "stored entry failed
+  acceptance", and the 1,001st local post was refused outright.
+  **Gate** (`crates/vox-core/tests/a_room_has_no_history_limit.rs`, release): one author posts 1,500
+  messages; the node restarts and the room reopens with all 1,500 readable; a new member joins cold and
+  its log reaches all 1,500 entries with no further command (observed: 1,024 after the first session,
+  1,500 after the second, ~7 s). Mutation: the quota restored in `Dag::accept` → red at post 1,001;
+  restored on the reopen path only → red at the reopen.
+- **A `WANT` is bounded by what is held (2026-09-24, PRD-001 D2/R4).** `entries_for_wants` looped
+  `from_seq..=to_seq` — one lookup per *number* — collecting into memory with the room's lock held, so
+  `WANT (author, 1, u64::MAX)` from any member spun a core for ever and nothing else could touch the
+  room. Now each author's ranges are sorted and merged (duplicates and overlaps cost nothing and serve
+  nothing twice), each merged range walks `Feed::range` over the entries actually held, and a session
+  serves at most `MAX_SERVE_ENTRIES` / `MAX_SERVE_BYTES` within `SERVE_BUDGET`, always at least one
+  entry. The continuation is the existing one: a sync that applied entries marks a push, so the
+  requester comes straight back for the rest.
+  **Gate** (`a_want_cannot_wedge_a_room.rs`, release): a real member's identity, over a real
+  connection, sends `WANT` with 1,000 copies of `(victim, 1, u64::MAX)` plus an unheld feed and an
+  inverted range; an ordinary post into the room on the victim completes (observed 7 ms) and the
+  attacker receives each of the 50 held entries exactly once. Mutation: the old loop → the post gets no
+  answer in 5 s; ranges not merged → 1,024 entries served for 50 held.
+- **Sync is bound to the room (2026-09-24, PRD-001 D5/R5).** `run_sync_session` received the peer's
+  identity and discarded it, so any member of any room this node held could name another room's channel
+  id in the preamble and be served its log; and a fresh connection pushed every open room to the peer,
+  serving whatever it then asked for. Both directions now require the peer to be an admitted author of
+  *that* room or one of *that* room's anchors (`ChannelState::anchors`, which includes the node's
+  configured anchors); for a room this node only anchors, an author its board knows. Before refusing an
+  inbound session the node admits from its own board's bundle records (the same M17.6 evidence as
+  everywhere), so a member who joined through somebody else is not refused for being new. A refused
+  inbound session gets the same coded reset as a stream kind the peer may not open; a refused outbound
+  one reports through `SyncDone`, so the room's in-flight mark is released as on every other exit.
+  **Gate** (`sync_serves_a_room_only_to_its_members.rs`, release): the victim holds rooms A and B; a
+  member of A only, using its own identity, is served A in full (the control) and asks for B five times —
+  zero sessions answered, zero entries; the victim's own push on a fresh connection carries A and nothing
+  of B; a member of B still syncs all of B. Mutation: the inbound check removed → 25 of B's entries over
+  5 answered sessions; the outbound check removed → the victim pushes B's 5 entries itself.
 
 ## Links
 **Depends on**: ADR-002, ADR-006.

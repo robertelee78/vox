@@ -170,6 +170,17 @@ impl Feed {
         self.entries.values()
     }
 
+    /// The entries this feed **holds** with `from <= seq <= to`, in ascending seq
+    /// order. The cost is bounded by what is stored, never by the numbers asked
+    /// for: a peer's `WANT (author, 1, u64::MAX)` walks this feed's entries, not
+    /// eighteen quintillion lookups (PRD-001 R4). An inverted range is empty.
+    pub fn range(&self, from: u64, to: u64) -> impl Iterator<Item = &Entry> {
+        (from <= to)
+            .then(|| self.entries.range(from..=to).map(|(_, e)| e))
+            .into_iter()
+            .flatten()
+    }
+
     /// Append `entry` as the next contiguous entry, validating it links correctly.
     ///
     /// Enforces, in order: single author; `seq == max_seq + 1` (contiguous,
@@ -193,9 +204,9 @@ impl Feed {
 
     /// Validate that `entry` would be a legal next append — single author,
     /// contiguous monotonic `seq`, no append past end-of-feed, and correct
-    /// `prev_hash`/`lipmaa_backlink` — **without** mutating the feed. The caller
-    /// uses this to gate side effects (e.g. committing quota) before the insert,
-    /// so a later rejection never leaves partial state.
+    /// `prev_hash`/`lipmaa_backlink` — **without** mutating the feed, so a caller
+    /// can gate side effects on it before the insert and a later rejection never
+    /// leaves partial state.
     pub fn validate_next(&self, entry: &Entry) -> Result<()> {
         let seq = entry.skeleton.seq;
 

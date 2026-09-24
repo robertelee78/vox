@@ -1934,7 +1934,7 @@ impl Node {
         };
         let now = self.now();
         let opened =
-            crate::node::anchor::AnchorState::open(&store, sek, channel_id, now).or_else(|_| {
+            crate::node::anchor::AnchorState::open(&store, sek, channel_id).or_else(|_| {
                 let sek = self
                     .anchor_sek(channel_id)
                     .ok_or(Error::Profile("no anchor key"))?;
@@ -1993,12 +1993,11 @@ impl Node {
         let (Some(store), Some(net)) = (self.log_store(), self.net.as_ref().map(Arc::clone)) else {
             return Ok(());
         };
-        let now = self.now();
         for cid in store.anchored_channels()? {
             let Some(sek) = self.anchor_sek(&cid) else {
                 continue;
             };
-            if let Ok(state) = crate::node::anchor::AnchorState::open(&store, sek, &cid, now) {
+            if let Ok(state) = crate::node::anchor::AnchorState::open(&store, sek, &cid) {
                 let _ = net.publish_local(&state.genesis().to_wire());
                 self.anchored
                     .insert(cid, Arc::new(tokio::sync::Mutex::new(state)));
@@ -2278,8 +2277,9 @@ impl Node {
                 send,
                 recv,
             } => {
-                let _ = (&conn, peer);
-                self.run_sync_session(channel_id, epoch, send, recv).await;
+                let _ = &conn;
+                self.run_sync_session(peer, channel_id, epoch, send, recv)
+                    .await;
             }
             NetEvent::AddressesDiscovered { mappings } => {
                 // Re-publish every open channel's records: the addresses in them were
@@ -3954,6 +3954,27 @@ impl Node {
                 }
                 SessionTarget::Anchored(state) => state.lock().await.epoch(),
             };
+            // A room's log goes only to that room's members and anchors (PRD-001 R5), and that
+            // holds for a session this node starts as much as for one it answers: a fresh
+            // connection reconciles *every* open room with the peer (see `run_due_syncs`), and the
+            // session serves whatever the peer then asks for. Asked only now, after the board was
+            // read, so a member who just joined through somebody else has been learned first.
+            let allowed = match &target {
+                SessionTarget::Channel(shared) => {
+                    let ch = shared.lock().await;
+                    ch.is_author(&peer) || ch.anchors().nodes().iter().any(|a| a.id == peer)
+                }
+                SessionTarget::Anchored(state) => state.lock().await.is_author(&peer),
+            };
+            if !allowed {
+                let _ = tx
+                    .send(NetEvent::SyncDone {
+                        channel_id: cid,
+                        outcome: Err(Error::StreamRefused("peer is not a member of this room")),
+                    })
+                    .await;
+                return;
+            }
             // 2. Open the stream. Also a round trip.
             //
             // **A stream that will not open still reports.** This returned without a word, and the
@@ -3984,7 +4005,7 @@ impl Node {
                         shared.blocking_lock().sync_over(&store, &mut t, now)
                     }
                     SessionTarget::Anchored(state) => {
-                        state.blocking_lock().sync_over(&store, &mut t, now)
+                        state.blocking_lock().sync_over(&store, &mut t)
                     }
                 }
             })
@@ -4037,7 +4058,7 @@ impl Node {
                         shared.blocking_lock().sync_over(&store, &mut t, now)
                     }
                     SessionTarget::Anchored(state) => {
-                        state.blocking_lock().sync_over(&store, &mut t, now)
+                        state.blocking_lock().sync_over(&store, &mut t)
                     }
                 }
             })
@@ -4088,8 +4109,16 @@ impl Node {
     /// actor is the only writer of channel state and anything it awaits inline stops the whole
     /// node, so it must never wait on an untrusted peer to speak. What it does here is local
     /// and ordered, which is what the single-task design is for.
+    ///
+    /// **Only a member of *this* room is served its log** (PRD-001 R5). The stream-kind gate
+    /// in `node::net` asks whether the peer may open a sync stream *at all*, which any member
+    /// of any room this node holds may — and the preamble then names whichever channel the
+    /// peer likes. Nothing here checked the two against each other, so a member of room A who
+    /// had ever seen room B's `.vox` name was handed B's whole log (PRD-001 D5). See
+    /// [`Self::may_sync`] for who counts.
     async fn run_sync_session(
         &mut self,
+        peer: Digest32,
         channel_id: Digest32,
         epoch: u64,
         send: quinn::SendStream,
@@ -4131,8 +4160,66 @@ impl Node {
         if !matches_epoch {
             return;
         }
+        if !self.may_sync(&channel_id, &peer, epoch).await {
+            // Refused explicitly, with the same coded reset as a stream kind the peer may not
+            // open, rather than left to read for a frame that never comes.
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream(&mut send, &mut recv);
+            return;
+        }
         let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
         self.start_session(channel_id, transport);
+    }
+
+    /// Whether `peer` may reconcile `channel_id`'s log with this node.
+    ///
+    /// - An **admitted author** of that room. If it is not one yet, this node's own board is
+    ///   consulted first — local, so cheap — because a member that joined through somebody
+    ///   else is on the board before it is in this node's author table, and refusing it for
+    ///   that would be the "precondition behind its own check" defect `run_due_syncs` documents.
+    ///   Admission there takes the same M17.6 evidence as everywhere else.
+    /// - An **anchor of that room** — in the room's own anchor set, which holds this node's
+    ///   configured anchors and those the room's link named. It keeps the room's ciphertext by
+    ///   design (ADR-016 M15.2b) for members who are away. An anchor named only by *another*
+    ///   room's link is not an anchor of this one.
+    ///
+    /// For a room this node only anchors, the peer must be an author the board knows.
+    async fn may_sync(&mut self, channel_id: &Digest32, peer: &Digest32, epoch: u64) -> bool {
+        if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
+            {
+                let channel = shared.lock().await;
+                if channel.is_author(peer)
+                    || channel.anchors().nodes().iter().any(|a| a.id == *peer)
+                {
+                    return true;
+                }
+            }
+            let (Some(net), Some(store)) = (
+                self.net.as_ref().map(Arc::clone),
+                self.profile.as_ref().map(Profile::store_handle),
+            ) else {
+                return false;
+            };
+            let bundles = net.board_bundles(channel_id, epoch);
+            if !bundles.iter().any(|b| b.author_id == *peer) {
+                return false;
+            }
+            let now = self.now();
+            let mut channel = shared.lock().await;
+            let _ = admit_board_records(
+                &mut channel,
+                &store,
+                &bundles,
+                ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+                now,
+            )
+            .await;
+            return channel.is_author(peer);
+        }
+        if let Some(state) = self.anchored.get(channel_id) {
+            return state.lock().await.is_author(peer);
+        }
+        false
     }
 
     /// Accept an inbound [`PairwiseFrame::Hello`], establishing the responder half of

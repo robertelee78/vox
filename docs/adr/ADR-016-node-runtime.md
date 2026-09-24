@@ -126,7 +126,8 @@ decrypt/author paths require — not a configuration flag.
 
 - **Engine.** `redb` (pure Rust, copy-on-write B-tree, ACID, single writer / MVCC readers, single
   file, stable on-disk format). It was chosen over `fjall` (pure-Rust LSM): Vox's write rate is
-  bounded by design (ADR-008 quotas), every stored value is an already-sealed blob, the single-writer
+  that of people and agents in invited rooms (the ADR-008 quotas that once capped it were removed
+  2026-09-24, PRD-001 R3), every stored value is an already-sealed blob, the single-writer
   constraint matches the actor, and a two-crate dependency with no background threads and a
   one-sentence crash model ("the last committed state is what you get") is the right posture for a
   file that holds sealed key material. Space reclamation is an explicit `compact()` the node runs
@@ -258,8 +259,12 @@ Two supporting facts follow from moving it:
   tunnel or stream through the anchor when both direct and punched paths fail) remains ADR-013's
   mechanism and is a named later capability; ADR-012's availability model does not need it —
   a channel's log reaches an offline member through the anchor's *store*, not through a live relay.
-- **Sync scheduling (ADR-008).** On every new connection, a frontier session for each channel both
-  peers hold; every 30 seconds while connected; and a push immediately after a local append. Range
+- **Sync scheduling (ADR-008).** A session for a room runs only with a peer that is an admitted
+  author of that room or one of its anchors — in both directions, checked after the stream-kind gate
+  because the room is only named in the stream's preamble (ADR-008 §"Who is served", PRD-001 R5,
+  gated by `sync_serves_a_room_only_to_its_members.rs`). An anchor keeps syncing the rooms it keeps
+  with those rooms' members, which its board vouches for. On every new connection, a frontier
+  session for each channel both peers hold; every 30 seconds while connected; and a push immediately after a local append. Range
   reconciliation (`range_reconcile_exchange`) is wired over `QuicStreamTransport` and selected when a
   channel exceeds 100 authors, as the ADR requires at scale. The anchor participates as an ordinary
   peer whose `AuthorResolver` is built from the channel's genesis, admin certificates and the

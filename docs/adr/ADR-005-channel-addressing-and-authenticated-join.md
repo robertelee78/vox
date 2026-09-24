@@ -80,17 +80,19 @@ concrete, non-bypassable layers rather than rate-limiting alone:
    (≈200–500 ms)** — not zero — so a leaked channelID cannot cheaply flood the swarm; literal zero is
    reserved for explicitly LAN/closed deployments. Per-sender consent remains the real read-gate
    regardless.
-3. **Identity-bound log acceptance + per-author quotas.** Joining the swarm grants no authority to be
+3. **Identity-bound log acceptance.** Joining the swarm grants no authority to be
    *rendered*: the causal log accepts entries only from identities that completed the authenticated
-   join and carry valid per-author composite signatures, each bounded by per-author entry/byte quotas
-   (ADR-008). No amount of passphrase guessing yields readable content or unbounded write authority —
+   join and carry valid per-author composite signatures (ADR-008). *(The per-author entry/byte quotas
+   this item used to name were removed 2026-09-24, PRD-001 R3: an admitted member is trusted and is not
+   rate-limited.)* No amount of passphrase guessing yields readable content or unbounded write authority —
    there is no admin-signed membership certificate to forge (ADR-007), because there is no membership
    certificate at all.
 
 Rate-limiting by peers remains a cheap first filter but is explicitly **not** the security boundary.
 **Bandwidth abuse beyond join** (a joined member spamming the log or rendezvous, or forcing
-render-gating amplification) is bounded by the per-author log quotas (ADR-008) and rendezvous-record
-caps (ADR-012), not by join PoW.
+render-gating amplification) is **not** bounded by a log quota — there is none since 2026-09-24
+(PRD-001 R3) — but by membership itself: such a member is revoked and the channel rotated (ADR-007).
+Rendezvous-record caps (ADR-012) still bound the board, and join PoW bounds none of it.
 
 ### Implementation notes (normative)
 

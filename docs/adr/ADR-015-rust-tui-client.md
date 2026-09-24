@@ -194,8 +194,9 @@ A terminal has no camera, so the strong scan path is **relocated to the peer's d
 ### Error & offline UX
 
 - A persistent **status bar** plus a **dismissible alert log**. The **ADR-008 wire error codes
-  `0x01`–`0x08`** map to human strings; join failures (wrong passphrase, Equihash PoW delay, PoP
-  mismatch), unreachable-peer / "both must be online", epoch mismatch, quota, key-change, and
+  `0x01`–`0x08`** map to human strings (`0x06`, the removed quota's code, is reserved and reads as
+  malformed like any unknown code); join failures (wrong passphrase, Equihash PoW delay, PoP
+  mismatch), unreachable-peer / "both must be online", epoch mismatch, key-change, and
   missing-consent ("you'll see them once they consent") each render as a visible state with a recovery
   action — never a silent failure.
 
