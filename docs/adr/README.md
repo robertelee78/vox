@@ -24,6 +24,8 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [015](ADR-015-rust-tui-client.md) | Rust TUI Client (chat, swarm create/join, verification) | 002, 005–010, 012, 013 |
 | [016](ADR-016-node-runtime.md) | Node Runtime — composing the core (persistence, rendezvous service, join over the network, sync, headless anchor) | 002, 003, 005–008, 010–013, 015 |
 | [017](ADR-017-room-bound-services.md) | Room-Bound Services (the Tor-hidden-service equivalent) | 005, 007, 012, 013, 016 |
+| [018](ADR-018-quality-bar-and-product-proof.md) | Quality Bar — the Product-Proof Harness is the Test Authority | 001 |
+| [019](ADR-019-pure-rust-tls-provider.md) | A Pure-Rust TLS Crypto Provider | 001, 003, 011 |
 | [020](ADR-020-agent-comms.md) | Agent Comms (a room-based messaging app for AI coding agents across hosts) | 007, 008, 012, 016, 017, 018 |
 | [021](ADR-021-work-item-interop.md) | Work-Item Interop (the contract Vox exposes to an external work tracker) | 008, 018, 020 |
 
@@ -43,7 +45,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
   semantics still live inside `vox-core`, and extracting them into a sibling `vox-chat` crate is the
   follow-on this tier anticipates.
 
-## Status (2026-09-21)
+## Status (2026-09-24)
 
 Each ADR's `Status` line is authoritative; this is the roll-up. Every ADR is grounded in a multi-pass
 research effort (Signal/PQXDH, Sender Keys/Megolm, MLS, SSB/Hypercore/Merkle-DAG, CPace/PAKE,
@@ -69,7 +71,9 @@ QUIC/DCUtR, NAT/IPv6, deniable authentication).
 | 016 | implemented (M13–M15) | node runtime: M13 single device ✓, M14 two machines over the real network ✓, M15 anchors + headless anchor ✓ |
 | 017 | implemented (M17.1–M17.3) | room-bound services: genesis service grant, `vox serve`/`vox connect`, `.vox` names resolved by the `vox up` SOCKS5 entry point |
 | 018 | accepted — **in force** | quality bar: unit tests removed (M18.2 ✓), distribution proved as built (M18.2a ✓), the node/edge/journey harness outstanding (M18.3) |
-| 020 | proposed — not started | agent comms: `crates/vox-agentcomms` (the app tier's first crate) over new `vox-core` IPC/event fan-out and a local trust keyring. Both unknowns spiked 2026-09-21 — fan-out measured, harness drain resolved to a `UserPromptSubmit` hook. No wire change. |
+| 019 | proposed — not started | pure-Rust TLS crypto provider |
+| 020 | partly implemented | agent comms: `crates/vox-agentcomms` over the `vox-core` IPC/event fan-out and the trust keyring; M19.1–M19.9 done, M19.10–M19.12 decided and not built. Its claim protocol is corrected by ADR-021; open defects F12, F15 and F17 recorded there. No wire change. |
+| 021 | implemented on PR #14, not yet on `main` (M21.1–M21.8); M21.9–M21.10 decided | work-item interop: session-scoped claims, pending handoffs, bound renewals, op ids, the exact-version gate, a gapless `tail --json`, `board --json`, structured `post`. Vox holds no work state; an external tracker owns it. No wire change. |
 
 **The node runtime that composes the layers is in.** ADR-016 landed through M15 — join, per-sender
 consent and log sync run between separate hosts over QUIC, through the full NAT ladder, relayed by an
