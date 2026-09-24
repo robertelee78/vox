@@ -88,7 +88,7 @@ impl QuicStreamTransport {
 impl Transport for QuicStreamTransport {
     fn send(&mut self, frame: &[u8]) -> Result<()> {
         if self.closed.is_some() {
-            return Err(Error::MalformedBundle("quic transport: send after close"));
+            return Err(Error::Unreachable("quic transport: send after close"));
         }
         let send = &mut self.send;
         let bound = self.frame_timeout;
