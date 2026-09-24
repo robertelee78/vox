@@ -1157,6 +1157,9 @@ pub struct Node {
     /// message posted right after a join crossed in 20s or 40s — one and two frame timeouts — instead
     /// of the 0-1s it takes when the rooms are free.
     syncing: std::collections::BTreeSet<Digest32>,
+    /// A local append (or a finished session with pushes still owed) wants `run_due_syncs` now
+    /// rather than at the next tick. See `push_if_owed`.
+    push_now: bool,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012).
     record_seq: BTreeMap<Digest32, u64>,
@@ -1302,6 +1305,7 @@ impl Node {
             join_slots: Arc::new(tokio::sync::Semaphore::new(JOINS_IN_FLIGHT)),
             join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
+            push_now: false,
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
             prekeys: None,
@@ -1362,6 +1366,7 @@ impl Node {
                     if shutdown {
                         break;
                     }
+                    self.push_if_owed().await;
                 }
                 Some(event) = net_rx.recv() => {
                     let name = net_event_name(&event);
@@ -1369,6 +1374,7 @@ impl Node {
                     self.handle_net(event).await;
                     self.note_if_stalled(name, started);
                     self.publish().await;
+                    self.push_if_owed().await;
                 }
                 _ = ticker.tick() => {
                     if let Some(net) = self.net.as_ref() {
@@ -2322,6 +2328,10 @@ impl Node {
                 outcome,
             } => {
                 self.syncing.remove(&channel_id);
+                // A push that found this room mid-session is owed; the room is free now.
+                if !self.pending_push.is_empty() {
+                    self.push_now = true;
+                }
                 self.refresh_network_view().await;
                 if let Ok(o) = outcome {
                     // **Event, not interval.** Propagation was event-driven in one direction only:
@@ -3654,6 +3664,7 @@ impl Node {
         if self.net.is_none() {
             return;
         }
+        self.push_now = true;
         self.pending_push.insert(*channel_id);
         for schedule in self.schedules.values_mut() {
             schedule.note_local_append();
@@ -3691,6 +3702,23 @@ impl Node {
             let mappings = net.refresh_advertised().await;
             let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
         });
+    }
+
+    /// Push what a local append made due **now**, rather than at the next tick.
+    ///
+    /// A message was marked due by `note_local_append` and then waited for `TICK` — up to a full
+    /// second — before anything sent it: PRD-001 R40 asks for chat under a second, and measured
+    /// through the real binary the median was 322–894ms with a maximum of 1.021s, the tick's own
+    /// shape. Run after the command or event that made the push due, and after its reply, so the
+    /// command's own latency is unchanged.
+    ///
+    /// A burst coalesces for free: a room mid-session is owed rather than re-sent (see
+    /// `run_due_syncs`), and the session's `SyncDone` re-arms this while pushes are still owed, so
+    /// posts go out back to back instead of one per tick.
+    async fn push_if_owed(&mut self) {
+        if std::mem::take(&mut self.push_now) && self.run_due_syncs().await {
+            self.publish().await;
+        }
     }
 
     async fn run_due_syncs(&mut self) -> bool {
