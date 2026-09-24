@@ -2660,6 +2660,13 @@ impl Node {
         if let Some(net) = self.net.as_ref() {
             net.policy().forget_joiner(&peer);
         }
+        // **Consent at admission, not on the tick** (ADR-021 F12). A room is ForwardOnly:
+        // a newcomer reads only what is sealed after the key is released to it. With the
+        // joiner already in this node's trust ring, leaving the release to the next tick
+        // opened a window in which anything this node posted was unreadable to the
+        // joiner for good. The actor is serial, so releasing here — before any later
+        // command is served — means everything posted after the join is readable.
+        self.deliver_owed_consents().await;
         let _ = self
             .event_tx
             .send(NodeEvent::PeerJoined { channel_id, peer });
