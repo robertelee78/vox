@@ -1320,6 +1320,11 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         let Some(body) = read_frame(&mut stream).await? else {
             return Ok(());
         };
+        // PRD-001 R35: `vox status`. Answered, and the connection serves on.
+        if crate::node::status::is_request(&body) {
+            crate::node::status::serve(&mut stream, &handle).await?;
+            continue;
+        }
         // Protocol 6: an app request turns the connection into an app connection for
         // the rest of its life (ADR-022 decision 7, `node::appipc`).
         if let Some(app) = crate::node::appipc::AppRequest::parse(&body) {

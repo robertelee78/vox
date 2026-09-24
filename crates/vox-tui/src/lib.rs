@@ -28,6 +28,7 @@ pub mod qr;
 pub mod room_cli;
 pub mod shell;
 pub mod state;
+pub mod status_cli;
 pub mod tunnel_cli;
 pub mod ui;
 pub mod update;

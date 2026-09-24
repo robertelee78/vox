@@ -350,7 +350,7 @@ where
             send_frame(&mut send, &CircuitFrame::Opened).await?;
             let mut flow = asker_conn.bind_flow(send, recv)?;
             flow.cap_datagrams(CIRCUIT_DATAGRAM_MAX);
-            let port = endpoint.attach_circuit(&origin)?;
+            let port = endpoint.attach_circuit_via(&origin, &peer)?;
             tokio::spawn(terminate(port, flow));
             Ok(())
         }
@@ -386,7 +386,7 @@ pub async fn connect_through(
     }
     let mut flow = relay.bind_flow(send, recv)?;
     flow.cap_datagrams(CIRCUIT_DATAGRAM_MAX);
-    let port = endpoint.attach_circuit(&peer)?;
+    let port = endpoint.attach_circuit_via(&peer, &relay.peer_id())?;
     // Read before the port moves into the driver: the address is allocated per circuit,
     // so the port is the only thing that knows it.
     let target = port.addr();

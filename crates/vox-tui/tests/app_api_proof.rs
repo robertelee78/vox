@@ -779,6 +779,10 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
         // anywhere from ~30 ms to ~1.03 s here (measured, three runs). ADR-022's "under
         // 1 s" is therefore not a bound anything can meet; what 200 stalled app streams
         // must not do is add to it.
+        //
+        // **Temporary.** The tick is itself a defect against PRD-001 R40 (a chat message
+        // arrives in under 1 s). When R40's fix to the sync scheduling lands, this bound
+        // returns to 1 s.
         assert!(
             took < Duration::from_millis(1500),
             "a room message took {took:?} behind 200 stalled app streams"

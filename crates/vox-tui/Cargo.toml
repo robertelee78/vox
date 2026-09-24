@@ -52,5 +52,10 @@ serde_json.workspace = true
 semver.workspace = true
 rustix.workspace = true
 
-# No `[dev-dependencies]`: `tempfile` is a normal dependency above and is in scope for the
-# integration proofs too.
+# `tempfile` is a normal dependency above and is in scope for the integration proofs too.
+
+[dev-dependencies]
+# The status proof forces a relayed path on vox-core's simulated NAT network
+# (`tests/support/vnet.rs`), which is written against quinn's socket traits. Same
+# workspace pin as vox-core, so it is the same quinn.
+quinn.workspace = true
