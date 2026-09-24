@@ -1202,6 +1202,9 @@ pub struct Node {
     /// A local append (or a finished session with pushes still owed) wants `run_due_syncs` now
     /// rather than at the next tick. See `push_if_owed`.
     push_now: bool,
+    /// Rooms whose anchor publish found them mid-session: run when that session's `SyncDone`
+    /// lands. See `publish_channel_to_anchors`.
+    publish_owed: std::collections::BTreeSet<Digest32>,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012).
     record_seq: BTreeMap<Digest32, u64>,
@@ -1364,6 +1367,7 @@ impl Node {
             join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
             push_now: false,
+            publish_owed: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
             initiated: BTreeMap::new(),
@@ -2177,6 +2181,20 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
+        // **Never wait on a room a session holds.** Building the records takes the room's lock, and
+        // a sync session holds that lock for its whole run on a blocking thread — bounded only by
+        // the 20s frame timeout when the peer is slow. Measured through the real binaries with the
+        // wait timed: `publish waited 19.9987s for the ROOM lock`, against `busy 20005ms — passing on
+        // a record that landed on our board`, while every put on the wire took under 22ms. It was
+        // also half of a cycle: this actor waiting on its room, whose session waited on a peer
+        // whose actor was waiting the same way, broken only by the frame timeout.
+        //
+        // Owed instead, and run the moment that session's `SyncDone` lands — still on the actor, so
+        // anything that follows a publish still follows it.
+        if self.syncing.contains(channel_id) {
+            self.publish_owed.insert(*channel_id);
+            return;
+        }
         let anchors: Vec<Arc<VoxConnection>> = self
             .anchor_ids
             .iter()
@@ -2416,6 +2434,9 @@ impl Node {
                 } else if !self.pending_push.is_empty() {
                     // A push that found this room mid-session is owed; the room is free now.
                     self.push_now = true;
+                }
+                if self.publish_owed.remove(&channel_id) {
+                    self.publish_channel_to_anchors(&channel_id).await;
                 }
                 self.refresh_network_view().await;
                 if let Ok(o) = outcome {
