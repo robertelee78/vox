@@ -951,6 +951,21 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   prompt push: 27.1 s and 21.7 s, red. Mutation, no board offer: 27.6 s and 26.4 s, red. R40 is
   unaffected: relayed p95 64 ms, direct p95 31 ms.
 
+- **A node that stops tells its relayed peers (2026-09-25, v0.2.10).** Closing every connection at
+  once closed each circuit's carrier in the same instant as the relayed connection riding it, so the
+  relayed peer never received the CONNECTION_CLOSE. It learned the node was gone only by inference:
+  after `SILENCE_IS_DEATH` (30 s), or, with V29-15, by reading the severed circuit as no longer a
+  direct path. `stop_network` now closes relayed connections first, waits `RELAYED_CLOSE_LEAD`
+  (50 ms), then closes the rest.
+  **Both mechanisms stay, for different paths.** V29-15's inference is what a peer has after a crash,
+  when there is no close to receive. The ordered close is what an orderly stop owes its peers.
+  On `m15_members_never_online_together`:
+  - 33.3 s in 10 of 12 runs with neither;
+  - 107–115 ms with this ordering alone (3 of 3);
+  - 2.3–4.9 s with V29-15 alone (5 of 5).
+
+  Its gate now bounds the anchor taking Alice's post at 10 s. Mutation (everything closed at once, no
+  V29-15): 31.0 s and 30.5 s, red.
 - **One dead member no longer stalls a room for everyone (2026-09-25, v0.2.10).** A push reconciles
   the room with a member and waits for its answer. When that member's process died without closing
   its connections, nothing answered until the connection was declared dead (`SILENCE_IS_DEATH`,

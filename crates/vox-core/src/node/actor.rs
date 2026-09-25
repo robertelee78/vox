@@ -116,6 +116,11 @@ const TICK: Duration = Duration::from_secs(1);
 /// dial to one member it cannot currently reach. See `reach_member`.
 const MEMBER_REDIAL_SECS: u64 = 30;
 
+/// How long relayed connections' closes get to leave through their circuits before the circuits'
+/// carrier connections are closed too (see `stop_network`). The frame only has to be handed to the
+/// circuit's stream, which happens on the endpoint driver's next turn.
+const RELAYED_CLOSE_LEAD: Duration = Duration::from_millis(50);
+
 /// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
@@ -2102,7 +2107,7 @@ impl Node {
         }
         // Channel closed or shutdown: lock (wipe every SEK + the signer) and stop.
         let store = self.log_store();
-        self.stop_network();
+        self.stop_network().await;
         self.lock_all().await;
         self.publish().await;
         let _ = self.event_tx.send(NodeEvent::Shutdown);
@@ -2450,8 +2455,19 @@ impl Node {
 
     /// Tear the network down: close every connection and the endpoint, so a locked
     /// node presents no network identity at all.
-    fn stop_network(&mut self) {
+    async fn stop_network(&mut self) {
         if let Some(net) = self.net.take() {
+            // **Relayed connections first**, while the circuits their closes travel in still run,
+            // then everything else. Closing them all at once closed each circuit's carrier in the
+            // same instant, so a relayed peer never received the CONNECTION_CLOSE. It learned this
+            // node was gone only by inference: from `SILENCE_IS_DEATH` (30 s), or, since V29-15,
+            // from reading the severed circuit as not a direct path. Inference is the fallback for
+            // a crash. A node that is stopping **says** it is leaving, which is what a close is for.
+            // Measured on `m15_members_never_online_together`: 33.3 s in 10 of 12 runs without
+            // either, 107–115 ms with this ordering alone.
+            if net.manager().close_relayed() > 0 {
+                tokio::time::sleep(RELAYED_CLOSE_LEAD).await;
+            }
             net.manager().close_all();
             net.manager().endpoint().close();
         }
@@ -5951,7 +5967,7 @@ impl Node {
         self.reopen.clear();
         // And take the network down: a locked node has no identity to present, so it
         // must not keep serving or holding connections (M14.7d).
-        self.stop_network();
+        self.stop_network().await;
         if let Some(p) = self.profile.as_mut() {
             p.lock();
         }

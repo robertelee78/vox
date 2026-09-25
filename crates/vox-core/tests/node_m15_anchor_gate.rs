@@ -42,6 +42,11 @@ use vox_core::node::paths::Paths;
 /// extra cost is real and is paid once per pair; it is not a regression to hide.
 const TIMEOUT: Duration = Duration::from_secs(240);
 
+/// How soon after Alice posts the anchor must hold the post, in the never-online-together gate.
+/// Well under the 30 s a departed peer's silence takes to be noticed, which is what it measured
+/// before the fix.
+const ANCHOR_TAKES: Duration = Duration::from_secs(10);
+
 fn secret(s: &str) -> Secret {
     Secret::new(s.as_bytes().to_vec())
 }
@@ -446,6 +451,7 @@ fn m15_members_never_online_together_converge_through_the_anchor() {
         assert!(bob.apply(NodeCommand::Shutdown).await.is_done());
 
         // ---- Alice speaks into an empty room; the anchor takes it ----
+        let spoke = std::time::Instant::now();
         assert!(alice
             .apply(NodeCommand::SendText {
                 channel_id: cid,
@@ -489,6 +495,19 @@ fn m15_members_never_online_together_converge_through_the_anchor() {
         })
         .await
         .expect("the anchor holds the whole log Alice has");
+        // **Promptly, not on the next interval.** Bob leaving closed his relayed connection to
+        // Alice at the same instant as the circuit it rode, so the close never reached her. Her
+        // push of this post to Bob then held the room for `SILENCE_IS_DEATH` (30 s), refusing the
+        // anchor's sessions for it: this gate took 33.3 s in 10 of 12 runs. A departing node now
+        // closes its relayed connections first (`stop_network`).
+        let took = spoke.elapsed();
+        eprintln!("the anchor held Alice's post {took:?} after she sent it (bound {ANCHOR_TAKES:?})");
+        assert!(
+            took <= ANCHOR_TAKES,
+            "the anchor held Alice's post only {took:?} after she sent it, beyond {ANCHOR_TAKES:?}: \
+             a push to a member who had just left held the room until that member was declared \
+             silent"
+        );
         assert!(
             carol.view().open_channels.is_empty(),
             "and reads none of it"
