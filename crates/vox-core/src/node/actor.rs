@@ -705,6 +705,20 @@ fn spawn_stream_loop(
             let _ = net.learn_observed(peer).await;
         });
     }
+    // **The loop does not hold the connection; it holds a way to reach it.** Waiting for
+    // streams needs only the quinn handle, and a stream that arrives needs the
+    // `VoxConnection` only for as long as it is served, so the loop keeps a `Weak` and
+    // upgrades it per stream.
+    //
+    // Holding the `Arc` here made every connection look carried for its whole life. A
+    // connection's strong count is how `ConnectionManager::retire_expired` tells a retired
+    // path that is still carrying a tunnel from one that is not, and with this loop in the
+    // count it was never below two: a relayed connection displaced by a direct one was
+    // never closed, and its circuit held a relay slot until the relay's idle timeout. With
+    // the loop out of the count, what remains is what the count is meant to measure — the
+    // manager, and whatever is serving a stream or splicing a tunnel on it.
+    let quic = conn.quinn().clone();
+    let conn = Arc::downgrade(&conn);
     tokio::spawn(async move {
         // One stream failing is **not** the connection failing. A refused kind, a
         // malformed frame or a peer that abandons a stream must not stop the others
@@ -729,10 +743,10 @@ fn spawn_stream_loop(
             // Only these three. Every other kind is handed on in the order it arrived, as before:
             // a pairwise hello and the key that follows it are separate streams, and reordering
             // them is exactly the race F12 was.
-            let (kind, send, recv) = match net.accept_authorized(&conn).await {
+            let (kind, send, recv) = match net.accept_authorized_on(&quic, peer).await {
                 Ok(accepted) => accepted,
                 Err(_) => {
-                    if conn.quinn().close_reason().is_some() {
+                    if quic.close_reason().is_some() {
                         break; // the peer or the network closed it
                     }
                     failures += 1;
@@ -741,6 +755,11 @@ fn spawn_stream_loop(
                     }
                     continue;
                 }
+            };
+            // Nobody holds the connection any more: the node has let it go, and a stream
+            // arriving on it has nothing to be served against.
+            let Some(conn) = conn.upgrade() else {
+                break;
             };
             if matches!(
                 kind,
@@ -851,7 +870,7 @@ fn spawn_stream_loop(
                     }
                 }
                 Err(_) => {
-                    if conn.quinn().close_reason().is_some() {
+                    if quic.close_reason().is_some() {
                         break; // the peer or the network closed it
                     }
                     failures += 1;
@@ -982,36 +1001,11 @@ async fn serve_filed(
     // we preferred another, so it opens streams there — and serving only the kept
     // connection leaves the retired one transport-alive and application-deaf, which is
     // worse than the close it replaced.
+    //
+    // The reader needs no bound of its own: a stream loop does not hold its connection, so
+    // it ends when `retire_expired` closes the retired one and cannot keep it from closing.
     if let Some(also) = filed.also_serve {
-        // Bounded by the retirement grace: `retire_expired` will not close a connection
-        // while anything still holds it, and a stream loop holds its `Arc` for the
-        // connection's life — so an unbounded reader would pin the very thing whose
-        // purpose is to be let go.
-        //
-        // **Unless it was promoted.** A retired connection becomes the peer's connection when the
-        // one it lost to goes silent (a restarted peer, `SILENCE_IS_DEATH`), and from then on it
-        // is read for its whole life like any other. Held weakly, so this timer is not itself
-        // what keeps the connection "carried".
-        let grace = Duration::from_secs(net.manager().retire_grace_secs());
-        let watched = Arc::downgrade(&also);
-        let loop_task = spawn_stream_loop(Arc::clone(net), also, tx.clone());
-        // The network is held weakly too. A strong handle here kept the whole `NodeNet` — its
-        // endpoint and its socket — alive for the grace after the node shut down: a restarted
-        // node in the same process then shared a socket with a ghost that read half its packets,
-        // and `m15_members_never_online_together` saw the returning member's dial to its anchor
-        // time out. A network that is gone has nothing left to promote.
-        let net = Arc::downgrade(net);
-        tokio::spawn(async move {
-            tokio::time::sleep(grace).await;
-            let promoted = net.upgrade().is_some_and(|net| {
-                watched
-                    .upgrade()
-                    .is_some_and(|c| net.manager().is_primary(&c))
-            });
-            if !promoted {
-                loop_task.abort();
-            }
-        });
+        spawn_stream_loop(Arc::clone(net), also, tx.clone());
     }
     spawn_stream_loop(Arc::clone(net), filed.kept, tx.clone());
     tx.send(NetEvent::Connected { peer }).await.is_ok()
@@ -2029,7 +2023,11 @@ impl Node {
                     // same reason: a trusted member that was unreachable a moment
                     // ago is picked up as soon as it can be reached (ADR-020 §3).
                     self.deliver_owed_consents(None).await;
-                    if self.run_due_syncs().await {
+                    // Paths change on the tick with no event to say so — a retired connection
+                    // closed, a circuit this node relayed ended — and a view published only on
+                    // events kept showing them: an anchor with no rooms reported a circuit it
+                    // no longer carried for as long as nothing else happened to it.
+                    if self.run_due_syncs().await || self.paths_moved() {
                         self.publish().await;
                     }
                 }
@@ -3417,7 +3415,7 @@ impl Node {
             NetEvent::Stream { conn, inbound } => {
                 // Held for the whole handler: the connection must outlive the streams
                 // opened on it, or the peer sees it close mid-exchange.
-                let _connection = conn;
+                let connection = conn;
                 match inbound {
                     Inbound::Join { .. } => {
                         // Unreachable: the stream loop turns these into
@@ -3446,7 +3444,12 @@ impl Node {
                         // The host is told who reached what, because the carried
                         // service only ever sees loopback (ADR-017 decision 6).
                         let events = self.event_tx.clone();
+                        // **The tunnel holds its connection for as long as it runs.** That
+                        // is what tells `retire_expired` the path is still carrying, so a
+                        // better path appearing does not close it under a live session.
+                        let carried = Arc::clone(&connection);
                         tokio::spawn(async move {
+                            let _carried = carried;
                             let _ = crate::node::tunnel::serve_reporting(
                                 peer,
                                 send,
@@ -6499,6 +6502,20 @@ impl Node {
                 .as_ref()
                 .map_or(0, |net| net.manager().peers().len()),
         }
+    }
+
+    /// Whether the connections and circuits the published view shows are no longer the ones
+    /// the connection manager holds.
+    fn paths_moved(&self) -> bool {
+        let (relayed_peers, relaying) = self.path_view();
+        let connected = self
+            .net
+            .as_ref()
+            .map_or(0, |net| net.manager().peers().len());
+        let shown = self.view_tx.borrow();
+        shown.relayed_peers != relayed_peers
+            || shown.relaying != relaying
+            || shown.connected != connected
     }
 
     /// Which peers are reached through a relay, and how many circuits this node carries for

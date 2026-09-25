@@ -237,6 +237,11 @@ async fn reach_host_with_patience<D: HostDialer>(
 /// (PRD-001 R24). A **refusal** is never retried: the host has decided, and asking again
 /// would only make a refused application wait five minutes to be told so.
 ///
+/// **The connection comes back too, and the caller holds it for as long as it splices.**
+/// Holding it is what marks the path as carrying: when a better path displaces this one,
+/// `ConnectionManager::retire_expired` closes the old one only once nothing holds it, so a
+/// tunnel that let go of it here would be cut the moment the retirement grace ran out.
+///
 /// # Errors
 /// [`Error::TunnelDenied`] when the host refused; otherwise the last reason the host could
 /// not be reached.
@@ -245,7 +250,7 @@ pub async fn open_tunnel<D: HostDialer>(
     host: &Digest32,
     channel_id: &Digest32,
     service_tag: &str,
-) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+) -> Result<(quinn::SendStream, quinn::RecvStream, Arc<VoxConnection>)> {
     let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
     loop {
         let attempt = async {
@@ -256,7 +261,7 @@ pub async fn open_tunnel<D: HostDialer>(
             )
             .await?;
             crate::tunnel::session::request(&mut send, &mut recv, channel_id, service_tag).await?;
-            Ok::<_, Error>((send, recv))
+            Ok::<_, Error>((send, recv, conn))
         };
         match attempt.await {
             Ok(streams) => return Ok(streams),
@@ -329,7 +334,9 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
     // **The port is the service tag** (ADR-017 decision 4), so nothing here invents a name,
     // and the **host** decides whether the dial is allowed — this side claims nothing.
     let tag = port.to_string();
-    let (send, recv) = match open_tunnel(dialer, &room.host, &room.channel_id, &tag).await {
+    // `_carried` is held for the whole splice: see [`open_tunnel`].
+    let (send, recv, _carried) = match open_tunnel(dialer, &room.host, &room.channel_id, &tag).await
+    {
         Ok(streams) => streams,
         Err(why) => {
             // The SOCKS reply is a code, and a coarse one; the sentence goes to this node's

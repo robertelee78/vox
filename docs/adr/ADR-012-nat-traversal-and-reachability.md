@@ -399,6 +399,35 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   sides with the relayed one retiring on each; behind symmetric NATs `reach` is as fast and `upgrade`
   comes back empty; a private-only address record no longer costs the dial timeout. ADR-016's M15.1 gate
   went from 22.9 s to 7.9 s, the join itself now bounded at 12 s.
+  - **A retired connection is let go (2026-09-25, v0.2.9).** "Closed by the node's tick" did not
+    happen. `retire_expired` closes a retired connection once the grace is up **and** nothing holds its
+    `Arc` — the strong count is how a path still carrying a tunnel is told from one that is not — and
+    every connection's stream loop held that `Arc` for the connection's life, so the count never fell
+    below two and no retired connection was ever closed. A pair that went direct kept its relayed
+    connection, and the relay kept its circuit, for as long as both nodes ran: keep-alives crossing
+    the relay every few seconds kept the circuit's idle timeout from ever firing. Two more holds did the
+    same for shorter spells: `upgrade` held the connection it was replacing for the whole ladder
+    (`PUNCH_ATTEMPT_TIMEOUT`), and nothing ended a circuit when the connection it carried closed.
+    Now:
+    - the stream loop holds a `Weak` and the quinn handle, and upgrades the `Weak` per stream, so the
+      count is the manager plus whatever is serving a stream or splicing a tunnel on it;
+    - a tunnel holds its connection for as long as it splices, on both ends (`up::open_tunnel`
+      returns it; the host's tunnel task keeps the one it arrived on), and a circuit holds the
+      connections it rides;
+    - `upgrade` holds the connection it replaces weakly;
+    - the initiator's circuit driver ends 1 s (`CIRCUIT_CLOSE_LINGER`) after the connection it carries
+      closes, which ends the relay's forwarding and the far driver;
+    - a node republishes its view on the tick when its connections or circuits changed, so a relay
+      with no rooms no longer reports a circuit it stopped carrying.
+
+    Proved on real nodes over the virtual NAT network
+    (`crates/vox-core/tests/displaced_relay_is_let_go.rs`): a relayed pair goes direct; with nothing
+    carried, the anchor reports 0 circuits 1.52–1.63 s after the grace is up (5 runs; the bound is
+    two ticks, the linger and 1 s of slack). With a tunnel open, the relayed connection outlives the
+    grace, the tunnel still echoes, and the anchor reports 0 circuits 1.47–1.63 s after the tunnel
+    closes (5 runs). Before the change both stayed at 1 circuit for the full 15 s watched; with the stream loop
+    holding the `Arc` again, both go red the same way; with the tunnels not holding their connection,
+    the tunnel is cut when the grace runs out.
   - **Proved on the virtual NAT network.** With both peers behind *symmetric* NATs — every earlier rung
     defeated, which the same file demonstrates — `reach` returns a connection pinned to and authenticated
     by the far peer, its remote address is the circuit's, the relay reports carrying exactly one
