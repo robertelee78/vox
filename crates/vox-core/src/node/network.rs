@@ -972,6 +972,21 @@ impl NodeNet {
         out
     }
 
+    /// Every live bundle record this node's board holds for `(channel, epoch)`, as
+    /// records. Local, so cheap: it is what lets the sync gate learn a member that
+    /// joined through somebody else before refusing it (`run_sync_session`).
+    #[must_use]
+    pub fn board_bundles(&self, channel_id: &Digest32, epoch: u64) -> Vec<MemberBundleRecord> {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .current_bundles(channel_id, epoch, now)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     /// The live bundle record this node's board holds for one member of `(channel,
     /// epoch)`, if any.
     ///
