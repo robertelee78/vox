@@ -341,7 +341,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   node admits from its own board's bundle records (the M17.6 evidence, as everywhere), so a member who
   joined through somebody else is not refused for being new. The check is one early return below the
   in-flight (`syncing`) refusal.
-  **Gate** (`crates/vox-core/tests/sync_serves_a_room_only_to_its_members.rs`, release, `--ignored`):
+  **Gate** (`crates/vox-tui/tests/a_member_of_one_room_is_not_served_another_proof.rs`, release, `--ignored`, since V29-17/RP-29 driving the **shipped `vox daemon`** as the victim; v0.2.8 leaks 25 of bravo's entries to it, `f5a1fe8` none):
   the victim holds rooms A and B; a member of A only, using its own identity over a real connection, is
   served all 5 of A's entries (the control) and asks for B five times — 0 sessions answered, 0 entries;
   a member of B still holds all 5 of B's. On 0844943 it is red: 25 of B's entries over 5 answered
