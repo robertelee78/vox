@@ -1479,6 +1479,9 @@ pub fn run() -> ExitCode {
                     ExitCode::FAILURE
                 }
                 Ok(r) => {
+                    for (key, command) in &r.entries {
+                        println!("vox: trusted {command:?} ({key})");
+                    }
                     println!(
                         "vox: {} Vox hook entr{} in Codex; {} newly trusted, the rest already were.",
                         r.found,
