@@ -321,6 +321,47 @@ pub const RETIRE_GRACE_SECS: u64 = 60;
 /// before this rule; it cannot make a live connection look dead.
 pub const SILENCE_IS_DEATH: Duration = Duration::from_secs(KEEP_ALIVE.as_secs() * 3 / 2);
 
+/// The one byte a liveness probe carries. Too short to be a framed datagram (which starts with an
+/// 8-byte sequence number), so the far end drops it unread; what matters is that the frame is
+/// ack-eliciting.
+const PROBE_BYTE: u8 = 0;
+
+/// How often a probe checks whether anything came back.
+const PROBE_POLL: Duration = Duration::from_millis(10);
+
+/// How long a probe waits for an answer: three round trips of the held connection's own RTT
+/// estimate — one for the probe and its ACK, the rest for an ACK delay and a loss — but never
+/// less than 250ms, where a loopback RTT of microseconds would make scheduling noise look like
+/// death, and never more than 2s, past which a newcomer is kept waiting for a path that is too
+/// slow to be the one worth keeping.
+fn probe_patience(rtt: Duration) -> Duration {
+    (rtt * 3).clamp(Duration::from_millis(250), Duration::from_secs(2))
+}
+
+/// Send one probe on `conn` and wait [`probe_patience`] for anything at all to arrive on it.
+/// `true` is an answer, or a connection that cannot be probed (no datagram support) or that
+/// closed on its own meanwhile — none of which is evidence that a live peer is absent.
+async fn probe_answers(conn: &VoxConnection) -> bool {
+    let quic = conn.quinn();
+    let before = quic.stats().udp_rx.datagrams;
+    if quic
+        .send_datagram(bytes::Bytes::from_static(&[PROBE_BYTE]))
+        .is_err()
+    {
+        return true;
+    }
+    let deadline = tokio::time::Instant::now() + probe_patience(quic.rtt());
+    loop {
+        if quic.stats().udp_rx.datagrams != before || !is_live(conn) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(PROBE_POLL).await;
+    }
+}
+
 /// One QUIC connection per peer fingerprint (see the module docs).
 pub struct ConnectionManager {
     endpoint: Arc<VoxEndpoint>,
@@ -542,7 +583,7 @@ impl ConnectionManager {
             (self.clock)(),
         )
         .await?;
-        Ok(self.file(conn))
+        Ok(self.file(conn).await)
     }
 
     /// Accept the next inbound connection under `admission` and file it under the
@@ -560,7 +601,7 @@ impl ConnectionManager {
         else {
             return Ok(None);
         };
-        Ok(Some(self.file(conn)))
+        Ok(Some(self.file(conn).await))
     }
 
     /// Phase one for an accept loop: the next inbound attempt, with no handshake.
@@ -579,13 +620,13 @@ impl ConnectionManager {
             .endpoint
             .finish_incoming(incoming, (self.clock)(), admission)
             .await?;
-        Ok(self.file_reporting(conn))
+        Ok(self.file_reporting(conn).await)
     }
 
     /// Take ownership of a connection this manager did not dial — one a hole punch
     /// produced (ADR-012 rung 3) — under the same one-per-peer rule.
-    pub fn adopt(&self, conn: VoxConnection) -> Arc<VoxConnection> {
-        self.file(conn)
+    pub async fn adopt(&self, conn: VoxConnection) -> Arc<VoxConnection> {
+        self.file(conn).await
     }
 
     /// File a connection under its peer id. One connection per peer is a
@@ -620,12 +661,13 @@ impl ConnectionManager {
     /// node then failed ("relay cannot reach the peer") until the grace ran out. This is
     /// the "cross-connection interaction in circuit establishment" ADR-017 recorded as
     /// unidentified: the serial loop was hiding an order-dependent tie-break.
-    fn file(&self, conn: VoxConnection) -> Arc<VoxConnection> {
+    async fn file(&self, conn: VoxConnection) -> Arc<VoxConnection> {
         // **Closes the loser, because this caller will not serve it.** Retiring a duplicate is only
         // safe where somebody keeps reading it; retiring it here and dropping the handle would
         // leave it transport-alive and application-deaf, which is strictly worse than the close it
         // replaced. `connect`, the one-shot `accept` and `adopt` all arrive through here and none of
         // them serves a second connection, so for them the old behaviour is the correct one.
+        self.probe_held(&conn).await;
         let filed = self.file_inner(conn, false);
         debug_assert!(filed.also_serve.is_none());
         filed.kept
@@ -646,8 +688,75 @@ impl ConnectionManager {
     /// Retiring without serving it would be worse than the close it replaces: the connection
     /// would be transport-alive and application-deaf, and the peer's request would never be
     /// answered at all.
-    fn file_reporting(&self, conn: VoxConnection) -> Filed {
+    async fn file_reporting(&self, conn: VoxConnection) -> Filed {
+        self.probe_held(&conn).await;
         self.file_inner(conn, true)
+    }
+
+    /// **Ask the connections held for a peer whether anyone is there**, before a newcomer for
+    /// the same peer is filed against them — and close each one nobody answers on.
+    ///
+    /// Silence ([`SILENCE_IS_DEATH`]) tells a dead connection from a live one, but only after
+    /// 30s, and a restarted peer's new connection usually arrives within a second or two of the
+    /// crash. In that window the tie-break keeps the dead one half the time, and the restarted
+    /// peer is unreachable through this node until the silence rule catches up: measured with
+    /// `vox`'s two-daemon harness as 23–27s before anything crossed.
+    ///
+    /// So the question is asked instead of waited for. One datagram goes out on each held
+    /// connection — one byte, deliberately unframed, which the far end's
+    /// [`VoxConnection::recv_datagram`] discards before any application sees it — and a
+    /// datagram frame is ack-eliciting, so a live peer ACKs it within its ACK delay (25ms)
+    /// whether or not anything reads datagrams. Anything at all arriving on a held connection
+    /// within [`probe_patience`] of its probe is an answer. Nothing is a connection whose far
+    /// end is gone: it is closed, and [`Self::file_inner`] then files the newcomer against no
+    /// rival.
+    ///
+    /// Measured against `a_restarted_host_is_reached_through_its_anchor` (real nodes, a relayed
+    /// client, the host crashed and restarted): reachable again within 0.1s of being back, where
+    /// without the probe 5 of 12 restarts waited 28.0–28.6s for the silence rule.
+    ///
+    /// **Both ends still decide alike.** A restarted peer holds nothing to probe, and the dead
+    /// side cannot vote, so only this end decides. Two *live* connections — a member whose NAT
+    /// rebound dialling again — are both probed, one from each end, and each end's probe is
+    /// traffic the other end hears: the member's probe even migrates the old connection onto
+    /// its new port at the anchor, where the anchor's own probe could not reach. Both ends see
+    /// an answer and both go to [`tie_key`], as before. `a_live_duplicate_is_decided_alike`
+    /// is the gate for that.
+    ///
+    /// A held connection that cannot carry a datagram (the peer disabled them) is assumed live:
+    /// that is the old behaviour, and silence still catches it.
+    async fn probe_held(&self, newcomer: &VoxConnection) {
+        let peer = newcomer.peer_id();
+        // **Every** connection held for the peer, not only the primary. A retired one — the
+        // loser of an earlier tie-break, still served for its grace — is as dead as the primary
+        // when the peer's process is, and it is exactly what [`Self::promote_heard`] reaches for
+        // when a primary closes: measured, an anchor promoted the connection to a process two
+        // restarts old, because it had been silent for only 3s of the 30s silence needs, and
+        // relayed a client onto it for 28s. Probing them here closes them while the evidence is
+        // fresh.
+        let mut held: Vec<Arc<VoxConnection>> = Vec::new();
+        if let Some(primary) = lock(&self.conns).get(&peer) {
+            held.push(Arc::clone(primary));
+        }
+        held.extend(
+            lock(&self.retiring)
+                .iter()
+                .filter(|(c, _)| c.peer_id() == peer)
+                .map(|(c, _)| Arc::clone(c)),
+        );
+        // A closed or already-silent connection is no rival to `file_inner` or to a promotion.
+        held.retain(|c| is_live(c) && !self.is_silent(c));
+        // Probed at once, so a peer with a dead primary and a dead retired connection costs one
+        // patience, not two.
+        let mut probes = tokio::task::JoinSet::new();
+        for c in held {
+            probes.spawn(async move {
+                if !probe_answers(&c).await {
+                    c.close(WireError::AuthenticatorInvalid);
+                }
+            });
+        }
+        while probes.join_next().await.is_some() {}
     }
 
     /// [`Self::file_reporting`]'s body. `serve_loser` says whether the caller will read a duplicate

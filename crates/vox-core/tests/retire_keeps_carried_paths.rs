@@ -47,7 +47,7 @@ async fn a_retired_connection_stays_open_while_it_is_still_carrying() {
     let accepting = tokio::spawn(async move { b_ep.accept(1_000).await });
     let dialled = a.endpoint().connect(b_addr, b_id, 1_000).await.unwrap();
     let _server = accepting.await.unwrap().unwrap();
-    let held = a.adopt(dialled);
+    let held = a.adopt(dialled).await;
 
     // Displace it: a second connection to the same peer on a path the manager prefers, or
     // failing that, retire it directly the way `file` does. Either way it lands in the
@@ -97,7 +97,7 @@ async fn an_uncarried_retired_connection_still_closes_on_time() {
     let accepting = tokio::spawn(async move { b_ep.accept(2_000).await });
     let dialled = a.endpoint().connect(b_addr, b_id, 2_000).await.unwrap();
     let _server = accepting.await.unwrap().unwrap();
-    let held = a.adopt(dialled);
+    let held = a.adopt(dialled).await;
     a.retire_for_test(&held);
     drop(held);
 
