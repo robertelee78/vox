@@ -69,6 +69,9 @@ pub struct StatusBook {
     pub last_seen: BTreeMap<Digest32, u64>,
     /// Tunnels being served, by a local id; entries leave when the tunnel ends.
     pub served: Arc<Mutex<BTreeMap<u64, ServedTunnel>>>,
+    /// When the node started, seconds since the epoch: a room that has not synced *yet*
+    /// is not stale until it has had [`STALE_SYNC_SECS`] to do so.
+    pub started: u64,
     next_tunnel: u64,
 }
 
@@ -186,6 +189,8 @@ pub struct DialedTunnel {
 pub struct StatusReport {
     /// When this was taken, seconds since the epoch.
     pub now: u64,
+    /// When the node started, seconds since the epoch.
+    pub started: u64,
     /// This node.
     pub identity: Option<Digest32>,
     /// Whether it is on the network.
@@ -207,7 +212,18 @@ pub struct StatusReport {
     /// The app layer's counters.
     pub app: AppStats,
     /// What needs looking at.
-    pub unhealthy: Vec<String>,
+    pub unhealthy: Vec<Unhealthy>,
+}
+
+/// One condition that needs looking at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unhealthy {
+    /// A stable name for the condition — `peer-unreachable:<room>:<peer>` or
+    /// `room-stale:<room>` — the same for as long as the condition holds, so a notifier
+    /// can tell it starting from it continuing (PRD-001 R37).
+    pub key: String,
+    /// What a person reads. May change while the condition holds ("last seen 12s ago").
+    pub message: String,
 }
 
 fn short(d: &Digest32) -> String {
@@ -223,29 +239,41 @@ impl StatusReport {
             if others == 0 || !self.networked {
                 continue;
             }
-            let stale = room
-                .last_sync
-                .is_none_or(|t| self.now.saturating_sub(t) > STALE_SYNC_SECS);
+            // Measured from the last completed sync, or from the node's start when there
+            // has been none: a daemon that has just started is not unhealthy for not
+            // having synced in its first seconds, and would otherwise alarm on every start.
+            let since = room.last_sync.unwrap_or(self.started);
+            let stale = self.now.saturating_sub(since) > STALE_SYNC_SECS;
             if stale {
-                out.push(format!(
-                    "room {} ({}): no completed sync in {} minutes",
-                    short(&room.id),
-                    room.name,
-                    STALE_SYNC_SECS / 60
-                ));
+                out.push(Unhealthy {
+                    key: format!("room-stale:{}", b32_encode(&room.id)),
+                    message: format!(
+                        "room {} ({}): no completed sync in {} minutes",
+                        short(&room.id),
+                        room.name,
+                        STALE_SYNC_SECS / 60
+                    ),
+                });
             }
             for m in &room.members {
                 if m.me || !m.trusted || m.connected {
                     continue;
                 }
                 if let Some(seen) = m.last_seen {
-                    out.push(format!(
-                        "room {} ({}): trusted member {} unreachable, last seen {}s ago",
-                        short(&room.id),
-                        room.name,
-                        short(&m.id),
-                        self.now.saturating_sub(seen)
-                    ));
+                    out.push(Unhealthy {
+                        key: format!(
+                            "peer-unreachable:{}:{}",
+                            b32_encode(&room.id),
+                            b32_encode(&m.id)
+                        ),
+                        message: format!(
+                            "room {} ({}): trusted member {} unreachable, last seen {}s ago",
+                            short(&room.id),
+                            room.name,
+                            short(&m.id),
+                            self.now.saturating_sub(seen)
+                        ),
+                    });
                 }
             }
         }
@@ -346,7 +374,11 @@ impl StatusReport {
         let _ = write!(
             j,
             "\"unhealthy\":[{}]",
-            list(self.unhealthy.iter().map(|s| q(s)))
+            list(self.unhealthy.iter().map(|u| format!(
+                "{{\"key\":{},\"message\":{}}}",
+                q(&u.key),
+                q(&u.message)
+            )))
         );
         j.push('}');
         j

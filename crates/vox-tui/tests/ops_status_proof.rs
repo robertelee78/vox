@@ -683,7 +683,8 @@ fn a_killed_peer_is_flagged_unhealthy() {
     let bob_short: String = b32_encode(&bob_fp).chars().take(12).collect();
     let flagged = |s: &Value| {
         s["unhealthy"].as_array().unwrap().iter().any(|l| {
-            l.as_str()
+            l["message"]
+                .as_str()
                 .is_some_and(|l| l.contains(&bob_short) && l.contains("unreachable"))
         })
     };

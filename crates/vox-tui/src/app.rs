@@ -881,6 +881,10 @@ pub fn run_daemon(
         .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
         .map_err(|e| AppError::Usage(format!("control socket: {e}")))?;
 
+    // Tell the operator when `vox status` would flag something, and when it clears
+    // (PRD-001 R37). Off with `notify = off` in the profile's config file.
+    rt.spawn(crate::notify::watch(node.clone(), paths.clone()));
+
     let fp = node
         .view()
         .identity
