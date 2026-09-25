@@ -995,16 +995,22 @@ async fn serve_filed(
         let grace = Duration::from_secs(net.manager().retire_grace_secs());
         let watched = Arc::downgrade(&also);
         let loop_task = spawn_stream_loop(Arc::clone(net), also, tx.clone());
-        let net = Arc::clone(net);
+        // The network is held weakly too. A strong handle here kept the whole `NodeNet` — its
+        // endpoint and its socket — alive for the grace after the node shut down: a restarted
+        // node in the same process then shared a socket with a ghost that read half its packets,
+        // and `m15_members_never_online_together` saw the returning member's dial to its anchor
+        // time out. A network that is gone has nothing left to promote.
+        let net = Arc::downgrade(net);
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
-            if watched
-                .upgrade()
-                .is_some_and(|c| net.manager().is_primary(&c))
-            {
-                return;
+            let promoted = net.upgrade().is_some_and(|net| {
+                watched
+                    .upgrade()
+                    .is_some_and(|c| net.manager().is_primary(&c))
+            });
+            if !promoted {
+                loop_task.abort();
             }
-            loop_task.abort();
         });
     }
     spawn_stream_loop(Arc::clone(net), filed.kept, tx.clone());
