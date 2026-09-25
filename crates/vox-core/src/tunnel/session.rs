@@ -144,10 +144,7 @@ async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
 /// Dialer side: open a tunnel for `service_tag` on an already-opened QUIC stream
 /// pair, then splice the local `local` TCP socket to it.
 ///
-/// Sends the request, awaits the host's status, and on [`TunnelStatus::Accepted`]
-/// splices bytes until either side closes. A [`TunnelStatus::Denied`] (or any other
-/// status) returns [`Error::TunnelDenied`] without exposing whether the service
-/// exists.
+/// [`request`] then [`splice`].
 pub async fn dial(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -155,18 +152,38 @@ pub async fn dial(
     service_tag: &str,
     local: TcpStream,
 ) -> Result<()> {
+    request(&mut send, &mut recv, channel_id, service_tag).await?;
+    splice(send, recv, local).await
+}
+
+/// Dialer side, first half: send the [`TunnelRequest`] and wait for the host's verdict.
+///
+/// `Ok(())` means the host authorized the request **and** connected its local endpoint, so
+/// the stream is ready to [`splice`]. [`Error::TunnelDenied`] is the host's refusal —
+/// uniform, so it does not say whether the service exists (ADR-013 dark services). Any
+/// other error is the path failing before the host answered, which a caller may retry on
+/// a fresh connection; a refusal it must not, because the host has decided.
+///
+/// Split out of [`dial`] so a caller can tell the host's verdict from the path failing:
+/// a forward that retries a dead connection on a fresh one must never retry a refusal.
+pub async fn request(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    channel_id: &Digest32,
+    service_tag: &str,
+) -> Result<()> {
     let req = TunnelRequest {
         channel_id: *channel_id,
         service_tag: service_tag.to_owned(),
     };
-    write_frame(&mut send, &req.to_bytes()).await?;
-    let status_frame = read_frame(&mut recv).await?;
+    write_frame(send, &req.to_bytes()).await?;
+    let status_frame = read_frame(recv).await?;
     if status_frame.len() != 1
         || TunnelStatus::from_byte(status_frame[0])? != TunnelStatus::Accepted
     {
         return Err(Error::TunnelDenied("dial refused"));
     }
-    splice(send, recv, local).await
+    Ok(())
 }
 
 /// What the host knows about one `(channel, service)` pair a dialer named: where the
@@ -364,7 +381,7 @@ async fn splice_until_withdrawn(
 /// when one side reaches EOF it shuts down the opposite writer (a quinn `finish`
 /// or a TCP FIN) and drains the other direction before returning, so neither a
 /// one-way close nor an idle reverse path leaks the tunnel.
-async fn splice(send: SendStream, recv: RecvStream, mut tcp: TcpStream) -> Result<()> {
+pub async fn splice(send: SendStream, recv: RecvStream, mut tcp: TcpStream) -> Result<()> {
     let mut quic = tokio::io::join(recv, send);
     match tokio::io::copy_bidirectional(&mut tcp, &mut quic).await {
         Ok(_) => Ok(()),

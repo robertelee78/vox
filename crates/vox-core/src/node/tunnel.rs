@@ -7,15 +7,16 @@
 //!   reacher set (ADR-017 decision 3). Nothing here can grant reach: this supplies host
 //!   configuration and the live sets, never a decision.
 //! - **Dial side** — [`Forward`]: a local TCP listener. Every accepted connection
-//!   opens its own tunnel stream and splices, so a forward carries as many
-//!   connections as the application makes and a dead one takes nothing else with it
-//!   (ADR-013: one QUIC stream per tunneled TCP connection).
+//!   reaches the host afresh, opens its own tunnel stream and splices, so a forward
+//!   carries as many connections as the application makes, a dead one takes nothing
+//!   else with it (ADR-013: one QUIC stream per tunneled TCP connection), and a host that
+//!   restarted is reached again (PRD-001 R24).
 //!
 //! ## What is dark stays dark
-//! An untrusted dialer, a channel this node does not hold, a service it does not
-//! offer, and a local service that refuses the connection all end the same way: the
-//! accepted TCP connection closes. `TunnelStatus::Denied` distinguishes none of them,
-//! and neither does this.
+//! An untrusted dialer, a channel this node does not hold, a service it does not offer,
+//! and a local service that refuses the connection all end the same way: the accepted TCP
+//! connection closes. `TunnelStatus::Denied` distinguishes none of them, and neither does
+//! this.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -27,8 +28,7 @@ use tokio::task::JoinHandle;
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::api::NodeEvent;
-use crate::transport::quic::VoxConnection;
-use crate::transport::streams::{open_typed, StreamKind};
+use crate::node::up;
 use crate::tunnel::session::{self, HostService};
 
 /// The set of identities that may reach a host's services in one channel, shared live
@@ -196,25 +196,49 @@ impl Drop for Forward {
     }
 }
 
+/// How long an accept loop waits after the listener fails before trying again.
+///
+/// A failed `accept` is almost always the process running out of descriptors (`EMFILE`),
+/// and retrying at once fails again at once: the loop spins a core and never gives the
+/// connections holding those descriptors a chance to close. Exiting instead — which the
+/// forward used to do, `while let Ok(..) = accept()` — turns a moment of pressure into a
+/// port that is still bound and never answers again.
+pub(crate) const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl Forward {
-    /// Bind `local` and forward every connection to `service_tag` on `host`, over
-    /// `conn` — the live connection to that member, which the ADR-012 ladder produced.
+    /// Bind `local` and forward every connection to `service_tag` on `host`, reaching the
+    /// host through `dialer` — **per connection**.
     ///
     /// Binding happens here, so a port already in use is an error the caller sees
     /// rather than a task that dies silently. Each accepted connection gets its own
     /// tunnel stream on its own task.
+    ///
+    /// Per connection, not once (PRD-001 R24). This used to take the one `VoxConnection`
+    /// the ladder produced when the forward started and keep it for the forward's whole
+    /// life, so when the host restarted, or the path to it changed, every later connection
+    /// was opened on a connection that no longer went anywhere and the forward was dead
+    /// while still bound. `vox up` already asked its dialer per request; the forward now
+    /// does the same, through the same [`up::open_tunnel`].
+    ///
+    /// `report` hears, in words, when the host cut a session this forward was carrying.
     ///
     /// `local` must be a loopback address. This is the structural backstop for the rule
     /// the node actor enforces on the way in: the socket is created here and nowhere
     /// else, so no caller can bind a forward where the network can reach it. Reaching
     /// this refusal means a caller bypassed the actor, which is a bug rather than user
     /// input — hence a fault rather than a message about what to type.
-    pub async fn bind(
-        conn: Arc<VoxConnection>,
+    pub async fn bind<D, F>(
+        dialer: Arc<D>,
+        host: Digest32,
         channel_id: Digest32,
         service_tag: String,
         local: SocketAddr,
-    ) -> Result<Self> {
+        report: F,
+    ) -> Result<Self>
+    where
+        D: up::HostDialer + 'static,
+        F: Fn(String) + Send + Sync + 'static,
+    {
         if !local.ip().is_loopback() {
             return Err(Error::MalformedTunnel("a forward binds loopback only"));
         }
@@ -224,17 +248,32 @@ impl Forward {
         let bound = listener
             .local_addr()
             .map_err(|_| Error::TunnelDenied("forward: bound port unknown"))?;
-        let host = conn.peer_id();
         let tag = service_tag.clone();
+        let report = Arc::new(report);
         let task = tokio::spawn(async move {
-            while let Ok((app, _)) = listener.accept().await {
-                let conn = Arc::clone(&conn);
+            loop {
+                let app = match listener.accept().await {
+                    Ok((app, _)) => app,
+                    Err(_) => {
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                };
+                let dialer = Arc::clone(&dialer);
+                let report = Arc::clone(&report);
                 let tag = tag.clone();
                 tokio::spawn(async move {
-                    // One stream per connection. A refusal closes this connection and
-                    // says nothing about why (dark services).
-                    if let Ok((send, recv)) = open_typed(&conn, StreamKind::Tunnel).await {
-                        let _ = session::dial(send, recv, &channel_id, &tag, app).await;
+                    // One stream per connection, on whatever connection reaches the host now. A
+                    // refusal closes this connection and says nothing about why (dark services).
+                    if let Ok((send, recv)) =
+                        up::open_tunnel(dialer.as_ref(), &host, &channel_id, &tag).await
+                    {
+                        if let Err(Error::TunnelRevoked(_)) = session::splice(send, recv, app).await
+                        {
+                            report(format!(
+                                "the host withdrew access to {tag:?} — that session was cut"
+                            ));
+                        }
                     }
                 });
             }

@@ -4736,8 +4736,30 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         };
-        match crate::node::tunnel::Forward::bind(conn, *channel_id, service_tag.to_owned(), local)
-            .await
+        // The first dial above is kept for what it tells the caller — a forward to a host that
+        // cannot be reached at all fails here, with the ladder's words — but the forward does
+        // not keep `conn`. It reaches the host afresh for every connection (PRD-001 R24), and
+        // `reach` hands back this same connection for as long as it lives.
+        drop(conn);
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return Outcome::Failed(Fault::NotNetworked);
+        };
+        let dialer = Arc::new(NodeDialer {
+            net,
+            channel_id: *channel_id,
+        });
+        let events = self.event_tx.clone();
+        match crate::node::tunnel::Forward::bind(
+            dialer,
+            *host,
+            *channel_id,
+            service_tag.to_owned(),
+            local,
+            move |reason: String| {
+                let _ = events.send(NodeEvent::ProxyRefused { reason });
+            },
+        )
+        .await
         {
             Ok(fwd) => {
                 let (channel_id, host, service_tag, bound) =
