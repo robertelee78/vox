@@ -9,8 +9,10 @@
 //! 1. a session whose claims did not change is told nothing;
 //! 2. a claim that **lapsed** between two drains is reported, naming the resource and the
 //!    lapse — and only on the first drain after it;
-//! 3. a claim **someone else now holds** is reported as such, naming the holder;
-//! 4. a claim the session **released itself** is not news, and is not reported.
+//! 3. a claim that lapsed and **someone else now holds**, or that lapsed and is now
+//!    **reserved** for someone by a handoff, is reported with the lapse and who has it;
+//! 4. a claim the session **released itself** is not news, and is not reported — in the
+//!    same drain that does report a lapse, so the silence is a decision, not a dead drain.
 
 #![cfg(unix)]
 
@@ -112,17 +114,67 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     );
     let told = drain(alice, r, "s1");
     assert!(
-        told.contains("You no longer hold `taken`: it is now held by")
+        told.contains("You no longer hold `taken`: your claim lapsed, and it is now held by")
             && told.contains(&format!("{}/b1", &bob_fp[..12])),
         "a claim someone else now holds must name the holder: {told:?}"
     );
 
-    // ---- (4) a session's own release is not news ----
+    // ---- (3b) lapsed, then reserved for someone by a handoff ----
+    claim(alice, "s1", r, "reserved", "2");
+    let _ = drain(alice, r, "s1");
+    std::thread::sleep(Duration::from_secs(4));
+    until(
+        bob,
+        Some("b1"),
+        "bob to take the lapsed claim",
+        &["room", "claim", r, "reserved", "--ttl", "600"],
+        |o: &Out| o.ok,
+    );
+    let alice_fp = alice.b32();
+    let o = bob.vox(
+        Some("b1"),
+        &[
+            "room",
+            "handoff",
+            r,
+            "reserved",
+            "--to",
+            &alice_fp[..16],
+            "--to-session",
+            "s9",
+        ],
+    );
+    assert!(o.ok, "{o:?}");
+    until(
+        alice,
+        Some("s1"),
+        "alice's node to see the handoff",
+        &["room", "board", r, "--json"],
+        |o: &Out| {
+            o.ok && support::resource(&o.json(), "reserved")
+                .is_some_and(|x| x["state"] == "pending")
+        },
+    );
+    let told = drain(alice, r, "s1");
+    assert!(
+        told.contains(
+            "You no longer hold `reserved`: your claim lapsed, and it is now reserved for"
+        ) && told.contains(&format!("{}/s9", &alice_fp[..12])),
+        "a lapsed claim now reserved by a handoff must say so and name the recipient: {told:?}"
+    );
+
+    // ---- (4) a session's own release is not news — with a positive control ----
     claim(alice, "s1", r, "mine", "600");
+    claim(alice, "s1", r, "gone", "2");
     let _ = drain(alice, r, "s1");
     let o = alice.vox(Some("s1"), &["room", "release", r, "mine"]);
     assert!(o.ok, "{o:?}");
+    std::thread::sleep(Duration::from_secs(4));
     let told = drain(alice, r, "s1");
+    assert!(
+        told.contains("You no longer hold `gone`"),
+        "the positive control: the same drain must report the lapse of `gone`: {told:?}"
+    );
     assert!(
         !told.contains("`mine`"),
         "a session's own release must not be reported back to it: {told:?}"

@@ -111,19 +111,37 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     let (a_fp, b_fp) = (alice.b32(), bob.b32());
     let b_prefix = &b_fp[..16];
 
-    // F2's premise, made true: each node knows the other by a petname nobody else uses.
-    rt.block_on(async {
-        for (w, other, name) in [(alice, bob.fp, "bob-the-builder"), (bob, alice.fp, "boss")] {
-            assert!(w
-                .node
-                .apply(vox_core::node::api::NodeCommand::Trust {
-                    fingerprint: other,
-                    petname: name.into()
-                })
-                .await
-                .is_done());
-        }
-    });
+    // F2's premise, made true: each node knows the other by a petname nobody else uses —
+    // through the shipped binary, and read back so the premise is not assumed.
+    for (w, other, name) in [(alice, &b_fp, "bob-the-builder"), (bob, &a_fp, "boss")] {
+        let o = w.vox(
+            None,
+            &[
+                "trust",
+                "add",
+                other,
+                "--name",
+                name,
+                "--identity-passphrase-file",
+                w.pass.to_str().unwrap(),
+            ],
+        );
+        assert!(o.ok, "{} must be able to name its peer: {o:?}", w.name);
+        let listed = w.vox(
+            None,
+            &[
+                "trust",
+                "list",
+                "--identity-passphrase-file",
+                w.pass.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            listed.stdout.contains(name),
+            "{} must now call its peer {name:?}: {listed:?}",
+            w.name
+        );
+    }
 
     // ---- (1) ownership is per session ----
     let o = bob.vox(Some("b1"), &["room", "claim", r, "own-1"]);

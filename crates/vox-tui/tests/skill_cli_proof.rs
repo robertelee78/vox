@@ -19,15 +19,23 @@ use std::process::Command;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 
-/// Whether `help` lists `flag` as a whole flag: `--to` must not be satisfied by
-/// `--to-session`.
+/// Whether `help` lists `flag` as an option: only on option lines (those that begin,
+/// after indentation, with `-`), and as a whole flag — `--to` is not satisfied by
+/// `--to-session`, nor by prose that happens to mention it.
 fn has_flag(help: &str, flag: &str) -> bool {
-    help.match_indices(flag).any(|(i, _)| {
-        !help[i + flag.len()..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
-    })
+    help.lines()
+        .filter(|l| l.trim_start().starts_with('-'))
+        .any(|l| {
+            l.match_indices(flag).any(|(i, _)| {
+                let before_ok =
+                    i == 0 || !l[..i].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '-');
+                let after_ok = !l[i + flag.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-');
+                before_ok && after_ok
+            })
+        })
 }
 
 fn vox(args: &[&str]) -> (bool, String) {
@@ -48,6 +56,7 @@ struct Cmd {
     paths: Vec<Vec<String>>,
     flags: BTreeSet<String>,
     source: String,
+    section: usize,
 }
 
 fn is_verb(t: &str) -> bool {
@@ -92,17 +101,25 @@ fn parse_command(text: &str) -> Option<Cmd> {
         paths: verbs,
         flags,
         source: text.trim().to_owned(),
+        section: 0,
     })
 }
 
 /// Commands and bare flags, from fenced blocks (with `\` continuations joined) and inline
-/// code spans.
-fn extract(skill: &str) -> (Vec<Cmd>, BTreeSet<String>) {
+/// code spans. Each bare flag is kept with the section (`#` heading) it appears in, so it
+/// can be checked against the verbs that section is about.
+fn extract(skill: &str) -> (Vec<Cmd>, Vec<(String, usize)>) {
     let mut cmds = Vec::new();
-    let mut bare = BTreeSet::new();
+    let mut bare = Vec::new();
+    let mut section = 0usize;
     let mut fenced = false;
     let mut pending = String::new();
     for line in skill.lines() {
+        // A section is a `#`/`##` heading; a `###` subsection belongs to its parent, so
+        // a flag named under "What each type means" is checked against "Speaking"'s verbs.
+        if !fenced && (line.starts_with("# ") || line.starts_with("## ")) {
+            section += 1;
+        }
         if line.trim_start().starts_with("```") {
             fenced = !fenced;
             continue;
@@ -113,7 +130,8 @@ fn extract(skill: &str) -> (Vec<Cmd>, BTreeSet<String>) {
             if line.trim_end().ends_with('\\') {
                 continue;
             }
-            if let Some(c) = parse_command(&pending) {
+            if let Some(mut c) = parse_command(&pending) {
+                c.section = section;
                 cmds.push(c);
             }
             pending.clear();
@@ -124,7 +142,8 @@ fn extract(skill: &str) -> (Vec<Cmd>, BTreeSet<String>) {
                 continue; // outside a code span
             }
             if span.starts_with("vox ") {
-                if let Some(c) = parse_command(span) {
+                if let Some(mut c) = parse_command(span) {
+                    c.section = section;
                     cmds.push(c);
                 }
             } else if let Some(flag) = span.split_whitespace().next().filter(|f| {
@@ -132,7 +151,7 @@ fn extract(skill: &str) -> (Vec<Cmd>, BTreeSet<String>) {
                     && f.len() > 2
                     && f[2..].chars().all(|c| c.is_ascii_lowercase() || c == '-')
             }) {
-                bare.insert(flag.to_owned());
+                bare.push((flag.to_owned(), section));
             }
         }
     }
@@ -182,9 +201,29 @@ fn every_verb_and_flag_the_skill_names_exists_in_the_cli() {
             }
         }
     }
-    for f in &bare {
-        if !help.values().any(|h| has_flag(h, f)) {
-            problems.push(format!("the skill names {f}, which none of its verbs has"));
+    // A bare flag belongs to the verbs of its own section; only a section that names no
+    // command falls back to every verb the skill names.
+    assert!(
+        bare.len() >= 5,
+        "the extractor must find the skill's bare flags, or this half proves nothing: {bare:?}"
+    );
+    for (f, section) in &bare {
+        let local: Vec<&Vec<String>> = cmds
+            .iter()
+            .filter(|c| c.section == *section)
+            .flat_map(|c| c.paths.iter())
+            .collect();
+        let found = if local.is_empty() {
+            help.values().any(|h| has_flag(h, f))
+        } else {
+            local
+                .iter()
+                .any(|p| help.get(*p).is_some_and(|h| has_flag(h, f)))
+        };
+        if !found {
+            problems.push(format!(
+                "the skill names {f} in a section whose verbs ({local:?}) do not have it"
+            ));
         }
     }
     assert!(

@@ -131,9 +131,10 @@ fn save_held(
 
 /// **The claims this session no longer holds, and why** (ADR-021 M21.9).
 ///
-/// A lapse, a takeover or a completed handoff ends a session's ownership without any
-/// message addressed to it, so a busy holder can keep working on something it no
-/// longer owns. Each is told **once**: `prev` is what the session held at its last
+/// A lapse ends a session's ownership without any message addressed to it, so a busy
+/// holder can keep working on something it no longer owns. (A handoff or release is the
+/// holder's own act, so it is not news; once lapsed, the item may already be held by, or
+/// reserved for, someone else, and the notice says which.) Each is told **once**: `prev` is what the session held at its last
 /// drain, and the caller records `now` afterwards. A loss the session caused itself —
 /// its own latest operation on the resource is a `release` or `handoff` — is not
 /// news, and is not reported.
@@ -165,14 +166,19 @@ fn lost_claims(
             )
         })
         .map(|r| match snap.fold.resources.get(r.as_str()) {
+            // Only the holder can release or hand off, and those were filtered out
+            // above, so a claim that is gone and not by this session's own act LAPSED
+            // first; what state it is in now is the rest of the news.
             Some(State::Held { owner, .. }) => format!(
-                "You no longer hold `{r}`: it is now held by {}. Stop work on it.",
+                "You no longer hold `{r}`: your claim lapsed, and it is now held by {}. \
+                 Stop work on it.",
                 who(&owner.author, &owner.session)
             ),
             Some(State::Pending {
                 to_fp, to_session, ..
             }) => format!(
-                "You no longer hold `{r}`: it was handed off to {}. Stop work on it.",
+                "You no longer hold `{r}`: your claim lapsed, and it is now reserved for {}. \
+                 Stop work on it.",
                 who(to_fp, to_session.as_deref().unwrap_or("any session"))
             ),
             None => format!(

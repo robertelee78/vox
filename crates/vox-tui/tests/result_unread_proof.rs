@@ -10,7 +10,9 @@
 //!    stderr and in `--json`'s `unread_addressed`;
 //! 2. a broadcast, and a message addressed to someone else, are not named;
 //! 3. once the session's drain has delivered it, the next result warns about nothing;
-//! 4. a post that is not a `result` never warns.
+//! 4. a post that is not a `result` never warns;
+//! 5. a session is also addressed by its `VOX_AGENT_NAME` — the name a harness gives it —
+//!    and a message to that name is named too.
 
 #![cfg(unix)]
 
@@ -145,4 +147,51 @@ fn a_result_names_the_addressed_messages_its_session_has_not_read() {
         "a delivered message is not unread: {o:?}"
     );
     assert!(!o.stderr.contains("unread"), "{o:?}");
+
+    // ---- (5) addressed by VOX_AGENT_NAME ----
+    post(
+        bob,
+        "b1",
+        r,
+        &["--type", "ask", "--to", "alpha"],
+        "alpha: please rebase first",
+    );
+    until(
+        alice,
+        None,
+        "bob's message to alpha to reach alice",
+        &["room", "read", r],
+        |o: &Out| o.stdout.contains("please rebase first"),
+    );
+    let o = alice.vox_env(
+        Some("s1"),
+        &[("VOX_AGENT_NAME", "alpha")],
+        &[
+            "room",
+            "post",
+            r,
+            "--type",
+            "result",
+            "--work",
+            "gh:acme/w#1",
+            "--data",
+            r#"{"evidence":[{"kind":"commit","ref":"9f3c2e1a"}]}"#,
+            "--json",
+            "-",
+        ],
+        Some("done again"),
+    );
+    assert!(o.ok, "{o:?}");
+    let bodies: Vec<String> = o.json()["unread_addressed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|x| x["body"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        bodies,
+        ["alpha: please rebase first"],
+        "a message to the session's VOX_AGENT_NAME must be named: {o:?}"
+    );
 }

@@ -1,36 +1,54 @@
-//! Shared set-up for the ADR-021 product proofs: N workers, each a real node with its
-//! own identity, in one room, mutually admitted to each other's trust keyrings, each
-//! serving the control socket that the shipped `vox` binary attaches to.
+//! Shared set-up for the ADR-021 product proofs: an anchor and N workers, **each a real
+//! `vox daemon` process** with its own identity, in one room, each trusting every other.
 //!
-//! Every verb under test is run as the **real `vox` binary**, as a separate process,
-//! exactly as an agent's shell would run it. Nothing here calls the CLI's functions.
+//! Every node is the shipped binary, started as a person starts it — `vox node` for the
+//! anchor, `vox daemon` for each worker — and every verb under test is the real `vox`
+//! binary as a separate process, exactly as an agent's shell runs it. Nothing here runs a
+//! node in this process or calls the CLI's functions (V29-17: a test counts only if it
+//! drives the shipped product). The room is built with `vox room create|invite|join` and
+//! `vox trust add`, and is ready when every worker has **rendered** a post by every other.
+//!
+//! Trust is added **after** the joins. Rooms are forward-only (ADR-006): a member reads
+//! only what an author sealed after releasing its key to that member, and on this tree a
+//! trust added before the join releases the key only on a later tick (F12). Adding it
+//! after the join releases the key at once, and the readiness wait keeps posting until
+//! each reader renders one — so a proof starts from a room where anyone reads anyone.
 
 #![allow(dead_code)]
 
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use vox_core::node::actor::{Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
 use vox_core::node::paths::Paths;
 
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
+const ID_PASS: &str = "identity passphrase";
+const ROOM_PASS: &str = "channel passphrase";
+
 /// Everything a harness might have put in this process's environment that would
 /// silently name a session. **This test process may itself be running inside Claude
 /// Code or Codex**, and a leaked `CLAUDE_CODE_SESSION_ID` would make every worker the
 /// same session — the exact defect these proofs exist to catch.
-pub const HARNESS_SESSION_VARS: [&str; 5] = [
+pub const HARNESS_SESSION_VARS: [&str; 6] = [
     "VOX_SESSION",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
     "CODEX_SESSION_ID",
     "VOX_ROOM",
+    "VOX_AGENT_NAME",
 ];
 
-pub fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
+/// A child process killed and reaped when dropped, by its own handle — never by a name
+/// pattern (a path-pattern `pkill` once missed every node and leaked hundreds).
+pub struct Proc(Child);
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// What one `vox` invocation did.
@@ -60,14 +78,17 @@ impl Out {
     }
 }
 
-/// One worker: a node, its identity, and the profile directories the binary reads.
+/// One worker: a `vox daemon` process, its identity, and the profile directories the
+/// binary reads.
 pub struct Worker {
     pub name: String,
     pub data: std::path::PathBuf,
     pub cfg: std::path::PathBuf,
     pub paths: Paths,
-    pub node: NodeHandle,
     pub fp: [u8; 32],
+    /// The identity passphrase file the daemon was unlocked with.
+    pub pass: std::path::PathBuf,
+    daemon: Option<Proc>,
 }
 
 impl Worker {
@@ -81,12 +102,35 @@ impl Worker {
         self.vox_bin(VOX, session, args, stdin)
     }
 
+    /// As [`Worker::vox_in`], with extra environment — for what a harness sets beside
+    /// the session, such as `VOX_AGENT_NAME`.
+    pub fn vox_env(
+        &self,
+        session: Option<&str>,
+        env: &[(&str, &str)],
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Out {
+        self.vox_bin_env(VOX, session, env, args, stdin)
+    }
+
     /// Run a given `vox` binary — the one under test, or a published release — as this
     /// worker.
     pub fn vox_bin(
         &self,
         bin: &str,
         session: Option<&str>,
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Out {
+        self.vox_bin_env(bin, session, &[], args, stdin)
+    }
+
+    fn vox_bin_env(
+        &self,
+        bin: &str,
+        session: Option<&str>,
+        env: &[(&str, &str)],
         args: &[&str],
         stdin: Option<&str>,
     ) -> Out {
@@ -107,6 +151,9 @@ impl Worker {
         }
         if let Some(s) = session {
             cmd.env("VOX_SESSION", s);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
         }
         let mut child = cmd.spawn().expect("spawn vox");
         if let Some(input) = stdin {
@@ -148,149 +195,232 @@ impl Worker {
     }
 }
 
-/// A room shared by every worker, and the socket guards that keep it served.
+/// A room shared by every worker, and the processes that serve it. Dropping it kills
+/// the daemons and the anchor.
 pub struct Room {
     pub workers: Vec<Worker>,
     pub id: String,
     pub cid: [u8; 32],
-    _socks: Vec<vox_core::node::ipc::IpcServer>,
+    _anchor: Proc,
 }
 
-async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) -> T {
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match h.next_event().await {
-                Some(e) => {
-                    if let Some(v) = f(e) {
-                        return v;
-                    }
-                }
-                None => panic!("event stream ended"),
-            }
+fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
+    let (data, cfg) = (tmp.join("anchor/data"), tmp.join("anchor/cfg"));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let out = tmp.join("anchor.out");
+    let anchor = Proc(
+        Command::new(VOX)
+            .args(["node", "--listen", "127.0.0.1:0"])
+            .env("VOX_DATA_DIR", &data)
+            .env("VOX_CONFIG_DIR", &cfg)
+            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vox node"),
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        if let Some(spec) = text
+            .split_whitespace()
+            .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
+        {
+            return (anchor, spec.to_owned());
         }
-    })
-    .await
-    .expect("timed out waiting for an event")
+        assert!(
+            Instant::now() < deadline,
+            "the anchor never printed its spec"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
-async fn worker(tmp: &std::path::Path, name: &str) -> Worker {
+fn worker(tmp: &std::path::Path, name: &str) -> Worker {
     let data = tmp.join(name).join("data");
     let cfg = tmp.join(name).join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let pass = tmp.join(format!("{name}.pass"));
+    std::fs::write(&pass, ID_PASS).unwrap();
     let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
-    let node = Node::spawn_networked(paths.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
-    assert!(node
-        .apply(NodeCommand::CreateIdentity {
-            passphrase: secret("identity passphrase"),
-        })
-        .await
-        .is_done());
-    let fp = node.view().identity.expect("identity").fingerprint;
-    Worker {
+    let mut w = Worker {
         name: name.to_owned(),
         data,
         cfg,
         paths,
-        node,
-        fp,
+        fp: [0; 32],
+        pass,
+        daemon: None,
+    };
+    // `vox id` creates the identity on first use and prints its fingerprint.
+    let o = w.vox(
+        None,
+        &["id", "--identity-passphrase-file", w.pass.to_str().unwrap()],
+    );
+    assert!(o.ok, "{name}: vox id: {o:?}");
+    let fp = vox_core::node::link::b32_decode(o.stdout.trim(), "fingerprint")
+        .unwrap_or_else(|e| panic!("{name}: vox id printed no fingerprint ({e:?}): {o:?}"));
+    w.fp = fp;
+    w
+}
+
+fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
+    let child = Command::new(VOX)
+        .args([
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--anchor",
+            anchor,
+            "--passphrase-file",
+        ])
+        .arg(&w.pass)
+        .env("VOX_DATA_DIR", &w.data)
+        .env("VOX_CONFIG_DIR", &w.cfg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(err).unwrap()))
+        .spawn()
+        .expect("spawn vox daemon");
+    w.daemon = Some(Proc(child));
+    let deadline = Instant::now() + TIMEOUT;
+    while !w.vox(None, &["room", "list"]).ok {
+        assert!(
+            Instant::now() < deadline,
+            "{}'s daemon never answered",
+            w.name
+        );
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 
-/// Build `names.len()` workers in one room. Each trusts every other, and the room is
-/// ready when every worker holds every other's sender key — so any post by anyone is
-/// readable by everyone.
+/// Build `names.len()` workers in one room: an anchor, a daemon per worker, the first
+/// creating the room and the rest joining it, every worker trusting every other. Ready
+/// when every worker has rendered a post by every other.
 pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
-    let mut workers = Vec::new();
-    for n in names {
-        workers.push(worker(tmp, n).await);
+    let (anchor, spec) = spawn_anchor(tmp);
+    let mut workers: Vec<Worker> = names.iter().map(|n| worker(tmp, n)).collect();
+    for w in &mut workers {
+        let err = tmp.join(format!("{}.daemon.err", w.name));
+        start_daemon(w, &spec, &err);
     }
+
     let first = &workers[0];
-    assert!(first
-        .node
-        .apply(NodeCommand::CreateChannel {
-            local_name: "mission".into(),
-            passphrase: secret("channel passphrase"),
-        })
-        .await
-        .is_done());
-    let cid = first.node.view().channels[0].channel_id;
-    assert!(first
-        .node
-        .apply(NodeCommand::Invite { channel_id: cid })
-        .await
-        .is_done());
-    let url = wait_for(&first.node, |e| match e {
-        NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
-        _ => None,
-    })
-    .await;
+    let o = first.vox_in(
+        None,
+        &["room", "create", "--name", "mission"],
+        Some(ROOM_PASS),
+    );
+    assert!(o.ok, "room create: {o:?}");
+    let id = first
+        .vox(None, &["room", "list"])
+        .stdout
+        .split_whitespace()
+        .next()
+        .expect("the new room in `vox room list`")
+        .to_owned();
+    let link = first
+        .vox(None, &["room", "invite", &id])
+        .stdout
+        .trim()
+        .to_owned();
     for w in &workers[1..] {
-        assert!(w
-            .node
-            .apply(NodeCommand::JoinChannel {
-                link: url.clone(),
-                local_name: "mission".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
+        // A join can be turned away while the host is busy admitting another joiner — a
+        // known, separate defect. Retry, bounded, and say so in the receipt.
+        let joined = (1..=6).any(|attempt| {
+            let o = w.vox_in(
+                None,
+                &["room", "join", &link, "--name", "mission"],
+                Some(ROOM_PASS),
+            );
+            if !o.ok {
+                eprintln!(
+                    "[harness] {} join attempt {attempt} refused; retrying",
+                    w.name
+                );
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            o.ok
+        });
+        assert!(joined, "{} could not join the room", w.name);
     }
+
+    // Trust after the joins (see the module note), each worker trusting every other.
     for a in &workers {
         for b in &workers {
             if a.fp != b.fp {
-                assert!(a
-                    .node
-                    .apply(NodeCommand::Trust {
-                        fingerprint: b.fp,
-                        petname: b.name.clone(),
-                    })
-                    .await
-                    .is_done());
+                let o = a.vox(
+                    None,
+                    &[
+                        "trust",
+                        "add",
+                        &b.b32(),
+                        "--name",
+                        &b.name,
+                        "--identity-passphrase-file",
+                        a.pass.to_str().unwrap(),
+                    ],
+                );
+                assert!(o.ok, "{} trusts {}: {o:?}", a.name, b.name);
             }
         }
     }
-    // One wait per worker for the WHOLE set of peers: events are consumed as they are
-    // read, so waiting for one peer at a time would discard the event for the next.
-    for a in &workers {
-        let mut owed: std::collections::BTreeSet<[u8; 32]> = workers
-            .iter()
-            .map(|b| b.fp)
-            .filter(|fp| *fp != a.fp)
-            .collect();
-        let names: std::collections::BTreeMap<[u8; 32], String> =
-            workers.iter().map(|w| (w.fp, w.name.clone())).collect();
-        let waited = tokio::time::timeout(TIMEOUT, async {
-            loop {
-                match a.node.next_event().await {
-                    Some(NodeEvent::SenderKeyReceived {
-                        channel_id, peer, ..
-                    }) if channel_id == cid => {
-                        owed.remove(&peer);
-                        if owed.is_empty() {
-                            return;
-                        }
-                    }
-                    Some(_) => {}
-                    None => panic!("event stream ended"),
-                }
-            }
+
+    // Ready when every reader has rendered a post by every author. Forward-only means an
+    // early post can stay unreadable forever, so each author keeps posting fresh ones.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut owed: Vec<(usize, usize)> = (0..workers.len())
+        .flat_map(|a| {
+            (0..workers.len())
+                .filter(move |r| *r != a)
+                .map(move |r| (a, r))
         })
-        .await;
-        assert!(
-            waited.is_ok(),
-            "{} never received the sender key of {:?}",
-            a.name,
-            owed.iter().map(|f| names[f].clone()).collect::<Vec<_>>()
-        );
-    }
-    let socks = workers
-        .iter()
-        .map(|w| vox_core::node::ipc::bind(w.node.clone(), &w.paths).expect("socket"))
         .collect();
+    let mut n = 0u32;
+    while !owed.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the room never became readable both ways: owed (author, reader) {:?}",
+            owed.iter()
+                .map(|(a, r)| (workers[*a].name.clone(), workers[*r].name.clone()))
+                .collect::<Vec<_>>()
+        );
+        n += 1;
+        for (a, author) in workers.iter().enumerate() {
+            if owed.iter().any(|(x, _)| *x == a) {
+                let o = author.vox(
+                    None,
+                    &[
+                        "room",
+                        "post",
+                        &id,
+                        &format!("harness: ready {} {n}", author.name),
+                    ],
+                );
+                assert!(o.ok, "{o:?}");
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        owed.retain(|(a, r)| {
+            let seen = workers[*r].vox(None, &["room", "read", &id]).stdout;
+            !seen.contains(&format!("harness: ready {} ", workers[*a].name))
+        });
+    }
+
+    // `vox room list` prints a prefix; every `read --json` row names the room in full.
+    let rows = workers[0]
+        .vox(None, &["room", "read", &id, "--json"])
+        .ndjson();
+    let full = rows
+        .first()
+        .and_then(|r| r["room"].as_str())
+        .expect("a readable room names itself in full")
+        .to_owned();
+    let cid = vox_core::node::link::b32_decode(&full, "room id").expect("a room id");
     Room {
-        id: vox_core::node::link::b32_encode(&cid),
+        id: full,
         cid,
         workers,
-        _socks: socks,
+        _anchor: anchor,
     }
 }
 

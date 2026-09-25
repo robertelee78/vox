@@ -866,14 +866,17 @@ that proves it.**
   *Proof*: through the shipped binary, a session whose claim lapses between two drains is told exactly
   once, and a session whose claims did not change is told nothing.
 
-  > **Built on PR #14, 2026-09-25** (proof `claim_lost_proof`, two nodes, the real drain hook). The drain
+  > **Built on PR #14, 2026-09-25** (proof `claim_lost_proof`, two `vox daemon`s and a `vox node` anchor,
+  > the real drain hook). The drain
   > compares what the session holds now with what it held at its previous drain (recorded next to its
   > cursor) and says, once: *lapsed*, *now held by `<fp>/<session>`*, or *handed off to …*. A loss the
   > session caused itself — its own latest operation on the resource is a `release` or `handoff` — is not
-  > reported. Proved: unchanged claims say nothing; a lapse is reported once and not again; a claim bob
-  > re-took names bob; an own release says nothing. Four mutants caught (no report; own release reported;
-  > held set never recorded; every loss called a lapse). **Not proved:** the *handed off* wording — no
-  > proof yet hands a claim away from a session that did not do it itself.
+  > reported. Only the holder can release or hand off, so any other loss is a **lapse**, and the notice
+  > adds what the item is now: *now held by `<fp>/<session>`* or *now reserved for …* (the first version
+  > called the second "handed off", which review showed could only follow a lapse). Proved: unchanged
+  > claims say nothing; a lapse is reported once; a lapsed claim bob re-took names bob; a lapsed claim bob
+  > re-took and handed off names the recipient; an own release says nothing **in the same drain that
+  > reports another lapse** (the positive control). Five mutants caught on the real-process harness.
 - **M21.10 — a `result` warns about unread addressed messages.** Decided 2026-09-24, not built. A
   redirect addressed to a session can arrive after its last drain and before it reports. `vox room post
   --type result` **MUST** still post, and **MUST** print to the caller every message addressed to that
@@ -882,12 +885,13 @@ that proves it.**
   *Proof*: through the shipped binary, a `result` posted with an addressed message unread posts and
   names that message; with nothing unread it prints no warning.
 
-  > **Built on PR #14, 2026-09-25** (proof `result_unread_proof`, two nodes). `vox room post --type result`
+  > **Built on PR #14, 2026-09-25** (proof `result_unread_proof`, two `vox daemon`s). `vox room post --type result`
   > posts, then names every message past the session's **drain cursor** that is not its own and names it
   > in `to` — by its session id or its `VOX_AGENT_NAME` — on stderr and as `unread_addressed` in `--json`.
   > Proved: the addressed redirect is named and the broadcast and a message to someone else are not;
-  > after the drain delivers it, the next result names nothing; a non-`result` post never warns. Four
-  > mutants caught (never reports; cursor ignored; addressing ignored; every post warns).
+  > after the drain delivers it, the next result names nothing; a non-`result` post never warns; a message
+  > to the session's `VOX_AGENT_NAME` is named. Five mutants caught on the real-process harness (never
+  > reports; cursor ignored; addressing ignored; every post warns; `VOX_AGENT_NAME` ignored).
 
 ## Links
 
