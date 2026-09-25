@@ -70,6 +70,13 @@ impl Drop for Daemon {
 }
 
 impl Daemon {
+    /// Kill it by its PID now, in place, and report whether it is gone (reaped).
+    fn kill_now(&mut self) -> bool {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        matches!(self.0.try_wait(), Ok(Some(_)))
+    }
+
     /// Send it a signal by its PID (`-STOP` freezes it, `-CONT` thaws it).
     fn signal(&self, sig: &str) {
         let ok = Command::new("kill")
@@ -827,6 +834,108 @@ fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let at = shown.iter().position(|t| *t == away).unwrap();
+    let meanwhile = shown.iter().position(|t| t == "meanwhile 1").unwrap();
+    let l = late(alice, &room);
+    println!(
+        "alice: {away:?} at {at}, above \"meanwhile 1\" at {meanwhile}; marked late: {l:?} \
+         (after {attempt} attempt(s))"
+    );
+    assert!(at < meanwhile, "the late post is not in its true place");
+    assert_eq!(
+        l,
+        vec![away.clone()],
+        "exactly the late post is marked late"
+    );
+    stop_all(vec![alice_d, bob_d]);
+}
+
+/// The other way a member goes offline: its node **restarts**. Bob posts and his daemon is killed
+/// before its push; alice goes on; bob's daemon starts again (on a new port, as a restarted node
+/// does) and delivers the post, which lands above what alice was already shown and is marked
+/// late.
+///
+/// Red today for v0.2.9 V29-23 (#104), not for the order: the restarted daemon's board records
+/// restart their sequence at 1, the board holds a newer one from before the restart, and nobody
+/// can reach it at its new address (2 of 5 runs never delivered). It becomes a gate when that fix
+/// lands; the frozen-daemon variant above carries the claim meanwhile.
+#[test]
+#[ignore = "red for v0.2.9 V29-23 (#104, a restarted daemon's board record is refused); CI skips it \
+            by name until that fix lands"]
+fn a_late_arrival_after_a_restart_is_marked() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = members(tmp.path(), &["alice", "bob"]);
+    let (alice, bob) = (&dirs[0], &dirs[1]);
+    let alice_d = daemon(
+        alice,
+        "alice",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n"),
+        None,
+    );
+    attached(alice, "alice");
+    let mut bob_d = daemon(bob, "bob", "127.0.0.1:0", &format!("{IDENTITY}\n"), None);
+    attached(bob, "bob");
+    let room = room(alice, &[bob]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        post(bob, &room, "bob probe");
+        std::thread::sleep(Duration::from_millis(500));
+        if texts(&read(alice, &room)).contains(&"bob probe") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "alice never read bob");
+    }
+    // Killed straight after posting, before the push; retried if the push won the race.
+    let mut attempt = 0;
+    let away = loop {
+        attempt += 1;
+        assert!(
+            attempt <= 5,
+            "bob's post got out before his node went down, 5 times"
+        );
+        let text = format!("while away {attempt}");
+        post(bob, &room, &text);
+        assert!(bob_d.kill_now(), "bob's daemon did not stop");
+        std::thread::sleep(Duration::from_secs(2));
+        if !texts(&read(alice, &room)).contains(&text.as_str()) {
+            break text;
+        }
+        bob_d = daemon(
+            bob,
+            &format!("bob-{attempt}"),
+            "127.0.0.1:0",
+            &format!("{IDENTITY}\n{ROOMPASS}\n"),
+            None,
+        );
+        attached(bob, "bob");
+    };
+    for i in 1..=3 {
+        post(alice, &room, &format!("meanwhile {i}"));
+    }
+    std::thread::sleep(Duration::from_secs(12));
+    let bob_d = daemon(
+        bob,
+        "bob-back",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        None,
+    );
+    attached(bob, "bob");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !texts(&read(alice, &room)).contains(&away.as_str()) {
+        assert!(
+            Instant::now() < deadline,
+            "alice never received {away:?}\n{}",
+            daemon_logs(&[(alice.as_path(), "alice"), (bob.as_path(), "bob")])
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let shown: Vec<String> = texts(&read(alice, &room))
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     let at = shown.iter().position(|t| *t == away).unwrap();
     let meanwhile = shown.iter().position(|t| t == "meanwhile 1").unwrap();
     let l = late(alice, &room);
