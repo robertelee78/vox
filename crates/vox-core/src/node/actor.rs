@@ -4567,17 +4567,19 @@ impl Node {
                         return;
                     }
                 };
-            // 3. Run the session. `blocking_lock` is the sanctioned way to take a tokio mutex off a
-            //    blocking thread; anything else wanting this room waits for the session rather than
-            //    finding it missing.
+            // 3. Run the session. It takes the room's lock inside each protocol step and never across
+            //    a send or a receive (`sync_over_room`), so a peer slow to answer no longer holds the
+            //    room — or, through `publish()` and every other lock on it, the actor.
             let joined = tokio::task::spawn_blocking(move || {
                 let mut t = transport;
                 match target {
                     SessionTarget::Channel(shared) => {
-                        shared.blocking_lock().sync_over(&store, &mut t, now)
+                        crate::node::channel::ChannelState::sync_over_room(
+                            &shared, &store, &mut t, now,
+                        )
                     }
                     SessionTarget::Anchored(state) => {
-                        state.blocking_lock().sync_over(&store, &mut t)
+                        crate::node::anchor::AnchorState::sync_over_room(&state, &store, &mut t)
                     }
                 }
             })
@@ -4623,16 +4625,17 @@ impl Node {
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
             let joined = tokio::task::spawn_blocking(move || {
-                // `blocking_lock` is the sanctioned way to take a tokio mutex off a
-                // blocking thread. Anything else wanting this channel waits for the
-                // session — a few milliseconds — instead of finding it missing.
+                // The room is locked inside each protocol step only, never across the
+                // network (`sync_over_room`).
                 let mut t = transport;
                 match target {
                     SessionTarget::Channel(shared) => {
-                        shared.blocking_lock().sync_over(&store, &mut t, now)
+                        crate::node::channel::ChannelState::sync_over_room(
+                            &shared, &store, &mut t, now,
+                        )
                     }
                     SessionTarget::Anchored(state) => {
-                        state.blocking_lock().sync_over(&store, &mut t)
+                        crate::node::anchor::AnchorState::sync_over_room(&state, &store, &mut t)
                     }
                 }
             })

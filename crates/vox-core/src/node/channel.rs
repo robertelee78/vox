@@ -2047,8 +2047,33 @@ impl ChannelState {
 
         // Collect what arrived, in per-author sequence order, before touching the
         // store (the borrow of `self.dag` ends here).
+        let mut out = self.absorb_arrived(store, &before, now_secs)?;
+        if let Ok(n) = session {
+            out.applied = n;
+        }
+        match session {
+            Ok(_) => Ok(out),
+            Err(code) => Err(sync_failure(code)),
+        }
+    }
+
+    /// Each author's head, for [`ChannelState::absorb_arrived`] to find what a sync added.
+    fn heads(&self) -> BTreeMap<Digest32, u64> {
+        self.authors
+            .keys()
+            .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
+            .collect()
+    }
+
+    /// Persist, fold and render every entry a sync added past `before`'s heads.
+    fn absorb_arrived(
+        &mut self,
+        store: &Store,
+        before: &BTreeMap<Digest32, u64>,
+        now_secs: u64,
+    ) -> Result<SyncOutcome> {
         let mut arrived: Vec<(Digest32, Digest32, Vec<u8>)> = Vec::new();
-        for (author, head) in &before {
+        for (author, head) in before {
             let Some(feed) = self.dag.feed(author) else {
                 continue;
             };
@@ -2063,7 +2088,7 @@ impl ChannelState {
         }
 
         let mut out = SyncOutcome {
-            applied: session.unwrap_or(arrived.len()),
+            applied: arrived.len(),
             ..SyncOutcome::default()
         };
         for (author, entry_hash, payload) in arrived {
@@ -2117,8 +2142,47 @@ impl ChannelState {
         }
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
+        Ok(out)
+    }
+
+    /// Reconcile the room with a peer over `transport`, holding `shared`'s lock only inside each
+    /// protocol step — never across a send or a receive. See [`crate::log::sync::SessionRoom`].
+    ///
+    /// # Errors
+    /// The room is poisoned, a persist fails, or the session hard-fails.
+    pub fn sync_over_room<T: Transport>(
+        shared: &tokio::sync::Mutex<Self>,
+        store: &Store,
+        transport: &mut T,
+        now_secs: u64,
+    ) -> Result<SyncOutcome> {
+        let epoch = {
+            let ch = shared.blocking_lock();
+            if ch.poisoned {
+                return Err(Error::Profile(
+                    "channel is poisoned after a failed persist; reopen it",
+                ));
+            }
+            ch.epoch
+        };
+        let room = ChannelSessionRoom {
+            shared,
+            store,
+            now_secs,
+            epoch,
+            out: std::cell::RefCell::new(SyncOutcome::default()),
+            fatal: std::cell::RefCell::new(None),
+        };
+        let session = crate::log::sync::frontier_session_room(transport, &room);
+        if let Some(e) = room.fatal.take() {
+            return Err(e);
+        }
+        let mut out = room.out.into_inner();
         match session {
-            Ok(_) => Ok(out),
+            Ok(n) => {
+                out.applied = n;
+                Ok(out)
+            }
             Err(code) => Err(sync_failure(code)),
         }
     }
@@ -2630,5 +2694,82 @@ impl ChannelState {
     #[must_use]
     pub fn can_answer_join(&self) -> bool {
         !self.passphrase.is_empty()
+    }
+}
+
+/// A channel as a [`crate::log::sync::SessionRoom`]: each step locks the room, does its work, and
+/// lets go. See [`ChannelState::sync_over_room`].
+struct ChannelSessionRoom<'a> {
+    shared: &'a tokio::sync::Mutex<ChannelState>,
+    store: &'a Store,
+    now_secs: u64,
+    /// The epoch the session began at; a room that has moved on refuses what was staged for it.
+    epoch: u64,
+    out: std::cell::RefCell<SyncOutcome>,
+    /// A local failure (a persist that failed) that must reach the caller as itself, not as a code.
+    fatal: std::cell::RefCell<Option<Error>>,
+}
+
+impl ChannelSessionRoom<'_> {
+    fn room(
+        &self,
+    ) -> std::result::Result<tokio::sync::MutexGuard<'_, ChannelState>, crate::wire::WireError>
+    {
+        let ch = self.shared.blocking_lock();
+        if ch.poisoned {
+            return Err(crate::wire::WireError::TransportFailed);
+        }
+        if ch.epoch != self.epoch {
+            return Err(crate::wire::WireError::EpochMismatch);
+        }
+        Ok(ch)
+    }
+}
+
+impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
+    fn frontiers(
+        &self,
+    ) -> std::result::Result<Vec<crate::log::sync::FeedFrontier>, crate::wire::WireError> {
+        Ok(crate::log::sync::frontiers_of(&self.room()?.dag))
+    }
+
+    fn wants(
+        &self,
+        remote: &[crate::log::sync::FeedFrontier],
+    ) -> std::result::Result<Vec<crate::log::sync::WantRange>, crate::wire::WireError> {
+        Ok(crate::log::sync::wants_for(&self.room()?.dag, remote))
+    }
+
+    fn entries(
+        &self,
+        wants: &[crate::log::sync::WantRange],
+    ) -> std::result::Result<Vec<Vec<u8>>, crate::wire::WireError> {
+        Ok(crate::log::sync::entries_for_wants(
+            &self.room()?.dag,
+            wants,
+        ))
+    }
+
+    fn apply(&self, staged: Vec<Vec<u8>>) -> std::result::Result<usize, crate::wire::WireError> {
+        let mut guard = self.room()?;
+        let ch = &mut *guard;
+        let before = ch.heads();
+        // The resolver as it is *now*: an author revoked while this batch was on the wire is not
+        // an author of this room any more, and its entries are refused.
+        let resolver = ch.resolver();
+        let stored =
+            crate::log::sync::apply_staged(&mut ch.dag, &resolver, &ch.admission, &staged)?;
+        match ch.absorb_arrived(self.store, &before, self.now_secs) {
+            Ok(got) => {
+                let mut out = self.out.borrow_mut();
+                out.rendered += got.rendered;
+                out.governance += got.governance;
+                Ok(stored)
+            }
+            Err(e) => {
+                *self.fatal.borrow_mut() = Some(e);
+                Err(crate::wire::WireError::TransportFailed)
+            }
+        }
     }
 }

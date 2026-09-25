@@ -808,6 +808,137 @@ where
     drain_entries(t, dag, resolver, admission)
 }
 
+/// What a frontier session may do to a room, **one step at a time**. Each method takes the room's
+/// lock, does its step, releases the lock and returns owned data; none of them sees the transport.
+/// [`frontier_session_room`] sees the transport and never the room. So no lock can be held across a
+/// network wait, and the compiler keeps it that way: there is no scope in which both exist.
+///
+/// This replaces a session that held the room's mutex from its first frame to its last. A peer that
+/// was slow to answer then held the room for up to the frame timeout, and every other use of the
+/// room — a message being posted, the node's view being published after every event — waited
+/// behind it (ADR-008's own implementation note named the fix).
+pub trait SessionRoom {
+    /// The room's frontiers, for `HAVE`.
+    ///
+    /// # Errors
+    /// The room is unusable (poisoned, or moved to another epoch).
+    fn frontiers(&self) -> std::result::Result<Vec<FeedFrontier>, WireError>;
+    /// What to ask the peer for, given its `HAVE`.
+    ///
+    /// # Errors
+    /// As [`SessionRoom::frontiers`].
+    fn wants(&self, remote: &[FeedFrontier]) -> std::result::Result<Vec<WantRange>, WireError>;
+    /// The entries to serve for the peer's `WANT` — owned and bounded.
+    ///
+    /// # Errors
+    /// As [`SessionRoom::frontiers`].
+    fn entries(&self, wants: &[WantRange]) -> std::result::Result<Vec<Vec<u8>>, WireError>;
+    /// Apply a batch of received entries under a fresh lock, **against the room's current rules**: an
+    /// author revoked while the batch was on the wire is refused, and a room that moved to another
+    /// epoch refuses the whole batch. Returns how many were newly stored.
+    ///
+    /// # Errors
+    /// A hard sync failure from an entry, or the room is unusable.
+    fn apply(&self, staged: Vec<Vec<u8>>) -> std::result::Result<usize, WireError>;
+}
+
+/// How many received entries are staged before a batch is applied. Bounds what a session holds in
+/// memory between locks; each batch is one short hold of the room.
+pub const MAX_STAGED: usize = 256;
+
+/// One peer's half of a frontier session, over `t`, against `room` — the same protocol as
+/// [`frontier_session_peer`], with the room locked only inside each [`SessionRoom`] step and never
+/// across a send or a receive.
+///
+/// # Errors
+/// The coded [`WireError`] of a hard fail; the transport is closed with it.
+pub fn frontier_session_room<T, S>(t: &mut T, room: &S) -> std::result::Result<usize, WireError>
+where
+    T: Transport,
+    S: SessionRoom + ?Sized,
+{
+    match frontier_session_room_inner(t, room) {
+        Ok(applied) => Ok(applied),
+        Err(code) => {
+            t.close(code);
+            Err(code)
+        }
+    }
+}
+
+fn frontier_session_room_inner<T, S>(t: &mut T, room: &S) -> std::result::Result<usize, WireError>
+where
+    T: Transport,
+    S: SessionRoom + ?Sized,
+{
+    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
+
+    send(t, encode_hello(SYNC_MODE_FRONTIER))?;
+    let remote_hello = expect_hello(t.recv())?;
+    negotiate_mode(SYNC_MODE_FRONTIER, remote_hello)?;
+
+    send(t, encode_have(&room.frontiers()?))?;
+    let remote_have = expect_have(t.recv())?;
+
+    send(t, encode_want(&room.wants(&remote_have)?))?;
+    let their_wants = expect_want(t.recv())?;
+
+    let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
+    for wire in room.entries(&their_wants)? {
+        if std::time::Instant::now() >= serve_deadline {
+            break;
+        }
+        send(t, encode_entry(&wire))?;
+    }
+    t.finish();
+
+    // Drained with no lock held; applied a batch at a time under a fresh one.
+    let deadline = std::time::Instant::now() + DRAIN_BUDGET;
+    let mut staged: Vec<Vec<u8>> = Vec::new();
+    let mut applied = 0;
+    while let Some(frame) = t.recv().map_err(|_| WireError::TransportFailed)? {
+        if std::time::Instant::now() >= deadline {
+            return Err(WireError::SyncModeUnsupported);
+        }
+        match decode_frame(&frame) {
+            Ok(SyncFrame::Entry(wire)) => {
+                staged.push(wire);
+                if staged.len() >= MAX_STAGED {
+                    applied += room.apply(std::mem::take(&mut staged))?;
+                }
+            }
+            Ok(_) | Err(_) => return Err(WireError::SyncModeUnsupported),
+        }
+    }
+    if !staged.is_empty() {
+        applied += room.apply(staged)?;
+    }
+    Ok(applied)
+}
+
+/// Apply staged entries into `dag`, returning how many were newly stored — the apply half of
+/// [`SessionRoom::apply`], for a caller that already holds its room.
+///
+/// # Errors
+/// The first hard sync failure.
+pub fn apply_staged<R: AuthorResolver>(
+    dag: &mut Dag,
+    resolver: &R,
+    admission: &AdmissionPolicy,
+    staged: &[Vec<u8>],
+) -> std::result::Result<usize, WireError> {
+    let mut stored = 0;
+    for wire in staged {
+        if matches!(
+            apply_entry(dag, resolver, admission, wire)?,
+            ApplyOutcome::Stored
+        ) {
+            stored += 1;
+        }
+    }
+    Ok(stored)
+}
+
 /// Read and apply every queued `ENTRY` frame on `t` into `dag`. A hard fail
 /// returns the mapped [`WireError`]; the caller ([`frontier_session`]) performs
 /// the coded stream close, so this function does not close itself (one central
