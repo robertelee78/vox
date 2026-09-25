@@ -634,6 +634,11 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
      grant is a key the recipient must not use), which also unblocks the responder.
   3. **A pending joiner needed the `pairwise` stream too**, not "the join stream only": the instant a join
      completes the newcomer must deliver that key, before the responder has reclassified it as a member.
+     **The same holds in the other direction (2026-09-25, v0.2.9):** the responder releases *its* key the
+     moment it admits the joiner, before the joiner holds the room or knows the responder as a member. So
+     the joiner classifies the member it is joining through as `JoinResponder` (pairwise, plus what an
+     unknown peer may already open) from just before the exchange until `JoinerDone`. Without that, a
+     joiner's first room was the one room whose key was refused at accept.
   4. **A node must publish its records to the *anchors*, not only to its own board**, and must **learn the
      current members from the board before syncing**. A key nobody can find cannot be admitted, and an
      ADR-008 session hard-fails on the first entry from an unadmitted author — so a member who joined after

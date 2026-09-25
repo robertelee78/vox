@@ -95,6 +95,9 @@ const MEMBER_REDIAL_SECS: u64 = 30;
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+/// How long a delivered sender key may go unanswered before it is counted as not taken and sent
+/// again. See `pairwise_stream::refused`.
+const KEY_DELIVERY_PATIENCE: Duration = Duration::from_secs(30);
 /// How many failed sessions in a row a `(room, peer)` push is retried on the next tick before it is
 /// left to the periodic interval. Enough to ride out a collision (both sides pushing at once); few
 /// enough that a peer whose sessions always fail cannot hold the room.
@@ -214,6 +217,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AddressesDiscovered { .. } => "publishing every room at a new address",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::PushRetry { .. } => "retrying a push that failed",
+        NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
@@ -507,6 +511,18 @@ enum NetEvent {
         peer: Digest32,
         /// What the session did, or why it failed.
         outcome: crate::error::Result<crate::node::channel::SyncOutcome>,
+    },
+    /// A sender key written to `peer` was not taken (see `pairwise_stream::refused`): it is owed
+    /// again, and the tick re-sends it.
+    SkdmRefused {
+        /// The room.
+        channel_id: Digest32,
+        /// The member it was for.
+        peer: Digest32,
+        /// The generation that did not land.
+        chain_id: u64,
+        /// What the recipient's side said.
+        why: String,
     },
     /// A push whose session failed is due again for that peer — sent after a short random wait by
     /// the `SyncDone` handler, so two ends that collided do not retry together.
@@ -1596,6 +1612,7 @@ pub struct Node {
         Digest32,
         Digest32,
         crate::node::pairwise_stream::PairwiseFrame,
+        quinn::SendStream,
         quinn::RecvStream,
     )>,
     /// Rooms whose anchor publish found them mid-session: run when that session's `SyncDone`
@@ -2879,8 +2896,8 @@ impl Node {
                     .into_iter()
                     .partition(|(r, ..)| *r == room);
                 self.held_pairwise = kept;
-                for (_, peer, first, recv) in held {
-                    self.handle_pairwise(peer, first, recv).await;
+                for (_, peer, first, send, recv) in held {
+                    self.handle_pairwise(peer, first, send, recv).await;
                 }
                 let _ = reply.send(outcome);
             }
@@ -2968,6 +2985,28 @@ impl Node {
                 self.schedules
                     .entry(peer)
                     .or_insert_with(SyncSchedule::connected);
+            }
+            NetEvent::SkdmRefused {
+                channel_id,
+                peer,
+                chain_id,
+                why,
+            } => {
+                let (Some(profile), Some(shared)) = (
+                    self.profile.as_ref(),
+                    self.channels.get(&channel_id).map(Arc::clone),
+                ) else {
+                    return;
+                };
+                let _ = shared
+                    .lock()
+                    .await
+                    .note_undelivered(profile.store(), peer, chain_id);
+                let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
+                    channel_id,
+                    peer,
+                    why,
+                });
             }
             NetEvent::PushRetry { channel_id, peer } => {
                 self.pending_push.insert(channel_id);
@@ -3078,8 +3117,8 @@ impl Node {
                         // Unreachable: the stream loop turns these into
                         // `NetEvent::JoinRequest` once the request is read.
                     }
-                    Inbound::Pairwise { peer, recv, .. } => {
-                        self.take_inbound_skdm(peer, recv).await;
+                    Inbound::Pairwise { peer, send, recv } => {
+                        self.take_inbound_skdm(peer, send, recv).await;
                     }
                     Inbound::Sync { .. } => {
                         // Unreachable: the stream loop converts these into
@@ -3858,7 +3897,7 @@ impl Node {
         let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
             return Outcome::Failed(Fault::Unreachable);
         };
-        if let Err(e) = crate::node::pairwise_stream::deliver_skdm(
+        let sent = match crate::node::pairwise_stream::deliver_skdm(
             &conn,
             channel_id,
             session,
@@ -3867,21 +3906,24 @@ impl Node {
         )
         .await
         {
-            return Outcome::Failed(fault_of(&e));
-        }
+            Ok(sent) => sent,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
             self.channels.get(channel_id).map(Arc::clone),
         ) else {
             return Outcome::Failed(Fault::UnknownChannel);
         };
-        if let Err(e) = shared
-            .lock()
-            .await
-            .issue_consent(profile, target, &skdm, now)
-        {
-            return Outcome::Failed(fault_of(&e));
-        }
+        let chain_id = {
+            let mut channel = shared.lock().await;
+            if let Err(e) = channel.issue_consent(profile, target, &skdm, now) {
+                return Outcome::Failed(fault_of(&e));
+            }
+            channel.sender_generation()
+        };
+        // The consent is a fact once decided; whether the key landed is learnt off the actor.
+        self.watch_delivery(sent, *channel_id, target, chain_id);
         Outcome::Done
     }
 
@@ -4103,7 +4145,7 @@ impl Node {
             let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
                 continue;
             };
-            if crate::node::pairwise_stream::deliver_skdm(
+            let Ok(sent) = crate::node::pairwise_stream::deliver_skdm(
                 &conn,
                 channel_id,
                 session,
@@ -4111,10 +4153,10 @@ impl Node {
                 hello.as_ref(),
             )
             .await
-            .is_err()
-            {
+            else {
                 continue;
-            }
+            };
+            self.watch_delivery(sent, *channel_id, target, generation);
             // Recorded only after the bytes went out, so a failed delivery stays owed.
             let noted = {
                 let Some(profile) = self.profile.as_ref() else {
@@ -4810,6 +4852,32 @@ impl Node {
         true
     }
 
+    /// Learn, off the actor, whether the key just written to `target` was taken; if it was not,
+    /// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
+    fn watch_delivery(
+        &self,
+        sent: quinn::RecvStream,
+        channel_id: Digest32,
+        target: Digest32,
+        chain_id: u64,
+    ) {
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            if let Some(why) =
+                crate::node::pairwise_stream::refused(sent, KEY_DELIVERY_PATIENCE).await
+            {
+                let _ = tx
+                    .send(NetEvent::SkdmRefused {
+                        channel_id,
+                        peer: target,
+                        chain_id,
+                        why,
+                    })
+                    .await;
+            }
+        });
+    }
+
     /// A connection to `target`: the live one if there is one, otherwise dialled
     /// through the ADR-012 ladder.
     ///
@@ -4926,7 +4994,12 @@ impl Node {
 
     /// Take an inbound sealed control message: an ADR-006 SKDM, which makes that
     /// author's messages readable and backfills any already held as ciphertext.
-    async fn take_inbound_skdm(&mut self, peer: Digest32, mut recv: quinn::RecvStream) {
+    async fn take_inbound_skdm(
+        &mut self,
+        peer: Digest32,
+        send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+    ) {
         use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
         let Ok(Some(first)) = recv_pairwise(&mut recv).await else {
             return;
@@ -4944,10 +5017,10 @@ impl Node {
         // ran on the actor the stream waited in the queue until the room existed; this puts that
         // ordering back. `JoinerDone` replays whatever was held.
         if self.joining.contains(&room) && !self.channels.contains_key(&room) {
-            self.held_pairwise.push((room, peer, first, recv));
+            self.held_pairwise.push((room, peer, first, send, recv));
             return;
         }
-        self.handle_pairwise(peer, first, recv).await;
+        self.handle_pairwise(peer, first, send, recv).await;
     }
 
     /// Act on a pairwise stream whose first frame has been read.
@@ -4955,8 +5028,42 @@ impl Node {
         &mut self,
         peer: Digest32,
         first: crate::node::pairwise_stream::PairwiseFrame,
+        mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
     ) {
+        // **Taken, or said not to be.** A sender cannot learn from the transport whether its key
+        // was taken: QUIC acknowledges the bytes before this node decides anything. So a stream
+        // that carried a key is answered, one byte once the key is taken, and reset with a wire
+        // code when it is not. A stream that carried no key (a bare hello, an `Open`) is finished.
+        match self.take_pairwise(peer, first, &mut recv).await {
+            Some(true) => {
+                let _ = send
+                    .write_all(&[crate::node::pairwise_stream::KEY_TAKEN])
+                    .await;
+                let _ = send.finish();
+            }
+            Some(false) => {
+                let code = crate::transport::quic::close_code(
+                    crate::wire::WireError::AuthenticatorInvalid,
+                );
+                let _ = send.reset(code);
+                let _ = recv.stop(code);
+            }
+            None => {
+                let _ = send.finish();
+            }
+        }
+    }
+
+    /// Act on a pairwise stream whose first frame has been read: `Some(true)` if it carried a key
+    /// and the key was taken, `Some(false)` if it carried one that was not, `None` if it carried
+    /// none.
+    async fn take_pairwise(
+        &mut self,
+        peer: Digest32,
+        first: crate::node::pairwise_stream::PairwiseFrame,
+        recv: &mut quinn::RecvStream,
+    ) -> Option<bool> {
         use crate::node::pairwise_stream::{open_skdm, recv_pairwise, PairwiseFrame};
         // A `Hello` opens a session the join path never created (ADR-016): accept it
         // against our own prekey ring, exactly as the join responder does, then read
@@ -4973,16 +5080,16 @@ impl Node {
                         let _ = session.decrypt(&message, now);
                     }
                 }
-                return;
+                return None;
             }
             PairwiseFrame::Hello {
                 channel_id,
                 initial,
             } => {
                 if !self.accept_hello(channel_id, peer, &initial).await {
-                    return;
+                    return None;
                 }
-                match recv_pairwise(&mut recv).await {
+                match recv_pairwise(recv).await {
                     Ok(Some(PairwiseFrame::Skdm { channel_id, sealed })) => (channel_id, sealed),
                     Ok(Some(PairwiseFrame::Open { channel_id, sealed })) => {
                         let now = self.now();
@@ -4993,24 +5100,24 @@ impl Node {
                                 let _ = session.decrypt(&message, now);
                             }
                         }
-                        return;
+                        return None;
                     }
                     _ => {
                         // A session with nothing behind it is still progress: the peer
                         // may deliver over it later.
-                        return;
+                        return None;
                     }
                 }
             }
         };
         let now = self.now();
         let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
-            // No session with this peer for that channel: nothing can open it. The
-            // sender retries once a join or key exchange establishes one.
-            return;
+            // No session with this peer for that channel: nothing can open it. Said, so the
+            // sender sends it again once a join or key exchange establishes one.
+            return Some(false);
         };
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
-            return;
+            return Some(false);
         };
         let backfilled = match (
             self.profile.as_ref(),
@@ -5023,13 +5130,15 @@ impl Node {
                 .ok(),
             _ => None,
         };
-        if let Some(n) = backfilled {
-            let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
-                channel_id,
-                peer,
-                backfilled: n as u64,
-            });
-        }
+        let Some(n) = backfilled else {
+            return Some(false);
+        };
+        let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
+            channel_id,
+            peer,
+            backfilled: n as u64,
+        });
+        Some(true)
     }
 
     /// Load (or, on first use, generate) the prekey ring for the unlocked

@@ -1709,6 +1709,29 @@ impl ChannelState {
 
     /// Record that `target` has been delivered generation `chain_id` of this
     /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
+    pub fn note_undelivered(
+        &mut self,
+        store: &Store,
+        target: Digest32,
+        chain_id: u64,
+    ) -> Result<()> {
+        // Only the generation that was refused: a later one that did land stays recorded.
+        if self.delivered.get(&target) != Some(&chain_id) {
+            return Ok(());
+        }
+        match chain_id.checked_sub(1) {
+            Some(before) => {
+                self.delivered.insert(target, before);
+            }
+            None => {
+                self.delivered.remove(&target);
+            }
+        }
+        self.persist_delivered(store)
+    }
+
+    /// Record that `target` has been delivered generation `chain_id` of this
+    /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
     pub fn note_delivered(&mut self, store: &Store, target: Digest32, chain_id: u64) -> Result<()> {
         let entry = self.delivered.entry(target).or_default();
         if *entry >= chain_id {

@@ -135,6 +135,15 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   member drops out because the log says so, not because a cached list was updated — so no bookkeeping
   error can re-key someone the log has excluded. Delivery is recorded only after the bytes go out, so a
   failed delivery stays owed and the node's tick retries it when the peer is reachable.
+  > **Written is not delivered (2026-09-25, v0.2.9, V29-22).** Bytes going out proved nothing: QUIC
+  > acknowledges them before the recipient decides anything, and a recipient that refused the stream at
+  > accept, or had no session to open the key with, dropped it without saying so. The sender recorded
+  > it as delivered and never sent it again. A trusted member then never read the first room it joined:
+  > measured through the real binaries, both members had nothing in the first of two rooms after 90s, in
+  > 3 runs of 3. The recipient now **answers**, with one byte once the key is taken, or by resetting the
+  > stream with a wire code. The sender awaits that answer on its own task, never on the actor. Anything
+  > but the byte (a reset, no answer within 30s, a lost connection) lowers the ledger row for exactly that
+  > generation, and the tick sends the key again. Sending a key twice is harmless.
 - **Sender keys are delivered and retained (ADR-016 M14.5b).** An SKDM now travels as one frame on a
   bi-stream typed `pairwise`, sealed into the recipient's ADR-004 session (`Skdm::seal_into`), so the
   ratchet — not the stream — provides confidentiality and authenticity; the recipient verifies it against
