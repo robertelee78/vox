@@ -37,6 +37,9 @@ pub const ANCHORS_FILE: &str = "anchors";
 /// The profile's settings file in the config directory: `key = value` lines, `#`
 /// comments. Its first setting is `notify = off` (PRD-001 R37).
 pub const CONFIG_FILE: &str = "config";
+
+/// The node's retention policy file (ADR-023 decision 2), in the config directory.
+pub const RETENTION_FILE: &str = "retention";
 /// Directory of per-session read cursors inside a profile.
 pub const CURSOR_DIR: &str = "cursors";
 /// Where a harness session records how it can be woken (ADR-020 §6).
@@ -150,6 +153,13 @@ impl Paths {
     #[must_use]
     pub fn anchors_file(&self) -> PathBuf {
         self.config_dir.join(ANCHORS_FILE)
+    }
+
+    /// The node's retention file for this profile ([`RETENTION_FILE`],
+    /// [`crate::node::retention::RetentionConfig`]).
+    #[must_use]
+    pub fn retention_file(&self) -> PathBuf {
+        self.config_dir.join(RETENTION_FILE)
     }
 
     /// Where an agent session's read cursor for one room is kept

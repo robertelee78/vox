@@ -1,28 +1,45 @@
 //! The cross-author causal Merkle-DAG (ADR-008 §Decision) — a CRDT for causal
 //! histories.
 //!
-//! ## Causality model (explicit — the SSB / Hypercore model ADR-008 cites)
-//! Vox uses **per-author causal chains merged as concurrent feeds**, exactly the
-//! Secure-Scuttlebutt / Hypercore structure ADR-008 §Decision names. Concretely:
+//! ## Causality model (ADR-008 as amended by ADR-023 decision 1)
 //! - **Within one author** the feed is a *total order*: `seq` is strictly
 //!   monotonic and each entry hash-links its predecessors (`prev_hash` = seq−1,
 //!   `lipmaa_backlink` = the Bamboo skip predecessor). Entry *n* causally
 //!   precedes *n+1* of the same author.
-//! - **Across authors** entries are **concurrent**: the ADR-008 entry schema has
-//!   **no cross-author parent field**, so M5 records no happens-before edge
-//!   between two different authors' entries. (Any application-level cross-author
-//!   reference lives inside the encrypted, opaque payload and surfaces in later
-//!   milestones; adding a cross-author parent to the *schema* would be an ADR-008
-//!   amendment and is deliberately NOT done here.)
-//! - **Merge = union.** The DAG is the set union of all per-author feeds. Because
-//!   each feed is independently hash-chain-verifiable and there is no cross-author
-//!   edge to reconcile, the union of the same entry set is identical on every
-//!   replica regardless of receipt order — **Strong Eventual Consistency**. This
-//!   is a valid causal CRDT (the Matrix-event-graph convergence result, ADR-008).
+//! - **Across authors** an entry's `seen` names the heads of other authors' feeds
+//!   its author had applied when writing it. Those are real happens-before edges:
+//!   an entry follows everything it saw, and everything those saw. Two entries
+//!   neither of which reaches the other are **concurrent**.
+//! - **Merge = union.** The DAG is the set union of all per-author feeds. The edges
+//!   are signed into each entry, so the same entry set is the same graph on every
+//!   replica, whatever order it arrived in — Strong Eventual Consistency.
 //!
-//! The convergence test exercises *concurrent cross-author* entries: two authors'
-//! feeds delivered to two replicas in different interleavings yield byte-identical
-//! [`Dag::causal_order`] output.
+//! ## The one order (PRD-001 R13)
+//! Every entry gets a **hybrid logical clock**:
+//!
+//! ```text
+//! latest(e)  = max clock(p) over the parents p this node holds (or the room's genesis time)
+//! clock(e)   = max( min(claimed_ms(e), latest(e) + MAX_LEAD_MS), latest(e) + 1 )
+//! parents(e) = { e's own seq−1 } ∪ seen(e)
+//! ```
+//!
+//! and the order is ascending `(clock, entry_hash)`. A parent's clock is strictly
+//! below its child's, so this is a topological order of the DAG; among concurrent
+//! entries it is the authors' claimed milliseconds, then the hash. It is a function
+//! of the entry set alone, so every node holding the same entries computes the
+//! identical sequence. An author's clock can move its entry only among its concurrent
+//! peers: an entry written an hour "early" is still lifted to just after the newest
+//! thing it saw. A clock running *ahead* is capped at [`MAX_LEAD_MS`] past the
+//! entry's latest parent, so one member cannot drag everyone's clocks into the future.
+//!
+//! **A `seen` hash this node does not hold never blocks acceptance.** Entries arrive
+//! out of order (a member was offline, a sync session died half-way), and refusing
+//! an entry until its parents arrive would let one lost entry stall a room. The
+//! missing parent simply contributes nothing yet; when it arrives, the clocks of
+//! everything that named it are raised and propagated to their descendants
+//! ([`Dag::reorder_generation`] counts those moves, so a timeline knows to re-sort).
+//! Because a clock only ever rises to what the full set requires, the result is the
+//! same as if everything had arrived in causal order.
 //!
 //! ## What this module owns
 //! - The **store**: feeds keyed by author, plus a content-addressed index by
@@ -38,39 +55,37 @@
 //! - **Fork / equivocation handling** (ADR-008 §"Fork / equivocation handling"):
 //!   two distinct entries at the same `(author, seq)` with different hashes are an
 //!   equivocation. For **attributable** entries this is a self-authenticating
-//!   fork proof → the author is frozen and the proof recorded. For **deniable**
-//!   content (M7) the authenticator is forgeable, so a conflict raises a
-//!   non-attributable *alarm* and does **not** auto-freeze.
+//!   fork proof → the author is frozen and the proof recorded. Every entry is
+//!   attributable (composite-signed), so every fork is one.
 //! - **Render-gating** ([`Dag::render`]): the store holds ciphertext regardless of
 //!   readability; rendering attempts decryption and succeeds only if keys are held
 //!   (the decryptor is M4/M6).
 //!
-//! ## Causal ordering / convergence
-//! [`Dag::causal_order`] returns a topological order: every entry appears after
-//! all of its causal predecessors. The order is made **deterministic** (stable
-//! across replicas) by breaking ties on `(author_id, seq)`, so two replicas with
-//! the same entry set produce the identical sequence — the observable form of
-//! convergence.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
-use crate::log::entry::{DeniableVerifier, Entry, EntryKind};
-use crate::log::feed::Feed;
+use crate::log::checkpoint::Checkpoint;
+use crate::log::entry::{Entry, EntryKind, MAX_SEEN};
 
-/// An uninhabited [`DeniableVerifier`] naming the concrete type for the `None`
-/// default in [`Dag::accept`] (which performs no deniable verification). Its
-/// method is unreachable.
-enum NoDeniable {}
-impl DeniableVerifier for NoDeniable {
-    fn verify_deniable(&self, _: &crate::log::entry::EntrySkeleton, _: &[u8]) -> Result<()> {
-        Err(Error::DeniableVerificationUnavailable)
-    }
-}
-/// The typed `None` deniable verifier used by [`Dag::accept`].
-const NO_DENIABLE: Option<&NoDeniable> = None;
+/// How far an entry's claimed time may run ahead of the latest entry it names (or of the room's
+/// genesis, if it names none) before it is capped: ten minutes.
+///
+/// Without a cap one member could pin everyone's clocks forward: an entry claiming "tomorrow"
+/// lifts every entry that later sees it to tomorrow too, and everything concurrent with those
+/// then sorts before them for a day. The cap is computed from the entry's parents, never from
+/// the receiving node's clock, because a cap on "now" would differ between nodes and so would the
+/// order. With it, one post can move the room's clocks at most ten minutes, and moving them a day
+/// takes 144 posts, each visible and attributable.
+///
+/// Why ten minutes: honest clocks without time sync drift by seconds to a few minutes, so an
+/// honest entry is almost never capped; when it is (after a quiet spell of more than ten
+/// minutes), capping moves it only among entries it did not see, which is all the claimed time
+/// is ever used for. A larger bound would be a larger lever for a dishonest one.
+pub const MAX_LEAD_MS: u64 = 10 * 60 * 1_000;
+use crate::log::feed::Feed;
 
 /// The set of identities admitted to a `(channelID, epoch)` — the membership
 /// input to the acceptance predicate (ADR-008 §"Abuse resistance"). M5 models
@@ -132,16 +147,6 @@ pub enum ForkOutcome {
     /// proof carries two full entries (each with a multi-kilobyte composite
     /// signature), so it is boxed to keep the common `Ok`/error paths small.
     Attributable(Box<ForkProof>),
-    /// Deniable-content conflict (M7 authenticator): the proof does NOT
-    /// incriminate a specific author (any member could mint it), so this is a
-    /// non-attributable *alarm* — surfaced for manual resolution, **never** an
-    /// auto-freeze (it would be a framing/DoS primitive, ADR-008/ADR-009).
-    DeniableAlarm {
-        /// The author whose `(author, seq)` slot saw a conflict.
-        author_id: Digest32,
-        /// The shared sequence number.
-        seq: u64,
-    },
 }
 
 /// Why an entry was not accepted into the DAG.
@@ -153,18 +158,18 @@ pub enum Rejected {
     /// The entry's authenticator (or author/structure) failed verification.
     Verification(Error),
     /// The entry conflicts with a stored entry at the same `(author, seq)`
-    /// (equivocation); the [`ForkOutcome`] carries the attributable-vs-deniable
-    /// remedy.
+    /// (equivocation); the [`ForkOutcome`] carries the proof.
     Fork(ForkOutcome),
     /// The entry did not link correctly into the author's feed (bad seq, broken
     /// `prev_hash`/`lipmaa_backlink`, append past end-of-feed).
     Feed(Error),
     /// A duplicate of an already-stored entry (same hash) — idempotently ignored.
     Duplicate,
-    /// A governance/control entry carried a non-attributable (deniable)
-    /// authenticator. Governance MUST be composite-signed in every channel
-    /// (ADR-008), so this is rejected before storage.
-    GovernanceNotAttributable,
+    /// A position at or below its author's checkpoint that this node does not hold as
+    /// this entry (ADR-023 decision 3). Refused, never classified as a fork: below the line
+    /// the body is expired, so it could never be shown, and a fork proof would need the
+    /// very signature the checkpoint lets nodes drop.
+    PreCheckpoint,
 }
 
 /// The replicated log store: per-author feeds, a hash index, and frozen authors.
@@ -178,6 +183,34 @@ pub struct Dag {
     /// Authors frozen by an attributable fork proof; their later entries are
     /// refused (ADR-008 — members revoke/rotate to exclude the equivocator).
     frozen: HashMap<Digest32, ForkProof>,
+    /// entry hash -> its hybrid logical clock (module docs).
+    clock: HashMap<Digest32, u64>,
+    /// Every stored entry keyed `(clock, entry_hash)`: iterating it **is** the order.
+    ordered: BTreeSet<(u64, Digest32)>,
+    /// hash -> the stored entries whose `seen` names it. Kept for hashes not held
+    /// yet too: that is how a late parent finds the children it has to lift.
+    seen_by: HashMap<Digest32, Vec<Digest32>>,
+    /// `(author, other author)` -> the highest seq of `other` that one of `author`'s
+    /// entries names in its `seen`. What [`Dag::seen_for`] need not name again.
+    referenced: HashMap<(Digest32, Digest32), u64>,
+    /// author -> the highest checkpoint its own signed feed carries: `(seq, entry_hash)`
+    /// (ADR-023 decision 3).
+    checkpoints: HashMap<Digest32, (u64, Digest32)>,
+    /// author -> the lowest seq of the run of **unsigned** entries at the top of its feed:
+    /// skeletons that arrived with their signature dropped and have no signed successor
+    /// yet. They are authentic only once one arrives; [`Dag::discard_unverified`] takes
+    /// back whatever never is.
+    unverified_from: HashMap<Digest32, u64>,
+    /// author -> the seq through which [`Dag::drop_checkpointed_signatures`] has looked, so
+    /// each checkpoint's range is walked once. An entry there that still had its body is
+    /// handled when it is pruned ([`Dag::drop_signature_if_checkpointed`]).
+    swept_to: HashMap<Digest32, u64>,
+    /// Bumped whenever an already-stored entry's clock moves (a late parent arrived),
+    /// so a timeline can tell a re-sort is due without recomputing anything.
+    reorder_generation: u64,
+    /// The room's genesis time in ms, the anchor for an entry with no parent
+    /// ([`Dag::for_room`]).
+    origin_ms: Option<u64>,
 }
 
 impl Dag {
@@ -185,6 +218,18 @@ impl Dag {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty DAG for a room created at `origin_ms` (its genesis time): an entry with no
+    /// parent is capped at [`MAX_LEAD_MS`] past it, as every other entry is capped past its
+    /// latest parent. Without an origin such an entry's claimed time stands uncapped, which is
+    /// right only where nothing is shown from the order (an anchor's ciphertext copy).
+    #[must_use]
+    pub fn for_room(origin_ms: u64) -> Self {
+        Self {
+            origin_ms: Some(origin_ms),
+            ..Self::default()
+        }
     }
 
     /// The number of entries stored across all authors.
@@ -232,6 +277,18 @@ impl Dag {
         self.feeds.get(author).and_then(|f| f.get(*seq))
     }
 
+    /// Drop the payload body of the stored entry `hash`, keeping its signed skeleton
+    /// (ADR-010 retention). A peer that asks for it afterwards is served the skeleton.
+    /// Returns whether a body was dropped.
+    pub fn prune_payload(&mut self, hash: &Digest32) -> bool {
+        let Some((author, seq)) = self.by_hash.get(hash).copied() else {
+            return false;
+        };
+        self.feeds
+            .get_mut(&author)
+            .is_some_and(|f| f.prune_payload(seq))
+    }
+
     /// Whether an entry with this hash is stored.
     #[must_use]
     pub fn contains(&self, hash: &Digest32) -> bool {
@@ -255,23 +312,17 @@ impl Dag {
     /// 6. Feed link: `seq`/`prev_hash`/`lipmaa_backlink`/end-of-feed.
     ///
     /// Equivocation is classified **only after** admission and verification
-    /// (steps 3–4 precede 5). An ADR-008 fork proof must be *self-authenticating*
-    /// and a deniable-content alarm must come from an entry the epoch verifier
-    /// accepts; classifying first would let a peer holding *no* valid key surface
-    /// fork proofs and alarms — a framing / attention-DoS primitive
+    /// (steps 3–4 precede 5). An ADR-008 fork proof must be *self-authenticating*;
+    /// classifying first would let a peer holding *no* valid key surface fork
+    /// proofs — a framing / attention-DoS primitive
     /// (2026-09-19 review, HIGH). A conflicting entry that is unadmitted or fails
     /// verification is therefore rejected as [`Rejected::NotAdmitted`] /
     /// [`Rejected::Verification`], never as a fork.
     ///
-    /// `kind` selects the governance/content rule; fork attributability is then
-    /// determined by the entry's authenticator type (governance is forced
-    /// composite above).
-    ///
-    /// Equivalent to [`Dag::accept_with_deniable`] with no deniable verifier, so a
-    /// **deniable** content entry fails verification with
-    /// [`Error::DeniableVerificationUnavailable`] (the M7 verifier is supplied via
-    /// [`Dag::accept_with_deniable`]) — including a conflicting one, which is
-    /// consequently never classified as an alarm without a verifier.
+    /// `kind` is the entry's classification. The DAG no longer branches on it — every
+    /// entry is composite-signed since deniable rooms were removed — but callers already
+    /// classify each entry, and keeping the argument keeps that classification at the
+    /// seam where a future per-kind rule would go.
     pub fn accept(
         &mut self,
         entry: Entry,
@@ -279,35 +330,12 @@ impl Dag {
         author_root: &CompositePublicKey,
         admission: &AdmissionPolicy,
     ) -> std::result::Result<Digest32, Rejected> {
-        self.accept_with_deniable(entry, kind, author_root, admission, NO_DENIABLE)
-    }
-
-    /// Accept an entry, verifying a [`crate::log::entry::Authenticator::Deniable`] authenticator with
-    /// the supplied M7 [`DeniableVerifier`] when one is given (ADR-009 crypto is
-    /// M7). The composite path is unaffected. This is the seam M7 fills; M5 callers
-    /// use [`Dag::accept`].
-    pub fn accept_with_deniable<V: DeniableVerifier>(
-        &mut self,
-        entry: Entry,
-        kind: EntryKind,
-        author_root: &CompositePublicKey,
-        admission: &AdmissionPolicy,
-        deniable: Option<&V>,
-    ) -> std::result::Result<Digest32, Rejected> {
+        let _ = kind;
         let author = entry.skeleton.author_id;
         let seq = entry.skeleton.seq;
         let channel = entry.skeleton.channel_id;
         let epoch = entry.skeleton.epoch;
         let hash = entry.entry_hash();
-
-        // Governance/control entries MUST be composite (attributable) in EVERY
-        // channel (ADR-008 §"Per-entry-type authentication"): a deniable
-        // authenticator on a governance entry is rejected outright, so the
-        // governance plane — and its fork attribution — stays intact even in
-        // deniable channels.
-        if matches!(kind, EntryKind::Governance) && !entry.authenticator.is_attributable() {
-            return Err(Rejected::GovernanceNotAttributable);
-        }
 
         // A frozen author's further entries are refused outright.
         if self.frozen.contains_key(&author) {
@@ -319,33 +347,73 @@ impl Dag {
             return Err(Rejected::Duplicate);
         }
 
+        // Below its author's checkpoint, nothing new is taken: every position there is
+        // already held (the feed is contiguous), so a different entry for one is refused as
+        // pre-checkpoint — not raised as a fork.
+        if self
+            .checkpoints
+            .get(&author)
+            .is_some_and(|(below, _)| seq <= *below)
+        {
+            return Err(Rejected::PreCheckpoint);
+        }
+
         // Admission.
         if !admission.is_admitted(&channel, epoch, &author) {
             return Err(Rejected::NotAdmitted);
         }
 
-        // Authenticator + structure (deniable verified via the M7 seam if given).
-        // This precedes equivocation classification on purpose: only an entry
-        // that is admitted AND authenticates may surface a fork proof / alarm.
-        entry
-            .verify_with_deniable(author_root, deniable)
-            .map_err(Rejected::Verification)?;
+        // Authenticator + structure. This precedes equivocation classification on
+        // purpose: only an entry that is admitted AND authenticates may surface a
+        // fork proof.
+        //
+        // A skeleton whose signature was dropped under a checkpoint cannot verify on its own.
+        // It is taken provisionally, body-less only, and becomes authentic when a signed
+        // entry of the same feed chains to it (module docs, "Checkpoints").
+        let signed = entry.is_signed();
+        if signed {
+            entry.verify(author_root).map_err(Rejected::Verification)?;
+        } else if entry.payload.is_some() {
+            return Err(Rejected::Verification(Error::MalformedBundle(
+                "an unsigned log entry must carry no body",
+            )));
+        }
 
         // Equivocation: a *different* entry already occupies (author, seq)?
         if let Some(feed) = self.feeds.get(&author) {
             if let Some(existing) = feed.get(seq) {
+                // An unsigned entry proves nothing: it can conflict, never incriminate.
+                if !signed {
+                    return Err(Rejected::Verification(Error::MalformedBundle(
+                        "an unsigned log entry conflicts with a held one",
+                    )));
+                }
                 // Same seq, different hash (duplicate handled above) ⇒ a fork.
                 let outcome = self.classify_fork(existing.clone(), entry);
-                if let ForkOutcome::Attributable(ref proof) = outcome {
-                    // `conflicting` verified just above. `existing` was verified
-                    // when it was accepted (only this path stores entries); the
-                    // re-check is an invariant guard so the recorded proof is
-                    // self-authenticating regardless of how `existing` arrived.
-                    if existing.verify(author_root).is_ok() {
-                        self.frozen.insert(author, (**proof).clone());
-                    }
+                let ForkOutcome::Attributable(ref proof) = outcome;
+                // `conflicting` verified just above. `existing` was verified
+                // when it was accepted (only this path stores entries); the
+                // re-check is an invariant guard so the recorded proof is
+                // self-authenticating regardless of how `existing` arrived.
+                if existing.verify(author_root).is_ok() {
+                    self.frozen.insert(author, (**proof).clone());
                 }
                 return Err(Rejected::Fork(outcome));
+            }
+        }
+
+        // A checkpoint must name its own feed truthfully: a position below this entry,
+        // with the hash this node holds there.
+        let checkpoint = match entry.payload.as_deref() {
+            Some(p) if signed => Checkpoint::from_payload(p).map_err(Rejected::Verification)?,
+            _ => None,
+        };
+        if let Some(cp) = checkpoint {
+            let named = self.feeds.get(&author).and_then(|f| f.get(cp.seq));
+            if cp.seq >= seq || named.map(Entry::entry_hash) != Some(cp.entry_hash) {
+                return Err(Rejected::Verification(Error::MalformedBundle(
+                    "checkpoint names a position its own feed does not hold",
+                )));
             }
         }
 
@@ -357,57 +425,318 @@ impl Dag {
             .append(entry)
             .map_err(Rejected::Feed)?;
         self.by_hash.insert(hash, (author, seq));
+        if signed {
+            // Chains every unsigned entry below it to a signature.
+            self.unverified_from.remove(&author);
+        } else {
+            self.unverified_from.entry(author).or_insert(seq);
+        }
+        if let Some(cp) = checkpoint {
+            let held = self.checkpoints.entry(author).or_insert((0, cp.entry_hash));
+            if cp.seq > held.0 {
+                *held = (cp.seq, cp.entry_hash);
+            }
+        }
+        self.place(hash);
         Ok(hash)
     }
 
-    /// Classify a `(author, seq)` conflict by the **authenticator type** of the
-    /// conflicting entries (ADR-008 §"Fork / equivocation handling"). A conflict
-    /// is a self-authenticating fork proof only if *both* entries are attributable
-    /// (composite-signed): governance entries are forced composite at acceptance,
-    /// so this rule alone covers them — no caller hint is consulted. If either
-    /// entry carries a forgeable (deniable) authenticator, the conflict is a
-    /// non-attributable alarm (auto-freeze would be a framing/DoS primitive).
-    fn classify_fork(&self, existing: Entry, conflicting: Entry) -> ForkOutcome {
-        let author_id = conflicting.skeleton.author_id;
-        let seq = conflicting.skeleton.seq;
-        let attributable =
-            conflicting.authenticator.is_attributable() && existing.authenticator.is_attributable();
-        if attributable {
-            ForkOutcome::Attributable(Box::new(ForkProof {
-                author_id,
-                seq,
-                existing,
-                conflicting,
-            }))
-        } else {
-            ForkOutcome::DeniableAlarm { author_id, seq }
+    /// Take back every unsigned skeleton no signed entry has chained to (ADR-023 decision
+    /// 3): what a sync session or a reload leaves provisional at its end. They are not
+    /// authentic, and keeping them would block the real entries at those positions.
+    /// Returns how many were removed.
+    pub fn discard_unverified(&mut self) -> usize {
+        let mut removed = 0usize;
+        for (author, from) in std::mem::take(&mut self.unverified_from) {
+            let Some(feed) = self.feeds.get_mut(&author) else {
+                continue;
+            };
+            for entry in feed.truncate_from(from) {
+                let h = entry.entry_hash();
+                self.by_hash.remove(&h);
+                if let Some(c) = self.clock.remove(&h) {
+                    self.ordered.remove(&(c, h));
+                }
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.reorder_generation = self.reorder_generation.wrapping_add(1);
+        }
+        removed
+    }
+
+    /// Drop the signature of `hash` if its author's checkpoint covers it and its body is gone
+    /// — for an entry pruned after the checkpoint arrived. Returns whether one was dropped.
+    pub fn drop_signature_if_checkpointed(&mut self, hash: &Digest32) -> bool {
+        let Some((author, seq)) = self.by_hash.get(hash).copied() else {
+            return false;
+        };
+        if self.checkpoints.get(&author).is_none_or(|(b, _)| seq > *b) {
+            return false;
+        }
+        let Some(feed) = self.feeds.get_mut(&author) else {
+            return false;
+        };
+        feed.get(seq).is_some_and(|e| e.payload.is_none()) && feed.drop_signature(seq)
+    }
+
+    /// The highest seq of `author`'s feed that is authentic: its head, less any run of
+    /// unsigned skeletons at the top that no signed entry has chained to yet (ADR-023
+    /// decision 3). What a caller may persist.
+    #[must_use]
+    pub fn verified_head(&self, author: &Digest32) -> u64 {
+        let head = self.feeds.get(author).map_or(0, Feed::max_seq);
+        self.unverified_from
+            .get(author)
+            .map_or(head, |from| from.saturating_sub(1).min(head))
+    }
+
+    /// The highest checkpoint `author` has posted on its own feed: `(seq, entry_hash)`.
+    #[must_use]
+    pub fn checkpoint(&self, author: &Digest32) -> Option<(u64, Digest32)> {
+        self.checkpoints.get(author).copied()
+    }
+
+    /// Drop the signatures of every entry at or below its author's checkpoint whose body is
+    /// already pruned (ADR-023 decision 3), returning their hashes so the caller can rewrite
+    /// what it stores. An entry with a body keeps its signature: governance is never pruned,
+    /// and content keeps it until it expires here.
+    ///
+    /// Walks only what no earlier call covered, so it costs nothing between checkpoints.
+    pub fn drop_checkpointed_signatures(&mut self) -> Vec<Digest32> {
+        let mut dropped = Vec::new();
+        for (author, (below, _)) in &self.checkpoints {
+            let Some(feed) = self.feeds.get_mut(author) else {
+                continue;
+            };
+            let from = self.swept_to.get(author).map_or(1, |s| s + 1);
+            if from > *below {
+                continue;
+            }
+            self.swept_to.insert(*author, *below);
+            for seq in from..=*below {
+                let eligible = feed
+                    .get(seq)
+                    .is_some_and(|e| e.is_signed() && e.payload.is_none());
+                if eligible && feed.drop_signature(seq) {
+                    if let Some(e) = feed.get(seq) {
+                        dropped.push(e.entry_hash());
+                    }
+                }
+            }
+        }
+        dropped
+    }
+
+    /// Give a just-stored entry its clock, record its `seen` edges, and lift every
+    /// stored entry that was waiting for it (module docs, "The one order").
+    fn place(&mut self, hash: Digest32) {
+        let Some(entry) = self.get_by_hash(&hash) else {
+            return;
+        };
+        let author = entry.skeleton.author_id;
+        let seq = entry.skeleton.seq;
+        let seen = entry.skeleton.seen.clone();
+        for parent in &seen {
+            if let Some((other, other_seq)) = self.by_hash.get(parent).copied() {
+                let r = self.referenced.entry((author, other)).or_insert(0);
+                *r = (*r).max(other_seq);
+            }
+            self.seen_by.entry(*parent).or_default().push(hash);
+        }
+        let clock = self.clock_of(&hash);
+        self.clock.insert(hash, clock);
+        self.ordered.insert((clock, hash));
+
+        // Children that named this entry before it arrived: their clocks are recomputed with
+        // it held, and whatever moves takes its descendants along.
+        let waiting = self.seen_by.get(&hash).cloned().unwrap_or_default();
+        for child in &waiting {
+            if let Some((child_author, _)) = self.by_hash.get(child).copied() {
+                let r = self.referenced.entry((child_author, author)).or_insert(0);
+                *r = (*r).max(seq);
+            }
+        }
+        let mut work = waiting;
+        while let Some(h) = work.pop() {
+            let Some(old) = self.clock.get(&h).copied() else {
+                continue;
+            };
+            let new = self.clock_of(&h);
+            if new <= old {
+                continue;
+            }
+            self.ordered.remove(&(old, h));
+            self.ordered.insert((new, h));
+            self.clock.insert(h, new);
+            self.reorder_generation = self.reorder_generation.wrapping_add(1);
+            if let Some((a, s)) = self.by_hash.get(&h).copied() {
+                if let Some(succ) = self.feeds.get(&a).and_then(|f| f.get(s + 1)) {
+                    work.push(succ.entry_hash());
+                }
+            }
+            if let Some(children) = self.seen_by.get(&h) {
+                work.extend(children.iter().copied());
+            }
         }
     }
 
-    /// A deterministic causal (topological) order of every stored entry: each
-    /// entry appears after all of its causal predecessors (its own feed's earlier
-    /// entries). Ties between concurrent entries are broken on `(author_id, seq)`,
-    /// so two replicas holding the same entry set yield the **identical** order —
-    /// the observable form of Strong Eventual Consistency.
+    /// An entry's clock from its parents' clocks as currently held (module docs, "The one
+    /// order"): its claimed time, capped at [`MAX_LEAD_MS`] past the latest parent — or past
+    /// the room's origin when it has none — and never below one past any parent.
     ///
-    /// The visible causal edges in M5 are the per-author `seq` chains; cross-author
-    /// causal references travel inside (opaque, encrypted) payloads and surface in
-    /// later milestones, so the merge here is the union of per-author total orders,
-    /// deterministically interleaved.
+    /// Monotone in the parents' clocks, so recomputing a child when a parent rises only ever
+    /// raises it, and the fixpoint is the same whatever order entries arrived in.
+    fn clock_of(&self, hash: &Digest32) -> u64 {
+        let Some(entry) = self.get_by_hash(hash) else {
+            return 0;
+        };
+        let sk = &entry.skeleton;
+        let parents = sk.seen.iter().chain((sk.seq > 1).then_some(&sk.prev_hash));
+        let latest_parent = parents.filter_map(|p| self.clock.get(p).copied()).max();
+        let anchor = latest_parent.or(self.origin_ms);
+        let claimed = match anchor {
+            Some(a) => sk.claimed_ms.min(a.saturating_add(MAX_LEAD_MS)),
+            None => sk.claimed_ms,
+        };
+        match latest_parent {
+            Some(p) => claimed.max(p.saturating_add(1)),
+            None => claimed,
+        }
+    }
+
+    /// What an entry `author` writes now should list in `seen`: the head of every
+    /// other author's feed that none of `author`'s entries has named yet, at most
+    /// [`MAX_SEEN`], in canonical (ascending) order.
+    ///
+    /// A head `author` already named — or an older entry of that feed — is left out:
+    /// `author`'s own previous entry already follows it, and the feed chain carries
+    /// the rest. When more than [`MAX_SEEN`] feeds moved, the most recent by the order
+    /// are named; the others stay unnamed and are picked up by the next entry, so
+    /// nothing is lost, only deferred.
     #[must_use]
-    pub fn causal_order(&self) -> Vec<Digest32> {
-        // Within an author, seq order is the causal order. Across authors there is
-        // no edge visible to M5, so we interleave deterministically by author id,
-        // emitting all entries in (author_id, seq) lexicographic order. This is a
-        // valid topological order (per-author predecessors precede successors) and
-        // is identical on any replica with the same set.
-        let mut keyed: BTreeMap<(Digest32, u64), Digest32> = BTreeMap::new();
-        for (author, feed) in &self.feeds {
-            for entry in feed.iter() {
-                keyed.insert((*author, entry.skeleton.seq), entry.entry_hash());
+    pub fn seen_for(&self, author: &Digest32) -> Vec<Digest32> {
+        let mut heads: Vec<(u64, Digest32)> = self
+            .feeds
+            .iter()
+            .filter(|(other, _)| *other != author)
+            .filter_map(|(other, feed)| {
+                let head = feed.max_seq();
+                let named = self
+                    .referenced
+                    .get(&(*author, *other))
+                    .copied()
+                    .unwrap_or(0);
+                if head == 0 || head <= named {
+                    return None;
+                }
+                let h = feed.get(head)?.entry_hash();
+                Some((self.clock.get(&h).copied().unwrap_or(0), h))
+            })
+            .collect();
+        heads.sort_unstable_by(|a, b| b.cmp(a));
+        heads.truncate(MAX_SEEN);
+        let mut seen: Vec<Digest32> = heads.into_iter().map(|(_, h)| h).collect();
+        seen.sort_unstable();
+        seen
+    }
+
+    /// The entry's position key in [`Dag::causal_order`]: `(clock, entry_hash)`.
+    /// Comparing two keys compares the two entries' places in the room's order.
+    #[must_use]
+    pub fn order_key(&self, hash: &Digest32) -> Option<(u64, Digest32)> {
+        self.clock.get(hash).map(|c| (*c, *hash))
+    }
+
+    /// How many times an already-stored entry has moved in the order (a parent it
+    /// named arrived after it). A consumer that keeps its own sorted copy re-sorts
+    /// when this changes.
+    #[must_use]
+    pub fn reorder_generation(&self) -> u64 {
+        self.reorder_generation
+    }
+
+    /// Whether `a` **happened before** `b`: `a` is a proper causal ancestor of `b`
+    /// through `b`'s own feed and the `seen` edges, as far as this node holds them.
+    ///
+    /// This is the relation claims are to be built on (PRD-001 R17, ADR-020): a claim
+    /// that saw another claim follows it. `false` means concurrent **or** not yet
+    /// known to be ordered — `a` may be an ancestor through an entry this node has not
+    /// received. Neither entry held is `false`.
+    #[must_use]
+    pub fn happened_before(&self, a: &Digest32, b: &Digest32) -> bool {
+        let (Some(ca), Some(cb)) = (self.clock.get(a).copied(), self.clock.get(b).copied()) else {
+            return false;
+        };
+        // An ancestor's clock is strictly below its descendant's.
+        if ca >= cb {
+            return false;
+        }
+        let Some((a_author, a_seq)) = self.by_hash.get(a).copied() else {
+            return false;
+        };
+        let mut visited: HashSet<Digest32> = HashSet::new();
+        let mut stack = vec![*b];
+        while let Some(h) = stack.pop() {
+            if !visited.insert(h) {
+                continue;
+            }
+            let Some(entry) = self.get_by_hash(&h) else {
+                continue;
+            };
+            let sk = &entry.skeleton;
+            // Reaching `a`'s feed at or past `a` means `a` precedes it on that chain.
+            if h != *b && sk.author_id == a_author && sk.seq >= a_seq {
+                return true;
+            }
+            if h == *b && sk.author_id == a_author {
+                return sk.seq > a_seq;
+            }
+            let parents = sk
+                .seen
+                .iter()
+                .copied()
+                .chain((sk.seq > 1).then_some(sk.prev_hash));
+            for p in parents {
+                // Anything at or below `a`'s clock cannot have `a` as an ancestor
+                // (unless it is `a`, which the feed check above catches).
+                if p == *a {
+                    return true;
+                }
+                if self.clock.get(&p).is_some_and(|c| *c > ca) {
+                    stack.push(p);
+                }
             }
         }
-        keyed.into_values().collect()
+        false
+    }
+
+    /// Build the fork proof for a `(author, seq)` conflict (ADR-008 §"Fork /
+    /// equivocation handling"). Every entry is composite-signed, so a conflict
+    /// between two that both verified is always a self-authenticating proof.
+    fn classify_fork(&self, existing: Entry, conflicting: Entry) -> ForkOutcome {
+        ForkOutcome::Attributable(Box::new(ForkProof {
+            author_id: conflicting.skeleton.author_id,
+            seq: conflicting.skeleton.seq,
+            existing,
+            conflicting,
+        }))
+    }
+
+    /// The room's one order (PRD-001 R13): every stored entry, ascending by
+    /// `(clock, entry_hash)` — a topological order of the DAG whose ties between
+    /// concurrent entries fall to the authors' claimed milliseconds, then the hash
+    /// (module docs). Identical on every replica holding the same entry set.
+    #[must_use]
+    pub fn causal_order(&self) -> Vec<Digest32> {
+        self.ordered.iter().map(|(_, h)| *h).collect()
+    }
+
+    /// [`Dag::causal_order`] with each entry's clock: `(entry_hash, clock_ms)`, first to last.
+    #[must_use]
+    pub fn order_keys(&self) -> Vec<(Digest32, u64)> {
+        self.ordered.iter().map(|(c, h)| (*h, *c)).collect()
     }
 
     /// Render-gating seam (ADR-008): attempt to decrypt+render the payload of the

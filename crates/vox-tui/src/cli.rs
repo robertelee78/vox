@@ -441,6 +441,15 @@ enum RoomCmd {
     Join(JoinRoomArgs),
     /// Create a room on a running node. Passphrase on stdin.
     Create(CreateRoomArgs),
+    /// Set how long the room keeps messages: `1h`, `1w`, `1m` (a month), a number of
+    /// seconds, or `forever` (PRD-001 R7).
+    ///
+    /// It applies to **everything already in the room**, on every member, as the change
+    /// reaches them: shortening it deletes older messages. Only the room's admin may, and it
+    /// asks for the identity passphrase for that reason. A node can keep less than its room
+    /// (the `retention` file in its config directory); the shorter wins. This is look and
+    /// feel, not a security property: a modified node can keep everything.
+    Retention(RetentionArgs),
     /// Print a room's address, for someone else to `vox room join` with.
     ///
     /// The address is rendezvous information, not a credential — no passphrase,
@@ -475,6 +484,23 @@ pub struct CreateRoomArgs {
     /// A local name for the room. Never leaves this device.
     #[arg(long, default_value = "room")]
     pub name: String,
+}
+
+/// `vox room retention`
+#[derive(Args, Debug, Clone)]
+pub struct RetentionArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`.
+    pub duration: String,
+    /// **Refused**, as on `vox trust add`: a command line is world-readable.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line).
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox room send`
@@ -677,15 +703,25 @@ pub struct RoomReadArgs {
     pub profile: ProfileArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// Return only what follows this entry hash — the full 64 characters, as the
-    /// first column prints it. Not prefix-matched: a cursor comes from previous
-    /// output, and a prefix that matched the wrong entry would silently skip or
-    /// repeat messages.
+    /// Return only what arrived after this entry hash, in the order it arrived — the
+    /// full 64 characters, as the first column prints it. Arrival, not position: a
+    /// message from a member who was offline takes its place *above* newer ones, and
+    /// is still returned. Not prefix-matched: a cursor comes from previous output, and
+    /// a prefix that matched the wrong entry would silently skip or repeat messages.
     #[arg(long)]
     pub since: Option<String>,
     /// At most this many messages. 0 means no limit.
     #[arg(long, default_value_t = 0)]
     pub limit: u64,
+    /// Print every entry this node holds for the room in the room's order, one per
+    /// line as `<entry-hash> <clock-ms>` — readable or not. The sequence every member's view is a part of,
+    /// and the one that must be identical on every node (PRD-001 R13).
+    #[arg(long, hide = true, conflicts_with_all = ["since", "limit"])]
+    pub hashes: bool,
+    /// Print only the messages marked late: they arrived after rows below them had already
+    /// been shown, and sit in their true place in history (ADR-023 decision 1).
+    #[arg(long, hide = true, conflicts_with = "hashes")]
+    pub late: bool,
 }
 
 /// Selecting a room, by the prefix of its channelID as `vox` prints it.
@@ -1171,6 +1207,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Join(a) => &a.profile,
                 RoomCmd::Create(a) => &a.profile,
                 RoomCmd::Invite(a) => &a.profile,
+                RoomCmd::Retention(a) => &a.profile,
             };
             let paths = match profile.paths() {
                 Ok(p) => p,
@@ -1194,8 +1231,10 @@ pub fn run() -> ExitCode {
                     RoomCmd::Post(a) => {
                         crate::room_cli::post(&paths, &a.room, a.text.as_deref()).await
                     }
+                    RoomCmd::Read(a) if a.hashes => crate::room_cli::order(&paths, &a.room).await,
                     RoomCmd::Read(a) => {
-                        crate::room_cli::read(&paths, &a.room, a.since.as_deref(), a.limit).await
+                        crate::room_cli::read(&paths, &a.room, a.since.as_deref(), a.limit, a.late)
+                            .await
                     }
                     RoomCmd::Tail(a) => crate::room_cli::tail(&paths, &a.room).await,
                     RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
@@ -1214,6 +1253,14 @@ pub fn run() -> ExitCode {
                     RoomCmd::Join(a) => crate::room_cli::join(&paths, &a.link, &a.name).await,
                     RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
                     RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
+                    RoomCmd::Retention(a) => {
+                        let identity = crate::tunnel_cli::identity_passphrase_for(
+                            &paths,
+                            a.identity_passphrase.clone(),
+                            a.identity_passphrase_file.clone(),
+                        )?;
+                        crate::room_cli::retention(&paths, &a.room, &a.duration, &identity).await
+                    }
                     RoomCmd::Get(a) => {
                         crate::room_cli::get_file(&paths, &a.room, &a.file, a.out.as_deref()).await
                     }

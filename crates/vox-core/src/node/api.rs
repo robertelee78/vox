@@ -59,6 +59,12 @@ pub struct MessageRow {
     pub created_millis: u64,
     /// The text.
     pub text: String,
+    /// When this node rendered it, as a number that only grows; local, and not the
+    /// room's order ([`crate::node::channel::Rendered::arrival`]).
+    pub arrival: u64,
+    /// It took its place above a row this node had already shown: it arrived late
+    /// (ADR-023 decision 1).
+    pub late: bool,
 }
 
 /// An open channel's full state for display.
@@ -74,6 +80,10 @@ pub struct ChannelDetail {
     pub members: Vec<Digest32>,
     /// The render-gated timeline, oldest first.
     pub timeline: Vec<MessageRow>,
+    /// Every entry this node holds for the channel, readable or not, in the room's one
+    /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
+    /// sequence restricted to rendered rows.
+    pub order: Vec<(Digest32, u64)>,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
@@ -360,6 +370,15 @@ pub enum NodeCommand {
     StopForward {
         /// The local address the forward is listening on.
         local: std::net::SocketAddr,
+    },
+    /// Set a room's retention (PRD-001 R7, ADR-023 decision 2): `ttl` seconds, `0` for
+    /// forever, as an ADR-007 policy-update. Only the room's admin may; it applies to what is
+    /// already stored.
+    SetRetention {
+        /// The channel.
+        channel_id: Digest32,
+        /// Seconds a message body is kept; `0` keeps it forever.
+        ttl: u64,
     },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).

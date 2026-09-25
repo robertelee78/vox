@@ -130,6 +130,9 @@ const KEY_DELIVERY_PATIENCE: Duration = Duration::from_secs(30);
 /// left to the periodic interval. Enough to ride out a collision (both sides pushing at once); few
 /// enough that a peer whose sessions always fail cannot hold the room.
 const MAX_PUSH_RETRIES: u32 = 3;
+/// How often the node re-reads its retention file (ADR-023 decision 2: the sweep runs at
+/// least every minute; the file is read on the same cadence).
+const RETENTION_REREAD_SECS: u64 = 60;
 
 /// How often a peer reached over a relay is retried for a direct path.
 ///
@@ -348,6 +351,21 @@ pub struct NodeConfig {
     /// the copy holds nothing this node could read. `vox node` turns it on; a client
     /// leaves it off, so a stranger's genesis on its board costs it nothing.
     pub anchor_logs: bool,
+    /// How long nothing new must have expired before a backlog of this identity's expired
+    /// entries smaller than a checkpoint batch is checkpointed anyway (ADR-023 decision 3).
+    /// Production is [`crate::node::channel::CHECKPOINT_IDLE_SECS`]; only the test-only
+    /// `VOX_TEST_CHECKPOINT_IDLE_SECS` changes it, so a proof need not wait ten minutes.
+    pub checkpoint_idle_secs: u64,
+}
+
+/// [`crate::node::channel::CHECKPOINT_IDLE_SECS`], unless the **test-only**
+/// `VOX_TEST_CHECKPOINT_IDLE_SECS` says otherwise. Nothing in a real deployment sets it; a proof of
+/// the closing checkpoint drives the shipped binary and cannot wait ten minutes per run.
+fn checkpoint_idle_from_env() -> u64 {
+    std::env::var("VOX_TEST_CHECKPOINT_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(crate::node::channel::CHECKPOINT_IDLE_SECS)
 }
 
 impl std::fmt::Debug for NodeConfig {
@@ -373,13 +391,15 @@ impl NodeConfig {
     pub fn new() -> Self {
         Self {
             clock: system_clock(),
-            millis_clock: crate::time::system_millis_clock(),
+            // The system clock unless a proof set the test-only skew (ADR-023 proof 2).
+            millis_clock: crate::time::millis_clock_with_test_skew(),
             argon2: Argon2Profile::default(),
             bind: None,
             pow_params: None,
             anchors: BootstrapSet::new(),
             headless: None,
             anchor_logs: false,
+            checkpoint_idle_secs: checkpoint_idle_from_env(),
         }
     }
 
@@ -1788,12 +1808,19 @@ pub struct Node {
     /// half the ADR-020 claim ordering key, where whole seconds put two racing agents in one
     /// bucket and let a hash decide.
     millis_clock: crate::time::MillisClock,
+    /// See [`NodeConfig::checkpoint_idle_secs`].
+    checkpoint_idle_secs: u64,
     argon2: Argon2Profile,
     view_tx: watch::Sender<NodeView>,
     event_tx: broadcast::Sender<NodeEvent>,
     /// The ADR-020 §3 trust keyring, loaded on unlock and empty while locked
     /// (it is sealed under the identity, so there is nothing to hold locked).
     trust: crate::node::trust::Keyring,
+    /// This node's own retention (ADR-023 decision 2), re-read from the config directory
+    /// at most every [`RETENTION_REREAD_SECS`] so an edit takes effect without a restart.
+    node_retention: crate::node::retention::RetentionConfig,
+    /// When `node_retention` was last read; `0` before the first read.
+    retention_read_at: u64,
     /// When each peer was last tried for a better path, so a relayed connection is retried
     /// on a schedule rather than only at the moment it was made.
     last_upgrade: std::collections::BTreeMap<Digest32, u64>,
@@ -1876,6 +1903,7 @@ impl Node {
             anchors,
             headless,
             anchor_logs,
+            checkpoint_idle_secs,
         } = cfg;
         let profile = if Profile::exists(&paths) {
             Some(Profile::open(paths.clone())?)
@@ -1892,6 +1920,7 @@ impl Node {
             paths,
             profile,
             millis_clock,
+            checkpoint_idle_secs,
             net: None,
             net_tx,
             bind,
@@ -1940,6 +1969,8 @@ impl Node {
             view_tx: watch::Sender::new(NodeView::default()),
             event_tx,
             trust: crate::node::trust::Keyring::new(),
+            node_retention: crate::node::retention::RetentionConfig::default(),
+            retention_read_at: 0,
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
             offered: std::collections::BTreeMap::new(),
@@ -2103,6 +2134,11 @@ impl Node {
                     if self.run_due_syncs().await || self.paths_moved() {
                         self.publish().await;
                     }
+                    // Retention on every tick: the index is ordered by age, so a pass that
+                    // prunes nothing costs one comparison per open room.
+                    if self.sweep_retention().await {
+                        self.publish().await;
+                    }
                 }
             }
         }
@@ -2254,6 +2290,9 @@ impl Node {
                 }
             }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
+            NodeCommand::SetRetention { channel_id, ttl } => {
+                self.set_retention(&channel_id, ttl).await
+            }
             NodeCommand::Shutdown => Outcome::Done,
         }
     }
@@ -6523,6 +6562,78 @@ impl Node {
         self.app.set_reachers(&self.reachers);
     }
 
+    /// Set a room's retention, then apply it here at once and push the policy-update to the
+    /// other members, whose own sweeps apply it as it arrives (ADR-023 decision 2).
+    async fn set_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        if let Err(e) = shared.lock().await.set_retention(profile, ttl, now) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.note_local_append(channel_id);
+        self.retention_read_at = 0; // re-read the node's own file too: an explicit act
+        self.sweep_retention().await;
+        Outcome::Done
+    }
+
+    /// Prune every open room to its effective retention — the shorter of the room's policy and
+    /// this node's own (ADR-023 decision 2). `true` when anything was pruned, so the view is
+    /// republished and `vox room read` stops showing it.
+    async fn sweep_retention(&mut self) -> bool {
+        let now = self.now();
+        if self.retention_read_at == 0
+            || now.saturating_sub(self.retention_read_at) >= RETENTION_REREAD_SECS
+        {
+            // An unreadable file keeps the last policy read rather than dropping to "no node
+            // limit", which would keep more than the operator asked for.
+            if let Ok(cfg) =
+                crate::node::retention::RetentionConfig::load(&self.paths.retention_file())
+            {
+                self.node_retention = cfg;
+            }
+            self.retention_read_at = now.max(1);
+        }
+        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+            return false;
+        };
+        let mut pruned = 0usize;
+        let mut checkpointed: Vec<Digest32> = Vec::new();
+        for (cid, shared) in &self.channels {
+            // A room mid-session is skipped, not waited for: the actor must not park behind a
+            // sync, and the next tick comes round in a second.
+            let Ok(mut ch) = shared.try_lock() else {
+                continue;
+            };
+            ch.set_node_retention(self.node_retention.for_room(cid));
+            let here = ch.sweep_retention(&store, now).unwrap_or(0);
+            pruned += here;
+            // Asked every tick, not only after a prune: a room opened with an expired backlog
+            // (after a restart) or one idle with a backlog under the batch size is checkpointed
+            // without waiting for another prune. The check stops at this identity's first entry
+            // still holding a body, so it costs almost nothing. Then every checkpoint held sheds
+            // the signatures below it (ADR-023 decision 3).
+            let _ = here;
+            ch.set_checkpoint_idle(self.checkpoint_idle_secs);
+            if let Some(profile) = self.profile.as_ref() {
+                if ch.checkpoint_if_due(profile, now).unwrap_or(false) {
+                    checkpointed.push(*cid);
+                }
+            }
+            let _ = ch.drop_checkpointed_signatures(&store);
+        }
+        // A checkpoint is a local append: pushed like a post, so the other members can shed
+        // their copies' signatures too.
+        for cid in &checkpointed {
+            self.note_local_append(cid);
+        }
+        pruned > 0 || !checkpointed.is_empty()
+    }
+
     async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
@@ -6536,7 +6647,7 @@ impl Node {
         // composed from two clock reads can go backwards across a second boundary, which is the
         // ordering inversion this change exists to remove.
         let now_millis = (self.millis_clock)();
-        let appended = match ch.append_text(profile, text, now_millis) {
+        let appended = match ch.append_text(profile, text, now_millis, now) {
             Ok(r) => row_of(r),
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
@@ -6709,6 +6820,7 @@ impl Node {
                 epoch: ch.epoch(),
                 members: ch.members(),
                 timeline: ch.timeline().iter().map(row_of).collect(),
+                order: ch.order_keys(),
                 services: ch
                     .services()
                     .iter()
@@ -6797,6 +6909,8 @@ fn row_of(r: &Rendered) -> MessageRow {
         author: r.author,
         created_millis: r.created_millis,
         text: r.text.clone(),
+        arrival: r.arrival,
+        late: r.late,
     }
 }
 
@@ -6898,6 +7012,8 @@ fn fault_of(e: &Error) -> Fault {
         Error::MalformedLink(_) | Error::MalformedAnchor(_) => Fault::BadLink,
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
+        // Retention is the admin's to set; anyone else is refused, not failed.
+        Error::MalformedGovernance("only the room's admin may set its retention") => Fault::Refused,
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,
         // A join refused before the challenge (the responder does not hold that
         // channel open) reaches the joiner as a malformed exchange; report it as the

@@ -51,7 +51,7 @@ use crate::governance::capability::CapabilitySet;
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::entry::GovEntry;
 use crate::governance::evaluator::Evaluator;
-use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+use crate::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use crate::governance::membership::{
     issue_consent_grant, issue_consent_revocation, MembershipView,
 };
@@ -70,6 +70,7 @@ use crate::nat::bootstrap::BootstrapSet;
 use crate::nat::record::Admission;
 use crate::node::content::Content;
 use crate::node::profile::Profile;
+use crate::node::retention::{RetentionIndex, Tracked};
 use crate::node::store::Store;
 use crate::suite::{algo, SuiteFloor};
 
@@ -116,6 +117,26 @@ const SEG_DELIVERED: u64 = 7;
 /// bundle at all, and would fall off every board — the same reason `SEG_ANCHORS`
 /// exists.
 const SEG_ADMISSION: u64 = 8;
+
+/// Version of an entry's retention record: the `Index` segment sharing its `LogDb` id,
+/// `[version, first_seen_secs]` (ADR-023 decision 2).
+const FIRST_SEEN_VERSION: u64 = 1;
+
+fn first_seen_bytes(first_seen: u64) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(FIRST_SEEN_VERSION).uint(first_seen);
+    e.finish()
+}
+
+fn parse_first_seen(bytes: &[u8]) -> Result<u64> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 || d.uint()? != FIRST_SEEN_VERSION {
+        return Err(Error::MalformedAtRest("retention record"));
+    }
+    let t = d.uint()?;
+    d.finish()?;
+    Ok(t)
+}
 
 /// At-rest version of the delivery-ledger segment.
 const DELIVERED_VERSION: u64 = 1;
@@ -237,6 +258,8 @@ pub enum Accepted {
     ContentNotReadable,
     /// A content entry that was decrypted and rendered into the timeline.
     Rendered,
+    /// An author's checkpoint on its own feed (ADR-023 decision 3): verified and stored.
+    Checkpoint,
 }
 
 /// A rendered (decrypted, render-gated) message in the timeline.
@@ -254,7 +277,43 @@ pub struct Rendered {
     pub created_millis: u64,
     /// The text.
     pub text: String,
+    /// When **this node** rendered it: the id of its sealed plaintext cache row, which
+    /// only grows. Local, never shared, and not part of the room's order. It is what
+    /// "new since" means to a reader holding a cursor: a late arrival can land above
+    /// the cursor in the order, and is still after it here.
+    pub arrival: u64,
+    /// When this node placed it in the timeline, ms on this node's clock; `0` for a row
+    /// loaded from the store at open, which the reader saw before the restart. Local, never
+    /// persisted, and only used to decide [`Rendered::late`].
+    pub shown_at_ms: u64,
+    /// This row took its place **above a row the reader had already been shown**: it
+    /// arrived late, from a member who was offline or a sync that caught up (ADR-023
+    /// decision 1). It is shown where it belongs, not at the bottom, and the flag is how a
+    /// reader is told something appeared in history.
+    ///
+    /// "Already shown" means placed at least [`LATE_AFTER_MS`] earlier. Posts crossing in
+    /// flight land within a second of each other and above one another in the order;
+    /// that is ordinary concurrency, and flagging it would make the flag meaningless.
+    pub late: bool,
 }
+
+/// How many more of an author's entries must have expired since its last checkpoint before it
+/// posts another (ADR-023 decision 3): 32. A checkpoint is itself a signed entry of about the
+/// size it saves on one skeleton, so one per 32 costs about 3% of what it frees, and a room
+/// that expires slowly is not filled with checkpoints.
+pub const CHECKPOINT_EVERY: usize = 32;
+
+/// How long nothing new must have expired before an author closes a backlog smaller than
+/// [`CHECKPOINT_EVERY`] with a checkpoint anyway: ten minutes. Long enough that a room expiring
+/// steadily batches its checkpoints; short enough that a quiet room's last few entries do not
+/// keep their signatures indefinitely.
+pub const CHECKPOINT_IDLE_SECS: u64 = 600;
+
+/// How long a row must have been on screen before something landing above it counts as a
+/// late arrival rather than ordinary concurrency: ten seconds. A push delivers a member's
+/// post in about a second, so two people typing at once never trip it; a member returning
+/// from offline, or a post that only arrived with the 30-second sync pass, does.
+pub const LATE_AFTER_MS: u64 = 10_000;
 
 /// An open (SEK-unlocked) channel on this device.
 pub struct ChannelState {
@@ -274,7 +333,14 @@ pub struct ChannelState {
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
+    /// Rendered rows in the room's one order ([`Dag::causal_order`]), never in the
+    /// order they arrived (PRD-001 R13).
     timeline: Vec<Rendered>,
+    /// The [`Dag::reorder_generation`] the timeline was last sorted at.
+    timeline_generation: u64,
+    /// entry hash -> the `LogDb` page it is stored in, so a signature dropped under a
+    /// checkpoint (ADR-023 decision 3) can be rewritten in place.
+    log_ids: std::collections::HashMap<Digest32, u64>,
     /// Accepted governance entries (consent grants and the rest) in acceptance
     /// order — the evaluator's input, rebuilt from the log on open (M14.5).
     gov_entries: Vec<GovEntry>,
@@ -317,6 +383,17 @@ pub struct ChannelState {
     /// written to disk, and never crosses the client boundary (no view, event or
     /// `Debug` output carries it).
     passphrase: Zeroizing<Vec<u8>>,
+    /// Every content entry still holding its body, by age (ADR-023 decision 2).
+    retention: RetentionIndex,
+    /// This node's own retention for the room, seconds; `0` is no node limit. Set by the
+    /// actor from the node's config; the room's own lives in the evaluator's policy.
+    node_retention: u64,
+    /// When this node last pruned anything in the room (seconds), or opened it: what a closing
+    /// checkpoint waits [`ChannelState::set_checkpoint_idle`] past (ADR-023 decision 3).
+    last_pruned_at: u64,
+    /// How long nothing new must have expired before an author closes a backlog smaller than
+    /// [`CHECKPOINT_EVERY`] with a checkpoint anyway. [`CHECKPOINT_IDLE_SECS`] unless set.
+    checkpoint_idle: u64,
     poisoned: bool,
 }
 
@@ -571,7 +648,10 @@ pub(crate) fn classify_payload(payload: &[u8]) -> Result<EntryKind> {
     if payload.starts_with(GROUP_MSG_SIGN_DOMAIN.as_bytes()) {
         return Ok(EntryKind::Content);
     }
-    if crate::wire::parse_frame(payload).is_ok() {
+    if let Ok(frame) = crate::wire::parse_frame(payload) {
+        if frame.tag == crate::wire::StructTag::Checkpoint {
+            return Ok(EntryKind::Checkpoint);
+        }
         return Ok(EntryKind::Governance);
     }
     Err(Error::MalformedAtRest(
@@ -617,7 +697,34 @@ fn parse_cache(bytes: &[u8]) -> Result<Rendered> {
         author,
         created_millis,
         text,
+        arrival: 0,
+        shown_at_ms: 0,
+        late: false,
     })
+}
+
+/// Sort rendered rows into the room's one order ([`Dag::order_key`]) and mark the late
+/// ones. A row the DAG does not hold cannot be in a timeline (every row is render-gated
+/// by it); it would sort last rather than panic.
+fn sort_timeline(dag: &Dag, timeline: &mut [Rendered]) {
+    timeline.sort_by_cached_key(|r| {
+        dag.order_key(&r.entry_hash)
+            .unwrap_or((u64::MAX, r.entry_hash))
+    });
+    mark_late(timeline);
+}
+
+/// Mark each row placed above a row the reader had already been shown — shown at least
+/// [`LATE_AFTER_MS`] before this one arrived (see [`Rendered::late`]). One pass from the
+/// bottom, tracking the earliest time any row below was shown.
+fn mark_late(timeline: &mut [Rendered]) {
+    let mut earliest_below = u64::MAX;
+    for r in timeline.iter_mut().rev() {
+        r.late = earliest_below
+            .checked_add(LATE_AFTER_MS)
+            .is_some_and(|seen| r.shown_at_ms >= seen);
+        earliest_below = earliest_below.min(r.shown_at_ms);
+    }
 }
 
 impl ChannelState {
@@ -715,7 +822,6 @@ impl ChannelState {
         let signer = profile.signer()?;
         let policy = ChannelPolicy {
             history_mode: HistoryMode::ForwardOnly,
-            deniability_mode: DeniabilityMode::Attributable,
             ttl: 0,
             min_suite: SuiteFloor::DAY_ONE.id(),
         };
@@ -801,6 +907,7 @@ impl ChannelState {
 
         let mut admission = AdmissionPolicy::new();
         admission.admit(channel_id, epoch, me);
+        let origin_ms = genesis.body.created.saturating_mul(1_000);
         let evaluator = Arc::new(Self::build_evaluator(&genesis, &authors, &[], now_secs)?);
         Ok(Self {
             channel_id,
@@ -812,11 +919,13 @@ impl ChannelState {
             sek,
             authors,
             admission,
-            dag: Dag::new(),
+            dag: Dag::for_room(origin_ms),
             evaluator,
             sender,
             next_log_id: 1,
             timeline: Vec::new(),
+            timeline_generation: 0,
+            log_ids: std::collections::HashMap::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
@@ -826,6 +935,10 @@ impl ChannelState {
             own_admission: Some(Admission::Creator),
             origins,
             delivered: BTreeMap::new(),
+            retention: RetentionIndex::default(),
+            node_retention: 0,
+            last_pruned_at: now_secs,
+            checkpoint_idle: CHECKPOINT_IDLE_SECS,
             poisoned: false,
         })
     }
@@ -882,9 +995,11 @@ impl ChannelState {
         // Rebuild the DAG: every stored entry re-passes the acceptance predicate,
         // classified by its payload so governance entries are not re-admitted as
         // content.
-        let mut dag = Dag::new();
+        let mut dag = Dag::for_room(genesis.body.created.saturating_mul(1_000));
+        let mut log_ids = std::collections::HashMap::new();
         let mut next_log_id = 1u64;
         let mut gov_entries = Vec::new();
+        let mut retention = RetentionIndex::default();
         for (id, seg) in store.segments(channel_id, SegmentKind::LogDb)? {
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
             let entry = Entry::from_wire(&wire)?;
@@ -892,11 +1007,32 @@ impl ChannelState {
                 .get(&entry.skeleton.author_id)
                 .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?
                 .clone();
-            let payload = entry
-                .payload
-                .as_deref()
-                .ok_or(Error::MalformedAtRest("stored entry payload pruned"))?;
-            let kind = classify_payload(payload)?;
+            // **A pruned entry is a kept entry** (ADR-023 decision 2). Retention drops a content
+            // body and keeps the signed skeleton, which still verifies and still links the feed —
+            // refusing it here made a room with one expired message impossible to open.
+            // Governance is never pruned, so a body-less entry is content.
+            let kind = match entry.payload.as_deref() {
+                Some(payload) => classify_payload(payload)?,
+                None => EntryKind::Content,
+            };
+            if kind == EntryKind::Content && entry.payload.is_some() {
+                let first_seen = match store.get_segment(channel_id, SegmentKind::Index, id)? {
+                    Some(seg) => {
+                        parse_first_seen(&open_segment(&sek, SegmentKind::Index, id, &seg)?)?
+                    }
+                    // No record: aged from now, which can only keep it longer, never shorter.
+                    None => now_secs,
+                };
+                retention.track(
+                    entry.entry_hash(),
+                    Tracked {
+                        log_id: id,
+                        first_seen,
+                        claimed: None,
+                        cache_id: None,
+                    },
+                );
+            }
             if kind == EntryKind::Governance {
                 gov_entries.push(GovEntry::from_verified_log_entry(
                     &entry,
@@ -905,20 +1041,34 @@ impl ChannelState {
                     Default::default(),
                 )?);
             }
+            log_ids.insert(entry.entry_hash(), id);
             dag.accept(entry, kind, &key, &admission)
                 .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
             next_log_id = id.saturating_add(1);
         }
+        // A stored skeleton without its signature was dropped under a checkpoint, and the
+        // signed checkpoint above it was stored too. One left unchained is not ours to trust.
+        if dag.discard_unverified() > 0 {
+            return Err(Error::MalformedAtRest(
+                "a stored unsigned entry has no signed successor",
+            ));
+        }
 
-        // Timeline from the sealed plaintext cache, render-gated by the DAG.
+        // Timeline from the sealed plaintext cache, render-gated by the DAG — and by
+        // retention: a row whose body is gone is not shown, whatever the cache says.
         let mut timeline = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::PlaintextCache)? {
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
-            let rendered = parse_cache(&row)?;
-            if dag.contains(&rendered.entry_hash) {
+            let mut rendered = parse_cache(&row)?;
+            rendered.arrival = id;
+            if retention.get(&rendered.entry_hash).is_some() {
+                retention.rendered(&rendered.entry_hash, rendered.created_millis / 1_000, id);
                 timeline.push(rendered);
             }
         }
+        // The cache is in the order rows were rendered; the timeline is in the room's.
+        sort_timeline(&dag, &mut timeline);
+        let timeline_generation = dag.reorder_generation();
 
         let sender_seg = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_SENDER)?
@@ -1007,6 +1157,8 @@ impl ChannelState {
             sender,
             next_log_id,
             timeline,
+            timeline_generation,
+            log_ids,
             gov_entries,
             receivers,
             anchors,
@@ -1014,6 +1166,10 @@ impl ChannelState {
             own_admission,
             origins,
             delivered,
+            retention,
+            node_retention: 0,
+            last_pruned_at: now_secs,
+            checkpoint_idle: CHECKPOINT_IDLE_SECS,
             poisoned: false,
         })
     }
@@ -1216,11 +1372,13 @@ impl ChannelState {
             sek,
             authors,
             admission,
-            dag: Dag::new(),
+            dag: Dag::for_room(genesis.body.created.saturating_mul(1_000)),
             evaluator,
             sender,
             next_log_id: 1,
             timeline: Vec::new(),
+            timeline_generation: 0,
+            log_ids: std::collections::HashMap::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
@@ -1229,6 +1387,10 @@ impl ChannelState {
             own_admission: None,
             origins,
             delivered: BTreeMap::new(),
+            retention: RetentionIndex::default(),
+            node_retention: 0,
+            last_pruned_at: now_secs,
+            checkpoint_idle: CHECKPOINT_IDLE_SECS,
             poisoned: false,
         })
     }
@@ -1884,6 +2046,314 @@ impl ChannelState {
         &self.genesis.body.service_grant
     }
 
+    /// The room's retention, seconds (`0` = forever): the ADR-007 policy-update `ttl` in
+    /// force, as the evaluator folds it from the log.
+    #[must_use]
+    pub fn room_retention(&self) -> u64 {
+        self.evaluator.policy().ttl
+    }
+
+    /// The retention this node applies to the room: the shorter of the room's and its own
+    /// (ADR-023 decision 2, PRD-001 R9). `0` is forever.
+    #[must_use]
+    pub fn effective_retention(&self) -> u64 {
+        crate::node::retention::shortest(self.room_retention(), self.node_retention)
+    }
+
+    /// Set this node's own retention for the room (from its config; `0` = no node limit).
+    /// Takes effect at the next [`ChannelState::sweep_retention`].
+    pub fn set_node_retention(&mut self, secs: u64) {
+        self.node_retention = secs;
+    }
+
+    /// Set the **room's** retention (PRD-001 R7): append an ADR-007 policy-update carrying
+    /// `ttl` seconds (`0` = forever). Only a holder of the `policy` capability may — the
+    /// room's admin; anyone else is refused here rather than writing an entry every other
+    /// node would ignore. It applies to what is already stored, at the next sweep (R8).
+    pub fn set_retention(&mut self, profile: &Profile, ttl: u64, now_secs: u64) -> Result<()> {
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        if !self
+            .evaluator
+            .grants(&me, &crate::governance::capability::Capability::Policy)
+            .is_granted()
+        {
+            return Err(Error::MalformedGovernance(
+                "only the room's admin may set its retention",
+            ));
+        }
+        let update = crate::governance::policy::PolicyUpdate::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            None,
+            Some(ttl),
+            None,
+        )?;
+        self.append_governance(profile, &update.to_wire(), now_secs)?;
+        Ok(())
+    }
+
+    /// Prune every content entry older than the effective retention (ADR-023 decision 2):
+    /// drop its body, delete its plaintext cache row, keep the signed skeleton, and take it
+    /// out of the timeline. Retroactive by construction — it looks only at what is held now
+    /// against the policy in force now. Returns how many entries were pruned.
+    ///
+    /// Costs what it prunes, not what the room holds: the index is ordered by age.
+    pub fn sweep_retention(&mut self, store: &Store, now_secs: u64) -> Result<usize> {
+        let ttl = self.effective_retention();
+        if ttl == 0 || self.poisoned {
+            return Ok(0);
+        }
+        let due = self.retention.take_due(now_secs.saturating_sub(ttl));
+        let pruned = self.prune(store, &due, false)?;
+        if pruned > 0 {
+            self.last_pruned_at = now_secs;
+        }
+        Ok(pruned)
+    }
+
+    /// How long nothing new must have expired before a backlog smaller than
+    /// [`CHECKPOINT_EVERY`] is checkpointed anyway (seconds). Set by the actor.
+    pub fn set_checkpoint_idle(&mut self, secs: u64) {
+        self.checkpoint_idle = secs;
+    }
+
+    /// Post a checkpoint on this identity's **own** feed when one is due (ADR-023 decision 3,
+    /// [`crate::log::checkpoint`] for why only the author checkpoints its feed). Returns
+    /// whether one was posted — a local append the caller pushes like any other.
+    ///
+    /// Due when the **room** keeps messages for a while (its retention is not forever; a
+    /// node's own shorter limit does not make it the room's business), and either at least
+    /// [`CHECKPOINT_EVERY`] more of this author's entries have expired here since its last
+    /// checkpoint, or fewer have and nothing new has expired for the checkpoint idle time — a
+    /// **closing** checkpoint, so no expired entry keeps its signature indefinitely.
+    ///
+    /// Cheap enough to ask on every tick: it looks only past the last checkpoint and stops at
+    /// the first of this author's entries still holding a body. Asking every tick, not only
+    /// after a prune, is what checkpoints a room opened with a backlog already expired (after a
+    /// restart, or pruned while the room kept everything) without waiting for another prune. The position named is the highest one below which every content entry of
+    /// this author has had its body pruned on this node; governance and earlier checkpoints
+    /// keep their bodies and never hold it back.
+    pub fn checkpoint_if_due(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+        if self.poisoned || self.room_retention() == 0 {
+            return Ok(false);
+        }
+        let me = profile.signer()?.fingerprint();
+        let Some(feed) = self.dag.feed(&me) else {
+            return Ok(false);
+        };
+        let mut below: Option<(u64, Digest32)> = None;
+        let mut expired = 0usize;
+        let already = self.dag.checkpoint(&me).map_or(0, |(s, _)| s);
+        // Everything at or below the last checkpoint is already behind it.
+        for seq in already.saturating_add(1)..=feed.max_seq() {
+            let Some(e) = feed.get(seq) else { break };
+            match e.payload.as_deref() {
+                None => {
+                    below = Some((seq, e.entry_hash()));
+                    expired += 1;
+                }
+                Some(p) if matches!(classify_payload(p), Ok(EntryKind::Content)) => break,
+                Some(_) => {}
+            }
+        }
+        let Some((seq, entry_hash)) = below else {
+            return Ok(false);
+        };
+        let idle = now_secs.saturating_sub(self.last_pruned_at) >= self.checkpoint_idle;
+        if seq <= already || (expired < CHECKPOINT_EVERY && !idle) {
+            return Ok(false);
+        }
+        let payload = crate::log::checkpoint::Checkpoint { seq, entry_hash }.to_wire();
+        self.append_control(profile, &payload, now_secs)?;
+        Ok(true)
+    }
+
+    /// Drop the signatures of every entry at or below its author's checkpoint whose body has
+    /// expired here, and rewrite those pages (ADR-023 decision 3). Only in a room whose
+    /// retention here is not forever: a room that keeps everything keeps its evidence too.
+    /// Returns how many signatures were dropped.
+    pub fn drop_checkpointed_signatures(&mut self, store: &Store) -> Result<usize> {
+        if self.poisoned || self.effective_retention() == 0 {
+            return Ok(0);
+        }
+        let dropped = self.dag.drop_checkpointed_signatures();
+        if dropped.is_empty() {
+            return Ok(0);
+        }
+        let mut pages = Vec::with_capacity(dropped.len());
+        for hash in &dropped {
+            let (Some(id), Some(entry)) = (self.log_ids.get(hash), self.dag.get_by_hash(hash))
+            else {
+                continue;
+            };
+            pages.push((
+                *id,
+                seal_segment(&self.sek, SegmentKind::LogDb, *id, &entry.to_wire())?,
+            ));
+        }
+        let persisted = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            for (id, page) in &pages {
+                batch.put_segment(&self.channel_id, SegmentKind::LogDb, *id, page)?;
+            }
+            batch.commit()
+        })();
+        if let Err(e) = persisted {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(pages.len())
+    }
+
+    /// Append a control entry (a checkpoint) on this identity's own feed: signed and stored
+    /// like governance, never folded into the ADR-007 evaluator, since it grants nothing.
+    fn append_control(&mut self, profile: &Profile, payload: &[u8], now_secs: u64) -> Result<()> {
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        let skeleton = self.next_skeleton(&me, payload, now_secs.saturating_mul(1_000));
+        let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
+        let hash = entry.entry_hash();
+        let id = self.next_log_id;
+        let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &entry.to_wire())?;
+        self.dag
+            .accept(
+                entry,
+                EntryKind::Checkpoint,
+                &signer.public_key(),
+                &self.admission,
+            )
+            .map_err(|_| Error::Profile("authored checkpoint failed the acceptance predicate"))?;
+        if let Err(e) =
+            profile
+                .store()
+                .put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)
+        {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.log_ids.insert(hash, id);
+        self.next_log_id = id.saturating_add(1);
+        Ok(())
+    }
+
+    /// Whether an entry this node is about to render has already outlived the effective
+    /// retention — a late arrival of a message that is expired everywhere else.
+    fn already_expired(&self, entry_hash: &Digest32, claimed: u64, now_secs: u64) -> bool {
+        let ttl = self.effective_retention();
+        if ttl == 0 {
+            return false;
+        }
+        let first_seen = self
+            .retention
+            .get(entry_hash)
+            .map_or(now_secs, |t| t.first_seen);
+        claimed.min(first_seen) <= now_secs.saturating_sub(ttl)
+    }
+
+    /// Drop the bodies of `due`: rewrite each log page with the skeleton alone, delete its
+    /// cache row and its retention record, in one batch. `with_receivers` also persists the
+    /// receiver chains, for a caller that has just advanced one (a render that decrypted and
+    /// then found the message expired must still record that the key was used).
+    fn prune(
+        &mut self,
+        store: &Store,
+        due: &[(Digest32, Tracked)],
+        with_receivers: bool,
+    ) -> Result<usize> {
+        if due.is_empty() && !with_receivers {
+            return Ok(0);
+        }
+        let mut pages = Vec::with_capacity(due.len());
+        let shed = self.effective_retention() != 0;
+        for (hash, t) in due {
+            self.dag.prune_payload(hash);
+            // Pruned below its author's checkpoint: the signature goes with the body.
+            if shed {
+                self.dag.drop_signature_if_checkpointed(hash);
+            }
+            let wire = self
+                .dag
+                .get_by_hash(hash)
+                .ok_or(Error::MalformedGovernance("pruned entry vanished"))?
+                .to_wire();
+            pages.push((
+                t.log_id,
+                t.cache_id,
+                seal_segment(&self.sek, SegmentKind::LogDb, t.log_id, &wire)?,
+            ));
+        }
+        let receivers_seg = if with_receivers {
+            Some(seal_segment(
+                &self.sek,
+                SegmentKind::KeyMaterial,
+                SEG_RECEIVERS,
+                &receivers_bytes(&self.receivers),
+            )?)
+        } else {
+            None
+        };
+        let persisted = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            for (log_id, cache_id, page) in &pages {
+                batch.put_segment(&self.channel_id, SegmentKind::LogDb, *log_id, page)?;
+                batch.delete_segment(&self.channel_id, SegmentKind::Index, *log_id)?;
+                if let Some(c) = cache_id {
+                    batch.delete_segment(&self.channel_id, SegmentKind::PlaintextCache, *c)?;
+                }
+            }
+            if let Some(seg) = &receivers_seg {
+                batch.put_segment(
+                    &self.channel_id,
+                    SegmentKind::KeyMaterial,
+                    SEG_RECEIVERS,
+                    seg,
+                )?;
+            }
+            batch.commit()
+        })();
+        if let Err(e) = persisted {
+            self.poisoned = true;
+            return Err(e);
+        }
+        let gone: BTreeSet<Digest32> = due.iter().map(|(h, _)| *h).collect();
+        self.timeline.retain(|r| !gone.contains(&r.entry_hash));
+        mark_late(&mut self.timeline);
+        Ok(due.len())
+    }
+
+    /// Start tracking a content body just stored under `log_id`, first seen `now_secs`, and
+    /// record that time durably beside it.
+    fn track_body(
+        &mut self,
+        store: &Store,
+        entry_hash: Digest32,
+        log_id: u64,
+        now_secs: u64,
+    ) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::Index,
+            log_id,
+            &first_seen_bytes(now_secs),
+        )?;
+        if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::Index, log_id, &seg) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.retention.track(
+            entry_hash,
+            Tracked {
+                log_id,
+                first_seen: now_secs,
+                claimed: None,
+                cache_id: None,
+            },
+        );
+        Ok(())
+    }
+
     /// Append an already-built governance struct as a signed log entry.
     fn append_governance(
         &mut self,
@@ -1903,7 +2373,9 @@ impl ChannelState {
                 "this identity is not an author of the channel",
             ));
         }
-        let skeleton = self.next_skeleton(&me, payload);
+        // Governance is authored on the seconds clock; its place in the order is whole
+        // seconds, which only matters against entries it did not see.
+        let skeleton = self.next_skeleton(&me, payload, now_secs.saturating_mul(1_000));
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let hash = entry.entry_hash();
         let wire = entry.to_wire();
@@ -1923,6 +2395,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        self.log_ids.insert(hash, id);
         self.next_log_id = id.saturating_add(1);
         self.gov_entries.push(gov);
         self.evaluator = Arc::new(Self::build_evaluator(
@@ -2010,28 +2483,32 @@ impl ChannelState {
     fn heads(&self) -> BTreeMap<Digest32, u64> {
         self.authors
             .keys()
-            .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
+            .map(|a| (*a, self.dag.verified_head(a)))
             .collect()
     }
 
     /// Persist, fold and render every entry a sync added past `before`'s heads.
+    ///
+    /// Only up to each author's **verified** head: a run of unsigned skeletons that no signed
+    /// entry has chained to yet (ADR-023 decision 3) waits in memory for a later batch, and is
+    /// taken back at the session's end if none comes. Persisting it would store what is not
+    /// yet authentic.
     fn absorb_arrived(
         &mut self,
         store: &Store,
         before: &BTreeMap<Digest32, u64>,
         now_secs: u64,
     ) -> Result<SyncOutcome> {
-        let mut arrived: Vec<(Digest32, Digest32, Vec<u8>)> = Vec::new();
+        // A skeleton without its body — pruned at the peer — is stored too: the feed must
+        // stay contiguous on disk or the next reopen breaks at the gap (ADR-023 decision 2).
+        let mut arrived: Vec<(Digest32, Digest32, Option<Vec<u8>>)> = Vec::new();
         for (author, head) in before {
             let Some(feed) = self.dag.feed(author) else {
                 continue;
             };
-            for seq in (head + 1)..=feed.max_seq() {
+            for seq in (head + 1)..=self.dag.verified_head(author) {
                 if let Some(entry) = feed.get(seq) {
-                    let Some(payload) = entry.payload.clone() else {
-                        continue;
-                    };
-                    arrived.push((*author, entry.entry_hash(), payload));
+                    arrived.push((*author, entry.entry_hash(), entry.payload.clone()));
                 }
             }
         }
@@ -2059,7 +2536,11 @@ impl ChannelState {
                 self.poisoned = true;
                 return Err(e);
             }
+            self.log_ids.insert(entry_hash, id);
             self.next_log_id = id.saturating_add(1);
+            let Some(payload) = payload else {
+                continue; // a skeleton: stored, never rendered
+            };
             match classify_payload(&payload)? {
                 EntryKind::Governance => {
                     let entry = self
@@ -2082,13 +2563,18 @@ impl ChannelState {
                     )?);
                     out.governance += 1;
                 }
+                // A checkpoint is stored and read by the DAG; there is nothing to render.
+                EntryKind::Checkpoint => {}
                 EntryKind::Content => {
+                    self.track_body(store, entry_hash, id, now_secs)?;
                     if self.render_content(store, author, entry_hash, &payload, now_secs)? {
                         out.rendered += 1;
                     }
                 }
             }
         }
+        // An entry that arrived may be a parent others named before it: rows move.
+        self.settle_timeline();
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
         Ok(out)
@@ -2123,6 +2609,15 @@ impl ChannelState {
             fatal: std::cell::RefCell::new(None),
         };
         let session = crate::log::sync::frontier_session_room(transport, &room);
+        // Whatever arrived without a signature and was never chained to a signed entry is not
+        // authentic; it was never persisted, and it is taken back here on every path out of the
+        // session (ADR-023 decision 3).
+        {
+            let mut ch = shared.blocking_lock();
+            if ch.dag.discard_unverified() > 0 {
+                ch.settle_timeline();
+            }
+        }
         if let Some(e) = room.fatal.take() {
             return Err(e);
         }
@@ -2276,11 +2771,27 @@ impl ChannelState {
         let Ok(content) = Content::from_canonical_slice(&plaintext) else {
             return Ok(false);
         };
+        // **A late arrival of an expired message never renders** (ADR-023 decision 2). Its key
+        // has been used, so the chain is persisted all the same; the body goes as any other
+        // expired body does.
+        if self.already_expired(&entry_hash, content.created_millis / 1_000, now_secs) {
+            let due: Vec<(Digest32, Tracked)> = self
+                .retention
+                .forget(&entry_hash)
+                .map(|t| (entry_hash, t))
+                .into_iter()
+                .collect();
+            self.prune(store, &due, true)?;
+            return Ok(false);
+        }
         let rendered = Rendered {
             entry_hash,
             author,
             created_millis: content.created_millis,
             text: content.text,
+            arrival: self.next_log_id,
+            shown_at_ms: 0,
+            late: false,
         };
         // The cache row shares the entry's log id space; use a fresh id so it never
         // collides with an authored row.
@@ -2320,9 +2831,62 @@ impl ChannelState {
             return Err(e);
         }
         self.next_log_id = id.saturating_add(1);
-        self.timeline.push(rendered);
-        let _ = now_secs;
+        self.retention
+            .rendered(&entry_hash, rendered.created_millis / 1_000, id);
+        self.place_rendered(rendered, now_secs.saturating_mul(1_000));
         Ok(true)
+    }
+
+    /// Insert a just-rendered row at its place in the room's order — which is above
+    /// rows already shown when it arrived late (ADR-023 decision 1) — and re-sort first
+    /// if a late parent has moved rows since the last sort.
+    ///
+    /// `now_ms` is this node's wall clock — the seconds clock every other local decision
+    /// uses, not the (possibly skewed) clock an author stamps its messages with.
+    fn place_rendered(&mut self, mut rendered: Rendered, now_ms: u64) {
+        rendered.shown_at_ms = now_ms;
+        self.settle_timeline();
+        let dag = &self.dag;
+        let key = dag.order_key(&rendered.entry_hash);
+        let at = self
+            .timeline
+            .partition_point(|r| dag.order_key(&r.entry_hash) <= key);
+        self.timeline.insert(at, rendered);
+        mark_late(&mut self.timeline);
+    }
+
+    /// Re-sort the timeline if any stored entry moved in the order since it was last
+    /// sorted: a parent named in `seen` arrived after its children and lifted them
+    /// ([`Dag::reorder_generation`]). Cheap when nothing moved, which is nearly always.
+    fn settle_timeline(&mut self) {
+        let generation = self.dag.reorder_generation();
+        if generation != self.timeline_generation {
+            sort_timeline(&self.dag, &mut self.timeline);
+            self.timeline_generation = generation;
+        }
+    }
+
+    /// Whether `a` happened before `b` in this room: `a` is a causal ancestor of `b`
+    /// through `b`'s author's feed and the `seen` edges this node holds
+    /// ([`Dag::happened_before`]). `false` means concurrent or not yet known to be
+    /// ordered. The seam claims are to be built on (PRD-001 R17).
+    #[must_use]
+    pub fn happened_before(&self, a: &Digest32, b: &Digest32) -> bool {
+        self.dag.happened_before(a, b)
+    }
+
+    /// Every entry this node holds for the room — readable or not, body pruned or not —
+    /// in the room's one order (PRD-001 R13). The timeline is this sequence restricted
+    /// to the rows this node can render.
+    #[must_use]
+    pub fn causal_order(&self) -> Vec<Digest32> {
+        self.dag.causal_order()
+    }
+
+    /// [`ChannelState::causal_order`] with each entry's clock (ms): the key that placed it.
+    #[must_use]
+    pub fn order_keys(&self) -> Vec<(Digest32, u64)> {
+        self.dag.order_keys()
     }
 
     /// Accept an entry authored by **another** member (M14.5; the bytes arrive from
@@ -2346,6 +2910,14 @@ impl ChannelState {
         if entry.skeleton.epoch != self.epoch {
             return Err(Error::MalformedGovernance("entry binds another epoch"));
         }
+        // A skeleton without its signature is authentic only through a signed successor,
+        // which a single entry cannot bring; only a sync session, which brings the feed,
+        // takes them (ADR-023 decision 3).
+        if !entry.is_signed() {
+            return Err(Error::MalformedGovernance(
+                "an unsigned entry arrives only inside a sync session",
+            ));
+        }
         let author = entry.skeleton.author_id;
         let key = self
             .authors
@@ -2354,11 +2926,12 @@ impl ChannelState {
                 "entry from an unadmitted author",
             ))?
             .clone();
-        let payload = entry
-            .payload
-            .as_deref()
-            .ok_or(Error::MalformedGovernance("entry payload pruned"))?;
-        let kind = classify_payload(payload)?;
+        // A pruned entry is a skeleton the peer no longer holds a body for: stored, so the
+        // feed stays whole, and never rendered (ADR-023 decision 2).
+        let kind = match entry.payload.as_deref() {
+            Some(payload) => classify_payload(payload)?,
+            None => EntryKind::Content,
+        };
         let gov = if kind == EntryKind::Governance {
             Some(GovEntry::from_verified_log_entry(
                 &entry,
@@ -2375,12 +2948,24 @@ impl ChannelState {
         let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
         self.dag
             .accept(entry, kind, &key, &self.admission)
-            .map_err(|_| Error::MalformedGovernance("entry failed the acceptance predicate"))?;
+            .map_err(|r| match r {
+                // Said as what it is: refused below the author's checkpoint, not a fork.
+                crate::log::dag::Rejected::PreCheckpoint => {
+                    Error::MalformedGovernance("entry is at or below its author's checkpoint")
+                }
+                _ => Error::MalformedGovernance("entry failed the acceptance predicate"),
+            })?;
         if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg) {
             self.poisoned = true;
             return Err(e);
         }
+        self.log_ids.insert(entry_hash, id);
         self.next_log_id = id.saturating_add(1);
+        // It may be a parent rows already shown named before it arrived.
+        self.settle_timeline();
+        if kind == EntryKind::Checkpoint {
+            return Ok(Accepted::Checkpoint);
+        }
         match gov {
             Some(g) => {
                 self.gov_entries.push(g);
@@ -2396,11 +2981,14 @@ impl ChannelState {
             // has consented to us; otherwise it stays stored as ciphertext
             // (ADR-007 step 3) until an SKDM arrives and backfills it.
             None => {
-                let payload = self
+                let Some(payload) = self
                     .dag
                     .get_by_hash(&entry_hash)
                     .and_then(|e| e.payload.clone())
-                    .ok_or(Error::MalformedGovernance("accepted entry payload missing"))?;
+                else {
+                    return Ok(Accepted::ContentNotReadable);
+                };
+                self.track_body(store, entry_hash, id, now_secs)?;
                 if self.render_content(store, author, entry_hash, &payload, now_secs)? {
                     Ok(Accepted::Rendered)
                 } else {
@@ -2429,6 +3017,8 @@ impl ChannelState {
         // converted at the call site: this value becomes half the ADR-020 claim ordering key, and a
         // caller still thinking in seconds should fail to compile rather than stamp 1970.
         now_millis: u64,
+        // This node's seconds clock, for local decisions (when the row was shown).
+        now_secs: u64,
     ) -> Result<&Rendered> {
         if self.poisoned {
             return Err(Error::Profile(
@@ -2447,7 +3037,7 @@ impl ChannelState {
         let msg = self.sender.encrypt(&plaintext)?;
         let payload = msg.to_wire();
 
-        let skeleton = self.next_skeleton(&me, &payload);
+        let skeleton = self.next_skeleton(&me, &payload, now_millis);
         let entry = Entry::build_signed(signer, skeleton, payload)?;
         let entry_hash = entry.entry_hash();
         let wire = entry.to_wire();
@@ -2456,6 +3046,9 @@ impl ChannelState {
             author: me,
             created_millis: now_millis,
             text: content.text,
+            arrival: self.next_log_id,
+            shown_at_ms: 0,
+            late: false,
         };
 
         let id = self.next_log_id;
@@ -2471,6 +3064,12 @@ impl ChannelState {
             SegmentKind::KeyMaterial,
             SEG_SENDER,
             &self.sender.to_state(),
+        )?;
+        let seen_seg = seal_segment(
+            &self.sek,
+            SegmentKind::Index,
+            id,
+            &first_seen_bytes(now_millis / 1_000),
         )?;
 
         // Validate against the DAG first (structural), then persist, then commit
@@ -2494,21 +3093,37 @@ impl ChannelState {
                 SEG_SENDER,
                 &sender_seg,
             )?;
+            batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen_seg)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
             self.poisoned = true;
             return Err(e);
         }
+        self.log_ids.insert(entry_hash, id);
         self.next_log_id = id.saturating_add(1);
-        self.timeline.push(rendered);
+        self.retention.track(
+            entry_hash,
+            Tracked {
+                log_id: id,
+                first_seen: now_millis / 1_000,
+                claimed: Some(now_millis / 1_000),
+                cache_id: Some(id),
+            },
+        );
+        // Its `seen` names every head this node holds, so it sorts after all of them;
+        // placed through the same path as any row all the same.
+        self.place_rendered(rendered, now_secs.saturating_mul(1_000));
         self.timeline
-            .last()
-            .ok_or(Error::Profile("timeline empty after push"))
+            .iter()
+            .find(|r| r.entry_hash == entry_hash)
+            .ok_or(Error::Profile("timeline lost the appended row"))
     }
 
-    /// The next entry skeleton for `author`'s feed in this DAG.
-    fn next_skeleton(&self, author: &Digest32, payload: &[u8]) -> EntrySkeleton {
+    /// The next entry skeleton for `author`'s feed in this DAG, naming in `seen` the
+    /// other authors' heads this node has applied (ADR-023 decision 1): that is what
+    /// places the entry after everything its author could have read.
+    fn next_skeleton(&self, author: &Digest32, payload: &[u8], claimed_ms: u64) -> EntrySkeleton {
         let feed = self.dag.feed(author);
         let max = feed.map_or(0, |f| f.max_seq());
         let seq = max + 1;
@@ -2537,6 +3152,8 @@ impl ChannelState {
             payload_hash: sha256(payload),
             payload_len: payload.len() as u64,
             end_of_feed: false,
+            claimed_ms,
+            seen: self.dag.seen_for(author),
         }
     }
 
