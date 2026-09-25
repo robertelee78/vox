@@ -364,8 +364,9 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   restarted and the room opens with all 1,500 rows readable, and a newcomer who joins with `vox room
   join` holds every entry alice's log does (1,502: the posts and two consents, counted off both stores).
   On v0.2.8 (0844943) it is red at post 1,001; with the quota restored on the reopen path only it is red
-  at the reopen (`[closed]`). `crates/vox-core/tests/a_room_has_no_history_limit.rs` is the same claim
-  on in-process nodes, with the cold catch-up timed.
+  at the reopen (`[closed]`). `crates/vox-core/tests/a_room_has_no_history_limit.rs` was the same claim
+  on in-process nodes; it was deleted in V29-17 because `a_long_room_reopens_proof` proves it through
+  the shipped binary.
   **Observed alongside, not fixed or diagnosed here:** through the CLI the newcomer rendered none of
   the pre-join history, and — the part that matters for R1 — did not render alice's *next* post within
   180 s once the history was 1,500 long, where with 5 posts it did. A likely cause, **not verified**, is

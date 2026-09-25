@@ -630,7 +630,8 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   state from two threads. To make that possible the channel's persistence-only methods now take `&Store`
   rather than `&Profile` (signing still needs the signer), and `ChannelState::me` comes from its own sender
   chain, so rendering needs no signer at all.
-  **The gate is met** (`tests/node_m14_gate.rs`, production Argon2id + `(200,9)` PoW, ≈ 11 s in release):
+  **The gate is met** (`tests/node_m14_gate.rs` — replaced in V29-17 by the real-binary
+  `vox-tui/tests/a_room_admits_the_passphrase_and_authors_decide_readers.rs` — production Argon2id + `(200,9)` PoW, ≈ 11 s in release):
   three nodes create, invite, join with an out-of-band passphrase, consent, exchange messages both ways,
   and the third — which joined and was consented to by nobody — receives the entire log and renders
   **nothing**. Writing it exposed four more things the Decision had wrong or unstated, all now fixed:
