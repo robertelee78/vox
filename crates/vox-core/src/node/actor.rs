@@ -4707,9 +4707,9 @@ impl Node {
             // Rooms this pass wanted with this peer but found **already mid-session**. See the
             // `owed` handling after the loop: they are retried next tick, not forgotten.
             let mut owed: Vec<Digest32> = Vec::new();
-            // A member reconciles a channel with its co-authors — and with its
-            // anchors, which keep the log for whoever is away (M15.2b).
-            let peer_is_anchor = self.anchor_ids.contains(&peer);
+            // A member reconciles a channel with its co-authors — and with that channel's
+            // anchors, which keep the log for whoever is away (M15.2b). Both are decided per room
+            // by `may_sync` below.
 
             // **Learn who this peer is before deciding we share nothing with it.**
             //
@@ -4750,12 +4750,17 @@ impl Node {
             // and this was the outbound half handing the same log over unasked. The bypass existed
             // because a peer that has just joined is not yet an author in this node's view;
             // `may_sync` covers that case properly, by admitting the peer from this node's own board
-            // before deciding, which is the evidence the bypass was standing in for. This node's own
-            // anchors still get every room: holding the log for whoever is away is what they are for.
+            // before deciding, which is the evidence the bypass was standing in for.
+            //
+            // **An anchor gets the rooms that name it, not every room** (V29-04, #39). An anchor was
+            // pushed every room this node held because `anchor_ids` held it, and `anchor_ids` holds
+            // the anchors named by ANY room's invite link: an anchor named only by room A's link was
+            // handed room B's log unasked, while that anchor's own `may_sync` would have refused B
+            // inbound. vox-bc's verifier reproduced it with real nodes: the other room's anchor was
+            // pushed room B, one session and five entries. `may_sync` already accepts a room's own
+            // anchors, and the configured ones are in every room's anchor set, so it decides alone.
             for cid in member_rooms {
-                let belongs = if peer_is_anchor {
-                    true
-                } else {
+                let belongs = {
                     let Some(epoch) = (match self.channels.get(&cid) {
                         Some(shared) => Some(shared.lock().await.epoch()),
                         None => None,
