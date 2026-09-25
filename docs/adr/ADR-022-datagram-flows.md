@@ -218,6 +218,9 @@ What does not change: the relay is still ciphertext-only by construction.
   - An incoming stream nobody accepts within **5 s** is reset.
 - **In-process library API.** The same operations are exposed from `vox-core` for a mobile app that
   embeds the node (R30). Packaging for Swift and Kotlin belongs to the app, not here.
+  *Built for Swift (2026-09-25):* `crates/vox-ffi` exposes the app API over UniFFI
+  (`appListen`/`appOpen`, stream and datagram calls), proved from a Swift program against a real
+  daemon's `vox app listen` (ADR-014 §"The embedded node"). Kotlin is not built.
 - **Limits:**
   - 16 app streams per peer;
   - an open-rate bucket of about 10 per second per peer;

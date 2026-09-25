@@ -1,0 +1,33 @@
+# Vox Lux — the embedding library for native apps (PRD-001 R30/R31, ADR-014).
+#
+# The node runs inside the app's own process, as a library: an iOS app cannot run a
+# daemon beside itself, and a macOS app should not have to. The boundary is UniFFI, as
+# ADR-014 decided — typed, memory-safe, async, and the same Swift for macOS and iOS.
+[package]
+name = "vox-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Vox Lux embedded node for native apps (UniFFI)"
+
+[lib]
+name = "vox_ffi"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+# Generates the Swift bindings from the built library (`scripts/build-xcframework.sh`).
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+vox-core = { path = "../vox-core" }
+uniffi.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
