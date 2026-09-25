@@ -65,4 +65,5 @@ pub mod quic;
 pub mod session;
 pub mod stream_transport;
 pub mod streams;
+pub mod taper;
 pub mod verifier;

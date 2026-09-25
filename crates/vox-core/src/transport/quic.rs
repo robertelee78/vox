@@ -161,6 +161,10 @@ pub(crate) const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_sec
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
+    // SPIKE (ADR-024 M24.1, not for merge): tier 2 alone — Cubic with non-congestion loss withheld.
+    cfg.congestion_controller_factory(
+        Arc::new(crate::transport::taper::LossAwareConfig::default()),
+    );
     // `From<VarInt>` rather than `try_from(Duration)`: the millisecond value is a compile-
     // time constant inside the varint range, so there is no error case to handle.
     cfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(

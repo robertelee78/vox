@@ -30,6 +30,7 @@ equihash.workspace = true
 blake2b_simd.workspace = true
 # Transport substrate (ADR-011, M9).
 quinn.workspace = true
+quinn-proto.workspace = true
 rustls.workspace = true
 rustls-post-quantum.workspace = true
 rustls-pki-types.workspace = true
