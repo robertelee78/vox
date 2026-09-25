@@ -462,63 +462,6 @@ impl VoxEndpoint {
     fn clone_key(&self) -> rustls_pki_types::PrivateKeyDer<'static> {
         self.leaf_key.clone_key()
     }
-
-    /// **Test-only.** Attempt to connect with a deliberately *classical-only* TLS
-    /// key-exchange group (no X25519MLKEM768), to prove the PQ-only server refuses
-    /// to negotiate it — i.e. there is no silent downgrade. Returns `Err` on the
-    /// (expected) handshake failure.
-    ///
-    /// This is the only place a non-hybrid provider is constructed, and it exists
-    /// solely so the downgrade-rejection property is testable through the real
-    /// handshake. Production code never offers a classical group.
-    #[cfg(test)]
-    pub async fn connect_classical_only(
-        &self,
-        addr: SocketAddr,
-        expected_peer: Digest32,
-    ) -> Result<VoxConnection> {
-        use rustls::crypto::aws_lc_rs;
-
-        // A provider whose ONLY kx group is classical X25519 (TLS 0x001D) — no
-        // hybrid group offered.
-        let classical_x25519 = aws_lc_rs::default_provider()
-            .kx_groups
-            .into_iter()
-            .find(|g| u16::from(g.name()) == 0x001D)
-            .ok_or(Error::MalformedBundle("classical X25519 group unavailable"))?;
-        let provider = Arc::new(rustls::crypto::CryptoProvider {
-            kx_groups: vec![classical_x25519],
-            ..aws_lc_rs::default_provider()
-        });
-        let supported = provider.signature_verification_algorithms;
-        let verified = VerifiedPeer::new();
-        let verifier = Arc::new(VoxServerCertVerifier::pinned(
-            supported,
-            expected_peer,
-            verified.clone(),
-        ));
-
-        // Build the client config by hand over the classical provider.
-        let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| Error::MalformedBundle("classical client provider/version"))?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-        cfg.alpn_protocols = vec![crate::transport::provider::VOX_ALPN.to_vec()];
-        cfg.enable_early_data = false;
-
-        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(cfg)
-            .map_err(|_| Error::MalformedBundle("classical quic client config"))?;
-        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
-        client_cfg.transport_config(transport_config());
-        let connecting = self
-            .endpoint
-            .connect_with(client_cfg, addr, "vox.invalid")
-            .map_err(|_| Error::MalformedBundle("classical connect"))?;
-        let connection = connecting.await.map_err(|_| Error::SignatureInvalid)?;
-        finish_connection(connection, &verified, 0)
-    }
 }
 
 /// Confirm the negotiated group, record the session, and build the connection.

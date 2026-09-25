@@ -1,6 +1,7 @@
 //! ADR-020 §8 — `vox room` driven as a **real binary against a real node**.
 //!
-//! The library gate (`node_m19_ipc_requests_gate`) proves the socket answers.
+//! It replaced the in-process gate `node_m19_ipc_requests_gate` (deleted in V29-17), which only
+//! proved the socket answers.
 //! This proves the thing an agent actually runs: the `vox` binary, as a separate
 //! process, attaching to a node it did not start.
 //!
