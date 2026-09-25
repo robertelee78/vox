@@ -176,6 +176,20 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     were 0.94–1.01 (1 ms and 20 ms RTT), and restoring quinn's default window dropped the 20 ms
     class to 0.46. They stand as history only. R41 against an emulated link is measured by
     `perf_r41` (its own owner and method).
+  - **Connection receive window 32 MiB** (`quic::CONNECTION_WINDOW`, two stream windows). quinn's
+    default connection window is unlimited, which was safe only while stream windows were small.
+    At 16 MiB per stream and quinn's default 100 concurrent streams, one peer writing into streams
+    nobody reads could park 1.6 GiB in this node. Proved on real endpoints
+    (`crates/vox-core/tests/transport_mtu_and_window_proof.rs`):
+    - 100 streams, 100 MiB offered to a reader that reads nothing: 33.75 MB received (3 runs), with
+      a bound of 32 MiB + 10% for packet overhead;
+    - mutation (no connection window): 105.4 MB received, red.
+  - **The 8192 ceiling needs both settings**: `MtuDiscoveryConfig::upper_bound` and
+    `EndpointConfig::max_udp_payload_size`. quinn searches only up to the smaller of its own ceiling
+    and the peer's advertised maximum. Same proof file, after a 32 MiB transfer on loopback:
+    - path MTU 7973–8082 (dialler) and 8192 (acceptor), 0 black holes, 3 runs;
+    - with `max_udp_payload_size` removed, both sides stop at 1472, red;
+    - with `upper_bound` removed, both stop at 1452, red.
   - **Unshaped loopback: ~1.1–1.2 GB/s (8.8–9.6 Gbit/s), about 11–12% of loopback TCP.** The decider
     has ruled that loopback is the wrong yardstick (PRD-001 R41 as clarified 2026-09-25): R41 is
     measured against a link.
