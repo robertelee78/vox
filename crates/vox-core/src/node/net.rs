@@ -303,7 +303,7 @@ pub const RETIRE_GRACE_SECS: u64 = 60;
 /// ends keep different connections — each then uses one the other has retired.
 ///
 /// Silence is the evidence that the process is gone. A live peer is heard from at least every
-/// [`KEEP_ALIVE`]: quinn re-arms the keep-alive on every packet it *receives*, so the side that
+/// `KEEP_ALIVE`: quinn re-arms the keep-alive on every packet it *receives*, so the side that
 /// has heard nothing for 20s sends a PING, and a live peer ACKs it within a round trip and its
 /// ACK delay (25ms). Both ends run the same timer, so on an idle path each hears from the other
 /// at most about 20s apart. 30s leaves 10s for the round trip, a lost PING and its PTO
@@ -313,7 +313,7 @@ pub const RETIRE_GRACE_SECS: u64 = 60;
 /// A dead connection cannot vote, which is why this needs no protocol. The end that restarted
 /// holds only the new connection; the end that kept the old one stops hearing from it; so both
 /// ends agree on the new one. Two **live** connections both keep hearing keep-alives, so a
-/// live duplicate still goes to [`tie_key`], which both ends compute identically.
+/// live duplicate still goes to `tie_key`, which both ends compute identically.
 ///
 /// **Residual, stated rather than implied:** the count is of datagrams routed to the
 /// connection, before authentication, so an on-path attacker that knows a connection ID can

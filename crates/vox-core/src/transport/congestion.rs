@@ -38,7 +38,7 @@ pub const IDLE_RESTART: Duration = Duration::from_secs(1);
 /// restarted between two flights of the same transfer.
 const IDLE_RTTS: u32 = 4;
 
-/// Builds [`IdleRestart`] controllers around quinn's Cubic.
+/// Builds `IdleRestart` controllers around quinn's Cubic.
 #[derive(Debug, Default)]
 pub struct IdleRestartConfig {
     cubic: Arc<CubicConfig>,
