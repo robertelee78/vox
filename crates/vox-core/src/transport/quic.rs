@@ -153,6 +153,39 @@ const MAX_IDLE_MS: u32 = 60_000;
 /// read.
 const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// The largest UDP payload a Vox endpoint accepts, and the ceiling path-MTU discovery
+/// searches up to (PRD-001 R41).
+///
+/// quinn's default ceiling is 1452 — Ethernet's — so every path, loopback and jumbo-frame
+/// links included, ran at 1452-byte packets, and a tunnel on this machine spent most of its
+/// time in one `sendmsg` per packet: profiled, the sending node sat in `__sendmsg` and in
+/// the connection lock that `sendmsg` is made under, with encryption at a few percent.
+/// Discovery is probing, not assuming: a path that will not carry a larger packet loses the
+/// probe and keeps what it had, so a 1500-byte link is exactly where it was.
+///
+/// **8192, not the loopback MTU (16384).** macOS refuses a UDP datagram over
+/// `net.inet.udp.maxdgram` (9216 by default), and with the ceiling at 16356 connections
+/// failed outright on this machine rather than falling back — measured, not reasoned. 8192
+/// stays under that limit on every platform Vox builds for.
+const MAX_UDP_PAYLOAD: u16 = 8_192;
+
+/// The UDP socket buffers a node asks for, each way.
+///
+/// The OS default (768 KiB receive on macOS) overflowed during a burst, and a large packet
+/// lost to overflow reads to quinn as a black hole: it drops the path MTU back to 1200 and
+/// does not probe again for a minute. Measured with the larger ceiling and larger stream
+/// windows (an experiment since dropped): without these buffers the MTU fell back to 1200 in
+/// 3 of 3 runs (`black_holes_detected` 1–9); with them, 0 black holes in 3 of 3.
+/// The OS may grant less; that is not an error.
+const UDP_SOCKET_BUFFER: usize = 4 << 20;
+
+/// The endpoint parameters every Vox endpoint runs with.
+fn endpoint_config() -> quinn::EndpointConfig {
+    let mut cfg = quinn::EndpointConfig::default();
+    let _ = cfg.max_udp_payload_size(MAX_UDP_PAYLOAD);
+    cfg
+}
+
 /// The transport parameters every Vox connection runs with, in both directions.
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut cfg = quinn::TransportConfig::default();
@@ -162,6 +195,9 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     cfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
         MAX_IDLE_MS,
     ))));
+    let mut mtu = quinn::MtuDiscoveryConfig::default();
+    mtu.upper_bound(MAX_UDP_PAYLOAD);
+    cfg.mtu_discovery_config(Some(mtu));
     Arc::new(cfg)
 }
 
@@ -194,6 +230,11 @@ impl VoxEndpoint {
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
+        {
+            let sock = socket2::SockRef::from(&socket);
+            let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
+            let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER);
+        }
         let wrapped = quinn::TokioRuntime
             .wrap_udp_socket(socket)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
@@ -218,7 +259,7 @@ impl VoxEndpoint {
             Arc::clone(&mux) as Arc<dyn quinn::AsyncUdpSocket>;
         Self::bind_with(signer, mux, |cfg| {
             Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::default(),
+                endpoint_config(),
                 Some(cfg),
                 for_endpoint,
                 Arc::new(quinn::TokioRuntime),

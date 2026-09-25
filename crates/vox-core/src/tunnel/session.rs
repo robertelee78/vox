@@ -474,7 +474,12 @@ async fn splice_until(
     cut: impl core::future::Future<Output = ()>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    const CHUNK: usize = 16 * 1024;
+    // 64 KiB per direction (PRD-001 R41). At 16 KiB the sending node's profile showed the
+    // splice's `recvfrom` and the stream writes it drives — each of which takes the
+    // connection lock `sendmsg` also holds — as a visible share of its time; measured on
+    // this machine, 16 KiB ran at ~1.11 GB/s, 64 KiB at ~1.20 GB/s and 256 KiB at ~1.31 GB/s.
+    // 64 KiB takes most of that for a quarter of the memory per tunnel.
+    const CHUNK: usize = 64 * 1024;
     let outcome = {
         let (mut tcp_r, mut tcp_w) = tcp.split();
         let (send, recv) = (&mut send, &mut recv);
