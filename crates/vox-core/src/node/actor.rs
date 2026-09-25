@@ -1405,10 +1405,6 @@ impl Node {
                         // Connections a better path displaced are closed once their
                         // grace is up (M15.1b).
                         net.manager().retire_expired();
-                        // A connection silent past `SILENCE_IS_DEATH` gives way to a live one to
-                        // the same peer — how a restarted peer's connection takes over from the
-                        // dead one it lost the tie-break to.
-                        net.manager().tend_liveness();
                     }
                     self.retry_upgrades_if_due().await;
                     self.renew_mappings_if_due();
@@ -1698,6 +1694,29 @@ impl Node {
         }
         let net = Arc::new(net);
         self.net = Some(Arc::clone(&net));
+        // **Liveness is tended off the actor.** A connection silent past `SILENCE_IS_DEATH` gives
+        // way to a live one to the same peer, or is closed — how a restarted peer's connection
+        // takes over from the dead one. That cannot ride the actor's tick, because the actor is
+        // exactly what a dead connection stalls: measured with a real `vox forward` whose host was
+        // killed, the actor sat 60s inside "publishing every room to an anchor that answered",
+        // awaiting a stream on the dead connection, and no tick ran until QUIC's idle timeout
+        // ended the wait — so the rule that would have ended it at 30s never got to run. Closing
+        // the connection from here is also what ends that wait. Held weakly, so the task ends
+        // with the network.
+        {
+            let manager = Arc::downgrade(net.manager());
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(TICK);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let Some(manager) = manager.upgrade() else {
+                        break;
+                    };
+                    manager.tend_liveness();
+                }
+            });
+        }
         // The configured anchors are dialled at once, each on its own task: they are
         // where this node's records go and the helpers its ladder climbs through, and
         // an anchor that is down must not hold up the ones that are not.
