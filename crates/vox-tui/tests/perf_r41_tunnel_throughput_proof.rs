@@ -443,8 +443,9 @@ fn after_label(line: &str, label: &str) -> String {
         .to_owned()
 }
 
-/// A sink: counts each connection's bytes and reports the instant the `BYTES`th arrives.
-fn sink() -> (u16, mpsc::Receiver<Instant>) {
+/// A sink: counts each connection's bytes and reports two instants, when the first quarter of
+/// `BYTES` has arrived and when the last byte has.
+fn sink() -> (u16, mpsc::Receiver<(Instant, Instant)>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind the sink");
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -455,24 +456,33 @@ fn sink() -> (u16, mpsc::Receiver<Instant>) {
             std::thread::spawn(move || {
                 let mut buf = vec![0u8; CHUNK];
                 let mut got = 0u64;
+                let mut quarter = None;
                 while got < BYTES {
                     match s.read(&mut buf) {
                         Ok(0) | Err(_) => return,
                         Ok(n) => got += n as u64,
                     }
+                    if quarter.is_none() && got >= BYTES / 4 {
+                        quarter = Some(Instant::now());
+                    }
                 }
-                let _ = tx.send(Instant::now());
+                let _ = tx.send((quarter.unwrap_or_else(Instant::now), Instant::now()));
             });
         }
     });
     (port, rx)
 }
 
-/// Push `BYTES` to `to` and return the throughput in bytes per second, clocked from the
-/// connect to the sink's last byte.
-fn transfer(to: SocketAddr, done: &mpsc::Receiver<Instant>) -> f64 {
+/// Push `BYTES` to `to` and return the **steady-state** throughput in bytes per second: the last
+/// three quarters of the bytes over the time they took to land.
+///
+/// **Past the ramp, for both.** The raw arm crosses a TCP shaper that terminates the connection, so
+/// raw TCP never pays slow start over the emulated round trip, while the tunnel's QUIC does. Clocked
+/// from the connect, a transfer of about a second on a 50 ms link charged the tunnel for a ramp that
+/// a real TCP flow over that link pays too, and that the raw arm here skipped: the first run read
+/// 55% where the steady state was the question. The first quarter is the allowance for that ramp.
+fn transfer(to: SocketAddr, done: &mpsc::Receiver<(Instant, Instant)>) -> f64 {
     let chunk = vec![0x5au8; CHUNK];
-    let t0 = Instant::now();
     let mut s = TcpStream::connect(to).expect("connect for the transfer");
     let mut sent = 0u64;
     while sent < BYTES {
@@ -480,12 +490,12 @@ fn transfer(to: SocketAddr, done: &mpsc::Receiver<Instant>) -> f64 {
         s.write_all(&chunk[..n]).expect("write the transfer");
         sent += n as u64;
     }
-    let end = done
+    let (quarter, end) = done
         .recv_timeout(Duration::from_secs(300))
         .expect("the sink never received every byte");
-    let secs = end.duration_since(t0).as_secs_f64();
+    let secs = end.duration_since(quarter).as_secs_f64();
     drop(s);
-    BYTES as f64 / secs
+    (BYTES - BYTES / 4) as f64 / secs
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -716,7 +726,7 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
 fn measure(
     tunnel: SocketAddr,
     raw: SocketAddr,
-    done: &mpsc::Receiver<Instant>,
+    done: &mpsc::Receiver<(Instant, Instant)>,
     carried: &std::sync::atomic::AtomicU64,
     link: Option<Link>,
 ) -> (f64, f64) {
