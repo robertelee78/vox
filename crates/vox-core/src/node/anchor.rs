@@ -452,12 +452,12 @@ impl crate::log::sync::SessionRoom for AnchorSessionRoom<'_> {
         let st = &mut *guard;
         let before = st.heads();
         let resolver = ChannelAuthors::new(st.authors.clone());
-        let stored =
-            crate::log::sync::apply_staged(&mut st.dag, &resolver, &st.admission, &staged)?;
+        // Absorb what was stored, then report the failure: see `ChannelSessionRoom::apply`.
+        let stored = crate::log::sync::apply_staged(&mut st.dag, &resolver, &st.admission, &staged);
         match st.absorb_arrived(self.store, &before) {
             Ok(got) => {
                 self.out.borrow_mut().governance += got.governance;
-                Ok(stored)
+                stored
             }
             Err(e) => {
                 *self.fatal.borrow_mut() = Some(e);
