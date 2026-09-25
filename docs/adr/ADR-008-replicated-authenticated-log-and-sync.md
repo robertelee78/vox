@@ -2,7 +2,7 @@
 
 **Status**: implemented (M5, `crates/vox-core/src/log/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6). 2026-09-24 — PRD-001 R5: a node answers a sync session for a room only from that room's members and anchors (§"Who is served"). 2026-09-24 — PRD-001 R1/R3: the per-author quota is **removed** (wire code `0x06` reserved). See §"Abuse resistance" and the 2026-09-24 Implementation note.
+**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6). 2026-09-24 — PRD-001 R5: a node answers a sync session for a room only from that room's members and anchors (§"Who is served"). 2026-09-24 — PRD-001 R1/R3: the per-author quota is **removed** (wire code `0x06` reserved). See §"Abuse resistance" and the 2026-09-24 Implementation note. 2026-09-24 — PRD-001 D2/R4: a `WANT` is served clamped to what is held, merged, and bounded per session (see the 2026-09-24 Implementation note).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
@@ -114,13 +114,16 @@ frontier, bit 1 = range-reconciliation); both peers use the highest bit both set
   `0x05 NEG {negentropy_msg}` (range-reconciliation payload).
 - **Frontier mode (default; required of every peer).** `HAVE` lists the feeds a peer holds; the receiver
   replies `WANT` with the missing `(author_id, from_seq..to_seq)` ranges; the holder streams `ENTRY`
-  frames (skeleton + any retained payloads) over a reliable QUIC stream (ADR-011).
+  frames (skeleton + any retained payloads) over a reliable QUIC stream (ADR-011). A `WANT` is the
+  peer's to write, so the holder trusts nothing in it for size: each author's ranges are merged and each
+  merged range walks only the entries actually held, and one session serves at most `MAX_SERVE_ENTRIES`
+  (1,024) entries / `MAX_SERVE_BYTES` (64 MiB) within `SERVE_BUDGET` (30 s). That bounds one session,
+  never a history: a requester that applied entries syncs again at once and asks for the rest.
 - **Who is served (normative, PRD-001 R5).** A node serves a room's log only to that room's
   **admitted authors** and to **that room's anchors**. The stream-kind gate (ADR-016) only decides
   whether a peer may open a `sync` stream at all; the room is named afterwards, in the stream's
-  preamble, and must be checked against the peer. *Built so far for sessions the node **answers**; a
-  session the node **starts** — a fresh connection pushes every open room to the peer — is not yet
-  checked and must be.*
+  preamble, and must be checked against the peer. Built for sessions the node **answers** (V29-03) and
+  for sessions it **starts** (V29-04): a fresh connection is pushed only the rooms the peer belongs to.
 - **Range-reconciliation mode (used when both peers set bit 1; the default *above ~100 active authors*,
   where `HAVE` size dominates).** `NEG` frames carry Negentropy range-based set reconciliation over entry
   hashes (logarithmic rounds). The `NEG` body is **Negentropy v1** keyed by the **full 32-byte SHA-256
@@ -369,6 +372,20 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   that the key a newcomer receives sits at the chain's origin and the sender-key chain refuses a gap
   over `MAX_SKIP` (1,000). That belongs to ADR-006 and R12 (per-grant history); the gate above counts
   the newcomer's log for this reason rather than what it renders.
+- **A `WANT` is bounded by what is held (2026-09-24, PRD-001 D2/R4).** `entries_for_wants` looped
+  `from_seq..=to_seq` — one lookup per *number* — collecting into memory with the room's lock held, so
+  `WANT (author, 1, u64::MAX)` from any member spun for ever and nothing else could touch the room. Now
+  each author's ranges are sorted and merged (duplicates and overlaps cost nothing and serve nothing
+  twice), each merged range walks `Feed::range` over the entries actually held, and a session serves at
+  most `MAX_SERVE_ENTRIES` / `MAX_SERVE_BYTES` within `SERVE_BUDGET`, always at least one entry. The
+  continuation is the existing one: a sync that applied entries marks a push, so the requester comes
+  straight back for the rest.
+  **Gate** (`crates/vox-core/tests/a_want_cannot_wedge_a_room.rs`, release, `--ignored`): a real
+  member's identity, over a real connection, sends `WANT` with 1,000 copies of `(victim, 1, u64::MAX)`
+  plus an unheld feed and an inverted range; an ordinary post into the room on the victim completes
+  (6.6, 10.8 and 6.7 ms over three runs) and the attacker receives each of the 50 held entries exactly
+  once. On v0.2.8 (3cac220) the post gets no answer in 5 s in three runs of three; with the old loop
+  restored, the same; with ranges not merged, 1,024 entries are served for 50 held.
 
 ## Links
 **Depends on**: ADR-002, ADR-006.

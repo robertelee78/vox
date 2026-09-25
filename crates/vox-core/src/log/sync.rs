@@ -34,6 +34,18 @@
 //! ([`crate::log::dag::Dag::accept`]): admission, authenticator, feed link, and
 //! fork handling. A peer never trusts an entry merely because it arrived over
 //! sync.
+//!
+//! ## Serving is bounded by what is held, never by what is asked
+//! A `WANT` is the peer's to write, so nothing in it is trusted for size: each
+//! range is clamped to the entries this node actually holds, overlapping and
+//! duplicate ranges are merged so no entry is sent twice, and one session serves
+//! at most [`MAX_SERVE_ENTRIES`] entries / [`MAX_SERVE_BYTES`] bytes within
+//! [`SERVE_BUDGET`]. That is correctness, not a quota (PRD-001 R4): a session that
+//! stops at the bound still sends what it served, the requester applies it, and
+//! because it applied something it syncs again at once and asks for the rest. A
+//! history of any size therefore still catches up — in as many sessions as it
+//! takes — while no single request can hold the room's lock for longer than the
+//! bound.
 
 use std::collections::VecDeque;
 
@@ -59,6 +71,28 @@ use crate::wire::{FrameId, WireError, SYNC_MODE_FRONTIER, SYNC_MODE_RANGE_RECONC
 /// reclaims a circuit on total idle. A per-frame bound alone defends only against a peer that
 /// stops, never against one that drips.
 const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most entries one session serves to a peer's `WANT`.
+///
+/// The session holds the room's lock throughout, so what one peer may ask for is
+/// what every other operation on the room waits behind. This bounds one session,
+/// not a catch-up: the requester applies what it got and, because it applied
+/// something, syncs again at once for the rest (see the module docs). A thousand
+/// entries verify and file in well under the requester's [`DRAIN_BUDGET`].
+pub const MAX_SERVE_ENTRIES: usize = 1024;
+
+/// The most entry bytes one session serves, for the same reason as
+/// [`MAX_SERVE_ENTRIES`]: a single entry may be up to [`MAX_PAYLOAD_LEN`], so a
+/// count alone would still let one `WANT` pull gigabytes into memory. At least one
+/// entry is always served, so an entry larger than this still gets through.
+pub const MAX_SERVE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The serve phase's wall-clock budget. Each frame is bounded by the transport,
+/// but a peer that *reads* one frame every nineteen seconds would otherwise keep
+/// the room's lock for as long as there are entries to send — the drip that
+/// [`DRAIN_BUDGET`] closes on the other direction. Stopping here is not a failure:
+/// what was served is kept, and the requester comes back for the rest.
+pub const SERVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Hard upper bound on an `ENTRY` frame's carried wire bytes, checked **before**
 /// `to_vec` so a hostile frame cannot force a large allocation ahead of
@@ -442,20 +476,67 @@ pub fn wants_for(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
 }
 
 /// Collect the `ENTRY` wire frames satisfying a peer's `WANT` ranges from the
-/// local [`Dag`]. Entries the local peer does not hold are simply omitted.
+/// local [`Dag`], in per-author seq order, up to [`MAX_SERVE_ENTRIES`] /
+/// [`MAX_SERVE_BYTES`].
+///
+/// **The work is bounded by what this node holds, never by the ranges' numbers.**
+/// This used to loop `from_seq..=to_seq` doing one lookup per number, collecting
+/// into memory with the room's lock held, so a single `WANT (author, 1,
+/// u64::MAX)` — any member may send one — pinned a core on a loop that would not
+/// finish in the life of the machine, and nothing else could touch that room
+/// again (PRD-001 D2). Now each author's ranges are merged, so duplicates and
+/// overlaps cost nothing and serve nothing twice, and each merged range walks
+/// only the entries the feed actually has. Entries not held are simply omitted.
 #[must_use]
 pub fn entries_for_wants(dag: &Dag, wants: &[WantRange]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    for w in wants {
-        if let Some(feed) = dag.feed(&w.author_id) {
-            for seq in w.from_seq..=w.to_seq {
-                if let Some(entry) = feed.get(seq) {
-                    out.push(entry.to_wire());
+    let mut bytes = 0usize;
+    for (author, ranges) in merged_wants(wants) {
+        let Some(feed) = dag.feed(&author) else {
+            continue;
+        };
+        for (from, to) in ranges {
+            for entry in feed.range(from, to) {
+                let wire = entry.to_wire();
+                if !out.is_empty()
+                    && (out.len() >= MAX_SERVE_ENTRIES
+                        || bytes.saturating_add(wire.len()) > MAX_SERVE_BYTES)
+                {
+                    return out;
                 }
+                bytes = bytes.saturating_add(wire.len());
+                out.push(wire);
             }
         }
     }
     out
+}
+
+/// A `WANT`'s ranges grouped by author (in author order) with each author's
+/// ranges sorted and merged, so the ranges are disjoint and ascending. Inverted
+/// ranges are dropped. The cost is `O(n log n)` in the number of ranges, which
+/// the frame size already bounds.
+fn merged_wants(wants: &[WantRange]) -> std::collections::BTreeMap<Digest32, Vec<(u64, u64)>> {
+    let mut by_author: std::collections::BTreeMap<Digest32, Vec<(u64, u64)>> =
+        std::collections::BTreeMap::new();
+    for w in wants.iter().filter(|w| w.from_seq <= w.to_seq) {
+        by_author
+            .entry(w.author_id)
+            .or_default()
+            .push((w.from_seq, w.to_seq));
+    }
+    for ranges in by_author.values_mut() {
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for &(from, to) in ranges.iter() {
+            match merged.last_mut() {
+                Some(last) if from <= last.1.saturating_add(1) => last.1 = last.1.max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+        *ranges = merged;
+    }
+    by_author
 }
 
 /// Map a parse/verify [`Error`] to the M0 wire application-error code (ADR-008
@@ -709,7 +790,13 @@ where
     //    `Transport::close` here (that is the hard-fail path); a clean FIN is the
     //    success terminator. The QUIC mapping finishes the send stream; the
     //    in-memory duplex relies on the drain loop observing an empty inbox.
+    //    Bounded in count, bytes and time (see the module docs); stopping at the
+    //    time bound is a clean end, not a failure — the peer keeps what it got.
+    let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
     for wire in entries_for_wants(dag, &their_wants) {
+        if std::time::Instant::now() >= serve_deadline {
+            break;
+        }
         send(t, encode_entry(&wire))?;
     }
     // Signal a clean end-of-stream on our send side (success terminator, not a
