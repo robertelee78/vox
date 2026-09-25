@@ -66,6 +66,17 @@ pub const PROTOCOL_VERSION: u64 = 5;
 /// [`crate::node::content::MAX_TEXT_LEN`] (64 KiB).
 pub const MAX_FRAME: usize = 256 * 1024;
 
+/// What one `Rows` reply may carry, counted as text plus [`ROW_OVERHEAD`] per row.
+/// Half a frame, so an estimate that ran short would still fit.
+pub const ROWS_BUDGET: usize = MAX_FRAME / 2;
+
+/// Everything a row carries besides its text — two 32-byte hashes, a timestamp and the
+/// CBOR around them — rounded up.
+pub const ROW_OVERHEAD: usize = 128;
+
+// A reply always carries at least one row, so the largest row must fit a frame by itself.
+const _: () = assert!(crate::node::content::MAX_TEXT_LEN + ROW_OVERHEAD <= ROWS_BUDGET);
+
 // ---- frame tags ------------------------------------------------------------
 // Node → client.
 const T_HELLO: u64 = 1;
@@ -1466,10 +1477,25 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     }
                 },
             };
-            let mut rows: Vec<MessageRow> =
-                detail.timeline[start.min(detail.timeline.len())..].to_vec();
-            if limit > 0 {
-                rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            // **One reply is bounded by bytes, never the whole room.** A reply was every row
+            // after `since`, in one frame, and the client refuses a frame over `MAX_FRAME`:
+            // so a room past 256 KiB of history could not be read, tailed, posted to with
+            // `--op` or board'ed at all ("declared size exceeds hard limit: ipc frame
+            // length"). A reply now stops at `ROWS_BUDGET`, always carrying at least one
+            // row, and `IpcClient::read_rows` asks again from the last row it got.
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            let mut rows: Vec<MessageRow> = Vec::new();
+            let mut bytes = 0usize;
+            for r in &detail.timeline[start.min(detail.timeline.len())..] {
+                if limit > 0 && rows.len() >= limit {
+                    break;
+                }
+                let cost = r.text.len() + ROW_OVERHEAD;
+                if !rows.is_empty() && bytes + cost > ROWS_BUDGET {
+                    break;
+                }
+                bytes += cost;
+                rows.push(r.clone());
             }
             Frame::Rows { rows }
         }
@@ -1757,6 +1783,42 @@ impl IpcClient {
             return Err(Error::MalformedBundle("ipc closed before reply"));
         };
         Frame::from_bytes(&body)
+    }
+
+    /// Every row after `since`, however many replies that takes — as one
+    /// [`Frame::Rows`], or the first reply that was not rows (an error).
+    ///
+    /// A reply is bounded by bytes (see [`ROWS_BUDGET`]), so a room's history comes in
+    /// pages; this asks again from the last row until a reply is empty.
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn read_rows(
+        &mut self,
+        channel_id: Digest32,
+        since: Option<Digest32>,
+    ) -> Result<Frame> {
+        let mut all = Vec::new();
+        let mut cursor = since;
+        loop {
+            match self
+                .request(&Request::Read {
+                    channel_id,
+                    since: cursor,
+                    limit: 0,
+                })
+                .await?
+            {
+                Frame::Rows { rows } => {
+                    let Some(last) = rows.last() else {
+                        return Ok(Frame::Rows { rows: all });
+                    };
+                    cursor = Some(last.entry_hash);
+                    all.extend(rows);
+                }
+                other => return Ok(other),
+            }
+        }
     }
 
     /// Turn this connection into an event stream. Terminal: no further request

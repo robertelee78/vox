@@ -1763,14 +1763,7 @@ pub async fn get_file(
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
-    let rows = match client
-        .request(&Request::Read {
-            channel_id,
-            since: None,
-            limit: 0,
-        })
-        .await
-    {
+    let rows = match client.read_rows(channel_id, None).await {
         Ok(Frame::Rows { rows }) => rows,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),

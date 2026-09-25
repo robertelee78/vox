@@ -368,26 +368,12 @@ async fn drain(
     crate::wake::register(paths, &input.session_id, &room_key);
 
     let since = load_cursor(paths, &room_key, &input.session_id);
-    let rows = match client
-        .request(&Request::Read {
-            channel_id,
-            since,
-            limit: 0,
-        })
-        .await
-    {
+    let rows = match client.read_rows(channel_id, since).await {
         Ok(Frame::Rows { rows }) => rows,
         // A cursor the node no longer holds — the room was re-opened, or the log
         // was pruned. Start from the beginning rather than failing: the agent
         // seeing a message twice is recoverable, an agent stuck forever is not.
-        Ok(Frame::Error { .. }) => match client
-            .request(&Request::Read {
-                channel_id,
-                since: None,
-                limit: 0,
-            })
-            .await
-        {
+        Ok(Frame::Error { .. }) => match client.read_rows(channel_id, None).await {
             Ok(Frame::Rows { rows }) => rows,
             Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
             Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
