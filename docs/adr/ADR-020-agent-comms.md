@@ -718,6 +718,16 @@ Both unknowns are already spiked; neither remains open.
   auto-consent retried on the tick beside `deliver_owed_rekeys` — consent *is* a network act (the
   SKDM rides a pairwise session), so a trusted member that is offline is skipped and picked up when
   it returns, exactly as a re-key is.
+  > **Off the actor 2026-09-25 (v0.2.9).** No member is dialled on the actor any more, for automatic
+  > work or for a command. Before, every owed consent dialled inline, so `vox trust add` with K trusted
+  > members offline across R rooms froze the whole node for up to K×R×`PER_ATTEMPT_TIMEOUT` (10s).
+  > Now the dial runs in the background and `Dialed` delivers what that member is owed at once; a
+  > command dials immediately rather than after `MEMBER_REDIAL_SECS`, and an explicit `consent` keeps
+  > its reply until the dial's outcome is known, so the person still gets the true answer.
+  > *Measured* through the real binaries (anchor, Alice, and Bob and Carol, who joined three rooms
+  > untrusted and then went offline): `vox trust add` for each took 31s and then 62s before, while a
+  > post from another shell waited 29s and 60s (`busy 61545ms — a client command`); after, 0.29–0.73s,
+  > a concurrent post ≤95ms, and no busy line (2 runs per arm).
   **At rest**: sealed under a key derived from the identity (`vox/trust-keyring-sek/v1`, the same
   shape as an anchor's log key), kept as a ciphertext blob in the store's public `meta` table — which
   stays honest, since ciphertext *is* a public fact. Two intended consequences: a stolen disk yields
