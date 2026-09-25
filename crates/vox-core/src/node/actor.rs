@@ -1612,6 +1612,7 @@ pub struct Node {
         Digest32,
         Digest32,
         crate::node::pairwise_stream::PairwiseFrame,
+        quinn::SendStream,
         quinn::RecvStream,
     )>,
     /// Rooms whose anchor publish found them mid-session: run when that session's `SyncDone`
@@ -2895,8 +2896,8 @@ impl Node {
                     .into_iter()
                     .partition(|(r, ..)| *r == room);
                 self.held_pairwise = kept;
-                for (_, peer, first, recv) in held {
-                    self.handle_pairwise(peer, first, recv).await;
+                for (_, peer, first, send, recv) in held {
+                    self.handle_pairwise(peer, first, send, recv).await;
                 }
                 let _ = reply.send(outcome);
             }
@@ -3116,8 +3117,8 @@ impl Node {
                         // Unreachable: the stream loop turns these into
                         // `NetEvent::JoinRequest` once the request is read.
                     }
-                    Inbound::Pairwise { peer, recv, .. } => {
-                        self.take_inbound_skdm(peer, recv).await;
+                    Inbound::Pairwise { peer, send, recv } => {
+                        self.take_inbound_skdm(peer, send, recv).await;
                     }
                     Inbound::Sync { .. } => {
                         // Unreachable: the stream loop converts these into
@@ -4855,7 +4856,7 @@ impl Node {
     /// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
     fn watch_delivery(
         &self,
-        sent: quinn::SendStream,
+        sent: quinn::RecvStream,
         channel_id: Digest32,
         target: Digest32,
         chain_id: u64,
@@ -4993,7 +4994,12 @@ impl Node {
 
     /// Take an inbound sealed control message: an ADR-006 SKDM, which makes that
     /// author's messages readable and backfills any already held as ciphertext.
-    async fn take_inbound_skdm(&mut self, peer: Digest32, mut recv: quinn::RecvStream) {
+    async fn take_inbound_skdm(
+        &mut self,
+        peer: Digest32,
+        send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+    ) {
         use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
         let Ok(Some(first)) = recv_pairwise(&mut recv).await else {
             return;
@@ -5011,10 +5017,10 @@ impl Node {
         // ran on the actor the stream waited in the queue until the room existed; this puts that
         // ordering back. `JoinerDone` replays whatever was held.
         if self.joining.contains(&room) && !self.channels.contains_key(&room) {
-            self.held_pairwise.push((room, peer, first, recv));
+            self.held_pairwise.push((room, peer, first, send, recv));
             return;
         }
-        self.handle_pairwise(peer, first, recv).await;
+        self.handle_pairwise(peer, first, send, recv).await;
     }
 
     /// Act on a pairwise stream whose first frame has been read.
@@ -5022,8 +5028,42 @@ impl Node {
         &mut self,
         peer: Digest32,
         first: crate::node::pairwise_stream::PairwiseFrame,
+        mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
     ) {
+        // **Taken, or said not to be.** A sender cannot learn from the transport whether its key
+        // was taken: QUIC acknowledges the bytes before this node decides anything. So a stream
+        // that carried a key is answered, one byte once the key is taken, and reset with a wire
+        // code when it is not. A stream that carried no key (a bare hello, an `Open`) is finished.
+        match self.take_pairwise(peer, first, &mut recv).await {
+            Some(true) => {
+                let _ = send
+                    .write_all(&[crate::node::pairwise_stream::KEY_TAKEN])
+                    .await;
+                let _ = send.finish();
+            }
+            Some(false) => {
+                let code = crate::transport::quic::close_code(
+                    crate::wire::WireError::AuthenticatorInvalid,
+                );
+                let _ = send.reset(code);
+                let _ = recv.stop(code);
+            }
+            None => {
+                let _ = send.finish();
+            }
+        }
+    }
+
+    /// Act on a pairwise stream whose first frame has been read: `Some(true)` if it carried a key
+    /// and the key was taken, `Some(false)` if it carried one that was not, `None` if it carried
+    /// none.
+    async fn take_pairwise(
+        &mut self,
+        peer: Digest32,
+        first: crate::node::pairwise_stream::PairwiseFrame,
+        recv: &mut quinn::RecvStream,
+    ) -> Option<bool> {
         use crate::node::pairwise_stream::{open_skdm, recv_pairwise, PairwiseFrame};
         // A `Hello` opens a session the join path never created (ADR-016): accept it
         // against our own prekey ring, exactly as the join responder does, then read
@@ -5040,16 +5080,16 @@ impl Node {
                         let _ = session.decrypt(&message, now);
                     }
                 }
-                return;
+                return None;
             }
             PairwiseFrame::Hello {
                 channel_id,
                 initial,
             } => {
                 if !self.accept_hello(channel_id, peer, &initial).await {
-                    return;
+                    return None;
                 }
-                match recv_pairwise(&mut recv).await {
+                match recv_pairwise(recv).await {
                     Ok(Some(PairwiseFrame::Skdm { channel_id, sealed })) => (channel_id, sealed),
                     Ok(Some(PairwiseFrame::Open { channel_id, sealed })) => {
                         let now = self.now();
@@ -5060,34 +5100,24 @@ impl Node {
                                 let _ = session.decrypt(&message, now);
                             }
                         }
-                        return;
+                        return None;
                     }
                     _ => {
                         // A session with nothing behind it is still progress: the peer
                         // may deliver over it later.
-                        return;
+                        return None;
                     }
                 }
             }
         };
         let now = self.now();
-        // A key this node cannot open is **said**, by stopping the stream with a wire code, rather
-        // than dropped: the sender counts a key it wrote as delivered unless told otherwise, and a
-        // silent drop left the member unable to read with nothing ever re-sent.
-        let refuse = |mut recv: quinn::RecvStream| {
-            let _ = recv.stop(crate::transport::quic::close_code(
-                crate::wire::WireError::AuthenticatorInvalid,
-            ));
-        };
         let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
-            // No session with this peer for that channel: nothing can open it. The
-            // sender retries once a join or key exchange establishes one.
-            refuse(recv);
-            return;
+            // No session with this peer for that channel: nothing can open it. Said, so the
+            // sender sends it again once a join or key exchange establishes one.
+            return Some(false);
         };
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
-            refuse(recv);
-            return;
+            return Some(false);
         };
         let backfilled = match (
             self.profile.as_ref(),
@@ -5100,13 +5130,15 @@ impl Node {
                 .ok(),
             _ => None,
         };
-        if let Some(n) = backfilled {
-            let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
-                channel_id,
-                peer,
-                backfilled: n as u64,
-            });
-        }
+        let Some(n) = backfilled else {
+            return Some(false);
+        };
+        let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
+            channel_id,
+            peer,
+            backfilled: n as u64,
+        });
+        Some(true)
     }
 
     /// Load (or, on first use, generate) the prekey ring for the unlocked
