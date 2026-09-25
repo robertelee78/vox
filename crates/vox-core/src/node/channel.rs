@@ -2706,14 +2706,21 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         // The resolver as it is *now*: an author revoked while this batch was on the wire is not
         // an author of this room any more, and its entries are refused.
         let resolver = ch.resolver();
-        let stored =
-            crate::log::sync::apply_staged(&mut ch.dag, &resolver, &ch.admission, &staged)?;
+        // **Absorb what was stored, then report the failure.** `apply_staged` stores entries one
+        // at a time and stops at the first it refuses; those before it are already in the log.
+        // Returning the refusal first skipped persisting and rendering them, yet the log now held
+        // them, so every later session saw nothing to send and they were never shown: one joiner
+        // read nothing from the host in a room, silently, about one run in four (tworooms.sh). The
+        // refusal was the other joiner's entry, from an author this node had not admitted yet.
+        // `sync_over` always did it in this order ("reconciliation done; only now surface a
+        // session failure"); the per-step path lost it.
+        let stored = crate::log::sync::apply_staged(&mut ch.dag, &resolver, &ch.admission, &staged);
         match ch.absorb_arrived(self.store, &before, self.now_secs) {
             Ok(got) => {
                 let mut out = self.out.borrow_mut();
                 out.rendered += got.rendered;
                 out.governance += got.governance;
-                Ok(stored)
+                stored
             }
             Err(e) => {
                 *self.fatal.borrow_mut() = Some(e);
