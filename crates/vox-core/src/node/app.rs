@@ -711,6 +711,17 @@ impl StreamInner {
     /// Tear the stream down because trust was withdrawn: reset both halves with
     /// [`APP_WITHDRAWN_CODE`], so the peer learns it was a decision and not an ending,
     /// and drop the flow. Once only, whoever notices first.
+    ///
+    /// **Whoever notices first must be the one to do it.** Every call on the stream races
+    /// the same withdrawal the guardian waits for, and a call used to return its error and
+    /// leave the teardown to the guardian. When the caller then dropped the stream — which
+    /// the IPC splice does the moment a call fails — the drop aborted the guardian before
+    /// it ran, and the stream was *finished* rather than reset: the peer read a clean end
+    /// of stream, took it for the other program hanging up, and stayed open waiting for
+    /// input. Measured: 6 runs in 30 of `withdrawing_trust_tears_down_a_live_app_stream`,
+    /// every one with this side cut in ~18 ms, the peer still running 5 s later, and
+    /// `withdrawn: 0`. So every path that observes the withdrawal tears down before it
+    /// returns, and [`AppStream`]'s drop does too if nothing has yet.
     async fn tear_down(&self) {
         if self.withdrawn.swap(true, Ordering::SeqCst) {
             return;
@@ -762,6 +773,21 @@ impl std::fmt::Debug for AppStream {
 impl Drop for AppStream {
     fn drop(&mut self) {
         self.guardian.abort();
+        // Dropped after trust was withdrawn but before anything tore it down: reset now,
+        // or the halves are finished on drop and the peer reads a clean ending.
+        let inner = &self.inner;
+        if !inner.reachers.borrow().contains(&inner.peer)
+            && !inner.withdrawn.swap(true, Ordering::SeqCst)
+        {
+            bump(&inner.hub.counters.withdrawn);
+            let code = quinn::VarInt::from_u32(APP_WITHDRAWN_CODE);
+            if let Ok(mut send) = inner.send.try_lock() {
+                let _ = send.reset(code);
+            }
+            if let Ok(mut recv) = inner.recv.try_lock() {
+                let _ = recv.stop(code);
+            }
+        }
     }
 }
 
@@ -826,15 +852,29 @@ impl AppStream {
     /// If trust was withdrawn on either side, or the stream failed.
     pub async fn read(&self, buf: &mut [u8]) -> Result<Option<usize>> {
         self.check()?;
-        let mut recv = self.inner.recv.lock().await;
-        tokio::select! {
-            r = recv.read(buf) => r.map_err(|e| match e {
-                quinn::ReadError::Reset(code) if code.into_inner() == u64::from(APP_WITHDRAWN_CODE) => {
-                    Error::TunnelRevoked("app: the peer withdrew trust, so the app stream was closed")
+        let read = {
+            let mut recv = self.inner.recv.lock().await;
+            tokio::select! {
+                r = recv.read(buf) => Some(r),
+                () = self.inner.withdrawal() => None,
+            }
+        };
+        match read {
+            Some(r) => r.map_err(|e| match e {
+                quinn::ReadError::Reset(code)
+                    if code.into_inner() == u64::from(APP_WITHDRAWN_CODE) =>
+                {
+                    Error::TunnelRevoked(
+                        "app: the peer withdrew trust, so the app stream was closed",
+                    )
                 }
                 _ => Error::MalformedTunnel("app stream read"),
             }),
-            () = self.inner.withdrawal() => Err(withdrawn_error()),
+            // Torn down here, not left to the guardian: see `StreamInner::tear_down`.
+            None => {
+                self.inner.tear_down().await;
+                Err(withdrawn_error())
+            }
         }
     }
 
@@ -844,10 +884,19 @@ impl AppStream {
     /// If trust was withdrawn, or the stream failed.
     pub async fn write_all(&self, data: &[u8]) -> Result<()> {
         self.check()?;
-        let mut send = self.inner.send.lock().await;
-        tokio::select! {
-            r = send.write_all(data) => r.map_err(|_| Error::MalformedTunnel("app stream write")),
-            () = self.inner.withdrawal() => Err(withdrawn_error()),
+        let wrote = {
+            let mut send = self.inner.send.lock().await;
+            tokio::select! {
+                r = send.write_all(data) => Some(r),
+                () = self.inner.withdrawal() => None,
+            }
+        };
+        match wrote {
+            Some(r) => r.map_err(|_| Error::MalformedTunnel("app stream write")),
+            None => {
+                self.inner.tear_down().await;
+                Err(withdrawn_error())
+            }
         }
     }
 
@@ -874,11 +923,20 @@ impl AppStream {
         if self.check().is_err() {
             return None;
         }
-        let mut flow = self.inner.flow.lock().await;
-        let flow = flow.as_mut()?;
-        tokio::select! {
-            d = flow.recv() => d,
-            () = self.inner.withdrawal() => None,
+        let got = {
+            let mut flow = self.inner.flow.lock().await;
+            let flow = flow.as_mut()?;
+            tokio::select! {
+                d = flow.recv() => Some(d),
+                () = self.inner.withdrawal() => None,
+            }
+        };
+        match got {
+            Some(d) => d,
+            None => {
+                self.inner.tear_down().await;
+                None
+            }
         }
     }
 
