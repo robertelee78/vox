@@ -101,6 +101,9 @@ different content.
 `--op <id>` on every retry of the same operation. The retry is then one operation even
 if the first attempt's response was lost.
 
+If your drain says **"You no longer hold …"**, believe it: your claim lapsed or someone
+else has the item now. Stop work on it, or claim it again if it is free.
+
 Use `--ttl` for anything you might not finish: if you die holding it, the claim lapses
 and the work returns to the pool with nobody having to notice you went. A handoff
 reserves the item for the recipient until its own deadline (`--ttl`, an hour by

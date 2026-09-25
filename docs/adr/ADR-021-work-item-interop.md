@@ -865,6 +865,15 @@ that proves it.**
 
   *Proof*: through the shipped binary, a session whose claim lapses between two drains is told exactly
   once, and a session whose claims did not change is told nothing.
+
+  > **Built on PR #14, 2026-09-25** (proof `claim_lost_proof`, two nodes, the real drain hook). The drain
+  > compares what the session holds now with what it held at its previous drain (recorded next to its
+  > cursor) and says, once: *lapsed*, *now held by `<fp>/<session>`*, or *handed off to …*. A loss the
+  > session caused itself — its own latest operation on the resource is a `release` or `handoff` — is not
+  > reported. Proved: unchanged claims say nothing; a lapse is reported once and not again; a claim bob
+  > re-took names bob; an own release says nothing. Four mutants caught (no report; own release reported;
+  > held set never recorded; every loss called a lapse). **Not proved:** the *handed off* wording — no
+  > proof yet hands a claim away from a session that did not do it itself.
 - **M21.10 — a `result` warns about unread addressed messages.** Decided 2026-09-24, not built. A
   redirect addressed to a session can arrive after its last drain and before it reports. `vox room post
   --type result` **MUST** still post, and **MUST** print to the caller every message addressed to that
