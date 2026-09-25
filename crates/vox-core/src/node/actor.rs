@@ -127,6 +127,16 @@ const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 /// `Node::view_of`.
 const VIEW_LOCK_PATIENCE: Duration = Duration::from_millis(250);
 
+/// A room's summary for the view, from its state.
+fn summary_of(ch: &ChannelState) -> ChannelSummary {
+    ChannelSummary {
+        channel_id: ch.channel_id(),
+        local_name: Some(ch.local_name().to_owned()),
+        open: true,
+        entries: ch.entry_count() as u64,
+    }
+}
+
 /// A room's detail for the view, from its state.
 fn detail_of(ch: &ChannelState) -> ChannelDetail {
     ChannelDetail {
@@ -1736,12 +1746,12 @@ pub struct Node {
     pending_consents: Vec<(Digest32, Digest32, oneshot::Sender<Outcome>, u8)>,
     /// Consecutive failed sessions per `(room, peer)`; see `MAX_PUSH_RETRIES`.
     push_failures: BTreeMap<(Digest32, Digest32), u32>,
-    /// Each room's view detail as this node's own latest write left it, taken under the room's lock
+    /// Each room's view summary and detail as this node's own latest write left them, taken under the room's lock
     /// by the write itself. `view_of` uses it when a session holds the room, so a person always sees
     /// their own post in what they read straight after, however long that session holds on. A room's
     /// entry is removed once a view reads the room under its lock, since that read includes the
     /// write: an entry here is therefore always newer than the published one.
-    fresh_details: BTreeMap<Digest32, ChannelDetail>,
+    fresh_details: BTreeMap<Digest32, (ChannelSummary, ChannelDetail)>,
     /// Peers that were skipped behind a busy room or had a push re-owed: served first on the next
     /// pass, so a peer that always takes the room cannot always go first.
     owed_first: std::collections::BTreeSet<Digest32>,
@@ -6352,7 +6362,8 @@ impl Node {
         // append is still reported as the success it was.
         let rotated =
             ch.should_rotate_sender(now) && ch.rotate_sender(profile.store(), now).is_ok();
-        self.fresh_details.insert(*channel_id, detail_of(&ch));
+        self.fresh_details
+            .insert(*channel_id, (summary_of(&ch), detail_of(&ch)));
         drop(ch);
         let channel_id = *channel_id;
         let _ = self.event_tx.send(NodeEvent::NewEntry {
@@ -6485,29 +6496,25 @@ impl Node {
         let mut mlock_active = true;
         for (id, shared) in &self.channels {
             let Some(ch) = by(deadline, shared).await else {
-                // The detail taken under this room's lock by this node's own latest write, if any, is
-                // newer than the one last published (see `fresh_details`): a person reads their own
-                // post (read-your-writes).
-                let newest = self
-                    .fresh_details
-                    .get(id)
-                    .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id));
-                if let Some(d) = newest {
-                    open_channels.push(d.clone());
+                // The summary and detail taken under this room's lock by this node's own latest write,
+                // if any, are newer than the ones last published (see `fresh_details`): a person reads
+                // their own post (read-your-writes), and the room's entry count agrees with it.
+                match self.fresh_details.get(id) {
+                    Some((summary, detail)) => {
+                        summaries.insert(*id, summary.clone());
+                        open_channels.push(detail.clone());
+                    }
+                    None => {
+                        if let Some(d) = prev.open_channels.iter().find(|d| d.channel_id == *id) {
+                            open_channels.push(d.clone());
+                        }
+                    }
                 }
                 mlock_active &= prev.mlock_active;
                 continue;
             };
             read.insert(*id);
-            summaries.insert(
-                *id,
-                ChannelSummary {
-                    channel_id: *id,
-                    local_name: Some(ch.local_name().to_owned()),
-                    open: true,
-                    entries: ch.entry_count() as u64,
-                },
-            );
+            summaries.insert(*id, summary_of(&ch));
             mlock_active &= ch.mlock_active();
             open_channels.push(detail_of(&ch));
         }
