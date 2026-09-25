@@ -79,10 +79,21 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 }
 
 fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
+    daemon_on(dir, tag, stdin_lines, "127.0.0.1:0")
+}
+
+/// A free loopback UDP port, so a node can come back on the address its peers know.
+fn free_port() -> String {
+    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    format!("127.0.0.1:{}", s.local_addr().unwrap().port())
+}
+
+/// [`daemon`] listening on `listen`.
+fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
     let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
     let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
     let mut child = Command::new(VOX)
-        .args(["daemon", "--listen", "127.0.0.1:0"])
+        .args(["daemon", "--listen", listen])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_ROOM")
@@ -327,9 +338,11 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     let (bob, alice) = pair(tmp.path());
     // Alice's node keeps a minute, whatever the room says.
     std::fs::write(alice.join("cfg").join("retention"), "default 60\n").unwrap();
-    let bob_d = daemon(&bob, "bob", &format!("{IDENTITY}\n"));
+    // Fixed addresses, so both can be restarted and still find each other below.
+    let (bob_at, alice_at) = (free_port(), free_port());
+    let bob_d = daemon_on(&bob, "bob", &format!("{IDENTITY}\n"), &bob_at);
     attached(&bob, "bob");
-    let alice_d = daemon(&alice, "alice", &format!("{IDENTITY}\n"));
+    let alice_d = daemon_on(&alice, "alice", &format!("{IDENTITY}\n"), &alice_at);
     attached(&alice, "alice");
     let room = room(&bob, &alice);
     let (ok, out, err) = vox(&bob, &["room", "retention", &room, "1w"], None);
@@ -357,16 +370,90 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     );
 
     // ---- a late arrival of what is already expired here never shows ---------------------
+    //
+    // Measured on alice's own event stream, not only by polling `vox room read`: a render the
+    // next sweep takes back is visible to a poll for under a second, which a poll can miss, but
+    // the node announces every row a sync renders (`Synced { rendered }`) and that cannot be
+    // taken back. So bob is down while alice comes back, the test subscribes to alice's
+    // control socket, and only then does bob return and deliver.
     drop(alice_d);
     for i in 1..=5 {
         post(&bob, &room, &format!("late {i}"));
     }
+    drop(bob_d);
     std::thread::sleep(Duration::from_secs(65));
-    let _alice_d = daemon(&alice, "alice-2", &format!("{IDENTITY}\n{ROOMPASS}\n"));
+    let _alice_d = daemon_on(
+        &alice,
+        "alice-2",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &alice_at,
+    );
     attached(&alice, "alice");
+    // **The node's own retention is in force from the moment the room opens**, before any tick
+    // or session can reach it: the first reading `vox status` can give is already 60 s. Left
+    // to the sweep, a room a session got to first was judged by the room's week alone.
+    let first = {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (ok, out, _) = vox(&alice, &["status", "--json"], None);
+            let v: serde_json::Value = if ok {
+                serde_json::from_str(&out).unwrap_or_default()
+            } else {
+                serde_json::Value::Null
+            };
+            if let Some(r) = v["rooms"][0]["retention"].as_u64() {
+                break r;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "alice's status never named a retention"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    println!("alice reopened: the first retention her status reports is {first} s");
+    assert_eq!(
+        first, 60,
+        "a reopened room must carry the node's own retention from the start, not the room's"
+    );
+    let sock = vox_core::node::paths::Paths::resolve(
+        "default",
+        Some(alice.as_path()),
+        Some(&alice.join("cfg")),
+    )
+    .unwrap()
+    .socket_file();
+    let rendered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    {
+        let rendered = std::sync::Arc::clone(&rendered);
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut client = vox_core::node::ipc::IpcClient::open(&sock).await.unwrap();
+                client.subscribe().await.unwrap();
+                let _ = ready_tx.send(());
+                while let Ok(Some(frame)) = client.next().await {
+                    if let vox_core::node::ipc::Frame::Event(
+                        vox_core::node::api::NodeEvent::Synced { rendered: n, .. },
+                    ) = frame
+                    {
+                        rendered.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            });
+        });
+    }
+    ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("subscribed to alice's events");
+    let _bob_d = daemon_on(&bob, "bob-2", &format!("{IDENTITY}\n{ROOMPASS}\n"), &bob_at);
+    attached(&bob, "bob");
     post(&bob, &room, "fresh");
     // `fresh` follows the five in bob's feed, so once alice shows it she holds all of them.
-    // Polled as tightly as the CLI allows, so a render that a later sweep took back is seen.
     let deadline = Instant::now() + Duration::from_secs(90);
     let (mut polls, mut late_seen) = (0usize, 0usize);
     let mut fresh = false;
@@ -376,14 +463,20 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
         late_seen = late_seen.max(count(&t, "late "));
         fresh = t.iter().any(|x| x == "fresh");
     }
+    std::thread::sleep(Duration::from_secs(2)); // let the last event land
+    let announced = rendered.load(std::sync::atomic::Ordering::SeqCst);
     println!(
         "alice: `fresh` shown {fresh}; the 5 late ones shown at most {late_seen} times over \
-         {polls} reads"
+         {polls} reads; rows her syncs announced as rendered: {announced} (only `fresh` may be)"
     );
     assert!(fresh, "alice never caught up with bob's feed");
     assert_eq!(
         late_seen, 0,
         "a message that arrives already expired must never be shown"
     );
-    drop(bob_d);
+    assert_eq!(
+        announced, 1,
+        "a message that arrives already expired must never be rendered: alice's syncs rendered \
+         {announced} rows where only `fresh` was live"
+    );
 }
