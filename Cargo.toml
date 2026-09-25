@@ -137,6 +137,17 @@ sha1 = { version = "0.11", default-features = false }
 redb = "4.3"
 # Temp directories for store/vault tests only (pure Rust).
 tempfile = "3.27"
+# --- Terminal proofs (test-only) -----------------------------------------------
+# A proof that reads what the TUI draws must run the shipped binary on a real terminal.
+# `portable-pty` (wezterm's) opens the pty, makes it the child's controlling terminal and
+# sets its size — the three things crossterm needs to enter raw mode and lay out a frame.
+# `vt100` replays the child's output into a screen grid, because ratatui redraws only the
+# cells that changed: the bytes on the wire never hold "(1 unread)" as one string, the
+# screen does. 0.15, not 0.16: ratatui pins `unicode-width = 0.2.0` and vt100 0.16 needs
+# 0.2.1+, while 0.15 uses the 0.1 line the tree already carries. Both are
+# dev-dependencies of `vox-tui` only; neither ships.
+portable-pty = "0.9"
+vt100 = "0.15"
 
 # --- Rust TUI client (ADR-015, M12) ------------------------------------------
 # Pure-Rust terminal stack; keeps the static-musl generate path clean (ADR-015).

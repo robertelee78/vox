@@ -59,3 +59,7 @@ rustix.workspace = true
 # (`tests/support/vnet.rs`), which is written against quinn's socket traits. Same
 # workspace pin as vox-core, so it is the same quinn.
 quinn.workspace = true
+# Driving the TUI on a real terminal (the unread-badge proof): a pty, and a screen grid to
+# replay its output into. The workspace manifest says why each version.
+portable-pty.workspace = true
+vt100.workspace = true
