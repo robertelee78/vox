@@ -2984,6 +2984,17 @@ impl Node {
                 for (_, peer, first, send, recv) in held {
                     self.handle_pairwise(peer, first, send, recv).await;
                 }
+                // **The joiner's consent at admission too, before `room join` is answered.** The same
+                // ForwardOnly window f4d13d8 closed on the host's side (see `apply_join_outcome`) was
+                // open on this side: a joiner that already trusted the host released its key on its
+                // next tick, from the chain's position *then*, so a post made the moment the join
+                // returned was sealed before the released key and unreadable to the host for good.
+                // Measured through `trust_before_join_proof`: the joiner posted at +0ms and consented
+                // at +743ms; `alice reads bob = false`, 3 runs of 3. Released here, the key goes out
+                // before the person hears the join succeeded, so it covers everything they post next.
+                if outcome.is_done() {
+                    self.deliver_owed_consents(None).await;
+                }
                 // The view first, then the answer: whoever hears `Done` reads the view next, and a
                 // room that is joined but not yet in it reads as a join that did nothing.
                 self.publish().await;
@@ -3199,6 +3210,23 @@ impl Node {
                         self.note_local_append(&channel_id);
                         self.refresh_reachers().await;
                         self.publish_channel_to_anchors(&channel_id).await;
+                    }
+                    // **A newcomer this session admitted is consented to now, not on the tick.** Two
+                    // members who joined the same room learn of each other only here, from the board.
+                    // Under ForwardOnly a post sealed before the author consents to a reader is never
+                    // readable to it, so every tick of delay is a window of posts lost to the
+                    // newcomer. Measured in room_of_three_keys_proof: the joiners' keys to each other
+                    // landed 388ms and 846ms after their posts. This shrinks the window; it cannot
+                    // close it, since nobody can consent to a member it has not yet heard of.
+                    if !self.trust.is_empty() {
+                        let trusted = self.trust.trusted();
+                        let owes = match self.channels.get(&channel_id).map(Arc::clone) {
+                            Some(shared) => !shared.lock().await.owed_consents(&trusted).is_empty(),
+                            None => false,
+                        };
+                        if owes {
+                            self.deliver_owed_consents(None).await;
+                        }
                     }
                     if o.rendered > 0 || o.governance > 0 {
                         let _ = self.event_tx.send(NodeEvent::Synced {
