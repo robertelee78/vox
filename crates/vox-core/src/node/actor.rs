@@ -126,10 +126,11 @@ const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
 /// How long a delivered sender key may go unanswered before it is counted as not taken and sent
 /// again. See `pairwise_stream::refused`.
 const KEY_DELIVERY_PATIENCE: Duration = Duration::from_secs(30);
-/// How many failed sessions in a row a `(room, peer)` push is retried on the next tick before it is
-/// left to the periodic interval. Enough to ride out a collision (both sides pushing at once); few
-/// enough that a peer whose sessions always fail cannot hold the room.
-const MAX_PUSH_RETRIES: u32 = 3;
+/// The longest a failed `(room, peer)` push waits before its next try; see the `SyncDone` handler.
+/// Long enough that a peer whose sessions always fail (an anchor keeping no log for the room) costs
+/// one session every few seconds, not a stream; far shorter than the 30s interval it used to fall
+/// back to.
+const MAX_PUSH_RETRY_WAIT: Duration = Duration::from_secs(8);
 
 /// How often a peer reached over a relay is retried for a direct path.
 ///
@@ -1709,7 +1710,7 @@ pub struct Node {
     /// far, so one that cannot succeed is answered rather than kept. The person gets the real
     /// outcome and the node keeps answering meanwhile.
     pending_consents: Vec<(Digest32, Digest32, oneshot::Sender<Outcome>, u8)>,
-    /// Consecutive failed sessions per `(room, peer)`; see `MAX_PUSH_RETRIES`.
+    /// Consecutive failed sessions per `(room, peer)`; see the `SyncDone` handler.
     push_failures: BTreeMap<(Digest32, Digest32), u32>,
     /// Peers that were skipped behind a busy room or had a push re-owed: served first on the next
     /// pass, so a peer that always takes the room cannot always go first.
@@ -3327,26 +3328,41 @@ impl Node {
                 // every tick, sorted ahead of the member it shared the room with, took the room each
                 // pass, and the member's owed push lost every round: the independent verdict
                 // measured 2–3 relayed runs in 10 losing a message for 120s (vox-bc, #41). Now the
-                // retry goes to the peer that failed, at most `MAX_PUSH_RETRIES` times running; past
-                // that the pair waits for the periodic interval like any other.
+                // retry goes to the peer that failed, with a wait that grows each time (below), so a
+                // peer that always fails costs a session every few seconds and never holds the room.
                 //
                 // **After a short random wait, not the next tick.** The commonest failure is a
                 // collision: both ends push on the same event, each refuses the other because its
                 // own session for the room is running, and both fail. Retried on the tick, the two
                 // retries landed together again and a message took up to a second (median 364–531ms
                 // in 3 of 10 relayed runs, measured). A random 20–100ms wait desynchronises them.
+                // **Backed off, desynchronised, and never handed to the 30s tick.** A retry capped at
+                // three and then left to the periodic interval lost messages for up to 30s whenever
+                // both ends kept colliding: the V29-06 verdict caught alice and bob refusing each
+                // other six times in ~200ms, because their 20–100ms random waits kept landing within
+                // 0–8ms of each other, and then a message sat 29.7s. Now the wait doubles from 25ms up
+                // to `MAX_PUSH_RETRY_WAIT`, and the two ends draw from **disjoint** ranges by
+                // fingerprint order (the lower waits [w/2, w), the higher [w, 2w)), so two nodes that
+                // collided once cannot keep colliding in lockstep.
                 if outcome.is_err() {
                     let failures = self.push_failures.entry((channel_id, peer)).or_insert(0);
                     *failures = failures.saturating_add(1);
-                    if *failures <= MAX_PUSH_RETRIES {
-                        let jitter = crate::identity::rng::random_array::<1>().map_or(0, |b| b[0]);
-                        let wait = Duration::from_millis(20 + u64::from(jitter) * 80 / 255);
-                        let tx = self.net_tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(wait).await;
-                            let _ = tx.send(NetEvent::PushRetry { channel_id, peer }).await;
-                        });
-                    }
+                    let base_ms = (25u64 << (*failures - 1).min(9))
+                        .min(u64::try_from(MAX_PUSH_RETRY_WAIT.as_millis()).unwrap_or(8_000) / 2);
+                    let jitter = crate::identity::rng::random_array::<2>()
+                        .map_or(0, |b| u64::from(u16::from_le_bytes(b)));
+                    let lower = self.net.as_ref().is_some_and(|n| n.local_id() < peer);
+                    let (from, span) = if lower {
+                        (base_ms / 2, base_ms / 2)
+                    } else {
+                        (base_ms, base_ms)
+                    };
+                    let wait = Duration::from_millis(from + jitter % span.max(1));
+                    let tx = self.net_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(wait).await;
+                        let _ = tx.send(NetEvent::PushRetry { channel_id, peer }).await;
+                    });
                 } else {
                     self.push_failures.remove(&(channel_id, peer));
                 }
