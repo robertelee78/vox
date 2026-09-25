@@ -1614,10 +1614,12 @@ pub struct Node {
     push_now: bool,
     /// When a background dial to each member was last started: see `reach_member`.
     member_dialed_at: BTreeMap<Digest32, u64>,
-    /// Explicit consents waiting for a member's dial: answered on `Dialed` (by delivering) or
-    /// `ReachFailed` (as `Unreachable`), so the person gets the real outcome and the node keeps
-    /// answering meanwhile.
-    pending_consents: Vec<(Digest32, Digest32, oneshot::Sender<Outcome>)>,
+    /// Explicit consents waiting on the network: for a member's dial (answered on `Dialed` by
+    /// delivering, or on `ReachFailed` as `Unreachable`), or for that member's bundle record to
+    /// reach this node's board (retried on the room's `SyncDone`). Each carries its attempts so
+    /// far, so one that cannot succeed is answered rather than kept. The person gets the real
+    /// outcome and the node keeps answering meanwhile.
+    pending_consents: Vec<(Digest32, Digest32, oneshot::Sender<Outcome>, u8)>,
     /// Consecutive failed sessions per `(room, peer)`; see `MAX_PUSH_RETRIES`.
     push_failures: BTreeMap<(Digest32, Digest32), u32>,
     /// Peers that were skipped behind a busy room or had a push re-owed: served first on the next
@@ -1862,13 +1864,8 @@ impl Node {
                     // started lands: see `pending_consents`.
                     if let NodeCommand::Consent { channel_id, target } = command {
                         let outcome = self.consent(&channel_id, target, true).await;
-                        if matches!(outcome, Outcome::Failed(Fault::Unreachable))
-                            && self.net.as_ref().is_some_and(|n| n.manager().existing(&target).is_none())
-                        {
-                            self.pending_consents.push((channel_id, target, reply));
-                        } else {
-                            let _ = reply.send(outcome);
-                        }
+                        self.settle_consent(channel_id, target, reply, outcome, 0)
+                            .await;
                         self.note_if_stalled(name, started);
                         self.publish().await;
                         self.push_if_owed().await;
@@ -2870,7 +2867,8 @@ impl Node {
                 }
                 // Whatever this member is owed goes out now that it can be reached, rather than on
                 // the next tick: a dial `reach_member` started was started for exactly this.
-                self.answer_pending_consents(peer, None).await;
+                self.answer_pending_consents(|_, target| *target == peer, None)
+                    .await;
                 self.deliver_owed_rekeys().await;
                 self.deliver_owed_consents(None).await;
             }
@@ -2982,8 +2980,11 @@ impl Node {
                 }
             }
             NetEvent::ReachFailed { peer, why } => {
-                self.answer_pending_consents(peer, Some(Outcome::Failed(Fault::Unreachable)))
-                    .await;
+                self.answer_pending_consents(
+                    |_, target| *target == peer,
+                    Some(Outcome::Failed(Fault::Unreachable)),
+                )
+                .await;
                 let _ = self.event_tx.send(NodeEvent::PeerUnreachable { peer, why });
             }
             NetEvent::UpgradeFailed { peer, reason } => {
@@ -3026,6 +3027,8 @@ impl Node {
                 outcome,
             } => {
                 self.syncing.remove(&channel_id);
+                self.answer_pending_consents(|room, _| *room == channel_id, None)
+                    .await;
                 // **A session that failed delivered nothing, so its push is owed again.**
                 // `run_due_syncs` counts a push as done when the session *starts*, which is the
                 // only thing it can know then; a session the peer refused — because its own
@@ -3928,28 +3931,91 @@ impl Node {
         Outcome::Done
     }
 
-    /// Answer the explicit consents that were waiting on a dial to `peer`: with `outcome` when the
-    /// dial failed, otherwise by delivering now that a connection exists.
-    async fn answer_pending_consents(&mut self, peer: Digest32, outcome: Option<Outcome>) {
+    /// Decide what an explicit consent's `outcome` means for the person waiting on it.
+    ///
+    /// `Unreachable` has two causes. With no connection to the member, `reach_member` has started
+    /// a dial, so the consent waits for `Dialed` or `ReachFailed`. With a connection but no pairwise
+    /// session, the member's bundle record is not on this node's board yet: a node that has just
+    /// started holds only what its first sessions bring in. V29-19 measured this through the real
+    /// `vox tui`: a consent to a member who was online failed at once, in 0.75s, with
+    /// `no reachable peer`, at 0, 3, 6 and 10s after the room opened, and succeeded from 15s. So a
+    /// sync with that member is started, since that is what fetches its records, and the consent
+    /// is retried when the room's session is done.
+    async fn settle_consent(
+        &mut self,
+        channel_id: Digest32,
+        target: Digest32,
+        reply: oneshot::Sender<Outcome>,
+        outcome: Outcome,
+        attempts: u8,
+    ) {
+        const MAX_CONSENT_ATTEMPTS: u8 = 3;
+        if !matches!(outcome, Outcome::Failed(Fault::Unreachable))
+            || attempts >= MAX_CONSENT_ATTEMPTS
+        {
+            let _ = reply.send(outcome);
+            return;
+        }
+        let connected = self
+            .net
+            .as_ref()
+            .is_some_and(|n| n.manager().existing(&target).is_some());
+        if connected {
+            // Started or not (the room may be mid-session with somebody else), the retry rides the
+            // room's next `SyncDone`.
+            let _ = self.sync_one(&channel_id, target).await;
+            if !self.syncing.contains(&channel_id) {
+                let _ = reply.send(outcome);
+                return;
+            }
+        } else if attempts > 0 {
+            // A dial already landed once for this consent and the connection is gone again.
+            let _ = reply.send(outcome);
+            return;
+        }
+        self.pending_consents
+            .push((channel_id, target, reply, attempts.saturating_add(1)));
+    }
+
+    /// Retry the explicit consents `matches` selects (`Dialed` passes its peer, `SyncDone` its
+    /// room), or answer them all with `failed` (`ReachFailed`).
+    async fn answer_pending_consents(
+        &mut self,
+        matches: impl Fn(&Digest32, &Digest32) -> bool,
+        failed: Option<Outcome>,
+    ) {
         let (waiting, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_consents)
             .into_iter()
-            .partition(|(_, target, _)| *target == peer);
+            .partition(|(room, target, _, _)| matches(room, target));
         self.pending_consents = rest;
-        let mut answers = Vec::with_capacity(waiting.len());
-        for (channel_id, target, reply) in waiting {
-            let answer = match &outcome {
-                Some(o) => *o,
-                None => self.consent(&channel_id, target, false).await,
-            };
-            answers.push((reply, answer));
+        if waiting.is_empty() {
+            return;
         }
-        // The view first, then the answer, as for a deferred create or join.
-        if !answers.is_empty() {
-            self.publish().await;
+        for (channel_id, target, reply, attempts) in waiting {
+            match failed {
+                Some(o) => {
+                    let _ = reply.send(o);
+                }
+                None => {
+                    // Still waiting on its dial: that is `Dialed`'s or `ReachFailed`'s to answer, not
+                    // a session with somebody else that happened to finish first.
+                    let connected = self
+                        .net
+                        .as_ref()
+                        .is_some_and(|n| n.manager().existing(&target).is_some());
+                    if !connected {
+                        self.pending_consents
+                            .push((channel_id, target, reply, attempts));
+                        continue;
+                    }
+                    let outcome = self.consent(&channel_id, target, false).await;
+                    self.settle_consent(channel_id, target, reply, outcome, attempts)
+                        .await;
+                }
+            }
         }
-        for (reply, answer) in answers {
-            let _ = reply.send(answer);
-        }
+        // The view reflects whatever was granted before anyone reads it.
+        self.publish().await;
     }
 
     /// Consent to `target` reading this identity's messages — ADR-007 step 3, the

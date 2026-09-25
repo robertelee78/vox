@@ -728,6 +728,11 @@ Both unknowns are already spiked; neither remains open.
   > untrusted and then went offline): `vox trust add` for each took 31s and then 62s before, while a
   > post from another shell waited 29s and 60s (`busy 61545ms — a client command`); after, 0.29–0.73s,
   > a concurrent post ≤95ms, and no busy line (2 runs per arm).
+  > An explicit consent to a member whose bundle record is not yet on this node's board (a node that
+  > has just started holds only what its first sessions bring in) starts a sync with that member,
+  > which fetches it, and is retried when the room's session ends, up to three times (V29-19). Through
+  > the real `vox tui`, a consent to an online member right after start went from `no reachable peer`
+  > in 0.75s to granted in 0.76–0.80s, 5 runs of 5. An offline member still gets `no reachable peer`.
   **At rest**: sealed under a key derived from the identity (`vox/trust-keyring-sek/v1`, the same
   shape as an anchor's log key), kept as a ciphertext blob in the store's public `meta` table — which
   stays honest, since ciphertext *is* a public fact. Two intended consequences: a stolen disk yields
