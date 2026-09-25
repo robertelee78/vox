@@ -961,6 +961,14 @@ Both unknowns are already spiked; neither remains open.
   verb and flag the shipped agent skill (`vox agent skill`) names **MUST** exist in the CLI, checked by a
   gate that turns red when the skill names one that does not. (Orca keeps its agent guide honest this
   way.)
+
+  > **Built on PR #14, 2026-09-25** (gate `skill_cli_proof`, not `#[ignore]`d — it runs in 0.3 s with every
+  > `cargo test`). It reads the skill from the shipped binary (`vox agent skill`), extracts every `vox …`
+  > command from fenced blocks and inline code spans (13 commands, 12 verb paths) and every bare
+  > `` `--flag` `` (5), and asks the binary: each verb path must answer `--help`, each flag written with a
+  > command must be in that command's help as a whole flag (`--to` is not satisfied by `--to-session`),
+  > and each bare flag must exist on one of the skill's verbs. Four planted faults caught: a misspelled
+  > flag, a missing verb, an invented bare flag, a truncated flag (`--o` for `--out`).
 - **M19.11 — Codex runs the drain hook without the operator trusting it by hand.** Decided 2026-09-24,
   not built. Codex runs a `hooks.json` entry only once its hash is trusted. Vox installs the entry but
   grants no trust, so the Codex drain works only where the operator trusted it by hand. Vox **MUST**
