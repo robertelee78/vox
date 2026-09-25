@@ -1217,6 +1217,9 @@ impl Joiner {
                     }
                 ));
             }
+            // Before the exchange: its key comes back the moment it admits us (see
+            // `PeerClass::JoinResponder`).
+            self.net.policy().expect_join_responder(responder);
             let conn = if board.peer_id() == responder {
                 Arc::clone(&board)
             } else {
@@ -2746,12 +2749,15 @@ impl Node {
         for anchor in &self.anchor_ids {
             policy.add_anchor(*anchor);
         }
-        // Replacing wholesale would drop the pending joiners the actor is expecting,
-        // so they are carried over.
+        // Replacing wholesale would drop the pending joiners the actor is expecting, and the
+        // responders a join in flight is waiting on, so both are carried over.
         let previous = net.policy().snapshot();
         net.policy().replace(policy);
         for joiner in previous.pending_joiners() {
             net.policy().expect_joiner(joiner);
+        }
+        for responder in previous.join_responders() {
+            net.policy().expect_join_responder(responder);
         }
     }
 
@@ -2864,6 +2870,11 @@ impl Node {
                 // Whatever arrived for this room while it was being joined, in arrival order — into
                 // the room if the join made one, or discarded as before if it did not.
                 self.joining.remove(&room);
+                if self.joining.is_empty() {
+                    if let Some(net) = self.net.as_ref() {
+                        net.policy().forget_join_responders();
+                    }
+                }
                 let (held, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_pairwise)
                     .into_iter()
                     .partition(|(r, ..)| *r == room);
