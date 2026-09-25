@@ -260,12 +260,27 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
     tui.expect("that it unlocked", 90, |t| t.contains("unlocked"));
 
     // ---- rooms, made over the TUI's own control socket ----
-    until(
-        &alice_dir,
-        "alice's daemon to answer",
-        &["room", "list"],
-        |_| true,
-    );
+    // alice's daemon answers only once it has unlocked and bound its socket. The wait must see
+    // `room list` *succeed*: an `until` that accepts any output returned on the first try, and
+    // under load the `room create` below then met "no node is running".
+    {
+        let started = Instant::now();
+        loop {
+            let (ok, _, err) = vox(&alice_dir, &["room", "list"], None);
+            if ok {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(90),
+                "alice's daemon never answered: {err}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        eprintln!(
+            "[receipt] alice's daemon answered after {} ms",
+            started.elapsed().as_millis()
+        );
+    }
     let (ok, _, err) = vox(
         &alice_dir,
         &["room", "create", "--name", "mission"],
