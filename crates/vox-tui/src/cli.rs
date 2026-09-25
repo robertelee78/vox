@@ -253,12 +253,38 @@ fn label_of(spec: &str) -> String {
     vox_core::tunnel::udp::service_label(spec).unwrap_or_else(|| spec.to_owned())
 }
 
+/// Run a verb that attaches to the node already holding the profile.
+fn run_attached<Fut>(body: Fut) -> ExitCode
+where
+    Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
+{
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(body) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("vox: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Whether a node is already serving this profile, so a trust verb should ask it.
 fn trust_over_socket(sub: &TrustCmd) -> bool {
     let profile = match sub {
         TrustCmd::List(a) => &a.profile,
         TrustCmd::Add(a) => &a.profile,
         TrustCmd::Remove(a) => &a.profile,
+        TrustCmd::Rename(a) => &a.profile,
     };
     let Ok(paths) = profile.paths() else {
         return false;
@@ -286,6 +312,11 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             a.identity_passphrase_file.clone(),
         ),
         TrustCmd::Remove(a) => (
+            a.profile.clone(),
+            a.identity_passphrase.clone(),
+            a.identity_passphrase_file.clone(),
+        ),
+        TrustCmd::Rename(a) => (
             a.profile.clone(),
             a.identity_passphrase.clone(),
             a.identity_passphrase_file.clone(),
@@ -327,6 +358,9 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             TrustCmd::Remove(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
                 crate::room_cli::trust_remove(&paths, target, &identity).await
+            }
+            TrustCmd::Rename(a) => {
+                crate::room_cli::trust_rename(&paths, &a.fingerprint, &a.name, &identity).await
             }
         }
     });
@@ -966,6 +1000,27 @@ enum TrustCmd {
     /// reading what comes next, everywhere (ADR-017 M17.14). It keeps what it already
     /// read; that cannot be taken back.
     Remove(TrustRemoveArgs),
+    /// Change the name this node calls a trusted identity. The name is what
+    /// `<name>.<room>.vox` reaches (PRD-001 R20); it is local to this machine and never
+    /// leaves it. Grants nothing: only an identity already trusted can be renamed.
+    Rename(TrustRenameArgs),
+}
+
+/// `vox trust rename`
+#[derive(Args, Debug, Clone)]
+pub struct TrustRenameArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The trusted identity (base32, or a unique prefix).
+    pub fingerprint: String,
+    /// Its new name.
+    pub name: String,
+    /// **Refused.** Use `--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the prompt.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line).
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox trust add`
@@ -1102,7 +1157,20 @@ pub struct ConnectArgs {
 #[derive(Args, Debug, Clone)]
 pub struct UpArgs {
     #[command(flatten)]
-    pub room: RoomArgs,
+    pub profile: ProfileArgs,
+    /// One room to open and carry, with its passphrase. Omitted, the proxy runs inside
+    /// the node already holding this profile (`vox daemon`) and carries every room it
+    /// holds: `ssh nas.family.vox` for any node you trust, in any room (PRD-001 R20).
+    pub room: Option<String>,
+    /// The room's passphrase, when a room is named. Prompted for when omitted.
+    #[arg(long, env = "VOX_ROOM_PASSPHRASE")]
+    pub passphrase: Option<String>,
+    /// **Refused.** Use `--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the prompt.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line).
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
     /// Where the proxy listens. Loopback only, and a port above 1024 — nothing here needs
     /// privilege.
     #[arg(long, default_value = "127.0.0.1:1080")]
@@ -1862,6 +1930,17 @@ pub fn run() -> ExitCode {
                 },
             )
         }
+        Cmd::Trust(TrustCmd::Rename(args)) => {
+            let a = args.clone();
+            run_new_room_verb(
+                args.profile.clone(),
+                args.identity_passphrase.clone(),
+                args.identity_passphrase_file.clone(),
+                move |node, _anchors| async move {
+                    crate::tunnel_cli::trust_rename(&node, &a.fingerprint, &a.name).await
+                },
+            )
+        }
         Cmd::Trust(TrustCmd::Remove(args)) => {
             let a = args.clone();
             run_new_room_verb(
@@ -1875,7 +1954,25 @@ pub fn run() -> ExitCode {
         }
         Cmd::Up(args) => {
             let bind = args.bind;
-            run_tunnel_verb(args.room.clone(), move |node, cid| async move {
+            let Some(room) = args.room.clone() else {
+                // Every room, from the node already running this profile.
+                let paths = match args.profile.paths() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("vox: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                return run_attached(async move { crate::tunnel_cli::up_all(&paths, bind).await });
+            };
+            let room = RoomArgs {
+                profile: args.profile.clone(),
+                room,
+                passphrase: args.passphrase.clone(),
+                identity_passphrase: args.identity_passphrase.clone(),
+                identity_passphrase_file: args.identity_passphrase_file.clone(),
+            };
+            run_tunnel_verb(room, move |node, cid| async move {
                 crate::tunnel_cli::up(&node, cid, bind).await
             })
         }
@@ -1885,6 +1982,25 @@ pub fn run() -> ExitCode {
             // name gives both the room and its host (the genesis creator, ADR-017), so the
             // positionals shift left by one.
             let mut room = args.room.clone();
+            // `<node>.<room>.vox`: a name in this machine's own words, resolved by the node
+            // already holding the profile, which carries the forward (PRD-001 R20).
+            let name = room.room.trim().to_ascii_lowercase();
+            if name
+                .strip_suffix(".vox")
+                .is_some_and(|labels| labels.contains('.'))
+            {
+                let paths = match room.profile.paths() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("vox: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let (service, local) = (label_of(&args.host), args.tag.clone());
+                return run_attached(async move {
+                    crate::tunnel_cli::forward_named(&paths, &name, &service, &local).await
+                });
+            }
             let (host, tag, local) = if room.room.trim().ends_with(".vox") {
                 let cid = match vox_core::node::link::channel_of_hostname(&room.room) {
                     Ok(c) => c,

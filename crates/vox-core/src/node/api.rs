@@ -282,6 +282,14 @@ pub enum NodeCommand {
         /// What this node will call it. Local; nothing is registered.
         petname: String,
     },
+    /// Rename an identity already trusted, keeping its history grant (PRD-001 R12). Fails
+    /// with [`Fault::NotConsented`] for an identity that is not trusted.
+    Rename {
+        /// The trusted identity.
+        fingerprint: Digest32,
+        /// Its new petname.
+        petname: String,
+    },
     /// [`NodeCommand::Trust`], choosing what each consent releases of **this node's own**
     /// messages (PRD-001 R12): [`HistoryGrant::Now`](crate::node::trust::HistoryGrant),
     /// the default, or `Full` — every generation of this node's sender key still held,

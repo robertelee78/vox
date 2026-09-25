@@ -2158,6 +2158,54 @@ pub async fn trust_add(
     }
 }
 
+/// `vox trust rename`, asked of the running node: only an identity already trusted.
+pub async fn trust_rename(
+    paths: &Paths,
+    fingerprint: &str,
+    name: &str,
+    identity_passphrase: &str,
+) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let entries = match client
+        .request(&Request::TrustList {
+            identity_passphrase: identity_passphrase.to_owned(),
+        })
+        .await
+    {
+        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let ids: Vec<Digest32> = entries.iter().map(|(id, _)| *id).collect();
+    let target = resolve_prefix(fingerprint, &ids).map_err(|_| {
+        AppError::Usage(format!(
+            "no trusted identity matches {fingerprint:?}, so there is nothing to rename — \
+             `vox trust add` it first"
+        ))
+    })?;
+    match client
+        .request(&Request::Rename {
+            target,
+            petname: name.to_owned(),
+            identity_passphrase: identity_passphrase.to_owned(),
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!(
+                "vox: {} is now {name:?} — reachable as {}.<room>.vox",
+                short(&target),
+                vox_core::node::resolver::label_of(name)
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
 /// `vox trust remove`, asked of the running node.
 pub async fn trust_remove(
     paths: &Paths,

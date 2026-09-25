@@ -40,7 +40,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
-use crate::node::resolver::VoxResolver;
+use crate::node::resolver::{ServiceRoom, VoxResolver};
 use crate::transport::quic::VoxConnection;
 use crate::tunnel::socks::{self, Command, Reply, Target};
 
@@ -75,18 +75,34 @@ pub trait HostDialer: Send + Sync {
     ) -> impl core::future::Future<Output = Result<Arc<VoxConnection>>> + Send;
 }
 
+/// How the proxy turns a `.vox` name into a room and a member.
+///
+/// Asked per connection, like [`HostDialer`], so a room joined or a node renamed after the
+/// proxy came up is resolvable at once. A fixed [`VoxResolver`] answers from its snapshot;
+/// the node answers from its current rooms and keyring.
+pub trait Names: Send + Sync {
+    /// The room and member `name` leads to, or a sentence saying why it leads nowhere.
+    fn lookup(
+        &self,
+        name: &str,
+    ) -> impl core::future::Future<Output = std::result::Result<ServiceRoom, String>> + Send;
+}
+
+impl Names for VoxResolver {
+    async fn lookup(&self, name: &str) -> std::result::Result<ServiceRoom, String> {
+        VoxResolver::lookup(self, name)
+    }
+}
+
 /// Serve SOCKS5 on `bind` until the task is dropped.
 ///
 /// Loopback only, and enforced: this proxy carries traffic into rooms this machine is a
 /// member of, so exposing it to the network would hand that membership to anyone who can
 /// reach the port.
-pub async fn serve<D>(
-    listener: TcpListener,
-    resolver: Arc<VoxResolver>,
-    dialer: Arc<D>,
-) -> Result<()>
+pub async fn serve<D, N>(listener: TcpListener, resolver: Arc<N>, dialer: Arc<D>) -> Result<()>
 where
     D: HostDialer + 'static,
+    N: Names + 'static,
 {
     let flows = Arc::new(crate::tunnel::udp::UdpFlows::default());
     serve_reporting(listener, resolver, dialer, flows, |_, _| {}, |_| {}).await
@@ -108,9 +124,9 @@ where
 ///
 /// `flows` is the node's UDP flow table: `UDP ASSOCIATE` flows count against it like any
 /// other (ADR-022 decision 6).
-pub async fn serve_reporting<D, R, F>(
+pub async fn serve_reporting<D, N, R, F>(
     listener: TcpListener,
-    resolver: Arc<VoxResolver>,
+    resolver: Arc<N>,
     dialer: Arc<D>,
     flows: Arc<crate::tunnel::udp::UdpFlows>,
     withdrawn: R,
@@ -118,6 +134,7 @@ pub async fn serve_reporting<D, R, F>(
 ) -> Result<()>
 where
     D: HostDialer + 'static,
+    N: Names + 'static,
     R: Fn(&Digest32, u16) + Send + Sync + 'static,
     F: Fn(&str) + Send + Sync + 'static,
 {
@@ -309,9 +326,9 @@ const UNSPECIFIED: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// Negotiate, resolve, and carry one SOCKS5 connection.
-async fn handle<D, R, F>(
+async fn handle<D, N, R, F>(
     mut stream: TcpStream,
-    resolver: Arc<VoxResolver>,
+    resolver: Arc<N>,
     dialer: Arc<D>,
     flows: Arc<crate::tunnel::udp::UdpFlows>,
     withdrawn: &R,
@@ -319,6 +336,7 @@ async fn handle<D, R, F>(
 ) -> Result<()>
 where
     D: HostDialer + 'static,
+    N: Names + 'static,
     R: Fn(&Digest32, u16),
     F: Fn(&str) + Send + Sync + 'static,
 {
@@ -341,12 +359,16 @@ where
             ));
         }
     };
-    let Some(room) = resolver.resolve(&name).copied() else {
-        // A room this machine has not joined, or not a `.vox` name at all. One uniform
-        // refusal for both: which of the two it was is not the proxy's to disclose.
-        refused(&format!("no room on this machine answers to {name}"));
-        socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
-        return Err(Error::MalformedTunnel("no such .vox name on this machine"));
+    let room = match resolver.lookup(&name).await {
+        Ok(room) => room,
+        Err(why) => {
+            // Said to this machine's operator only, and only about this machine's own
+            // names: which part of the name matched nothing, or matched too much. The
+            // SOCKS client gets the one code.
+            refused(&why);
+            socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
+            return Err(Error::MalformedTunnel("no such .vox name on this machine"));
+        }
     };
     // **Reply only once the host has answered** (PRD-001 R23). This used to say
     // "succeeded" before dialling, on the belief that the host waits for the client's
@@ -414,15 +436,16 @@ pub fn ssh_config_hint(bind: SocketAddr) -> String {
 ///   and the port its first datagram came from. Anything else on loopback is ignored.
 /// - **The association dies with `control`**: when it closes, every flow is dropped, which
 ///   ends each flow's stream at the host.
-async fn associate<D, F>(
+async fn associate<D, N, F>(
     mut control: TcpStream,
-    resolver: Arc<VoxResolver>,
+    resolver: Arc<N>,
     dialer: Arc<D>,
     flows: Arc<crate::tunnel::udp::UdpFlows>,
     refused: Arc<F>,
 ) -> Result<()>
 where
     D: HostDialer + 'static,
+    N: Names + 'static,
     F: Fn(&str) + Send + Sync + 'static,
 {
     use crate::tunnel::udp;
@@ -481,9 +504,12 @@ where
                     dests.remove(&key);
                 }
                 if !dests.contains_key(&key) {
-                    let Some(room) = resolver.resolve(&name).copied() else {
-                        refused(&format!("no room on this machine answers to {name}"));
-                        continue;
+                    let room = match resolver.lookup(&name).await {
+                        Ok(room) => room,
+                        Err(why) => {
+                            refused(&why);
+                            continue;
+                        }
                     };
                     let label = format!("udp/{port}");
                     let Some(guard) = flows.admit(room.host, &label) else { continue };

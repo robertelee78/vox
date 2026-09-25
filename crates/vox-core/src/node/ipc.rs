@@ -171,6 +171,8 @@ const T_RETENTION: u64 = 23;
 // (PRD-001 R13), readable or not. What "the same order on every node" is checked
 // against, because a node's timeline shows only the rows it holds keys for.
 const T_ORDER: u64 = 24;
+// Renaming a trusted identity keeps its history grant (PRD-001 R12, R20's `vox name`).
+const T_RENAME: u64 = 25;
 
 /// What a client sends.
 ///
@@ -307,6 +309,17 @@ pub enum Request {
         /// The identity passphrase.
         identity_passphrase: String,
     },
+    /// Rename an identity already in the trust keyring, keeping what its consents release
+    /// (the history grant, PRD-001 R12). Requires the identity passphrase. A rename through
+    /// `Trust` would reset a full-history grant to from-now-on as a side effect.
+    Rename {
+        /// Who to rename, as a full fingerprint.
+        target: Digest32,
+        /// The new petname.
+        petname: String,
+        /// The identity passphrase, proving this is the operator and not an agent.
+        identity_passphrase: String,
+    },
     /// Read the trust keyring. Requires the identity passphrase.
     TrustList {
         /// The identity passphrase.
@@ -419,6 +432,17 @@ impl Request {
                     e.uint(1);
                 }
             }
+            Request::Rename {
+                target,
+                petname,
+                identity_passphrase,
+            } => {
+                e.array(4)
+                    .uint(T_RENAME)
+                    .bytes(target)
+                    .text(petname)
+                    .text(identity_passphrase);
+            }
             Request::SetRetention {
                 channel_id,
                 ttl,
@@ -527,6 +551,18 @@ impl Request {
                     petname,
                     identity_passphrase,
                     full_history,
+                })
+            }
+            (T_RENAME, 4) => {
+                let target = digest(&mut d)?;
+                let petname = text(&mut d, "ipc petname")?;
+                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Rename {
+                    target,
+                    petname,
+                    identity_passphrase,
                 })
             }
             (T_RETENTION, 4) => {
@@ -1438,6 +1474,13 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         let Some(body) = read_frame(&mut stream).await? else {
             return Ok(());
         };
+        // PRD-001 R20: resolving a `.vox` name serves on; `vox up` holds the connection.
+        if let Some(req) = crate::node::nameipc::NameRequest::parse(&body) {
+            if crate::node::nameipc::serve(&mut stream, &handle, req).await? {
+                continue;
+            }
+            return Ok(());
+        }
         // PRD-001 R35: `vox status`. Answered, and the connection serves on.
         if crate::node::status::is_request(&body) {
             crate::node::status::serve(&mut stream, &handle).await?;
@@ -1577,6 +1620,25 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             Ok(()) => match handle
                 .apply(crate::node::api::NodeCommand::Untrust {
                     fingerprint: target,
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: other.to_string(),
+                },
+            },
+        },
+        Request::Rename {
+            target,
+            petname,
+            identity_passphrase,
+        } => match verify_operator(handle, identity_passphrase).await {
+            Err(f) => f,
+            Ok(()) => match handle
+                .apply(crate::node::api::NodeCommand::Rename {
+                    fingerprint: target,
+                    petname,
                 })
                 .await
             {
