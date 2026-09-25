@@ -980,8 +980,11 @@ Both unknowns are already spiked; neither remains open.
   > installed codex-cli 0.157.0 in an isolated `CODEX_HOME`, read back through Codex's own `hooks/list`).
   > It starts a short-lived `codex app-server` over stdio, lists hooks, and writes `trusted_hash =
   > currentHash` for every **Vox** entry that is not `trusted` — another tool's entry is left alone.
-  > **"Vox's entry" is an exact grammar**, not a substring: `vox` (or an absolute path to `…/vox`), `agent
-  > hook`, and only that command's own flags with plain values; no shell metacharacter. Codex runs a
+  > **"Vox's entry" is an exact grammar**, not a substring: bare `vox` or the canonical path of **this**
+  > `vox` binary (not merely a path ending in `/vox`), then `agent hook`, then only `--room`, `--session`,
+  > `--profile` (plain values) and `--format`; no shell metacharacter. `--data-dir`/`--config-dir` are
+  > refused — they would let a tampered entry aim the hook at another profile's rooms — and the plugin
+  > never emits them. Codex runs a
   > hook's command through a shell, so trusting `curl … | sh; vox agent hook` would authorise it to run
   > every turn — the first version did exactly that and was **rejected in independent review**
   > (agent_comms, 2026-09-25). A trusted entry tampered into anything else lists `modified` and is not
@@ -991,8 +994,10 @@ Both unknowns are already spiked; neither remains open.
   > untrusted; a second run changes `config.toml` not at all; a changed entry reads `modified` and is
   > re-trusted; with no Vox entry the command fails and says why; five hostile look-alikes (pipe, `;`,
   > `$(…)`, another binary, an unknown flag) stay untrusted; a trusted entry tampered into a hostile
-  > command stays `modified`. Mutants caught: never writes; substring match (the original defect); any
-  > executable; unknown flags; unchecked values; `modified` counted as trusted. **Not proved:** that a trusted hook then fires in a
+  > command stays `modified`; a real file at `…/evil/vox` stays untrusted, and a trusted entry retargeted
+  > from this `vox` to it stays `modified`. Rejected twice in independent review (substring match; then
+  > any `…/vox` path and the directory flags) before this form. Mutants caught: never writes; substring
+  > match; any path ending `/vox`; directory flags allowed; unknown flags; unchecked values. **Not proved:** that a trusted hook then fires in a
   > live Codex turn — that needs a model login in the isolated home, and the proof does not take the
   > operator's credentials. `vox agent plugin codex` now says to run it.
 - **M19.12 — the Codex mid-turn claim is corrected.** Decided 2026-09-24; **text corrected 2026-09-25** in

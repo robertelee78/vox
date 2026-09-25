@@ -54,6 +54,7 @@ const HOSTILE: &[&str] = &[
     "vox agent hook --room $(id)",
     "/tmp/evil/notvox agent hook",
     "vox agent hook --format text --exec payload",
+    "vox agent hook --data-dir /tmp/attacker-profile",
 ];
 
 /// `command -> trustStatus`, asked of Codex's own app-server, independently of vox.
@@ -139,7 +140,17 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     const HOOK: &str = "vox agent hook";
 
     // ---- (1) before: both untrusted ----
-    let mut all = vec![HOOK];
+    // A real file named `vox` that is not this vox: a path ending in `/vox` is not enough.
+    let evil_dir = tmp.path().join("evil");
+    std::fs::create_dir_all(&evil_dir).unwrap();
+    std::fs::write(evil_dir.join("vox"), "#!/bin/sh\necho pwned\n").unwrap();
+    let evil = format!("{}/vox agent hook", evil_dir.display());
+    // And the absolute path of THIS vox, which is Vox's own entry.
+    let own_abs = format!(
+        "{} agent hook --room abcdef",
+        std::fs::canonicalize(VOX).unwrap().display()
+    );
+    let mut all: Vec<&str> = vec![HOOK, &own_abs, &evil];
     all.extend_from_slice(HOSTILE);
     write_hooks(home, &all);
     assert_eq!(status_of(home, HOOK), "untrusted");
@@ -147,7 +158,17 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
 
     // ---- (2) vox trusts its own entry, and only its own ----
     let (ok, said) = vox_trust(home);
-    assert!(ok && said.contains("1 newly trusted"), "{said}");
+    assert!(ok && said.contains("2 newly trusted"), "{said}");
+    assert_eq!(
+        status_of(home, &own_abs),
+        "trusted",
+        "the absolute path of this very vox is Vox's own entry"
+    );
+    assert_eq!(
+        status_of(home, &evil),
+        "untrusted",
+        "a different program at a path ending in /vox must never be trusted"
+    );
     assert!(
         said.contains("trusted \"vox agent hook\""),
         "the operator must be shown exactly what was trusted: {said}"
@@ -205,6 +226,24 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
         status_of(home, tampered),
         "modified",
         "a tampered entry must not be re-trusted: {said}"
+    );
+
+    // ---- (6c) a trusted absolute entry retargeted to another `…/vox` stays untrusted ----
+    write_hooks(home, &[&own_abs]);
+    let (ok, said) = vox_trust(home);
+    assert!(ok, "{said}");
+    assert_eq!(status_of(home, &own_abs), "trusted");
+    write_hooks(home, &[&evil]);
+    assert_eq!(
+        status_of(home, &evil),
+        "modified",
+        "Codex must list the retargeted entry as modified, or this step proves nothing"
+    );
+    let _ = vox_trust(home);
+    assert_eq!(
+        status_of(home, &evil),
+        "modified",
+        "an entry retargeted from this vox to another program must not be re-trusted"
     );
 
     // ---- (5) no Vox entry: a failure that says why ----
