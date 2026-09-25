@@ -359,10 +359,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   replaces the held connection, and the displaced one is **retired**, not closed: kept open for
   `RETIRE_GRACE_SECS` (60 s) so whatever is in flight on it — a join exchange, a sync session with its
   20 s frame bound — finishes, then closed by the node's tick. A worse newcomer is closed as before, which
-  is also what settles a simultaneous dial. *(Amended 2026-09-24, PRD-001 R24: a direct newcomer from a
-  **different direct address** than the held direct connection also replaces it, because the peer moved —
-  restarted, or changed path — and the held one is the stale one. A simultaneous dial arrives from the
-  same address and is settled as before. See ADR-013 "Tunnel honesty".)* Both ends apply the same rule, so the upgrade lands with no
+  is also what settles a simultaneous dial. Both ends apply the same rule, so the upgrade lands with no
   protocol: the side that punched files the direct connection as an improvement, and the side that
   accepted it does too. A circuit attempt abandoned because another rung won tears itself down on drop
   (its driver is aborted, the port detaches, the stream closes, and the relay and the far side let go).

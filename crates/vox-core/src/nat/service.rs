@@ -133,12 +133,19 @@ pub enum RejectReason {
     NotMember = 1,
     /// The record did not parse or verify (bad tag body, signature, binding).
     Malformed = 2,
-    /// Replay, refresh too fast, zero/over-long TTL, expired or future-dated.
+    /// Zero/over-long TTL, expired or future-dated.
     Policy = 3,
     /// The `(channelID, epoch)` bucket is full.
     Capacity = 4,
     /// The frame's struct tag is not a rendezvous record kind.
     UnknownKind = 5,
+    /// The board already holds a **newer** record from that author (a non-advancing `seq` or
+    /// `timestamp`). Its own code because it means opposite things by whose record it is: for a
+    /// record a node mirrors on another member's behalf it is benign — somebody got there first
+    /// with fresher news — and for the node's *own* record it means the board has something newer
+    /// from us than we do, which is real. Folded into `Policy` the two could not be told apart, and
+    /// every stale mirror was reported to the person as a refusal.
+    Stale = 6,
 }
 
 impl RejectReason {
@@ -149,6 +156,7 @@ impl RejectReason {
             3 => Some(Self::Policy),
             4 => Some(Self::Capacity),
             5 => Some(Self::UnknownKind),
+            6 => Some(Self::Stale),
             _ => None,
         }
     }
@@ -163,6 +171,7 @@ impl RejectReason {
             Self::Policy => "rejected: policy",
             Self::Capacity => "rejected: capacity",
             Self::UnknownKind => "rejected: unknown record kind",
+            Self::Stale => "rejected: the board holds a newer record from that author",
         }
     }
 
@@ -171,6 +180,7 @@ impl RejectReason {
         match err {
             Error::RendezvousRejected("author is not a channel member") => Self::NotMember,
             Error::RendezvousRejected(s) if s.ends_with("at capacity") => Self::Capacity,
+            Error::RendezvousRejected(s) if s.starts_with("non-increasing") => Self::Stale,
             Error::RendezvousRejected(_) => Self::Policy,
             _ => Self::Malformed,
         }

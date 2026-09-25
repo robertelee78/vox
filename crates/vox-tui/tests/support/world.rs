@@ -384,9 +384,6 @@ pub fn lossy_proxy(
     (addr, dropped, knob)
 }
 
-/// The host's handshake bound (`HANDSHAKE_TIMEOUT`, 30 s) with a margin. See [`World::new`].
-pub const ACCEPT_WINDOW: Duration = Duration::from_secs(35);
-
 /// One host, one anchor, one guest who has joined the host's `vox serve` room.
 pub struct World {
     pub tmp: tempfile::TempDir,
@@ -558,14 +555,6 @@ impl World {
         };
         let (ok, _, out, err) = w.join(&w.guest_dir);
         assert!(ok, "vox connect failed.\nstdout:\n{out}\nstderr:\n{err}");
-        // **Wait out the host's accept window before anything dials it.** While the node's
-        // accept loop awaits each handshake inline (PRD-001 D8, owned on
-        // `fix/accept-loop-split`), the one-shot `vox connect` above leaves the host deaf to
-        // everybody for up to its 30 s handshake bound, and a dialer that retries inside that
-        // window keeps it deaf: measured, a `vox up` never reached a host that was up for
-        // 300 s. That is D8's to prove and fix, not these proofs', so they step around it —
-        // and this wait is to be removed once the accept loop is split.
-        std::thread::sleep(ACCEPT_WINDOW);
         w
     }
 

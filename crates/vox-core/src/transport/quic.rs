@@ -144,6 +144,11 @@ impl Admission {
 /// and a keep-alive keeps the path warm underneath it.
 const MAX_IDLE_MS: u32 = 60_000;
 
+/// How long opening a stream may wait for the peer to grant one. Stream credit on a live
+/// connection is immediate; the only thing this waits for is a peer that is not granting it, so
+/// it is sized like a frame read (`SYNC_FRAME_TIMEOUT`, 20s) rather than a handshake.
+const OPEN_STREAM_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// How often a silent connection sends a keep-alive.
 ///
 /// Comfortably under half [`MAX_IDLE_MS`], so a single lost keep-alive cannot expire the
@@ -178,7 +183,6 @@ const MAX_UDP_PAYLOAD: u16 = 8_192;
 /// 3 of 3 runs (`black_holes_detected` 1–9); with them, 0 black holes in 3 of 3.
 /// The OS may grant less; that is not an error.
 const UDP_SOCKET_BUFFER: usize = 4 << 20;
-
 
 /// The endpoint parameters every Vox endpoint runs with.
 fn endpoint_config() -> quinn::EndpointConfig {
@@ -662,11 +666,23 @@ impl VoxConnection {
     }
 
     /// Open a fresh outbound bidirectional stream for a logical flow.
+    ///
+    /// **Bounded, and reported as the peer being gone.** `open_bi` waits for stream credit, and
+    /// it waits indefinitely: a peer that stops granting credit — or a connection one end has
+    /// retired while the other still holds it — parked the caller for good with no error, and a
+    /// sync session parked there holds its room. And a connection that had closed came back as
+    /// `MalformedBundle("quic open_bi")`, which nothing maps, so it reached a person as
+    /// `Failed(Internal)`: a join whose stream opened on a retired connection said "internal
+    /// error" rather than "unreachable". Both failures are the same fact — this peer is not there
+    /// on this connection — and now say so.
     pub async fn open_stream(&self) -> Result<(SendStream, RecvStream)> {
-        self.connection
-            .open_bi()
-            .await
-            .map_err(|_| Error::MalformedBundle("quic open_bi"))
+        match tokio::time::timeout(OPEN_STREAM_PATIENCE, self.connection.open_bi()).await {
+            Ok(Ok(pair)) => Ok(pair),
+            Ok(Err(_)) => Err(Error::Unreachable("quic stream: the connection is closed")),
+            Err(_) => Err(Error::Unreachable(
+                "quic stream: the peer granted no stream in time",
+            )),
+        }
     }
 
     /// Accept the next inbound bidirectional stream the peer opened.
@@ -674,7 +690,7 @@ impl VoxConnection {
         self.connection
             .accept_bi()
             .await
-            .map_err(|_| Error::MalformedBundle("quic accept_bi"))
+            .map_err(|_| Error::Unreachable("quic stream: the connection is closed"))
     }
 
     /// Bind a datagram flow to the bidirectional stream `send`/`recv` (ADR-022
