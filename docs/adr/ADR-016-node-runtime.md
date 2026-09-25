@@ -283,6 +283,15 @@ Two supporting facts follow from moving it:
   pass, green at **32.09s**, one full interval late. Pass/fail could not tell those two apart; the
   latency could.
 
+  **Owed is per `(room, peer)` (2026-09-25, v0.2.9).** The session mark stays per room, for the reason
+  above. What a push *owes* is per pair: the node records which peers each room's latest append has
+  reached. The next append clears the room's record, and a failed push clears that peer. Before, a room
+  still owed to one peer was pushed again to every peer, so a member who already had it took the room
+  again. With two shared rooms that became a livelock: each `SyncDone` freed one room, the member who
+  sorted first took it back, and the other member never got a session. `node_m19_untrust_lock_gate` on
+  the v0.2.9 integration tree failed 0 of 2 (Alice ran ~40,000 empty sessions with Carol in two
+  minutes; Bob ran none). With the fix it passed 3 of 3 in 10–12s.
+
   Still open: the member→anchor session in that gate fails every time (`sync failed: transport`),
   in greens as well as reds; and opening a stream has no deadline.
 
