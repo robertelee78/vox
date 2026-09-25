@@ -61,6 +61,9 @@ pub enum PeerClass {
     /// An identity this node is currently expecting a join from (its pre-join
     /// record was accepted, or a link names it).
     PendingJoiner,
+    /// A member this node is joining a room *through* right now. It sends its sender key the
+    /// moment it admits us, before this node holds the room or knows it as a member.
+    JoinResponder,
     /// Authenticated, but otherwise unknown to us.
     Unknown,
 }
@@ -73,6 +76,7 @@ pub struct PeerPolicy {
     members: HashSet<Digest32>,
     anchors: HashSet<Digest32>,
     pending_joiners: HashSet<Digest32>,
+    join_responders: HashSet<Digest32>,
 }
 
 impl PeerPolicy {
@@ -102,6 +106,23 @@ impl PeerPolicy {
         self.pending_joiners.remove(joiner)
     }
 
+    /// Accept a join responder's sender key while this node joins through it (until
+    /// [`PeerPolicy::forget_join_responders`]).
+    pub fn expect_join_responder(&mut self, responder: Digest32) {
+        self.join_responders.insert(responder);
+    }
+
+    /// No join is in flight any more: its responders are members now, or were never admitted.
+    pub fn forget_join_responders(&mut self) {
+        self.join_responders.clear();
+    }
+
+    /// The members this node is joining through right now.
+    #[must_use]
+    pub fn join_responders(&self) -> Vec<Digest32> {
+        self.join_responders.iter().copied().collect()
+    }
+
     /// Classify a peer. Membership wins over every other class: a member that is
     /// also an anchor or a pending joiner is a member.
     #[must_use]
@@ -112,6 +133,8 @@ impl PeerPolicy {
             PeerClass::Anchor
         } else if self.pending_joiners.contains(peer) {
             PeerClass::PendingJoiner
+        } else if self.join_responders.contains(peer) {
+            PeerClass::JoinResponder
         } else {
             PeerClass::Unknown
         }
@@ -168,6 +191,18 @@ impl PeerPolicy {
                     | StreamKind::Coord
                     | StreamKind::Circuit
             ),
+            // **Its sender key, and nothing an unknown peer could not already open.** The responder
+            // releases its key the moment it admits us, which is before this node holds the room
+            // or knows the responder as a member. Judged as `Unknown`, that pairwise stream was
+            // refused at accept — `stream refused: peer may not open this stream kind` — while
+            // the responder counted the write as delivered and never sent it again. So a trusted
+            // member could never read the first room it joined: measured through the real
+            // binaries, both members had nothing in the first of two rooms after 90s, 3 runs of 3,
+            // while the second room — joined when the responder was already a member — worked.
+            PeerClass::JoinResponder => matches!(
+                kind,
+                StreamKind::Pairwise | StreamKind::Rendezvous | StreamKind::Coord
+            ),
             // An unknown peer reaches the board — and the coord stream, where the only
             // verb open to it is `WHOAMI`, whose answer is its own address (enforced in
             // `node::coordstream`). A NATed client cannot learn its reflexive address
@@ -187,6 +222,7 @@ impl PeerPolicy {
             .iter()
             .chain(self.anchors.iter())
             .chain(self.pending_joiners.iter())
+            .chain(self.join_responders.iter())
             .copied()
             .collect();
         Admission::Pinned(known)

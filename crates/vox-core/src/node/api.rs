@@ -491,6 +491,17 @@ pub enum NodeEvent {
         /// The joiner's verified identity fingerprint.
         peer: Digest32,
     },
+    /// A sender key this node delivered was not taken by `peer`, so it is owed again and
+    /// re-sent on the tick. Said rather than hidden: a member who never gets the key cannot
+    /// read, and the cause is on the recipient's side.
+    KeyNotTaken {
+        /// The channel.
+        channel_id: Digest32,
+        /// The member it was for.
+        peer: Digest32,
+        /// What the recipient's side said.
+        why: String,
+    },
     /// A peer's sender key arrived, so that peer's messages become readable. Any
     /// message already held as ciphertext was backfilled.
     SenderKeyReceived {

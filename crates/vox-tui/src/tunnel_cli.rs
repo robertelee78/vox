@@ -690,6 +690,17 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
                 short(channel_id)
             );
         }
+        NodeEvent::KeyNotTaken {
+            channel_id,
+            peer,
+            why,
+        } => {
+            eprintln!(
+                "vox: {} did not take our key for room {} — {why}; it is sent again",
+                short(peer),
+                short(channel_id)
+            );
+        }
         NodeEvent::StillRelayed { peer, reason } => {
             eprintln!("vox: still relayed to {} — {reason}", short(peer));
         }

@@ -100,6 +100,16 @@ impl SharedPolicy {
         lock(&self.inner).forget_joiner(joiner)
     }
 
+    /// Accept `responder`'s sender key while this node joins through it.
+    pub fn expect_join_responder(&self, responder: Digest32) {
+        lock(&self.inner).expect_join_responder(responder);
+    }
+
+    /// No join is in flight: stop treating anyone as a join responder.
+    pub fn forget_join_responders(&self) {
+        lock(&self.inner).forget_join_responders();
+    }
+
     /// A snapshot to authorize one stream against.
     #[must_use]
     pub fn snapshot(&self) -> PeerPolicy {

@@ -193,8 +193,8 @@ pub async fn deliver_skdm(
     session: &mut Session,
     skdm: &Skdm,
     hello: Option<&InitialMessage>,
-) -> Result<()> {
-    let (mut send, _recv) = open_typed(conn, StreamKind::Pairwise).await?;
+) -> Result<quinn::RecvStream> {
+    let (mut send, recv) = open_typed(conn, StreamKind::Pairwise).await?;
     if let Some(initial) = hello {
         let frame = PairwiseFrame::Hello {
             channel_id: *channel_id,
@@ -204,7 +204,31 @@ pub async fn deliver_skdm(
     }
     send_skdm(&mut send, channel_id, session, skdm).await?;
     let _ = send.finish();
-    Ok(())
+    // Returned so the caller can learn whether the key was taken: see `refused`.
+    Ok(recv)
+}
+
+/// The recipient's answer on a pairwise stream that carried a key it took.
+pub const KEY_TAKEN: u8 = 1;
+
+/// Whether the far side refused a delivered key: `Some(why)` if so, `None` if it took it.
+///
+/// **Written is not delivered.** QUIC acknowledges the bytes before the recipient has decided
+/// anything, so the transport cannot say whether a key was taken. The recipient answers instead,
+/// with [`KEY_TAKEN`] once the key is taken, or by resetting the stream with a wire code when it
+/// is not: refused at accept, no session to open it with, or a key it could not open. Anything
+/// but that one byte (a reset, the stream ending unanswered, the connection lost, or no answer
+/// within `patience`) counts as not taken. Sending a key twice is harmless; never sending it
+/// leaves a member unable to read. Awaited on its own task, never on the actor: the answer
+/// comes after the recipient's actor has handled the key.
+pub async fn refused(mut recv: quinn::RecvStream, patience: std::time::Duration) -> Option<String> {
+    let mut byte = [0u8; 1];
+    match tokio::time::timeout(patience, recv.read_exact(&mut byte)).await {
+        Ok(Ok(())) if byte[0] == KEY_TAKEN => None,
+        Ok(Ok(())) => Some(format!("answered {}", byte[0])),
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some(format!("no answer within {}s", patience.as_secs())),
+    }
 }
 
 /// Open a `pairwise` stream, give the far side the ratchet message its sending
