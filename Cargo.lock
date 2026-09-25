@@ -2674,6 +2674,7 @@ dependencies = [
  "ml-dsa",
  "ml-kem",
  "quinn",
+ "quinn-proto",
  "quinn-udp",
  "rcgen",
  "redb",

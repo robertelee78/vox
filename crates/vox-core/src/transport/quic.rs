@@ -224,6 +224,11 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     cfg.stream_receive_window(quinn::VarInt::from_u32(STREAM_WINDOW));
     cfg.send_window(2 * u64::from(STREAM_WINDOW));
     cfg.receive_window(quinn::VarInt::from_u32(CONNECTION_WINDOW));
+    // Cubic, restarted after the connection idles: a tunnel's transfer must not inherit the
+    // congestion history of an older one on the same long-lived connection (PRD-001 R41).
+    cfg.congestion_controller_factory(Arc::new(
+        crate::transport::congestion::IdleRestartConfig::default(),
+    ));
     Arc::new(cfg)
 }
 

@@ -81,6 +81,9 @@ blake2b_simd = { version = "1.0", default-features = false, features = ["std"] }
 # cross-stream head-of-line blocking; RFC 9221 unreliable datagrams carry the
 # low-latency flows. One connection per peer.
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
+# The congestion controller's interface names quinn-proto's `RttEstimator`, which quinn does not
+# re-export (transport::congestion). No features: quinn selects them.
+quinn-proto = { version = "0.11", default-features = false }
 # Socket options quinn does not set: the UDP buffer sizes (R41). Already in the tree through
 # tokio and quinn-udp; named here so the node can ask for buffers a burst fits in.
 socket2 = "0.6"

@@ -190,6 +190,21 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     - path MTU 7973–8082 (dialler) and 8192 (acceptor), 0 black holes, 3 runs;
     - with `max_udp_payload_size` removed, both sides stop at 1472, red;
     - with `upper_bound` removed, both stop at 1452, red.
+  - **Cubic restarts after idle** (`transport::congestion::IdleRestart`). A node keeps one QUIC
+    connection per peer, so every tunnel shares one congestion controller for the connection's
+    life. After ordinary drop-tail losses, Cubic's slow-start threshold and `W_max` stayed low, and a
+    later bulk transfer on a longer path grew one segment at a time. Measured with R41's gate
+    (`perf_r41_tunnel_throughput_proof`, 1 Gbit/s at 50 ms, run after the 2 ms LAN arm) and quinn's
+    own stats logged on both ends: cwnd plateaued at ~3.75 MB, which is ~590 Mbit/s. Flow control
+    never bound: 0 STREAM_DATA_BLOCKED and 0 DATA_BLOCKED on either side. With the WAN arm run first,
+    the same binary reached 98.4%.
+    - Now, after 1 s with nothing sent (and at least 4 smoothed RTTs), the next send starts from a
+      fresh Cubic: initial window, slow start. That is what a plain TCP transfer, a fresh
+      connection each time, always gets. RFC 5681 §4.1 restarts too but keeps ssthresh, which would
+      keep the plateau.
+    - Gate, 3 runs: WAN 95.5 / 97.9 / 92.7%, LAN 98.4 / 98.3 / 98.4%.
+    - Mutation (plain Cubic, same tree): WAN 56.9%, red.
+    - A quinn `black_hole_cooldown` of 3 s was tried and not kept: LAN 83.9%, WAN 28.8%.
   - **Unshaped loopback: ~1.1–1.2 GB/s (8.8–9.6 Gbit/s), about 11–12% of loopback TCP.** The decider
     has ruled that loopback is the wrong yardstick (PRD-001 R41 as clarified 2026-09-25): R41 is
     measured against a link.
