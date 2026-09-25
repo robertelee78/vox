@@ -193,7 +193,7 @@ pub async fn deliver_skdm(
     session: &mut Session,
     skdm: &Skdm,
     hello: Option<&InitialMessage>,
-) -> Result<()> {
+) -> Result<quinn::SendStream> {
     let (mut send, _recv) = open_typed(conn, StreamKind::Pairwise).await?;
     if let Some(initial) = hello {
         let frame = PairwiseFrame::Hello {
@@ -204,7 +204,27 @@ pub async fn deliver_skdm(
     }
     send_skdm(&mut send, channel_id, session, skdm).await?;
     let _ = send.finish();
-    Ok(())
+    // Returned so the caller can learn whether the key was taken: see `refused`.
+    Ok(send)
+}
+
+/// Whether the far side refused a delivered key: `Some(why)` if so, `None` if it took it.
+///
+/// **Written is not delivered.** A stream the recipient refuses at accept, or whose key it cannot
+/// open, is stopped with a Vox wire code, and every Vox wire code is non-zero. A key that was
+/// taken ends with the stream read to its end, or dropped once read, which is a stop with 0.
+/// Anything else (the connection lost before an answer, or no answer at all within `patience`)
+/// is counted as not delivered as well: sending a key twice is harmless, and never sending it
+/// leaves a member unable to read. Awaited on its own task, never on the actor: the answer
+/// comes after the recipient's actor has handled the key.
+pub async fn refused(send: quinn::SendStream, patience: std::time::Duration) -> Option<String> {
+    match tokio::time::timeout(patience, send.stopped()).await {
+        Ok(Ok(None)) => None,
+        Ok(Ok(Some(code))) if code.into_inner() == 0 => None,
+        Ok(Ok(Some(code))) => Some(format!("stopped with code {}", code.into_inner())),
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some(format!("no answer within {}s", patience.as_secs())),
+    }
 }
 
 /// Open a `pairwise` stream, give the far side the ratchet message its sending

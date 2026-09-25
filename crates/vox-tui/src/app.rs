@@ -418,6 +418,17 @@ pub fn run_node(
                                         crate::tunnel_cli::short_id_of(&channel_id)
                                     );
                                 }
+                                vox_core::node::api::NodeEvent::KeyNotTaken {
+                                    channel_id,
+                                    peer,
+                                    why,
+                                } => {
+                                    eprintln!(
+                                        "vox node: {} did not take our key for room {} — {why}; it is sent again",
+                                        crate::tunnel_cli::short_id_of(&peer),
+                                        crate::tunnel_cli::short_id_of(&channel_id)
+                                    );
+                                }
                                 vox_core::node::api::NodeEvent::StillRelayed { peer, reason } => {
                                     eprintln!(
                                         "vox node: still relayed to {} — {reason}",

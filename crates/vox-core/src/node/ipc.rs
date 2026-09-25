@@ -106,6 +106,8 @@ const T_PEER_UNREACHABLE: u64 = 1716;
 const T_PUBLISH_REFUSED: u64 = 1717;
 /// [`NodeEvent::JoinSteps`]: where a join's time went.
 const T_JOIN_STEPS: u64 = 1718;
+/// `NodeEvent::KeyNotTaken`.
+const T_KEY_NOT_TAKEN: u64 = 1719;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -805,6 +807,17 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::PeerJoined { channel_id, peer } => {
             e.array(3).uint(T_PEER_JOINED).bytes(channel_id).bytes(peer);
         }
+        NodeEvent::KeyNotTaken {
+            channel_id,
+            peer,
+            why,
+        } => {
+            e.array(4)
+                .uint(T_KEY_NOT_TAKEN)
+                .bytes(channel_id)
+                .bytes(peer)
+                .text(why);
+        }
         NodeEvent::SenderKeyReceived {
             channel_id,
             peer,
@@ -1077,6 +1090,14 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_PEER_JOINED, 3) => NodeEvent::PeerJoined {
             channel_id: digest(d)?,
             peer: digest(d)?,
+        },
+        (T_KEY_NOT_TAKEN, 4) => NodeEvent::KeyNotTaken {
+            channel_id: digest(d)?,
+            peer: digest(d)?,
+            why: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc why"))?
+                .to_owned(),
         },
         (T_SENDER_KEY, 4) => NodeEvent::SenderKeyReceived {
             channel_id: digest(d)?,
