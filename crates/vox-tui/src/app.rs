@@ -159,6 +159,17 @@ impl Default for CrosstermIo {
     }
 }
 
+/// How many worker threads a vox runtime gets: one per core, between 2 and 8.
+///
+/// A tunnel's two splice legs and QUIC's connection driver are three busy tasks at once, and
+/// every runtime here was pinned at two workers, so under load they queued behind one another.
+/// The cap keeps an idle daemon small on a many-core machine.
+pub(crate) fn runtime_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .clamp(2, 8)
+}
+
 fn restore_terminal() {
     // Best-effort, in order: leave raw mode, leave the alternate screen, purge
     // scrollback (ESC[3J — best-effort; tmux/screen/script may retain copies, the
@@ -271,7 +282,7 @@ pub fn run_node(
 ) -> Result<(), AppError> {
     use vox_core::identity::composite::RootSigner;
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(crate::app::runtime_workers())
         .enable_all()
         .build()?;
     let signer = vox_core::node::headless::load_or_create_identity(&paths)?;
@@ -631,7 +642,7 @@ pub fn run_daemon(
         .collect();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(crate::app::runtime_workers())
         .enable_all()
         .build()?;
     // **Wait briefly for a profile that is being closed.** redb allows one process per
@@ -1063,7 +1074,7 @@ pub fn run_live(
     anchors: vox_core::nat::bootstrap::BootstrapSet,
 ) -> Result<(), AppError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(crate::app::runtime_workers())
         .enable_all()
         .build()?;
     let cfg = vox_core::node::actor::NodeConfig::new()
