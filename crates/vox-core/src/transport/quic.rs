@@ -155,7 +155,7 @@ const OPEN_STREAM_PATIENCE: std::time::Duration = std::time::Duration::from_secs
 /// `iroh-relay`). Without this quinn sends nothing on an idle path and the connection dies
 /// at the idle timeout, which for a tunnel means a person's session dropping while they
 /// read.
-const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The transport parameters every Vox connection runs with, in both directions.
 fn transport_config() -> Arc<quinn::TransportConfig> {

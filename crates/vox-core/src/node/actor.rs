@@ -987,11 +987,30 @@ async fn serve_filed(
         // while anything still holds it, and a stream loop holds its `Arc` for the
         // connection's life — so an unbounded reader would pin the very thing whose
         // purpose is to be let go.
+        //
+        // **Unless it was promoted.** A retired connection becomes the peer's connection when the
+        // one it lost to goes silent (a restarted peer, `SILENCE_IS_DEATH`), and from then on it
+        // is read for its whole life like any other. Held weakly, so this timer is not itself
+        // what keeps the connection "carried".
         let grace = Duration::from_secs(net.manager().retire_grace_secs());
+        let watched = Arc::downgrade(&also);
         let loop_task = spawn_stream_loop(Arc::clone(net), also, tx.clone());
+        // The network is held weakly too. A strong handle here kept the whole `NodeNet` — its
+        // endpoint and its socket — alive for the grace after the node shut down: a restarted
+        // node in the same process then shared a socket with a ghost that read half its packets,
+        // and `m15_members_never_online_together` saw the returning member's dial to its anchor
+        // time out. A network that is gone has nothing left to promote.
+        let net = Arc::downgrade(net);
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
-            loop_task.abort();
+            let promoted = net.upgrade().is_some_and(|net| {
+                watched
+                    .upgrade()
+                    .is_some_and(|c| net.manager().is_primary(&c))
+            });
+            if !promoted {
+                loop_task.abort();
+            }
         });
     }
     spawn_stream_loop(Arc::clone(net), filed.kept, tx.clone());
@@ -2303,6 +2322,29 @@ impl Node {
         }
         let net = Arc::new(net);
         self.net = Some(Arc::clone(&net));
+        // **Liveness is tended off the actor.** A connection silent past `SILENCE_IS_DEATH` gives
+        // way to a live one to the same peer, or is closed — how a restarted peer's connection
+        // takes over from the dead one. That cannot ride the actor's tick, because the actor is
+        // exactly what a dead connection stalls: measured with a real `vox forward` whose host was
+        // killed, the actor sat 60s inside "publishing every room to an anchor that answered",
+        // awaiting a stream on the dead connection, and no tick ran until QUIC's idle timeout
+        // ended the wait — so the rule that would have ended it at 30s never got to run. Closing
+        // the connection from here is also what ends that wait. Held weakly, so the task ends
+        // with the network.
+        {
+            let manager = Arc::downgrade(net.manager());
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(TICK);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let Some(manager) = manager.upgrade() else {
+                        break;
+                    };
+                    manager.tend_liveness();
+                }
+            });
+        }
         // The configured anchors are dialled at once, each on its own task: they are
         // where this node's records go and the helpers its ladder climbs through, and
         // an anchor that is down must not hold up the ones that are not.
