@@ -50,6 +50,31 @@ use crate::node::syncstream::{SyncSchedule, SyncTrigger};
 use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
 
+/// A pairwise session this node opened (ADR-021 F12).
+#[derive(Debug, Clone)]
+struct Initiated {
+    /// The hello that lets the peer accept it; `None` for a session opened on the join
+    /// path, which the join protocol itself delivered.
+    initial: Option<InitialMessage>,
+    /// Whether that hello has reached the peer. Until it has, every delivery over the
+    /// session carries it again — a peer cannot open anything sealed under a session it
+    /// was never offered.
+    hello_delivered: bool,
+}
+
+/// **Which of two competing sessions for one pair both ends keep** (ADR-021 F12): the
+/// one opened by the lower fingerprint. Two members that opened a session to each other
+/// at the same moment each hold their own; both apply this rule and so keep the same
+/// one. `existing_mine` says whether the session already held was opened by `me`; the
+/// incoming one was opened by `peer`.
+///
+/// A second session from the same opener replaces the first: a peer only opens a
+/// session when it holds none, so a new hello from the peer that opened ours means it
+/// lost its state (a restart — sessions are not persisted), and the old one is dead.
+fn incoming_session_wins(me: &Digest32, peer: &Digest32, existing_mine: bool) -> bool {
+    !existing_mine || peer < me
+}
+
 /// Command queue depth (commands beyond it apply backpressure to the client).
 const COMMAND_QUEUE: usize = 64;
 /// Event buffer depth, per subscriber (ADR-020 §7).
@@ -1633,6 +1658,22 @@ pub struct Node {
     /// process only: persisting ratchet state is not part of M14, so a restart
     /// re-establishes a session on the next join or key exchange.
     sessions: BTreeMap<(Digest32, Digest32), crate::pairwise::session::Session>,
+    /// The sessions in [`Self::sessions`] that **this node opened**, and whether the
+    /// peer has been sent the hello that lets it accept them (ADR-021 F12).
+    ///
+    /// Two members can open a session to each other at the same moment — both
+    /// auto-consent when they trust each other, and each finds no session and opens
+    /// one. Each then holds its own and ignores the other's hello, and neither can
+    /// open the key the other sent. Knowing which sessions are ours is what lets both
+    /// ends apply one rule and converge: [`incoming_session_wins`].
+    initiated: BTreeMap<(Digest32, Digest32), Initiated>,
+    /// The hello each peer-opened session was accepted from, by hash, so a peer
+    /// re-sending the same hello is recognised and does not re-consume a one-time
+    /// prekey or reset a session that is already in use.
+    accepted_hello: BTreeMap<(Digest32, Digest32), Digest32>,
+    /// Sessions this node kept against a peer's competing hello, whose peer must now
+    /// be sent this node's hello so it adopts the same session; drained on the tick.
+    reopen: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// The identity's key-agreement keys (ADR-002 §2), held only while unlocked:
     /// loaded (or generated on first use) by [`crate::node::prekeys::load_or_create`]
     /// after the identity unlocks and dropped on lock, so no prekey secret is in
@@ -1781,6 +1822,9 @@ impl Node {
             owed_first: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            initiated: BTreeMap::new(),
+            accepted_hello: BTreeMap::new(),
+            reopen: std::collections::BTreeSet::new(),
             prekeys: None,
             channels: BTreeMap::new(),
             clock,
@@ -3392,10 +3436,18 @@ impl Node {
             // there now goes up, and what arrives later goes with the next mirror.
             self.publish_channel_to_anchors(&channel_id).await;
         }
-        self.sessions.insert((channel_id, peer), outcome.session);
+        self.adopt_join_session(channel_id, peer, outcome.session, false)
+            .await;
         if let Some(net) = self.net.as_ref() {
             net.policy().forget_joiner(&peer);
         }
+        // **Consent at admission, not on the tick** (ADR-021 F12). A room is ForwardOnly:
+        // a newcomer reads only what is sealed after the key is released to it. With the
+        // joiner already in this node's trust ring, leaving the release to the next tick
+        // opened a window in which anything this node posted was unreadable to the
+        // joiner for good. The actor is serial, so releasing here — before any later
+        // command is served — means everything posted after the join is readable.
+        self.deliver_owed_consents(None).await;
         let _ = self
             .event_tx
             .send(NodeEvent::PeerJoined { channel_id, peer });
@@ -3798,8 +3850,8 @@ impl Node {
         }
         // An admission changes a room's author set, the other half of the reacher join.
         self.refresh_reachers().await;
-        self.sessions
-            .insert((parsed.channel_id, responder), joined.session);
+        self.adopt_join_session(parsed.channel_id, responder, joined.session, true)
+            .await;
         // The link's anchors are this channel's anchors from now on (persisted, so a
         // restart still knows where the swarm's board is), together with our own.
         let mut learned = BootstrapSet::new();
@@ -3914,6 +3966,9 @@ impl Node {
         .await
         {
             return Outcome::Failed(fault_of(&e));
+        }
+        if hello.is_some() {
+            self.hello_delivered(channel_id, target);
         }
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
@@ -4138,7 +4193,11 @@ impl Node {
     /// Nothing here waits for a dial (see `reach_member`); consent follows on `Dialed`. Waiting
     /// made `vox trust add` freeze the node for 10s per offline trusted member per room.
     async fn deliver_owed_consents(&mut self, asked_for: Option<Digest32>) {
-        if self.net.is_none() || self.trust.is_empty() {
+        if self.net.is_none() {
+            return;
+        }
+        self.deliver_reopens().await;
+        if self.trust.is_empty() {
             return;
         }
         let trusted = self.trust.trusted();
@@ -4257,6 +4316,9 @@ impl Node {
             .is_err()
             {
                 continue;
+            }
+            if hello.is_some() {
+                self.hello_delivered(channel_id, target);
             }
             // Recorded only after the bytes went out, so a failed delivery stays owed.
             let noted = {
@@ -4887,8 +4949,33 @@ impl Node {
     /// An existing session is never replaced: a peer cannot reset our ratchet by
     /// sending a fresh `Hello`.
     async fn accept_hello(&mut self, channel_id: Digest32, peer: Digest32, initial: &[u8]) -> bool {
-        if self.sessions.contains_key(&(channel_id, peer)) {
-            return true;
+        let key = (channel_id, peer);
+        let hello_hash = crate::hash::sha256(initial);
+        let mut replaces = false;
+        if self.sessions.contains_key(&key) {
+            // The same hello again — the peer re-sending what we already accepted. The
+            // session is the one we hold; accepting it twice would re-consume a one-time
+            // prekey and reset a ratchet that is already in use.
+            if self.accepted_hello.get(&key) == Some(&hello_hash) {
+                return true;
+            }
+            // **Two sessions for one pair** (ADR-021 F12). Keep the one both ends will
+            // keep. It used to keep whichever it held, and so did the peer — each kept its
+            // own, and neither could open the key the other sent.
+            let me = self.profile.as_ref().map(|p| p.fingerprint());
+            let existing_mine = self.initiated.contains_key(&key);
+            if let Some(me) = me {
+                if !incoming_session_wins(&me, &peer, existing_mine) {
+                    // Ours wins. The peer is holding its own, so it must be offered ours
+                    // again: until it adopts it, nothing we seal can be opened there.
+                    if let Some(i) = self.initiated.get_mut(&key) {
+                        i.hello_delivered = false;
+                    }
+                    self.reopen.insert(key);
+                    return false;
+                }
+            }
+            replaces = true;
         }
         let Ok(init) = InitialMessage::from_wire(initial) else {
             return false;
@@ -4962,8 +5049,130 @@ impl Node {
         ) else {
             return false;
         };
-        self.sessions.insert((channel_id, peer), session);
+        self.sessions.insert(key, session);
+        self.initiated.remove(&key);
+        self.reopen.remove(&key);
+        self.accepted_hello.insert(key, hello_hash);
+        if replaces {
+            // Whatever this node sent under the session it just dropped was sealed where
+            // the peer cannot open it: forget that it was delivered, so the tick re-sends
+            // the current key over the session both ends now hold.
+            self.forget_delivery(&channel_id, &peer).await;
+        }
         true
+    }
+
+    /// Forget that `peer` holds this identity's current sender key in `channel_id`, so
+    /// the next re-key round delivers it again (ADR-021 F12).
+    async fn forget_delivery(&mut self, channel_id: &Digest32, peer: &Digest32) {
+        let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
+            return;
+        };
+        let _ = shared.lock().await.forget_delivery(profile.store(), peer);
+    }
+
+    /// File the session a join just established — `mine` when this node was the joiner,
+    /// which opened it — applying the same rule as [`Self::accept_hello`] when a session
+    /// for that pair already exists (ADR-021 F12).
+    ///
+    /// A join can race an auto-consent: the member answering a join may, on its own
+    /// tick, have already opened a session to the joiner from its bundle record, because
+    /// a trust entry for the joiner predates the join. Keeping whichever arrived last on
+    /// one side and whichever arrived first on the other is exactly the split this rule
+    /// exists to prevent.
+    async fn adopt_join_session(
+        &mut self,
+        channel_id: Digest32,
+        peer: Digest32,
+        session: crate::pairwise::session::Session,
+        mine: bool,
+    ) {
+        let key = (channel_id, peer);
+        if self.sessions.contains_key(&key) {
+            let me = self.profile.as_ref().map(|p| p.fingerprint());
+            let existing_mine = self.initiated.contains_key(&key);
+            // The rule is stated for an incoming session the PEER opened; a join session
+            // this node opened wins exactly when the existing one would lose to ours.
+            let incoming_wins = match me {
+                Some(me) if mine => existing_mine || me < peer,
+                Some(me) => incoming_session_wins(&me, &peer, existing_mine),
+                None => true,
+            };
+            if !incoming_wins {
+                if existing_mine {
+                    // Ours stands: make sure the peer is offered it.
+                    if let Some(i) = self.initiated.get_mut(&key) {
+                        i.hello_delivered = false;
+                    }
+                    self.reopen.insert(key);
+                }
+                return;
+            }
+            self.forget_delivery(&channel_id, &peer).await;
+        }
+        self.sessions.insert(key, session);
+        self.accepted_hello.remove(&key);
+        self.reopen.remove(&key);
+        if mine {
+            self.initiated.insert(
+                key,
+                Initiated {
+                    initial: None,
+                    hello_delivered: true,
+                },
+            );
+        } else {
+            self.initiated.remove(&key);
+        }
+    }
+
+    /// Offer this node's hello again to every peer that kept a competing session
+    /// (ADR-021 F12), with the empty ratchet message behind it that gives the peer a
+    /// sending direction — so it adopts the session both ends will keep even when this
+    /// node owes it nothing else.
+    async fn deliver_reopens(&mut self) {
+        let pending: Vec<(Digest32, Digest32)> = self.reopen.iter().copied().collect();
+        for (channel_id, peer) in pending {
+            let Some(initial) = self
+                .initiated
+                .get(&(channel_id, peer))
+                .and_then(|i| i.initial.clone())
+            else {
+                // Nothing to offer — a session the join protocol opened, which the peer
+                // already holds.
+                self.reopen.remove(&(channel_id, peer));
+                continue;
+            };
+            let Some(conn) = self.reach_member(&channel_id, peer, false).await else {
+                continue;
+            };
+            let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
+                self.reopen.remove(&(channel_id, peer));
+                continue;
+            };
+            if crate::node::pairwise_stream::open_sending_direction(
+                &conn,
+                &channel_id,
+                session,
+                Some(&initial),
+            )
+            .await
+            .is_ok()
+            {
+                self.reopen.remove(&(channel_id, peer));
+                self.hello_delivered(&channel_id, peer);
+            }
+        }
+    }
+
+    /// Record that the peer now holds the hello for a session this node opened.
+    fn hello_delivered(&mut self, channel_id: &Digest32, peer: Digest32) {
+        if let Some(i) = self.initiated.get_mut(&(*channel_id, peer)) {
+            i.hello_delivered = true;
+        }
     }
 
     /// A connection to `target`: the live one if there is one, otherwise dialled
@@ -5051,7 +5260,14 @@ impl Node {
         target: Digest32,
     ) -> Option<InitialMessage> {
         if self.sessions.contains_key(&(*channel_id, target)) {
-            return None;
+            // Ours, and the peer has not yet been sent its hello — a delivery that failed
+            // after the session was opened. Offer it again, or nothing sealed under it
+            // can be opened there.
+            return self
+                .initiated
+                .get(&(*channel_id, target))
+                .filter(|i| !i.hello_delivered)
+                .and_then(|i| i.initial.clone());
         }
         let net = self.net.as_ref().map(Arc::clone)?;
         let shared = self.channels.get(channel_id).map(Arc::clone)?;
@@ -5068,6 +5284,14 @@ impl Node {
         )
         .ok()?;
         self.sessions.insert((*channel_id, target), session);
+        self.accepted_hello.remove(&(*channel_id, target));
+        self.initiated.insert(
+            (*channel_id, target),
+            Initiated {
+                initial: Some(initial.clone()),
+                hello_delivered: false,
+            },
+        );
         Some(initial)
     }
 
@@ -5224,6 +5448,9 @@ impl Node {
         // Pairwise sessions hold ratchet key material: drop them with everything else
         // (their secrets zeroize on drop).
         self.sessions.clear();
+        self.initiated.clear();
+        self.accepted_hello.clear();
+        self.reopen.clear();
         // And take the network down: a locked node has no identity to present, so it
         // must not keep serving or holding connections (M14.7d).
         self.stop_network();

@@ -1824,6 +1824,21 @@ impl ChannelState {
         Ok(revocation)
     }
 
+    /// Forget that `target` holds this identity's current sender key, so the next
+    /// re-key round delivers it again (ADR-021 F12).
+    ///
+    /// For when the pairwise session a key was delivered over has been replaced by the
+    /// one both ends keep: what was sealed under the dropped session cannot be opened.
+    ///
+    /// # Errors
+    /// If the ledger cannot be persisted.
+    pub fn forget_delivery(&mut self, store: &Store, target: &Digest32) -> Result<()> {
+        if self.delivered.remove(target).is_some() {
+            self.persist_delivered(store)?;
+        }
+        Ok(())
+    }
+
     fn persist_delivered(&mut self, store: &Store) -> Result<()> {
         let seg = seal_segment(
             &self.sek,
