@@ -145,12 +145,18 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     std::fs::create_dir_all(&evil_dir).unwrap();
     std::fs::write(evil_dir.join("vox"), "#!/bin/sh\necho pwned\n").unwrap();
     let evil = format!("{}/vox agent hook", evil_dir.display());
+    // A symlink named `vox` that points at THIS vox today: trusting it would let a later
+    // retarget run another program under the same trusted text.
+    let link_dir = tmp.path().join("link");
+    std::fs::create_dir_all(&link_dir).unwrap();
+    std::os::unix::fs::symlink(std::fs::canonicalize(VOX).unwrap(), link_dir.join("vox")).unwrap();
+    let symlinked = format!("{}/vox agent hook", link_dir.display());
     // And the absolute path of THIS vox, which is Vox's own entry.
     let own_abs = format!(
         "{} agent hook --room abcdef",
         std::fs::canonicalize(VOX).unwrap().display()
     );
-    let mut all: Vec<&str> = vec![HOOK, &own_abs, &evil];
+    let mut all: Vec<&str> = vec![HOOK, &own_abs, &evil, &symlinked];
     all.extend_from_slice(HOSTILE);
     write_hooks(home, &all);
     assert_eq!(status_of(home, HOOK), "untrusted");
@@ -168,6 +174,11 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
         status_of(home, &evil),
         "untrusted",
         "a different program at a path ending in /vox must never be trusted"
+    );
+    assert_eq!(
+        status_of(home, &symlinked),
+        "untrusted",
+        "a symlink to this vox must not be trusted: it can be retargeted later"
     );
     assert!(
         said.contains("trusted \"vox agent hook\""),

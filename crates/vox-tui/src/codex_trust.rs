@@ -133,7 +133,9 @@ impl Drop for AppServer {
 /// Two things are deliberately refused though `vox agent hook` accepts them:
 /// - **any other absolute path**, even one ending in `/vox`: `/tmp/evil/vox agent hook`
 ///   is a different program, and a trusted entry tampered to point at it would
-///   otherwise be re-trusted silently;
+///   otherwise be re-trusted silently. The entry's path is compared **as written** with
+///   this binary's canonical path — never resolved — because a symlink that points here
+///   today can be retargeted tomorrow, and Codex's hash covers only the command text;
 /// - **`--data-dir` and `--config-dir`**: they choose which profile's rooms land in the
 ///   agent's context, so a tampered entry could aim the hook at an attacker's profile.
 ///   `vox agent plugin codex` never emits them; `--profile` selects a profile within the
@@ -151,8 +153,7 @@ pub fn is_vox_hook(command: &str, this_exe: Option<&std::path::Path>) -> bool {
         return false;
     };
     let exe_ok = *exe == "vox"
-        || (exe.starts_with('/')
-            && this_exe.is_some_and(|me| std::fs::canonicalize(exe).is_ok_and(|p| p == me)));
+        || (exe.starts_with('/') && this_exe.is_some_and(|me| me.to_str() == Some(exe)));
     if !exe_ok || flags.len() % 2 != 0 {
         return false;
     }

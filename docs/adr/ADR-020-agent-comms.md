@@ -980,8 +980,9 @@ Both unknowns are already spiked; neither remains open.
   > installed codex-cli 0.157.0 in an isolated `CODEX_HOME`, read back through Codex's own `hooks/list`).
   > It starts a short-lived `codex app-server` over stdio, lists hooks, and writes `trusted_hash =
   > currentHash` for every **Vox** entry that is not `trusted` — another tool's entry is left alone.
-  > **"Vox's entry" is an exact grammar**, not a substring: bare `vox` or the canonical path of **this**
-  > `vox` binary (not merely a path ending in `/vox`), then `agent hook`, then only `--room`, `--session`,
+  > **"Vox's entry" is an exact grammar**, not a substring: bare `vox` or, **as written, never resolved**, the
+  > canonical path of this `vox` binary — not a path ending in `/vox`, and not a symlink to it, which
+  > could be retargeted later under the same trusted text — then `agent hook`, then only `--room`, `--session`,
   > `--profile` (plain values) and `--format`; no shell metacharacter. `--data-dir`/`--config-dir` are
   > refused — they would let a tampered entry aim the hook at another profile's rooms — and the plugin
   > never emits them. Codex runs a
@@ -995,8 +996,9 @@ Both unknowns are already spiked; neither remains open.
   > re-trusted; with no Vox entry the command fails and says why; five hostile look-alikes (pipe, `;`,
   > `$(…)`, another binary, an unknown flag) stay untrusted; a trusted entry tampered into a hostile
   > command stays `modified`; a real file at `…/evil/vox` stays untrusted, and a trusted entry retargeted
-  > from this `vox` to it stays `modified`. Rejected twice in independent review (substring match; then
-  > any `…/vox` path and the directory flags) before this form. Mutants caught: never writes; substring
+  > from this `vox` to it stays `modified`. a symlink to this `vox` stays untrusted. Rejected three times in
+  > independent review (substring match; any `…/vox` path and the directory flags; symlink resolution)
+  > before this form. Mutants caught: never writes; substring
   > match; any path ending `/vox`; directory flags allowed; unknown flags; unchecked values. **Not proved:** that a trusted hook then fires in a
   > live Codex turn — that needs a model login in the isolated home, and the proof does not take the
   > operator's credentials. `vox agent plugin codex` now says to run it.
