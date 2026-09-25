@@ -164,6 +164,24 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     loopback MTU) broke connections on macOS, whose `net.inet.udp.maxdgram` is 9216.
   - UDP socket buffers 4 MiB each way (`quic::UDP_SOCKET_BUFFER`): no gain alone, but without them
     a burst overflowed the default buffer and quinn's black-hole detection dropped the MTU to 1200.
+  - **The 8192 ceiling follows the buffer the OS actually granted (2026-09-25, v0.2.9 release
+    blocker).** Linux caps `SO_RCVBUF` at `net.core.rmem_max` (about 208 KiB) without an error,
+    and the result was ignored. So on Linux the 8192 ceiling ran on a tenth of the buffer it needs:
+    CI's loopback proof pinned the dialler at 1200 bytes with a black hole, below stock quinn's
+    1452.
+    - The endpoint now reads the receive buffer back after setting it. It takes the 8192 ceiling
+      (both `max_udp_payload_size` and `upper_bound`) only when at least 4 MiB was granted, the
+      buffer the ceiling was measured with. Otherwise it keeps quinn's 1452 and prints one line
+      saying why (`quic::mtu_ceiling_for`).
+    - Proved, `transport_mtu_and_window_proof`:
+      - Linux container: buffer 416 KiB, so the ceiling stays 1452. Path 1452/1452, 0 black holes,
+        5 of 5.
+      - The previous tree on Linux: dialler at 1200 with 1–2 black holes, 3 of 3 red.
+      - macOS: 8192 is granted; path 7973–8192, 0 black holes.
+      - macOS with the granted buffer forced to 416 KiB or 768 KiB: the fix keeps 1452 and passes
+        5 of 5 at each. The old 8192-regardless rule went red 1 of 5 at each.
+    - Not a fix for every buffer: forced to 256 KiB, macOS black-holed even at 1452 (2 of 3). That
+      is below any OS default, and is recorded, not bounded.
   - Measured and **not** kept: 4 runtime workers instead of 2 (no change). A 16 MiB stream window
     with a **64 MiB** send window (more in flight, more overflow loss, and the MTU collapsed) was
     also not kept; the windows that were kept are below.

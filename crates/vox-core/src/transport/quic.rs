@@ -82,6 +82,10 @@ pub struct VoxEndpoint {
     supported: rustls::crypto::WebPkiSupportedAlgorithms,
     /// This endpoint's own identity fingerprint.
     local_id: Digest32,
+    /// The largest UDP payload this endpoint advertises and path-MTU discovery searches up to:
+    /// [`MAX_UDP_PAYLOAD`] when the socket's receive buffer can take its bursts, else quinn's
+    /// Ethernet default. See [`mtu_ceiling_for`].
+    mtu_ceiling: u16,
 }
 
 /// Transport-layer admission for an *inbound* connection, evaluated **after** the
@@ -180,7 +184,8 @@ pub const MAX_UDP_PAYLOAD: u16 = 8_192;
 /// does not probe again for a minute. Measured with the larger ceiling and larger stream
 /// windows (an experiment since dropped): without these buffers the MTU fell back to 1200 in
 /// 3 of 3 runs (`black_holes_detected` 1–9); with them, 0 black holes in 3 of 3.
-/// The OS may grant less; that is not an error.
+/// The OS may grant less, and Linux does so silently (`net.core.rmem_max`); that is not an
+/// error, but it decides the path-MTU ceiling (`mtu_ceiling_for`).
 const UDP_SOCKET_BUFFER: usize = 4 << 20;
 
 /// Per-stream flow-control window (and half the connection's send window), sized for the
@@ -197,15 +202,53 @@ pub const STREAM_WINDOW: u32 = 16 << 20;
 /// speed, and lets a second one run beside it.
 pub const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
 
+/// quinn's own path-MTU ceiling (`MtuDiscoveryConfig::default().upper_bound`): 1500-byte Ethernet
+/// less IPv6 and UDP headers. What an endpoint falls back to when its socket cannot take the
+/// bursts [`MAX_UDP_PAYLOAD`] brings.
+pub const DEFAULT_UDP_PAYLOAD: u16 = 1_452;
+
+/// The path-MTU ceiling for a socket whose receive buffer is `effective` bytes, as the OS
+/// reports it after [`UDP_SOCKET_BUFFER`] was asked for, and why.
+///
+/// **The 8192 ceiling needs the buffer it was measured with.** A burst of large datagrams that
+/// overflows the receive buffer loses a run of large packets and nothing small, which is exactly
+/// what quinn's black-hole detector looks for: it drops the path to 1200 bytes, below the 1452 a
+/// stock endpoint keeps, and does not probe again for a minute. On macOS the 768 KiB default did
+/// that in 3 of 3 runs and the 4 MiB buffer in 0 of 3. Linux, though, caps `SO_RCVBUF` at
+/// `net.core.rmem_max` without an error (about 208 KiB by default; only `CAP_NET_ADMIN` can
+/// exceed it), so an endpoint there ran the 8192 ceiling on a tenth of the buffer, and CI's
+/// loopback proof pinned the dialler at 1200.
+///
+/// So the larger ceiling is taken only when the buffer the OS actually granted is at least the
+/// one it was measured with. Linux reports double the value set (it counts its own bookkeeping),
+/// so a granted request reads as 8 MiB there and a capped one as about 416 KiB; macOS reports
+/// what it granted. Anything short of [`UDP_SOCKET_BUFFER`] keeps quinn's default ceiling, which
+/// is what every other QUIC endpoint on that host runs with.
+#[must_use]
+pub fn mtu_ceiling_for(effective: usize) -> (u16, &'static str) {
+    if effective >= UDP_SOCKET_BUFFER {
+        (
+            MAX_UDP_PAYLOAD,
+            "the receive buffer takes a burst of 8192-byte datagrams",
+        )
+    } else {
+        (
+            DEFAULT_UDP_PAYLOAD,
+            "the OS granted a smaller receive buffer than 8192-byte datagrams need \
+             (on Linux, raise net.core.rmem_max to at least 4 MiB)",
+        )
+    }
+}
+
 /// The endpoint parameters every Vox endpoint runs with.
-fn endpoint_config() -> quinn::EndpointConfig {
+fn endpoint_config(mtu_ceiling: u16) -> quinn::EndpointConfig {
     let mut cfg = quinn::EndpointConfig::default();
-    let _ = cfg.max_udp_payload_size(MAX_UDP_PAYLOAD);
+    let _ = cfg.max_udp_payload_size(mtu_ceiling);
     cfg
 }
 
 /// The transport parameters every Vox connection runs with, in both directions.
-fn transport_config() -> Arc<quinn::TransportConfig> {
+fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
     // `From<VarInt>` rather than `try_from(Duration)`: the millisecond value is a compile-
@@ -214,7 +257,7 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
         MAX_IDLE_MS,
     ))));
     let mut mtu = quinn::MtuDiscoveryConfig::default();
-    mtu.upper_bound(MAX_UDP_PAYLOAD);
+    mtu.upper_bound(mtu_ceiling);
     cfg.mtu_discovery_config(Some(mtu));
     // Enough flow-control credit to fill a long, fast path (PRD-001 R41). quinn's default
     // stream window is 1.25 MB, sized for 100 Mbit/s at 100 ms; at 1 Gbit/s and 20 ms RTT that
@@ -261,15 +304,29 @@ impl VoxEndpoint {
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
-        {
+        let effective = {
             let sock = socket2::SockRef::from(&socket);
             let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
             let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER);
+            // What the OS granted, not what was asked for: see `mtu_ceiling_for`.
+            sock.recv_buffer_size().unwrap_or(0)
+        };
+        let (mtu_ceiling, why) = mtu_ceiling_for(effective);
+        if mtu_ceiling != MAX_UDP_PAYLOAD {
+            // Once per process: every endpoint on the host gets the same answer.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                eprintln!(
+                    "vox: UDP receive buffer {} KiB: path-MTU ceiling {mtu_ceiling} bytes, not \
+                     {MAX_UDP_PAYLOAD} — {why}",
+                    effective / 1024
+                );
+            });
         }
         let wrapped = quinn::TokioRuntime
             .wrap_udp_socket(socket)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
-        Self::bind_abstract(signer, wrapped)
+        Self::bind_abstract_with(signer, wrapped, mtu_ceiling)
     }
 
     /// Bind on a caller-supplied datagram socket instead of a real UDP socket.
@@ -283,14 +340,23 @@ impl VoxEndpoint {
         signer: &S,
         socket: Arc<dyn quinn::AsyncUdpSocket>,
     ) -> Result<Self> {
+        // A caller-supplied socket has no kernel buffer to overflow.
+        Self::bind_abstract_with(signer, socket, MAX_UDP_PAYLOAD)
+    }
+
+    fn bind_abstract_with<S: RootSigner>(
+        signer: &S,
+        socket: Arc<dyn quinn::AsyncUdpSocket>,
+        mtu_ceiling: u16,
+    ) -> Result<Self> {
         // Every endpoint runs on the multiplexer, so a relay circuit can be attached
         // to a real socket and a simulated one alike.
         let mux = MuxSocket::new(socket);
         let for_endpoint: Arc<dyn quinn::AsyncUdpSocket> =
             Arc::clone(&mux) as Arc<dyn quinn::AsyncUdpSocket>;
-        Self::bind_with(signer, mux, |cfg| {
+        Self::bind_with(signer, mux, mtu_ceiling, |cfg| {
             Endpoint::new_with_abstract_socket(
-                endpoint_config(),
+                endpoint_config(mtu_ceiling),
                 Some(cfg),
                 for_endpoint,
                 Arc::new(quinn::TokioRuntime),
@@ -334,6 +400,7 @@ impl VoxEndpoint {
     fn bind_with<S: RootSigner>(
         signer: &S,
         mux: Arc<MuxSocket>,
+        mtu_ceiling: u16,
         make: impl FnOnce(quinn::ServerConfig) -> std::io::Result<Endpoint>,
     ) -> Result<Self> {
         let leaf = build_leaf_certificate(signer)?;
@@ -356,7 +423,7 @@ impl VoxEndpoint {
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(s_cfg)
             .map_err(|_| Error::MalformedBundle("quic server config"))?;
         let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
-        server_cfg.transport_config(transport_config());
+        server_cfg.transport_config(transport_config(mtu_ceiling));
 
         let endpoint =
             make(server_cfg).map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
@@ -368,7 +435,15 @@ impl VoxEndpoint {
             leaf_key,
             supported,
             local_id: leaf.identity_fingerprint(),
+            mtu_ceiling,
         })
+    }
+
+    /// The largest UDP payload this endpoint advertises and searches up to (see
+    /// [`mtu_ceiling_for`]).
+    #[must_use]
+    pub fn mtu_ceiling(&self) -> u16 {
+        self.mtu_ceiling
     }
 
     /// The bound local socket address (useful when binding to port 0).
@@ -407,7 +482,7 @@ impl VoxEndpoint {
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(c_cfg)
             .map_err(|_| Error::MalformedBundle("quic client config"))?;
         let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
-        client_cfg.transport_config(transport_config());
+        client_cfg.transport_config(transport_config(self.mtu_ceiling));
 
         // The SNI server name is unused for authentication (we authenticate by the
         // Vox identity), but rustls requires a syntactically valid name.
@@ -498,7 +573,7 @@ impl VoxEndpoint {
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(s_cfg)
             .map_err(|_| Error::MalformedBundle("quic server config (accept)"))?;
         let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
-        server_cfg.transport_config(transport_config());
+        server_cfg.transport_config(transport_config(self.mtu_ceiling));
         // Bounded: an unauthenticated peer must not be able to hold a task open for ever by
         // beginning a handshake and never finishing it.
         let connecting = incoming
