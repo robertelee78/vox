@@ -253,6 +253,20 @@ impl VoxEndpoint {
         self.mux.attach(peer)
     }
 
+    /// [`VoxEndpoint::attach_circuit`], recording `relay` as the peer carrying it.
+    ///
+    /// # Errors
+    /// As [`VoxEndpoint::attach_circuit`].
+    pub fn attach_circuit_via(&self, peer: &Digest32, relay: &Digest32) -> Result<CircuitPort> {
+        self.mux.attach_via(peer, relay)
+    }
+
+    /// The relay carrying `peer`'s live circuit, if one is recorded.
+    #[must_use]
+    pub fn circuit_relay_of(&self, peer: &Digest32) -> Option<Digest32> {
+        self.mux.circuit_relay_of(peer)
+    }
+
     /// Whether `addr` is a **live circuit** on this endpoint's socket — answered from the
     /// mux's table, which is the only authority on it.
     #[must_use]

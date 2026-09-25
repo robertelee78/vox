@@ -2700,6 +2700,7 @@ dependencies = [
  "clap_mangen",
  "crossterm",
  "qrcode",
+ "quinn",
  "ratatui",
  "reqwest",
  "rustix 1.1.4",

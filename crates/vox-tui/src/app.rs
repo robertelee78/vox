@@ -584,8 +584,20 @@ pub fn run_daemon(
     anchors: vox_core::nat::bootstrap::BootstrapSet,
     anchor_specs: Vec<String>,
     passphrase_file: Option<std::path::PathBuf>,
+    metrics: Option<std::net::SocketAddr>,
 ) -> Result<(), AppError> {
     use std::io::Read as _;
+
+    // Refused before anything is read or unlocked: a metrics endpoint the network can
+    // reach names every peer and room this node talks to (PRD-001 R38).
+    if let Some(addr) = metrics {
+        if !addr.ip().is_loopback() {
+            return Err(AppError::Usage(format!(
+                "--metrics {addr}: the metrics endpoint binds loopback only (127.0.0.1 or \
+                 ::1); it names every peer and room this node talks to"
+            )));
+        }
+    }
 
     let raw = match &passphrase_file {
         Some(path) => std::fs::read_to_string(path)
@@ -850,6 +862,18 @@ pub fn run_daemon(
                 }
             }
         });
+    }
+
+    if let Some(addr) = metrics {
+        let listener = rt
+            .block_on(vox_core::node::status::bind_metrics(addr))
+            .map_err(|e| AppError::Usage(e.to_string()))?;
+        let bound = listener.local_addr().map_err(AppError::Io)?;
+        rt.spawn(vox_core::node::status::serve_metrics(
+            listener,
+            node.clone(),
+        ));
+        println!("vox daemon: metrics http://{bound}/metrics");
     }
 
     // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.

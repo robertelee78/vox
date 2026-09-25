@@ -492,6 +492,18 @@ that project). Each client **MUST** have its own cursor.
 `AppListen`, `AppAccept` or `AppOpen` becomes a listener registration or a splice of one app stream
 for its whole life. The requests are additive; nothing earlier changed shape.
 
+*Status (PRD-001 R35, R38).* The socket also answers a status request (tag 2301, additive), with the
+node's report as JSON: rooms with each member's last-seen and last-sync time and the room's last
+completed sync; peers with their path (`direct` or `relayed`, and which relay) and RTT; tunnels
+served and dialed; datagram and app counters; and the lines that need attention — a room with
+other members and no completed sync in 10 minutes, a trusted member that was connected and no
+longer is. `vox status` prints it (`--json` verbatim). `vox daemon --metrics <loopback addr>` serves
+the same report as Prometheus text and refuses a non-loopback address, as `vox forward` does,
+because the counters name every peer and room the node talks to. Proved by
+`crates/vox-tui/tests/ops_status_proof.rs`. Not knowable yet, and said so in the report: whether a
+room has an always-on member (not recorded until ADR-023), and whether a direct path was dialled
+or hole-punched (the ladder does not keep which rung won).
+
 ### 8. The agent-facing surface is a CLI plus a skill
 
 Agents **MUST** be served by CLI verbs — `vox room post` (JSON on stdin, so no shell-quoting hazard),
