@@ -2682,6 +2682,7 @@ dependencies = [
  "rustls-post-quantum",
  "sha1",
  "sha2",
+ "socket2",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
