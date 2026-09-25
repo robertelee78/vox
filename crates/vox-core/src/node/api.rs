@@ -398,6 +398,15 @@ pub enum Fault {
     /// An invite link would not parse, or named a channel/anchor this node cannot
     /// use.
     BadLink,
+    /// A join reached a board, and the board does not hold the room: its host has not
+    /// published the room there yet (it is offline, or its publish has not landed).
+    ///
+    /// **Not [`Fault::BadLink`].** This was reported as one, so a person whose host had simply
+    /// not reached the anchor yet was told the address would not parse and to check they had
+    /// copied all of it — the one thing that was not wrong. Measured on a relayed join: the
+    /// board was reached after 20s, held nothing for the room, and the advice pointed at the
+    /// address.
+    RoomNotOnBoard,
     /// A peer could not be reached (no live endpoint, or the dial failed).
     Unreachable,
     /// The remote refused: a join was refused, or a record was rejected.

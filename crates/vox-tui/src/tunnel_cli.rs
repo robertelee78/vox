@@ -749,6 +749,12 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::BadLink) => {
             "that address will not parse, or names a room this node cannot use\n       this one IS the address — check you copied all of it"
         }
+        // The address was fine: it named a room, and the board simply does not hold it yet. The
+        // one thing to say is who has to act — the host, by being online — and that retrying
+        // after that is the whole remedy.
+        Some(Fault::RoomNotOnBoard) => {
+            "the room is not on that board yet — its host has not published it there\n       the address is fine; the host must be online to publish the room\n       make sure it is, then run this again"
+        }
         // **Do not claim the passphrase is fine here.** Nobody answered, so nobody
         // checked it — a wrong passphrase against an offline room reaches exactly this
         // branch. The first version of this fix said "NOT the address or the
@@ -783,6 +789,7 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
     Some(match name {
         "WrongPassphrase" => Fault::WrongPassphrase,
         "BadLink" => Fault::BadLink,
+        "RoomNotOnBoard" => Fault::RoomNotOnBoard,
         "Unreachable" => Fault::Unreachable,
         "Refused" => Fault::Refused,
         "NotNetworked" => Fault::NotNetworked,
