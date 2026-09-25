@@ -75,11 +75,15 @@ pub enum StructTag {
     /// only on such evidence, which is what makes "no member can add another member"
     /// enforceable rather than merely intended.
     JoinWitness = 0x0014,
+    /// `0x0015` — key-package (ADR-023 decision 4, M23.3): a sender-key message sealed to one
+    /// member and posted to the room's log, so any member that replicates the log carries it
+    /// to a recipient who is never online with its sender.
+    KeyPackage = 0x0015,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 20] = [
+    pub const ALL: [StructTag; 21] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -100,6 +104,7 @@ impl StructTag {
         StructTag::MemberBundleRecord,
         StructTag::ServiceGrantExclusion,
         StructTag::JoinWitness,
+        StructTag::KeyPackage,
     ];
 
     /// The 2-byte tag value.
@@ -110,7 +115,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 20-element table: trivial and avoids an
+        // Linear scan over a 21-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -144,6 +149,7 @@ impl StructTag {
             StructTag::SessionEstablishment => "vox/session-establishment/v1",
             StructTag::MemberBundleRecord => "vox/member-bundle-record/v1",
             StructTag::JoinWitness => "vox/join-witness/v1",
+            StructTag::KeyPackage => "vox/key-package/v1",
         }
     }
 }

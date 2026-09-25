@@ -275,6 +275,10 @@ pub struct ChannelState {
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
     timeline: Vec<Rendered>,
+    /// Key-packages addressed to this identity that arrived in the log and are not installed
+    /// yet, oldest first (ADR-023 decision 4). Installing one needs this identity's prekey
+    /// ring, which the actor holds, so the actor drains them ([`Self::take_inbound_packages`]).
+    inbound_packages: Vec<crate::node::keypackage::KeyPackage>,
     /// Accepted governance entries (consent grants and the rest) in acceptance
     /// order — the evaluator's input, rebuilt from the log on open (M14.5).
     gov_entries: Vec<GovEntry>,
@@ -571,6 +575,12 @@ pub(crate) fn classify_payload(payload: &[u8]) -> Result<EntryKind> {
     if payload.starts_with(GROUP_MSG_SIGN_DOMAIN.as_bytes()) {
         return Ok(EntryKind::Content);
     }
+    // A key-package (ADR-023 decision 4) is framed like governance and carried like content:
+    // any member may post one and it governs nothing. So the DAG sees content, and the channel
+    // recognises it by its tag before trying to render it.
+    if crate::node::keypackage::KeyPackage::is_key_package(payload) {
+        return Ok(EntryKind::Content);
+    }
     if crate::wire::parse_frame(payload).is_ok() {
         return Ok(EntryKind::Governance);
     }
@@ -817,6 +827,7 @@ impl ChannelState {
             sender,
             next_log_id: 1,
             timeline: Vec::new(),
+            inbound_packages: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
@@ -885,6 +896,11 @@ impl ChannelState {
         let mut dag = Dag::new();
         let mut next_log_id = 1u64;
         let mut gov_entries = Vec::new();
+        // Key-packages for this identity found on reload are offered again: installing one
+        // twice is harmless (`accept_skdm` keeps the live chain), and one that arrived just
+        // before a crash would otherwise never be installed.
+        let me = signer.fingerprint();
+        let mut inbound_packages = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::LogDb)? {
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
             let entry = Entry::from_wire(&wire)?;
@@ -897,6 +913,14 @@ impl ChannelState {
                 .as_deref()
                 .ok_or(Error::MalformedAtRest("stored entry payload pruned"))?;
             let kind = classify_payload(payload)?;
+            if let Some(pkg) = Some(payload)
+                .filter(|p| crate::node::keypackage::KeyPackage::is_key_package(p))
+                .and_then(|p| crate::node::keypackage::KeyPackage::from_wire(p).ok())
+            {
+                if pkg.recipient == me {
+                    inbound_packages.push(pkg);
+                }
+            }
             if kind == EntryKind::Governance {
                 gov_entries.push(GovEntry::from_verified_log_entry(
                     &entry,
@@ -1007,6 +1031,7 @@ impl ChannelState {
             sender,
             next_log_id,
             timeline,
+            inbound_packages,
             gov_entries,
             receivers,
             anchors,
@@ -1221,6 +1246,7 @@ impl ChannelState {
             sender,
             next_log_id: 1,
             timeline: Vec::new(),
+            inbound_packages: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
@@ -1523,6 +1549,93 @@ impl ChannelState {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// If `payload` is a key-package, queue it when it is for this identity and say so; the
+    /// caller then neither renders nor retries it as a message.
+    fn queue_if_key_package(&mut self, payload: &[u8]) -> bool {
+        if !crate::node::keypackage::KeyPackage::is_key_package(payload) {
+            return false;
+        }
+        if let Ok(pkg) = crate::node::keypackage::KeyPackage::from_wire(payload) {
+            if pkg.recipient == self.me() {
+                self.inbound_packages.push(pkg);
+            }
+        }
+        true
+    }
+
+    /// Take the key-packages addressed to this identity that the log delivered since the last
+    /// call (ADR-023 decision 4). The caller installs them with its prekey ring.
+    pub fn take_inbound_packages(&mut self) -> Vec<crate::node::keypackage::KeyPackage> {
+        std::mem::take(&mut self.inbound_packages)
+    }
+
+    /// Every key-package this node holds in the room's log, with its author, whoever it is
+    /// for — a diagnostic of what this node carries, not of what it can open.
+    #[must_use]
+    pub fn key_packages(&self) -> Vec<(Digest32, crate::node::keypackage::KeyPackage)> {
+        let mut out = Vec::new();
+        for author in self.authors.keys() {
+            let Some(feed) = self.dag.feed(author) else {
+                continue;
+            };
+            for seq in 1..=feed.max_seq() {
+                let Some(payload) = feed.get(seq).and_then(|e| e.payload.as_deref()) else {
+                    continue;
+                };
+                if let Ok(pkg) = crate::node::keypackage::KeyPackage::from_wire(payload) {
+                    out.push((*author, pkg));
+                }
+            }
+        }
+        out
+    }
+
+    /// Post a key-package to the room's log (ADR-023 decision 4): an entry every member
+    /// replicates, carrying a sender key to one member who may never be online with its
+    /// sender. Content-kind for the DAG; never rendered, never cached.
+    ///
+    /// # Errors
+    /// If this identity is not an author, the channel is poisoned, or the persist fails.
+    pub fn append_key_package(
+        &mut self,
+        profile: &Profile,
+        package: &crate::node::keypackage::KeyPackage,
+    ) -> Result<Digest32> {
+        if self.poisoned {
+            return Err(Error::Profile(
+                "channel is poisoned after a failed persist; reopen it",
+            ));
+        }
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        if !self.authors.contains_key(&me) {
+            return Err(Error::Profile(
+                "this identity is not an author of the channel",
+            ));
+        }
+        let payload = package.to_wire();
+        let skeleton = self.next_skeleton(&me, &payload);
+        let entry = Entry::build_signed(signer, skeleton, payload)?;
+        let entry_hash = entry.entry_hash();
+        let wire = entry.to_wire();
+        let id = self.next_log_id;
+        let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
+        let key = signer.public_key();
+        self.dag
+            .accept(entry, EntryKind::Content, &key, &self.admission)
+            .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
+        if let Err(e) =
+            profile
+                .store()
+                .put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)
+        {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.next_log_id = id.saturating_add(1);
+        Ok(entry_hash)
     }
 
     /// This identity's fingerprint in this channel — structurally the author of its
@@ -2083,6 +2196,9 @@ impl ChannelState {
                     out.governance += 1;
                 }
                 EntryKind::Content => {
+                    if self.queue_if_key_package(&payload) {
+                        continue;
+                    }
                     if self.render_content(store, author, entry_hash, &payload, now_secs)? {
                         out.rendered += 1;
                     }
@@ -2401,6 +2517,9 @@ impl ChannelState {
                     .get_by_hash(&entry_hash)
                     .and_then(|e| e.payload.clone())
                     .ok_or(Error::MalformedGovernance("accepted entry payload missing"))?;
+                if self.queue_if_key_package(&payload) {
+                    return Ok(Accepted::ContentNotReadable);
+                }
                 if self.render_content(store, author, entry_hash, &payload, now_secs)? {
                     Ok(Accepted::Rendered)
                 } else {

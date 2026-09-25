@@ -3164,6 +3164,9 @@ impl Node {
                     Some(Outcome::Failed(Fault::Unreachable)),
                 )
                 .await;
+                // The fast path failed: what this node owes that member goes into the log,
+                // where an always-on member carries it (ADR-023 decision 4).
+                self.deliver_through_log(peer).await;
                 let _ = self.event_tx.send(NodeEvent::PeerUnreachable { peer, why });
             }
             NetEvent::UpgradeFailed { peer, reason } => {
@@ -3267,6 +3270,9 @@ impl Node {
                 outcome,
             } => {
                 self.syncing.remove(&channel_id);
+                // Sender keys the log delivered in this session (ADR-023 decision 4). Whatever
+                // the outcome: a session that failed late may have applied some entries first.
+                self.install_key_packages(&channel_id).await;
                 self.answer_pending_consents(|room, _| *room == channel_id, None)
                     .await;
                 // **A session that failed delivered nothing, so its push is owed again.**
@@ -5158,6 +5164,252 @@ impl Node {
         false
     }
 
+    /// **Store-and-forward for a member the direct path could not reach** (ADR-023 decision 4,
+    /// M23.3).
+    ///
+    /// Sender keys go to a member on a pairwise stream, and that stays the fast path. But a
+    /// member who is never online with this node could not be given a key at all: two members
+    /// converged on each other's ciphertext and neither could read it. So when a dial to a
+    /// member fails, whatever this node owes it — the key a trust decision released, or the new
+    /// generation after a rotation — is sealed to that member and posted to the room's log as a
+    /// key-package. Every member replicates the log, so an always-on member carries it to them.
+    ///
+    /// The consent is issued exactly as the direct path issues it: the key is delivered by the
+    /// log instead of the stream, and it is the same key.
+    async fn deliver_through_log(&mut self, peer: Digest32) {
+        if self.net.is_none() {
+            return;
+        }
+        let trusted = self.trust.trusted();
+        let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+        for channel_id in channels {
+            let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+                continue;
+            };
+            let (owes_consent, owes_rekey) = {
+                let channel = shared.lock().await;
+                (
+                    channel.owed_consents(&trusted).contains(&peer),
+                    channel.owed_rekeys().contains(&peer),
+                )
+            };
+            if owes_consent {
+                let skdm = {
+                    let Some(profile) = self.profile.as_ref() else {
+                        return;
+                    };
+                    let Ok(skdm) = shared.lock().await.skdm_for_consent(profile) else {
+                        continue;
+                    };
+                    skdm
+                };
+                if self.post_key_package(&channel_id, peer, &skdm).await {
+                    let now = self.now();
+                    let issued = {
+                        let Some(profile) = self.profile.as_ref() else {
+                            return;
+                        };
+                        shared
+                            .lock()
+                            .await
+                            .issue_consent(profile, peer, &skdm, now)
+                            .is_ok()
+                    };
+                    if issued {
+                        self.note_local_append(&channel_id);
+                        let _ = self.event_tx.send(NodeEvent::Consented {
+                            channel_id,
+                            target: peer,
+                        });
+                    }
+                }
+            } else if owes_rekey {
+                let (skdm, generation) = {
+                    let Some(profile) = self.profile.as_ref() else {
+                        return;
+                    };
+                    let channel = shared.lock().await;
+                    let Ok(skdm) = channel.rekey_skdm(profile) else {
+                        continue;
+                    };
+                    (skdm, channel.sender_generation())
+                };
+                if self.post_key_package(&channel_id, peer, &skdm).await {
+                    let Some(profile) = self.profile.as_ref() else {
+                        return;
+                    };
+                    let _ = shared
+                        .lock()
+                        .await
+                        .note_delivered(profile.store(), peer, generation);
+                }
+            }
+        }
+    }
+
+    /// Seal `skdm` to `target` and post it to the room's log as a key-package (ADR-023
+    /// decision 4, M23.3). Returns whether it was posted.
+    ///
+    /// Needs the target's published prekey bundle, which this node holds once it has read a
+    /// board that carries it. Without one there is nothing to seal to, and the key stays owed.
+    async fn post_key_package(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        skdm: &crate::group::skdm::Skdm,
+    ) -> bool {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return false;
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return false;
+        };
+        let Ok(ctx) = shared.lock().await.join_context() else {
+            return false;
+        };
+        let Some(record) = net.board_bundle(channel_id, ctx.epoch, &target) else {
+            return false;
+        };
+        let package = {
+            let Some(ring) = self.prekeys.as_ref().map(Arc::clone) else {
+                return false;
+            };
+            let ring = ring.lock().await;
+            match crate::node::keypackage::KeyPackage::seal(
+                ring.identity_dh(),
+                &record.prekey_bundle,
+                &ctx,
+                target,
+                skdm,
+            ) {
+                Ok(p) => p,
+                Err(_) => return false,
+            }
+        };
+        let posted = {
+            let Some(profile) = self.profile.as_ref() else {
+                return false;
+            };
+            shared
+                .lock()
+                .await
+                .append_key_package(profile, &package)
+                .is_ok()
+        };
+        if posted {
+            // An entry like any other: it goes out on the next push.
+            self.note_local_append(channel_id);
+        }
+        posted
+    }
+
+    /// Install the key-packages the log has delivered to this identity in `channel_id`: open
+    /// each with a one-shot PQXDH against this node's own prekeys and hand the sender key to
+    /// the channel, which verifies it against its author and backfills what it opens.
+    async fn install_key_packages(&mut self, channel_id: &Digest32) {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let (packages, ctx) = {
+            let mut channel = shared.lock().await;
+            let packages = channel.take_inbound_packages();
+            if packages.is_empty() {
+                return;
+            }
+            let Ok(ctx) = channel.join_context() else {
+                return;
+            };
+            (packages, ctx)
+        };
+        let now = self.now();
+        for package in packages {
+            let Ok(init) = package.initial_message() else {
+                continue;
+            };
+            let Some(mut session) = self.respond_to_initial(&init, &ctx).await else {
+                continue;
+            };
+            let Ok(skdm) = package.open(&mut session, now) else {
+                continue;
+            };
+            let author = skdm.body.author_id;
+            let installed = {
+                let Some(profile) = self.profile.as_ref() else {
+                    return;
+                };
+                shared.lock().await.accept_skdm(profile.store(), &skdm, now)
+            };
+            if let Ok(backfilled) = installed {
+                let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
+                    channel_id: *channel_id,
+                    peer: author,
+                    backfilled: backfilled as u64,
+                });
+            }
+        }
+    }
+
+    /// The responder half of an ADR-004 PQXDH opening message: consume the one-time prekey it
+    /// names (persisted before the handshake completes, graded last-resort on reuse) and build
+    /// the session from this node's own prekey ring. Shared by a pairwise `Hello` and a
+    /// key-package (ADR-023 decision 4), which is the same opening message kept in the log.
+    async fn respond_to_initial(
+        &mut self,
+        init: &InitialMessage,
+        ctx: &crate::join::session::JoinContext,
+    ) -> Option<crate::pairwise::session::Session> {
+        let now = self.now();
+        let mut reuse = crate::pairwise::OtpReuseTracker::new();
+        let profile = self.profile.as_ref()?;
+        let store = profile.store();
+        let Ok(signer) = profile.signer() else {
+            return None;
+        };
+        // The ring is taken under its lock below, so take what the save needs first. The
+        // `Send + Sync` bound is load-bearing, not decoration: this function now awaits the
+        // ring lock, so the actor's whole future has to stay `Send`, and a bare
+        // `&dyn RootSigner` is not.
+        let signer: &(dyn crate::identity::composite::RootSigner + Send + Sync) = signer;
+        let ring = self.prekeys.as_ref().map(Arc::clone)?;
+        let mut ring = ring.lock().await;
+        if let Some(id) = init.one_time_prekey_id {
+            match ring.use_one_time(id, now) {
+                prekeys::OneTimeUse::Fresh => {}
+                prekeys::OneTimeUse::Reused => {
+                    // Seed the per-process tracker from the ring's persistent record so
+                    // the downgrade is graded even after a restart (ADR-004).
+                    reuse.observe(id);
+                }
+                prekeys::OneTimeUse::Unknown => return None,
+            }
+            // Persist the consume before the handshake completes: a crash here must not
+            // leave the prekey re-offerable.
+            if prekeys::save(store, signer, &ring).is_err() {
+                return None;
+            }
+        }
+        let signed_prekey = ring.signed_prekey_for(init.signed_prekey_id)?;
+        let one_time_prekey = init
+            .one_time_prekey_id
+            .and_then(|id| ring.consumed_one_time(id));
+        let prekeys = crate::pairwise::ResponderPrekeys {
+            identity_dh_key: ring.identity_dh(),
+            signed_prekey,
+            one_time_prekey,
+        };
+        let Ok(session) = crate::pairwise::session::Session::accept(
+            init,
+            &prekeys,
+            &ctx.channel_id,
+            ctx.epoch,
+            &mut reuse,
+            ctx.floor,
+        ) else {
+            return None;
+        };
+        Some(session)
+    }
+
     /// Accept an inbound [`PairwiseFrame::Hello`], establishing the responder half of
     /// a session a peer opened from our bundle record. `true` if a session now exists.
     ///
@@ -5216,59 +5468,7 @@ impl Node {
                 Err(_) => return false,
             }
         };
-        let now = self.now();
-        let mut reuse = crate::pairwise::OtpReuseTracker::new();
-        let Some(profile) = self.profile.as_ref() else {
-            return false;
-        };
-        let store = profile.store();
-        let Ok(signer) = profile.signer() else {
-            return false;
-        };
-        // The ring is taken under its lock below, so take what the save needs first. The
-        // `Send + Sync` bound is load-bearing, not decoration: this function now awaits the
-        // ring lock, so the actor's whole future has to stay `Send`, and a bare
-        // `&dyn RootSigner` is not.
-        let signer: &(dyn crate::identity::composite::RootSigner + Send + Sync) = signer;
-        let Some(ring) = self.prekeys.as_ref().map(Arc::clone) else {
-            return false;
-        };
-        let mut ring = ring.lock().await;
-        if let Some(id) = init.one_time_prekey_id {
-            match ring.use_one_time(id, now) {
-                prekeys::OneTimeUse::Fresh => {}
-                prekeys::OneTimeUse::Reused => {
-                    // Seed the per-process tracker from the ring's persistent record so
-                    // the downgrade is graded even after a restart (ADR-004).
-                    reuse.observe(id);
-                }
-                prekeys::OneTimeUse::Unknown => return false,
-            }
-            // Persist the consume before the handshake completes: a crash here must not
-            // leave the prekey re-offerable.
-            if prekeys::save(store, signer, &ring).is_err() {
-                return false;
-            }
-        }
-        let Some(signed_prekey) = ring.signed_prekey_for(init.signed_prekey_id) else {
-            return false;
-        };
-        let one_time_prekey = init
-            .one_time_prekey_id
-            .and_then(|id| ring.consumed_one_time(id));
-        let prekeys = crate::pairwise::ResponderPrekeys {
-            identity_dh_key: ring.identity_dh(),
-            signed_prekey,
-            one_time_prekey,
-        };
-        let Ok(session) = crate::pairwise::session::Session::accept(
-            &init,
-            &prekeys,
-            &ctx.channel_id,
-            ctx.epoch,
-            &mut reuse,
-            ctx.floor,
-        ) else {
+        let Some(session) = self.respond_to_initial(&init, &ctx).await else {
             return false;
         };
         self.sessions.insert(key, session);
@@ -5900,6 +6100,7 @@ impl Node {
                 self.refresh_network_view().await;
                 self.publish_channel_locally(channel_id).await;
                 self.publish_channel_to_anchors(channel_id).await;
+                self.install_key_packages(channel_id).await;
                 let _ = self.event_tx.send(NodeEvent::ChannelOpened {
                     channel_id: *channel_id,
                 });
