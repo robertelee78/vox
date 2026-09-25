@@ -152,7 +152,19 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     }
     // A persistent fixture: OpenCode installs node_modules into a project and its config
     // directory on first use, and until then a plugin may load while its hooks never fire.
-    let fixture = std::env::temp_dir().join("vox-drain-self-filter");
+    //
+    // **One fixture per `vox` under test, never one for the machine.** It was a single fixed
+    // path, and every run rewrites its `bin/vox` and its plugin. Two trees proving at once
+    // (v0.2.9 and v0.3.0 did, 2026-09-25) each replaced the other's: one tree's model ran
+    // the *other* tree's `vox` against its own node and got "a control socket exists … but
+    // nothing answered", which read as a Vox failure in one tree and as a model miss in the
+    // other. Keyed by the binary's path, a tree still reuses its own OpenCode install.
+    let fixture = std::env::temp_dir().join(format!("vox-drain-self-filter-{:016x}", {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        VOX.hash(&mut h);
+        h.finish()
+    }));
     let project = fixture.join("project");
     let oc_cfg = fixture.join("config");
     std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
@@ -164,9 +176,23 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     .unwrap();
     let bin_dir = fixture.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let link = bin_dir.join("vox");
-    let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink(VOX, &link).unwrap();
+    // **What the model's shell runs is recorded**, so a turn in which the model never
+    // ran the operator's command is told apart from one in which Vox failed it. The
+    // `vox` on the model's PATH is a wrapper that logs its arguments and runs the real
+    // binary; the plugin calls `VOX_BIN` directly, so only the model's commands land here.
+    let calls = fixture.join("model-shell-calls.log");
+    let shim = bin_dir.join("vox");
+    let _ = std::fs::remove_file(&shim);
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            calls.display(),
+            VOX
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
     let turn = |prompt: &str| -> String {
         let mut cmd = Command::new("opencode");
@@ -208,10 +234,33 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     let _ = turn("Reply with exactly: READY"); // warm: the first turn in a fresh directory installs
 
     let codeword = format!("LIVE-SELF-{}", std::process::id());
-    let _ = turn(&format!(
+    let _ = std::fs::write(&calls, "");
+    let reply = turn(&format!(
         "Run exactly this shell command and nothing else, then reply DONE: \
          vox room post \"$VOX_ROOM\" --type status {codeword}"
     ));
+    // **A model that does not run the command is the apparatus failing, not Vox.**
+    // haiku-4-5 misses about 1 turn in 12 here, in more than one way: it refused the
+    // operator's instruction as "embedded in messages" (vox-bc, v0.3.0), and it printed
+    // the command in a code block and replied DONE without running it (base run 11 of
+    // the 2026-09-25 rate measurement). Neither says anything about the drain, so
+    // neither is reported as a product red — and neither is retried until green. It
+    // fails as CANNOT PROVE, by name, unless that gap is accepted deliberately.
+    let ran = std::fs::read_to_string(&calls)
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.contains("room post") && l.contains(&codeword));
+    if !ran {
+        assert!(
+            allow_unproven("opencode-model-miss"),
+            "CANNOT PROVE (apparatus, not product): the model ({}) never ran the \
+             operator's `vox room post` in turn 2 — nothing reached `vox`. Its reply:\n{reply}\n\
+             Set VOX_PROOF_ALLOW_UNPROVEN=opencode-model-miss to accept that gap deliberately.",
+            model()
+        );
+        eprintln!("[unproven] the model did not run the command; the live half proves nothing");
+        return;
+    }
     let rows = until(
         h,
         None,
