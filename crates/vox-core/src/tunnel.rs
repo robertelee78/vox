@@ -33,3 +33,4 @@ pub mod service;
 pub mod session;
 pub mod socks;
 pub mod sshca;
+pub mod udp;

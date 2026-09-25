@@ -352,6 +352,7 @@ fn restarts_are_recognised_by_silence(comeback: Comeback) {
                 local_name: "infra".into(),
                 passphrase: secret("generated passphrase"),
                 port,
+                udp: false,
                 at: Some(service_addr),
             })
             .await;

@@ -317,18 +317,28 @@ pub fn service_list(node: &NodeHandle, channel_id: Digest32) {
 pub async fn forward(
     node: &NodeHandle,
     channel_id: Digest32,
-    host_prefix: &str,
-    tag: &str,
+    host_prefix: Option<&str>,
+    service: &str,
     local: SocketAddr,
 ) -> Result<(), AppError> {
     let view = node.view();
-    let members: Vec<Digest32> = view
+    let detail = view
         .open_channels
         .iter()
-        .find(|d| d.channel_id == channel_id)
-        .map(|d| d.members.clone())
-        .unwrap_or_default();
-    let host = resolve_prefix(host_prefix, &members)?;
+        .find(|d| d.channel_id == channel_id);
+    let host = match host_prefix {
+        Some(prefix) => {
+            let members: Vec<Digest32> = detail.map(|d| d.members.clone()).unwrap_or_default();
+            resolve_prefix(prefix, &members)?
+        }
+        // A `.vox` name reaches the room's genesis creator (ADR-017).
+        None => detail
+            .map(|d| d.creator)
+            .ok_or_else(|| AppError::Usage("that room is not open".into()))?,
+    };
+    // `53/udp` is the service `udp/53`; anything that is not a port spec is a tag as is.
+    let label = vox_core::tunnel::udp::service_label(service).unwrap_or_else(|| service.to_owned());
+    let tag = label.as_str();
     // **Retried until the host becomes reachable, not asked once.**
     //
     // `forward` is a one-shot verb: it starts a node, opens the room and dials, all inside a few
@@ -446,8 +456,11 @@ fn reachable_or_relayed(node: &NodeHandle, anchors: &BootstrapSet) -> bool {
     })
 }
 
-/// `vox serve <port>` — create a service room, offer the port in it, and serve until
-/// interrupted (ADR-017 decisions 3 and 4).
+/// `vox serve <port>[/udp] …` — create a service room, offer the ports in it, and serve
+/// until interrupted (ADR-017 decisions 3 and 4; ADR-022 decision 6 for `/udp`).
+///
+/// The first spec creates the room; any further ones are added to it, so TCP 53 and UDP 53
+/// can be served together (`vox serve 53 53/udp`). `--at` applies to every spec.
 ///
 /// Prints three things and says plainly that two of them must travel separately: the
 /// address is a rendezvous, and the passphrase is what turns it into access (ADR-005).
@@ -455,9 +468,26 @@ pub async fn serve(
     node: &NodeHandle,
     anchors: &BootstrapSet,
     name: &str,
-    port: u16,
+    specs: &[String],
     at: Option<SocketAddr>,
 ) -> Result<(), AppError> {
+    // Parsed before anything is created: a typo must not leave a half-made room.
+    let mut services: Vec<(u16, String)> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let label = vox_core::tunnel::udp::service_label(spec).ok_or_else(|| {
+            AppError::Usage(format!(
+                "{spec:?} is not a port: use <port>, <port>/tcp or <port>/udp"
+            ))
+        })?;
+        let port = label
+            .trim_start_matches("udp/")
+            .parse()
+            .map_err(|_| AppError::Usage(format!("{spec:?} is not a port")))?;
+        services.push((port, label));
+    }
+    let Some((port, first)) = services.first().cloned() else {
+        return Err(AppError::Usage("name at least one port to serve".into()));
+    };
     if !reachable_or_relayed(node, anchors) {
         return Err(AppError::Usage(
             "this machine has no address a guest could reach and no anchor to relay \
@@ -474,6 +504,7 @@ pub async fn serve(
             local_name: name.to_owned(),
             passphrase: Secret::new(passphrase.as_bytes().to_vec()),
             port,
+            udp: vox_core::tunnel::udp::is_udp(&first),
             at,
         })
         .await;
@@ -488,6 +519,20 @@ pub async fn serve(
         .find(|id| !before.contains(id))
         .ok_or_else(|| AppError::Usage("the room was not created".into()))?;
 
+    for (port, label) in services.iter().skip(1) {
+        let local = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], *port)));
+        let out = node
+            .apply(NodeCommand::AddService {
+                channel_id,
+                service_tag: label.clone(),
+                local,
+            })
+            .await;
+        if !out.is_done() {
+            return Err(AppError::Usage(format!("cannot serve {label}: {out:?}")));
+        }
+    }
+
     let out = node.apply(NodeCommand::Invite { channel_id }).await;
     if !out.is_done() {
         return Err(AppError::Usage(format!("cannot mint an address: {out}")));
@@ -500,16 +545,23 @@ pub async fn serve(
         }
     };
 
-    let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)));
     println!("room       {}", b32_encode(&channel_id));
     println!("address    {url}");
     println!("passphrase {}", passphrase.as_str());
     println!("           ^ send this by a different channel than the address");
     println!();
-    println!(
-        "serving {endpoint} at port {port} of {}",
-        vox_hostname(&channel_id)
-    );
+    for (port, label) in &services {
+        let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], *port)));
+        let proto = if vox_core::tunnel::udp::is_udp(label) {
+            "/udp"
+        } else {
+            ""
+        };
+        println!(
+            "serving {endpoint} at port {port}{proto} of {}",
+            vox_hostname(&channel_id)
+        );
+    }
     // **Not "anyone who joins with both".** That was true of the withdrawn model, where a
     // room's genesis authorized every admitted member and joining WAS the authorization
     // (ADR-017 decision 3 as revised, M17.7). Printing it now would tell a person the
