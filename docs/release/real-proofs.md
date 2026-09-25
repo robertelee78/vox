@@ -3,6 +3,7 @@
 - **Source**: the decider's choice (a) for V29-17, 2026-09-25: a test that does not drive the shipped `vox` is kept only while it backs a product claim, and each such test gets its own item to replace it. *"I don't like clutter I don't like junk. I don't want to pretend that a test is a valuable thing unless it actually is."*
 - **Rule for every item**: the replacement drives the shipped `vox` (and only it) for every node in the claim, is mutation-checked (it goes red when the behaviour it covers is broken), and the in-process test is deleted in the same change. Until then the in-process test is never cited as evidence.
 - **Delivery boundary**: an item is delivered when its replacement is merged to `main`.
+- **Exempt**: `vox-core/tests/watchdog_proof.rs` proves the test harness's own watchdog (a hung test process is killed), not the product, so it makes no product claim and needs no replacement.
 
 ### RP-01 — The agent-comms envelope and claim rules hold, through the shipped binary
 **Why.** `crates/vox-agentcomms/tests/agentcomms_gate.rs` runs every node in-process, so it is not proof that a person running `vox` gets this.
@@ -223,3 +224,8 @@
 **Why.** `crates/vox-core/tests/node_m17_up_gate.rs` runs every node in-process, so it is not proof that a person running `vox` gets this.
 **Acceptance.** A proof that drives only the shipped `vox` shows that a .vox name for a room this machine never joined is refused at the proxy, goes red under a mutation that breaks it, and `crates/vox-core/tests/node_m17_up_gate.rs` is deleted.
 **Validation.** The new proof is green on `main` and red under its mutation; `crates/vox-core/tests/node_m17_up_gate.rs` no longer exists.
+
+### RP-45 — A wedged client cannot stall a node and is told it lagged, through the shipped binary
+**Why.** `crates/vox-core/tests/node_m19_fanout_gate.rs` runs every node in-process, so it is not proof that a person running `vox` gets this.
+**Acceptance.** A proof that drives only the shipped `vox` shows that a wedged client cannot stall a node and is told it lagged, goes red under a mutation that breaks it, and `crates/vox-core/tests/node_m19_fanout_gate.rs` is deleted.
+**Validation.** The new proof is green on `main` and red under its mutation; `crates/vox-core/tests/node_m19_fanout_gate.rs` no longer exists.
