@@ -36,7 +36,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};

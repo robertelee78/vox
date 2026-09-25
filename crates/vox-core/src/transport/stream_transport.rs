@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 use tokio::runtime::Handle;
 
 use crate::error::{Error, Result};

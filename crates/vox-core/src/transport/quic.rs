@@ -39,14 +39,14 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use quinn::{Connection, Endpoint, RecvStream, Runtime, SendStream};
+use noq::{Connection, Endpoint, RecvStream, Runtime, SendStream};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
 use crate::transport::datagram::{parse_datagram, DatagramSender, ReplayWindow, SEQ_PREFIX_LEN};
 use crate::transport::identity_cert::build_leaf_certificate;
-use crate::transport::mux::{CircuitPort, MuxSocket};
+use crate::transport::mux::{shared_socket, CircuitPort, MuxSocket, SharedUdpSocket};
 use crate::transport::provider::{client_config, server_config, X25519MLKEM768_CODE_POINT};
 use crate::transport::session::SessionEstablishment;
 use crate::transport::verifier::{VerifiedPeer, VoxClientCertVerifier, VoxServerCertVerifier};
@@ -61,8 +61,8 @@ pub const MAX_STREAM_FRAME: usize = crate::log::sync::MAX_ENTRY_WIRE + 4096;
 /// The QUIC application close code carried when a sync stream hard-fails. quinn
 /// requires a `VarInt`; the M5 [`WireError`] byte is widened into it so the peer
 /// observes the exact coded reason (ADR-008 — never a silent downgrade).
-pub fn close_code(err: WireError) -> quinn::VarInt {
-    quinn::VarInt::from_u32(u32::from(err.code()))
+pub fn close_code(err: WireError) -> noq::VarInt {
+    noq::VarInt::from_u32(u32::from(err.code()))
 }
 
 /// A Vox QUIC endpoint: it owns the local UDP socket and the authenticated TLS
@@ -158,12 +158,17 @@ const OPEN_STREAM_PATIENCE: std::time::Duration = std::time::Duration::from_secs
 pub(crate) const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The transport parameters every Vox connection runs with, in both directions.
-fn transport_config() -> Arc<quinn::TransportConfig> {
-    let mut cfg = quinn::TransportConfig::default();
+fn transport_config() -> Arc<noq::TransportConfig> {
+    let mut cfg = noq::TransportConfig::default();
+    // EXPERIMENT (branch agentcomms/exp-noq, not for merge): congestion control is noq's
+    // BBRv3 at its default configuration, in place of the Cubic default, so a throughput
+    // gate can measure it against quinn 0.11 + Cubic. Unconditional on purpose: this
+    // branch *is* the experiment.
+    cfg.congestion_controller_factory(Arc::new(noq::congestion::Bbr3Config::default()));
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
     // `From<VarInt>` rather than `try_from(Duration)`: the millisecond value is a compile-
     // time constant inside the varint range, so there is no error case to handle.
-    cfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
+    cfg.max_idle_timeout(Some(noq::IdleTimeout::from(noq::VarInt::from_u32(
         MAX_IDLE_MS,
     ))));
     Arc::new(cfg)
@@ -198,10 +203,10 @@ impl VoxEndpoint {
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
-        let wrapped = quinn::TokioRuntime
+        let wrapped = noq::TokioRuntime
             .wrap_udp_socket(socket)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
-        Self::bind_abstract(signer, wrapped)
+        Self::bind_socket(signer, wrapped)
     }
 
     /// Bind on a caller-supplied datagram socket instead of a real UDP socket.
@@ -213,19 +218,25 @@ impl VoxEndpoint {
     /// hook any other datagram substrate would use.
     pub fn bind_abstract<S: RootSigner>(
         signer: &S,
-        socket: Arc<dyn quinn::AsyncUdpSocket>,
+        socket: Arc<dyn SharedUdpSocket>,
+    ) -> Result<Self> {
+        Self::bind_socket(signer, shared_socket(socket))
+    }
+
+    /// Bind on an owned noq socket, real or adapted.
+    fn bind_socket<S: RootSigner>(
+        signer: &S,
+        socket: Box<dyn noq::AsyncUdpSocket>,
     ) -> Result<Self> {
         // Every endpoint runs on the multiplexer, so a relay circuit can be attached
         // to a real socket and a simulated one alike.
-        let mux = MuxSocket::new(socket);
-        let for_endpoint: Arc<dyn quinn::AsyncUdpSocket> =
-            Arc::clone(&mux) as Arc<dyn quinn::AsyncUdpSocket>;
+        let (mux, for_endpoint) = MuxSocket::new(socket);
         Self::bind_with(signer, mux, |cfg| {
             Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::default(),
+                noq::EndpointConfig::default(),
                 Some(cfg),
-                for_endpoint,
-                Arc::new(quinn::TokioRuntime),
+                Box::new(for_endpoint),
+                Arc::new(noq::TokioRuntime),
             )
         })
     }
@@ -266,7 +277,7 @@ impl VoxEndpoint {
     fn bind_with<S: RootSigner>(
         signer: &S,
         mux: Arc<MuxSocket>,
-        make: impl FnOnce(quinn::ServerConfig) -> std::io::Result<Endpoint>,
+        make: impl FnOnce(noq::ServerConfig) -> std::io::Result<Endpoint>,
     ) -> Result<Self> {
         let leaf = build_leaf_certificate(signer)?;
         let leaf_chain = leaf.cert_chain();
@@ -285,9 +296,9 @@ impl VoxEndpoint {
             leaf_chain.clone(),
             leaf.private_key(),
         )?;
-        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(s_cfg)
+        let quic_server = noq::crypto::rustls::QuicServerConfig::try_from(s_cfg)
             .map_err(|_| Error::MalformedBundle("quic server config"))?;
-        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        let mut server_cfg = noq::ServerConfig::with_crypto(Arc::new(quic_server));
         server_cfg.transport_config(transport_config());
 
         let endpoint =
@@ -336,9 +347,9 @@ impl VoxEndpoint {
             self.leaf_chain.clone(),
             self.clone_key(),
         )?;
-        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(c_cfg)
+        let quic_client = noq::crypto::rustls::QuicClientConfig::try_from(c_cfg)
             .map_err(|_| Error::MalformedBundle("quic client config"))?;
-        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
+        let mut client_cfg = noq::ClientConfig::new(Arc::new(quic_client));
         client_cfg.transport_config(transport_config());
 
         // The SNI server name is unused for authentication (we authenticate by the
@@ -403,7 +414,7 @@ impl VoxEndpoint {
     /// an anchor is.
     ///
     /// `None` when the endpoint is closed.
-    pub async fn accept_incoming(&self) -> Option<quinn::Incoming> {
+    pub async fn accept_incoming(&self) -> Option<noq::Incoming> {
         self.endpoint.accept().await
     }
 
@@ -414,7 +425,7 @@ impl VoxEndpoint {
     /// an accept loop.
     pub async fn finish_incoming(
         &self,
-        incoming: quinn::Incoming,
+        incoming: noq::Incoming,
         now_secs: u64,
         mut admission: Admission,
     ) -> Result<VoxConnection> {
@@ -427,9 +438,9 @@ impl VoxEndpoint {
             self.leaf_chain.clone(),
             self.clone_key(),
         )?;
-        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(s_cfg)
+        let quic_server = noq::crypto::rustls::QuicServerConfig::try_from(s_cfg)
             .map_err(|_| Error::MalformedBundle("quic server config (accept)"))?;
-        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        let mut server_cfg = noq::ServerConfig::with_crypto(Arc::new(quic_server));
         server_cfg.transport_config(transport_config());
         // Bounded: an unauthenticated peer must not be able to hold a task open for ever by
         // beginning a handshake and never finishing it.
@@ -455,7 +466,7 @@ impl VoxEndpoint {
     /// Gracefully close the endpoint (all connections).
     pub fn close(&self) {
         self.endpoint
-            .close(quinn::VarInt::from_u32(0), b"endpoint closed");
+            .close(noq::VarInt::from_u32(0), b"endpoint closed");
     }
 
     /// Clone the private key (rustls `PrivateKeyDer` is clone-by-method).
@@ -517,7 +528,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// mismatch breaks the handshake rather than passing quietly. The group cannot be
 /// checked *here* because quinn 0.11 gates rustls's
 /// `negotiated_key_exchange_group` behind a test-only cfg, so the value rustls holds
-/// is not reachable from the connection.
+/// is not reachable from the connection. (On the noq experiment branch the value *is*
+/// reachable — `HandshakeData::negotiated_key_exchange_group` — but this check is kept
+/// exactly as it is on main, so the experiment changes nothing but the transport.)
 ///
 /// The ALPN check is still worth keeping: it confirms a Vox-configured handshake
 /// completed, and a non-Vox config would not carry this protocol.
@@ -525,7 +538,7 @@ fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
     let Some(hd) = connection.handshake_data() else {
         return Err(Error::SignatureInvalid);
     };
-    let Some(hd) = hd.downcast_ref::<quinn::crypto::rustls::HandshakeData>() else {
+    let Some(hd) = hd.downcast_ref::<noq::crypto::rustls::HandshakeData>() else {
         return Err(Error::SignatureInvalid);
     };
     match &hd.protocol {
@@ -665,11 +678,29 @@ impl VoxConnection {
             .close(close_code(err), err.to_string().as_bytes());
     }
 
-    /// The underlying quinn connection, for advanced callers (M11 tunnels).
+    /// The underlying noq connection, for advanced callers (M11 tunnels). Named
+    /// `quinn` still: the noq port is an experiment and keeps call sites unchanged.
     #[must_use]
     pub fn quinn(&self) -> &Connection {
         &self.connection
     }
+
+    /// The peer's current address: the address of the connection's one path.
+    ///
+    /// noq is multipath-capable and so addresses a peer per path; Vox does not enable
+    /// multipath, so [`noq::PathId::ZERO`] is the only path, and it migrates as quinn's
+    /// connection did. `None` only once that path is closed, which is the connection
+    /// closing.
+    #[must_use]
+    pub fn remote_address(&self) -> Option<SocketAddr> {
+        remote_address(&self.connection)
+    }
+}
+
+/// The address of `conn`'s one path — see [`VoxConnection::remote_address`].
+#[must_use]
+pub fn remote_address(conn: &Connection) -> Option<SocketAddr> {
+    conn.path(noq::PathId::ZERO)?.remote_address().ok()
 }
 
 // The M5 `Transport` over a reliable QUIC bi-stream lives in its own module to

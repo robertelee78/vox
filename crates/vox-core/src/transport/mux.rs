@@ -44,12 +44,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, UdpPoller};
+use noq::udp::{RecvMeta, Transmit};
+use noq::{AsyncUdpSocket, UdpSender};
 use tokio::sync::mpsc;
 
 use crate::error::Result;
@@ -109,9 +110,96 @@ fn key(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+/// A datagram socket a caller supplies instead of a real UDP socket — a simulated
+/// network, or any other substrate — through
+/// [`VoxEndpoint::bind_abstract`](crate::transport::quic::VoxEndpoint::bind_abstract).
+///
+/// Shared (`&self` throughout) so one socket can be handed to successive endpoints, as a
+/// restarted node does. noq's own [`AsyncUdpSocket`] receives through `&mut self` and so
+/// cannot be shared; [`shared_socket`] adapts this shape to it.
+///
+/// **Sends never block.** [`SharedUdpSocket::try_send`] either accepts the transmit or
+/// drops it, as a lossy path would; it must not return `WouldBlock`, because nothing
+/// would wake the sender again.
+pub trait SharedUdpSocket: Send + Sync + std::fmt::Debug + 'static {
+    /// Send one transmit (possibly several segments), or drop it.
+    ///
+    /// # Errors
+    /// A hard send failure, reported to the endpoint as the kernel's would be.
+    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()>;
+
+    /// Receive datagrams, or register `cx`'s waker and return `Pending`.
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>>;
+
+    /// The address this socket is bound to.
+    ///
+    /// # Errors
+    /// If the substrate cannot say.
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    /// Whether datagrams might be fragmented (the endpoint disables MTU discovery if so).
+    fn may_fragment(&self) -> bool {
+        true
+    }
+}
+
+/// Adapt a [`SharedUdpSocket`] to the owned [`AsyncUdpSocket`] an endpoint runs on.
+#[must_use]
+pub fn shared_socket(socket: Arc<dyn SharedUdpSocket>) -> Box<dyn AsyncUdpSocket> {
+    Box::new(SharedAdapter(socket))
+}
+
+#[derive(Debug)]
+struct SharedAdapter(Arc<dyn SharedUdpSocket>);
+
+impl AsyncUdpSocket for SharedAdapter {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(SharedSender(Arc::clone(&self.0)))
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        self.0.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.0.may_fragment()
+    }
+}
+
+#[derive(Debug)]
+struct SharedSender(Arc<dyn SharedUdpSocket>);
+
+impl UdpSender for SharedSender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit<'_>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(self.0.try_send(transmit))
+    }
+}
+
 /// The socket every endpoint runs on: the real one plus the circuits.
+///
+/// This is the shared half — the circuit table and the inbound circuit queue — that the
+/// endpoint's socket ([`MuxEndpointSocket`]) and every circuit's driver hold in common.
+/// The real socket itself is owned by the endpoint's half, because noq receives through
+/// `&mut`.
 pub struct MuxSocket {
-    inner: Arc<dyn AsyncUdpSocket>,
     circuits: Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
     /// Which address each peer's live circuit stands at. The addresses are random, so
     /// this is the only way to get from a peer to its circuit.
@@ -128,7 +216,6 @@ struct Inbox {
 impl std::fmt::Debug for MuxSocket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MuxSocket")
-            .field("inner", &self.inner)
             .field("circuits", &self.circuits().len())
             .finish()
     }
@@ -195,14 +282,21 @@ impl CircuitInlet {
 
 impl MuxSocket {
     /// Wrap a socket. Everything not addressed to a circuit passes straight through.
+    ///
+    /// Returns the shared circuit table and the socket to hand the endpoint, which owns
+    /// `inner`.
     #[must_use]
-    pub fn new(inner: Arc<dyn AsyncUdpSocket>) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
+    pub fn new(inner: Box<dyn AsyncUdpSocket>) -> (Arc<Self>, MuxEndpointSocket) {
+        let mux = Arc::new(Self {
             circuits: Mutex::new(HashMap::new()),
             by_peer: Mutex::new(HashMap::new()),
             inbox: Mutex::new(Inbox::default()),
-        })
+        });
+        let socket = MuxEndpointSocket {
+            mux: Arc::clone(&mux),
+            inner,
+        };
+        (mux, socket)
     }
 
     /// Attach a circuit to `peer` at a freshly allocated address, replacing any earlier
@@ -294,20 +388,26 @@ impl MuxSocket {
     }
 }
 
-impl AsyncUdpSocket for MuxSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        // Circuit sends never block, so the real socket's writability is the only
-        // one worth waiting for.
-        Arc::clone(&self.inner).create_io_poller()
-    }
+/// The endpoint's half of the multiplexer: the real socket, owned, plus the shared
+/// circuit table.
+pub struct MuxEndpointSocket {
+    mux: Arc<MuxSocket>,
+    inner: Box<dyn AsyncUdpSocket>,
+}
 
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        // The table decides, not the address's shape. A datagram for the subnet with no
-        // live circuit behind it is not a circuit send; it goes to the socket and fails
-        // there, which is the same answer any unreachable destination gets.
-        if !self.is_circuit(transmit.destination) {
-            return self.inner.try_send(transmit);
-        }
+impl std::fmt::Debug for MuxEndpointSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MuxEndpointSocket")
+            .field("inner", &self.inner)
+            .field("mux", &self.mux)
+            .finish()
+    }
+}
+
+impl MuxSocket {
+    /// Carry one transmit down its circuit, splitting a segmented batch into its
+    /// datagrams.
+    fn send_transmit(&self, transmit: &Transmit<'_>) {
         match transmit.segment_size {
             Some(size) if size < transmit.contents.len() => {
                 for chunk in transmit.contents.chunks(size) {
@@ -316,47 +416,69 @@ impl AsyncUdpSocket for MuxSocket {
             }
             _ => self.send_circuit(transmit.destination, transmit.contents),
         }
-        Ok(())
+    }
+
+    /// Fill `bufs` from the circuits' inbound queue. `None` (with the waker registered)
+    /// when there is nothing queued.
+    fn poll_circuits(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Option<usize> {
+        let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        let capacity = bufs.len().min(meta.len());
+        let mut filled = 0;
+        while filled < capacity {
+            let Some((from, datagram)) = inbox.queue.front() else {
+                break;
+            };
+            if datagram.len() > bufs[filled].len() {
+                // Larger than the buffer offered: dropped, as a kernel would
+                // truncate it. Never handed up corrupted.
+                inbox.queue.pop_front();
+                continue;
+            }
+            let (from, datagram) = (*from, datagram.clone());
+            inbox.queue.pop_front();
+            bufs[filled][..datagram.len()].copy_from_slice(&datagram);
+            // `RecvMeta` is non-exhaustive in noq: start from its default (every
+            // optional field `None`, as quinn's circuit datagrams carried) and set the rest.
+            let mut m = RecvMeta::default();
+            m.addr = from;
+            m.len = datagram.len();
+            m.stride = datagram.len();
+            meta[filled] = m;
+            filled += 1;
+        }
+        if filled > 0 {
+            return Some(filled);
+        }
+        inbox.waker = Some(cx.waker().clone());
+        None
+    }
+}
+
+impl AsyncUdpSocket for MuxEndpointSocket {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        // Circuit sends never block, so the real socket's writability is the only
+        // one worth waiting for.
+        Box::pin(MuxSender {
+            mux: Arc::clone(&self.mux),
+            inner: self.inner.create_sender(),
+        })
     }
 
     fn poll_recv(
-        &self,
-        cx: &mut Context,
+        &mut self,
+        cx: &mut Context<'_>,
         bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         // Circuits first: they are cheap to drain and the real socket registers its
         // own wake-up when it has nothing.
-        {
-            let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
-            let capacity = bufs.len().min(meta.len());
-            let mut filled = 0;
-            while filled < capacity {
-                let Some((from, datagram)) = inbox.queue.front() else {
-                    break;
-                };
-                if datagram.len() > bufs[filled].len() {
-                    // Larger than the buffer offered: dropped, as a kernel would
-                    // truncate it. Never handed up corrupted.
-                    inbox.queue.pop_front();
-                    continue;
-                }
-                let (from, datagram) = (*from, datagram.clone());
-                inbox.queue.pop_front();
-                bufs[filled][..datagram.len()].copy_from_slice(&datagram);
-                meta[filled] = RecvMeta {
-                    addr: from,
-                    len: datagram.len(),
-                    stride: datagram.len(),
-                    ecn: None,
-                    dst_ip: None,
-                };
-                filled += 1;
-            }
-            if filled > 0 {
-                return Poll::Ready(Ok(filled));
-            }
-            inbox.waker = Some(cx.waker().clone());
+        if let Some(filled) = self.mux.poll_circuits(cx, bufs, meta) {
+            return Poll::Ready(Ok(filled));
         }
         self.inner.poll_recv(cx, bufs, meta)
     }
@@ -365,15 +487,41 @@ impl AsyncUdpSocket for MuxSocket {
         self.inner.local_addr()
     }
 
-    fn max_transmit_segments(&self) -> usize {
-        self.inner.max_transmit_segments()
-    }
-
-    fn max_receive_segments(&self) -> usize {
+    fn max_receive_segments(&self) -> NonZeroUsize {
         self.inner.max_receive_segments()
     }
 
     fn may_fragment(&self) -> bool {
         self.inner.may_fragment()
+    }
+}
+
+/// One sending task's handle on the multiplexer: circuit destinations go to their
+/// circuit, everything else to the real socket's own sender.
+#[derive(Debug)]
+struct MuxSender {
+    mux: Arc<MuxSocket>,
+    inner: Pin<Box<dyn UdpSender>>,
+}
+
+impl UdpSender for MuxSender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // The table decides, not the address's shape. A datagram for the subnet with no
+        // live circuit behind it is not a circuit send; it goes to the socket and fails
+        // there, which is the same answer any unreachable destination gets.
+        if !this.mux.is_circuit(transmit.destination) {
+            return this.inner.as_mut().poll_send(transmit, cx);
+        }
+        this.mux.send_transmit(transmit);
+        Poll::Ready(Ok(()))
+    }
+
+    fn max_transmit_segments(&self) -> NonZeroUsize {
+        self.inner.max_transmit_segments()
     }
 }

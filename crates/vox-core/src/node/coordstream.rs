@@ -49,7 +49,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};

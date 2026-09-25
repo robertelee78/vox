@@ -32,7 +32,7 @@
 //! reorder these frames; it cannot forge, read or replay one into a different
 //! channel or epoch.
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -193,7 +193,7 @@ pub async fn deliver_skdm(
     session: &mut Session,
     skdm: &Skdm,
     hello: Option<&InitialMessage>,
-) -> Result<quinn::RecvStream> {
+) -> Result<noq::RecvStream> {
     let (mut send, recv) = open_typed(conn, StreamKind::Pairwise).await?;
     if let Some(initial) = hello {
         let frame = PairwiseFrame::Hello {
@@ -231,8 +231,8 @@ pub enum KeyRefusal {
 impl KeyRefusal {
     /// The stream reset code.
     #[must_use]
-    pub fn code(self) -> quinn::VarInt {
-        quinn::VarInt::from_u32(self as u32)
+    pub fn code(self) -> noq::VarInt {
+        noq::VarInt::from_u32(self as u32)
     }
 
     /// Words for a reset code a recipient sent back.
@@ -259,12 +259,12 @@ impl KeyRefusal {
 /// within `patience`) counts as not taken. Sending a key twice is harmless; never sending it
 /// leaves a member unable to read. Awaited on its own task, never on the actor: the answer
 /// comes after the recipient's actor has handled the key.
-pub async fn refused(mut recv: quinn::RecvStream, patience: std::time::Duration) -> Option<String> {
+pub async fn refused(mut recv: noq::RecvStream, patience: std::time::Duration) -> Option<String> {
     let mut byte = [0u8; 1];
     match tokio::time::timeout(patience, recv.read_exact(&mut byte)).await {
         Ok(Ok(())) if byte[0] == KEY_TAKEN => None,
         Ok(Ok(())) => Some(format!("answered {}", byte[0])),
-        Ok(Err(quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)))) => {
+        Ok(Err(noq::ReadExactError::ReadError(noq::ReadError::Reset(code)))) => {
             Some(KeyRefusal::describe(code.into_inner()))
         }
         Ok(Err(e)) => Some(e.to_string()),

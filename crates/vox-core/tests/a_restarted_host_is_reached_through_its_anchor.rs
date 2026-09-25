@@ -81,7 +81,7 @@ fn paths(tmp: &tempfile::TempDir, name: &str) -> Paths {
 }
 
 fn config(socket: Arc<vnet::VirtualSocket>, anchors: BootstrapSet) -> NodeConfig {
-    let socket: Arc<dyn quinn::AsyncUdpSocket> = socket;
+    let socket: Arc<dyn vox_core::transport::mux::SharedUdpSocket> = socket;
     let mut cfg = NodeConfig::new()
         .bind(Bind::Socket(socket))
         .anchors(anchors);

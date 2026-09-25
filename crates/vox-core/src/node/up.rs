@@ -250,7 +250,7 @@ pub async fn open_tunnel<D: HostDialer>(
     host: &Digest32,
     channel_id: &Digest32,
     service_tag: &str,
-) -> Result<(quinn::SendStream, quinn::RecvStream, Arc<VoxConnection>)> {
+) -> Result<(noq::SendStream, noq::RecvStream, Arc<VoxConnection>)> {
     let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
     loop {
         let attempt = async {

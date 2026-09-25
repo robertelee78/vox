@@ -138,18 +138,24 @@ async fn trial(n: usize) -> ([u8; 8], [u8; 8], [u8; 8], [u8; 8], bool, [u8; 8]) 
     let member_kept = member.adopt(second);
     let second_filed = recv_filed(&mut filed_rx).await;
     let second_seen_from = if tag(&second_filed.kept) == second_tag {
-        second_filed.kept.quinn().remote_address()
+        second_filed
+            .kept
+            .remote_address()
+            .expect("the connection has its path")
     } else {
         second_filed
             .also_serve
             .as_ref()
             .expect("the anchor either kept the newcomer or retired it")
-            .quinn()
             .remote_address()
+            .expect("the connection has its path")
     };
     // Where the anchor places the first connection **now**, as the second is filed: that is the
     // comparison an address rule makes, so it is the one that says whether this was staged.
-    let first_seen_from = first_filed.kept.quinn().remote_address();
+    let first_seen_from = first_filed
+        .kept
+        .remote_address()
+        .expect("the connection has its path");
     let staged = first_seen_from != second_seen_from;
 
     // Settled: both ends' current connection, after any close has crossed.

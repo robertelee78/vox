@@ -40,7 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
@@ -251,7 +251,10 @@ pub enum PathClass {
 /// circuit's address looks like nothing in particular.
 #[must_use]
 pub fn path_class(endpoint: &VoxEndpoint, conn: &VoxConnection) -> PathClass {
-    if endpoint.is_circuit(conn.quinn().remote_address()) {
+    if conn
+        .remote_address()
+        .is_some_and(|addr| endpoint.is_circuit(addr))
+    {
         PathClass::Relayed
     } else {
         PathClass::Direct
@@ -565,14 +568,14 @@ impl ConnectionManager {
 
     /// Phase one for an accept loop: the next inbound attempt, with no handshake.
     /// `None` when the endpoint is closed.
-    pub async fn accept_incoming(&self) -> Option<quinn::Incoming> {
+    pub async fn accept_incoming(&self) -> Option<noq::Incoming> {
         self.endpoint.accept_incoming().await
     }
 
     /// Phase two: complete one attempt's handshake and admission, then file it. Spawn this.
     pub async fn finish_incoming(
         &self,
-        incoming: quinn::Incoming,
+        incoming: noq::Incoming,
         admission: Admission,
     ) -> Result<Filed> {
         let conn = self

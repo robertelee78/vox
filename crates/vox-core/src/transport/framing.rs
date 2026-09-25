@@ -8,7 +8,7 @@
 //! them to the synchronous M5 engine. A caller supplies the per-flow frame cap so
 //! a hostile peer cannot announce a huge length to force an allocation.
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 
 use crate::error::{Error, Result};
 
@@ -55,7 +55,7 @@ pub async fn read_frame_within(
     let mut len_buf = [0u8; 4];
     match tokio::time::timeout(patience, recv.read_exact(&mut len_buf)).await {
         Ok(Ok(())) => {}
-        Ok(Err(quinn::ReadExactError::FinishedEarly(0))) => return Ok(None),
+        Ok(Err(noq::ReadExactError::FinishedEarly(0))) => return Ok(None),
         Ok(Err(_)) => return Err(Error::Unreachable("quic stream: closed by the peer")),
         Err(_) => {
             return Err(Error::Unreachable(

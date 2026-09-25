@@ -5,7 +5,7 @@
 //! a NAT that drops unsolicited inbound datagrams. On loopback there is no such NAT,
 //! so a test that "punches" over loopback proves nothing — it would pass without any
 //! punch at all. This module supplies the middlebox: a deterministic, in-process
-//! network of virtual sockets ([`quinn::AsyncUdpSocket`], driven through
+//! network of virtual sockets ([`SharedUdpSocket`], driven through
 //! [`VoxEndpoint::bind_abstract`](vox_core::transport::quic::VoxEndpoint::bind_abstract)),
 //! where each host may sit behind a NAT that maps and filters per RFC 4787.
 //!
@@ -18,13 +18,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
-use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, UdpPoller};
+use noq::udp::{RecvMeta, Transmit};
+use vox_core::transport::mux::SharedUdpSocket;
 
 /// How a NAT device maps and filters (RFC 4787 terminology).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,27 +333,13 @@ impl std::fmt::Debug for VirtualSocket {
     }
 }
 
-/// A poller for a socket whose sends never block: the inbox is unbounded, so a
-/// transmit is always accepted.
-#[derive(Debug)]
-struct AlwaysWritable;
-
-impl UdpPoller for AlwaysWritable {
-    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncUdpSocket for VirtualSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(AlwaysWritable)
-    }
-
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+// Sends never block: the inbox is unbounded, so a transmit is always accepted.
+impl SharedUdpSocket for VirtualSocket {
+    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
         if self.severed.load(Ordering::SeqCst) {
             return Ok(()); // a crashed process's last words never leave the box
         }
-        // `max_transmit_segments` is 1, so quinn never batches; a segmented transmit
+        // a shared socket's sender allows 1 segment, so noq never batches; a segmented transmit
         // is still split rather than silently sent as one oversized datagram.
         match transmit.segment_size {
             Some(size) if size < transmit.contents.len() => {
@@ -371,7 +356,7 @@ impl AsyncUdpSocket for VirtualSocket {
 
     fn poll_recv(
         &self,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
@@ -391,13 +376,12 @@ impl AsyncUdpSocket for VirtualSocket {
             let (src, payload) = (*src, payload.clone());
             inbox.queue.pop_front();
             bufs[filled][..payload.len()].copy_from_slice(&payload);
-            meta[filled] = RecvMeta {
-                addr: src,
-                len: payload.len(),
-                stride: payload.len(),
-                ecn: None,
-                dst_ip: Some(self.addr.ip()),
-            };
+            let mut m = RecvMeta::default();
+            m.addr = src;
+            m.len = payload.len();
+            m.stride = payload.len();
+            m.dst_ip = Some(self.addr.ip());
+            meta[filled] = m;
             filled += 1;
         }
         if filled == 0 {
@@ -409,14 +393,6 @@ impl AsyncUdpSocket for VirtualSocket {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.addr)
-    }
-
-    fn max_transmit_segments(&self) -> usize {
-        1
-    }
-
-    fn max_receive_segments(&self) -> usize {
-        1
     }
 
     fn may_fragment(&self) -> bool {

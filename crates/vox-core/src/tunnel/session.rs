@@ -20,7 +20,7 @@
 
 use std::net::SocketAddr;
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 use tokio::net::TcpStream;
 
 use crate::cbor::{Decoder, Encoder};
@@ -510,7 +510,7 @@ async fn splice_until(
             // socket takes them: one stream lock and, usually, one syscall per batch.
             let mut chunks: [bytes::Bytes; 16] = Default::default();
             loop {
-                match recv.read_chunks(&mut chunks).await {
+                match recv.read_many_chunks(&mut chunks).await {
                     Ok(None) => {
                         let _ = tcp_w.shutdown().await;
                         return Leg::Clean;
@@ -523,8 +523,8 @@ async fn splice_until(
                             return Leg::Abort;
                         }
                     }
-                    Err(quinn::ReadError::Reset(code))
-                        if code == quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE) =>
+                    Err(noq::ReadError::Reset(code))
+                        if code == noq::VarInt::from_u32(REACH_WITHDRAWN_CODE) =>
                     {
                         return Leg::Withdrawn
                     }
@@ -554,15 +554,15 @@ async fn splice_until(
     match outcome {
         Some(Leg::Clean) => Ok(()),
         Some(Leg::Abort) => {
-            let code = quinn::VarInt::from_u32(TUNNEL_ABORT_CODE);
+            let code = noq::VarInt::from_u32(TUNNEL_ABORT_CODE);
             let _ = send.reset(code);
             let _ = recv.stop(code);
             abort_local(&tcp);
             Err(Error::MalformedTunnel("tunnel splice aborted"))
         }
         Some(Leg::Withdrawn) => {
-            let _ = recv.stop(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
-            let _ = send.reset(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
+            let _ = recv.stop(noq::VarInt::from_u32(REACH_WITHDRAWN_CODE));
+            let _ = send.reset(noq::VarInt::from_u32(REACH_WITHDRAWN_CODE));
             abort_local(&tcp);
             Err(Error::TunnelRevoked(
                 "the host withdrew access to this service",
@@ -571,7 +571,7 @@ async fn splice_until(
         None => {
             // Reset rather than finish: a clean close is indistinguishable from the carried
             // service hanging up, and the dialer deserves to know this was a decision.
-            let code = quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE);
+            let code = noq::VarInt::from_u32(REACH_WITHDRAWN_CODE);
             let _ = send.reset(code);
             let _ = recv.stop(code);
             abort_local(&tcp);

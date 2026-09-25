@@ -303,7 +303,7 @@ pub enum Bind {
     Addr(std::net::SocketAddr),
     /// A caller-supplied datagram socket — a simulated network with NAT devices, or
     /// any other substrate (`VoxEndpoint::bind_abstract`).
-    Socket(Arc<dyn quinn::AsyncUdpSocket>),
+    Socket(Arc<dyn crate::transport::mux::SharedUdpSocket>),
 }
 
 impl std::fmt::Debug for Bind {
@@ -501,9 +501,9 @@ enum NetEvent {
         /// The epoch it named.
         epoch: u64,
         /// The stream's send half.
-        send: quinn::SendStream,
+        send: noq::SendStream,
         /// The stream's receive half.
-        recv: quinn::RecvStream,
+        recv: noq::RecvStream,
     },
     /// A peer asked to reconcile a channel, and its request has **already been read** on
     /// the stream's own task. The actor does the reconciliation; it never waits for the
@@ -518,9 +518,9 @@ enum NetEvent {
         /// The epoch it named.
         epoch: u64,
         /// The stream's send half.
-        send: quinn::SendStream,
+        send: noq::SendStream,
         /// The stream's receive half.
-        recv: quinn::RecvStream,
+        recv: noq::RecvStream,
     },
     /// A peer connected inbound: it gets a sync schedule, due immediately.
     Connected {
@@ -978,7 +978,7 @@ const HANDSHAKES_IN_FLIGHT: usize = 64;
 /// Phase two for one connection: complete the handshake and admission, or drop it.
 async fn finish_one(
     net: &Arc<NodeNet>,
-    incoming: quinn::Incoming,
+    incoming: noq::Incoming,
 ) -> Option<crate::node::net::Filed> {
     net.manager()
         .finish_incoming(
@@ -1679,8 +1679,8 @@ pub struct Node {
         Digest32,
         Digest32,
         crate::node::pairwise_stream::PairwiseFrame,
-        quinn::SendStream,
-        quinn::RecvStream,
+        noq::SendStream,
+        noq::RecvStream,
     )>,
     /// Rooms whose anchor publish found them mid-session: run when that session's `SyncDone`
     /// lands. See `publish_channel_to_anchors`.
@@ -3499,8 +3499,8 @@ impl Node {
         peer: Digest32,
         channel_id: Digest32,
         epoch: u64,
-        send: quinn::SendStream,
-        recv: quinn::RecvStream,
+        send: noq::SendStream,
+        recv: noq::RecvStream,
     ) {
         let answerable = match self.channels.get(&channel_id) {
             Some(shared) => {
@@ -3640,7 +3640,7 @@ impl Node {
     /// the problem. The stream belongs to the peer, so if it opens one and never reads, QUIC flow
     /// control stalls the write, and awaiting that on the actor hands a stranger the same stall
     /// this change removes from the exchange itself. Nothing here needs the result.
-    fn spawn_refuse_join(send: quinn::SendStream) {
+    fn spawn_refuse_join(send: noq::SendStream) {
         tokio::spawn(crate::node::joinstream::refuse_join(send));
     }
 
@@ -3846,8 +3846,8 @@ impl Node {
         &mut self,
         peer: Digest32,
         coordinator: Digest32,
-        send: quinn::SendStream,
-        recv: quinn::RecvStream,
+        send: noq::SendStream,
+        recv: noq::RecvStream,
     ) {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
@@ -5093,8 +5093,8 @@ impl Node {
         peer: Digest32,
         channel_id: Digest32,
         epoch: u64,
-        send: quinn::SendStream,
-        recv: quinn::RecvStream,
+        send: noq::SendStream,
+        recv: noq::RecvStream,
     ) {
         use crate::node::syncstream::accept_sync;
         // Answering while our own session holds this room is the other half of the deadlock.
@@ -5446,7 +5446,7 @@ impl Node {
     /// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
     fn watch_delivery(
         &self,
-        sent: quinn::RecvStream,
+        sent: noq::RecvStream,
         channel_id: Digest32,
         target: Digest32,
         chain_id: u64,
@@ -5595,8 +5595,8 @@ impl Node {
     async fn take_inbound_skdm(
         &mut self,
         peer: Digest32,
-        send: quinn::SendStream,
-        mut recv: quinn::RecvStream,
+        send: noq::SendStream,
+        mut recv: noq::RecvStream,
     ) {
         use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
         let Ok(Some(first)) = recv_pairwise(&mut recv).await else {
@@ -5626,8 +5626,8 @@ impl Node {
         &mut self,
         peer: Digest32,
         first: crate::node::pairwise_stream::PairwiseFrame,
-        mut send: quinn::SendStream,
-        mut recv: quinn::RecvStream,
+        mut send: noq::SendStream,
+        mut recv: noq::RecvStream,
     ) {
         // **Taken, or said not to be.** A sender cannot learn from the transport whether its key
         // was taken: QUIC acknowledges the bytes before this node decides anything. So a stream
@@ -5657,7 +5657,7 @@ impl Node {
         &mut self,
         peer: Digest32,
         first: crate::node::pairwise_stream::PairwiseFrame,
-        recv: &mut quinn::RecvStream,
+        recv: &mut noq::RecvStream,
     ) -> Option<Result<(), crate::node::pairwise_stream::KeyRefusal>> {
         use crate::node::pairwise_stream::KeyRefusal;
         use crate::node::pairwise_stream::{open_skdm, recv_pairwise, PairwiseFrame};

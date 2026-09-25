@@ -142,8 +142,8 @@ pub type HostSnapshot = BTreeMap<Digest32, ChannelServices>;
 /// apart would leak which channels this node is in.
 pub async fn serve(
     client: Digest32,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    send: noq::SendStream,
+    recv: noq::RecvStream,
     snapshot: HostSnapshot,
 ) -> Result<()> {
     serve_reporting(client, send, recv, snapshot, None).await
@@ -163,8 +163,8 @@ pub async fn serve(
 /// audit record — ADR-013's signed session events remain its own item.
 pub async fn serve_reporting(
     client: Digest32,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    send: noq::SendStream,
+    recv: noq::RecvStream,
     snapshot: HostSnapshot,
     events: Option<tokio::sync::broadcast::Sender<NodeEvent>>,
 ) -> Result<()> {

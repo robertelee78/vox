@@ -29,7 +29,7 @@
 //! on a thread that may block — `tokio::task::spawn_blocking` in the node, a plain
 //! thread in tests — never inside an async task on a runtime worker.
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 use tokio::runtime::Handle;
 
 use crate::cbor::{Decoder, Encoder};
@@ -140,7 +140,7 @@ pub async fn open_sync(
 
 /// Read the preamble from an accepted `sync` stream: which `(channelID, epoch)` the
 /// peer wants to reconcile.
-pub async fn read_sync_request(recv: &mut quinn::RecvStream) -> Result<(Digest32, u64)> {
+pub async fn read_sync_request(recv: &mut noq::RecvStream) -> Result<(Digest32, u64)> {
     let bytes = read_frame(recv, MAX_SYNC_PREAMBLE)
         .await?
         .ok_or(Error::MalformedGovernance(

@@ -5,7 +5,7 @@
 //! one-element canonical-CBOR array `[kind]`; an unknown kind is refused before
 //! any flow-specific bytes are read.
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -98,7 +98,7 @@ pub async fn accept_typed(conn: &VoxConnection) -> Result<(StreamKind, SendStrea
 /// **without holding the [`VoxConnection`]** — the node's per-connection stream loop, which
 /// would otherwise count as a user of the connection for as long as the connection lives.
 pub async fn accept_typed_on(
-    conn: &quinn::Connection,
+    conn: &noq::Connection,
 ) -> Result<(StreamKind, SendStream, RecvStream)> {
     let (send, mut recv) = conn
         .accept_bi()

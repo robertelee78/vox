@@ -78,7 +78,7 @@ use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::VoxConnection;
 use crate::transport::streams::{open_typed, StreamKind};
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 
 /// The largest join frame either side will read. The biggest is `CHALLENGE`
 /// (a prekey bundle is ~15 KiB, measured 2026-09-20); an Equihash (200,9) solution

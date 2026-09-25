@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use quinn::{RecvStream, SendStream};
+use noq::{RecvStream, SendStream};
 use tokio::task::JoinSet;
 
 use crate::error::{Error, Result};
@@ -477,7 +477,7 @@ impl NodeNet {
     /// waiting does not hold the [`VoxConnection`] — see `actor::spawn_stream_loop`.
     pub async fn accept_authorized_on(
         &self,
-        conn: &quinn::Connection,
+        conn: &noq::Connection,
         peer: Digest32,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
         let (kind, mut send, mut recv) = accept_typed_on(conn).await?;
@@ -597,9 +597,10 @@ impl NodeNet {
                 //
                 // `ask_observed` returns a `Result` and its callers tolerate failure,
                 // falling back to local endpoints.
-                let remote = conn.quinn().remote_address();
-                let observed =
-                    (!self.manager.endpoint().is_circuit(remote)).then(|| Multiaddr::from(remote));
+                let observed = conn
+                    .remote_address()
+                    .filter(|remote| !self.manager.endpoint().is_circuit(*remote))
+                    .map(Multiaddr::from);
                 let manager = Arc::clone(&self.manager);
                 match coordstream::serve_coord(
                     peer,

@@ -501,8 +501,8 @@ fn m15_members_never_online_together_converge_through_the_anchor() {
         // exactly what keeps two instances from ever opening it at once.
         let bob = tokio::time::timeout(TIMEOUT, async {
             loop {
-                let socket: Arc<dyn quinn::AsyncUdpSocket> =
-                    Arc::clone(&b_sock) as Arc<dyn quinn::AsyncUdpSocket>;
+                let socket: Arc<dyn vox_core::transport::mux::SharedUdpSocket> =
+                    Arc::clone(&b_sock) as Arc<dyn vox_core::transport::mux::SharedUdpSocket>;
                 let mut cfg = NodeConfig::new().bind(Bind::Socket(socket));
                 cfg.pow_params = Some(PowParams { n: 48, k: 5 });
                 match Node::spawn_config(paths(&tmp, "bob"), cfg) {

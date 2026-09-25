@@ -106,10 +106,14 @@ impl Scene {
         // Hypothesis 1: the coordinator's view of the connection is the mapped address.
         let a_to_c = a.connect(c_public, c_id, NOW).await.expect("A reaches C");
         let c_from_a = c_inbound.recv().await.expect("C accepted A");
-        let a_observed = c_from_a.quinn().remote_address();
+        let a_observed = c_from_a
+            .remote_address()
+            .expect("the connection has its path");
         let b_to_c = b.connect(c_public, c_id, NOW).await.expect("B reaches C");
         let c_from_b = c_inbound.recv().await.expect("C accepted B");
-        let b_observed = c_from_b.quinn().remote_address();
+        let b_observed = c_from_b
+            .remote_address()
+            .expect("the connection has its path");
         assert_eq!(a_observed.ip(), ip("203.0.113.1"), "A's mapped address");
         assert_eq!(b_observed.ip(), ip("203.0.113.2"), "B's mapped address");
         assert_ne!(
@@ -257,7 +261,7 @@ fn clock() -> vox_core::time::Clock {
 
 /// Streams the node's loop hands up to "the actor" — here, the test — as the actor
 /// would receive them: a `sync` stream arrives as `Inbound::Sync`.
-type Handoff = tokio::sync::mpsc::UnboundedSender<(Digest32, quinn::SendStream, quinn::RecvStream)>;
+type Handoff = tokio::sync::mpsc::UnboundedSender<(Digest32, noq::SendStream, noq::RecvStream)>;
 
 /// Accept connections and serve every stream on them, exactly as the node actor does:
 /// the board, `WHOAMI` and circuits are handled inside `accept_stream`, a relayed
@@ -335,8 +339,7 @@ struct Swarm {
     b_private: SocketAddr,
     ids: HashMap<char, Digest32>,
     /// The `sync` streams B's node loop handed up.
-    b_inbound:
-        tokio::sync::mpsc::UnboundedReceiver<(Digest32, quinn::SendStream, quinn::RecvStream)>,
+    b_inbound: tokio::sync::mpsc::UnboundedReceiver<(Digest32, noq::SendStream, noq::RecvStream)>,
 }
 
 async fn swarm(seed: u8) -> Swarm {
@@ -464,10 +467,10 @@ fn two_nated_nodes_reach_each_other_through_a_coordinator_then_upgrade_to_a_punc
         // The address is allocated, not derived, so what matters is that A's own mux
         // holds it as B's live circuit — which is also the only thing any code should
         // ever ask about a circuit address.
-        assert!(a_ep.is_circuit(conn.quinn().remote_address()));
+        assert!(a_ep.is_circuit(conn.remote_address().expect("the connection has its path")));
         assert_eq!(
             a_ep.circuit_addr_of(&b_id),
-            Some(conn.quinn().remote_address()),
+            Some(conn.remote_address().expect("the connection has its path")),
             "the circuit A dialled is the one filed under B"
         );
         assert_eq!(s.c.relaying(), 1, "the coordinator is carrying the circuit");
@@ -510,7 +513,9 @@ fn two_nated_nodes_reach_each_other_through_a_coordinator_then_upgrade_to_a_punc
             .observed(s.b_private, s.c_addr)
             .expect("B has a mapping");
         assert_eq!(
-            better.quinn().remote_address(),
+            better
+                .remote_address()
+                .expect("the connection has its path"),
             b_mapped,
             "the punched connection goes to B's NAT, not to the coordinator"
         );
@@ -536,7 +541,9 @@ fn two_nated_nodes_reach_each_other_through_a_coordinator_then_upgrade_to_a_punc
         .await
         .expect("B's primary became the direct path too");
         assert_eq!(
-            b_primary.quinn().remote_address(),
+            b_primary
+                .remote_address()
+                .expect("the connection has its path"),
             s.net.observed(s.a_private, s.c_addr).unwrap()
         );
         assert_eq!(
@@ -641,7 +648,7 @@ fn two_nodes_behind_symmetric_nats_reach_each_other_through_a_relay() {
         // The path is a circuit, not the wire — and the relay is carrying exactly one.
         assert_eq!(
             s.a.manager().endpoint().circuit_addr_of(&b_id),
-            Some(conn.quinn().remote_address()),
+            Some(conn.remote_address().expect("the connection has its path")),
             "A's connection to B runs over the circuit A filed for B"
         );
         assert_eq!(s.c.relaying(), 1, "the relay carries one circuit");
@@ -667,7 +674,11 @@ fn two_nodes_behind_symmetric_nats_reach_each_other_through_a_relay() {
                 .expect("B holds A's relayed connection");
         assert_eq!(
             s.b.manager().endpoint().circuit_addr_of(&a_id),
-            Some(b_conn.quinn().remote_address()),
+            Some(
+                b_conn
+                    .remote_address()
+                    .expect("the connection has its path")
+            ),
             "B's side of the same circuit is filed under A"
         );
         let b_side = tokio::spawn(async move {
