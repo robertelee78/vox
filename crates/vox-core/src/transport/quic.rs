@@ -164,7 +164,7 @@ fn transport_config() -> Arc<noq::TransportConfig> {
     // BBRv3 at its default configuration, in place of the Cubic default, so a throughput
     // gate can measure it against quinn 0.11 + Cubic. Unconditional on purpose: this
     // branch *is* the experiment.
-    cfg.congestion_controller_factory(Arc::new(noq::congestion::Bbr3Config::default()));
+    // EXPERIMENT arm: noq with its default controller (Cubic), to separate the stack from BBRv3.
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
     // `From<VarInt>` rather than `try_from(Duration)`: the millisecond value is a compile-
     // time constant inside the varint range, so there is no error case to handle.
