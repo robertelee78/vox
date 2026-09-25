@@ -687,7 +687,7 @@ Both unknowns are already spiked; neither remains open.
   independent `EventStream` per client; emission is a non-blocking broadcast; `EventStreamItem::
   Lagged(n)` surfaces lag instead of hiding it. `next_event()`/`try_next_event()` keep their
   signatures, so the TUI, `tunnel_cli` and every existing gate were untouched.
-  *Gate* `node_m19_fanout_gate` (release, ≈2.9 s; deleted in V29-17 as a duplicate of `node_m19_ipc_gate`, which proves the same across real processes): with a client wedged from the start, 400 appends
+  *Gate* `node_m19_fanout_gate` (release, ≈2.9 s; in-process, kept until its real-binary replacement lands — RP-45): with a client wedged from the start, 400 appends
   all succeed and the node still answers afterwards; a second client draining concurrently sees the
   whole burst; the wedged client is told it lagged and then resumes; the log holds every entry.
   Mutation-checked twice — swallowing the lag report, and a 100 000-event buffer — both caught.
