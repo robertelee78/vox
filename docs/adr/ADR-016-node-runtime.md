@@ -951,6 +951,26 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   prompt push: 27.1 s and 21.7 s, red. Mutation, no board offer: 27.6 s and 26.4 s, red. R40 is
   unaffected: relayed p95 64 ms, direct p95 31 ms.
 
+- **One dead member no longer stalls a room for everyone (2026-09-25, v0.2.10).** A push reconciles
+  the room with a member and waits for its answer. When that member's process died without closing
+  its connections, nothing answered until the connection was declared dead (`SILENCE_IS_DEATH`,
+  30 s). The session guard (`syncing`) was keyed by room, so for the whole wait every other member's
+  session for the room was refused and every push to them was owed. log-scale measured it with
+  shipped daemons: converged 29.5 s and 21.9 s after a member returned.
+  - The guard is now keyed by **room and peer**. What it prevents is a pair colliding, both ends
+    reconciling the same room with each other at once, and a pair is what it keys on.
+  - Sessions with different peers run side by side. Each takes the room's lock inside one protocol
+    step at a time, never across the network (`ChannelState::sync_over_room`).
+  - Work that must not wait on a room held by any session (the anchor publish, `note_new_members`)
+    asks `room_in_session`.
+
+  Gate `crates/vox-tui/tests/a_dead_member_does_not_stall_the_room_proof.rs` (a real anchor and three
+  real daemons; Carol's daemon killed by PID; five posts from Alice timed to Bob's `vox room read`,
+  bound 1 s, R40): 56–65 ms each, 2 runs. Mutation, guard keyed by room again: posts waited 30.0 s and
+  29.3 s, red. Not covered here: a member that restarts under the **same** identity while the old
+  session still waits is refused as the same pair until that session ends. restart-probe's held-
+  connection probe (582f18a) closes the dead connection when the newcomer is filed.
+
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
 ADR-013, ADR-015.

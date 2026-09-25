@@ -1711,7 +1711,17 @@ pub struct Node {
     /// by *its* initiated session. Nothing breaks it but `SYNC_FRAME_TIMEOUT`. Measured as a user, a
     /// message posted right after a join crossed in 20s or 40s — one and two frame timeouts — instead
     /// of the 0-1s it takes when the rooms are free.
-    syncing: std::collections::BTreeSet<Digest32>,
+    ///
+    /// **Per room and peer, not per room.** Keyed by room alone, one session made the whole room
+    /// wait: a push to a member whose process had died waited for an answer until the connection
+    /// was declared dead (`SILENCE_IS_DEATH`, 30 s), and for all that time every other member's
+    /// session for the room was refused and every push to them was owed. One dead member stalled a
+    /// room for everyone (measured by log-scale, and in `a_dead_member_does_not_stall_the_room`).
+    /// What this guards against is a *pair* colliding, both ends reconciling the same room with
+    /// each other at once, so that is what it keys on. Sessions with different peers run side by
+    /// side: each takes the room's lock inside one protocol step at a time, never across the
+    /// network (`ChannelState::sync_over_room`).
+    syncing: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// Rooms this node is joining right now (their join is on a `Joiner` task).
     joining: std::collections::BTreeSet<Digest32>,
     /// Pairwise streams for a room still being joined, held until the join reports back: see
@@ -2933,7 +2943,7 @@ impl Node {
         //
         // Owed instead, and run the moment that session's `SyncDone` lands — still on the actor, so
         // anything that follows a publish still follows it.
-        if self.syncing.contains(channel_id) {
+        if self.room_in_session(channel_id) {
             self.publish_owed.insert(*channel_id);
             return;
         }
@@ -3364,7 +3374,7 @@ impl Node {
                 peer,
                 outcome,
             } => {
-                self.syncing.remove(&channel_id);
+                self.syncing.remove(&(channel_id, peer));
                 self.answer_pending_consents(|room, _| *room == channel_id, None)
                     .await;
                 // **A session that failed delivered nothing, so its push is owed again.**
@@ -4337,7 +4347,7 @@ impl Node {
             // Started or not (the room may be mid-session with somebody else), the retry rides the
             // room's next `SyncDone`.
             let _ = self.sync_one(&channel_id, target).await;
-            if !self.syncing.contains(&channel_id) {
+            if !self.room_in_session(&channel_id) {
                 let _ = reply.send(outcome);
                 return;
             }
@@ -4683,7 +4693,7 @@ impl Node {
     /// because a board that already holds the record does not grow.
     async fn note_new_members(&mut self, channel_id: &Digest32) {
         // Never wait on a room a session holds; see `publish_channel_to_anchors`.
-        if self.syncing.contains(channel_id) {
+        if self.room_in_session(channel_id) {
             self.growth_owed.insert(*channel_id);
             return;
         }
@@ -4714,6 +4724,20 @@ impl Node {
         }
         self.refresh_network_view().await;
         self.note_local_append(channel_id);
+    }
+
+    /// Whether a sync session with `peer` is running on `channel_id`: the collision a new
+    /// session with that peer for that room must not start into (see `syncing`).
+    fn in_session_with(&self, channel_id: &Digest32, peer: &Digest32) -> bool {
+        self.syncing.contains(&(*channel_id, *peer))
+    }
+
+    /// Whether any sync session, with any peer, is running on `channel_id` (see `syncing`).
+    fn room_in_session(&self, channel_id: &Digest32) -> bool {
+        self.syncing
+            .range((*channel_id, [0u8; 32])..=(*channel_id, [0xFFu8; 32]))
+            .next()
+            .is_some()
     }
 
     /// Mark a channel as having a local append to push, and make every peer's
@@ -4851,7 +4875,7 @@ impl Node {
                 {
                     continue;
                 }
-                if self.syncing.contains(cid) || self.publishing.contains(&(*cid, peer)) {
+                if self.in_session_with(cid, &peer) || self.publishing.contains(&(*cid, peer)) {
                     owed.push(*cid);
                     continue;
                 }
@@ -4896,7 +4920,7 @@ impl Node {
                 {
                     continue;
                 }
-                if self.syncing.contains(cid) {
+                if self.in_session_with(cid, &peer) {
                     owed.push(*cid);
                     continue;
                 }
@@ -5008,13 +5032,13 @@ impl Node {
         if matches!(target, SessionTarget::Anchored(_)) {
             self.refresh_anchored_authors(channel_id).await;
         }
-        if self.syncing.contains(channel_id) {
-            return false; // a session already has this room; a second would deadlock against it
+        if self.in_session_with(channel_id, &peer) {
+            return false; // a session with this peer already has this room
         }
         let Ok(slot) = Arc::clone(&self.sync_slots).try_acquire_owned() else {
             return false; // past the cap: skipped, not queued. The schedule comes round again.
         };
-        self.syncing.insert(*channel_id);
+        self.syncing.insert((*channel_id, peer));
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
         let cid = *channel_id;
         let now = self.now();
@@ -5155,7 +5179,7 @@ impl Node {
         };
         // Marked here, past both early returns above, so a session that never starts never
         // leaves the room marked. Its caller used to mark it first.
-        self.syncing.insert(channel_id);
+        self.syncing.insert((channel_id, peer));
         let now = self.now();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
@@ -5248,7 +5272,7 @@ impl Node {
         // **Refused before the lock, not after.** A session holds this room's mutex for its whole
         // run, and this is the actor: awaiting that lock to read the epoch parked the whole node
         // behind the very session this check exists to detect.
-        if self.syncing.contains(&channel_id) {
+        if self.in_session_with(&channel_id, &peer) {
             let (mut send, mut recv) = (send, recv);
             crate::node::net::refuse_stream(&mut send, &mut recv);
             return;
