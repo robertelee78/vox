@@ -419,21 +419,31 @@ async fn splice_until(
     cut: impl core::future::Future<Output = ()>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    const CHUNK: usize = 16 * 1024;
+    // **Large chunks, handed over without a copy.** Every write to a QUIC send stream takes the
+    // connection's lock, which the connection driver holds while it builds and sends packets.
+    // Profiled on the shipped binary (a 2 GB transfer through `vox forward`), the sending node
+    // spent most of its time waiting on that lock from `SendStream::write_all`, once per 16 KiB.
+    // Reading the TCP side into a buffer and handing it to QUIC whole (`write_chunk`, which
+    // takes ownership rather than copying) takes the lock once per chunk; the inbound side reads
+    // QUIC's own buffers (`read_chunk`) instead of copying them into ours first.
+    const CHUNK: usize = 256 * 1024;
     let outcome = {
         let (mut tcp_r, mut tcp_w) = tcp.split();
         let (send, recv) = (&mut send, &mut recv);
         // TCP → QUIC.
         let outbound = async move {
-            let mut buf = vec![0u8; CHUNK];
+            let mut buf = bytes::BytesMut::with_capacity(CHUNK);
             loop {
-                match tcp_r.read(&mut buf).await {
+                if buf.capacity() < CHUNK / 2 {
+                    buf.reserve(CHUNK);
+                }
+                match tcp_r.read_buf(&mut buf).await {
                     Ok(0) => {
                         let _ = send.finish();
                         return Leg::Clean;
                     }
-                    Ok(n) => {
-                        if send.write_all(&buf[..n]).await.is_err() {
+                    Ok(_) => {
+                        if send.write_chunk(buf.split().freeze()).await.is_err() {
                             return Leg::Abort;
                         }
                     }
@@ -443,15 +453,14 @@ async fn splice_until(
         };
         // QUIC → TCP.
         let inbound = async move {
-            let mut buf = vec![0u8; CHUNK];
             loop {
-                match recv.read(&mut buf).await {
+                match recv.read_chunk(CHUNK, true).await {
                     Ok(None) => {
                         let _ = tcp_w.shutdown().await;
                         return Leg::Clean;
                     }
-                    Ok(Some(n)) => {
-                        if tcp_w.write_all(&buf[..n]).await.is_err() {
+                    Ok(Some(chunk)) => {
+                        if tcp_w.write_all(&chunk.bytes).await.is_err() {
                             return Leg::Abort;
                         }
                     }
