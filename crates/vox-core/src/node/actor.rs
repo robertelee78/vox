@@ -1873,6 +1873,9 @@ pub struct Node {
     /// The ADR-020 §3 trust keyring, loaded on unlock and empty while locked
     /// (it is sealed under the identity, so there is nothing to hold locked).
     trust: crate::node::trust::Keyring,
+    /// Where each member was last reached directly (`node::peer_book`), so a restart can find
+    /// them again with no anchor. Sealed under the identity: empty while locked.
+    peer_book: crate::node::peer_book::PeerBook,
     /// This node's own retention (ADR-023 decision 2), re-read from the config directory
     /// at most every [`RETENTION_REREAD_SECS`] so an edit takes effect without a restart.
     node_retention: crate::node::retention::RetentionConfig,
@@ -2033,6 +2036,7 @@ impl Node {
             view_tx: watch::Sender::new(NodeView::default()),
             event_tx,
             trust: crate::node::trust::Keyring::new(),
+            peer_book: crate::node::peer_book::PeerBook::new(),
             node_retention: crate::node::retention::RetentionConfig::default(),
             retention_read_at: 0,
             retention_dirty: std::collections::BTreeSet::new(),
@@ -3432,6 +3436,13 @@ impl Node {
                 self.adopt_connection(conn);
             }
             NetEvent::Connected { peer } => {
+                if let Some(conn) = self
+                    .net
+                    .as_ref()
+                    .and_then(|net| net.manager().existing(&peer))
+                {
+                    self.note_peer_endpoint(&conn);
+                }
                 // A fresh connection syncs at once (ADR-016), then on the interval.
                 self.schedules
                     .entry(peer)
@@ -4132,7 +4143,34 @@ impl Node {
     /// Give a connection the bookkeeping every connection needs, however it arrived:
     /// a stream loop (a connection we opened must still accept the streams the peer
     /// opens back — its sender key arrives that way) and a sync schedule.
+    /// Remember where `conn`'s peer was reached, if the path is direct (`node::peer_book`),
+    /// and save the book when that is news. A relay circuit's address means nothing to a
+    /// later process and is never kept.
+    fn note_peer_endpoint(&mut self, conn: &VoxConnection) {
+        let Some(net) = self.net.as_ref() else {
+            return;
+        };
+        if crate::node::net::path_class(net.manager().endpoint(), conn)
+            == crate::node::net::PathClass::Relayed
+        {
+            return;
+        }
+        let now = self.now();
+        if !self
+            .peer_book
+            .note(conn.peer_id(), conn.quinn().remote_address(), now)
+        {
+            return;
+        }
+        if let Some(profile) = self.profile.as_ref() {
+            if let Ok(signer) = profile.signer() {
+                let _ = self.peer_book.save(profile.store(), signer);
+            }
+        }
+    }
+
     fn adopt_connection(&mut self, conn: Arc<VoxConnection>) {
+        self.note_peer_endpoint(&conn);
         let peer = conn.peer_id();
         if let Some(net) = self.net.as_ref().map(Arc::clone) {
             if self.stream_loops.insert(conn.quinn().stable_id()) {
@@ -6036,6 +6074,22 @@ impl Node {
     /// `ConnectionManager::existing` alone means "whoever we happen to be talking to",
     /// which is not a membership property — it made delivery depend on connection
     /// history rather than on the room.
+    /// Dial every other member of a room this node has just opened, in the background — what
+    /// a restart needs to find them again (`node::peer_book`). `reach_member` dials off the
+    /// actor, and a connection it makes is adopted with a sync due at once.
+    async fn reach_members_of(&mut self, channel_id: &Digest32) {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let (me, members) = {
+            let ch = shared.lock().await;
+            (ch.me(), ch.members())
+        };
+        for member in members.into_iter().filter(|m| *m != me) {
+            let _ = self.reach_member(channel_id, member, false).await;
+        }
+    }
+
     async fn reach_member(
         &mut self,
         channel_id: &Digest32,
@@ -6046,7 +6100,12 @@ impl Node {
         if let Some(conn) = net.manager().existing(&target) {
             return Some(conn);
         }
-        let endpoints = net.board_endpoints(channel_id, &target);
+        // The board first — it is current. After a restart it is empty, and where the member
+        // was last reached (`node::peer_book`) is the only address this node has.
+        let mut endpoints = net.board_endpoints(channel_id, &target);
+        if endpoints.is_empty() {
+            endpoints = self.peer_book.endpoints(&target);
+        }
         // **Nothing dials a member on the actor.** A dial to a member that is not there waits out
         // `PER_ATTEMPT_TIMEOUT` (10s), and the node answers nobody meanwhile. Measured through the
         // real binaries: a room that had rotated its sender key answered nothing for 10s at a time
@@ -6315,6 +6374,11 @@ impl Node {
         // (ADR-020 §3). Without this the node would hold an empty keyring and
         // silently trust nobody after every restart.
         self.trust = crate::node::trust::Keyring::load(profile.store(), signer)?;
+        // Where members were last reached. A book that will not open is started afresh rather
+        // than refusing the unlock: it is a cache of addresses, and the next connection to
+        // each member fills it again.
+        self.peer_book =
+            crate::node::peer_book::PeerBook::load(profile.store(), signer).unwrap_or_default();
         Ok(())
     }
 
@@ -6339,6 +6403,7 @@ impl Node {
         // and says who this operator talks to. A locked node holds neither, and it
         // is re-opened on the next unlock (ADR-020 §3).
         self.trust = crate::node::trust::Keyring::new();
+        self.peer_book = crate::node::peer_book::PeerBook::new();
         // Pairwise sessions hold ratchet key material: drop them with everything else
         // (their secrets zeroize on drop).
         self.sessions.clear();
@@ -6518,6 +6583,7 @@ impl Node {
                 self.publish_channel_locally(channel_id).await;
                 self.publish_channel_to_anchors(channel_id).await;
                 self.install_key_packages(channel_id).await;
+                self.reach_members_of(channel_id).await;
                 let _ = self.event_tx.send(NodeEvent::ChannelOpened {
                     channel_id: *channel_id,
                 });

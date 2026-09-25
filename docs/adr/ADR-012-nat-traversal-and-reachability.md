@@ -406,6 +406,22 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   sides with the relayed one retiring on each; behind symmetric NATs `reach` is as fast and `upgrade`
   comes back empty; a private-only address record no longer costs the dial timeout. ADR-016's M15.1 gate
   went from 22.9 s to 7.9 s, the join itself now bounded at 12 s.
+  - **A node remembers where it last reached each member (2026-09-25, PRD-001, found by ADR-023's
+    R10 gate).** Addresses came only from the rendezvous board, which lives in memory, so a member
+    that restarted in a room with no anchor knew no member's address and stayed alone. The node now
+    keeps each member's last direct addresses (at most 4 per member, each with the time last seen) in
+    `node::peer_book`, sealed under its identity in its own store. It records the address on every
+    direct connection, falls back to the book when the board has nothing for a member, and dials
+    every other member of a room when it opens the room. Relayed paths are not recorded.
+    - **Gate:** `a_member_that_restarts_finds_its_room_proof`. Two members and no anchor; one
+      restarts on the same port and then on a new port. A message posted while it was down and one
+      it posts once back must cross within 10 s of it answering.
+    - **Mutation, nothing persisted:** red. Neither message crossed in 60 s in either case.
+    - **Not yet within 10 s on this base.** Both directions took 29.4–30.1 s: the survivor's old
+      connection to the dead process holds its sync for the room until `SILENCE_IS_DEATH` promotes
+      the new one. With `prd1/restart-probe`'s 582f18a (a held connection is probed when a newcomer
+      is filed) applied as well, the same gate measured 0.23–0.38 s, 2 of 2. The bar is met only
+      once that change is merged with this one.
   - **A retired connection is let go (2026-09-25, v0.2.9).** "Closed by the node's tick" did not
     happen. `retire_expired` closes a retired connection once the grace is up **and** nothing holds its
     `Arc` — the strong count is how a path still carrying a tunnel is told from one that is not — and
