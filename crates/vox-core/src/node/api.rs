@@ -398,8 +398,10 @@ pub enum Fault {
     /// An invite link would not parse, or named a channel/anchor this node cannot
     /// use.
     BadLink,
-    /// A join reached a board, and the board does not hold the room: its host has not
-    /// published the room there yet (it is offline, or its publish has not landed).
+    /// A join reached a board, and the board has nothing for the room: either its host has not
+    /// published the room there yet (it is offline, or its publish has not landed), or the room id
+    /// in the address is wrong — a link carries no checksum, so a mistyped room id still parses.
+    /// The board cannot tell the two apart, so neither can this.
     ///
     /// **Not [`Fault::BadLink`].** This was reported as one, so a person whose host had simply
     /// not reached the anchor yet was told the address would not parse and to check they had

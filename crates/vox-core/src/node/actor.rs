@@ -1190,15 +1190,16 @@ impl Joiner {
             .await
             .map_err(|e| JoinerLost::of(fault_of(&e)))?;
         steps.took("fetch", t);
-        // **A board that does not hold the room is not a bad address.** The link parsed and named
-        // a room; the board we reached simply has nothing for it yet, because the room's host has
-        // not published it there. Say which board, so the person can tell which of their anchors
-        // is behind, and let the advice say what to try.
+        // **A board that does not hold the room is not a malformed address.** The link parsed and
+        // named a room; the board we reached has nothing for it. That is either a room its host has
+        // not published there yet, or a room id mistyped into another valid one (a link carries no
+        // checksum), and the board cannot tell which. Say which board and which room, so the person
+        // can check both, and let the advice name the two causes.
         let Some(genesis) = set.genesis.clone() else {
             return Err(JoinerLost {
                 fault: Fault::RoomNotOnBoard,
                 why: vec![format!(
-                    "board {} does not hold room {} yet",
+                    "board {} has nothing for room {}",
                     crate::node::network::short_id(board.peer_id()),
                     crate::node::network::short_id(parsed.channel_id)
                 )],
