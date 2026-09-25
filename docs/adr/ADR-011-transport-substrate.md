@@ -2,7 +2,7 @@
 
 **Status**: implemented (M9, `crates/vox-core/src/transport/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline). 2026-09-20 — stream framing lifted into `transport::framing`; typed streams (`transport::streams`, ADR-016 M14.2).
+**Updated**: 2026-09-25 — **path-MTU discovery searches to 8192 bytes and the UDP socket buffers are 4 MiB** (PRD-001 R41; see "Throughput (R41)" under Implementation notes). 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline). 2026-09-20 — stream framing lifted into `transport::framing`; typed streams (`transport::streams`, ADR-016 M14.2).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: transport, quic, tls, post-quantum, multiplexing, datagrams
 
@@ -151,6 +151,65 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   server loop must catch-and-continue. Gate obligation: the cross-version interop matrix
   (handshake + identity-PoP) does not exist — no second implementation, no version-pinned matrix, no
   CI job; the PoP is over the raw subject-public-key bits (not SPKI DER), which such a matrix must pin.
+- **Throughput (R41), 2026-09-25.** A direct tunnel through `vox forward` on one machine ran at ~290
+  MB/s (2.3 Gbit/s) against ~10 GB/s (80 Gbit/s) for plain loopback TCP. Profiled with macOS
+  `sample` during a transfer: the **receiving** node was mostly idle; the **sending** node spent
+  its time in `__sendmsg` (one syscall per 1452-byte packet) and in the connection lock that
+  `sendmsg` runs under, which the splice's stream writes wait on. AES-GCM (aws-lc) was a few
+  percent; the flow-control windows did not bind. Changes, each A/B-measured against the others in
+  interleaved rounds on one box (quiet-round medians):
+  - `MtuDiscoveryConfig::upper_bound` and `EndpointConfig::max_udp_payload_size` raised to **8192**
+    (`quic::MAX_UDP_PAYLOAD`): ~290 → ~1100 MB/s on loopback. Discovery probes, so a 1500-byte link
+    keeps 1452 and gains nothing — this helps loopback and jumbo-frame links only. 16356 (the
+    loopback MTU) broke connections on macOS, whose `net.inet.udp.maxdgram` is 9216.
+  - UDP socket buffers 4 MiB each way (`quic::UDP_SOCKET_BUFFER`): no gain alone, but without them
+    a burst overflowed the default buffer and quinn's black-hole detection dropped the MTU to 1200.
+  - Measured and **not** kept: 4 runtime workers instead of 2 (no change). A 16 MiB stream window
+    with a **64 MiB** send window (more in flight, more overflow loss, and the MTU collapsed) was
+    also not kept; the windows that were kept are below.
+  - **quinn-udp `fast-apple-datapath`** (batched `sendmsg_x`): +18% at a 1452-byte MTU, +4% at
+    8192. It calls a private Apple API. The decider adopted it for every platform, iOS included.
+  - **Stream window 16 MiB, send window 32 MiB** (`quic::STREAM_WINDOW`). quinn's default 1.25 MB
+    stream window is sized for 100 Mbit/s at 100 ms, so a longer or faster path is capped by credit,
+    not by the link. **History, withdrawn method:** these were measured over macOS dummynet shaping
+    set up with `sudo`, which agents may no longer run (2026-09-25). Vox/raw-TCP ratios at 1 Gbit/s
+    were 0.94–1.01 (1 ms and 20 ms RTT), and restoring quinn's default window dropped the 20 ms
+    class to 0.46. They stand as history only. R41 against an emulated link is measured by
+    `perf_r41` (its own owner and method).
+  - **Connection receive window 32 MiB** (`quic::CONNECTION_WINDOW`, two stream windows). quinn's
+    default connection window is unlimited, which was safe only while stream windows were small.
+    At 16 MiB per stream and quinn's default 100 concurrent streams, one peer writing into streams
+    nobody reads could park 1.6 GiB in this node. Proved on real endpoints
+    (`crates/vox-core/tests/transport_mtu_and_window_proof.rs`):
+    - 100 streams, 100 MiB offered to a reader that reads nothing: 33.75 MB received (3 runs), with
+      a bound of 32 MiB + 10% for packet overhead;
+    - mutation (no connection window): 105.4 MB received, red.
+  - **The 8192 ceiling needs both settings**: `MtuDiscoveryConfig::upper_bound` and
+    `EndpointConfig::max_udp_payload_size`. quinn searches only up to the smaller of its own ceiling
+    and the peer's advertised maximum. Same proof file, after a 32 MiB transfer on loopback:
+    - path MTU 7973–8082 (dialler) and 8192 (acceptor), 0 black holes, 3 runs;
+    - with `max_udp_payload_size` removed, both sides stop at 1472, red;
+    - with `upper_bound` removed, both stop at 1452, red.
+  - **Cubic restarts after idle** (`transport::congestion::IdleRestart`). A node keeps one QUIC
+    connection per peer, so every tunnel shares one congestion controller for the connection's
+    life. After ordinary drop-tail losses, Cubic's slow-start threshold and `W_max` stayed low, and a
+    later bulk transfer on a longer path grew one segment at a time. Measured with R41's gate
+    (`perf_r41_tunnel_throughput_proof`, 1 Gbit/s at 50 ms, run after the 2 ms LAN arm) and quinn's
+    own stats logged on both ends: cwnd plateaued at ~3.75 MB, which is ~590 Mbit/s. Flow control
+    never bound: 0 STREAM_DATA_BLOCKED and 0 DATA_BLOCKED on either side. With the WAN arm run first,
+    the same binary reached 98.4%.
+    - Now, after 1 s with nothing sent (and at least 4 smoothed RTTs), the next send starts from a
+      fresh Cubic: initial window, slow start. That is what a plain TCP transfer, a fresh
+      connection each time, always gets. RFC 5681 §4.1 restarts too but keeps ssthresh, which would
+      keep the plateau.
+    - Gate, 3 runs: WAN 95.5 / 97.9 / 92.7%, LAN 98.4 / 98.3 / 98.4%.
+    - Mutation (plain Cubic, same tree): WAN 56.9%, red.
+    - A quinn `black_hole_cooldown` of 3 s was tried and not kept: LAN 83.9%, WAN 28.8%.
+  - **Unshaped loopback: ~1.1–1.2 GB/s (8.8–9.6 Gbit/s), about 11–12% of loopback TCP.** The decider
+    has ruled that loopback is the wrong yardstick (PRD-001 R41 as clarified 2026-09-25): R41 is
+    measured against a link.
+  - **Observed, unexplained:** on unshaped loopback, 2 of 54 transfers collapsed to ~14 MB/s for the
+    whole transfer, with and without the window change. Recorded, not investigated.
 
 ## Links
 **Depends on**: ADR-002, ADR-004, ADR-008.
