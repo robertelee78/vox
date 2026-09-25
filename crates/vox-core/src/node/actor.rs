@@ -4185,7 +4185,16 @@ impl Node {
             (None, None) => false,
         };
 
+        // **Refused, not dropped.** A node asked for a room it does not hold — an anchor that keeps
+        // no log for it, most often — or at an epoch it is not at, returned here and let the streams
+        // fall, and the initiator learned only `sync failed: transport` — indistinguishable from a
+        // connection that died. Every push to an anchor that keeps no log for the room read as a
+        // network fault. A coded reset says what happened. (It does not recover time: a dropped
+        // stream already ended the initiator's session within milliseconds, measured; the long
+        // losses once blamed on this were the room-wide starvation v0.2.8 fixed.)
         if !matches_epoch {
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream(&mut send, &mut recv);
             return;
         }
         let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
