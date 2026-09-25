@@ -42,7 +42,11 @@
 //!    anchor circuit joins them. The guest's leg runs through a proxy this test controls,
 //!    which also counts what crossed, as evidence that the call went that way;
 //! 3. **mesh**: four members, each calling the other three at once (twelve directions
-//!    per stream), the same bars per direction.
+//!    per stream), the same bars per direction. Every member opens its own flows to every
+//!    other at the same moment, so each pair's daemons dial each other at once and the
+//!    connection tie-break runs under live calls. The call lasts past the grace after which
+//!    a displaced connection is closed unless something holds it (`RETIRE_GRACE_SECS` +
+//!    15 s), and every direction must deliver its whole schedule.
 //!
 //! ## Why it is `#[ignore]`d
 //! Production Argon2id per profile, a real proof of work per join, and the harness's
@@ -73,8 +77,19 @@ use vox_core::node::link::{b32_decode, b32_encode};
 use vox_core::node::paths::Paths;
 use world::{args, vox_once, PathKind, Setup, VoxProc, World, IDENTITY, LINE_TIMEOUT};
 
-/// How long each call lasts.
+/// How long a pair's call lasts.
 const CALL: Duration = Duration::from_secs(30);
+/// How long the mesh's call lasts: past the grace after which a displaced connection is
+/// closed unless something still holds it, so every call must survive that moment.
+const MESH_CALL: Duration =
+    Duration::from_secs(vox_core::node::net::RETIRE_GRACE_SECS + 15);
+
+/// How the members of a call dial each other.
+#[derive(Clone, Copy)]
+enum Shape {
+    Pairs,
+    CrossingMesh,
+}
 const VOICE_BYTES: usize = 160;
 const VOICE_EVERY: Duration = Duration::from_millis(20);
 const VIDEO_BYTES: usize = 1200;
@@ -144,6 +159,10 @@ struct Flow {
     peer: String,
     arm: &'static str,
     stream: tokio::net::UnixStream,
+    /// `both` for a pair's flows, which carry each direction; in the crossing mesh every
+    /// member opens its own flow to every other, and sends only on those (`out`),
+    /// receiving on the ones the others opened to it (`in`).
+    dir: &'static str,
 }
 
 /// The app's side of one call on one flow: send this arm's frames on schedule from
@@ -153,10 +172,10 @@ struct Flow {
 /// `[u32 length ‖ frame]` records in the stream. The product never does that, but the
 /// proof's mutation (a) makes the daemon carry datagrams on the reliable stream, and the
 /// app must still be able to see what that did to the call.
-async fn run_flow(flow: Flow, start: u64, pause: Option<(u64, u64)>) -> Value {
+async fn run_flow(flow: Flow, start: u64, pause: Option<(u64, u64)>, call: Duration) -> Value {
     let (mut rd, mut wr) = flow.stream.into_split();
-    let arm = flow.arm;
-    let end = start + u64::try_from((CALL + Duration::from_secs(3)).as_nanos()).unwrap();
+    let (arm, dir) = (flow.arm, flow.dir);
+    let end = start + u64::try_from((call + Duration::from_secs(3)).as_nanos()).unwrap();
     let reader = tokio::spawn(async move {
         let mut got: Received = Vec::new();
         let mut spill: Vec<u8> = Vec::new();
@@ -194,7 +213,11 @@ async fn run_flow(flow: Flow, start: u64, pause: Option<(u64, u64)>) -> Value {
     } else {
         (VIDEO_EVERY, VIDEO_BYTES)
     };
-    let frames = u32::try_from(CALL.as_nanos() / every.as_nanos()).unwrap();
+    let frames = if dir == "in" {
+        0
+    } else {
+        u32::try_from(call.as_nanos() / every.as_nanos()).unwrap()
+    };
     let mut sent = Vec::new();
     let mut keys = Vec::new();
     let t0 = tokio::time::Instant::now() + Duration::from_nanos(start.saturating_sub(now_ns()));
@@ -222,6 +245,7 @@ async fn run_flow(flow: Flow, start: u64, pause: Option<(u64, u64)>) -> Value {
     json!({
         "peer": flow.peer,
         "arm": arm,
+        "dir": dir,
         "sent": sent,
         "keyframes": keys,
         "got": got,
@@ -246,6 +270,9 @@ fn app_role() {
         .collect();
     let accepts: usize = env("VOX_CALLS_ACCEPT").parse().unwrap_or(0);
     // Leaked once for the process: every task logs under it.
+    let call = Duration::from_secs(env("VOX_CALLS_SECS").parse().unwrap());
+    let cross = env("VOX_CALLS_CROSS") == "1";
+    let (out_dir, in_dir) = if cross { ("out", "in") } else { ("both", "both") };
     let me: &'static str = Box::leak(env("VOX_CALLS_NAME").into_boxed_str());
     let pause: Option<(u64, u64)> = env("VOX_CALLS_PAUSE_MS").parse::<u64>().ok().map(|ms| {
         let from = ms * 1_000_000;
@@ -288,7 +315,12 @@ fn app_role() {
                             Ok((stream, info)) => {
                                 assert!(info.datagrams, "an accepted flow without datagrams");
                                 eprintln!("[app {me}] accepted {arm} from {peer}");
-                                let flow = Flow { peer: peer.clone(), arm, stream };
+                                let flow = Flow {
+                                    peer: peer.clone(),
+                                    arm,
+                                    stream,
+                                    dir: in_dir,
+                                };
                                 if accepted.lock().await.insert((peer.clone(), arm), flow).is_some() {
                                     eprintln!("[app {me}] {arm} from {peer} again: the newer one is the call");
                                 }
@@ -332,6 +364,7 @@ fn app_role() {
                     peer: peer.clone(),
                     arm,
                     stream,
+                    dir: out_dir,
                 });
             }
         }
@@ -353,7 +386,7 @@ fn app_role() {
         .unwrap();
         let runs: Vec<_> = flows
             .into_iter()
-            .map(|f| tokio::spawn(run_flow(f, start, pause)))
+            .map(|f| tokio::spawn(run_flow(f, start, pause, call)))
             .collect();
         let mut results = Vec::new();
         for r in runs {
@@ -388,6 +421,7 @@ struct App {
     child: Child,
     lines: std::sync::mpsc::Receiver<String>,
     out: PathBuf,
+    call: Duration,
 }
 
 impl Drop for App {
@@ -398,6 +432,7 @@ impl Drop for App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         m: &Member,
         room: &str,
@@ -405,6 +440,8 @@ impl App {
         accepts: usize,
         pause: bool,
         tmp: &Path,
+        call: Duration,
+        cross: bool,
     ) -> App {
         let out = tmp.join(format!("{}-calls.json", m.name));
         let open: Vec<&str> = open.iter().map(|p| p.fp.as_str()).collect();
@@ -421,6 +458,8 @@ impl App {
             .env("VOX_CALLS_OPEN", open.join(","))
             .env("VOX_CALLS_ACCEPT", accepts.to_string())
             .env("VOX_CALLS_NAME", &m.name)
+            .env("VOX_CALLS_SECS", call.as_secs().to_string())
+            .env("VOX_CALLS_CROSS", if cross { "1" } else { "0" })
             .env("VOX_CALLS_OUT", &out)
             .env(
                 "VOX_CALLS_PAUSE_MS",
@@ -454,6 +493,7 @@ impl App {
             child,
             lines,
             out,
+            call,
         }
     }
 
@@ -481,7 +521,7 @@ impl App {
     }
 
     fn results(&mut self) -> Vec<Value> {
-        self.wait_for("done", CALL + Duration::from_secs(60));
+        self.wait_for("done", self.call + Duration::from_secs(60));
         serde_json::from_slice(&std::fs::read(&self.out).unwrap()).unwrap()
     }
 }
@@ -646,16 +686,25 @@ fn directions(
                 continue;
             }
             for (arm, _) in ARMS {
-                let pick = |who: &Member, peer: &Member| {
+                // The sender's record of the flow it sent on, and the receiver's of the flow
+                // it received on: one flow for a pair, two for a crossing mesh pair.
+                let pick = |who: &Member, peer: &Member, dirs: [&str; 2]| {
                     results[&who.name]
                         .iter()
-                        .find(|v| v["peer"] == peer.fp.as_str() && v["arm"] == arm)
+                        .find(|v| {
+                            v["peer"] == peer.fp.as_str()
+                                && v["arm"] == arm
+                                && dirs.iter().any(|d| v["dir"] == *d)
+                        })
                         .cloned()
                         .unwrap_or_else(|| {
                             panic!("{} has no {arm} flow with {}", who.name, peer.name)
                         })
                 };
-                let (s, r) = (pick(from, to), pick(to, from));
+                let (s, r) = (
+                    pick(from, to, ["out", "both"]),
+                    pick(to, from, ["in", "both"]),
+                );
                 out.push(measure(
                     format!("{arm} {}->{}", from.name, to.name),
                     &s,
@@ -696,19 +745,19 @@ fn report(d: &Direction) {
 /// The bars every direction must meet.
 /// How many frames a sender puts on a flow in the whole call: every scheduled one, less
 /// those its pause skips. What the sender runs is this same schedule.
-fn scheduled(arm: &str, paused: bool) -> usize {
+fn scheduled(arm: &str, paused: bool, call: Duration) -> usize {
     let every = if arm == "voice" {
         VOICE_EVERY
     } else {
         VIDEO_EVERY
     };
-    let frames = u32::try_from(CALL.as_nanos() / every.as_nanos()).unwrap();
+    let frames = u32::try_from(call.as_nanos() / every.as_nanos()).unwrap();
     (0..frames)
         .filter(|seq| !(paused && (PAUSE_AT..PAUSE_AT + STALL).contains(&(every * *seq))))
         .count()
 }
 
-fn bars(ds: &[Direction], p99_bar: f64, pauser: Option<&str>) {
+fn bars(ds: &[Direction], p99_bar: f64, pauser: Option<&str>, call: Duration) {
     for d in ds {
         report(d);
     }
@@ -719,7 +768,7 @@ fn bars(ds: &[Direction], p99_bar: f64, pauser: Option<&str>) {
         // directions stopped at about 16 s and passed every other bar.
         let (arm, from) = d.label.split_once(' ').unwrap();
         let from = from.split("->").next().unwrap();
-        let want = scheduled(arm, pauser == Some(from));
+        let want = scheduled(arm, pauser == Some(from), call);
         assert_eq!(
             d.sent + d.excluded,
             want,
@@ -784,6 +833,7 @@ fn call(
     tmp: &Path,
     pauser: Option<&str>,
     blacked: Option<&str>,
+    shape: Shape,
     during: impl FnOnce(u64),
 ) -> Vec<Direction> {
     let mut daemons: Vec<VoxProc> = Vec::new();
@@ -818,13 +868,25 @@ fn call(
         });
         daemons.push(d);
     }
-    // Each member opens to the members after it and accepts from those before it.
     let mut apps: Vec<App> = members
         .iter()
         .enumerate()
         .map(|(i, m)| {
             let pause = pauser == Some(m.name.as_str());
-            App::spawn(m, room, &members[i + 1..], i, pause, tmp)
+            match shape {
+                // Each member opens to the members after it and accepts from those before
+                // it: one flow per pair, carrying both directions.
+                Shape::Pairs => App::spawn(m, room, &members[i + 1..], i, pause, tmp, CALL, false),
+                // Every member opens to every other at the same moment, so every pair's
+                // daemons dial each other at once and the connection tie-break runs under
+                // live calls; and the call outlasts the retire grace, so a call left on a
+                // connection the tie-break retired has to survive that too.
+                Shape::CrossingMesh => {
+                    let others: Vec<&Member> =
+                        members.iter().copied().filter(|o| o.fp != m.fp).collect();
+                    App::spawn(m, room, &others, others.len(), pause, tmp, MESH_CALL, true)
+                }
+            }
         })
         .collect();
     for a in &mut apps {
@@ -953,6 +1015,7 @@ fn run_pair(path: PathKind) {
         w.tmp.path(),
         Some("host"),
         knob.as_ref().map(|_| "guest"),
+        Shape::Pairs,
         move |start| {
             if let Some((black, _)) = black {
                 let until = |off: Duration| {
@@ -981,7 +1044,7 @@ fn run_pair(path: PathKind) {
             "the call did not cross the relay leg: {crossed} < {guest_frames}"
         );
     }
-    bars(&ds, bar, Some("host"));
+    bars(&ds, bar, Some("host"), CALL);
     pause_unfelt(&ds, "host", "guest->host", bar);
     if knob.is_some() {
         blackout_held_nothing(&ds, bar);
@@ -1092,12 +1155,21 @@ fn a_four_member_mesh_call_meets_the_bars_on_every_direction() {
             (guest_anchor.clone(), "127.0.0.1:0")
         }
     };
-    let ds = call(&all, &w.room, &anchor_for, w.tmp.path(), None, None, |_| {});
+    let ds = call(
+        &all,
+        &w.room,
+        &anchor_for,
+        w.tmp.path(),
+        None,
+        None,
+        Shape::CrossingMesh,
+        |_| {},
+    );
     eprintln!("[mesh] {} directions measured", ds.len());
     assert_eq!(
         ds.len(),
         4 * 3 * 2,
         "every member to every other, both streams"
     );
-    bars(&ds, P99_DIRECT_MS, None);
+    bars(&ds, P99_DIRECT_MS, None, MESH_CALL);
 }
