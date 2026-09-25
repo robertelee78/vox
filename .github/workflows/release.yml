@@ -61,7 +61,7 @@ jobs:
       - run: rustc --version && cargo --version
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
         env:
           # `update_proof` asks GitHub which releases exist, to find one to update *from*.
           GH_TOKEN: ${{ github.token }}
@@ -91,8 +91,10 @@ jobs:
       # answered nobody for up to `HANDSHAKE_TIMEOUT` (30s), and `vox connect` exits the moment it has
       # joined, which leaves the host mid-handshake. v0.2.8 spawns each handshake on its own bounded
       # task, which closes ADR-017's "Open proof gap". Back in the blocking set.
+      # `--no-fail-fast`: without it cargo stops at the first red test binary, and v0.2.9's run left
+      # ~120 binaries unrun behind one red, so each run could show only one red per hour.
       - run: |
-          cargo test --release --workspace -- --ignored \
+          cargo test --release --workspace --no-fail-fast -- --ignored \
             --skip two_agents_on_separate_processes_join_through_an_anchor_and_talk
 
   # **Reporting only, and in its OWN job on purpose.** These are the proofs excluded from the gate
@@ -125,7 +127,7 @@ jobs:
       # Run them anyway, reporting only: a rate that changes is information, and a gate that hides
       # them entirely would let them rot.
       - run: |
-          cargo test --release --workspace -- --ignored \
+          cargo test --release --workspace --no-fail-fast -- --ignored \
             two_agents_on_separate_processes_join_through_an_anchor_and_talk \
             || echo "::warning::cross_process_join_proof failed — known flake, ADR-018"
 

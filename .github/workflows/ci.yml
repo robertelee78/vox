@@ -106,7 +106,7 @@ jobs:
       - name: Clippy (default, pure-Rust)
         run: cargo clippy --all-targets -- -D warnings
       - name: Test (default, pure-Rust)
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
         env:
           # `update_proof` asks GitHub which releases exist, to find one to update *from*.
           GH_TOKEN: ${{ github.token }}
@@ -118,4 +118,4 @@ jobs:
       # live-client lifecycle tests (ADR-016 M13; ≈0.3 s per derivation in
       # release). Run here in release.
       - name: Real-parameter gates (release)
-        run: cargo test --release --workspace -- --ignored
+        run: cargo test --release --workspace --no-fail-fast -- --ignored
