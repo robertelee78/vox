@@ -74,7 +74,7 @@ fn parse_input(raw: &str) -> HookInput {
 }
 
 /// Read this session's cursor for `room`, if it has one.
-fn load_cursor(paths: &Paths, room: &str, session: &str) -> Option<Digest32> {
+pub(crate) fn load_cursor(paths: &Paths, room: &str, session: &str) -> Option<Digest32> {
     let text = std::fs::read_to_string(paths.cursor_file(room, session)).ok()?;
     let t = text.trim();
     vox_core::node::link::b32_decode(t, "cursor").ok()

@@ -417,21 +417,94 @@ pub async fn post_cmd(
         body: body.trim_end().to_owned(),
         data,
     };
+    let is_result = draft.kind == vox_agentcomms::envelope::work::RESULT;
     let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;
+    // **A `result` says what it has not read** (ADR-021 M21.10). A redirect addressed
+    // to this session can land after its last drain and before it reports; the result
+    // still posts, and the caller is shown every such message so it can follow up.
+    let unread = if is_result {
+        unread_addressed(paths, &room_key, &session, &posting)
+    } else {
+        Vec::new()
+    };
     if opts.coord.json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "schema": "vox.room.post/1",
-                "room": room_key,
-                "entry_hash": claim::b32(&posting.entry_hash),
-                "op": posting.op,
-                "status": posting.status,
-                "session": session,
-            })
+        let mut out = serde_json::json!({
+            "schema": "vox.room.post/1",
+            "room": room_key,
+            "entry_hash": claim::b32(&posting.entry_hash),
+            "op": posting.op,
+            "status": posting.status,
+            "session": session,
+        });
+        if is_result {
+            out["unread_addressed"] = serde_json::Value::Array(
+                unread
+                    .iter()
+                    .map(|(h, from, kind, body)| {
+                        serde_json::json!({"entry_hash": h, "from": from, "type": kind, "body": body})
+                    })
+                    .collect(),
+            );
+        }
+        println!("{out}");
+    }
+    if !unread.is_empty() {
+        eprintln!(
+            "vox: your result is posted, but {} message(s) addressed to you are unread — \
+             read them before moving on:",
+            unread.len()
         );
+        for (h, from, kind, body) in &unread {
+            eprintln!("  {} {from} [{kind}] {body}", &h[..12]);
+        }
     }
     Ok(())
+}
+
+/// Messages addressed to this session that its drain has not delivered yet: past its
+/// drain cursor, not its own, naming it in `to` — by `VOX_AGENT_NAME`, the name it is
+/// addressed by, or by its session id. The one just posted is excluded.
+fn unread_addressed(
+    paths: &Paths,
+    room_key: &str,
+    session: &str,
+    posting: &coord::Posting,
+) -> Vec<(String, String, String, String)> {
+    let snap = &posting.after;
+    let names: Vec<String> = std::iter::once(session.to_owned())
+        .chain(
+            std::env::var("VOX_AGENT_NAME")
+                .ok()
+                .filter(|n| !n.trim().is_empty()),
+        )
+        .collect();
+    let start = crate::agent_hook::load_cursor(paths, room_key, session)
+        .and_then(|c| snap.rows.iter().position(|r| r.entry_hash == c))
+        .map_or(0, |i| i + 1);
+    snap.rows[start..]
+        .iter()
+        .filter(|r| r.entry_hash != posting.entry_hash)
+        .filter_map(|r| {
+            let env = Envelope::parse(&r.text).ok()?;
+            let own = r.author == snap.me && env.from == session;
+            (!own && names.iter().any(|n| env.is_addressed_to(n))).then(|| {
+                let body: String = env
+                    .body
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(160)
+                    .collect();
+                (
+                    claim::b32(&r.entry_hash),
+                    env.from.clone(),
+                    env.kind.clone(),
+                    body,
+                )
+            })
+        })
+        .collect()
 }
 
 /// The entry that seeds the holder's default attempt id on `work`: its claim's

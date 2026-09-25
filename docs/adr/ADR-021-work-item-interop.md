@@ -882,6 +882,13 @@ that proves it.**
   *Proof*: through the shipped binary, a `result` posted with an addressed message unread posts and
   names that message; with nothing unread it prints no warning.
 
+  > **Built on PR #14, 2026-09-25** (proof `result_unread_proof`, two nodes). `vox room post --type result`
+  > posts, then names every message past the session's **drain cursor** that is not its own and names it
+  > in `to` — by its session id or its `VOX_AGENT_NAME` — on stderr and as `unread_addressed` in `--json`.
+  > Proved: the addressed redirect is named and the broadcast and a message to someone else are not;
+  > after the drain delivers it, the next result names nothing; a non-`result` post never warns. Four
+  > mutants caught (never reports; cursor ignored; addressing ignored; every post warns).
+
 ## Links
 
 - ADR-008 — the log, its ordering and tie-break key.
