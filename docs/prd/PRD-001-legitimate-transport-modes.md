@@ -1,7 +1,8 @@
 # PRD-001: Legitimate transport modes
 
-**Status**: draft for the decider's review — 2026-09-24. Nothing in this document is built unless it
-says so; every requirement is written as what the product **must** do.
+**Status**: **approved by the decider — 2026-09-25.** (Drafted 2026-09-24.) Nothing in this document is
+built unless it says so; every requirement is written as what the product **must** do. Delivery is tracked
+in GitHub as one epic per section (issues #52–#96) and in ADR-022 / ADR-023.
 
 **Source**: a product-management interview with the decider on 2026-09-24, and a read-only research
 pass over `origin/main` 96c47ed (v0.2.7) the same day (ruflo `research-synthesis`,
@@ -136,7 +137,16 @@ friction for this audience can be fixed later.
 
 - **R40.** A chat message between two online nodes **must** arrive in **under 1 s**, whether direct or
   relayed.
-- **R41.** A tunnel on a direct path **must** run near line rate (within about 10–20% of raw).
+- **R41.** A tunnel **must not throttle the network it runs over**. Revised by the decider on
+  2026-09-25, replacing "near line rate (within about 10–20% of raw)": *"let's not be overly pedantic here
+  but we should figure out what the maximum throughput is for a network connection and we should ensure
+  that our overlay system doesn't completely nuke that. We want vox to be as fast and efficient as possible
+  so that it is actually useful as a transport mechanism… [Tor hidden services] made me feel like I was on a
+  three hundred bps modem. I really want our solution to be elegant and fast and wonderful to use."*
+  - The gate measures raw TCP and a Vox tunnel over the **same emulated real link**: 1 Gbit/s at low and
+    WAN-like RTT, 10 Gbit/s, and a lossy Wi-Fi-like link.
+  - Vox **must** reach at least about 90% of raw at 1 Gbit/s; the other ratios are reported.
+  - Loopback speed is tracked as a raw-efficiency figure, not the bar.
 - **R42.** A first connection to a peer, including NAT traversal, **must** complete in **under 2 s**.
 
 ### 3.11 Removals

@@ -37,9 +37,11 @@ Revision history:
   `failed` seeds a retry's id but no retry exists until the next `working`; a `result` with no observed
   attempt-start stays an assertion (§2, §3). The seeded default id is unchanged on the wire.
   `tracker_rehearsal_proof` asserts claim-leaves-Ready, working-enters-Executing, failed-returns-Ready,
-  retry-only-on-working and blocked-is-Health-only through live models, and passed (227 s); **the mutation
-  check of these new checkpoints is pending** — its first runs were uninformative (the live-model warm-up
-  timed out before any checkpoint), not survivors.
+  retry-only-on-working and blocked-is-Health-only through live models, and passed (227 s, 149 s). Its new
+  checkpoints are **mutation-checked**: a stub that lets an unstarted `result` advance, a stub that starts an
+  attempt on `claim`, and a product that seeds no id each turn it red at exactly their checkpoint. (Earlier
+  mutant runs timed out in the live-model warm-up before any checkpoint; they were discarded as
+  uninformative, with an unmutated control run in the same window, not counted as survivors.)
 - 2026-09-24 — the decider's answers on ideas from a review of Orca: **M21.9** (the drain says when a
   claim was lost) and **M21.10** (a `result` warns about unread addressed messages) are decided and not
   built; grouped addresses (`@claude`, `@idle`) are **declined** — `to` stays explicit names. The status
