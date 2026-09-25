@@ -160,6 +160,12 @@ pub struct RoomStatus {
     /// R14: one, unless a full-history grant is still owed). `None` when the room was
     /// mid-session and could not be read without waiting.
     pub key_generations: Option<usize>,
+    /// Authors this node froze here for signing two entries at one position (ADR-008). `None`
+    /// when the room was mid-session and could not be read without waiting.
+    pub frozen: Option<Vec<Digest32>>,
+    /// Entries this node refused here as at or below their author's checkpoint since it opened
+    /// the room (ADR-023 decision 3). `None` as for `frozen`.
+    pub refused_below_checkpoint: Option<u64>,
     /// Its members.
     pub members: Vec<MemberStatus>,
 }
@@ -323,13 +329,18 @@ impl StatusReport {
                 )
             });
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"frozen\":{},\"refused_below_checkpoint\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
                 opt(r.last_sync),
                 opt(r.retention),
                 opt(r.key_generations.map(|n| n as u64)),
+                r.frozen.as_ref().map_or("null".into(), |f| format!(
+                    "[{}]",
+                    list(f.iter().map(|d| q(&b32_encode(d))))
+                )),
+                opt(r.refused_below_checkpoint),
                 list(members)
             )
         });

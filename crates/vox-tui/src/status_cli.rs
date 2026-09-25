@@ -83,6 +83,25 @@ fn render(v: &Value) -> String {
                 .and_then(Value::as_u64)
                 .map_or_else(|| "(busy)".to_owned(), |n| n.to_string())
         );
+        // A fork is a member caught signing two different entries at one position: loud,
+        // because everything that member posts here is refused from then on.
+        for f in r.get("frozen").and_then(Value::as_array).unwrap_or(&empty) {
+            let _ = writeln!(
+                o,
+                "    ! {} is frozen here: it signed two different entries at one position",
+                short(f.as_str().unwrap_or("?"))
+            );
+        }
+        if let Some(n) = r
+            .get("refused_below_checkpoint")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+        {
+            let _ = writeln!(
+                o,
+                "    refused {n} entries at or below their author's checkpoint"
+            );
+        }
         for m in r.get("members").and_then(Value::as_array).unwrap_or(&empty) {
             let flag = |k: &str| m.get(k).and_then(Value::as_bool) == Some(true);
             let _ = writeln!(

@@ -216,6 +216,32 @@ fn until_retention(dir: &Path, who: &str, want: u64, secs: u64) -> Duration {
     panic!("{who}'s room never reported retention {want}; last {last:?}");
 }
 
+/// What `dir`'s node reports it caught in the room: the authors it froze for a fork, and how
+/// many entries it refused as at or below their author's checkpoint. Polled past the moments a
+/// session holds the room (reported as `null` then) until `done` holds, or `secs` pass.
+fn fork_watch(dir: &Path, secs: u64, done: impl Fn(&[String], u64) -> bool) -> (Vec<String>, u64) {
+    let started = Instant::now();
+    let mut last = None;
+    while started.elapsed() < Duration::from_secs(secs) {
+        let room = &status(dir)["rooms"][0];
+        if let (Some(frozen), Some(refused)) = (
+            room["frozen"].as_array(),
+            room["refused_below_checkpoint"].as_u64(),
+        ) {
+            let frozen: Vec<String> = frozen
+                .iter()
+                .filter_map(|f| f.as_str().map(str::to_owned))
+                .collect();
+            if done(&frozen, refused) {
+                return (frozen, refused);
+            }
+            last = Some((frozen, refused));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    last.expect("the room was never readable in `vox status`")
+}
+
 /// `creator` makes a room; returns its short id as `vox room list` prints it.
 fn create(creator: &Path) -> String {
     let (ok, _, err) = vox(
@@ -365,13 +391,18 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
     until_readable(&alice, &[&bob, &carol], &room);
     let members = [(&alice, "alice"), (&bob, "bob"), (&carol, "carol")];
 
-    // ---- the admin sets it --------------------------------------------------------------
-    let (ok, said) = set_retention(&alice, &room, "1w");
-    assert!(ok, "the admin sets 1w: {said}");
-    for (dir, who) in members {
-        until_retention(dir, who, 604_800, 30);
+    // ---- the admin sets it: each preset the CLI offers, parsed into the room's ttl ---------
+    // ADR-023 decision 2 offers 1 hour, 1 week, 1 month or a custom value; the custom value
+    // is the 30 s below. The preset is what a person types, so it goes through the shipped
+    // CLI's parser, and what is checked is the ttl the room then carries on every member.
+    for (preset, want) in [("1h", 3_600), ("1m", 2_592_000), ("1w", 604_800)] {
+        let (ok, said) = set_retention(&alice, &room, preset);
+        assert!(ok, "the admin sets {preset}: {said}");
+        for (dir, who) in members {
+            until_retention(dir, who, want, 30);
+        }
+        println!("R7: the admin set {preset}; all three members report {want}");
     }
-    println!("R7: the admin set 1 week; all three members report 604800");
 
     // ---- a member who is not the admin cannot change it ---------------------------------
     let (ok, said) = set_retention(&bob, &room, "5");
@@ -409,12 +440,21 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
     let (ok, said) = set_retention(&alice, &room, "30");
     assert!(ok, "the admin shortens to 30 s: {said}");
     let changed = Instant::now();
+    // The whole of what each member reads, not a count by prefix: exactly the five newer
+    // messages, and nothing expired in any form — no older message, no probe, no other row.
+    let newer: Vec<String> = (1..=5).map(|i| format!("new {i}")).collect();
+    let only_newer = |t: &[String]| {
+        let mut t = t.to_vec();
+        t.sort();
+        t == newer
+    };
     for (dir, who) in members {
         until(dir, &room, &format!("{who} to keep only the 5"), 20, |t| {
-            count(t, "old ") == 0 && count(t, "new ") == 5 && count(t, "probe") == 0
+            only_newer(t)
         });
         println!(
-            "R7: shortened to 30 s — {who} reads 0 of 10 older, 5 of 5 newer ({} ms after the change)",
+            "R7: shortened to 30 s — {who}'s whole `room read` is the 5 newer and nothing else \
+             (0 of 10 older, 0 probes; {} ms after the change)",
             changed.elapsed().as_millis()
         );
     }
@@ -429,13 +469,14 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
     for (dir, who) in members {
         let t = read(dir, &room);
         println!(
-            "R7: forever again, 40 s later (past the old 30 s) — {who} reads {} of 5",
+            "R7: forever again, 40 s later (past the old 30 s) — {who} reads {} rows, {} of 5 \
+             newer",
+            t.len(),
             count(&t, "new ")
         );
-        assert_eq!(
-            count(&t, "new "),
-            5,
-            "{who}: lengthened, what is left must stay"
+        assert!(
+            only_newer(&t),
+            "{who}: lengthened, what is left must stay, and only it: {t:?}"
         );
     }
 }
@@ -614,8 +655,14 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
         count(t, "a ") == 0
     });
     std::thread::sleep(Duration::from_secs(15)); // alice's checkpoint reaches bob
-                                                 // Alice's node is stopped so the conflicting entry is signed with her own key, and started
-                                                 // again after: it finds bob and carol at the addresses it last reached them on.
+    let (frozen, refused) = fork_watch(&bob, 30, |_, _| true);
+    println!("R10: before — bob has frozen {frozen:?} and refused {refused} below a checkpoint");
+    assert!(
+        frozen.is_empty() && refused == 0,
+        "nothing has been caught yet: frozen {frozen:?}, refused {refused}"
+    );
+    // Alice's node is stopped so the conflicting entry is signed with her own key, and started
+    // again after: it finds bob and carol at the addresses it last reached them on.
     drop(alice_d.take());
     let (seq, pruned, signed, ended) =
         equivocate(&alice, alice_id, bob_id, &bob_at, channel_id, Some(5));
@@ -637,6 +684,25 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     assert!(
         !signed,
         "below the checkpoint bob must have shed the signature (ADR-023 decision 3)"
+    );
+    // **The refusal itself, not the absence of a freeze.** A conflicting entry at a position whose
+    // held side has shed its signature cannot freeze anyone in any case — it cannot incriminate —
+    // so "bob still reads alice" is what both a refusal and a fork that proves nothing look like.
+    // Only bob's count of entries refused below a checkpoint tells them apart.
+    assert!(
+        ended.is_none(),
+        "a refused entry does not end the session (ADR-008): {ended:?}"
+    );
+    let (frozen, refused) = fork_watch(&bob, 30, |_, n| n > 0);
+    println!(
+        "R10: below the checkpoint — bob refused {refused} entry as at or below alice's \
+         checkpoint, and has frozen {frozen:?}"
+    );
+    assert_eq!(
+        (refused, frozen.len()),
+        (1, 0),
+        "the conflicting entry must be refused as older than alice's checkpoint (ADR-023 \
+         decision 3), exactly once, and freeze nobody"
     );
     post(&alice, &room, "after-1");
     until(
@@ -681,6 +747,21 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     assert!(
         signed,
         "above the checkpoint the expired skeleton keeps its signature"
+    );
+    assert!(
+        ended.is_none(),
+        "a fork does not end the session (ADR-008): {ended:?}"
+    );
+    let (frozen, refused) = fork_watch(&bob, 30, |f, _| !f.is_empty());
+    println!(
+        "R10: above the checkpoint — bob has frozen {frozen:?} (alice is {alice_fp}), refused \
+         {refused} below a checkpoint"
+    );
+    assert_eq!(
+        (frozen, refused),
+        (vec![alice_fp.clone()], 1),
+        "the conflicting entry at an expired position must freeze alice as a fork, not be \
+         refused as pre-checkpoint"
     );
     post(&alice, &room, "after-2");
     until(

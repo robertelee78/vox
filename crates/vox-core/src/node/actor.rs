@@ -7024,6 +7024,10 @@ impl Node {
                         .filter(|t| *t > 0),
                 })
                 .collect();
+            let watch = self
+                .channels
+                .get(&room.channel_id)
+                .and_then(|shared| shared.try_lock().ok().map(|c| c.fork_watch()));
             report.rooms.push(RoomStatus {
                 id: room.channel_id,
                 name: room.local_name.clone(),
@@ -7037,6 +7041,8 @@ impl Node {
                     .channels
                     .get(&room.channel_id)
                     .and_then(|shared| shared.try_lock().ok().map(|c| c.key_generations())),
+                frozen: watch.as_ref().map(|(f, _)| f.clone()),
+                refused_below_checkpoint: watch.map(|(_, n)| n),
                 members,
             });
         }
