@@ -474,6 +474,9 @@ pub enum Fault {
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
     /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
     NotAServiceRoom,
+    /// The change is the room admin's to make — a holder of the `policy` capability — and
+    /// this identity is not one (PRD-001 R7: setting a room's retention).
+    NotAdmin,
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }
@@ -535,6 +538,9 @@ impl Fault {
             }
             Fault::NotAServiceRoom => {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
+            }
+            Fault::NotAdmin => {
+                "only the room's admin may change that, and this identity is not its admin\n       the admin is whoever created the room; ask them"
             }
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"

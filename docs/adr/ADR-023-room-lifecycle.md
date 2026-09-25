@@ -292,6 +292,26 @@ covers only the approver's own messages, as consent always has.
   ADR-010 §"Retention / TTL"). Not built within it: a room created with a retention (creation still
   writes `ttl` 0; `vox room retention` sets it after), and a gate isolating "a peer asking for a
   pruned body gets the skeleton" (the code path exists; nothing measures it alone).
+  - **R6, R7 and R10 gates** (`crates/vox-tui/tests/retention_requirements_proof.rs`, shipped
+    binary, each mutation-checked red):
+    - **R6, forever by default:** a room nobody set retention on reports `ttl` 0 on both members,
+      and after sweeps and a restart both read all 10 messages whose author's clock ran ten years
+      behind, plus 5 current ones. Mutation, room creation writes one year: red, status reads
+      `(31536000, 31536000)`.
+    - **R7, the admin's change reaches what every member already holds:** a non-admin's
+      `vox room retention` is refused with the admin message and changes nothing. The admin's
+      later change from a week to 30 s leaves each of three members 0 of 10 older and 5 of 5 newer
+      messages; setting forever again keeps those 5 past 40 s. Mutations: capability check
+      skipped, red (the non-admin's change succeeds); the sweep prunes nothing already held, red
+      (alice keeps the older 10).
+    - **Found by R7:** a non-admin's refusal printed "the other side refused". It now says the
+      change is the room admin's (`Fault::NotAdmin`).
+    - **R10, an expired entry's skeleton still catches a fork:** alice's node is stopped, a
+      conflicting entry is signed with her own key and pushed to bob, and her node is restarted.
+      At a pruned position below her checkpoint (seq 5, signature shed) it is refused and bob still
+      reads her next post. At a pruned position above it (seq 52, signature kept) bob freezes her:
+      carol reads her next post, bob reads it 0 times. Mutation, fork check skipped for a pruned
+      position: red, bob reads it once.
 - **M23.2** `seen` and the deterministic causal order (decision 1). Proofs 1–2. R17's
   takeover-after-silence does not need it. Hard-lock claims (PRD-001 §7 Q5) are to be designed on it
   if the decider answers "wait for certainty". **Built on `prd1/causal-order` (on v0.2.8). Proofs 2

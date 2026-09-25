@@ -2348,14 +2348,11 @@ pub async fn retention(
             }
             Ok(())
         }
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
-            "cannot set retention: {reason}{}",
-            if reason.contains("Refused") {
-                " — only the room's admin may"
-            } else {
-                ""
-            }
-        ))),
+        // The node's own words (`Fault::explain`) say why — including a member who is not the
+        // room's admin, which has its own fault rather than a generic refusal.
+        Ok(Frame::Error { reason }) => {
+            Err(AppError::Usage(format!("cannot set retention: {reason}")))
+        }
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }

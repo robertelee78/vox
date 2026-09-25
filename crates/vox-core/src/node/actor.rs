@@ -7652,8 +7652,12 @@ fn fault_of(e: &Error) -> Fault {
         Error::MalformedLink(_) | Error::MalformedAnchor(_) => Fault::BadLink,
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
-        // Retention is the admin's to set; anyone else is refused, not failed.
-        Error::MalformedGovernance("only the room's admin may set its retention") => Fault::Refused,
+        // Retention is the admin's to set; anyone else is refused, and told why. It was mapped to
+        // `Refused`, which reads "the other side refused" — for a check this node made itself,
+        // about its own identity, with nobody on any other side (found by the R7 gate).
+        Error::MalformedGovernance("only the room's admin may set its retention") => {
+            Fault::NotAdmin
+        }
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,
         // A join refused before the challenge (the responder does not hold that
         // channel open) reaches the joiner as a malformed exchange; report it as the
