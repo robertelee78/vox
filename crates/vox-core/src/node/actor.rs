@@ -1671,7 +1671,7 @@ pub struct Node {
     /// pass, so a peer that always takes the room cannot always go first.
     owed_first: std::collections::BTreeSet<Digest32>,
     /// Per-channel record sequence for board publishes (strictly increasing per
-    /// `(author, channel, epoch)`, ADR-012).
+    /// `(author, channel, epoch)`, ADR-012), across restarts too: see `next_record_seq`.
     record_seq: BTreeMap<Digest32, u64>,
     /// Pairwise ADR-004 sessions, keyed by `(channel, peer)` — a session is bound to
     /// a `(channelID, epoch)`, so one peer may have several. In memory for this
@@ -2358,11 +2358,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        let seq = {
-            let entry = self.record_seq.entry(*channel_id).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry
-        };
+        let seq = self.next_record_seq(channel_id);
         // The admission goes out with the bundle: a node that cannot say how it became
         // a member publishes nothing, rather than publishing an unevidenced key (M17.6).
         let (genesis_wire, epoch, admission) = match self.channels.get(channel_id) {
@@ -2516,6 +2512,23 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// The next board-record sequence number for `channel_id`: strictly above the last one this
+    /// process used, and never below the clock in milliseconds.
+    ///
+    /// **It must keep rising across a restart**, because a board accepts only a higher `seq` from
+    /// the same author (`non-increasing seq (replay)`). The counter started again at 1 in every
+    /// process, so after a restart every record this node published was older than the one the
+    /// board already held, and was refused. A member that restarted could not be reached at its
+    /// new address. vox-bc's causal-order proof measured it: the second joiner, restarted, logged
+    /// `a board would not take our address … the board holds a newer record from that author`,
+    /// and failed 5 of 9. The clock is what survives a restart without a store write per publish.
+    fn next_record_seq(&mut self, channel_id: &Digest32) -> u64 {
+        let floor = (self.millis_clock)();
+        let entry = self.record_seq.entry(*channel_id).or_insert(0);
+        *entry = entry.saturating_add(1).max(floor);
+        *entry
     }
 
     /// The store anchored logs and channels live in: the profile's, or the headless
@@ -2757,11 +2770,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        let seq = {
-            let entry = self.record_seq.entry(*channel_id).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry
-        };
+        let seq = self.next_record_seq(channel_id);
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
@@ -3778,11 +3787,7 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::Unreachable));
             return;
         }
-        let seq = {
-            let entry = self.record_seq.entry(parsed.channel_id).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry
-        };
+        let seq = self.next_record_seq(&parsed.channel_id);
         self.joining.insert(parsed.channel_id);
         let job = Joiner {
             net,
