@@ -1,11 +1,15 @@
 //! PRD-001 R41's transport settings, proved on real Vox endpoints over real loopback sockets.
 //!
-//! 1. **Path-MTU discovery reaches the 8192 ceiling.** It needs two settings, not one: the
-//!    discovery ceiling (`MtuDiscoveryConfig::upper_bound`) and the largest UDP payload this
-//!    endpoint *advertises* (`EndpointConfig::max_udp_payload_size`). quinn searches only up to
-//!    the smaller of our ceiling and the peer's advertised maximum, whose default is 1472, so
-//!    raising one alone leaves every path at 1452 or 1472. The proof reads quinn's own path
-//!    statistics after a bulk transfer.
+//! 1. **Path-MTU discovery reaches the ceiling this host can carry, and never falls below
+//!    quinn's.** The 8192 ceiling needs two settings, not one: the discovery ceiling
+//!    (`MtuDiscoveryConfig::upper_bound`) and the largest UDP payload this endpoint *advertises*
+//!    (`EndpointConfig::max_udp_payload_size`). quinn searches only up to the smaller of our
+//!    ceiling and the peer's advertised maximum, whose default is 1472, so raising one alone
+//!    leaves every path at 1452 or 1472. The ceiling is taken only when the OS granted the
+//!    receive buffer 8192-byte bursts need (`quic::mtu_ceiling_for`). Linux caps it silently
+//!    at `net.core.rmem_max`, so there the endpoint keeps quinn's 1452. Either way the proof
+//!    reads quinn's own path statistics after a bulk transfer: the path is at the endpoints'
+//!    ceiling (above 1472 when that is 8192, at least 1452 otherwise), with no black hole.
 //! 2. **One peer cannot park more than [`CONNECTION_WINDOW`] in this node's memory.** With a
 //!    16 MiB stream window and quinn's default of 100 concurrent streams, an unlimited
 //!    connection window let a peer that writes into streams nobody reads fill 1.6 GiB. Here a
@@ -13,14 +17,17 @@
 //!    accepts the streams and never reads them. What crosses the wire must stay within the
 //!    connection window.
 //!
-//! Mutations: drop `max_udp_payload_size` and (1) goes red at 1472; drop the connection
-//! `receive_window` and (2) goes red with ~100 MiB received.
+//! Mutations: drop `max_udp_payload_size` and (1) goes red at 1472. Take the 8192 ceiling on a
+//! buffer too small for it (the pre-fix behaviour) and (1) goes red with a black hole and the
+//! path at 1200. Drop the connection `receive_window` and (2) goes red with ~100 MiB received.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vox_core::identity::composite::SoftwareRootSigner;
-use vox_core::transport::quic::{VoxConnection, VoxEndpoint, CONNECTION_WINDOW, MAX_UDP_PAYLOAD};
+use vox_core::transport::quic::{
+    VoxConnection, VoxEndpoint, CONNECTION_WINDOW, DEFAULT_UDP_PAYLOAD, MAX_UDP_PAYLOAD,
+};
 
 fn signer(a: u8) -> SoftwareRootSigner {
     SoftwareRootSigner::from_component_seeds(&[a; 32], &[a ^ 0x5A; 32]).unwrap()
@@ -45,7 +52,17 @@ async fn path_mtu_discovery_reaches_the_ceiling_on_loopback() {
     /// quinn's default advertised maximum UDP payload. Above it proves both settings took: with
     /// the ceiling raised but the advertised maximum left alone, discovery stops exactly here.
     const PEER_DEFAULT: u16 = 1472;
-    let (out, inn, _d, _a) = pair(1, 2).await;
+    let (out, inn, d, a) = pair(1, 2).await;
+    let ceiling = d.mtu_ceiling().min(a.mtu_ceiling());
+    // The floor the path must reach: past the peer default when the larger ceiling is in force
+    // (proving both settings took), else quinn's own ceiling.
+    let reached = |m: u16| {
+        if ceiling == MAX_UDP_PAYLOAD {
+            m > PEER_DEFAULT
+        } else {
+            m >= DEFAULT_UDP_PAYLOAD
+        }
+    };
     // Traffic, so discovery has packets to probe with.
     let reader = tokio::spawn(async move {
         let (_send, mut recv) = inn.accept_stream().await.unwrap();
@@ -72,23 +89,36 @@ async fn path_mtu_discovery_reaches_the_ceiling_on_loopback() {
             out.quinn().stats().path.current_mtu,
             inn.quinn().stats().path.current_mtu,
         );
-        if mtu.0 > PEER_DEFAULT && mtu.1 > PEER_DEFAULT {
+        if reached(mtu.0) && reached(mtu.1) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let holes = (
+        out.quinn().stats().path.black_holes_detected,
+        inn.quinn().stats().path.black_holes_detected,
+    );
     eprintln!(
-        "path MTU after 32 MiB: dialler {} bytes, acceptor {} bytes (ceiling {MAX_UDP_PAYLOAD}); \
+        "path MTU after 32 MiB: dialler {} bytes, acceptor {} bytes (endpoint ceilings {} / {}); \
          black holes detected {} / {}",
         mtu.0,
         mtu.1,
-        out.quinn().stats().path.black_holes_detected,
-        inn.quinn().stats().path.black_holes_detected
+        d.mtu_ceiling(),
+        a.mtu_ceiling(),
+        holes.0,
+        holes.1
+    );
+    assert_eq!(
+        holes,
+        (0, 0),
+        "quinn declared a black hole on loopback (path now {mtu:?}): the ceiling ({ceiling}) is \
+         larger than this socket's receive buffer can take in a burst"
     );
     assert!(
-        mtu.0 > PEER_DEFAULT && mtu.1 > PEER_DEFAULT,
-        "path-MTU discovery stopped at {mtu:?} on loopback: the ceiling was not raised on both \
-         the discovery side and the advertised maximum UDP payload"
+        reached(mtu.0) && reached(mtu.1),
+        "path-MTU discovery stopped at {mtu:?} on loopback with a ceiling of {ceiling}: \
+         the ceiling was not raised on both the discovery side and the advertised maximum UDP \
+         payload, or the path fell below quinn's own {DEFAULT_UDP_PAYLOAD}"
     );
 }
 

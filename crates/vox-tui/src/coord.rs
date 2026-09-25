@@ -303,6 +303,13 @@ pub struct Draft {
     pub data: serde_json::Map<String, serde_json::Value>,
 }
 
+/// How long a post waits to see its own entry in the node's view. The view skips a room while a
+/// sync session holds it; a session that stalls is cut off by the 20s per-frame timeout
+/// (`SYNC_FRAME_TIMEOUT`), so the bound sits above one such stall rather than at a guess about load.
+const READBACK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Between reads while waiting for it.
+const READBACK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// What a post turned out to be once the log was read back.
 pub struct Posting {
     /// The entry that **is** the operation — the canonical first of its group.
@@ -393,19 +400,33 @@ pub async fn post_once(
         other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
     }
 
-    let after = snapshot(client, channel_id).await?;
-    let idx = after.ops();
-    let mine_entry = after
-        .posted
-        .iter()
-        .find(|p| p.author == after.me && ops::op_of(&p.envelope) == Some(op));
-    let Some(entry) = mine_entry else {
-        return Err(AppError::Usage(
-            "posted, but the entry is not in the room's log yet — read it back with \
-             `vox room read --json` before retrying with the same --op"
-                .into(),
-        ));
+    // **This post's own entry, by content — and waited for.** The node answers `Ok` once the
+    // entry is appended, but the view a read is served from skips a room a sync session holds at
+    // that moment (`view_of`), so the first read can be one publish behind. Two defects followed
+    // from reading it once and matching by op alone: on a busy node a post that succeeded was
+    // reported as a failure, and a racing post under the same op found the *other* post's entry,
+    // judged that entry alone, and reported success for content it never saw — both racers
+    // "succeeded". Matching the content this call sent means the verdict is only ever computed on
+    // a log that holds this entry, and so every entry before it.
+    let deadline = tokio::time::Instant::now() + READBACK_PATIENCE;
+    let is_mine = |me, p: &Posted| {
+        p.author == me && ops::op_of(&p.envelope) == Some(op) && ops::semantic(&p.envelope) == mine
     };
+    let (after, entry) = loop {
+        let after = snapshot(client, channel_id).await?;
+        if let Some(entry) = after.posted.iter().find(|p| is_mine(after.me, p)).cloned() {
+            break (after, entry);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Usage(format!(
+                "posted, but the entry was not in the room's log after {}s — read it back with \
+                 `vox room read --json` before retrying with the same --op",
+                READBACK_PATIENCE.as_secs()
+            )));
+        }
+        tokio::time::sleep(READBACK_POLL).await;
+    };
+    let idx = after.ops();
     match idx.verdict(entry.author, &entry.envelope, entry.entry_hash) {
         Some(Verdict::Conflict { group }) => Err(conflict(op, &group)),
         Some(Verdict::Duplicate { of }) => Ok(Posting {

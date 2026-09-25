@@ -120,6 +120,47 @@ const MEMBER_REDIAL_SECS: u64 = 30;
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+/// How long building the view may wait, in total across every room, for rooms sync sessions hold
+/// before using those rooms' previous entries. A session holds a room for one protocol step at a
+/// time. One deadline for the whole view, not one per room: with `SYNCS_IN_FLIGHT` sessions each
+/// holding a room, a wait per room would park the actor for seconds on a single publish. See
+/// `Node::view_of`.
+const VIEW_LOCK_PATIENCE: Duration = Duration::from_millis(250);
+
+/// A room's summary for the view, from its state.
+fn summary_of(ch: &ChannelState) -> ChannelSummary {
+    ChannelSummary {
+        channel_id: ch.channel_id(),
+        local_name: Some(ch.local_name().to_owned()),
+        open: true,
+        entries: ch.entry_count() as u64,
+    }
+}
+
+/// A room's detail for the view, from its state.
+fn detail_of(ch: &ChannelState) -> ChannelDetail {
+    ChannelDetail {
+        channel_id: ch.channel_id(),
+        local_name: ch.local_name().to_owned(),
+        epoch: ch.epoch(),
+        members: ch.members(),
+        timeline: ch.timeline().iter().map(row_of).collect(),
+        services: ch
+            .services()
+            .iter()
+            .map(|(tag, addr)| (tag.clone(), *addr))
+            .collect(),
+    }
+}
+
+/// A room's lock if it can be had by `deadline`. A free lock is taken even once the deadline has
+/// passed: only a held one is given up.
+async fn by<T>(
+    deadline: tokio::time::Instant,
+    m: &tokio::sync::Mutex<T>,
+) -> Option<tokio::sync::MutexGuard<'_, T>> {
+    tokio::time::timeout_at(deadline, m.lock()).await.ok()
+}
 /// How long one publish round to one board may take before it is given up until the next round: a
 /// live board answers each put in milliseconds. See `publish_channel_to_anchor`.
 const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
@@ -1705,6 +1746,12 @@ pub struct Node {
     pending_consents: Vec<(Digest32, Digest32, oneshot::Sender<Outcome>, u8)>,
     /// Consecutive failed sessions per `(room, peer)`; see `MAX_PUSH_RETRIES`.
     push_failures: BTreeMap<(Digest32, Digest32), u32>,
+    /// Each room's view summary and detail as this node's own latest write left them, taken under the room's lock
+    /// by the write itself. `view_of` uses it when a session holds the room, so a person always sees
+    /// their own post in what they read straight after, however long that session holds on. A room's
+    /// entry is removed once a view reads the room under its lock, since that read includes the
+    /// write: an entry here is therefore always newer than the published one.
+    fresh_details: BTreeMap<Digest32, (ChannelSummary, ChannelDetail)>,
     /// Peers that were skipped behind a busy room or had a push re-owed: served first on the next
     /// pass, so a peer that always takes the room cannot always go first.
     owed_first: std::collections::BTreeSet<Digest32>,
@@ -1888,6 +1935,7 @@ impl Node {
             member_dialed_at: BTreeMap::new(),
             pending_consents: Vec::new(),
             push_failures: BTreeMap::new(),
+            fresh_details: BTreeMap::new(),
             owed_first: std::collections::BTreeSet::new(),
             key_backoff: BTreeMap::new(),
             record_seq: BTreeMap::new(),
@@ -6314,6 +6362,8 @@ impl Node {
         // append is still reported as the success it was.
         let rotated =
             ch.should_rotate_sender(now) && ch.rotate_sender(profile.store(), now).is_ok();
+        self.fresh_details
+            .insert(*channel_id, (summary_of(&ch), detail_of(&ch)));
         drop(ch);
         let channel_id = *channel_id;
         let _ = self.event_tx.send(NodeEvent::NewEntry {
@@ -6376,12 +6426,14 @@ impl Node {
         });
     }
 
-    async fn publish(&self) {
-        let view = self.view_of().await;
+    async fn publish(&mut self) {
+        let (view, read) = self.view_of().await;
+        self.fresh_details
+            .retain(|id, _| self.channels.contains_key(id) && !read.contains(id));
         self.view_tx.send_replace(view);
     }
 
-    /// The node's view, built **without waiting on any room a session holds.**
+    /// The node's view, built **without waiting long on any room a session holds.**
     ///
     /// `publish()` runs this after every command and every event, and it took each room's lock in
     /// turn — the lock a sync session holds for its whole run, across its network waits. So while
@@ -6391,7 +6443,18 @@ impl Node {
     /// actor silent 19.9s, both sessions ending `sync failed: transport` at exactly the timeout). A
     /// room that is held now keeps its entry from the view already published — at most one event old
     /// — and is refreshed on the next publish after the session hands it back.
-    async fn view_of(&self) -> NodeView {
+    ///
+    /// **Briefly, not never.** Since sync sessions lock a room per protocol step (3f95b57), a holder
+    /// keeps it for milliseconds, not across a network wait, so the view waits up to
+    /// `VIEW_LOCK_PATIENCE`, in total across all rooms, before falling back. Falling back at once
+    /// served a stale view whenever a session happened to be mid-step, and a person's own post could
+    /// be missing from what they read straight after posting: `vox room post` then read back a view
+    /// without its entry, reported a successful post as failed, and let two racing posts under one
+    /// op both succeed (PR #14's work_op proof, on macOS and Linux).
+    ///
+    /// Returns the view and the rooms read under their lock.
+    async fn view_of(&self) -> (NodeView, std::collections::BTreeSet<Digest32>) {
+        let deadline = tokio::time::Instant::now() + VIEW_LOCK_PATIENCE;
         let prev = self.view_tx.borrow().clone();
         let identity = self.profile.as_ref().map(|p| IdentityInfo {
             fingerprint: p.fingerprint(),
@@ -6416,9 +6479,9 @@ impl Node {
             .unwrap_or_default();
         for a in &mut anchoring {
             if let Some(state) = self.anchored.get(&a.channel_id) {
-                a.entries = match state.try_lock() {
-                    Ok(st) => Some(st.entries() as u64),
-                    Err(_) => prev
+                a.entries = match by(deadline, state).await {
+                    Some(st) => Some(st.entries() as u64),
+                    None => prev
                         .anchoring
                         .iter()
                         .find(|p| p.channel_id == a.channel_id)
@@ -6426,17 +6489,41 @@ impl Node {
                 };
             }
         }
+        // Each open room's lock is taken once, for both its summary and its detail.
+        let mut read = std::collections::BTreeSet::new();
+        let mut summaries = BTreeMap::new();
+        let mut open_channels = Vec::with_capacity(self.channels.len());
+        let mut mlock_active = true;
+        for (id, shared) in &self.channels {
+            let Some(ch) = by(deadline, shared).await else {
+                // The summary and detail taken under this room's lock by this node's own latest write,
+                // if any, are newer than the ones last published (see `fresh_details`): a person reads
+                // their own post (read-your-writes), and the room's entry count agrees with it.
+                match self.fresh_details.get(id) {
+                    Some((summary, detail)) => {
+                        summaries.insert(*id, summary.clone());
+                        open_channels.push(detail.clone());
+                    }
+                    None => {
+                        if let Some(d) = prev.open_channels.iter().find(|d| d.channel_id == *id) {
+                            open_channels.push(d.clone());
+                        }
+                    }
+                }
+                mlock_active &= prev.mlock_active;
+                continue;
+            };
+            read.insert(*id);
+            summaries.insert(*id, summary_of(&ch));
+            mlock_active &= ch.mlock_active();
+            open_channels.push(detail_of(&ch));
+        }
         let mut channels = Vec::with_capacity(known.len());
         for id in &known {
             channels.push(match self.channels.get(id) {
-                Some(shared) => match shared.try_lock() {
-                    Ok(ch) => ChannelSummary {
-                        channel_id: *id,
-                        local_name: Some(ch.local_name().to_owned()),
-                        open: true,
-                        entries: ch.entry_count() as u64,
-                    },
-                    Err(_) => prev
+                Some(_) => match summaries.remove(id) {
+                    Some(summary) => summary,
+                    None => prev
                         .channels
                         .iter()
                         .find(|c| c.channel_id == *id)
@@ -6456,32 +6543,8 @@ impl Node {
                 },
             });
         }
-        let mut open_channels = Vec::with_capacity(self.channels.len());
-        let mut mlock_active = true;
-        for (id, shared) in &self.channels {
-            let Ok(ch) = shared.try_lock() else {
-                if let Some(d) = prev.open_channels.iter().find(|d| d.channel_id == *id) {
-                    open_channels.push(d.clone());
-                }
-                mlock_active &= prev.mlock_active;
-                continue;
-            };
-            mlock_active &= ch.mlock_active();
-            open_channels.push(ChannelDetail {
-                channel_id: ch.channel_id(),
-                local_name: ch.local_name().to_owned(),
-                epoch: ch.epoch(),
-                members: ch.members(),
-                timeline: ch.timeline().iter().map(row_of).collect(),
-                services: ch
-                    .services()
-                    .iter()
-                    .map(|(tag, addr)| (tag.clone(), *addr))
-                    .collect(),
-            });
-        }
         let (relayed_peers, relaying) = self.path_view();
-        NodeView {
+        let view = NodeView {
             identity,
             locked,
             mlock_active,
@@ -6506,7 +6569,8 @@ impl Node {
                 .net
                 .as_ref()
                 .map_or(0, |net| net.manager().peers().len()),
-        }
+        };
+        (view, read)
     }
 
     /// Whether the connections and circuits the published view shows are no longer the ones
