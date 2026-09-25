@@ -261,10 +261,23 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
             victim_feed >= POSTS as u64,
             "the victim's feed holds its posts"
         );
+        // **Each entry once — and the post made during the attack may be one of them.** The
+        // victim's `HAVE` is its feed when the session began; step 3 then posts into the room while
+        // the WANT is being served, which is the point of the proof. The room's lock is taken per
+        // protocol step, so a WANT served after that post lands is served the post too: 51 distinct
+        // entries, not a duplicate. The claim is no entry twice and nothing past what exists, so
+        // both are asserted directly rather than through a count taken before the post.
         assert_eq!(
-            y.entries as u64, victim_feed,
-            "the WANT must be served each entry of the victim's feed exactly once — \
-             {DUPLICATES} duplicate ranges merged, clamped to the {victim_feed} held — got {}",
+            y.distinct, y.entries,
+            "the WANT must serve each entry once — {DUPLICATES} duplicate ranges merged — but {} of \
+             the {} entries served were repeats",
+            y.entries - y.distinct,
+            y.entries
+        );
+        assert!(
+            (victim_feed..=victim_feed + 1).contains(&(y.entries as u64)),
+            "the WANT must be served the {victim_feed} entries held, plus at most the one posted \
+             during the attack — got {}",
             y.entries
         );
         assert_eq!(y.ended, None, "the session ended cleanly");
