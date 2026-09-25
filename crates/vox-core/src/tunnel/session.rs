@@ -399,6 +399,40 @@ pub async fn splice(send: SendStream, recv: RecvStream, tcp: TcpStream) -> Resul
     splice_until(send, recv, tcp, std::future::pending()).await
 }
 
+/// Write every byte of `chunks` to `w`, vectored, carrying a partial write over correctly.
+async fn write_all_chunks<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    chunks: &mut [bytes::Bytes],
+) -> std::io::Result<()> {
+    use bytes::Buf as _;
+    use tokio::io::AsyncWriteExt as _;
+    let mut first = 0;
+    while first < chunks.len() {
+        if chunks[first].is_empty() {
+            first += 1;
+            continue;
+        }
+        let slices: Vec<std::io::IoSlice<'_>> = chunks[first..]
+            .iter()
+            .map(|c| std::io::IoSlice::new(c))
+            .collect();
+        let mut written = w.write_vectored(&slices).await?;
+        drop(slices);
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        while written > 0 {
+            let take = written.min(chunks[first].len());
+            chunks[first].advance(take);
+            written -= take;
+            if chunks[first].is_empty() {
+                first += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// How one direction of a splice ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Leg {
@@ -443,8 +477,27 @@ async fn splice_until(
                         return Leg::Clean;
                     }
                     Ok(_) => {
+                        // Take whatever else is already waiting on the socket, without waiting
+                        // for more, so one chunk (one stream lock) carries a burst, not a
+                        // single read's worth of it.
+                        let mut eof = false;
+                        while buf.len() < CHUNK {
+                            match tcp_r.try_read_buf(&mut buf) {
+                                Ok(0) => {
+                                    eof = true;
+                                    break;
+                                }
+                                Ok(_) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(_) => return Leg::Abort,
+                            }
+                        }
                         if send.write_chunk(buf.split().freeze()).await.is_err() {
                             return Leg::Abort;
+                        }
+                        if eof {
+                            let _ = send.finish();
+                            return Leg::Clean;
                         }
                     }
                     Err(_) => return Leg::Abort,
@@ -453,14 +506,20 @@ async fn splice_until(
         };
         // QUIC → TCP.
         let inbound = async move {
+            // Several of QUIC's buffers at once, written to TCP in one vectored write where the
+            // socket takes them: one stream lock and, usually, one syscall per batch.
+            let mut chunks: [bytes::Bytes; 16] = Default::default();
             loop {
-                match recv.read_chunk(CHUNK, true).await {
+                match recv.read_chunks(&mut chunks).await {
                     Ok(None) => {
                         let _ = tcp_w.shutdown().await;
                         return Leg::Clean;
                     }
-                    Ok(Some(chunk)) => {
-                        if tcp_w.write_all(&chunk.bytes).await.is_err() {
+                    Ok(Some(n)) => {
+                        if write_all_chunks(&mut tcp_w, &mut chunks[..n])
+                            .await
+                            .is_err()
+                        {
                             return Leg::Abort;
                         }
                     }
