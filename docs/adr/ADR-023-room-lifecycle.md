@@ -220,7 +220,42 @@ covers only the approver's own messages, as consent always has.
   - joiner↔joiner in a 3-member room;
   - creator→joiner across processes through an anchor;
   - trust-before-join.
-- **M23.4** Per-grant history (decision 5).
+- **M23.4** Per-grant history (decision 5). **DONE (2026-09-25, `prd1/history-grants`)**, with the
+  R14 pruning of decision 4 that it depends on:
+  - `vox trust add <fp> --history now|full` (default `now`), additive on the control socket. The
+    choice is kept per identity in the trust keyring, so it covers every room shared with that
+    identity, now and later, and the approver's own messages only. `full` releases every retained
+    generation at iteration 0, oldest first, the live one last; the consent grant records
+    `FullHistory`.
+  - A grant that arrives after its key now makes stored messages readable: `sync_over` retries the
+    backfill for every author it holds a key for whenever governance arrives. Without it a
+    full-history grant showed only what was written after it, because the key usually lands first.
+  - R14: a superseded generation's origin key is deleted (`OriginKeyStore::retain_only`, zeroized on
+    drop) on the tick, unless a trusted identity with a full-history grant is still owed consent in
+    that room. `vox status` reports the generations held per room (`key_generations`).
+  - **Gates** (shipped binary, release, `--ignored`): `crates/vox-tui/tests/history_grant_proof.rs`
+    — alice posts 10, trusts bob with `--history full` and carol with the default, posts once more:
+    bob reads 10 of 10 earlier plus the later one, carol reads 0 of 10 plus the later one; after each
+    of two rotations alice holds 1 generation. Mutations, each red: `full` releasing only the current
+    position, and the grant-arrival backfill removed (bob shows only the later post); pruning
+    disabled (alice holds 2). `crates/vox-tui/tests/tui_unread_backfill_proof.rs` (the parked
+    unread-badge gate, now with `--history full`): the badge reads `(1 unread)` and stays 1, 3 runs
+    of 3; red with `--history now` or without the grant-arrival backfill. In this order the row is
+    counted by `Synced.rendered`, so the `SenderKeyReceived.backfilled` count in `live.rs` (for a
+    grant that lands before its key) is kept but not exercised by this gate.
+  - **Not proved:** that a generation is *kept* while a full-history grant is owed and released
+    once delivered. The code keeps it; the proof needs a member whose node is down, and on this tree
+    trusting such a member stops the trusting node answering (the consent delivery path, reported
+    separately), so neither half can be observed yet. Also: with a session opened by the grant
+    itself, only the first of several SKDMs carries the session's `Hello`; the others ride streams
+    that could reach the recipient first.
+  - **`MAX_SKIP`:** a full-history receiver starts at iteration 0. A generation never exceeds
+    `ROTATE_AFTER_MESSAGES` = 1000 = `MAX_SKIP` iterations (the runtime rotates at the bound), and
+    backfill walks stored bodies one iteration at a time, so the release itself cannot exceed the
+    skip bound. A live message that arrives before the backfill is decrypted with up to 999 skipped
+    keys cached (`MAX_CACHE` = 2000). A body missing below it (pruned by retention, or not yet
+    synced) is skipped over on the same budget. So `--history full` does not create a gap over
+    `MAX_SKIP`; it does not fix one that exists for other reasons either.
 - **M23.5** Delete the anchor log (decision 6). Rewrite `node_m15_anchor_gate`. Proof 6.
 - **M23.6** Checkpoints (decision 3), if open question 2 says now.
 

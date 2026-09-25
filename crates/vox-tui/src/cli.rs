@@ -315,7 +315,8 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             TrustCmd::List(_) => crate::room_cli::trust_list(&paths, &identity).await,
             TrustCmd::Add(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_add(&paths, target, &a.name, &identity).await
+                crate::room_cli::trust_add(&paths, target, &a.name, &identity, a.history == "full")
+                    .await
             }
             TrustCmd::Remove(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
@@ -814,6 +815,11 @@ pub struct TrustAddArgs {
     /// other node ever sees it.
     #[arg(long, default_value = "peer")]
     pub name: String,
+    /// What each consent to it releases of **your own** messages (PRD-001 R12): `now`,
+    /// the default, from this approval onward; or `full`, everything you still hold a key
+    /// for, so it also reads what you wrote before. Your messages only — nobody else's.
+    #[arg(long, value_parser = ["now", "full"], default_value = "now")]
+    pub history: String,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
     /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
     /// machine, and lands in the shell's history besides. It is still accepted by the
@@ -1571,7 +1577,13 @@ pub fn run() -> ExitCode {
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
-                    crate::tunnel_cli::trust_add(&node, &a.fingerprint, &a.name).await
+                    crate::tunnel_cli::trust_add(
+                        &node,
+                        &a.fingerprint,
+                        &a.name,
+                        a.history == "full",
+                    )
+                    .await
                 },
             )
         }

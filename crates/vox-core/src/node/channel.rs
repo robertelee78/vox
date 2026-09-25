@@ -1532,6 +1532,69 @@ impl ChannelState {
         self.sender.skdm_for(signer, iteration, key)
     }
 
+    /// Mint the SKDMs of a **full-history** grant (PRD-001 R12, ADR-023 decision 5):
+    /// every generation of this identity's sender key still retained, each at its
+    /// origin, oldest first, so the recipient reads this identity's messages from before
+    /// the approval as well as after. The **last** is the live generation — the one a
+    /// consent grant records.
+    ///
+    /// A live generation whose origin is not retained (a room from before M18.1) can
+    /// only be released from its current position, as [`Self::skdm_for_consent`] does;
+    /// that is the honest limit of "full", not a silent narrowing.
+    pub fn skdms_for_full_history(&self, profile: &Profile) -> Result<Vec<Skdm>> {
+        let signer = profile.signer()?;
+        let live = self.sender.chain_id();
+        let mut out = Vec::new();
+        for chain_id in self.origins.generations(&self.channel_id, self.epoch) {
+            if chain_id != live {
+                out.push(self.origins.release_at(
+                    signer,
+                    &self.channel_id,
+                    self.epoch,
+                    chain_id,
+                    0,
+                )?);
+            }
+        }
+        out.push(self.rekey_skdm(profile)?);
+        Ok(out)
+    }
+
+    /// How many generations of this identity's sender key this node still holds the
+    /// origin of — what `vox status` reports, and what R14 keeps down to one.
+    #[must_use]
+    pub fn key_generations(&self) -> usize {
+        self.origins.generations(&self.channel_id, self.epoch).len()
+    }
+
+    /// Delete every superseded generation's origin key (ADR-023 decision 4, PRD-001
+    /// R14), keeping only the live one. The caller decides *when*: not while a
+    /// full-history grant is still owed to somebody, because that grant is the one thing
+    /// the old generations are kept for. Returns how many were deleted.
+    pub fn prune_superseded_origins(&mut self, store: &Store) -> Result<usize> {
+        let live = self.sender.chain_id();
+        let gone = self.origins.retain_only(&self.channel_id, self.epoch, live);
+        if gone == 0 {
+            return Ok(0);
+        }
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_ORIGINS,
+            &self.origins.to_state(),
+        )?;
+        if let Err(e) = store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_ORIGINS,
+            &seg,
+        ) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(gone)
+    }
+
     /// Issue a **consent grant** to `target`: the ADR-007 log fact that this
     /// identity released its sender key to `target`, carrying the `skdm_ref` of the
     /// SKDM actually delivered over the pairwise session and the history mode in
@@ -1544,16 +1607,24 @@ impl ChannelState {
         profile: &Profile,
         target: Digest32,
         delivered_skdm: &Skdm,
+        full_history: bool,
         now_secs: u64,
     ) -> Result<ConsentGrant> {
         let signer = profile.signer()?;
+        // The grant records what this approval actually released (PRD-001 R12): the
+        // approver's per-grant choice, not a room-wide default.
+        let history_mode = if full_history {
+            HistoryMode::FullHistory
+        } else {
+            HistoryMode::ForwardOnly
+        };
         let grant = issue_consent_grant(
             signer,
             &self.channel_id,
             self.epoch,
             target,
             delivered_skdm,
-            self.genesis.body.policy.history_mode,
+            history_mode,
         )?;
         self.append_governance(profile, &grant.to_wire(), now_secs)?;
         // The grant is the record that `target` holds this generation; the ledger is
@@ -2255,6 +2326,19 @@ impl ChannelState {
                         out.rendered += 1;
                     }
                 }
+            }
+        }
+        // **A grant that arrives after its key makes stored messages readable.** A reader
+        // needs both the sender key and the author's consent on the log (ADR-007); the key
+        // comes over the pairwise stream and the grant by sync, so the key usually lands
+        // first — and its backfill found nothing it was allowed to show. Nothing retried when
+        // the grant followed, so a full-history grant (PRD-001 R12) showed only what was
+        // written after it. Retry every author this node holds a key for; rows already shown
+        // are skipped.
+        if out.governance > 0 {
+            let authors: BTreeSet<Digest32> = self.receivers.keys().map(|(a, _)| *a).collect();
+            for author in authors {
+                out.rendered += self.backfill(store, &author, now_secs)?;
             }
         }
         // Reconciliation done; only now surface a session failure, with its coded

@@ -74,11 +74,14 @@ fn render(v: &Value) -> String {
     for r in arr("rooms") {
         let _ = writeln!(
             o,
-            "  {} {}  epoch {}  last sync {}",
+            "  {} {}  epoch {}  last sync {}  sender keys held {}",
             short(s(r, "id")),
             s(r, "name"),
             r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
-            ago(now, &r["last_sync"])
+            ago(now, &r["last_sync"]),
+            r.get("key_generations")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "(busy)".to_owned(), |n| n.to_string())
         );
         for m in r.get("members").and_then(Value::as_array).unwrap_or(&empty) {
             let flag = |k: &str| m.get(k).and_then(Value::as_bool) == Some(true);

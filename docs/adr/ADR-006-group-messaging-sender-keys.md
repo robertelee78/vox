@@ -166,6 +166,12 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   release history at its head. The node runtime now enforces the bound: every append consults
   `should_rotate_sender` and rotates, so a chain never runs past it in the first place. (3) `GroupMessage::to_wire` reuses the *signing* label as its wire prefix rather
   than a struct-tag frame (safe — different arity — but inconsistent with the SKDM rule).
+- **History is chosen per grant, and superseded keys are deleted (2026-09-25, ADR-023 M23.4,
+  PRD-001 R12/R14).** The forward-only / full-history choice above is now the approver's, per
+  grant (`vox trust add --history now|full`), rather than a room-wide default; a full grant
+  releases each retained generation at its origin. A superseded generation's origin is deleted
+  once no full-history grant is still owed in the room, so a sender normally holds one. See
+  ADR-023 §Implementation plan M23.4 for the gates and what is not yet proved.
 
 ## Links
 **Depends on**: ADR-003, ADR-004.

@@ -152,6 +152,10 @@ pub struct RoomStatus {
     pub epoch: u64,
     /// When a sync this node ran there last completed.
     pub last_sync: Option<u64>,
+    /// How many generations of this node's own sender key it still holds here (PRD-001
+    /// R14: one, unless a full-history grant is still owed). `None` when the room was
+    /// mid-session and could not be read without waiting.
+    pub key_generations: Option<usize>,
     /// Its members.
     pub members: Vec<MemberStatus>,
 }
@@ -315,11 +319,12 @@ impl StatusReport {
                 )
             });
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"key_generations\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
                 opt(r.last_sync),
+                opt(r.key_generations.map(|n| n as u64)),
                 list(members)
             )
         });
