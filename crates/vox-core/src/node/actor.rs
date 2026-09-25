@@ -87,6 +87,11 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// on the network.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
+/// thread, an aborted join — to let go of the profile's store before answering. With the network
+/// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
 /// How often a peer reached over a relay is retried for a direct path.
 ///
 /// A relayed path works, so nothing forces a retry — but it costs a third party's bandwidth
@@ -1363,6 +1368,8 @@ impl Node {
         // (ADR-016). The actor holds a `net_tx` clone, so `net_rx` never closes and
         // this select cannot spin on a dead branch.
         let mut ticker = tokio::time::interval(TICK);
+        // A `Shutdown`'s reply, held until the node is actually gone: see the end of this function.
+        let mut shutdown_reply: Option<oneshot::Sender<Outcome>> = None;
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -1374,11 +1381,12 @@ impl Node {
                     let outcome = self.handle(command).await;
                     self.note_if_stalled(name, started);
                     self.publish().await;
-                    // A dropped reply receiver is the caller's choice, not an error.
-                    let _ = reply.send(outcome);
                     if shutdown {
+                        shutdown_reply = Some(reply);
                         break;
                     }
+                    // A dropped reply receiver is the caller's choice, not an error.
+                    let _ = reply.send(outcome);
                 }
                 Some(event) = net_rx.recv() => {
                     let name = net_event_name(&event);
@@ -1412,10 +1420,32 @@ impl Node {
             }
         }
         // Channel closed or shutdown: lock (wipe every SEK + the signer) and stop.
+        let store = self.log_store();
         self.stop_network();
         self.lock_all().await;
         self.publish().await;
         let _ = self.event_tx.send(NodeEvent::Shutdown);
+        // **`Done` means gone.** `Shutdown` used to be answered before any of the above ran, and
+        // even after it the profile's store stayed open for a few milliseconds more — held by
+        // work that outlives the actor's own fields: an aborted join exchange drops its handle at
+        // its next await, and a sync session on a blocking thread when its read fails. A caller
+        // that opened the same profile the moment it was told `Done` found it busy: v0.2.8's gate
+        // went red on exactly that (`vox daemon` exiting `ProfileBusy` in `remote_interrupt_proof`),
+        // tolerated there by a retry. So the actor gives up its own handles, waits — bounded — until
+        // it holds the store's last reference, and answers only then.
+        self.profile = None;
+        self.anchor_store = None;
+        if let Some(store) = store {
+            let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN;
+            while std::sync::Arc::strong_count(&store) > 1 && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Dropped here: with no other holder, this closes the store.
+        }
+        if let Some(reply) = shutdown_reply {
+            let _ = reply.send(Outcome::Done);
+        }
     }
 
     async fn handle(&mut self, command: NodeCommand) -> Outcome {
@@ -4439,7 +4469,9 @@ impl Node {
         // drops both at the task's next await point, which is what makes ADR-015's
         // lock/zeroize still true now that the exchange runs off the actor.
         self.join_tasks.abort_all();
-        while self.join_tasks.try_join_next().is_some() {}
+        // Awaited, not polled: `try_join_next` collects only tasks that have already finished, and
+        // an aborted one drops its handles — the signer, the ring, the store — at its next await.
+        while self.join_tasks.join_next().await.is_some() {}
         // Drop the prekey ring: its secrets zeroize on drop, so a locked node holds
         // no key-agreement material (ADR-015 lock/zeroize).
         self.prekeys = None;
