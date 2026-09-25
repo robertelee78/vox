@@ -25,6 +25,7 @@ pub mod app_cli;
 pub mod cli;
 pub mod codex_trust;
 pub mod coord;
+pub mod lan_cli;
 pub mod live;
 pub mod notify;
 pub mod qr;
