@@ -149,11 +149,12 @@ impl AnchorState {
                 .get(&entry.skeleton.author_id)
                 .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?
                 .clone();
-            let payload = entry
-                .payload
-                .as_deref()
-                .ok_or(Error::MalformedAtRest("stored entry payload pruned"))?;
-            let kind = classify_payload(payload)?;
+            // A skeleton whose body a member pruned is kept like any other entry: it still
+            // verifies and still links the feed (ADR-023 decision 2). Governance is never pruned.
+            let kind = match entry.payload.as_deref() {
+                Some(payload) => classify_payload(payload)?,
+                None => EntryKind::Content,
+            };
             state
                 .dag
                 .accept(entry, kind, &key, &state.admission)

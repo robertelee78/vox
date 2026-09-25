@@ -60,11 +60,9 @@ Mainstream secure messengers force trade-offs Vox refuses to make:
   tell you they hold, and that conditional is the whole reason for the hybrid. The QUIC handshake is
   pinned to the single group `X25519MLKEM768`, so there is no classical group to downgrade to.
   *(ADR-003, ADR-011)*
-- **Per-channel deniability — specified and built, not yet enabled.** ADR-009 designs message
-  content that carries no transferable proof of authorship to outsiders while membership and
-  governance stay verifiable, and `vox-core/src/deniable/` implements it. **No release turns it on**:
-  its formal analysis and its `0x000B` wire codec are outstanding. Treat it as a design commitment,
-  not a property you have today. *(ADR-009)*
+- **Every message is attributable.** Each entry carries its author's composite signature, so
+  members know who wrote what — and so would anyone a transcript leaked to. A deniable mode was
+  designed and built (ADR-009) and then withdrawn without ever shipping. *(ADR-008, ADR-009)*
 - **Chat *and* tunneling.** The same overlay carries arbitrary TCP between members — `ssh` over Vox
   is the canonical case — alongside messaging. UDP and an IP-level interface are designed and
   unbuilt. *(ADR-011, ADR-013)*
@@ -88,8 +86,7 @@ Each layer is a decision record in `docs/adr/`, built in dependency order:
    passphrase-epoch.
 7. **Replicated log & sync** *(ADR-008)* — per-author hash-linked logs in a causal Merkle-DAG (not a
    consensus blockchain), render-gating, anti-entropy sync, TTL pruning via payload-hash signing.
-8. **Deniability** *(ADR-009)* — per-channel content-authorship deniability via per-epoch ephemeral
-   signing keys.
+8. **Deniability** *(ADR-009)* — **withdrawn**; the design is kept, the code is removed.
 9. **At-rest storage** *(ADR-010)* — double-lock encryption (GPG key *and* channel passphrase),
    admin-set retention, app-lock for device seizure.
 10. **Transport** *(ADR-011)* — QUIC substrate with stream multiplexing + datagrams; interactive and

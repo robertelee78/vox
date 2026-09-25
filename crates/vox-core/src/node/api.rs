@@ -59,6 +59,12 @@ pub struct MessageRow {
     pub created_millis: u64,
     /// The text.
     pub text: String,
+    /// When this node rendered it, as a number that only grows; local, and not the
+    /// room's order ([`crate::node::channel::Rendered::arrival`]).
+    pub arrival: u64,
+    /// It took its place above a row this node had already shown: it arrived late
+    /// (ADR-023 decision 1).
+    pub late: bool,
 }
 
 /// An open channel's full state for display.
@@ -74,6 +80,10 @@ pub struct ChannelDetail {
     pub members: Vec<Digest32>,
     /// The render-gated timeline, oldest first.
     pub timeline: Vec<MessageRow>,
+    /// Every entry this node holds for the channel, readable or not, in the room's one
+    /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
+    /// sequence restricted to rendered rows.
+    pub order: Vec<(Digest32, u64)>,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
@@ -269,6 +279,18 @@ pub enum NodeCommand {
         /// What this node will call it. Local; nothing is registered.
         petname: String,
     },
+    /// [`NodeCommand::Trust`], choosing what each consent releases of **this node's own**
+    /// messages (PRD-001 R12): [`HistoryGrant::Now`](crate::node::trust::HistoryGrant),
+    /// the default, or `Full` — every generation of this node's sender key still held,
+    /// at its origin, so the newcomer reads what was written before the approval too.
+    TrustWith {
+        /// The identity to trust.
+        fingerprint: Digest32,
+        /// What this node will call it. Local; nothing is registered.
+        petname: String,
+        /// What its consents release.
+        history: crate::node::trust::HistoryGrant,
+    },
     /// Stop trusting an identity node-wide, and **change the lock** (ADR-020 §3).
     ///
     /// Removes the ring entry, then rotates this identity's sender key and re-keys
@@ -361,6 +383,15 @@ pub enum NodeCommand {
         /// The local address the forward is listening on.
         local: std::net::SocketAddr,
     },
+    /// Set a room's retention (PRD-001 R7, ADR-023 decision 2): `ttl` seconds, `0` for
+    /// forever, as an ADR-007 policy-update. Only the room's admin may; it applies to what is
+    /// already stored.
+    SetRetention {
+        /// The channel.
+        channel_id: Digest32,
+        /// Seconds a message body is kept; `0` keeps it forever.
+        ttl: u64,
+    },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).
     Sync {
@@ -421,8 +452,131 @@ pub enum Fault {
     /// network can reach would hand that membership to whoever reaches the port
     /// (ADR-013; the same rule `vox up` enforces).
     NotLoopback,
+    /// A local address this node was asked to listen on is taken, or is not an address of
+    /// this machine: the node's `--listen` port, a `vox up --bind`, a forward's local port.
+    AddressInUse,
+    /// A join named a room this profile already holds.
+    AlreadyMember,
+    /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
+    /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
+    NotAServiceRoom,
     /// An internal invariant failed (a bug, never user input).
     Internal,
+}
+
+impl Fault {
+    /// What this fault means to a person, and what to do about it, in the house style: one
+    /// short line saying what happened, then indented lines saying what to do.
+    ///
+    /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
+    /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,
+    /// `Failed(NotConsented)`: the name of an enum variant, not a cause. The token stays
+    /// machine-stable for code that matches on it; this is its reading for everyone else.
+    #[must_use]
+    pub fn explain(self) -> &'static str {
+        match self {
+            Fault::NoIdentity => {
+                "this profile has no identity yet\n       create one with `vox id` (or start `vox tui`)"
+            }
+            Fault::IdentityExists => "this profile already has an identity",
+            Fault::Locked => {
+                "the identity is locked\n       unlock it: pipe the identity passphrase to `vox daemon`, or run `vox tui`"
+            }
+            Fault::WrongPassphrase => "the passphrase is wrong",
+            Fault::UnknownChannel => {
+                "no such room in this profile\n       `vox room list` shows the rooms it holds"
+            }
+            Fault::ChannelNotOpen => {
+                "that room is not open on this node\n       open it with its passphrase: a line `<room> <passphrase>` to `vox daemon`, or in `vox tui`"
+            }
+            Fault::TooLong => "that is longer than this field allows",
+            Fault::Storage => {
+                "the profile's store could not be written\n       check free disk space and that the data directory is writable"
+            }
+            Fault::ShuttingDown => "the node is shutting down",
+            Fault::NotNetworked => {
+                "this node is not on the network (it is locked, or was started without a listen address)"
+            }
+            Fault::BadLink => {
+                "that address will not parse, or names a room this node cannot use\n       check you copied the whole vox:// address"
+            }
+            Fault::Unreachable => {
+                "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
+            }
+            Fault::Refused => "the other side refused",
+            Fault::NotConsented => {
+                "there is nothing to withdraw: that identity was never trusted or consented to, or already is not"
+            }
+            Fault::StillTrusted => {
+                "that identity is in your trust keyring, so a per-room revoke would heal itself\n       run `vox trust remove <fingerprint>` instead"
+            }
+            Fault::NotLoopback => {
+                "a local port for Vox must be on loopback (127.0.0.1 or ::1)\n       anything else would hand this room's membership to whoever reaches the port"
+            }
+            Fault::AddressInUse => {
+                "a local address it needs is already in use, or is not an address of this machine\n       pick another port, or stop whatever holds it (`lsof -i :<port>` names it)"
+            }
+            Fault::AlreadyMember => {
+                "this profile already holds that room — there is nothing to join\n       `vox room list` shows it; open it with its passphrase if it is closed"
+            }
+            Fault::NotAServiceRoom => {
+                "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
+            }
+            Fault::Internal => {
+                "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"
+            }
+        }
+    }
+}
+
+impl Fault {
+    /// [`Self::explain`] for a **join**, where the same token means something more specific.
+    ///
+    /// Moved here from `vox connect` so that `vox room join` — which reaches the node over its
+    /// control socket and used to print `cannot join: Failed(Refused)` — says the same thing
+    /// (PRD-001 R36). The house style and every judgement below are `vox connect`'s: one short
+    /// line saying what happened, then an indented line saying what to actually do.
+    #[must_use]
+    pub fn explain_join(self) -> &'static str {
+        match self {
+            Fault::WrongPassphrase => {
+                "the room passphrase is wrong\n       the address is not in question — this is the passphrase alone"
+            }
+            Fault::BadLink => {
+                "that address will not parse, or names a room this node cannot use\n       this one IS the address — check you copied all of it"
+            }
+            // **Do not claim the passphrase is fine here.** Nobody answered, so nobody
+            // checked it — a wrong passphrase against an offline room reaches exactly this
+            // branch. The first version of this fix said "NOT the address or the
+            // passphrase", which is the same false confidence as the sentence it replaced,
+            // pointed the other way. Say what was and was not established.
+            Fault::Unreachable => {
+                "nobody who can answer for this room could be reached\n       so your passphrase was never checked — this is not a verdict on it\n       every member the board knows is offline: ask one to come online, or check\n       `vox node` on the anchor shows more than `1m` for this room"
+            }
+            // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
+            // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
+            // responder, so it is the responder that says no. Leading with "the refusal is
+            // the thing to chase" was true and useless at the one moment a person most
+            // needs a suggestion. Name the likely cause first, without pretending it is the
+            // only one.
+            Fault::Refused => {
+                "a member answered and refused the join\n       usually the room passphrase is wrong — it is checked by them, not by you,\n       so a typo arrives here rather than as a passphrase error\n       if you are sure of it, they may have revoked you, or be on a different room"
+            }
+            Fault::NotNetworked => {
+                "this node is not networked, or its identity is locked\n       nothing about the room is in question"
+            }
+            Fault::Locked | Fault::NoIdentity => {
+                "this profile has no unlocked identity, so there is nobody to join as\n       run `vox id` to make one"
+            }
+            other => other.explain(),
+        }
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.explain())
+    }
 }
 
 /// The result of a command.
@@ -439,6 +593,15 @@ impl Outcome {
     #[must_use]
     pub fn is_done(self) -> bool {
         matches!(self, Outcome::Done)
+    }
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Done => f.write_str("done"),
+            Outcome::Failed(fault) => f.write_str(fault.explain()),
+        }
     }
 }
 

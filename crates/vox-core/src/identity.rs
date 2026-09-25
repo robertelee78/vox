@@ -2,8 +2,7 @@
 //!
 //! The self-sovereign identity that roots every other Vox mechanism: key
 //! agreement (ADR-004), channel join (ADR-005), governance certificates
-//! (ADR-007), per-author log authentication (ADR-008), and deniable content
-//! authentication (ADR-009). There are no accounts and no central key directory
+//! (ADR-007) and per-author log authentication (ADR-008). There are no accounts and no central key directory
 //! (ADR-001); identity is a set of keys with strictly separated roles, verified
 //! peer-to-peer, and post-quantum from day one (ADR-003).
 //!

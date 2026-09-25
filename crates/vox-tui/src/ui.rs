@@ -26,6 +26,11 @@ use crate::viewmodel::{
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
 pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
 
+/// Prefixed to a message that arrived after the rows below it were already shown — a member
+/// who was offline, or a sync that caught up (ADR-023 decision 1). It sits in its true place in
+/// history; without the marker it would go unseen above what the reader already read.
+pub const LATE_MARKER: &str = "[late] ";
+
 /// A short, colour-independent label + glyph for a verification state.
 #[must_use]
 pub fn verification_label(v: Verification) -> &'static str {
@@ -186,13 +191,20 @@ fn render_timeline(frame: &mut Frame, area: Rect, timeline: &[MessageView], focu
                 .body
                 .clone()
                 .unwrap_or_else(|| UNDECRYPTABLE_MARKER.to_owned());
-            Line::from(vec![
-                Span::styled(
-                    format!("{}: ", m.author_nick),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(body),
-            ])
+            let mut spans = Vec::with_capacity(3);
+            if m.late {
+                // In its true place, above rows already read: say so, or it goes unseen.
+                spans.push(Span::styled(
+                    LATE_MARKER,
+                    Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("{}: ", m.author_nick),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(body));
+            Line::from(spans)
         })
         .collect();
     let p = Paragraph::new(lines)

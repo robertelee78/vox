@@ -133,8 +133,20 @@ impl LiveCore {
                     self.notice = Some(format!("consented to {}", short_id(&target)));
                 }
                 NodeEvent::SenderKeyReceived {
-                    peer, backfilled, ..
+                    channel_id,
+                    peer,
+                    backfilled,
                 } => {
+                    // **Counted here, and only here.** A key arriving renders what this node
+                    // already held as ciphertext — messages that were unreadable a moment ago
+                    // and are new to whoever is looking. This arm only set a notice, so a
+                    // room whose messages all arrived before their key showed no unread at
+                    // all. `Synced.rendered` below counts rows a sync renders, which is a
+                    // disjoint set: a backfilled row was stored by an earlier sync that could
+                    // not render it, so it is counted once, here.
+                    if backfilled > 0 && self.active != Some(channel_id) {
+                        *self.unread.entry(channel_id).or_insert(0) += backfilled as usize;
+                    }
                     self.notice = Some(if backfilled > 0 {
                         format!(
                             "{} consented to you — {backfilled} earlier message(s) now readable",
@@ -218,6 +230,7 @@ impl LiveCore {
                             // Displayed as a time of day, so seconds; the full precision is kept for ordering.
                             timestamp: r.created_millis / 1_000,
                             body: Some(r.text.clone()),
+                            late: r.late,
                         })
                         .collect(),
                     reachability: Reachability::Offline,
@@ -253,6 +266,8 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::Refused => UiError::Refused,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
+        Fault::AddressInUse => UiError::AddressInUse,
+        Fault::AlreadyMember => UiError::AlreadyMember,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
     }
@@ -286,17 +301,10 @@ impl CoreHandle for LiveCore {
             Command::CreateChannel {
                 local_name,
                 passphrase,
-                deniable,
-            } => {
-                if deniable {
-                    // ADR-009 is implemented but not enabled for shipping.
-                    return CommandStatus::Failed(UiError::NotAvailableYet);
-                }
-                self.send(NodeCommand::CreateChannel {
-                    local_name,
-                    passphrase: Self::secret(&passphrase),
-                })
-            }
+            } => self.send(NodeCommand::CreateChannel {
+                local_name,
+                passphrase: Self::secret(&passphrase),
+            }),
             Command::OpenChannel {
                 channel_id,
                 passphrase,

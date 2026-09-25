@@ -2,7 +2,7 @@
 
 **Status**: implemented (M8, `crates/vox-core/src/atrest/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-20 — identity-level key material (the prekey ring) given its at-rest home and derivation (ADR-016 M14.3); admitted channel authors and received sender keys sealed as key material (M14.5); the two factors' compromise populations stated explicitly (M14.7c). 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
+**Updated**: 2026-09-24 — retention is switched on (ADR-023 M23.1): the room's policy-update `ttl` and the node's own `retention` file, shortest wins, applied retroactively by a sweep; see §"Retention / TTL". 2026-09-20 — identity-level key material (the prekey ring) given its at-rest home and derivation (ADR-016 M14.3); admitted channel authors and received sender keys sealed as key material (M14.5); the two factors' compromise populations stated explicitly (M14.7c). 2026-09-19 — Implementation notes (M8) added; Argon2id profile floor made structural (test-only reduced profile no longer resolvable in production); unknown-profile oracle collapsed on every unlock path.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: storage, at-rest, encryption, retention, ttl, device-seizure, app-lock
 
@@ -122,6 +122,42 @@ after pruning (ADR-008). "Disappearing" deletes both the plaintext cache and the
 TTL. This is **client-honored, not enforceable**: a malicious client can retain data; we state this
 plainly rather than implying a guarantee we cannot make.
 
+**As built (2026-09-24, ADR-023 M23.1, PRD-001 R6–R10).**
+- The room's retention is the ADR-007 policy-update `ttl`, authored with `vox room retention <room>
+  1h|1w|1m|<secs>|forever` by a holder of `policy` (refused to anyone else, and gated on the identity
+  passphrase over the control socket because shortening it deletes stored history). The node's own is
+  the `retention` file in its config directory (`default <dur>` and `<room-prefix> <dur>` lines),
+  re-read every minute. The effective retention is the shorter; `0` is forever. The node's own is
+  set on a room **when it is opened** (create, join, open), before anything can start a session on
+  it, and re-applied only when the file changes; `vox status --json` reports each room's effective
+  `retention`. *(2026-09-25: it used to be set only by the sweep, which skips a room a session
+  holds; on the v0.2.8 runtime a reopened room could sync before any sweep reached it, and a late
+  arrival was judged by the room's week alone and shown until the next sweep — measured
+  `node_retention=0` at render in the failing run.)*
+- A sweep runs on every tick (1 s) and after `vox room retention`: every content entry whose age is at
+  or past the effective retention loses its payload body (`LogDb` page rewritten with the skeleton),
+  its plaintext cache row and its first-seen record, and leaves the timeline. It is retroactive by
+  construction and costs what it prunes: bodies are indexed by age.
+- Age runs from the author's claimed time clamped to no later than first sight; the first-seen time
+  is kept per entry in a sealed `Index` segment beside its `LogDb` page. An entry this node cannot
+  read ages from first sight.
+- Reload keeps a body-less entry (it verifies and links the feed), and a synced skeleton is stored
+  like any other entry; a body that arrives already expired is pruned instead of rendered.
+- **Gates** (`crates/vox-tui/tests/retention_proof.rs`, shipped binary, release, `--ignored`):
+  retroactive — 40 + 60 messages, the room set to 30 s with the 40 at 47 s: both members' `vox room
+  read` show exactly the 60, both stores hold 60 cache rows and 107 log pages, the restarted node
+  opens the room, and the 60 go at 28 s; shortest wins — room 1 week, one node 60 s: that node shows
+  0 of 10 at 59 s while the other shows 10; late arrival — 5 messages synced to that node after 65 s
+  are never shown and never rendered: the restarted node's first `vox status` already reports 60 s,
+  and its own event stream (subscribed before the peer returns) announces 1 rendered row, the live
+  one. Mutations: sweep disabled (104 rows stay), reload refusing a pruned entry (room comes back
+  `[closed]`), node retention ignored (alice keeps 12 rows), arrival check removed (the 5 shown,
+  6 announced), node retention not set at open (never applied: alice still shows 12 rows past her minute).
+- **Not built:** the genesis `ttl` is still `0` at creation (a room is created forever and set after);
+  an anchor's log store keeps bodies regardless of retention (ADR-023 decision 6 removes that store);
+  a peer is served the skeleton of a pruned entry because the DAG holds only the skeleton, but no gate
+  isolates that.
+
 ## Consequences
 
 ### Positive
@@ -227,7 +263,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   with no nonce-count accounting (the 2^32 random-nonce GCM bound is not enforced). The
   hardware-stored-secret identity factor, gpg-agent/smartcard signers and biometric-gated re-wrap are
   trait seams only. TTL evaluation lives in governance policy; `retention` provides the prune
-  mechanism.
+  mechanism. *(The node runtime now drives it — see §"Retention / TTL", 2026-09-24.)*
 
 ## Links
 **Depends on**: ADR-002, ADR-007, ADR-008.

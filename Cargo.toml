@@ -4,7 +4,7 @@
 # Rust clients over it. Crates are added to `members` as milestones land.
 [workspace]
 resolver = "2"
-members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms"]
+members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms", "crates/vox-ffi"]
 
 [workspace.package]
 version = "0.2.9"
@@ -17,6 +17,9 @@ repository = "https://github.com/robertelee78/vox"
 # Dependencies shared across crates are pinned here so every crate signs/verifies
 # with the exact same primitive versions (ADR-003: deterministic, agile crypto).
 [workspace.dependencies]
+# The FFI boundary for the native apps (ADR-014: SwiftUI over the Rust core via UniFFI;
+# PRD-001 R30/R31). One pin, so the scaffolding and the bindgen agree.
+uniffi = { version = "0.32.2" }
 sha2 = "0.10"
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }
@@ -147,6 +150,17 @@ sha1 = { version = "0.11", default-features = false }
 redb = "4.3"
 # Temp directories for store/vault tests only (pure Rust).
 tempfile = "3.27"
+# --- Terminal proofs (test-only) -----------------------------------------------
+# A proof that reads what the TUI draws must run the shipped binary on a real terminal.
+# `portable-pty` (wezterm's) opens the pty, makes it the child's controlling terminal and
+# sets its size — the three things crossterm needs to enter raw mode and lay out a frame.
+# `vt100` replays the child's output into a screen grid, because ratatui redraws only the
+# cells that changed: the bytes on the wire never hold "(1 unread)" as one string, the
+# screen does. 0.15, not 0.16: ratatui pins `unicode-width = 0.2.0` and vt100 0.16 needs
+# 0.2.1+, while 0.15 uses the 0.1 line the tree already carries. Both are
+# dev-dependencies of `vox-tui` only; neither ships.
+portable-pty = "0.9"
+vt100 = "0.15"
 
 # --- Rust TUI client (ADR-015, M12) ------------------------------------------
 # Pure-Rust terminal stack; keeps the static-musl generate path clean (ADR-015).

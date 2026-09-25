@@ -123,15 +123,6 @@ pub enum Error {
     #[error("join proof-of-work invalid")]
     JoinPowInvalid,
 
-    /// A log entry carried the ADR-009 *deniable* content authenticator, whose
-    /// verification is provided by milestone M7 (ADR-009) — not implemented in M5.
-    /// This is an honest capability boundary, not a stub: M5 builds the wire seam
-    /// (the entry round-trips and is classified non-attributable) and the
-    /// composite path fully, and refuses to *claim* a deniable verification it
-    /// does not perform (ADR-008 §"build coupling with ADR-009").
-    #[error("deniable authenticator verification is provided by M7 (ADR-009)")]
-    DeniableVerificationUnavailable,
-
     /// A framed structure exceeded a hard size limit before any allocation
     /// proportional to attacker-declared counts/lengths was performed (ADR-008
     /// anti-abuse: a declared length is never trusted ahead of the bytes behind it).
@@ -149,8 +140,8 @@ pub enum Error {
     /// A governance struct (genesis record, admin-delegation cert, consent
     /// grant/revocation, admin-delegation revocation, policy update) was
     /// structurally malformed on parse — bad arity, an out-of-domain enum, a
-    /// wrong-length digest/key, or a field forbidden by its schema (e.g. a
-    /// policy-update carrying `deniability_mode`). Carries a static reason
+    /// wrong-length digest/key, a field forbidden by its schema, or a genesis
+    /// asking for a removed deniable room. Carries a static reason
     /// (ADR-007).
     #[error("malformed governance struct: {0}")]
     MalformedGovernance(&'static str),
@@ -251,6 +242,22 @@ pub enum Error {
     #[error("peer unreachable — {0}")]
     LadderExhausted(String),
 
+    /// This node could not listen on a local address it was told to use.
+    ///
+    /// Carried whole rather than as a `&'static str`: "quic endpoint bind" was the only thing
+    /// the daemon could say when its `--listen` port was taken, and it reached the person as
+    /// `Failed(Internal)` — a bug report for what is an occupied port (PRD-001 R36).
+    #[error("cannot listen on {addr}: {reason}")]
+    LocalBind {
+        /// The address that could not be bound.
+        addr: std::net::SocketAddr,
+        /// Whether something else already holds it (the common case, and the one with an
+        /// obvious fix).
+        in_use: bool,
+        /// What the operating system said.
+        reason: String,
+    },
+
     /// A tunnel operation was refused by authorization (ADR-013): the requesting
     /// member holds no valid `dial:<service>` capability (or the host no
     /// `bind:<service>`), or the service is dark/unknown. Default-deny: the absence
@@ -350,4 +357,10 @@ pub enum Error {
         /// The underlying OS message.
         detail: String,
     },
+
+    /// A node refused an app-API request over its control socket (ADR-022 decision 7),
+    /// carrying the node's own reason — `no-listener`, not in the keyring, and so on —
+    /// because the program asking has no other way to learn it.
+    #[error("{0}")]
+    AppRefused(String),
 }

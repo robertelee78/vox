@@ -6,9 +6,25 @@
 //! What it carries is the two peers' **QUIC packets**: each end attaches a
 //! [circuit](crate::transport::mux) to its endpoint, and the dial, the handshake and
 //! the identity pinning are exactly those of a direct connection. The relay forwards
-//! `DATAGRAM` frames it cannot read. That is what ADR-012's "ciphertext-only" relay
-//! means here, and it holds by construction: there is no plaintext for the relay to
-//! see, because the connection is not with the relay.
+//! datagrams it cannot read. That is what ADR-012's "ciphertext-only" relay means
+//! here, and it holds by construction: there is no plaintext for the relay to see,
+//! because the connection is not with the relay.
+//!
+//! ## The packets ride datagrams, not the stream (ADR-022 decision 5)
+//! The circuit stream carries only the opening exchange below. Once a circuit is up,
+//! each leg's stream is bound to a [datagram flow](crate::transport::router) on that
+//! leg's connection — the initiator–relay one and the relay–target one — and the QUIC
+//! packets travel as datagrams on those flows. The relay moves each datagram from one
+//! flow to the other without reading it, and fragments without reassembling them.
+//!
+//! Until ADR-022 the packets rode the stream itself as `DATAGRAM` frames. A stream is
+//! reliable and ordered, so one lost outer packet held back every inner packet queued
+//! behind it until it was retransmitted: the inner connection, which recovers from loss
+//! on its own, saw a stall instead of a loss. Carried as datagrams, a lost outer packet
+//! loses one inner packet and nothing waits for it.
+//!
+//! The stream still matters: each flow lives exactly as long as its leg's stream, so
+//! either end, or the relay, ending its stream tears the whole circuit down.
 //!
 //! ## Verbs
 //!
@@ -16,9 +32,8 @@
 //! |---|---|---|
 //! | `OPEN <peer>` | initiator → relay | "carry a circuit to this peer" |
 //! | `INCOMING <peer>` | relay → target | "a circuit from that peer" |
-//! | `OPENED` | either → its counterpart | the circuit is up; `DATAGRAM` frames follow |
+//! | `OPENED` | either → its counterpart | the circuit is up; the stream is a datagram flow from here |
 //! | `REFUSED <reason>` | either → its counterpart | it is not, and why |
-//! | `DATAGRAM <bytes>` | end to end | one QUIC packet, opaque to the relay |
 //!
 //! ## Who may ask
 //!
@@ -43,12 +58,26 @@ use crate::node::net::PeerClass;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::mux::CircuitPort;
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
+use crate::transport::router::DatagramFlow;
 use crate::transport::streams::{open_typed, StreamKind};
 
-/// The largest circuit frame. A QUIC packet is at most the path MTU (well under
-/// 2 KiB); this leaves room for a relay stream's own MTU discovery without letting
-/// the verb carry bulk.
-pub const MAX_CIRCUIT_FRAME: usize = 16 * 1024;
+/// The largest circuit frame. Only the opening exchange rides the stream — the largest
+/// frame is a verb and a 32-byte fingerprint — so anything bigger is not a circuit
+/// frame.
+pub const MAX_CIRCUIT_FRAME: usize = 256;
+
+/// The largest datagram either end of a circuit sends. Larger inner packets go as
+/// fragments.
+///
+/// Each end knows only its own leg to the relay, and the relay forwards each datagram as
+/// it is — it never re-splits one, since that would mean reassembling it. So a datagram
+/// sized for a leg that path-MTU discovery has grown to 1452 bytes would be dropped at
+/// the relay if the other leg is still at QUIC's 1200-byte floor, and the inner handshake,
+/// whose Initial packets are 1200 bytes, would never complete. Every QUIC connection
+/// carries a datagram of a little over a kilobyte (1200 bytes less its packet overhead);
+/// this stays under that with room for the relay's flow ID to be a few bytes longer than
+/// the end's.
+pub const CIRCUIT_DATAGRAM_MAX: usize = 1100;
 
 /// How many circuits a relay will carry at once, in total.
 pub const MAX_RELAYED_CIRCUITS: usize = 64;
@@ -67,7 +96,6 @@ const OP_OPEN: u64 = 0;
 const OP_INCOMING: u64 = 1;
 const OP_OPENED: u64 = 2;
 const OP_REFUSED: u64 = 3;
-const OP_DATAGRAM: u64 = 4;
 
 /// Why a relay or a target would not take part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,11 +147,6 @@ pub enum CircuitFrame {
         /// Why.
         reason: CircuitRefusal,
     },
-    /// One QUIC packet.
-    Datagram {
-        /// The packet, opaque to the relay.
-        payload: Vec<u8>,
-    },
 }
 
 impl CircuitFrame {
@@ -143,9 +166,6 @@ impl CircuitFrame {
             }
             CircuitFrame::Refused { reason } => {
                 e.array(2).uint(OP_REFUSED).uint(reason.code());
-            }
-            CircuitFrame::Datagram { payload } => {
-                e.array(2).uint(OP_DATAGRAM).bytes(payload);
             }
         }
         e.finish()
@@ -168,10 +188,7 @@ impl CircuitFrame {
             (OP_REFUSED, 2) => CircuitFrame::Refused {
                 reason: CircuitRefusal::from_code(d.uint()?)?,
             },
-            (OP_DATAGRAM, 2) => CircuitFrame::Datagram {
-                payload: d.bytes()?.to_vec(),
-            },
-            (OP_OPEN..=OP_DATAGRAM, _) => return Err(Error::Unreachable("circuit: frame arity")),
+            (OP_OPEN..=OP_REFUSED, _) => return Err(Error::Unreachable("circuit: frame arity")),
             _ => return Err(Error::Unreachable("circuit: unknown op")),
         };
         d.finish()
@@ -271,7 +288,8 @@ impl Drop for CircuitSlot {
 /// establishes — a relayed circuit, or a circuit terminating at this node — then runs
 /// on its own task, so the stream loop that accepted it is free at once.
 ///
-/// `carrier` is the connection the stream arrived on, and whatever the circuit becomes
+/// `carrier` is the connection the stream arrived on — the circuit's datagram flow is bound
+/// to it — and whatever the circuit becomes
 /// holds it — and the target's connection too, when this node relays — for as long as the
 /// circuit runs: that is what marks those connections as carrying, so a retired one is
 /// not closed under a live circuit. `connected` resolves a fingerprint to a live
@@ -317,9 +335,13 @@ where
                 }
                 _ => return Err(Error::Unreachable("circuit: target did not answer")),
             }
+            // Bound before the asker hears `OPENED`, so its first packet has a flow to
+            // land on: nothing is sent on a circuit before that answer.
+            let target_flow = target_conn.bind_forwarding_flow(target_send, target_recv)?;
             send_frame(&mut send, &CircuitFrame::Opened).await?;
+            let asker_flow = carrier.bind_forwarding_flow(send, recv)?;
             let carriers = [Arc::clone(carrier), target_conn];
-            tokio::spawn(relay(slot, carriers, send, recv, target_send, target_recv));
+            tokio::spawn(relay(slot, carriers, asker_flow, target_flow));
             Ok(())
         }
         CircuitFrame::Incoming { peer: origin } => {
@@ -330,8 +352,10 @@ where
                 return Err(Error::StreamRefused("circuit: peer may not relay to us"));
             }
             send_frame(&mut send, &CircuitFrame::Opened).await?;
-            let port = endpoint.attach_circuit(&origin)?;
-            tokio::spawn(terminate(port, Arc::clone(carrier), send, recv));
+            let mut flow = carrier.bind_flow(send, recv)?;
+            flow.cap_datagrams(CIRCUIT_DATAGRAM_MAX);
+            let port = endpoint.attach_circuit_via(&origin, &peer)?;
+            tokio::spawn(terminate(port, Arc::clone(carrier), flow));
             Ok(())
         }
         _ => Err(Error::Unreachable("circuit: unexpected opening frame")),
@@ -364,7 +388,9 @@ pub async fn connect_through(
         }
         _ => return Err(Error::Unreachable("circuit: relay did not open")),
     }
-    let port = endpoint.attach_circuit(&peer)?;
+    let mut flow = relay.bind_flow(send, recv)?;
+    flow.cap_datagrams(CIRCUIT_DATAGRAM_MAX);
+    let port = endpoint.attach_circuit_via(&peer, &relay.peer_id())?;
     // Read before the port moves into the driver: the address is allocated per circuit,
     // so the port is the only thing that knows it.
     let target = port.addr();
@@ -372,7 +398,7 @@ pub async fn connect_through(
     // succeeds: a failed dial — or an attempt abandoned because another rung won the
     // race (M15.1b) — aborts it on drop, which drops the port, which detaches the
     // circuit and closes the stream, which tells the relay and the far side to let go.
-    let driver = DriverGuard::new(tokio::spawn(terminate(port, Arc::clone(relay), send, recv)));
+    let driver = DriverGuard::new(tokio::spawn(terminate(port, Arc::clone(relay), flow)));
     let conn =
         crate::nat::reachability::connect_direct(Arc::clone(endpoint), &[target], peer, now_secs)
             .await?;
@@ -424,97 +450,73 @@ impl Drop for DriverGuard {
 }
 
 /// Drive a circuit that terminates at this endpoint: what the endpoint sends to the
-/// circuit's address goes out as `DATAGRAM` frames, and `DATAGRAM` frames coming in
-/// are handed to the endpoint as arrivals from that address. Ends when the stream
-/// does, or after [`CIRCUIT_IDLE_TIMEOUT`] without traffic; the port — and with it
-/// the circuit — is dropped then. `_carrier`, the connection the circuit rides, is held
-/// until then.
-async fn terminate(
-    mut port: CircuitPort,
-    _carrier: Arc<VoxConnection>,
-    mut send: SendStream,
-    mut recv: RecvStream,
-) {
+/// circuit's address goes out as datagrams on the circuit's flow, and datagrams
+/// arriving on the flow are handed to the endpoint as arrivals from that address.
+/// Ends when the flow does — its stream ended, here or anywhere along the circuit — or
+/// after [`CIRCUIT_IDLE_TIMEOUT`] without traffic; the port, and with it the circuit,
+/// is dropped then. `_carrier`, the connection the circuit rides, is held until then.
+async fn terminate(mut port: CircuitPort, _carrier: Arc<VoxConnection>, mut flow: DatagramFlow) {
     let Some(mut outbound) = port.take_outbound() else {
         return;
     };
-    let writer = tokio::spawn(async move {
-        while let Some(datagram) = outbound.recv().await {
-            let frame = CircuitFrame::Datagram { payload: datagram };
-            if send_frame(&mut send, &frame).await.is_err() {
-                break;
-            }
-        }
-        let _ = send.finish();
-    });
     let inlet = port.inlet();
+    let idle = tokio::time::sleep(CIRCUIT_IDLE_TIMEOUT);
+    tokio::pin!(idle);
     loop {
-        let next = tokio::time::timeout(
-            CIRCUIT_IDLE_TIMEOUT,
-            read_frame(&mut recv, MAX_CIRCUIT_FRAME),
-        )
-        .await;
-        match next {
-            Ok(Ok(Some(frame))) => match CircuitFrame::from_bytes(&frame) {
-                Ok(CircuitFrame::Datagram { payload }) => inlet.deliver(payload),
-                // Anything else on an open circuit ends it: the protocol has no other
-                // frame to say here.
-                _ => break,
-            },
-            _ => break,
+        // Both receivers are channels, so a branch that loses the race loses nothing.
+        tokio::select! {
+            out = outbound.recv() => {
+                let Some(packet) = out else { break };
+                if flow.send(&packet).is_err() {
+                    break;
+                }
+            }
+            inbound = flow.recv() => {
+                let Some(packet) = inbound else { break };
+                inlet.deliver(packet);
+            }
+            () = &mut idle => break,
         }
+        idle.as_mut()
+            .reset(tokio::time::Instant::now() + CIRCUIT_IDLE_TIMEOUT);
     }
-    writer.abort();
+    drop(flow);
     drop(port);
 }
 
-/// Carry `DATAGRAM` frames between the asker's stream and the target's, both ways,
-/// until either side is done or the circuit idles out. The slot in the ledger is
-/// given back when this returns, and the two connections the circuit rides are held until
-/// then.
+/// Move datagrams between the asker's flow and the target's, both ways, until either
+/// flow ends or the circuit idles out. Each datagram changes flows and nothing else:
+/// the relay never reads it, and never reassembles a fragment. Returning drops both
+/// flows, which ends both streams and so the circuit at both ends; the slot in the
+/// ledger is given back then too, and the two connections the circuit rides are held
+/// until then.
 async fn relay(
     slot: CircuitSlot,
     _carriers: [Arc<VoxConnection>; 2],
-    asker_send: SendStream,
-    asker_recv: RecvStream,
-    target_send: SendStream,
-    target_recv: RecvStream,
+    mut asker: DatagramFlow,
+    mut target: DatagramFlow,
 ) {
-    // One task per direction: `read_frame` is not cancel-safe, so a `select!` over
-    // both could abandon a half-read frame and desynchronize the stream.
-    let mut up = tokio::spawn(copy_datagrams(asker_recv, target_send));
-    let mut down = tokio::spawn(copy_datagrams(target_recv, asker_send));
-    tokio::select! {
-        _ = &mut up => {}
-        _ = &mut down => {}
-    }
-    up.abort();
-    down.abort();
-    drop(slot);
-}
-
-/// Forward `DATAGRAM` frames one way, verbatim, until the stream ends, a frame that
-/// is not a datagram arrives, or nothing arrives for [`CIRCUIT_IDLE_TIMEOUT`]. The
-/// relay never looks inside a datagram.
-async fn copy_datagrams(mut recv: RecvStream, mut send: SendStream) {
+    let idle = tokio::time::sleep(CIRCUIT_IDLE_TIMEOUT);
+    tokio::pin!(idle);
     loop {
-        let next = tokio::time::timeout(
-            CIRCUIT_IDLE_TIMEOUT,
-            read_frame(&mut recv, MAX_CIRCUIT_FRAME),
-        )
-        .await;
-        let Ok(Ok(Some(frame))) = next else {
-            break;
-        };
-        if !matches!(
-            CircuitFrame::from_bytes(&frame),
-            Ok(CircuitFrame::Datagram { .. })
-        ) {
-            break;
+        tokio::select! {
+            up = asker.recv() => {
+                let Some(datagram) = up else { break };
+                if target.forward(&datagram).is_err() {
+                    break;
+                }
+            }
+            down = target.recv() => {
+                let Some(datagram) = down else { break };
+                if asker.forward(&datagram).is_err() {
+                    break;
+                }
+            }
+            () = &mut idle => break,
         }
-        if write_frame(&mut send, &frame).await.is_err() {
-            break;
-        }
+        idle.as_mut()
+            .reset(tokio::time::Instant::now() + CIRCUIT_IDLE_TIMEOUT);
     }
-    let _ = send.finish();
+    drop((asker, target));
+    drop(slot);
 }

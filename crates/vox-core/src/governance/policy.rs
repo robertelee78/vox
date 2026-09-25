@@ -6,17 +6,8 @@
 //! **history-mode and/or TTL** from its causal position forward. Body:
 //! `{ history_mode?, ttl? }` — both optional.
 //!
-//! ## The deniability axis is genesis-immutable
-//! A policy-update **MUST NOT** change `deniability_mode`: it is set once in the
-//! genesis record ([`crate::governance::genesis`]) and never moves. There is no
-//! `deniability_mode` field in this struct *at all*, so the prohibition is
-//! enforced at the schema level — there is nothing to set. The strict body
-//! decoder only ever reads the history/ttl fields, so a malformed body cannot
-//! smuggle a deniability change in either.
-//! Rationale (ADR-007): members join under a fixed authorship-accountability
-//! contract; flipping attributable↔deniable mid-life would change the threat
-//! model under existing members and the fork-handling split (ADR-008). History
-//! and TTL are retention conveniences with no such trust-contract inversion.
+//! A policy-update carries only history mode and TTL. (It once had to be kept from changing
+//! the ADR-009 deniability axis; deniable rooms were removed, PRD-001 R43.)
 //!
 //! The same domain label (`vox/policy-rotation/v1`) and tag (`0x0006`) cover both
 //! a policy-update and a passphrase-rotation entry (the M0 wire registry collapses

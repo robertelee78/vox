@@ -567,10 +567,11 @@ pub fn wire_error_for_rejected(rej: &Rejected) -> WireError {
         Rejected::Verification(e) => wire_error_for(e),
         Rejected::Feed(_) => WireError::AuthenticatorInvalid,
         Rejected::Fork(_) => WireError::AuthenticatorInvalid,
-        Rejected::GovernanceNotAttributable => WireError::AuthenticatorInvalid,
         // A duplicate is not a hard fail; callers handle it before mapping. If it
         // ever reaches here, treat as a benign authenticator-class rejection.
         Rejected::Duplicate => WireError::AuthenticatorInvalid,
+        // Likewise handled before mapping (`apply_entry`): refused, and the session goes on.
+        Rejected::PreCheckpoint => WireError::AuthenticatorInvalid,
     }
 }
 
@@ -588,6 +589,10 @@ pub enum ApplyOutcome {
     /// raises an alarm) and sync **continues**. The stream is not closed for a
     /// fork (ADR-008 §"Fork / equivocation handling").
     Fork,
+    /// The entry was for a position at or below its author's checkpoint that this node does
+    /// not hold as it (ADR-023 decision 3): refused, not stored, not a fork. Nothing a peer
+    /// can say there is ever shown, so the session **continues**.
+    PreCheckpoint,
 }
 
 /// Apply a received `ENTRY` wire frame to the local [`Dag`] under the full
@@ -616,6 +621,7 @@ pub fn apply_entry<R: AuthorResolver>(
         // A fork is recorded by `accept` (freeze / proof) and surfaced; it does
         // not close the stream.
         Err(Rejected::Fork(_)) => Ok(ApplyOutcome::Fork),
+        Err(Rejected::PreCheckpoint) => Ok(ApplyOutcome::PreCheckpoint),
         Err(other) => Err(wire_error_for_rejected(&other)),
     }
 }
@@ -750,8 +756,12 @@ where
     T: Transport,
     R: AuthorResolver,
 {
-    match frontier_session_peer_inner(t, dag, resolver, admission) {
-        Ok(applied) => Ok(applied),
+    let outcome = frontier_session_peer_inner(t, dag, resolver, admission);
+    // Whatever arrived without a signature and was never chained to a signed entry is not
+    // authentic; it is taken back on every path out of the session (ADR-023 decision 3).
+    let discarded = dag.discard_unverified();
+    match outcome {
+        Ok(applied) => Ok(applied.saturating_sub(discarded)),
         Err(code) => {
             t.close(code);
             Err(code)

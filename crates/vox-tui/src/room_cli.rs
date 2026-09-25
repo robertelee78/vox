@@ -595,16 +595,27 @@ fn row_json(
 fn after_cursor(
     rows: &[vox_core::node::api::MessageRow],
     cursor: Option<Digest32>,
-) -> Result<usize, AppError> {
+) -> Result<Vec<&vox_core::node::api::MessageRow>, AppError> {
+    // **Arrival, not position** (ADR-023 decision 1): the room is shown in its one order, where a
+    // late arrival lands *above* rows already shown, so "everything below the cursor" would skip it
+    // for good. What follows a cursor is what this node rendered after it, in the order it
+    // rendered it, so the last row is always the right next cursor — the same rule the node
+    // applies to `Read { since }`.
     match cursor {
-        None => Ok(0),
-        Some(c) => rows
-            .iter()
-            .position(|r| r.entry_hash == c)
-            .map(|i| i + 1)
-            .ok_or_else(|| {
-                AppError::Usage(format!("cursor {} is not in this room's timeline", id(&c)))
-            }),
+        None => Ok(rows.iter().collect()),
+        Some(c) => {
+            let mark = rows
+                .iter()
+                .find(|r| r.entry_hash == c)
+                .map(|r| r.arrival)
+                .ok_or_else(|| {
+                    AppError::Usage(format!("cursor {} is not in this room's timeline", id(&c)))
+                })?;
+            let mut newer: Vec<&vox_core::node::api::MessageRow> =
+                rows.iter().filter(|r| r.arrival > mark).collect();
+            newer.sort_by_key(|r| r.arrival);
+            Ok(newer)
+        }
     }
 }
 
@@ -642,6 +653,7 @@ pub async fn read(
     since: Option<&str>,
     limit: u64,
     json: bool,
+    only_late: bool,
 ) -> Result<(), AppError> {
     let (mut client, channel_id, room_key) = open_room(paths, room).await?;
     let since = match since {
@@ -656,7 +668,7 @@ pub async fn read(
         } else {
             usize::try_from(limit).unwrap_or(usize::MAX)
         };
-        for r in rows.iter().take(take) {
+        for r in rows.iter().filter(|r| r.late || !only_late).take(take) {
             let _ = writeln!(out, "{}", plain_row(r));
         }
         return Ok(());
@@ -664,7 +676,7 @@ pub async fn read(
     // The operation index needs the whole room, not only what follows the cursor: an
     // entry after it may repeat, or conflict with, one before it.
     let all = coord::read_all(&mut client, channel_id, None).await?;
-    let from = after_cursor(&all, since)?;
+    let wanted = after_cursor(&all, since)?;
     let mut ops = vox_agentcomms::ops::OpIndex::new();
     for p in coord::posted_of(&all) {
         ops.insert(p.entry_hash, p.author, p.created_millis, &p.envelope);
@@ -675,10 +687,38 @@ pub async fn read(
         usize::try_from(limit).unwrap_or(usize::MAX)
     };
     let mut out = std::io::stdout().lock();
-    for r in all[from..].iter().take(take) {
+    for r in wanted
+        .into_iter()
+        .filter(|r| r.late || !only_late)
+        .take(take)
+    {
         let _ = writeln!(out, "{}", row_json(&room_key, r, &ops, None));
     }
     Ok(())
+}
+
+/// `vox room read --hashes` — every entry the node holds for the room, one per line as
+/// `<entry-hash> <clock-ms>`, in the room's one order (ADR-023 decision 1). The clock is the
+/// key that placed the entry: its claimed time, capped and lifted by what it saw.
+///
+/// The timeline shows only rows this node can decrypt, so two members' timelines can
+/// differ for reasons that have nothing to do with order: one holds a key the other
+/// does not yet. This is the sequence underneath both, and the one that must match.
+pub async fn order(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client.request(&Request::Order { channel_id }).await {
+        Ok(Frame::Order { entries }) => {
+            let mut out = std::io::stdout().lock();
+            for (h, clock) in entries {
+                let _ = writeln!(out, "{} {clock}", id(&h));
+            }
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
 }
 
 /// `vox room roster` — who is in the room.
@@ -742,9 +782,12 @@ pub async fn tail(
     let all = coord::read_all(&mut lookup, channel_id, None).await?;
     // With no cursor, a tail starts at the live edge, as it always has; everything
     // already in the room is context for the operation index, not output.
-    let from = match cursor {
-        None => all.len(),
-        Some(_) => after_cursor(&all, cursor)?,
+    let wanted: std::collections::HashSet<Digest32> = match cursor {
+        None => std::collections::HashSet::new(),
+        Some(_) => after_cursor(&all, cursor)?
+            .into_iter()
+            .map(|r| r.entry_hash)
+            .collect(),
     };
 
     let mut ops = vox_agentcomms::ops::OpIndex::new();
@@ -754,16 +797,21 @@ pub async fn tail(
     let mut last: Option<Digest32> = None;
     let mut out = std::io::stdout().lock();
 
-    // Index everything, emit only what follows the cursor.
-    for (i, r) in all.iter().enumerate() {
+    // Index everything, emit only what arrived after the cursor, in the order it arrived.
+    let mut backlog: Vec<&vox_core::node::api::MessageRow> = Vec::new();
+    for r in &all {
         seen.insert(r.entry_hash);
         by_hash.insert(r.entry_hash, r.clone());
         if let Ok(e) = Envelope::parse(&r.text) {
             ops.insert(r.entry_hash, r.author, r.created_millis, &e);
         }
-        if i >= from {
-            emit_row(&mut out, &room_key, r, &ops, json, None);
+        if wanted.contains(&r.entry_hash) {
+            backlog.push(r);
         }
+    }
+    backlog.sort_by_key(|r| r.arrival);
+    for r in backlog {
+        emit_row(&mut out, &room_key, r, &ops, json, None);
         last = Some(r.entry_hash);
     }
 
@@ -1976,6 +2024,65 @@ pub async fn create(paths: &Paths, local_name: &str) -> Result<(), AppError> {
     }
 }
 
+/// `vox room retention` — set how long the room keeps messages (ADR-023 decision 2).
+///
+/// # Errors
+/// An unparseable duration, an unreachable node, an unknown room, a wrong identity
+/// passphrase, or a caller who is not the room's admin.
+pub async fn retention(
+    paths: &Paths,
+    room: &str,
+    duration: &str,
+    identity_passphrase: &str,
+) -> Result<(), AppError> {
+    let ttl = vox_core::node::retention::parse_duration(duration).ok_or_else(|| {
+        AppError::Usage(format!(
+            "{duration:?} is not a retention: use 1h, 1w, 1m (a month), a number of seconds, \
+             or forever"
+        ))
+    })?;
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client
+        .request(&Request::SetRetention {
+            channel_id,
+            ttl,
+            identity_passphrase: identity_passphrase.to_owned(),
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!(
+                "vox: {} keeps messages {}",
+                short(&channel_id),
+                match ttl {
+                    0 => "forever".to_owned(),
+                    t => format!("for {}", vox_core::node::retention::describe(t)),
+                }
+            );
+            if ttl > 0 {
+                println!(
+                    "     older messages are removed now, on every member as this reaches them"
+                );
+                println!(
+                    "     a modified node can keep everything: this is not a security property"
+                );
+            }
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+            "cannot set retention: {reason}{}",
+            if reason.contains("Refused") {
+                " — only the room's admin may"
+            } else {
+                ""
+            }
+        ))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
 /// `vox room invite` — print a room's address for someone else to join with.
 ///
 /// The address is rendezvous information, not a credential: it names the room and
@@ -2023,6 +2130,7 @@ pub async fn trust_add(
     target: Digest32,
     petname: &str,
     identity_passphrase: &str,
+    full_history: bool,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     match client
@@ -2030,11 +2138,15 @@ pub async fn trust_add(
             target,
             petname: petname.to_owned(),
             identity_passphrase: identity_passphrase.to_owned(),
+            full_history,
         })
         .await
     {
         Ok(Frame::Ok) => {
             println!("vox: trusting {} as {petname:?}", short(&target));
+            if full_history {
+                println!("     with full history: it may also read what you wrote before now");
+            }
             println!("     it may now read what you write in every room you share — now and later");
             println!("     and reach every service you bind to a room you are both in");
             println!("     `vox trust remove` undoes it and changes the lock everywhere");

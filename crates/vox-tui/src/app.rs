@@ -605,8 +605,20 @@ pub fn run_daemon(
     anchors: vox_core::nat::bootstrap::BootstrapSet,
     anchor_specs: Vec<String>,
     passphrase_file: Option<std::path::PathBuf>,
+    metrics: Option<std::net::SocketAddr>,
 ) -> Result<(), AppError> {
     use std::io::Read as _;
+
+    // Refused before anything is read or unlocked: a metrics endpoint the network can
+    // reach names every peer and room this node talks to (PRD-001 R38).
+    if let Some(addr) = metrics {
+        if !addr.ip().is_loopback() {
+            return Err(AppError::Usage(format!(
+                "--metrics {addr}: the metrics endpoint binds loopback only (127.0.0.1 or \
+                 ::1); it names every peer and room this node talks to"
+            )));
+        }
+    }
 
     let raw = match &passphrase_file {
         Some(path) => std::fs::read_to_string(path)
@@ -706,7 +718,16 @@ pub fn run_daemon(
                      `vox daemon` is the identity passphrase; lines after it open rooms."
                         .to_owned()
                 }
-                other => format!("could not unlock this profile's identity: {other:?}"),
+                // Unlocking also brings the node onto the network, so a `--listen` port that
+                // is taken fails here. It said `Failed(Internal)` — a bug report for an
+                // occupied port (PRD-001 R36).
+                Outcome::Failed(Fault::AddressInUse) => format!(
+                    "cannot listen on {listen}: something else already holds that UDP port\n\
+                     \x20      Pick another with --listen, or stop whatever holds it \
+                     (`lsof -i :{}` names it).",
+                    listen.port()
+                ),
+                other => format!("could not unlock this profile's identity: {other}"),
             }));
         }
         // Then the second lock. `vox room post|read|board` all need the room OPEN,
@@ -796,7 +817,7 @@ pub fn run_daemon(
                 // An operator who mistyped one passphrase wants the other rooms served and
                 // a line telling them which one failed — not a process that refuses to
                 // start.
-                eprintln!("vox daemon: could not open that room: {outcome:?}");
+                eprintln!("vox daemon: could not open that room: {outcome}");
                 continue;
             }
             // Neither form opened anything. Nothing to undo — a room this did not open
@@ -873,10 +894,26 @@ pub fn run_daemon(
         });
     }
 
+    if let Some(addr) = metrics {
+        let listener = rt
+            .block_on(vox_core::node::status::bind_metrics(addr))
+            .map_err(|e| AppError::Usage(e.to_string()))?;
+        let bound = listener.local_addr().map_err(AppError::Io)?;
+        rt.spawn(vox_core::node::status::serve_metrics(
+            listener,
+            node.clone(),
+        ));
+        println!("vox daemon: metrics http://{bound}/metrics");
+    }
+
     // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
     let _ipc = rt
         .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
         .map_err(|e| AppError::Usage(format!("control socket: {e}")))?;
+
+    // Tell the operator when `vox status` would flag something, and when it clears
+    // (PRD-001 R37). Off with `notify = off` in the profile's config file.
+    rt.spawn(crate::notify::watch(node.clone(), paths.clone()));
 
     let fp = node
         .view()

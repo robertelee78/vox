@@ -2,7 +2,7 @@
 
 **Status**: implemented (M5, `crates/vox-core/src/log/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6). 2026-09-24 — PRD-001 R5: a node answers a sync session for a room only from that room's members and anchors (§"Who is served"). 2026-09-24 — PRD-001 R1/R3: the per-author quota is **removed** (wire code `0x06` reserved). See §"Abuse resistance" and the 2026-09-24 Implementation note. 2026-09-24 — PRD-001 D2/R4: a `WANT` is served clamped to what is held, merged, and bounded per session (see the 2026-09-24 Implementation note).
+**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6). 2026-09-24 — PRD-001 R5: a node answers a sync session for a room only from that room's members and anchors (§"Who is served"). 2026-09-24 — PRD-001 R1/R3: the per-author quota is **removed** (wire code `0x06` reserved). See §"Abuse resistance" and the 2026-09-24 Implementation note. 2026-09-24 — PRD-001 D2/R4: a `WANT` is served clamped to what is held, merged, and bounded per session (see the 2026-09-24 Implementation note). 2026-09-24 — ADR-023 M23.2: the skeleton gains `claimed_ms` and `seen`, and the room has one order (§"Cross-author edges and the one order"). 2026-09-25 — ADR-023 M23.6: checkpoints and shed signatures (authenticator type `0`, struct tag `0x0015`).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
@@ -39,7 +39,7 @@ you hold; the log replicates everything.
 **Concrete entry format (Bamboo-derived, no external log dependency).** A Vox log entry is a signed
 struct:
 `{ author_id, seq (per-author, strictly monotonic from 1), prev_hash, lipmaa_backlink, channelID,
-epoch, algo_ids, payload_hash, payload_len, end_of_feed_flag }`, authenticated **per entry type**
+epoch, algo_ids, payload_hash, payload_len, end_of_feed_flag, claimed_ms, seen }`, authenticated **per entry type**
 (see "Per-entry-type authentication" below): governance/control entries are *always* composite
 Ed25519+ML-DSA root-signed (in every channel); message-content entries are composite-signed in
 attributable channels and authenticated by the ADR-009 deniable authenticator in deniable channels.
@@ -49,6 +49,37 @@ hash-linked skeleton stays fully verifiable; **lipmaa skip-links** give logarith
 verification certificates for partial replication. This is the Bamboo design adapted to Vox's
 composite-PQ signatures and `(channelID, epoch)` binding — specified directly here, not pulled from
 an external library (Bamboo/Reed/Hypercore inform it but are not a runtime dependency).
+
+**Cross-author edges and the one order (amended 2026-09-24 by ADR-023 decision 1, PRD-001 R13).**
+`seen` is the list of the heads of **other** authors' feeds the author had applied when it wrote the
+entry: at most 16 32-byte entry hashes, strictly ascending (one encoding per set; a decoder refuses an
+unsorted, duplicated or longer list before reading it). A head the author already named, or an older
+entry of that feed, is left out — its own previous entry already follows it — and when more than 16
+feeds moved the most recent by the order are named and the rest wait for the next entry. With `seen`
+the log is a causal DAG *across* authors, not parallel chains. `claimed_ms` is the author's clock in
+milliseconds (the same value its content envelope carries). Both sit in the signed skeleton rather than
+the encrypted payload because a node must place entries it cannot read — an author whose key it lacks,
+a skeleton whose body was pruned — or every entry after them lands somewhere else than on a node that
+can read them. The cost is that anyone holding skeletons sees the claimed send time, as they already
+see arrival time.
+
+The **room's order** is a hybrid logical clock over that DAG: `clock(e) = max(min(claimed_ms(e),
+latest(e) + MAX_LEAD_MS), latest(e) + 1)`, where `latest(e)` is the highest clock of the held parents
+(the author's own seq−1 and `seen`), or the room's genesis time for an entry with none, and
+`MAX_LEAD_MS` is ten minutes. Entries sort ascending by `(clock, entry_hash)`. The cap is relative to
+the parents, never to the receiving node's clock (which would differ per node and break the one
+order). It stops one member pinning the room's clocks forward: a post claiming tomorrow moves them
+ten minutes, not a day (ADR-023 decision 1). A parent's clock is below its child's, so this is a
+topological order; ties between concurrent entries fall to the claimed milliseconds and then the hash.
+It is a function of the entry set alone, so every node holding the same entries shows the same
+sequence: a total order **derived** from the causal DAG, with no consensus and no coordination —
+the "no global order" above means none is *agreed*, not that none can be computed. An author's clock
+can move its entry only among its concurrent peers: an entry stamped an hour early is still lifted to
+just after the newest thing it saw. **A `seen` hash a node does not hold never blocks acceptance**
+(entries arrive out of order); it contributes nothing until it arrives, and then the clocks of what
+named it, and their descendants, are raised to what the full set requires — the same result as if
+everything had arrived in causal order. `Dag::happened_before(a, b)` is the causal relation itself
+(ancestor through feeds and `seen`), the seam claims (ADR-020/021, R17) are to be built on.
 
 **Canonical serialization (normative, series-wide — the one encoding every ADR signs over).** Every
 signed/authenticated structure in Vox — log entries (here), SKDMs (ADR-006), certificates and consent
@@ -387,6 +418,35 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   (6.6, 10.8 and 6.7 ms over three runs) and the attacker receives each of the 50 held entries exactly
   once. On v0.2.8 (3cac220) the post gets no answer in 5 s in three runs of three; with the old loop
   restored, the same; with ranges not merged, 1,024 entries are served for 50 held.
+
+- **`seen`, `claimed_ms` and the one order (2026-09-24, ADR-023 M23.2, PRD-001 R13).** The skeleton
+  is a 12-element array, and `EntrySkeleton::encode_fields` / `decode_fields` are now the only
+  encoder and decoder of its fields: the signed body and the wire frame both call them, where there
+  used to be four hand-kept copies. `Dag` keeps a clock per entry and an ordered index, so
+  `causal_order` iterates rather than sorts. It also keeps `seen_by` (hash → entries naming it, held
+  or not), which is how a late parent finds what it must lift, and `reorder_generation`, which a
+  timeline compares to know a re-sort is due. `Dag::seen_for(author)` picks what the next entry
+  names. `Dag::happened_before` walks parents with clock pruning. No backwards compatibility: an
+  entry in the 10-field shape is refused at decode. Gates: ADR-023 M23.2.
+
+- **Checkpoints and shed signatures (2026-09-25, ADR-023 M23.6).**
+  - **Wire:** the entry wire gains authenticator type `0`, "dropped under a checkpoint", which
+    carries an empty byte string. Type `2`, the removed deniable authenticator, stays refused.
+  - **Struct tag `0x0015`** (`vox/checkpoint/v1`) is an author's checkpoint on its own feed,
+    `[seq, entry_hash]`, carried as the payload of an ordinary signed entry of that feed.
+  - **What `Dag::accept` does with them:**
+    - An unsigned entry is taken only body-less and only provisionally. It becomes authentic when
+      a signed entry of the same feed chains to it. `Dag::discard_unverified` takes back whatever
+      never is, at the end of every sync session and of every reload. A reload that finds one
+      refuses the store.
+    - An entry for a position at or below its author's checkpoint that is not already held is
+      `Rejected::PreCheckpoint`, never a fork. `apply_entry` reports it as
+      `ApplyOutcome::PreCheckpoint` and the session continues.
+    - A checkpoint that names a position its own feed does not hold, with that hash, is refused.
+  - **Shedding:** `Dag::drop_checkpointed_signatures` walks each checkpoint's new range once, and
+    `drop_signature_if_checkpointed` handles an entry pruned afterwards.
+  - **Checking a whole feed:** `Feed::verify_all_signatures` accepts an unsigned run only if a
+    signed entry follows it.
 
 ## Links
 **Depends on**: ADR-002, ADR-006.

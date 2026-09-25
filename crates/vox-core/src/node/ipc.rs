@@ -57,7 +57,11 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// The protocol this build speaks. Bumped when a frame's shape changes in a way
 /// an older client would misread; a client that sees a version it does not know
 /// MUST disconnect rather than guess.
-pub const PROTOCOL_VERSION: u64 = 5;
+///
+/// 6: the app API (`node::appipc`, ADR-022 M22.5). 7: a row carries where it arrived
+/// and whether it arrived late, and `Order` asks for the room's whole order (ADR-023
+/// decision 1). Both 6s were bumped on separate branches; the merged build is 7.
+pub const PROTOCOL_VERSION: u64 = 7;
 
 /// Largest frame accepted in either direction.
 ///
@@ -120,6 +124,8 @@ const T_LINK: u64 = 9;
 /// collided with — the decoder then read a trusted list as a bound address and said
 /// "malformed identity bundle", three layers from the cause.
 const T_TRUSTED: u64 = 26;
+/// Protocol 6: the room's whole order, as `(entry hash, clock)` pairs.
+const T_ORDER_ROWS: u64 = 27;
 // Client → node.
 const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
@@ -158,6 +164,13 @@ const T_INVITE: u64 = 13;
 const T_TRUST: u64 = 14;
 const T_UNTRUST: u64 = 15;
 const T_TRUST_LIST: u64 = 16;
+// Setting a room's retention deletes what is already stored (ADR-023 decision 2), so it is an
+// operator decision like the keyring and carries the identity passphrase the same way.
+const T_RETENTION: u64 = 23;
+// Protocol 6 — every entry the node holds for a room, in the room's one order
+// (PRD-001 R13), readable or not. What "the same order on every node" is checked
+// against, because a node's timeline shows only the rows it holds keys for.
+const T_ORDER: u64 = 24;
 
 /// What a client sends.
 ///
@@ -187,6 +200,12 @@ pub enum Request {
         since: Option<Digest32>,
         /// Cap on rows returned; 0 means no cap.
         limit: u64,
+    },
+    /// Every entry the node holds for a room, in the room's one order (ADR-023
+    /// decision 1): the sequence the timeline is a subsequence of.
+    Order {
+        /// The room.
+        channel_id: Digest32,
     },
     /// The members of a room.
     Roster {
@@ -267,6 +286,19 @@ pub enum Request {
         petname: String,
         /// The identity passphrase, proving this is the operator and not an agent.
         identity_passphrase: String,
+        /// Whether its consents release this node's full history (PRD-001 R12). On the
+        /// wire only when `true`, so an older client's request still decodes.
+        full_history: bool,
+    },
+    /// Set a room's retention (ADR-023 decision 2). Requires the identity passphrase:
+    /// shortening it deletes stored history, which is not an agent's call.
+    SetRetention {
+        /// The room.
+        channel_id: Digest32,
+        /// Seconds a message body is kept; `0` keeps it forever.
+        ttl: u64,
+        /// The identity passphrase, proving this is the operator and not an agent.
+        identity_passphrase: String,
     },
     /// Remove an identity from the trust keyring. Requires the identity passphrase.
     Untrust {
@@ -309,6 +341,9 @@ impl Request {
             }
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
+            }
+            Request::Order { channel_id } => {
+                e.array(2).uint(T_ORDER).bytes(channel_id);
             }
             Request::Rooms => {
                 e.array(1).uint(T_ROOMS_REQ);
@@ -373,11 +408,26 @@ impl Request {
                 target,
                 petname,
                 identity_passphrase,
+                full_history,
             } => {
-                e.array(4)
+                e.array(if *full_history { 5 } else { 4 })
                     .uint(T_TRUST)
                     .bytes(target)
                     .text(petname)
+                    .text(identity_passphrase);
+                if *full_history {
+                    e.uint(1);
+                }
+            }
+            Request::SetRetention {
+                channel_id,
+                ttl,
+                identity_passphrase,
+            } => {
+                e.array(4)
+                    .uint(T_RETENTION)
+                    .bytes(channel_id)
+                    .uint(*ttl)
                     .text(identity_passphrase);
             }
             Request::Untrust {
@@ -451,20 +501,43 @@ impl Request {
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
             }
+            (T_ORDER, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Order { channel_id })
+            }
             (T_ROOMS_REQ, 1) => {
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Rooms)
             }
-            (T_TRUST, 4) => {
+            (T_TRUST, n @ (4 | 5)) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
                 let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                let full_history = n == 5
+                    && d.uint()
+                        .map_err(|_| Error::MalformedBundle("ipc history"))?
+                        == 1;
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Trust {
                     target,
                     petname,
+                    identity_passphrase,
+                    full_history,
+                })
+            }
+            (T_RETENTION, 4) => {
+                let channel_id = digest(&mut d)?;
+                let ttl = d.uint().map_err(|_| Error::MalformedBundle("ipc ttl"))?;
+                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::SetRetention {
+                    channel_id,
+                    ttl,
                     identity_passphrase,
                 })
             }
@@ -604,6 +677,11 @@ pub enum Frame {
         /// The rendered entries.
         rows: Vec<MessageRow>,
     },
+    /// The order a [`Request::Order`] asked for.
+    Order {
+        /// `(entry hash, clock in ms)`, first to last.
+        entries: Vec<(Digest32, u64)>,
+    },
     /// The members a [`Request::Roster`] asked for.
     Members {
         /// Member fingerprints, in the order the node holds them.
@@ -661,11 +739,19 @@ impl Frame {
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
                 for r in rows {
-                    e.array(4)
+                    e.array(6)
                         .bytes(&r.entry_hash)
                         .bytes(&r.author)
                         .uint(r.created_millis)
-                        .text(&r.text);
+                        .text(&r.text)
+                        .uint(r.arrival)
+                        .uint(u64::from(r.late));
+                }
+            }
+            Frame::Order { entries } => {
+                e.array(2).uint(T_ORDER_ROWS).array(entries.len());
+                for (h, clock) in entries {
+                    e.array(2).bytes(h).uint(*clock);
                 }
             }
             Frame::Members { members } => {
@@ -724,6 +810,15 @@ fn text(d: &mut Decoder<'_>, what: &'static str) -> Result<String> {
         .to_owned())
 }
 
+/// A 0/1 flag; any other value is malformed rather than read as true.
+fn flag(d: &mut Decoder<'_>, what: &'static str) -> Result<bool> {
+    match d.uint().map_err(|_| Error::MalformedBundle(what))? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(Error::MalformedBundle(what)),
+    }
+}
+
 fn addr(d: &mut Decoder<'_>) -> Result<std::net::SocketAddr> {
     d.text()
         .map_err(|_| Error::MalformedBundle("ipc addr"))?
@@ -734,13 +829,15 @@ fn addr(d: &mut Decoder<'_>) -> Result<std::net::SocketAddr> {
 fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
     match ev {
         NodeEvent::NewEntry { channel_id, row } => {
-            e.array(6)
+            e.array(8)
                 .uint(T_NEW_ENTRY)
                 .bytes(channel_id)
                 .bytes(&row.entry_hash)
                 .bytes(&row.author)
                 .uint(row.created_millis)
-                .text(&row.text);
+                .text(&row.text)
+                .uint(row.arrival)
+                .uint(u64::from(row.late));
         }
         NodeEvent::Unlocked => {
             e.array(1).uint(T_UNLOCKED);
@@ -935,7 +1032,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let mut rows = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let arity = d.array().map_err(|_| Error::MalformedBundle("ipc row"))?;
-                if arity != 4 {
+                if arity != 6 {
                     return Err(Error::MalformedBundle("ipc row arity"));
                 }
                 rows.push(MessageRow {
@@ -946,9 +1043,31 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                         .text()
                         .map_err(|_| Error::MalformedBundle("ipc text"))?
                         .to_owned(),
+                    arrival: d
+                        .uint()
+                        .map_err(|_| Error::MalformedBundle("ipc arrival"))?,
+                    late: flag(d, "ipc late")?,
                 });
             }
             return Ok(Frame::Rows { rows });
+        }
+        (T_ORDER_ROWS, 2) => {
+            let n = d.array().map_err(|_| Error::MalformedBundle("ipc order"))?;
+            let mut entries = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                if d.array()
+                    .map_err(|_| Error::MalformedBundle("ipc order entry"))?
+                    != 2
+                {
+                    return Err(Error::MalformedBundle("ipc order entry arity"));
+                }
+                let h = digest(d)?;
+                let clock = d
+                    .uint()
+                    .map_err(|_| Error::MalformedBundle("ipc order clock"))?;
+                entries.push((h, clock));
+            }
+            return Ok(Frame::Order { entries });
         }
         (T_MEMBERS, 2) => {
             let n = d
@@ -1012,7 +1131,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Trusted { entries });
         }
-        (T_NEW_ENTRY, 6) => {
+        (T_NEW_ENTRY, 8) => {
             let channel_id = digest(d)?;
             let entry_hash = digest(d)?;
             let author = digest(d)?;
@@ -1021,6 +1140,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .text()
                 .map_err(|_| Error::MalformedBundle("ipc text"))?
                 .to_owned();
+            let arrival = d
+                .uint()
+                .map_err(|_| Error::MalformedBundle("ipc arrival"))?;
+            let late = flag(d, "ipc late")?;
             NodeEvent::NewEntry {
                 channel_id,
                 row: MessageRow {
@@ -1028,6 +1151,8 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     author,
                     created_millis,
                     text,
+                    arrival,
+                    late,
                 },
             }
         }
@@ -1313,6 +1438,28 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         let Some(body) = read_frame(&mut stream).await? else {
             return Ok(());
         };
+        // PRD-001 R35: `vox status`. Answered, and the connection serves on.
+        if crate::node::status::is_request(&body) {
+            crate::node::status::serve(&mut stream, &handle).await?;
+            continue;
+        }
+        // Protocol 6: an app request turns the connection into an app connection for
+        // the rest of its life (ADR-022 decision 7, `node::appipc`).
+        if let Some(app) = crate::node::appipc::AppRequest::parse(&body) {
+            return match app {
+                Ok(app) => crate::node::appipc::serve(stream, handle, app).await,
+                Err(e) => {
+                    write_frame(
+                        &mut stream,
+                        &Frame::Error {
+                            reason: e.to_string(),
+                        }
+                        .to_bytes(),
+                    )
+                    .await
+                }
+            };
+        }
         let request = match Request::from_bytes(&body) {
             Ok(r) => r,
             Err(e) => {
@@ -1385,18 +1532,40 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             target,
             petname,
             identity_passphrase,
+            full_history,
         } => match verify_operator(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Trust {
+                .apply(crate::node::api::NodeCommand::TrustWith {
                     fingerprint: target,
                     petname,
+                    history: if full_history {
+                        crate::node::trust::HistoryGrant::Full
+                    } else {
+                        crate::node::trust::HistoryGrant::Now
+                    },
                 })
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
+                },
+            },
+        },
+        Request::SetRetention {
+            channel_id,
+            ttl,
+            identity_passphrase,
+        } => match verify_operator(handle, identity_passphrase).await {
+            Err(f) => f,
+            Ok(()) => match handle
+                .apply(crate::node::api::NodeCommand::SetRetention { channel_id, ttl })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: other.to_string(),
                 },
             },
         },
@@ -1413,7 +1582,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             },
         },
@@ -1432,7 +1601,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1451,27 +1620,59 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     reason: "room not open".into(),
                 };
             };
-            // The cursor is an entry hash the client already has; everything
-            // after it is what it has not seen. A cursor this node does not hold
-            // is an error rather than "from the start", which would silently
+            // The cursor is an entry hash the client already has; everything that
+            // **arrived** after it is what it has not seen. A cursor this node does not
+            // hold is an error rather than "from the start", which would silently
             // re-deliver the whole room.
-            let start = match since {
-                None => 0,
-                Some(cursor) => match detail.timeline.iter().position(|r| r.entry_hash == cursor) {
-                    Some(i) => i + 1,
-                    None => {
+            //
+            // Arrival, not position: the timeline is in the room's order (ADR-023
+            // decision 1), where a late arrival lands *above* rows already shown, and
+            // "everything below the cursor" would skip it for good. So a read from a
+            // cursor is a feed: what this node rendered after the cursor, in the order it
+            // rendered them, which makes the last line always the right next cursor. A
+            // read with no cursor is the room, in the room's order.
+            let mut rows: Vec<MessageRow> = match since {
+                None => detail.timeline.clone(),
+                Some(cursor) => {
+                    let Some(mark) = detail
+                        .timeline
+                        .iter()
+                        .find(|r| r.entry_hash == cursor)
+                        .map(|r| r.arrival)
+                    else {
                         return Frame::Error {
                             reason: "cursor not in this room's timeline".into(),
-                        }
-                    }
-                },
+                        };
+                    };
+                    let mut newer: Vec<MessageRow> = detail
+                        .timeline
+                        .iter()
+                        .filter(|r| r.arrival > mark)
+                        .cloned()
+                        .collect();
+                    newer.sort_by_key(|r| r.arrival);
+                    newer
+                }
             };
-            let mut rows: Vec<MessageRow> =
-                detail.timeline[start.min(detail.timeline.len())..].to_vec();
             if limit > 0 {
                 rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
             }
             Frame::Rows { rows }
+        }
+        Request::Order { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Order {
+                    entries: detail.order.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
         }
         Request::Roster { channel_id } => {
             let view = handle.view();
@@ -1508,7 +1709,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1524,7 +1725,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         {
             crate::node::api::Outcome::Done => Frame::Ok,
             other => Frame::Error {
-                reason: format!("{other:?}"),
+                reason: other.to_string(),
             },
         },
         Request::Forward {
@@ -1553,7 +1754,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 crate::node::api::Outcome::Done => {}
                 other => {
                     return Frame::Error {
-                        reason: format!("{other:?}"),
+                        reason: other.to_string(),
                     }
                 }
             }
@@ -1594,7 +1795,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1614,8 +1815,8 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             // The outcome is named, not reduced to "it failed". `Unreachable` and a
             // refused passphrase call for completely different responses from whoever
             // is holding the link, and this is the only place that knows which it was.
-            other => Frame::Error {
-                reason: format!("{other:?}"),
+            crate::node::api::Outcome::Failed(fault) => Frame::Error {
+                reason: fault.explain_join().to_owned(),
             },
         },
         Request::Create {
@@ -1630,7 +1831,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         {
             crate::node::api::Outcome::Done => Frame::Ok,
             other => Frame::Error {
-                reason: format!("{other:?}"),
+                reason: other.to_string(),
             },
         },
         Request::Invite { channel_id } => {
@@ -1644,7 +1845,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 crate::node::api::Outcome::Done => {}
                 other => {
                     return Frame::Error {
-                        reason: format!("{other:?}"),
+                        reason: other.to_string(),
                     }
                 }
             }

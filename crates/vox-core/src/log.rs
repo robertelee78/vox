@@ -10,8 +10,11 @@
 //! ## The pieces
 //! - [`entry`] — the log entry (tag `0x0001`, domain `vox/log-entry/v1`): the
 //!   signed 10-field skeleton over a payload **hash** (so payloads prune while the
-//!   skeleton stays verifiable), and the [`entry::Authenticator`] seam (composite
-//!   attributable today; ADR-009 deniable in M7).
+//!   skeleton stays verifiable), and the [`entry::Authenticator`] (composite,
+//!   always attributable).
+//! - [`checkpoint`] — an author's checkpoint on its own feed (tag `0x0015`, ADR-023
+//!   decision 3): the position below which its expired skeletons may lose their
+//!   signatures and stay authentic through the hash chain alone.
 //! - [`feed`] — the per-author append-only feed (Bamboo-derived): `prev_hash`
 //!   contiguous chaining plus the [`feed::lipmaa`] skip-link, full verification,
 //!   and logarithmic skip-link certificates for partial replication.
@@ -38,14 +41,13 @@
 //! ## Scope boundaries (documented, not stubbed)
 //! - **Real QUIC transport** is M9 (ADR-011): M5 is the protocol *logic* over an
 //!   abstract [`sync::Transport`]; an in-memory duplex drives the tests.
-//! - **Deniable content authenticator** is M7 (ADR-009): the attributable path is
-//!   built fully and [`entry::Authenticator`]/[`dag::ForkOutcome`] are the seam.
 //! - **Payload TTL policy / at-rest** is M8 (ADR-010): M5 provides *authenticated
 //!   pruning* ([`entry::Entry::prune_payload`]) — the mechanism, not the policy.
 //! - **Admitted-set population / consent read-gate** is M3/M6 (ADR-005/007): M5
 //!   models the admitted set as an input to the acceptance predicate
 //!   ([`dag::AdmissionPolicy`]).
 
+pub mod checkpoint;
 pub mod dag;
 pub mod entry;
 pub mod feed;

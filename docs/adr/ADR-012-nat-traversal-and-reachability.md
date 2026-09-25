@@ -2,7 +2,7 @@
 
 **Status**: implemented and composed — all four rungs of the reachability ladder run in the node (`crates/vox-core/src/nat/`, `crates/vox-core/src/node/{network,coordstream,circuitstream}.rs`, `crates/vox-core/src/transport/mux.rs`), proved against simulated RFC 4787 NATs; rung 2 complete including UPnP-IGD (proved against a specification-faithful in-process gateway, real-router validation pending); DHT not started (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-21 — recorded that **preferring a direct path is deliberate and address privacy is not a goal**; a relay-mandatory "location-hidden" mode was specified and reverted the same day (see the Decision). 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
+**Updated**: 2026-09-24 — each circuit's relay is recorded where the circuit is attached (`MuxSocket::attach_via`), so `vox status` names the relay carrying a relayed path (PRD-001 R35). 2026-09-24 — relay circuits carry the inner QUIC packets as **datagrams** on flows bound to each leg's circuit stream, not as frames on the stream (ADR-022 M22.2); the circuit-stream note below says what changed and why. 2026-09-21 — recorded that **preferring a direct path is deliberate and address privacy is not a goal**; a relay-mandatory "location-hidden" mode was specified and reverted the same day (see the Decision). 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
 
@@ -298,26 +298,33 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   peers' QUIC packets themselves:
   - **The socket is where paths meet (`transport::mux`).** quinn binds one endpoint to one socket, so
     every `VoxEndpoint` now runs on a `MuxSocket`: the real socket (or a simulation's abstract one) plus
-    **circuits** — synthetic destination addresses whose datagrams go to, and arrive from, a relay stream
-    instead of the wire. A circuit's address is derived from the far peer's fingerprint into
+    **circuits** — synthetic destination addresses whose datagrams go to, and arrive from, a relay
+    circuit instead of the wire. A circuit's address is derived from the far peer's fingerprint into
     `240.0.0.0/4` (reserved, never routed), always IPv4 because quinn refuses an IPv6 destination on an
     IPv4 socket and maps an IPv4 one on an IPv6 socket; a datagram for a circuit that no longer exists is
     dropped here, never handed to the kernel. Above the socket nothing changes: a relayed peer is an
     address to dial, the handshake and the identity pinning are exactly those of a direct connection,
     one-connection-per-peer still holds, and every stream kind works over it — join, pairwise, sync,
     coord, tunnel — which is what makes this a network layer rather than a feature of one application.
-    A circuit's outbound queue is bounded and drops when full: a relay stream that cannot keep up is a
-    slow path, and QUIC on a slow path drops packets, it does not buffer without bound.
+    A circuit's outbound queue is bounded and drops when full: a relay that cannot keep up is a slow
+    path, and QUIC on a slow path drops packets, it does not buffer without bound.
   - **The `circuit` stream (`node::circuitstream`, `StreamKind::Circuit = 7`).** `OPEN <peer>` asks a
     relay to carry a circuit; the relay opens its own `circuit` stream to the target with
-    `INCOMING <peer>`; on `OPENED` from the target it answers `OPENED` and forwards `DATAGRAM` frames — one
-    QUIC packet each — both ways, one task per direction (`read_frame` is not cancel-safe), until either
-    side is done or the circuit idles for `CIRCUIT_IDLE_TIMEOUT` (5 min; QUIC keeps a live connection
-    ticking well inside it). It forwards nothing but datagrams and never looks inside one. The **stream**
-    is the carrier rather than QUIC DATAGRAM frames on purpose: a QUIC Initial is at least 1200 bytes and
-    the outer connection's datagram limit is not guaranteed to hold one plus a header, whereas a stream
-    carries any size; the price — no inner loss, head-of-line blocking — is the ordinary price of
-    QUIC-over-reliable and acceptable for a last resort. Both ends of a circuit must be peers the relay
+    `INCOMING <peer>`; on `OPENED` from the target it answers `OPENED`. From then on the inner QUIC
+    packets travel as **QUIC datagrams** (ADR-022 M22.2): each leg's circuit stream is bound to a
+    datagram flow on that leg's connection, and the relay moves each datagram from one flow to the other
+    without reading it, and fragments without reassembling them, until either flow's stream ends or the
+    circuit idles for `CIRCUIT_IDLE_TIMEOUT` (5 min; QUIC keeps a live connection ticking well inside
+    it). *(As first built, the packets rode the circuit stream itself as `DATAGRAM` frames, because a
+    QUIC Initial is at least 1200 bytes and the outer datagram limit is not guaranteed to hold one plus a
+    header. The price was head-of-line blocking: one lost outer packet stalled every inner packet behind
+    it until retransmitted, so relayed UDP and calls stalled instead of dropping. ADR-022's
+    fragmentation removes the reason — an inner packet too big for one outer datagram goes as fragments
+    — and so the stream carriage was removed. Each end sends no datagram larger than
+    `CIRCUIT_DATAGRAM_MAX` (1100 bytes), because it sees only its own leg and the relay forwards a
+    datagram as it is: sized for a leg grown to 1452 bytes, it would be dropped on a leg still at QUIC's
+    1200-byte floor, and the inner handshake with it. Proved by `crates/vox-core/tests/relay_drops_not_stalls.rs`
+    over a lossy relay leg, mutation-checked against the old stream carriage.)* Both ends of a circuit must be peers the relay
     knows (member, anchor or pending joiner, the rung-3 rule for the rung-3 reasons), and carrying bytes
     is bounded where carrying signaling was not: `MAX_RELAYED_CIRCUITS = 64` in total,
     `MAX_CIRCUITS_PER_ASKER = 4`, enforced by a ledger whose places return on drop. A relay is a last

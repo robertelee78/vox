@@ -54,5 +54,14 @@ rustix.workspace = true
 # ADR-021 §6: a minted operation id is 128 bits of OS randomness.
 getrandom.workspace = true
 
-# No `[dev-dependencies]`: `tempfile` is a normal dependency above and is in scope for the
-# integration proofs too.
+# `tempfile` is a normal dependency above and is in scope for the integration proofs too.
+
+[dev-dependencies]
+# The status proof forces a relayed path on vox-core's simulated NAT network
+# (`tests/support/vnet.rs`), which is written against quinn's socket traits. Same
+# workspace pin as vox-core, so it is the same quinn.
+quinn.workspace = true
+# Driving the TUI on a real terminal (the unread-badge proof): a pty, and a screen grid to
+# replay its output into. The workspace manifest says why each version.
+portable-pty.workspace = true
+vt100.workspace = true
