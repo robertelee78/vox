@@ -87,6 +87,10 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// on the network.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How often automatic work (a rotation's rekeys, a trusted member's consent) may start a background
+/// dial to one member it cannot currently reach. See `reach_member`.
+const MEMBER_REDIAL_SECS: u64 = 30;
+
 /// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
@@ -1597,6 +1601,8 @@ pub struct Node {
     /// A local append (or a finished session with pushes still owed) wants `run_due_syncs` now
     /// rather than at the next tick. See `push_if_owed`.
     push_now: bool,
+    /// When automatic work last started a background dial to each member: see `reach_member`.
+    member_dialed_at: BTreeMap<Digest32, u64>,
     /// Consecutive failed sessions per `(room, peer)`; see `MAX_PUSH_RETRIES`.
     push_failures: BTreeMap<(Digest32, Digest32), u32>,
     /// Peers that were skipped behind a busy room or had a push re-owed: served first on the next
@@ -1751,6 +1757,7 @@ impl Node {
             held_pairwise: Vec::new(),
             publish_owed: std::collections::BTreeSet::new(),
             push_now: false,
+            member_dialed_at: BTreeMap::new(),
             push_failures: BTreeMap::new(),
             owed_first: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
@@ -1870,7 +1877,7 @@ impl Node {
                     // Auto-consent for trusted identities, retried here for the
                     // same reason: a trusted member that was unreachable a moment
                     // ago is picked up as soon as it can be reached (ADR-020 §3).
-                    self.deliver_owed_consents().await;
+                    self.deliver_owed_consents(false).await;
                     if self.run_due_syncs().await {
                         self.publish().await;
                     }
@@ -1968,7 +1975,9 @@ impl Node {
                 debug_assert!(false, "JoinChannel is answered by begin_join_channel");
                 Outcome::Failed(Fault::Internal)
             }
-            NodeCommand::Consent { channel_id, target } => self.consent(&channel_id, target).await,
+            NodeCommand::Consent { channel_id, target } => {
+                self.consent(&channel_id, target, true).await
+            }
             NodeCommand::Revoke { channel_id, target } => {
                 // A per-room revocation of a **trusted** identity does not hold: the ring
                 // still names it, so `deliver_owed_consents` re-issues consent on the next
@@ -3801,7 +3810,12 @@ impl Node {
     /// log is what makes a message *render*, because a reader requires both (ADR-007).
     /// Doing one without the other leaves a peer holding a key it must not use, or a
     /// grant it cannot act on.
-    async fn release_key_to(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
+    async fn release_key_to(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        wait: bool,
+    ) -> Outcome {
         if self.net.is_none() {
             return Outcome::Failed(Fault::NotNetworked);
         }
@@ -3827,7 +3841,7 @@ impl Node {
         // No session need exist yet: one is opened from this member's bundle record
         // if the join path never made one (ADR-016).
         let hello = self.ensure_session(channel_id, target).await;
-        let Some(conn) = self.reach_member(channel_id, target).await else {
+        let Some(conn) = self.reach_member(channel_id, target, wait).await else {
             return Outcome::Failed(Fault::Unreachable);
         };
         let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
@@ -3862,8 +3876,8 @@ impl Node {
 
     /// Consent to `target` reading this identity's messages — ADR-007 step 3, the
     /// human decision, taken per sender.
-    async fn consent(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
-        let outcome = self.release_key_to(channel_id, target).await;
+    async fn consent(&mut self, channel_id: &Digest32, target: Digest32, wait: bool) -> Outcome {
+        let outcome = self.release_key_to(channel_id, target, wait).await;
         if outcome.is_done() {
             let _ = self.event_tx.send(NodeEvent::Consented {
                 channel_id: *channel_id,
@@ -3897,7 +3911,7 @@ impl Node {
         // inputs must push. Immediately, not on the tick: a stream parked open across
         // this instant is judged by the set as it stands when its request lands (M17.11).
         self.refresh_reachers().await;
-        self.deliver_owed_consents().await;
+        self.deliver_owed_consents(true).await;
         self.publish().await;
         Outcome::Done
     }
@@ -3974,7 +3988,7 @@ impl Node {
     /// Retried on the tick for the same reason a re-key is: consent *is* a network
     /// act — the SKDM rides a pairwise session — so a trusted member that is
     /// offline right now is skipped, not failed, and picked up when it returns.
-    async fn deliver_owed_consents(&mut self) {
+    async fn deliver_owed_consents(&mut self, wait: bool) {
         if self.net.is_none() || self.trust.is_empty() {
             return;
         }
@@ -3991,7 +4005,7 @@ impl Node {
             for target in owed {
                 // `consent` emits `Consented` on success; a failure here is a peer
                 // that is not reachable yet, which the next tick retries.
-                let _ = self.consent(&channel_id, target).await;
+                let _ = self.consent(&channel_id, target, wait).await;
             }
         }
     }
@@ -4021,7 +4035,7 @@ impl Node {
         };
         // The revocation is a log fact the whole channel converges on.
         self.note_local_append(channel_id);
-        let rekeyed = self.deliver_rekeys_for(channel_id).await;
+        let rekeyed = self.deliver_rekeys_for(channel_id, true).await;
         let _ = self.event_tx.send(NodeEvent::Revoked {
             channel_id: *channel_id,
             target,
@@ -4036,14 +4050,14 @@ impl Node {
     async fn deliver_owed_rekeys(&mut self) {
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         for channel_id in channels {
-            let _ = self.deliver_rekeys_for(&channel_id).await;
+            let _ = self.deliver_rekeys_for(&channel_id, false).await;
         }
     }
 
     /// Deliver the current generation to the members of one channel that are owed it,
     /// returning how many were re-keyed. A member with no live pairwise session is
     /// skipped, not failed: the tick tries again once there is one.
-    async fn deliver_rekeys_for(&mut self, channel_id: &Digest32) -> u64 {
+    async fn deliver_rekeys_for(&mut self, channel_id: &Digest32, wait: bool) -> u64 {
         if self.net.is_none() {
             return 0;
         }
@@ -4072,7 +4086,7 @@ impl Node {
             // gap ADR-016 recorded, and it is what made revocation undeliverable after
             // a restart.
             let hello = self.ensure_session(channel_id, target).await;
-            let Some(conn) = self.reach_member(channel_id, target).await else {
+            let Some(conn) = self.reach_member(channel_id, target, wait).await else {
                 continue;
             };
             let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
@@ -4795,12 +4809,54 @@ impl Node {
         &mut self,
         channel_id: &Digest32,
         target: Digest32,
+        wait: bool,
     ) -> Option<Arc<crate::transport::quic::VoxConnection>> {
         let net = self.net.as_ref().map(Arc::clone)?;
         if let Some(conn) = net.manager().existing(&target) {
             return Some(conn);
         }
         let endpoints = net.board_endpoints(channel_id, &target);
+        // **Automatic work never dials on the actor.** A dial to a member that is not there waits
+        // out `PER_ATTEMPT_TIMEOUT` (10s), and the rekeys a rotation owes are retried on every tick:
+        // measured through the real binaries, a node whose room had rotated its sender key answered
+        // nothing for 10s at a time while one member was offline — `busy 10013ms — sending a
+        // message`, a person's post held behind a dial to somebody else. The tick and a post now
+        // start the dial in the background, at most once per `MEMBER_REDIAL_SECS`, and deliver on
+        // a later tick once the connection exists. A command the person gave — consent, revoke —
+        // still waits for its dial: they asked, and are waiting for the answer.
+        if !wait {
+            let now = self.now();
+            let recent = self
+                .member_dialed_at
+                .get(&target)
+                .is_some_and(|t| now.saturating_sub(*t) < MEMBER_REDIAL_SECS);
+            if !recent {
+                self.member_dialed_at.insert(target, now);
+                let tx = self.net_tx.clone();
+                tokio::spawn(async move {
+                    match net.reach(target, &endpoints).await {
+                        Ok(conn) => {
+                            let _ = tx
+                                .send(NetEvent::Dialed {
+                                    conn,
+                                    endpoints,
+                                    board: false,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(NetEvent::ReachFailed {
+                                    peer: target,
+                                    why: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                });
+            }
+            return None;
+        }
         // **Through `dial`, not `net.reach`.** This called `net.reach` directly and so
         // produced a connection the actor had never adopted: no receive loop
         // (`spawn_stream_loop`), no sync schedule, and no upgrade attempt behind a
@@ -5544,7 +5600,7 @@ impl Node {
         // letting the tick do the work keeps authoring off the network path.
         self.note_local_append(&channel_id);
         if rotated {
-            let _ = self.deliver_rekeys_for(&channel_id).await;
+            let _ = self.deliver_rekeys_for(&channel_id, false).await;
         }
         Outcome::Done
     }
