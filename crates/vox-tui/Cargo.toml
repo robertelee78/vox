@@ -50,7 +50,13 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["net"] }
+
+# The family LAN's helper (`vox lan helper`, ADR-013 §"The family LAN"): the macOS `utun`
+# control socket (`SysControlAddr`, `UtunIfname`), `getpeereid` and `chown`, all through
+# nix's safe wrappers so `#![forbid(unsafe_code)]` holds.
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["socket", "net", "ioctl", "user", "fs"] }
 
 # `tempfile` is a normal dependency above and is in scope for the integration proofs too.
 

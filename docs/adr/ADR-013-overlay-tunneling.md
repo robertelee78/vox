@@ -2,7 +2,9 @@
 
 **Status**: implemented and **reachable** — the per-stream port-forward model runs end to end through the node (`crates/vox-core/src/{tunnel,node/tunnel}.rs`, `crates/vox-tui` `service`/`grant`/`forward`), gated by a release test that reaches a TCP service between two symmetric-NAT clients through an anchor; SOCKS front-end, signed session events, the SSH-CA binding and the TUN datapath remain (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-24 — **UDP services are tunneled** as `udp/<port>`, a datagram flow bound to the tunnel stream after the same gate (ADR-022 decision 6, M22.3/M22.4: `vox serve 53/udp`, `vox forward <name>.vox 53/udp <port>`, SOCKS5 `UDP ASSOCIATE` in `vox up`); see ADR-022 for the proofs. 2026-09-24 — **a tunnel tells the truth about how it ended** (PRD-001 R22–R24): a SOCKS reply is the host's answer, a refused or cut forward resets the application's socket, an abortive close is carried as one, removing a service cuts its live sessions, and a forward reaches its host afresh per connection; `tunnel::authz`, `grant_capabilities`, `NodeCommand::GrantTunnel`, IPC `T_GRANT` and the `vox grant` verb are removed. See "Tunnel honesty" under Implementation notes. 2026-09-21 (later the same day) — **tunnel authorization is per-sender consent, not a per-member capability.** ADR-017's third revision withdraws the genesis service grant, `0x0013` and `vox grant`; this ADR's invariant that *"tunnel capabilities are never inherited from membership"* is restored **unqualified**, and its claim that message consent and tunnel access are *orthogonal* is **reversed** — they are one axis. See the Authorization model bullets and the `node_m15_anchor_gate` note. 2026-09-21 — the **SOCKS5 front-end is built and is the person-facing entry point** (`node::up`, ADR-017 decision 5 / M17.3): it resolves `.vox` names and needs no privilege, which is what this ADR listed as primary from the start. The TUN model stays optional and unbuilt. (A brief revision promoting TUN to the primary path was reverted the same day — see ADR-017 decision 5.) 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
+**Updated**: 2026-09-25 — **the family LAN is proposed and partly built** (PRD-001 R28, "The family LAN" under
+Interface models). The engine, the address plan and the gate are proven without root. The macOS `utun` path is built and
+waits for the decider's sudo proof. Linux is designed only. 2026-09-24 — **UDP services are tunneled** as `udp/<port>`, a datagram flow bound to the tunnel stream after the same gate (ADR-022 decision 6, M22.3/M22.4: `vox serve 53/udp`, `vox forward <name>.vox 53/udp <port>`, SOCKS5 `UDP ASSOCIATE` in `vox up`); see ADR-022 for the proofs. 2026-09-24 — **a tunnel tells the truth about how it ended** (PRD-001 R22–R24): a SOCKS reply is the host's answer, a refused or cut forward resets the application's socket, an abortive close is carried as one, removing a service cuts its live sessions, and a forward reaches its host afresh per connection; `tunnel::authz`, `grant_capabilities`, `NodeCommand::GrantTunnel`, IPC `T_GRANT` and the `vox grant` verb are removed. See "Tunnel honesty" under Implementation notes. 2026-09-21 (later the same day) — **tunnel authorization is per-sender consent, not a per-member capability.** ADR-017's third revision withdraws the genesis service grant, `0x0013` and `vox grant`; this ADR's invariant that *"tunnel capabilities are never inherited from membership"* is restored **unqualified**, and its claim that message consent and tunnel access are *orthogonal* is **reversed** — they are one axis. See the Authorization model bullets and the `node_m15_anchor_gate` note. 2026-09-21 — the **SOCKS5 front-end is built and is the person-facing entry point** (`node::up`, ADR-017 decision 5 / M17.3): it resolves `.vox` names and needs no privilege, which is what this ADR listed as primary from the start. The TUN model stays optional and unbuilt. (A brief revision promoting TUN to the primary path was reverted the same day — see ADR-017 decision 5.) 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: tunneling, tcp, ssh, tun, socks, authorization, zero-trust
 
@@ -34,7 +36,73 @@ established substrate and marked as such. This ADR specifies the complete tunnel
   reaches a name with nothing configured, which is why it stays specified — but it is an addition, not the
   path, exactly as Tor's `TransPort` is. Per-service authorization (below) still applies on the TUN path
   — the interface is convenience, not a bypass of policy. *(A userspace stack for this was built and
-  removed on 2026-09-21; see ADR-017 decision 5's recorded reversal for why.)*
+  removed on 2026-09-21; see ADR-017 decision 5's recorded reversal for why.)* One room-scoped form of
+  it is now specified and partly built: **the family LAN**, next.
+
+### The family LAN (PRD-001 R28) — proposed, 2026-09-25
+
+**Status: proposed.** Built and proven without root: the address plan, the packet mapping, the flood
+fan-out, the caps and the gate (`family_lan_proof::a_room_is_a_lan_for_its_trusted_members_and_nobody_else`,
+four real nodes, the kernel replaced by channels; green 4 of 4 runs in release). Each property was
+mutation-checked, and each mutation went red on its own assertion:
+  - flooding to one link: bob got 0 of 10 mDNS packets;
+  - routing to the wrong link: 100 of 202 unicast packets arrived;
+  - dropping the source check: 2 spoofed packets were delivered;
+  - removing the caps: 1000 floods delivered, against a bound of 201;
+  - no broadcast rewrite, or no UDP checksum fix: 0 of 10 were right.
+
+  Removing the responder's app gate alone stayed shut, because the live guardian tore carol's stream down.
+  Removing the gate and the guardian together let carol link. Built and **not yet proven**:
+the macOS `utun` path (`vox lan helper`, `vox lan up`) — that needs root, and is proven only when the
+decider runs `sudo scripts/family-lan-proof.sh`. Linux is designed, not built (below).
+
+- **What it is.** A room's trusted members on one IP subnet, so software that discovers things by asking
+  the local network — Plex/Jellyfin, Chromecast, a game's LAN lobby — works across Vox. Engine:
+  `vox_core::lan`; CLI: `crates/vox-tui/src/lan_cli.rs`.
+- **Addressing** (`lan::plan`), computed by every node from the room id and its member list alone:
+  - **IPv4:** one /24 of `100.64.0.0/10` (RFC 6598: neither public nor a home router's RFC 1918) chosen by
+    the room's hash; members hold `.1`–`.254`. A /24 is too small for hashing alone (ten members collide
+    about one time in six), so each member has a preferred host from its own hash and collisions settle in
+    a fixed hash order, the same on every node. A later joiner can move a member whose preferred host was
+    taken; `vox lan up` says so. A member past the 254th gets no IPv4 address. Tailscale uses the same
+    range; a clash shows as an existing route.
+  - **IPv6:** an RFC 4193 /64 per room (`fd` ‖ 40 bits of the room's hash), with a 64-bit interface id from
+    the member's hash. Per room, not the per-identity `fd…/128` below: a LAN needs a shared on-link prefix,
+    and per-room addresses do not link one person's presence across rooms.
+- **Device.** macOS `utun`, MTU 1280. Creating and addressing one needs root, so root's part is its own
+  process, **`sudo vox lan helper`**, which serves only the uid that ran `sudo` (`getpeereid`), accepts only
+  a host in `100.64.0.0/10` and one in `fd00::/8`, creates the `utun`, addresses it, routes the /24 and /64
+  to it, and hands the descriptor to `vox lan up` over its socket (`SCM_RIGHTS`). It keeps nothing, opens
+  no profile and touches no network. `vox lan up <room>` runs **as the person**. The kernel destroys a
+  `utun`, with its addresses and routes, when the last descriptor closes, so the interface lives exactly as
+  long as `vox lan up`, crash included. *Rejected:* one `sudo vox lan up` that drops privileges. macOS keeps
+  root's supplementary groups (`admin`, `kmem`) across `setuid` unless `setgroups` runs, and no safe binding
+  offers `setgroups` on Apple targets. **Linux** must use `/dev/net/tun`, whose `TUNSETIFF` ioctl has no
+  safe wrapper. Building it needs either an `unsafe` exception or a crate that does the ioctl; that is the
+  decider's call.
+- **Unicast** rides the app API (ADR-022 decision 7), label `vox-lan/v1`: **one app stream per trusted
+  member with a datagram flow bound**, one IP packet per datagram (fragmented by the flow past the path's
+  datagram size). The gate is the app gate, unchanged: this node's keyring joined with the room's authors,
+  checked on both ends, withdrawn live. When both ends open at once, both keep the stream the lower
+  fingerprint opened. **TCP** inside the LAN needs nothing: its segments are packets, and the endpoints'
+  TCP stacks retransmit what a datagram loses. No userspace TCP stack is needed, unlike the TUN model above,
+  because both ends are real kernels.
+- **Broadcast and multicast** (`224.0.0.0/4` including mDNS `224.0.0.251` and SSDP `239.255.255.250`, the
+  subnet broadcast, `255.255.255.255`, `ff00::/8`) are **copied onto every link**, as a switch floods. A copy
+  goes only where the gate admitted a link, so an untrusted member receives nothing. A `utun` is
+  point-to-point and does not accept its subnet's broadcast address, so an arriving subnet broadcast is
+  rewritten to `255.255.255.255`, fixing both the IPv4 and the UDP checksums.
+- **Caps.** A flood costs one datagram per member and is unasked-for, so both directions have a token
+  bucket: what this node floods, and what each peer may flood into it, 100 a second with bursts of 200.
+- **Checked on arrival, at the receiver** (the side whose code the sender does not control): the source
+  must be an address of the member it came from, and the destination one of mine or a group. So a trusted
+  member can impersonate nobody and cannot use a node as a router. The cost: IPv6 discovery sourced from a
+  link-local address (`fe80::`) is dropped, so mDNS over IPv6 does not cross, and mDNS over IPv4 does.
+- **What it changes about policy, for the decider.** Per-service darkness does **not** hold across the LAN.
+  A member who runs `vox lan up` exposes every socket bound to the wildcard address (Plex's `0.0.0.0:32400`,
+  and also anything else listening) to every member it trusts. That is the point for discovery, and it is
+  the host's own act, scoped to its own keyring. But it is wider than `vox serve`, and the macOS firewall is
+  the only per-port control. **Open question:** should `vox lan up` take a port whitelist?
 
 ### Authorization model (evidence-driven): zero-trust, capability-scoped, consent-gated
 
@@ -187,7 +255,9 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
 - **SOCKS5 front-end** (`tunnel::socks`): RFC 1928 no-auth negotiation + CONNECT request/reply, generic over the stream (tested over in-memory duplex); the caller maps the requested target onto a Vox service and splices to `session::dial`.
 - **Identity-derived addressing** (`tunnel::addr`): `0xFD ‖ high-120-bits(SHA-256("vox/ula/v1" ‖ composite_pubkey))`, self-certifying and `verify_addr`-able; an address grants no reachability.
 
-**Scope decision — the TUN/VPN datapath is deferred to the client (ADR-014), not built in `vox-core`.** ADR-013 marks the TUN model *optional*; its datapath needs a privileged helper / `NetworkExtension` and a userspace TCP stack (`smoltcp`), which are platform-client concerns (the ADR ties TUN to ADR-014). `vox-core` therefore ships the **primary** per-stream SOCKS/port-forward model complete (the `ssh`-over-Vox path) plus the identity-derived addressing the TUN model will consume. This is a layering decision, not a false deferral: the per-service authorization, advertisement, addressing, and data-path are all complete and tested; only the OS interface binding (a client surface) is out of `vox-core` scope. `tun`/`utun` + `smoltcp` land with ADR-014.
+**Scope decision — the TUN/VPN datapath is deferred to the client (ADR-014), not built in `vox-core`.** *(2026-09-25: the
+room-scoped family LAN is the exception. Its engine is in `vox-core` (`lan`) and needs no userspace TCP stack. Only the
+device is per-platform, in the CLI. See "The family LAN" above.)* ADR-013 marks the TUN model *optional*; its datapath needs a privileged helper / `NetworkExtension` and a userspace TCP stack (`smoltcp`), which are platform-client concerns (the ADR ties TUN to ADR-014). `vox-core` therefore ships the **primary** per-stream SOCKS/port-forward model complete (the `ssh`-over-Vox path) plus the identity-derived addressing the TUN model will consume. This is a layering decision, not a false deferral: the per-service authorization, advertisement, addressing, and data-path are all complete and tested; only the OS interface binding (a client surface) is out of `vox-core` scope. `tun`/`utun` + `smoltcp` land with ADR-014.
 
 - **A tunnel request names its channel (2026-09-20, M16.1).** `TunnelRequest` carried only a service tag,
   which cannot be authorized: a QUIC connection is per **peer**, not per channel (ADR-016), and the

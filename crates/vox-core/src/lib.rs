@@ -186,6 +186,7 @@ pub mod group;
 pub mod hash;
 pub mod identity;
 pub mod join;
+pub mod lan;
 pub mod log;
 pub mod nat;
 pub mod node;

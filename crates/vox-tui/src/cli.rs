@@ -383,6 +383,40 @@ enum ServiceCmd {
     List(RoomArgs),
 }
 
+/// `vox lan` — the family LAN.
+#[derive(Subcommand, Debug, Clone)]
+enum LanCmd {
+    /// Create LAN interfaces for `vox lan up`, as root. Run it with `sudo`: it serves only
+    /// the person who ran `sudo`, accepts only LAN addresses (`100.64.0.0/10`,
+    /// `fd00::/8`), opens no profile and touches no network. Runs until interrupted;
+    /// interfaces it made live exactly as long as the `vox lan up` holding them.
+    Helper(LanHelperArgs),
+    /// Bring this machine onto a room's LAN, through the helper. Run it as yourself, not
+    /// with `sudo`. Runs until interrupted, and the interface goes with it.
+    Up(Box<LanUpArgs>),
+}
+
+/// `vox lan helper`
+#[derive(Args, Debug, Clone)]
+pub struct LanHelperArgs {
+    /// Where to listen.
+    #[arg(long, default_value = crate::lan_cli::DEFAULT_HELPER_SOCKET)]
+    pub socket: PathBuf,
+}
+
+/// `vox lan up`
+#[derive(Args, Debug, Clone)]
+pub struct LanUpArgs {
+    #[command(flatten)]
+    pub room: RoomArgs,
+    /// The helper's socket.
+    #[arg(long, default_value = crate::lan_cli::DEFAULT_HELPER_SOCKET)]
+    pub helper_socket: PathBuf,
+    /// Write the plan, the links and the counters here as JSON, twice a second.
+    #[arg(long)]
+    pub stats_file: Option<PathBuf>,
+}
+
 /// `vox app` — app streams from a shell, over a running node.
 #[derive(Subcommand, Debug, Clone)]
 enum AppCmd {
@@ -1115,6 +1149,15 @@ enum Cmd {
     /// Forward a local port to a member's service over the overlay — `ssh` over Vox
     /// (ADR-013). Runs until interrupted.
     Forward(ForwardArgs),
+    /// Put this machine on a room's **family LAN** (PRD-001 R28): a network interface on
+    /// which the room's trusted members are one subnet, so that discovery — Plex and
+    /// Jellyfin, Chromecast, a game's LAN lobby — works across Vox.
+    ///
+    /// Two commands, because only one of them needs root: `sudo vox lan helper` creates
+    /// interfaces and does nothing else, and `vox lan up <room>`, run as yourself, asks it
+    /// for one and carries the room's traffic on it.
+    #[command(subcommand)]
+    Lan(LanCmd),
     /// Print this profile's own identity fingerprint — what to send someone so they can
     /// trust you (ADR-002).
     ///
@@ -1762,6 +1805,25 @@ pub fn run() -> ExitCode {
             };
             run_tunnel_verb(room, move |node, cid| async move {
                 crate::tunnel_cli::forward(&node, cid, host.as_deref(), &tag, local).await
+            })
+        }
+        Cmd::Lan(LanCmd::Helper(a)) => match crate::lan_cli::run_helper(&a.socket) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox lan helper: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Cmd::Lan(LanCmd::Up(a)) => {
+            // Asked before the profile is touched: without a helper nothing here can work,
+            // and a refusal should leave nothing behind — not even a profile directory.
+            if !crate::lan_cli::helper_reachable(&a.helper_socket) {
+                eprintln!("vox: {}", crate::lan_cli::no_helper(&a.helper_socket));
+                return ExitCode::FAILURE;
+            }
+            let (socket, stats) = (a.helper_socket.clone(), a.stats_file.clone());
+            run_tunnel_verb(a.room.clone(), move |node, cid| async move {
+                crate::lan_cli::up(&node, cid, socket, stats).await
             })
         }
         Cmd::ShellSetup { remove } => crate::shell::run(remove),
