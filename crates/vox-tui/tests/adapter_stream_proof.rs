@@ -12,16 +12,16 @@
 //!   local path (`NewEntry`) and the synced path (`Synced`, which carries no row) are
 //!   exercised, the second being the one `tail` used to drop entirely.
 //!
-//!   Not 2,000 as ADR-021 first planned: ADR-008's per-author quota admits at most
-//!   1,000 entries per member per sliding hour (`log/quota.rs`), and refuses the rest —
-//!   reported, wrongly, as `Failed(Internal)`, which is ADR-021 open defect F14. 900 per
-//!   member stays under the quota with room for the set-up entries;
-//! - a consumer that **stops reading its pipe** while all 900 of bob's own appends
-//!   land — about twice what the node's 256-event buffer plus the pipe and socket
-//!   buffers hold — so it is told it lagged; and the proof fails if that never
-//!   happened, because an un-lagged run proves nothing about lag. Two earlier versions
-//!   (a stall during a trickle, then under 450 appends) never lagged, and failed for
-//!   exactly that reason;
+//!   900 per member was chosen under ADR-008's per-author quota, which PRD-001 R3 has
+//!   since removed (`wire.rs` 0x06 is RESERVED); the count is kept, and the lag is
+//!   forced by bytes instead (below);
+//! - a consumer that is **frozen (SIGSTOP)** while all 900 of bob's own appends land,
+//!   each padded to 8 KiB, so the rows past the node's 256-event queue carry about
+//!   5 MiB — far more than a Unix socket buffer holds — and it is told it lagged; the
+//!   proof fails if that never happened, because an un-lagged run proves nothing about
+//!   lag. Three earlier versions (a stall during a trickle, then under 450 and 900
+//!   short appends, the last green on macOS and red on GitHub's ubuntu runner) depended
+//!   on how many *bytes* a machine's buffers hold, and failed for exactly that reason;
 //! - the consumer **killed three times** with SIGKILL at points inside the bursts, each
 //!   time restarted from the cursor it had persisted.
 //!
@@ -94,6 +94,15 @@ fn start(w: &Worker, r: &str, cursor: &str, stderr: &std::path::Path) -> Run {
     Run { child, rx, paused }
 }
 
+/// Send `sig` (`-STOP`, `-CONT`) to the consumer by its PID.
+fn signal(run: &Run, sig: &str) {
+    let ok = Command::new("kill")
+        .args([sig, &run.child.id().to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok, "kill {sig} {}", run.child.id());
+}
+
 /// Process up to `n` rows, waiting at most `idle` for each, persisting the cursor after
 /// each — exactly what a tracker's adapter does. Returns how many it processed.
 fn consume(
@@ -121,9 +130,29 @@ fn consume(
     got
 }
 
-fn say(i: usize) -> String {
-    format!("burst message {i:05}")
+fn say(i: usize, pad: usize) -> String {
+    format!("burst message {i:05}{}", " ".repeat(pad))
 }
+
+/// Padding for the burst that must make the consumer lag.
+///
+/// **The lag is forced, not hoped for.** The node reports `Lagged` only once its
+/// 256-event queue (`EVENT_QUEUE`) is full behind a subscriber that has stopped reading,
+/// and the kernel's socket buffer absorbs rows before that. The v0.2.9 release run went
+/// red here on GitHub's ubuntu runner (1800/1800 delivered, 0 lag reports), and making
+/// it deterministic took two things:
+///
+/// - the consumer must be **subscribed before it stalls** (see run 1): stalled any
+///   earlier, it has no subscription for anything to fall behind, and it catches up by
+///   an ordinary read afterwards. With padding alone it still lagged in only 1 run of 3;
+/// - it is then **frozen** (SIGSTOP), so nothing drains the socket, and at 8 KiB a row
+///   the 643 rows past the queue carry about 5 MiB where a default Unix socket buffer is
+///   a few hundred KiB. A machine whose buffer held more would fail this proof loudly,
+///   by the precondition below, rather than pass it.
+///
+/// Not larger: 32 KiB rows (29 MiB in bob's log) slowed the sync to alice enough that
+/// her next burst missed the liveness window below.
+const LAG_PAD: usize = 8 * 1024;
 
 #[test]
 #[ignore = "two networked nodes, production Argon2id and a 1,800-message burst; CI runs it in release"]
@@ -264,7 +293,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     // The producer, driven in phases by the proof so a burst lands exactly while the
     // consumer is not reading.
     let mut n = 0usize;
-    let mut burst = |w: &Worker, count: usize| {
+    let mut burst = |w: &Worker, count: usize, pad: usize| {
         let sock = w.paths.socket_file();
         let first = n;
         n += count;
@@ -274,7 +303,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
                 match c
                     .request(&vox_core::node::ipc::Request::Post {
                         channel_id: cid,
-                        text: say(i),
+                        text: say(i, pad),
                     })
                     .await
                 {
@@ -299,14 +328,24 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         );
     };
 
-    // Run 1: stall while all 900 of bob's local appends land. The pipe (~120 rows),
-    // the reader's buffer, the socket buffers (~50 frames) and the node's 256-event
-    // buffer together hold roughly 450 events; 900 is twice that, so the stream MUST lag.
-    // (450 was tried first and never lagged — it only just filled the headroom.)
+    // Run 1: freeze the consumer while 899 of bob's 900 local appends land, each padded
+    // to LAG_PAD, so the stream MUST lag whatever the machine's socket buffer (see LAG_PAD).
     let mut run = start(bob, &r, &cursor, &stderr);
+    // **Subscribed first, then frozen.** `tail` subscribes before it reads its backlog,
+    // so a row it emits proves it is subscribed. Frozen any earlier, it has no
+    // subscription yet: nothing falls behind, and it catches up afterwards by an
+    // ordinary read — which is how a run could deliver everything and never lag.
+    burst(bob, 1, 0);
+    assert_eq!(
+        consume(&run, 1, idle, &mut cursor, &mut seen),
+        1,
+        "the consumer is subscribed and live before it is frozen"
+    );
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
-    burst(bob, 900);
+    signal(&run, "-STOP"); // frozen: it reads nothing, so only the kernel buffer absorbs
+    burst(bob, 899, LAG_PAD);
     std::thread::sleep(Duration::from_secs(2));
+    signal(&run, "-CONT");
     run.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     consume(&run, 300, idle, &mut cursor, &mut seen);
     kill(&mut run, &mut restarts, &cursor, &seen);
@@ -315,7 +354,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     // First drain the backlog run 1 left, so every row counted below is one that
     // arrived by sync WHILE this consumer was running.
     while consume(&run, 1000, Duration::from_secs(3), &mut cursor, &mut seen) > 0 {}
-    burst(alice, 300);
+    burst(alice, 300, 0);
     // LIVENESS, not just completeness: rows synced from another node must reach a
     // consumer while it runs. A stream that only delivered them after a restart would
     // still have no gap — the defect `tail` shipped with — so this is its own assertion.
@@ -329,13 +368,13 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let mut run = start(bob, &r, &cursor, &stderr);
     consume(&run, 50, idle, &mut cursor, &mut seen);
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
-    burst(alice, 300);
+    burst(alice, 300, 0);
     std::thread::sleep(Duration::from_secs(2));
     run.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     consume(&run, 250, idle, &mut cursor, &mut seen);
     kill(&mut run, &mut restarts, &cursor, &seen);
     // The rest, while nobody is listening.
-    burst(alice, 300);
+    burst(alice, 300, 0);
     assert_eq!(n, 1800);
 
     let all = until(
