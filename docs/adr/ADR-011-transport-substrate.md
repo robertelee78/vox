@@ -154,7 +154,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
 
 ## Links
 **Depends on**: ADR-002, ADR-004, ADR-008.
-- Depended on by: ADR-012, ADR-013.
+- Depended on by: ADR-012, ADR-013, ADR-024 (tapered congestion control, which replaces quinn's default Cubic with a Cubic → loss-aware Cubic → BBR taper).
 
 ## Engineering Mantra
 

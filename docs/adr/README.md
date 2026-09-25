@@ -30,6 +30,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [021](ADR-021-work-item-interop.md) | Work-Item Interop (the contract Vox exposes to an external work tracker) | 008, 018, 020 |
 | [022](ADR-022-datagram-flows.md) | Datagram Flows (UDP tunnels, relays that behave like UDP, the app API) | 011, 012, 013, 016, 017, 020 |
 | [023](ADR-023-room-lifecycle.md) | Room Lifecycle (one order, retention, key delivery through members, dumb anchors) | 006, 007, 008, 010, 012, 016 |
+| [024](ADR-024-tapered-congestion-control.md) | Tapered Congestion Control (Cubic → loss-aware Cubic → BBR, both ways) | 011 |
 
 ## Tiers
 
