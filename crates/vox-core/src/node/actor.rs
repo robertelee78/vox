@@ -254,7 +254,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
-        NetEvent::Dialed { .. } => "adopting a connection a join dialled",
+        NetEvent::Dialed { .. } => "adopting a connection a join or an app dialled",
         NetEvent::JoinerDone { .. } => "finishing a join",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped => "shutting the network down",
@@ -3646,12 +3646,36 @@ impl Node {
                 peer,
                 reply,
             }) => {
-                let endpoints = self
-                    .net
-                    .as_ref()
-                    .map(|net| net.board_endpoints(&channel_id, &peer))
-                    .unwrap_or_default();
-                let _ = reply.send(self.dial(peer, &endpoints).await);
+                // **Off the actor.** Reaching a peer runs the whole ADR-012 ladder, and a
+                // relayed or unreachable peer takes seconds per attempt. This used to be
+                // awaited here, so the node answered nothing else meanwhile: an app retrying
+                // a call to a peer that was only reachable through an anchor kept the actor
+                // permanently busy ("busy 10001ms — reaching a peer for an app stream"), and
+                // that peer's own circuit to this node went quiet waiting on it. So neither
+                // end could ever place the call (calls_foundation_proof, relayed). The ladder
+                // runs on its own task, as a tunnel's does, and the connection comes back to
+                // the actor to be adopted, as a join's does.
+                let Some(net) = self.net.as_ref().map(Arc::clone) else {
+                    let _ = reply.send(Err(crate::error::Error::Unreachable(
+                        "node is not networked",
+                    )));
+                    return;
+                };
+                let endpoints = net.board_endpoints(&channel_id, &peer);
+                let tx = self.net_tx.clone();
+                tokio::spawn(async move {
+                    let reached = net.reach(peer, &endpoints).await;
+                    if let Ok(conn) = &reached {
+                        let _ = tx
+                            .send(NetEvent::Dialed {
+                                conn: Arc::clone(conn),
+                                endpoints,
+                                board: false,
+                            })
+                            .await;
+                    }
+                    let _ = reply.send(reached);
+                });
             }
             NetEvent::Stream { conn, inbound } => {
                 // Held for the whole handler: the connection must outlive the streams
@@ -6513,6 +6537,13 @@ impl Node {
                 ch.set_node_retention(self.node_retention_for(channel_id));
                 self.channels
                     .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+                // The app and tunnel gates are this room's authors joined with the ring,
+                // computed only when one of those changes. Opening a room is such a change:
+                // without this, a daemon that had just unlocked its rooms refused every
+                // App API open with "this node does not hold that room" until some sync
+                // happened to apply an entry — measured by calls_foundation_proof, where
+                // a call could not be placed for minutes.
+                self.refresh_reachers().await;
                 self.adopt_channel_anchors(channel_id, None).await;
                 self.refresh_network_view().await;
                 self.publish_channel_locally(channel_id).await;

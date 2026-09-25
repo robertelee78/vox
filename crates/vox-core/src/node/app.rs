@@ -560,6 +560,7 @@ impl AppHub {
             flow,
             reachers,
             None,
+            conn,
         ))
     }
 
@@ -705,6 +706,15 @@ struct StreamInner {
     withdrawn: AtomicBool,
     hub: Arc<AppHub>,
     _slot: Option<PeerSlot>,
+    /// **The connection this stream rides, held for the stream's life.** When a better
+    /// path to the peer appears, the old connection is retired, and it is closed once its
+    /// grace runs out *unless somebody still holds it* (`NodeNet::retire_expired`). A
+    /// tunnel holds its connection for that reason; an app stream held only the QUIC
+    /// stream halves, which do not count. So a call placed while the path was still
+    /// relayed, or before a crossing dial was settled, was cut the moment the path
+    /// improved: calls_foundation_proof's mesh saw three of twelve directions stop
+    /// mid-call, their senders' flows closed under them about 16 s in.
+    _carried: Arc<VoxConnection>,
 }
 
 impl StreamInner {
@@ -805,6 +815,7 @@ impl AppStream {
         flow: Option<DatagramFlow>,
         reachers: Reachers,
         slot: Option<PeerSlot>,
+        carried: Arc<VoxConnection>,
     ) -> Self {
         let flow_tx = flow.as_ref().map(DatagramFlow::sender);
         let inner = Arc::new(StreamInner {
@@ -817,6 +828,7 @@ impl AppStream {
             withdrawn: AtomicBool::new(false),
             hub,
             _slot: slot,
+            _carried: carried,
         });
         let guarded = Arc::clone(&inner);
         let guardian = tokio::spawn(async move {
@@ -1049,6 +1061,7 @@ pub async fn serve_inbound(
         flow,
         reachers,
         Some(slot),
+        conn,
     );
     // A program that asked and then went away drops the stream, which ends it.
     let _ = acceptor.send(stream);
