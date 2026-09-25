@@ -2,7 +2,7 @@
 
 **Status**: implemented (M9, `crates/vox-core/src/transport/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline). 2026-09-20 — stream framing lifted into `transport::framing`; typed streams (`transport::streams`, ADR-016 M14.2).
+**Updated**: 2026-09-25 — **path-MTU discovery searches to 8192 bytes and the UDP socket buffers are 4 MiB** (PRD-001 R41; see "Throughput (R41)" under Implementation notes). 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline). 2026-09-20 — stream framing lifted into `transport::framing`; typed streams (`transport::streams`, ADR-016 M14.2).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: transport, quic, tls, post-quantum, multiplexing, datagrams
 
@@ -151,6 +151,35 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   server loop must catch-and-continue. Gate obligation: the cross-version interop matrix
   (handshake + identity-PoP) does not exist — no second implementation, no version-pinned matrix, no
   CI job; the PoP is over the raw subject-public-key bits (not SPKI DER), which such a matrix must pin.
+- **Throughput (R41), 2026-09-25.** A direct tunnel through `vox forward` on one machine ran at ~290
+  MB/s (2.3 Gbit/s) against ~10 GB/s (80 Gbit/s) for plain loopback TCP. Profiled with macOS
+  `sample` during a transfer: the **receiving** node was mostly idle; the **sending** node spent
+  its time in `__sendmsg` (one syscall per 1452-byte packet) and in the connection lock that
+  `sendmsg` runs under, which the splice's stream writes wait on. AES-GCM (aws-lc) was a few
+  percent; the flow-control windows did not bind. Changes, each A/B-measured against the others in
+  interleaved rounds on one box (quiet-round medians):
+  - `MtuDiscoveryConfig::upper_bound` and `EndpointConfig::max_udp_payload_size` raised to **8192**
+    (`quic::MAX_UDP_PAYLOAD`): ~290 → ~1100 MB/s on loopback. Discovery probes, so a 1500-byte link
+    keeps 1452 and gains nothing — this helps loopback and jumbo-frame links only. 16356 (the
+    loopback MTU) broke connections on macOS, whose `net.inet.udp.maxdgram` is 9216.
+  - UDP socket buffers 4 MiB each way (`quic::UDP_SOCKET_BUFFER`): no gain alone, but without them
+    a burst overflowed the default buffer and quinn's black-hole detection dropped the MTU to 1200.
+  - Measured and **not** kept: 4 runtime workers instead of 2 (no change); a 16 MiB stream window
+    and 64 MiB send window (more in flight, more overflow loss, MTU collapsed); quinn-udp's
+    `fast-apple-datapath` (batched `sendmsg_x`, +18% at a 1452-byte MTU, +4% at 8192) — it calls a
+    private Apple API, which an iOS build (PRD-001 R31) may not be allowed to ship, so it is left to
+    the decider.
+  - **The result is ~1.1–1.2 GB/s (8.8–9.6 Gbit/s), about 11–12% of loopback TCP. R41's 80% of
+    loopback is not met**, and on this evidence cannot be met by tuning: what remains is one
+    userspace QUIC connection sending from one task. Whether "raw" means loopback or a real link is
+    the decider's question (PRD-001 §7).
+  - **Tried and removed:** capping a circuit's inner packets at 1452 bytes (dropping larger ones in
+    the circuit driver, as a path drops a probe that does not fit), to stop an inner connection over
+    a relay growing its packets to 8 KiB. It made `relay_drops_not_stalls` stall 4 of 4 runs
+    (117–361 ms gaps); without it the gate passed 3 of 3 with the 8192 ceiling. So an inner
+    connection over a circuit may now discover a larger MTU, and a large inner packet is fragmented
+    across relay datagrams (ADR-022 decision 4) — a loss amplifier for bulk traffic over a lossy
+    relay, recorded here, not bounded.
 
 ## Links
 **Depends on**: ADR-002, ADR-004, ADR-008.
