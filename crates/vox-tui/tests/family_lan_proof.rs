@@ -30,6 +30,16 @@
 //!    rate, and the rest are counted as capped.
 //! 8. **Withdrawing trust ends the link**: once alice untrusts bob, nothing crosses between
 //!    them, while dave still hears alice.
+//! 9. **Only whitelisted ports are reachable** (the decider's rule, 2026-09-25). Every
+//!    member runs with `--allow 5000`, so everything above goes to port 5000, and the
+//!    floods in (4) go to ports 5353, 1900 and 9999, which are *not* listed. So discovery
+//!    crosses the whitelist. Then:
+//!    - UDP and a TCP SYN to the unlisted port 6000 deliver 0;
+//!    - a SYN to 5000 and a non-SYN segment to 6000 (part of a connection that exists) are
+//!      delivered;
+//!    - a UDP reply to a port alice sent from is delivered, both after a unicast send and
+//!      after a group send (an SSDP search answered by unicast);
+//!    - UDP to a port alice never sent from delivers 0.
 //!
 //! And what the shipped binary can show without root: `vox lan up` with no helper refuses
 //! before touching the profile and names the command that starts one; the helper without
@@ -122,13 +132,31 @@ fn udp_body(pseudo: &[u8], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 fn udp4(src: Ipv4Addr, dst: Ipv4Addr, dport: u16, payload: &[u8]) -> Vec<u8> {
+    udp4s(src, dst, 40_000, dport, payload)
+}
+
+fn udp4s(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
     let mut pseudo = Vec::new();
     pseudo.extend_from_slice(&src.octets());
     pseudo.extend_from_slice(&dst.octets());
     pseudo.extend_from_slice(&[0, 17]);
     pseudo.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
-    ip4(17, src, dst, &udp_body(&pseudo, 40_000, dport, payload))
+    ip4(17, src, dst, &udp_body(&pseudo, sport, dport, payload))
 }
+
+/// A TCP segment with `flags` (0x02 SYN, 0x10 ACK); its checksum is not needed here.
+fn tcp4(src: Ipv4Addr, dst: Ipv4Addr, dport: u16, flags: u8, payload: &[u8]) -> Vec<u8> {
+    let mut t = vec![0u8; 20];
+    t[0..2].copy_from_slice(&40_001u16.to_be_bytes());
+    t[2..4].copy_from_slice(&dport.to_be_bytes());
+    t[12] = 5 << 4;
+    t[13] = flags;
+    t.extend_from_slice(payload);
+    ip4(6, src, dst, &t)
+}
+
+/// The port every member whitelists.
+const LISTED: u16 = 5000;
 
 fn udp6(src: Ipv6Addr, dst: Ipv6Addr, dport: u16, payload: &[u8]) -> Vec<u8> {
     let len = 8 + payload.len();
@@ -274,7 +302,7 @@ impl Host {
 
 fn host(m: Member, room: [u8; 32]) -> Host {
     let (tun, mut os) = channel_tun(4096);
-    let lan = Lan::start(&m.node, room, tun).unwrap();
+    let lan = Lan::start(&m.node, room, tun, [LISTED].into_iter().collect()).unwrap();
     let got = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&got);
     tokio::spawn(async move {
@@ -326,15 +354,17 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         })
         .await;
         for j in [&bob, &dave, &carol] {
-            assert!(j
+            // The outcome is printed on failure: a bare `is_done()` said only that a join
+            // failed, once, and not why.
+            let out = j
                 .node
                 .apply(NodeCommand::JoinChannel {
                     link: url.clone(),
                     local_name: "family".into(),
                     passphrase: secret("room passphrase"),
                 })
-                .await
-                .is_done());
+                .await;
+            assert!(out.is_done(), "{} could not join: {out:?}", j.name);
         }
         for m in [&alice, &bob, &dave, &carol] {
             let node = m.node.clone();
@@ -426,7 +456,7 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        let tcp = ip4(6, a.v4(), b.v4(), &payload("uni/bob/tcp/0", 60));
+        let tcp = tcp4(a.v4(), b.v4(), LISTED, 0x02, &payload("uni/bob/tcp/0", 60));
         let icmp = ip4(1, a.v4(), b.v4(), &payload("uni/bob/icmp/0", 60));
         sent.push((tag_of(&tcp), tcp.clone(), "bob"));
         sent.push((tag_of(&icmp), icmp.clone(), "bob"));
@@ -554,6 +584,60 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         let landed = a.tagged("spoof/").len();
         eprintln!("[spoof] bob sent 2 as dave -> alice dropped {spoofed} as spoofed, delivered {landed}");
         assert_eq!((spoofed, landed), (2, 0));
+
+        // ---- 9. only whitelisted ports are reachable ----
+        let filtered_before = b.lan.stats().filtered;
+        for i in 0..10 {
+            a.emit(udp4(a.v4(), b.v4(), 6000, &payload(&format!("wl/udp-unlisted/{i}"), 64)))
+                .await;
+        }
+        a.emit(tcp4(a.v4(), b.v4(), 6000, 0x02, &payload("wl/syn-unlisted/0", 40)))
+            .await;
+        a.emit(tcp4(a.v4(), b.v4(), LISTED, 0x02, &payload("wl/syn-listed/0", 40)))
+            .await;
+        a.emit(tcp4(a.v4(), b.v4(), 6000, 0x10, &payload("wl/ack-unlisted/0", 40)))
+            .await;
+        // alice sends from 41000 to bob and from 42000 to the SSDP group; bob answers
+        // both, and also writes to 41001, a port alice never sent from.
+        a.emit(udp4s(a.v4(), b.v4(), 41_000, LISTED, &payload("wl/ask/0", 40)))
+            .await;
+        a.emit(udp4s(
+            a.v4(),
+            Ipv4Addr::new(239, 255, 255, 250),
+            42_000,
+            1900,
+            &payload("wl/search/0", 40),
+        ))
+        .await;
+        settle().await;
+        b.emit(udp4s(b.v4(), a.v4(), LISTED, 41_000, &payload("wl/reply-unicast/0", 40)))
+            .await;
+        d.emit(udp4s(d.v4(), a.v4(), 1900, 42_000, &payload("wl/reply-group/0", 40)))
+            .await;
+        b.emit(udp4s(b.v4(), a.v4(), LISTED, 41_001, &payload("wl/unasked/0", 40)))
+            .await;
+        settle().await;
+        let n = |h: &Host, t: &str| h.tagged(&format!("wl/{t}/")).len();
+        let wl = [
+            ("udp to an unlisted port", n(&b, "udp-unlisted"), 0),
+            ("SYN to an unlisted port", n(&b, "syn-unlisted"), 0),
+            ("SYN to a listed port", n(&b, "syn-listed"), 1),
+            ("non-SYN to an unlisted port", n(&b, "ack-unlisted"), 1),
+            ("reply after a unicast send", n(&a, "reply-unicast"), 1),
+            ("reply after a group send", n(&a, "reply-group"), 1),
+            ("udp to a port never sent from", n(&a, "unasked"), 0),
+        ];
+        for (what, got, want) in wl {
+            eprintln!("[whitelist] {what}: delivered {got} (must be {want})");
+        }
+        eprintln!(
+            "[whitelist] bob filtered {} packets",
+            b.lan.stats().filtered - filtered_before
+        );
+        for (what, got, want) in wl {
+            assert_eq!(got, want, "{what}");
+        }
+        assert_eq!(b.lan.stats().filtered - filtered_before, 11);
 
         // ---- 7. floods are capped ----
         tokio::time::sleep(Duration::from_millis((FLOOD_BURST / FLOOD_RATE * 1000.0) as u64 + 500))

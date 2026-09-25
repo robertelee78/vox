@@ -98,11 +98,30 @@ decider runs `sudo scripts/family-lan-proof.sh`. Linux is designed, not built (b
   must be an address of the member it came from, and the destination one of mine or a group. So a trusted
   member can impersonate nobody and cannot use a node as a router. The cost: IPv6 discovery sourced from a
   link-local address (`fe80::`) is dropped, so mDNS over IPv6 does not cross, and mDNS over IPv4 does.
-- **What it changes about policy, for the decider.** Per-service darkness does **not** hold across the LAN.
-  A member who runs `vox lan up` exposes every socket bound to the wildcard address (Plex's `0.0.0.0:32400`,
-  and also anything else listening) to every member it trusts. That is the point for discovery, and it is
-  the host's own act, scoped to its own keyring. But it is wider than `vox serve`, and the macOS firewall is
-  the only per-port control. **Open question:** should `vox lan up` take a port whitelist?
+- **Ports: a whitelist, default none (decider, 2026-09-25).** Without it, `vox lan up` would expose every socket
+  bound to the wildcard address to every trusted member, which is wider than `vox serve`. So
+  `vox lan up <room> --allow 32400,8009,…` names the reachable ports. With no `--allow`, **nothing on the machine is
+  reachable over the LAN**, and discovery still flows. It is enforced **on the receiving node, before a packet reaches
+  the utun** (`lan::admitted`):
+  - a TCP SYN (without ACK) passes only to a listed port. Other TCP segments pass: they belong to a connection that
+    exists, or the kernel resets them;
+  - UDP passes to a listed port, or as a reply:
+    - to a local port this node sent from within 120 s;
+    - from the address it sent to, or from anyone if it sent to a group (an SSDP search is answered by unicast);
+  - ICMP passes;
+  - broadcast and multicast pass on any port, capped: they are the discovery;
+  - anything whose ports cannot be read is dropped: other protocols, later fragments, IPv6 extension headers.
+
+  Proven in `family_lan_proof` (phase 9, green 3 of 3 in release):
+  - every member allows only 5000, and the floods go to unlisted 5353, 1900 and 9999 and still cross;
+  - UDP and a SYN to an unlisted port deliver 0;
+  - a SYN to a listed port delivers 1, and so does a non-SYN to an unlisted port;
+  - replies after a unicast send and after a group send are each delivered;
+  - UDP to a port never sent from delivers 0.
+
+  Mutations, both red:
+  - whitelist bypassed: 10 of 10 delivered to the unlisted port;
+  - reply tracking off: both replies 0.
 
 ### Authorization model (evidence-driven): zero-trust, capability-scoped, consent-gated
 

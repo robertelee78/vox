@@ -415,6 +415,12 @@ pub struct LanUpArgs {
     /// Write the plan, the links and the counters here as JSON, twice a second.
     #[arg(long)]
     pub stats_file: Option<PathBuf>,
+    /// Local ports members may reach over the LAN, comma-separated (`--allow 32400,8009`).
+    /// **None by default**: without it nothing on this machine is reachable over the LAN,
+    /// while discovery (mDNS, SSDP, broadcast) still flows and replies to what this machine
+    /// sends still come back. ICMP echo always passes.
+    #[arg(long, value_delimiter = ',')]
+    pub allow: Vec<u16>,
 }
 
 /// `vox app` — app streams from a shell, over a running node.
@@ -1822,8 +1828,9 @@ pub fn run() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let (socket, stats) = (a.helper_socket.clone(), a.stats_file.clone());
+            let allow = a.allow.iter().copied().collect();
             run_tunnel_verb(a.room.clone(), move |node, cid| async move {
-                crate::lan_cli::up(&node, cid, socket, stats).await
+                crate::lan_cli::up(&node, cid, socket, stats, allow).await
             })
         }
         Cmd::ShellSetup { remove } => crate::shell::run(remove),

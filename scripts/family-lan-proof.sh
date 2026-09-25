@@ -14,7 +14,11 @@
 #   4. broadcast a UDP subnet broadcast from alice reaches bob and not carol.
 #   5. untrusted nothing carol sends — unicast or broadcast — reaches alice or bob, and
 #                carol has no link at all.
-#   6. teardown  after everything stops, no utun the proof made exists and no route to
+#   6. whitelist every node runs `--allow 47010,47011,47030`: a UDP datagram and a
+#                TCP connect to bob's unlisted ports get nothing (bob's LAN counts them
+#                filtered), a TCP connect to a listed port succeeds — while the discovery
+#                in 3 and 4 went to unlisted ports and crossed anyway.
+#   7. teardown  after everything stops, no utun the proof made exists and no route to
 #                the room's /24 or /64 remains (`ifconfig -l` and `netstat -rn` diffs).
 #
 # Run it, from the repository, as:
@@ -243,6 +247,28 @@ elif cmd == "udp-echo-client":   # ifname src dst port count
                 back += 1
                 break
     print(json.dumps({"sent": n, "echoed_back": back}))
+elif cmd == "tcp-listen":        # ifname port secs
+    ifname, port, secs = a[0], int(a[1]), float(a[2])
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    bind_if(s, ifname); s.bind(("", port)); s.listen(8); n = 0
+    end = time.time() + secs
+    while time.time() < end:
+        s.settimeout(max(0.05, end - time.time()))
+        try:
+            c, _ = s.accept(); n += 1; c.close()
+        except socket.timeout:
+            break
+    print(json.dumps({"accepted": n}))
+elif cmd == "tcp-connect":       # ifname src dst port timeout
+    ifname, src, dst, port, t = a[0], a[1], a[2], int(a[3]), float(a[4])
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    bind_if(s, ifname); s.bind((src, 0)); s.settimeout(t)
+    try:
+        s.connect((dst, port)); ok = True
+    except OSError:
+        ok = False
+    print(json.dumps({"connected": ok}))
 elif cmd == "mdns-respond":      # ifname addr secs
     ifname, addr, secs = a[0], a[1], float(a[2])
     s = mdns(ifname, addr); answered = 0
@@ -315,13 +341,17 @@ done
 stop_pid "$PID_serve"
 
 # ---- the helper (root) and three LANs (not root) ----
-say "vox lan helper (root) and three vox lan up (as $SUDO_USER)"
+# The decider's rule: nothing is reachable over the LAN unless its port is listed. The
+# checks' own ports are listed; 47040 and 47041 are the unlisted ones check 6 knocks on.
+ALLOW=47010,47011,47030
+say "vox lan helper (root) and three vox lan up (as $SUDO_USER), each --allow $ALLOW"
 bg helper "$VOX" lan helper --socket "$WORK/helper.sock"
 wait_line "$WORK/helper.log" 'serving uid' 30 || exit 1
 for m in alice bob carol; do
     voxcmd "$m"
     bg "lan_$m" "${VOXCMD[@]}" lan up "$ROOM" --anchor "$ANCHOR" --listen 127.0.0.1:0 \
-        --helper-socket "$WORK/helper.sock" --stats-file "$WORK/$m.json"
+        --helper-socket "$WORK/helper.sock" --stats-file "$WORK/$m.json" \
+        --allow "$ALLOW"
 done
 for m in alice bob carol; do
     LINE=$(wait_line "$WORK/lan_$m.log" '^vox lan up on utun' 300) || exit 1
@@ -458,6 +488,29 @@ if [[ $CO -ge 30 && $CA == 0 && $CB == 0 && $CL == 0 && $CC == 0 && $CP == 0 ]];
     pass "untrusted: carol's LAN took her 30 packets and delivered 0; she has 0 links"
 else
     fail "untrusted: carol's LAN took $CO, alice got $CA, bob $CB, carol links $CL, sent $CP, flood copies $CC"
+fi
+
+# ---- 6. the port whitelist ----
+say "6. whitelist: alice knocks on bob's unlisted 47040/udp and 47041/tcp, and on listed 47011/tcp"
+F0=$(counter bob filtered)
+"${PROBE[@]}" udp-listen "$IF_bob" 47040 5 "vox-unlisted" >"$WORK/wl-udp.json" &
+PIDS+=($!)
+"${PROBE[@]}" tcp-listen "$IF_bob" 47041 8 >"$WORK/wl-tcp-unlisted.json" &
+PIDS+=($!)
+"${PROBE[@]}" tcp-listen "$IF_bob" 47011 8 >"$WORK/wl-tcp-listed.json" &
+PIDS+=($!)
+sleep 1
+probe udp-send "$IF_alice" "$V4_alice" "$V4_bob" 47040 10 "vox-unlisted" >/dev/null
+UNLISTED=$(probe tcp-connect "$IF_alice" "$V4_alice" "$V4_bob" 47041 3)
+LISTED=$(probe tcp-connect "$IF_alice" "$V4_alice" "$V4_bob" 47011 5)
+sleep 5
+WU=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["got"])' "$WORK/wl-udp.json")
+DF=$(($(counter bob filtered) - F0))
+echo "unlisted udp: bob got $WU/10; unlisted tcp: $UNLISTED; listed tcp: $LISTED; bob's LAN filtered +$DF"
+if [[ $WU == 0 && $UNLISTED == *false* && $LISTED == *true* && $DF -ge 11 ]]; then
+    pass "whitelist: unlisted ports got 0 (bob's LAN filtered $DF), the listed port connected, discovery (3, 4) crossed on unlisted ports"
+else
+    fail "whitelist: unlisted udp $WU/10, unlisted tcp $UNLISTED, listed tcp $LISTED, filtered +$DF"
 fi
 
 say "counters"
