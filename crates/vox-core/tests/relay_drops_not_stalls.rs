@@ -9,7 +9,7 @@
 //! game, `mosh`) that stall is the failure: late is worse than lost.
 //!
 //! The scene: A and B behind symmetric NATs, C their relay, 20 ms one way on every link,
-//! and every 10th datagram A sends to C lost. Over the relayed A–B connection A sends a
+//! and about one in ten datagrams A sends to C lost. Over the relayed A–B connection A sends a
 //! numbered datagram every 10 ms on a datagram flow, and B timestamps each arrival.
 //!
 //! What must hold: B sees **loss** — some of the numbered datagrams never arrive, because
@@ -44,7 +44,7 @@ const NOW: u64 = 1_800_000_000;
 
 /// One way, on every link. The A–C round trip is then 40 ms, and so is C–B's.
 const DELAY: Duration = Duration::from_millis(20);
-/// Every Nth datagram from A to the relay is lost.
+/// About one in N datagrams from A to the relay is lost, at random (see `set_loss`).
 const LOSS_EVERY: u64 = 10;
 /// A sends one numbered datagram this often...
 const INTERVAL: Duration = Duration::from_millis(10);
@@ -71,10 +71,23 @@ const WARMUP: u32 = 100;
 /// control" consequence, real but not what R27 is about. At 100 a second of 32 bytes it
 /// never binds, and a gap can only be a lost datagram or a stall.
 const PAYLOAD: usize = 32;
-/// The longest gap between two arrivals B may see. A lost datagram costs one interval
-/// (a 20 ms gap) and a little scheduling jitter on top; an outer retransmission costs at
-/// least the A–C round trip (40 ms) plus loss detection. Anything past this is a stall.
-const MAX_GAP: Duration = Duration::from_millis(40);
+/// How much later than the fastest datagram any datagram after the warm-up may arrive.
+///
+/// **This is the claim, measured directly.** A stall behind a retransmission makes every
+/// datagram queued behind the lost packet *late* — by at least the A–C round trip (40 ms)
+/// plus loss detection. A loss makes nothing late: the next datagram arrives on time and
+/// only the gap before it grows. So the bound is on lateness, not on gaps.
+///
+/// It used to be on gaps (40 ms), which measured the wrong thing once the loss stopped
+/// being strictly periodic: with random loss two or three consecutive datagrams are
+/// sometimes lost, a 30–40 ms gap that is exactly what "loses packets instead of stalling"
+/// looks like.
+///
+/// 40 ms because a retransmission cannot cost less than the A–C round trip, so lateness
+/// under it cannot be a stall. Measured over 40 runs at load 93–256 with random loss: 3.4
+/// to 32.8 ms, the upper end from the receiver not being scheduled under that load. Under
+/// the stream-carriage mutation: see ADR-022 M22.2.
+const MAX_LATE: Duration = Duration::from_millis(40);
 
 fn signer(seed: u8) -> SoftwareRootSigner {
     SoftwareRootSigner::from_component_seeds(&[seed; 32], &[seed ^ 0xFF; 32]).unwrap()
@@ -161,6 +174,8 @@ struct Measured {
     /// congestion settling the warm-up excludes ran long), and the sender's own longest
     /// gap between two sends (a gap B saw because A did not send on time).
     late_after_warmup: usize,
+    /// The latest any datagram after the warm-up arrived, over the fastest one.
+    max_late: Duration,
     last_late: Option<u32>,
     max_send_gap: Duration,
 }
@@ -340,6 +355,12 @@ async fn measure(seed: u8) -> Measured {
         .iter()
         .filter(|(l, seq)| *seq >= WARMUP && *l > floor + Duration::from_millis(15))
         .count();
+    let max_late = lat
+        .iter()
+        .filter(|(_, seq)| *seq >= WARMUP)
+        .map(|(l, _)| l.saturating_sub(floor))
+        .max()
+        .unwrap_or_default();
     let last_late = lat
         .iter()
         .filter(|(l, _)| *l > floor + Duration::from_millis(15))
@@ -408,6 +429,7 @@ async fn measure(seed: u8) -> Measured {
         relay_in: relay_leg_a.delivered,
         relay_out: relay_leg_b.sent,
         late_after_warmup,
+        max_late,
         last_late,
         max_send_gap,
     }
@@ -421,7 +443,7 @@ fn a_lossy_relay_leg_loses_packets_instead_of_stalling_them() {
     let lost = m.sent as usize - m.received;
     eprintln!(
         "relay leg lost {} outer datagrams; B received {}/{} (lost {lost}); longest gap \
-         between arrivals {:?} (bound {MAX_GAP:?}; {:?} during the warm-up); five longest (gap, seq before, seq \
+         between arrivals {:?} ({:?} during the warm-up); latest arrival after the warm-up {:?} over the fastest (bound {MAX_LATE:?}); five longest (gap, seq before, seq \
          after): {:?}; inner cwnd {} after {} congestion events; the relay moved {} \
          datagrams in from A and {} out to B",
         m.lost_outer,
@@ -429,6 +451,7 @@ fn a_lossy_relay_leg_loses_packets_instead_of_stalling_them() {
         m.sent,
         m.max_gap,
         m.warmup_max_gap,
+        m.max_late,
         m.longest,
         m.inner_cwnd,
         m.inner_congestion_events,
@@ -440,15 +463,16 @@ fn a_lossy_relay_leg_loses_packets_instead_of_stalling_them() {
         "the relay leg lost nothing, so this measured a clean path"
     );
     assert!(
-        m.max_gap < MAX_GAP,
-        "B waited {:?} between two arrivals — a stall behind a retransmission, not a loss \
-         ({}/{} received, {} outer datagrams lost). {} datagrams after the warm-up were \
-         late (last late seq {:?}; the warm-up ends at {WARMUP}); the sender's own longest \
-         gap was {:?}",
-        m.max_gap,
+        m.max_late < MAX_LATE,
+        "a datagram arrived {:?} later than the fastest (bound {MAX_LATE:?}) — held behind a \
+         retransmission, a stall rather than a loss ({}/{} received, {} outer datagrams \
+         lost; longest gap {:?}). {} datagrams after the warm-up were late (last late seq \
+         {:?}; the warm-up ends at {WARMUP}); the sender's own longest gap was {:?}",
+        m.max_late,
         m.received,
         m.sent,
         m.lost_outer,
+        m.max_gap,
         m.late_after_warmup,
         m.last_late,
         m.max_send_gap
