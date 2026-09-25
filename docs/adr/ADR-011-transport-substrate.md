@@ -164,22 +164,23 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     loopback MTU) broke connections on macOS, whose `net.inet.udp.maxdgram` is 9216.
   - UDP socket buffers 4 MiB each way (`quic::UDP_SOCKET_BUFFER`): no gain alone, but without them
     a burst overflowed the default buffer and quinn's black-hole detection dropped the MTU to 1200.
-  - Measured and **not** kept: 4 runtime workers instead of 2 (no change); a 16 MiB stream window
-    and 64 MiB send window (more in flight, more overflow loss, MTU collapsed); quinn-udp's
-    `fast-apple-datapath` (batched `sendmsg_x`, +18% at a 1452-byte MTU, +4% at 8192) — it calls a
-    private Apple API, which an iOS build (PRD-001 R31) may not be allowed to ship, so it is left to
-    the decider.
-  - **The result is ~1.1–1.2 GB/s (8.8–9.6 Gbit/s), about 11–12% of loopback TCP. R41's 80% of
-    loopback is not met**, and on this evidence cannot be met by tuning: what remains is one
-    userspace QUIC connection sending from one task. Whether "raw" means loopback or a real link is
-    the decider's question (PRD-001 §7).
-  - **Tried and removed:** capping a circuit's inner packets at 1452 bytes (dropping larger ones in
-    the circuit driver, as a path drops a probe that does not fit), to stop an inner connection over
-    a relay growing its packets to 8 KiB. It made `relay_drops_not_stalls` stall 4 of 4 runs
-    (117–361 ms gaps); without it the gate passed 3 of 3 with the 8192 ceiling. So an inner
-    connection over a circuit may now discover a larger MTU, and a large inner packet is fragmented
-    across relay datagrams (ADR-022 decision 4) — a loss amplifier for bulk traffic over a lossy
-    relay, recorded here, not bounded.
+  - Measured and **not** kept: 4 runtime workers instead of 2 (no change). A 16 MiB stream window
+    with a **64 MiB** send window (more in flight, more overflow loss, and the MTU collapsed) was
+    also not kept; the windows that were kept are below.
+  - **quinn-udp `fast-apple-datapath`** (batched `sendmsg_x`): +18% at a 1452-byte MTU, +4% at
+    8192. It calls a private Apple API. The decider adopted it for every platform, iOS included.
+  - **Stream window 16 MiB, send window 32 MiB** (`quic::STREAM_WINDOW`). quinn's default 1.25 MB
+    stream window is sized for 100 Mbit/s at 100 ms, so a longer or faster path is capped by credit,
+    not by the link. **History, withdrawn method:** these were measured over macOS dummynet shaping
+    set up with `sudo`, which agents may no longer run (2026-09-25). Vox/raw-TCP ratios at 1 Gbit/s
+    were 0.94–1.01 (1 ms and 20 ms RTT), and restoring quinn's default window dropped the 20 ms
+    class to 0.46. They stand as history only. R41 against an emulated link is measured by
+    `perf_r41` (its own owner and method).
+  - **Unshaped loopback: ~1.1–1.2 GB/s (8.8–9.6 Gbit/s), about 11–12% of loopback TCP.** The decider
+    has ruled that loopback is the wrong yardstick (PRD-001 R41 as clarified 2026-09-25): R41 is
+    measured against a link.
+  - **Observed, unexplained:** on unshaped loopback, 2 of 54 transfers collapsed to ~14 MB/s for the
+    whole transfer, with and without the window change. Recorded, not investigated.
 
 ## Links
 **Depends on**: ADR-002, ADR-004, ADR-008.
