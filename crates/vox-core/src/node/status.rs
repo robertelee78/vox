@@ -156,6 +156,10 @@ pub struct RoomStatus {
     /// and the node's own (ADR-023 decision 2). `None` when the room was mid-session and could
     /// not be read without waiting.
     pub retention: Option<u64>,
+    /// How many generations of this node's own sender key it still holds here (PRD-001
+    /// R14: one, unless a full-history grant is still owed). `None` when the room was
+    /// mid-session and could not be read without waiting.
+    pub key_generations: Option<usize>,
     /// Its members.
     pub members: Vec<MemberStatus>,
 }
@@ -319,12 +323,13 @@ impl StatusReport {
                 )
             });
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
                 opt(r.last_sync),
                 opt(r.retention),
+                opt(r.key_generations.map(|n| n as u64)),
                 list(members)
             )
         });

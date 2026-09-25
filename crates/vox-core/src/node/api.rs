@@ -279,6 +279,18 @@ pub enum NodeCommand {
         /// What this node will call it. Local; nothing is registered.
         petname: String,
     },
+    /// [`NodeCommand::Trust`], choosing what each consent releases of **this node's own**
+    /// messages (PRD-001 R12): [`HistoryGrant::Now`](crate::node::trust::HistoryGrant),
+    /// the default, or `Full` — every generation of this node's sender key still held,
+    /// at its origin, so the newcomer reads what was written before the approval too.
+    TrustWith {
+        /// The identity to trust.
+        fingerprint: Digest32,
+        /// What this node will call it. Local; nothing is registered.
+        petname: String,
+        /// What its consents release.
+        history: crate::node::trust::HistoryGrant,
+    },
     /// Stop trusting an identity node-wide, and **change the lock** (ADR-020 §3).
     ///
     /// Removes the ring entry, then rotates this identity's sender key and re-keys

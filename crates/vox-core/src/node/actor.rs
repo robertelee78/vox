@@ -2133,6 +2133,9 @@ impl Node {
                     // same reason: a trusted member that was unreachable a moment
                     // ago is picked up as soon as it can be reached (ADR-020 §3).
                     self.deliver_owed_consents(None).await;
+                    // R14: a superseded generation's key goes once no full-history grant
+                    // still has to release it.
+                    self.prune_superseded_keys().await;
                     // Paths change on the tick with no event to say so — a retired connection
                     // closed, a circuit this node relayed ended — and a view published only on
                     // events kept showing them: an anchor with no rooms reported a circuit it
@@ -2262,7 +2265,15 @@ impl Node {
             NodeCommand::Trust {
                 fingerprint,
                 petname,
-            } => self.trust_identity(fingerprint, &petname).await,
+            } => {
+                self.trust_identity(fingerprint, &petname, crate::node::trust::HistoryGrant::Now)
+                    .await
+            }
+            NodeCommand::TrustWith {
+                fingerprint,
+                petname,
+                history,
+            } => self.trust_identity(fingerprint, &petname, history).await,
             NodeCommand::Untrust { fingerprint } => self.untrust_identity(&fingerprint).await,
             NodeCommand::Serve {
                 local_name,
@@ -4378,7 +4389,9 @@ impl Node {
         channel_id: &Digest32,
         target: Digest32,
         asked: bool,
+        history: crate::node::trust::HistoryGrant,
     ) -> Outcome {
+        let full = history == crate::node::trust::HistoryGrant::Full;
         if self.net.is_none() {
             return Outcome::Failed(Fault::NotNetworked);
         }
@@ -4396,7 +4409,15 @@ impl Node {
                 // it and cannot know we are releasing to the right party.
                 return Outcome::Failed(Fault::UnknownChannel);
             }
-            match channel.skdm_for_consent(profile) {
+            // PRD-001 R12: from now on (the default), or every generation still held,
+            // each at its origin. The live generation is last either way, and it is the
+            // one the grant records.
+            let minted = if full {
+                channel.skdms_for_full_history(profile)
+            } else {
+                channel.skdm_for_consent(profile).map(|s| vec![s])
+            };
+            match minted {
                 Ok(s) => s,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
@@ -4410,17 +4431,23 @@ impl Node {
         let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
             return Outcome::Failed(Fault::Unreachable);
         };
-        let sent = match crate::node::pairwise_stream::deliver_skdm(
-            &conn,
-            channel_id,
-            session,
-            &skdm,
-            hello.as_ref(),
-        )
-        .await
-        {
-            Ok(sent) => sent,
-            Err(e) => return Outcome::Failed(fault_of(&e)),
+        // One delivery per generation, over the same session. Only the first carries the
+        // session-opening `Hello`: the rest ride the session it established. The last is the
+        // live generation, the one the grant records and whose arrival is watched.
+        let mut sent = None;
+        for (i, one) in skdm.iter().enumerate() {
+            let opening = if i == 0 { hello.as_ref() } else { None };
+            match crate::node::pairwise_stream::deliver_skdm(
+                &conn, channel_id, session, one, opening,
+            )
+            .await
+            {
+                Ok(s) => sent = Some(s),
+                Err(e) => return Outcome::Failed(fault_of(&e)),
+            }
+        }
+        let (Some(sent), Some(skdm)) = (sent, skdm.last()) else {
+            return Outcome::Failed(Fault::Internal);
         };
         if hello.is_some() {
             self.hello_delivered(channel_id, target);
@@ -4433,7 +4460,7 @@ impl Node {
         };
         let chain_id = {
             let mut channel = shared.lock().await;
-            if let Err(e) = channel.issue_consent(profile, target, &skdm, now) {
+            if let Err(e) = channel.issue_consent(profile, target, skdm, full, now) {
                 return Outcome::Failed(fault_of(&e));
             }
             channel.sender_generation()
@@ -4533,7 +4560,10 @@ impl Node {
     /// Consent to `target` reading this identity's messages — ADR-007 step 3, the
     /// human decision, taken per sender.
     async fn consent(&mut self, channel_id: &Digest32, target: Digest32, asked: bool) -> Outcome {
-        let outcome = self.release_key_to(channel_id, target, asked).await;
+        let history = self.trust.history(&target);
+        let outcome = self
+            .release_key_to(channel_id, target, asked, history)
+            .await;
         if outcome.is_done() {
             let _ = self.event_tx.send(NodeEvent::Consented {
                 channel_id: *channel_id,
@@ -4545,7 +4575,12 @@ impl Node {
 
     /// Trust `fingerprint` node-wide under `petname` (ADR-020 §3), then act on it
     /// at once so the operator does not wait a tick to see the effect.
-    async fn trust_identity(&mut self, fingerprint: Digest32, petname: &str) -> Outcome {
+    async fn trust_identity(
+        &mut self,
+        fingerprint: Digest32,
+        petname: &str,
+        history: crate::node::trust::HistoryGrant,
+    ) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -4554,7 +4589,7 @@ impl Node {
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
         let mut next = self.trust.clone();
-        if let Err(e) = next.trust(fingerprint, petname) {
+        if let Err(e) = next.trust_with(fingerprint, petname, history) {
             return Outcome::Failed(fault_of(&e));
         }
         // Persist BEFORE adopting it: a keyring that consented but did not survive
@@ -4644,6 +4679,32 @@ impl Node {
     /// Retried on the tick for the same reason a re-key is: consent *is* a network
     /// act — the SKDM rides a pairwise session — so a trusted member that is
     /// offline right now is skipped, not failed, and picked up when it returns.
+    /// Delete every superseded sender-key generation this node no longer needs
+    /// (ADR-023 decision 4, PRD-001 R14), room by room: kept only while a trusted
+    /// identity with a **full-history** grant is still owed its consent there, because
+    /// that grant is what the old generations exist to serve.
+    async fn prune_superseded_keys(&mut self) {
+        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+            return;
+        };
+        let full: std::collections::BTreeSet<Digest32> = self
+            .trust
+            .trusted()
+            .into_iter()
+            .filter(|fp| self.trust.history(fp) == crate::node::trust::HistoryGrant::Full)
+            .collect();
+        for shared in self.channels.values() {
+            // A room mid-session is skipped, not waited for; the next tick comes round.
+            let Ok(mut channel) = shared.try_lock() else {
+                continue;
+            };
+            if channel.key_generations() <= 1 || !channel.owed_consents(&full).is_empty() {
+                continue;
+            }
+            let _ = channel.prune_superseded_origins(&store);
+        }
+    }
+
     ///
     /// `asked_for` is the identity a person just trusted: it is dialled at once rather than after
     /// the automatic spacing, and only once, since a connection is per member and not per room.
@@ -6502,6 +6563,10 @@ impl Node {
                     .channels
                     .get(&room.channel_id)
                     .and_then(|shared| shared.try_lock().ok().map(|c| c.effective_retention())),
+                key_generations: self
+                    .channels
+                    .get(&room.channel_id)
+                    .and_then(|shared| shared.try_lock().ok().map(|c| c.key_generations())),
                 members,
             });
         }

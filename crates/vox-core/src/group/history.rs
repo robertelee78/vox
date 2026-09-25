@@ -338,6 +338,30 @@ impl OriginKeyStore {
         self.records.retain(|_, r| r.created_at >= cutoff);
     }
 
+    /// The `chain_id`s retained for `(channel_id, epoch)`, ascending — the generations
+    /// a full-history grant can release.
+    #[must_use]
+    pub fn generations(&self, channel_id: &Digest32, epoch: u64) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .records
+            .keys()
+            .filter(|(c, e, _)| c == channel_id && *e == epoch)
+            .map(|(_, _, id)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Drop every retained origin of `(channel_id, epoch)` except generation `keep`
+    /// (ADR-023 decision 4, PRD-001 R14): a superseded generation's key is deleted —
+    /// zeroized on drop — once nothing still has to release it. Returns how many went.
+    pub fn retain_only(&mut self, channel_id: &Digest32, epoch: u64, keep: u64) -> usize {
+        let before = self.records.len();
+        self.records
+            .retain(|(c, e, id), _| c != channel_id || *e != epoch || *id == keep);
+        before - self.records.len()
+    }
+
     /// The number of retained generations (for tests / capacity reporting).
     #[must_use]
     pub fn len(&self) -> usize {

@@ -286,6 +286,9 @@ pub enum Request {
         petname: String,
         /// The identity passphrase, proving this is the operator and not an agent.
         identity_passphrase: String,
+        /// Whether its consents release this node's full history (PRD-001 R12). On the
+        /// wire only when `true`, so an older client's request still decodes.
+        full_history: bool,
     },
     /// Set a room's retention (ADR-023 decision 2). Requires the identity passphrase:
     /// shortening it deletes stored history, which is not an agent's call.
@@ -405,12 +408,16 @@ impl Request {
                 target,
                 petname,
                 identity_passphrase,
+                full_history,
             } => {
-                e.array(4)
+                e.array(if *full_history { 5 } else { 4 })
                     .uint(T_TRUST)
                     .bytes(target)
                     .text(petname)
                     .text(identity_passphrase);
+                if *full_history {
+                    e.uint(1);
+                }
             }
             Request::SetRetention {
                 channel_id,
@@ -505,16 +512,21 @@ impl Request {
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Rooms)
             }
-            (T_TRUST, 4) => {
+            (T_TRUST, n @ (4 | 5)) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
                 let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                let full_history = n == 5
+                    && d.uint()
+                        .map_err(|_| Error::MalformedBundle("ipc history"))?
+                        == 1;
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Trust {
                     target,
                     petname,
                     identity_passphrase,
+                    full_history,
                 })
             }
             (T_RETENTION, 4) => {
@@ -1520,12 +1532,18 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             target,
             petname,
             identity_passphrase,
+            full_history,
         } => match verify_operator(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Trust {
+                .apply(crate::node::api::NodeCommand::TrustWith {
                     fingerprint: target,
                     petname,
+                    history: if full_history {
+                        crate::node::trust::HistoryGrant::Full
+                    } else {
+                        crate::node::trust::HistoryGrant::Now
+                    },
                 })
                 .await
             {

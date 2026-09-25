@@ -1148,6 +1148,7 @@ pub async fn trust_add(
     target: Digest32,
     petname: &str,
     identity_passphrase: &str,
+    full_history: bool,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     match client
@@ -1155,11 +1156,15 @@ pub async fn trust_add(
             target,
             petname: petname.to_owned(),
             identity_passphrase: identity_passphrase.to_owned(),
+            full_history,
         })
         .await
     {
         Ok(Frame::Ok) => {
             println!("vox: trusting {} as {petname:?}", short(&target));
+            if full_history {
+                println!("     with full history: it may also read what you wrote before now");
+            }
             println!("     it may now read what you write in every room you share — now and later");
             println!("     and reach every service you bind to a room you are both in");
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
