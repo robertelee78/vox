@@ -136,7 +136,7 @@ impl Store {
     }
 
     /// Open an existing store **read-only**, writing nothing to it, for a profile whose
-    /// identity is still locked — see [`Backing`]. It becomes writable with
+    /// identity is still locked — see `Backing`. It becomes writable with
     /// [`Self::make_writable`].
     ///
     /// A store that cannot be read as it is — tables missing, or a file redb must repair first —

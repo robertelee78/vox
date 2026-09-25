@@ -78,7 +78,7 @@ const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// what every other operation on the room waits behind. This bounds one session,
 /// not a catch-up: the requester applies what it got and, because it applied
 /// something, syncs again at once for the rest (see the module docs). A thousand
-/// entries verify and file in well under the requester's [`DRAIN_BUDGET`].
+/// entries verify and file in well under the requester's `DRAIN_BUDGET`.
 pub const MAX_SERVE_ENTRIES: usize = 1024;
 
 /// The most entry bytes one session serves, for the same reason as
@@ -90,7 +90,7 @@ pub const MAX_SERVE_BYTES: usize = 64 * 1024 * 1024;
 /// The serve phase's wall-clock budget. Each frame is bounded by the transport,
 /// but a peer that *reads* one frame every nineteen seconds would otherwise keep
 /// the room's lock for as long as there are entries to send — the drip that
-/// [`DRAIN_BUDGET`] closes on the other direction. Stopping here is not a failure:
+/// `DRAIN_BUDGET` closes on the other direction. Stopping here is not a failure:
 /// what was served is kept, and the requester comes back for the rest.
 pub const SERVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 

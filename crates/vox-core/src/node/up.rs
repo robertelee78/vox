@@ -230,7 +230,7 @@ async fn reach_host_with_patience<D: HostDialer>(
 /// Reach `host` and open a tunnel to `service_tag` in `channel_id`, returning the stream
 /// pair **once the host has accepted** — so a caller can tell its application the truth.
 ///
-/// Patient in the same way and for the same reasons as [`reach_host_with_patience`], and
+/// Patient in the same way and for the same reasons as `reach_host_with_patience`, and
 /// patient about the *path* too: an attempt that fails before the host answered — the
 /// connection was stale because the host restarted, or the path changed under it — is
 /// retried on whatever connection reaches the host now, until [`HOST_PATIENCE`] runs out
