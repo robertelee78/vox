@@ -126,7 +126,8 @@ decrypt/author paths require — not a configuration flag.
 
 - **Engine.** `redb` (pure Rust, copy-on-write B-tree, ACID, single writer / MVCC readers, single
   file, stable on-disk format). It was chosen over `fjall` (pure-Rust LSM): Vox's write rate is
-  bounded by design (ADR-008 quotas), every stored value is an already-sealed blob, the single-writer
+  that of people and agents in invited rooms (the ADR-008 quotas that once capped it were removed
+  2026-09-24, PRD-001 R3), every stored value is an already-sealed blob, the single-writer
   constraint matches the actor, and a two-crate dependency with no background threads and a
   one-sentence crash model ("the last committed state is what you get") is the right posture for a
   file that holds sealed key material. Space reclamation is an explicit `compact()` the node runs
