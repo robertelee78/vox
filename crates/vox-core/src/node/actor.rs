@@ -1726,6 +1726,13 @@ pub struct Node {
     /// Rooms whose anchor publish found them mid-session: run when that session's `SyncDone`
     /// lands. See `publish_channel_to_anchors`.
     publish_owed: std::collections::BTreeSet<Digest32>,
+    /// Per room, the members this node's board has held a bundle record for. A record from an
+    /// author not in it is a member this node has just learned of, which is what
+    /// `note_new_members` passes on at once; a refresh of a known member's record is not.
+    board_authors: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
+    /// Rooms whose board grew while a session held them: `note_new_members` runs when that
+    /// session's `SyncDone` lands, like `publish_owed`.
+    growth_owed: std::collections::BTreeSet<Digest32>,
     /// `(room, board)` publish rounds in flight on their own tasks; see `publish_channel_to_anchor`.
     publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// Publishes asked for while that `(room, board)` round was in flight: run when it ends.
@@ -1928,6 +1935,8 @@ impl Node {
             joining: std::collections::BTreeSet::new(),
             held_pairwise: Vec::new(),
             publish_owed: std::collections::BTreeSet::new(),
+            board_authors: BTreeMap::new(),
+            growth_owed: std::collections::BTreeSet::new(),
             publishing: std::collections::BTreeSet::new(),
             publish_again: std::collections::BTreeSet::new(),
             publish_waiters: Vec::new(),
@@ -3221,6 +3230,7 @@ impl Node {
                 // around a ring of anchors.
                 if self.channels.contains_key(&channel_id) {
                     self.publish_channel_to_anchors(&channel_id).await;
+                    self.note_new_members(&channel_id).await;
                 }
             }
             NetEvent::SyncRequest {
@@ -3406,6 +3416,9 @@ impl Node {
                 }
                 if self.publish_owed.remove(&channel_id) {
                     self.publish_channel_to_anchors(&channel_id).await;
+                }
+                if self.growth_owed.remove(&channel_id) {
+                    self.note_new_members(&channel_id).await;
                 }
                 self.refresh_network_view().await;
                 if let Ok(o) = outcome {
@@ -4652,6 +4665,57 @@ impl Node {
         delivered
     }
 
+    /// **A member this node has just learned of is passed on at once**, like a local append.
+    ///
+    /// Membership travels on boards: a member who joins through one node puts its records on
+    /// that node's board, and every other member learned of it only by reading that board on
+    /// its own periodic sync (`SYNC_INTERVAL_SECS`, 30 s). Measured with three real nodes: the
+    /// third member saw a new one 24–28 s after the join returned; with the interval forced to
+    /// 5 s, 1.9–2.6 s. So when this node's board gains a bundle record from an author it has
+    /// not seen, it admits what the evidence allows and pushes the room to its connected members.
+    /// That push offers their boards the records they lack (`sync_one`), and each receiving
+    /// member does the same once, when the newcomer is new to it.
+    ///
+    /// **Bounded, not a storm.** Only a *new author* triggers this: a member's periodic refresh of
+    /// its own records does not. Each node therefore pushes at most once per newcomer, which is
+    /// the same fan-out one chat message already has, and in a 500-member room it is one pass per
+    /// member per join, over the connections it already holds, with nothing forwarded twice
+    /// because a board that already holds the record does not grow.
+    async fn note_new_members(&mut self, channel_id: &Digest32) {
+        // Never wait on a room a session holds; see `publish_channel_to_anchors`.
+        if self.syncing.contains(channel_id) {
+            self.growth_owed.insert(*channel_id);
+            return;
+        }
+        let (Some(net), Some(shared)) = (
+            self.net.as_ref().map(Arc::clone),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
+            return;
+        };
+        let epoch = shared.lock().await.epoch();
+        let bundles = net.board_bundles(channel_id, epoch);
+        let known = self.board_authors.entry(*channel_id).or_default();
+        let fresh = bundles.iter().filter(|b| known.insert(b.author_id)).count();
+        if fresh == 0 {
+            return;
+        }
+        if let Some(store) = self.profile.as_ref().map(Profile::store_handle) {
+            let now = self.now();
+            let mut channel = shared.lock().await;
+            let _ = admit_board_records(
+                &mut channel,
+                &store,
+                &bundles,
+                ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+                now,
+            )
+            .await;
+        }
+        self.refresh_network_view().await;
+        self.note_local_append(channel_id);
+    }
+
     /// Mark a channel as having a local append to push, and make every peer's
     /// schedule due (ADR-016: "a push immediately after a local append").
     fn note_local_append(&mut self, channel_id: &Digest32) {
@@ -4987,6 +5051,29 @@ impl Node {
                                 .chain(set.members.iter().map(RendezvousRecord::to_wire))
                             {
                                 let _ = net.publish_local(&wire);
+                            }
+                            // **And the other way: what this node's board holds that the peer's
+                            // lacks.** A member who joined through this node is on this node's
+                            // board and no other, and the peer learned of it only when *it* next
+                            // read this board, on its own periodic sync: 24–28 s for a third
+                            // member to see a new one, measured. Offered here, a push that follows
+                            // a join carries the newcomer to every connected member at once.
+                            // Best-effort: a refusal (a record the peer's board already holds
+                            // newer) costs nothing, and the peer's own sync still reads this board.
+                            let missing = net.board_records_missing_from(&cid, known, &set);
+                            if !missing.is_empty() {
+                                if let Ok(mut client) =
+                                    crate::nat::service::RendezvousClient::open(&conn).await
+                                {
+                                    for wire in &missing {
+                                        if let Err(e) = client.put(wire).await {
+                                            if !matches!(e, Error::RendezvousRejected(_)) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    client.finish();
+                                }
                             }
                         }
                     }

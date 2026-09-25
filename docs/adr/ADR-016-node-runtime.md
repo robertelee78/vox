@@ -932,6 +932,24 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   application-deaf for the whole grace. Retiring is now confined to the accept path, where the caller
   serves it; everywhere else the loser is closed as before, and a `debug_assert!` holds the
   invariant. Found independently by two reviewers reading the diff, not by a gate.
+- **A new member reaches the room when it joins, not on the next interval (2026-09-25, v0.2.10).**
+  Membership travels on boards. A member who joins through Alice puts its records on Alice's board,
+  and each other member learned of it only when it next read that board on its own periodic sync
+  (`SYNC_INTERVAL_SECS`, 30 s). Measured before: the third member listed the newcomer 21.7–27.1 s
+  after the join returned. With the interval forced to 5 s, 1.9–2.6 s, which confirmed the carrier.
+  Two changes, both needed (each alone was measured red):
+  - When a node's board gains a bundle record from an author it has not seen, it admits what the
+    evidence allows and pushes the room to its connected members at once (`note_new_members`).
+  - A sync now offers the peer's board the records this node's board holds and the peer's lacks
+    (`board_records_missing_from`, bundles before addresses). A push therefore carries the newcomer.
+
+  Only a *new author* triggers the push; a member refreshing its own records does not. So each node
+  pushes at most once per newcomer, the fan-out one chat message already has, and a board that
+  already holds a record does not grow and forwards nothing. Gate
+  `crates/vox-tui/tests/a_new_member_is_seen_promptly_proof.rs`: a real anchor and three real
+  daemons; Bob lists Carol 107–110 ms after her join returns (bound 3 s, 3 of 3). Mutation, no
+  prompt push: 27.1 s and 21.7 s, red. Mutation, no board offer: 27.6 s and 26.4 s, red. R40 is
+  unaffected: relayed p95 64 ms, direct p95 31 ms.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
