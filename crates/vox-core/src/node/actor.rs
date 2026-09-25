@@ -1528,6 +1528,14 @@ pub struct Node {
     schedules: BTreeMap<Digest32, SyncSchedule>,
     /// Channels with a local append not yet pushed to peers.
     pending_push: std::collections::BTreeSet<Digest32>,
+    /// Which peers each room's latest append has already gone to. **Owed is per (room, peer).**
+    /// With only `pending_push`, a room still owed to *one* peer was pushed again to *every* peer:
+    /// a member that had it already took the room again, and each `SyncDone` freed a room only for
+    /// the peer that sorted first to take it back. Measured in `node_m19_untrust_lock_gate` on
+    /// v0.2.9's integration tree: Alice ran ~40,000 empty sessions (`Ok((0, 0, 0))`) with Carol in
+    /// two minutes while Bob found both rooms mid-session on every pass and never got one, so he
+    /// never read the post. Cleared for a room by its next append, and for a peer by a failed push.
+    pushed_to: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// Slots for sync setups and sessions; see [`SYNCS_IN_FLIGHT`].
     sync_slots: Arc<tokio::sync::Semaphore>,
     /// The last refusal reported per room and record kind, so a standing one is said once.
@@ -1747,6 +1755,7 @@ impl Node {
             renew_mappings_at: None,
             schedules: BTreeMap::new(),
             pending_push: std::collections::BTreeSet::new(),
+            pushed_to: BTreeMap::new(),
             sync_slots: Arc::new(tokio::sync::Semaphore::new(SYNCS_IN_FLIGHT)),
             last_publish_refusal: BTreeMap::new(),
             publish_refusal_first_seen: BTreeMap::new(),
@@ -2243,6 +2252,7 @@ impl Node {
         self.renew_mappings_at = None;
         self.schedules.clear();
         self.pending_push.clear();
+        self.pushed_to.clear();
     }
 
     /// Put a channel's genesis and this node's records on an **anchor's** board
@@ -2965,6 +2975,10 @@ impl Node {
             }
             NetEvent::PushRetry { channel_id, peer } => {
                 self.pending_push.insert(channel_id);
+                // The failed session carried nothing, so this peer is owed the room again.
+                if let Some(to) = self.pushed_to.get_mut(&channel_id) {
+                    to.remove(&peer);
+                }
                 if let Some(schedule) = self.schedules.get_mut(&peer) {
                     schedule.note_local_append();
                 }
@@ -4134,6 +4148,8 @@ impl Node {
         }
         self.push_now = true;
         self.pending_push.insert(*channel_id);
+        // Something new: every peer is owed it again, including those that had the last one.
+        self.pushed_to.remove(channel_id);
         for schedule in self.schedules.values_mut() {
             schedule.note_local_append();
         }
@@ -4253,7 +4269,10 @@ impl Node {
             // admit a member from this node's own board), which the maps cannot be borrowed across.
             let mut member_rooms: Vec<Digest32> = Vec::new();
             for cid in self.channels.keys() {
-                if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
+                if trigger == SyncTrigger::LocalAppend
+                    && (!self.pending_push.contains(cid)
+                        || self.pushed_to.get(cid).is_some_and(|to| to.contains(&peer)))
+                {
                     continue;
                 }
                 if self.syncing.contains(cid) {
@@ -4290,7 +4309,10 @@ impl Node {
             // forward every kept room to any peer that connected or pushed.
             let mut kept_rooms: Vec<Digest32> = Vec::new();
             for cid in self.anchored.keys() {
-                if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
+                if trigger == SyncTrigger::LocalAppend
+                    && (!self.pending_push.contains(cid)
+                        || self.pushed_to.get(cid).is_some_and(|to| to.contains(&peer)))
+                {
                     continue;
                 }
                 if self.syncing.contains(cid) {
@@ -4311,6 +4333,8 @@ impl Node {
             for channel_id in channels {
                 if self.sync_one(&channel_id, peer).await {
                     ran = true;
+                    // Any session carries the room's latest append, whatever triggered it.
+                    self.pushed_to.entry(channel_id).or_default().insert(peer);
                     if trigger == SyncTrigger::LocalAppend {
                         pushed.insert(channel_id);
                     }
