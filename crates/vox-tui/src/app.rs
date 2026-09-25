@@ -314,6 +314,7 @@ pub fn run_node(
         let mut last_state: (usize, usize, usize) = (usize::MAX, 0, 0);
         // What the board actually holds per room, reported when it changes. See below.
         let mut last_board: Vec<String> = Vec::new();
+        let mut last_drops: (u64, u64) = (0, 0);
         let mut stalls = node.subscribe();
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
@@ -394,6 +395,21 @@ pub fn run_node(
                     if board != last_board {
                         println!("vox node: board — {}", board.join(", "));
                         last_board = board;
+                    }
+                    // **What the relay dropped rather than delivered late** (ADR-022 decision
+                    // 5). An anchor's legs stall like anyone's when a member's acknowledgements
+                    // stop; what it then drops for age is loss its members see, and an anchor has
+                    // no status verb to ask. On change.
+                    if let Ok(report) = node.status().await {
+                        let d = report.datagrams;
+                        let drops = (d.aged_out, d.displaced);
+                        if drops != last_drops {
+                            println!(
+                                "vox node: datagrams dropped for age {}, displaced {}",
+                                drops.0, drops.1
+                            );
+                            last_drops = drops;
+                        }
                     }
                     // Drained without blocking: this arm also has an anchors file to
                     // write, and a status line nobody reads is better than a tick nobody

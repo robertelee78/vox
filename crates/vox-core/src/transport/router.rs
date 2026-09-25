@@ -36,11 +36,37 @@
 //! loses its own packets and never delays another flow's, which is the property the
 //! whole seam exists for: a datagram that cannot be delivered now is worth nothing
 //! later.
+//!
+//! ## Late, never delivered late: the send queue (R27)
+//! A datagram that cannot go **now** is worth little later, and to a call it is worth less
+//! than nothing: a frame that arrives 350 ms late is not played, and everything queued
+//! behind it arrives late too. quinn's own datagram queue does not know that. Its
+//! congestion controller counts datagrams against the window, so while a path's
+//! acknowledgements are lost the window fills and every datagram waits, then all of them
+//! arrive together once it reopens. calls_foundation_proof measured it: the direction
+//! *opposite* a 500 ms black relay leg delivered its held frames 27–368 ms late.
+//!
+//! So the router keeps the queue itself:
+//! - every datagram records when it was queued, and its flow's **max age** ([`DEFAULT_MAX_AGE`]
+//!   unless the flow says otherwise, [`DatagramFlow::set_max_age`]);
+//! - quinn is let hold only [`QUIC_DATAGRAM_BUFFER`] bytes — enough to pack a few small
+//!   datagrams into one packet. One pump per connection hands it more as it sends, and drops
+//!   (and counts, [`DatagramStats::aged_out`]) any whose max age passes while they wait;
+//! - what quinn holds cannot be taken back through its API, but quinn discards what it holds,
+//!   oldest first, to make room for a datagram once its buffer is over-full. So when anything
+//!   quinn holds is past its max age and a younger datagram is waiting, the pump hands quinn a
+//!   padding datagram larger than its whole buffer and then the younger one: taking the second,
+//!   quinn discards everything before it, the padding included. The stale ones are dropped
+//!   rather than sent late ([`DatagramStats::displaced`]), and the padding never reaches the
+//!   wire.
+//!
+//! On a healthy path nothing ages: a keyframe burst waits in the queue only until quinn has
+//! sent the datagrams ahead of it, microseconds on loopback.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -54,6 +80,26 @@ use crate::transport::datagram::{
 
 /// How many datagrams a flow's inbox holds before newer ones are dropped.
 pub const FLOW_INBOX: usize = 256;
+
+/// How long a datagram may wait to be sent before it is dropped instead, unless its flow
+/// says otherwise: about a voice call's mouth-to-ear budget less the network's share. A flow
+/// that would rather be late than lose (a bulk transfer over UDP) sets its own.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_millis(100);
+
+/// quinn's `datagram_send_buffer_size`. Small, because what quinn holds cannot be dropped by
+/// age; big enough to pack several small datagrams into one packet, which a congestion window
+/// at its floor needs (a one-datagram buffer made `relay_drops_not_stalls` deliver a datagram
+/// 81 ms late: one datagram per packet could not keep up). Below the smallest datagram any
+/// QUIC path carries, so a padding datagram one byte larger can always be handed over.
+pub const QUIC_DATAGRAM_BUFFER: usize = 900;
+
+/// The flow a padding datagram is framed for: the largest varint, which no stream on a
+/// connection with a bounded stream count reaches. It is discarded by quinn before it is sent;
+/// should one ever reach a peer, its router counts it as padding and drops it.
+pub const PAD_FLOW: u64 = crate::transport::datagram::VARINT_MAX;
+
+/// The most bytes the router's own queue holds; past it the oldest are dropped.
+const MAX_QUEUED_BYTES: usize = 1 << 20;
 
 /// The largest header a whole packet can carry: an 8-byte flow ID and a 1-byte
 /// context.
@@ -98,6 +144,14 @@ pub struct DatagramStats {
     /// Packets (or forwarded datagrams) that could not be sent: too large to fragment,
     /// too large for the path, or refused by QUIC.
     pub send_dropped: u64,
+    /// Datagrams dropped because they waited longer than their flow's max age to be sent:
+    /// what a stalled path costs instead of late delivery.
+    pub aged_out: u64,
+    /// Datagrams quinn still held past their max age, discarded to make way for a younger one
+    /// rather than sent late.
+    pub displaced: u64,
+    /// Padding datagrams that reached this end (and were dropped). Should stay 0.
+    pub padding: u64,
 }
 
 #[derive(Default)]
@@ -113,6 +167,9 @@ struct Counters {
     sent: AtomicU64,
     fragmented: AtomicU64,
     send_dropped: AtomicU64,
+    aged_out: AtomicU64,
+    displaced: AtomicU64,
+    padding: AtomicU64,
 }
 
 fn bump(c: &AtomicU64, by: u64) {
@@ -134,11 +191,36 @@ struct Table {
     reader: Option<AbortHandle>,
 }
 
+fn default_max_age() -> Arc<AtomicU64> {
+    Arc::new(AtomicU64::new(
+        u64::try_from(DEFAULT_MAX_AGE.as_millis()).unwrap_or(100),
+    ))
+}
+
+fn max_age(ms: &AtomicU64) -> Duration {
+    Duration::from_millis(ms.load(Ordering::Relaxed))
+}
+
+/// One datagram waiting to be handed to quinn.
+struct Pending {
+    datagram: Vec<u8>,
+    /// Past this it is dropped rather than sent.
+    stale_at: Instant,
+}
+
+#[derive(Default)]
+struct SendQueue {
+    q: VecDeque<Pending>,
+    bytes: usize,
+}
+
 /// The per-connection datagram reader and flow table.
 pub struct DatagramRouter {
     conn: Connection,
     table: Mutex<Table>,
     counters: Counters,
+    sendq: Mutex<SendQueue>,
+    queued: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for DatagramRouter {
@@ -161,9 +243,13 @@ impl DatagramRouter {
                 reader: None,
             }),
             counters: Counters::default(),
+            sendq: Mutex::new(SendQueue::default()),
+            queued: tokio::sync::Notify::new(),
         });
         let task = tokio::spawn(Arc::clone(&router).read_loop());
         router.table().reader = Some(task.abort_handle());
+        // Ends with the connection.
+        tokio::spawn(Arc::clone(&router).pump());
         router
     }
 
@@ -206,6 +292,9 @@ impl DatagramRouter {
             sent: get(&c.sent),
             fragmented: get(&c.fragmented),
             send_dropped: get(&c.send_dropped),
+            aged_out: get(&c.aged_out),
+            displaced: get(&c.displaced),
+            padding: get(&c.padding),
         }
     }
 
@@ -232,6 +321,7 @@ impl DatagramRouter {
             inbox: rx,
             next_packet: Arc::new(AtomicU64::new(0)),
             cap: None,
+            max_age_ms: default_max_age(),
             watcher: Some(watcher),
         })
     }
@@ -257,6 +347,7 @@ impl DatagramRouter {
             inbox: rx,
             next_packet: Arc::new(AtomicU64::new(0)),
             cap: None,
+            max_age_ms: default_max_age(),
             watcher: None,
         })
     }
@@ -290,6 +381,10 @@ impl DatagramRouter {
             bump(&c.malformed, 1);
             return;
         };
+        if id == PAD_FLOW {
+            bump(&c.padding, 1);
+            return;
+        }
         let Some((tx, mode)) = self.table().flows.get(&id).map(|e| (e.tx.clone(), e.mode)) else {
             bump(&c.unknown_flow, 1);
             return;
@@ -320,24 +415,141 @@ impl DatagramRouter {
         }
     }
 
-    /// Hand one datagram to QUIC. Never waits: when QUIC's send buffer is full it
-    /// discards the oldest queued datagram to make room, so a stalled path loses old
-    /// packets rather than blocking the sender.
-    fn transmit(&self, datagram: Vec<u8>) -> bool {
+    fn sendq(&self) -> MutexGuard<'_, SendQueue> {
+        // Queue operations only, no `.await` inside: consistent between them.
+        self.sendq.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queue one datagram to be sent within `max_age`. Never waits: the pump sends it, or
+    /// drops it and counts it once it is older than that. One too large for the path is
+    /// dropped and counted now.
+    fn transmit(&self, datagram: Vec<u8>, max_age: Duration) -> bool {
         let fits = self
             .conn
             .max_datagram_size()
             .is_some_and(|max| datagram.len() <= max);
-        if fits && self.conn.send_datagram(datagram.into()).is_ok() {
-            bump(&self.counters.sent, 1);
-            true
-        } else {
+        if !fits {
             bump(&self.counters.send_dropped, 1);
-            false
+            return false;
+        }
+        {
+            let mut q = self.sendq();
+            q.bytes += datagram.len();
+            q.q.push_back(Pending {
+                stale_at: Instant::now() + max_age,
+                datagram,
+            });
+            while q.bytes > MAX_QUEUED_BYTES {
+                let Some(old) = q.q.pop_front() else { break };
+                q.bytes -= old.datagram.len();
+                bump(&self.counters.send_dropped, 1);
+            }
+        }
+        self.queued.notify_one();
+        true
+    }
+
+    /// The oldest datagram still young enough to send, dropping (and counting) the stale
+    /// ones ahead of it. Left in the queue: it is taken only once quinn has room.
+    fn fresh_head(&self, now: Instant) -> Option<usize> {
+        let mut q = self.sendq();
+        while let Some(head) = q.q.front() {
+            if head.stale_at > now {
+                return Some(head.datagram.len());
+            }
+            if let Some(old) = q.q.pop_front() {
+                q.bytes -= old.datagram.len();
+            }
+            bump(&self.counters.aged_out, 1);
+        }
+        None
+    }
+
+    fn take_head(&self) -> Option<Pending> {
+        let mut q = self.sendq();
+        let head = q.q.pop_front()?;
+        q.bytes -= head.datagram.len();
+        Some(head)
+    }
+
+    /// Hand queued datagrams to quinn as it has room, until the connection ends.
+    async fn pump(self: Arc<Self>) {
+        let full = QUIC_DATAGRAM_BUFFER;
+        // What quinn holds, oldest first: each datagram's length and when it goes stale. quinn
+        // sends in order, so what it has sent is always a prefix of this.
+        let mut held: VecDeque<(usize, Instant)> = VecDeque::new();
+        let mut held_bytes = 0usize;
+        let mut spins = 0u32;
+        loop {
+            let now = Instant::now();
+            let space = self.conn.datagram_send_buffer_space();
+            if space >= full {
+                held.clear();
+                held_bytes = 0;
+            } else if space > 0 {
+                // quinn holds exactly `full - space`: what it sent is gone from the front.
+                while held_bytes > full - space {
+                    let Some((len, _)) = held.pop_front() else {
+                        break;
+                    };
+                    held_bytes -= len;
+                }
+            }
+            let Some(len) = self.fresh_head(now) else {
+                tokio::select! {
+                    () = self.queued.notified() => {}
+                    _ = self.conn.closed() => return,
+                }
+                continue;
+            };
+            let stale = held.front().is_some_and(|(_, stale_at)| *stale_at <= now);
+            if stale {
+                // Padding over the whole buffer, then the young datagram: to take the second,
+                // quinn discards everything before it, the padding too.
+                let mut pad = Vec::with_capacity(full + 1);
+                crate::transport::datagram::put_varint(&mut pad, PAD_FLOW);
+                pad.resize(full + 1, 0);
+                let _ = self.conn.send_datagram(pad.into());
+                bump(&self.counters.displaced, held.len() as u64);
+                held.clear();
+                held_bytes = 0;
+            }
+            if stale || len <= space || space >= full {
+                if let Some(p) = self.take_head() {
+                    let len = p.datagram.len();
+                    if self.conn.send_datagram(p.datagram.into()).is_ok() {
+                        bump(&self.counters.sent, 1);
+                        held.push_back((len, p.stale_at));
+                        held_bytes += len;
+                    } else {
+                        bump(&self.counters.send_dropped, 1);
+                    }
+                }
+                spins = 0;
+                continue;
+            }
+            // quinn is still sending what it has: microseconds on a healthy path. Spin a
+            // little before sleeping, so a keyframe burst is not paced by the timer.
+            if spins < 64 {
+                spins += 1;
+                tokio::task::yield_now().await;
+            } else {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(1)) => {}
+                    _ = self.conn.closed() => return,
+                }
+            }
         }
     }
 
-    fn send_packet(&self, id: u64, packet_id: &AtomicU64, cap: Option<usize>, packet: &[u8]) {
+    fn send_packet(
+        &self,
+        id: u64,
+        packet_id: &AtomicU64,
+        cap: Option<usize>,
+        max_age: Duration,
+        packet: &[u8],
+    ) {
         let Some(max) = self
             .conn
             .max_datagram_size()
@@ -347,7 +559,7 @@ impl DatagramRouter {
             return;
         };
         if varint_len(id) + 1 + packet.len() <= max {
-            self.transmit(frame_packet(id, packet));
+            self.transmit(frame_packet(id, packet), max_age);
             return;
         }
         let pid = packet_id.fetch_add(1, Ordering::Relaxed);
@@ -357,7 +569,7 @@ impl DatagramRouter {
         };
         bump(&self.counters.fragmented, 1);
         for f in fragments {
-            self.transmit(f);
+            self.transmit(f, max_age);
         }
     }
 }
@@ -386,6 +598,9 @@ pub struct DatagramFlow {
     router: Arc<DatagramRouter>,
     inbox: mpsc::Receiver<Vec<u8>>,
     next_packet: Arc<AtomicU64>,
+    /// This flow's max age in milliseconds, shared with its senders so a later
+    /// [`DatagramFlow::set_max_age`] applies to them too.
+    max_age_ms: Arc<AtomicU64>,
     /// The largest datagram this flow sends, when smaller than the path's; see
     /// [`DatagramFlow::cap_datagrams`].
     cap: Option<usize>,
@@ -402,6 +617,7 @@ pub struct FlowSender {
     router: Arc<DatagramRouter>,
     next_packet: Arc<AtomicU64>,
     cap: Option<usize>,
+    max_age_ms: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for FlowSender {
@@ -411,6 +627,14 @@ impl std::fmt::Debug for FlowSender {
 }
 
 impl FlowSender {
+    /// As [`DatagramFlow::set_max_age`]: the flow and all its senders share one setting.
+    pub fn set_max_age(&self, max_age: Duration) {
+        self.max_age_ms.store(
+            u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
     /// As [`DatagramFlow::send`].
     ///
     /// # Errors
@@ -419,8 +643,13 @@ impl FlowSender {
         if !self.router.is_open(self.id) {
             return Err(Error::Unreachable("datagram flow closed"));
         }
-        self.router
-            .send_packet(self.id, &self.next_packet, self.cap, packet);
+        self.router.send_packet(
+            self.id,
+            &self.next_packet,
+            self.cap,
+            max_age(&self.max_age_ms),
+            packet,
+        );
         Ok(())
     }
 }
@@ -466,6 +695,15 @@ impl DatagramFlow {
         self.cap = Some(max);
     }
 
+    /// How long this flow's datagrams may wait to be sent before they are dropped instead
+    /// ([`DEFAULT_MAX_AGE`] until set). Applies to its senders too, from their next send.
+    pub fn set_max_age(&self, max_age: Duration) {
+        self.max_age_ms.store(
+            u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
     /// A cloneable sending half, sharing this flow's packet counter and cap.
     #[must_use]
     pub fn sender(&self) -> FlowSender {
@@ -474,6 +712,7 @@ impl DatagramFlow {
             router: Arc::clone(&self.router),
             next_packet: Arc::clone(&self.next_packet),
             cap: self.cap,
+            max_age_ms: Arc::clone(&self.max_age_ms),
         }
     }
 
@@ -490,8 +729,13 @@ impl DatagramFlow {
         if !self.is_open() {
             return Err(Error::Unreachable("datagram flow closed"));
         }
-        self.router
-            .send_packet(self.id, &self.next_packet, self.cap, packet);
+        self.router.send_packet(
+            self.id,
+            &self.next_packet,
+            self.cap,
+            max_age(&self.max_age_ms),
+            packet,
+        );
         Ok(())
     }
 
@@ -506,7 +750,8 @@ impl DatagramFlow {
         if !self.is_open() {
             return Err(Error::Unreachable("datagram flow closed"));
         }
-        self.router.transmit(reframe(self.id, rest));
+        self.router
+            .transmit(reframe(self.id, rest), max_age(&self.max_age_ms));
         Ok(())
     }
 

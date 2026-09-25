@@ -102,6 +102,17 @@ const KEYFRAME_EVERY: u32 = 30;
 const STALL: Duration = Duration::from_millis(500);
 const PAUSE_AT: Duration = Duration::from_secs(10);
 const BLACKOUT_AT: Duration = Duration::from_secs(20);
+/// The part of the relayed call whose losses the blackout causes, left out of the loss bar
+/// (its latency is not left out of anything). From just before the leg goes black — the
+/// sender's clock and the switch's are one clock, but not one thread — to half a second
+/// after it returns: QUIC backs its probe timer off while every probe is lost, so a sender
+/// whose window filled learns the leg is back only at its next probe, measured up to 260 ms
+/// after the leg returned, and the frames in between are dropped for age.
+const BLACK_WINDOW: (Duration, Duration) = (
+    Duration::from_millis(BLACKOUT_AT.as_millis() as u64 - 20),
+    Duration::from_millis(BLACKOUT_AT.as_millis() as u64 + STALL.as_millis() as u64 + 500),
+);
+
 /// A frame this late is not a call frame any more: it was held, not carried.
 const LATE: Duration = Duration::from_millis(150);
 
@@ -201,6 +212,7 @@ async fn run_flow(flow: Flow, start: u64, pause: Option<(u64, u64)>, call: Durat
                         record(&f, &mut got);
                     }
                 }
+                Ok(Ok(Some(SpliceFrame::MaxAge(_)))) => {}
                 // The peer finished, the daemon went, or the call is over.
                 Ok(Ok(Some(SpliceFrame::Fin)) | Ok(None) | Err(_)) | Err(_) => break,
             }
@@ -638,9 +650,7 @@ fn measure(
         }
         highest = Some(highest.map_or(seq, |h| h.max(seq)));
         let ms = (r.saturating_sub(s)) as f64 / 1e6;
-        if outside(&seq) {
-            lat.push(ms);
-        }
+        lat.push(ms);
         timeline.push((s.saturating_sub(start), ms));
         if let Some((ps, pr)) = prev {
             let d = (r as f64 - pr as f64) - (s as f64 - ps as f64);
@@ -678,12 +688,7 @@ fn directions(
     start: u64,
     blacked: Option<&str>,
 ) -> Vec<Direction> {
-    // With a little room either side: the sender's clock and the switch's are one clock,
-    // but not one thread.
-    let black: Window = Some((
-        BLACKOUT_AT - Duration::from_millis(20),
-        BLACKOUT_AT + STALL + Duration::from_millis(50),
-    ));
+    let black: Window = Some(BLACK_WINDOW);
     let mut out = Vec::new();
     for from in members {
         for to in members {
@@ -948,6 +953,45 @@ fn call(
         results.insert(a.name.clone(), a.results());
     }
     drop(apps);
+    // What each daemon's router dropped for age, and how often it flushed a stalled path:
+    // frames the call lost on purpose, counted where an app can read them (`vox status`).
+    let mut drops = DROPS.lock().unwrap();
+    drops.clear();
+    for m in members {
+        let (ok, out, err) = vox_once(&m.dir, &args(&["status", "--json"]));
+        assert!(ok, "vox status ({}): {err}", m.name);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let d = &v["datagrams"];
+        let (aged, flushes) = (
+            d["aged_out"].as_u64().unwrap_or(0),
+            d["displaced"].as_u64().unwrap_or(0),
+        );
+        eprintln!("[drops] {}: aged out {aged}, displaced {flushes}", m.name);
+        drops.insert(m.name.clone(), (aged, flushes));
+    }
+    // The anchor has no status verb; it says its drops on change. Its relay legs stall like
+    // anyone's when a member's acknowledgements stop.
+    let said = anchor.transcript();
+    let last = said
+        .lines()
+        .filter_map(|l| l.strip_prefix("vox node: datagrams dropped for age "))
+        .next_back()
+        .and_then(|rest| {
+            let (aged, flushes) = rest.split_once(", displaced ")?;
+            Some((aged.parse().ok()?, flushes.trim().parse().ok()?))
+        })
+        .unwrap_or((0, 0));
+    eprintln!("[drops] anchor: aged out {}, displaced {}", last.0, last.1);
+    drops.insert("anchor".into(), last);
+    drop(drops);
+    // Every warning a daemon printed during the call: a flow that dies is explained here
+    // or nowhere.
+    for d in &mut daemons {
+        let said = d.transcript();
+        for l in said.lines().filter(|l| l.starts_with("! ")) {
+            eprintln!("[{}] {l}", d.name);
+        }
+    }
     if matches!(shape, Shape::CrossingMesh) {
         a_dead_peer_does_not_hold_up_a_live_one(members, &mut daemons, room);
     }
@@ -1137,6 +1181,9 @@ fn a_dead_peer_does_not_hold_up_a_live_one(
     );
 }
 
+/// Each member's `(aged_out, displaced)` after the last call.
+static DROPS: Mutex<BTreeMap<String, (u64, u64)>> = Mutex::new(BTreeMap::new());
+
 /// The room passphrase of the current world, for the daemons' passphrase files.
 static PASSPHRASE: Mutex<String> = Mutex::new(String::new());
 
@@ -1296,16 +1343,56 @@ fn run_pair(path: PathKind) {
             "the call did not cross the relay leg: {crossed} < {guest_frames}"
         );
     }
+    if knob.is_some() {
+        recovery(&ds);
+    }
     bars(&ds, bar, Some("host"), CALL);
     pause_unfelt(&ds, "host", "guest->host", bar);
     if knob.is_some() {
-        blackout_held_nothing(&ds, bar);
+        blackout_held_nothing(&ds);
+    }
+}
+
+/// Every voice frame sent from just before the blackout to a second after it: how late it
+/// arrived, or `-` for lost, one slot per 20 ms. To see recovery, not only its worst frame.
+fn recovery(ds: &[Direction]) {
+    for d in ds {
+        if !d.label.starts_with("voice") {
+            continue;
+        }
+        let got: HashMap<u64, f64> = d
+            .timeline
+            .iter()
+            .map(|(t, ms)| (*t / 20_000_000, *ms))
+            .collect();
+        let from = (BLACKOUT_AT - Duration::from_millis(100)).as_millis() as u64 / 20;
+        let to = (BLACKOUT_AT + STALL + Duration::from_millis(900)).as_millis() as u64 / 20;
+        let row: Vec<String> = (from..to)
+            .map(|slot| {
+                got.get(&slot)
+                    .map_or("-".to_owned(), |ms| format!("{ms:.0}"))
+            })
+            .collect();
+        eprintln!(
+            "[recovery] {} from {:.2}s, one per 20 ms: {}",
+            d.label,
+            from as f64 * 0.02,
+            row.join(" ")
+        );
     }
 }
 
 /// R27: frames sent while the guest's leg was black are lost, not delivered late; frames
 /// after it are on time; the other direction is untouched.
-fn blackout_held_nothing(ds: &[Direction], bar: f64) {
+fn blackout_held_nothing(ds: &[Direction]) {
+    // The frames the opposite direction lost were dropped by the routers on purpose, and
+    // counted where an app can read them.
+    let (aged, flushes) = DROPS
+        .lock()
+        .unwrap()
+        .values()
+        .fold((0, 0), |(a, f), (x, y)| (a + x, f + y));
+    eprintln!("[blackout] counted by the members' routers: {aged} aged out, {flushes} displaced");
     for arm in ["voice", "video"] {
         let hit = ds
             .iter()
@@ -1341,32 +1428,57 @@ fn blackout_held_nothing(ds: &[Direction], bar: f64) {
             late, 0,
             "{arm}: {late} frames were held and delivered late instead of dropped"
         );
+        // After the leg returns, the first frames may have waited in the sender's queue for
+        // QUIC to learn the leg is back: on time means within the max age, the same rule as
+        // the other direction's.
+        let after_bound =
+            vox_core::transport::router::DEFAULT_MAX_AGE.as_secs_f64() * 1000.0 + hit.p50_ms;
         assert!(
-            n_after > 0 && worst_after <= bar,
-            "{arm}: after the blackout, worst {worst_after:.2} ms"
+            n_after > 0 && worst_after <= after_bound,
+            "{arm}: after the blackout, worst {worst_after:.2} ms (bound {after_bound:.1} ms)"
         );
-        // **Recorded, not bounded: the opposite direction is held while the blacked leg's
-        // acknowledgements are lost.** Its frames are not dropped, they are delivered late,
-        // together, when the leg returns: 20.14 s → 368 ms, 20.16 s → 347 ms, … 20.48 s →
-        // 27 ms in one run, worst 46 ms in another. QUIC's congestion control counts
-        // datagrams as in flight, and with no acknowledgement arriving for 500 ms the window
-        // fills and every later datagram waits in the send queue. UDP would not do that.
-        // The fix is a congestion-control or queue-staleness decision, not a calls-path fix,
-        // and is left to the decider (ADR-022 M22.6).
+        // **The opposite direction is on time or dropped, never late.** With the black
+        // leg's acknowledgements lost, QUIC's congestion window fills and datagrams cannot
+        // go. They used to wait in quinn's queue and arrive together when the leg returned —
+        // 20.14 s → 368 ms … 20.48 s → 27 ms in one run. The router now drops what waits
+        // past its flow's max age, and flushes what quinn holds when it stalls
+        // (`transport::router`). So no frame may arrive later than the max age plus this
+        // direction's own one-way time, and the ones that did not are counted.
+        let base = other.p50_ms;
+        let bound = vox_core::transport::router::DEFAULT_MAX_AGE.as_secs_f64() * 1000.0 + base;
+        let over: Vec<String> = other
+            .timeline
+            .iter()
+            .filter(|(_, ms)| *ms > bound)
+            .map(|(t, ms)| format!("{:.2}s:{ms:.0}ms", *t as f64 / 1e9))
+            .collect();
+        // The same window `directions` left out of the loss count.
+        let (n_black, _) = window(other, BLACK_WINDOW.0, BLACK_WINDOW.1);
+        eprintln!(
+            "[blackout] {arm} host->guest: {n_o} frames in and 1 s after the blackout, \
+             worst {worst_o:.2} ms; {} over the {bound:.1} ms bound in the whole call {over:?}; \
+             of {} sent while the guest's leg was black, {n_black} arrived",
+            over.len(),
+            other.excluded
+        );
         assert!(
             n_o > 0,
             "{arm} host->guest: nothing sent during the blackout"
         );
-        let held = other
-            .timeline
-            .iter()
-            .filter(|(t, ms)| {
-                (BLACKOUT_AT.as_nanos() as u64..(BLACKOUT_AT + STALL).as_nanos() as u64).contains(t)
-                    && *ms > bar
-            })
-            .count();
-        eprintln!(
-            "[blackout] {arm} host->guest (recorded, not bounded): {held} of {n_o} frames over {bar} ms while the guest's leg was black"
+        // A frame the opposite direction did not deliver was dropped on purpose — aged out, or
+        // displaced from a stalled quinn — by the host's router or by the anchor's (whose leg
+        // to the guest stalls too while the guest's acknowledgements are lost), and counted.
+        assert!(
+            other.excluded == n_black || aged + flushes > 0,
+            "{arm} host->guest: {} of {} frames sent into the blackout never arrived, and no \
+             router counted a drop",
+            other.excluded - n_black,
+            other.excluded
+        );
+        assert!(
+            over.is_empty(),
+            "{arm} host->guest: {} frames arrived later than max age + base ({bound:.1} ms): {over:?}",
+            over.len()
         );
     }
 }

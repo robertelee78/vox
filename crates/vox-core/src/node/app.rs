@@ -917,6 +917,15 @@ impl AppStream {
         let _ = self.inner.send.lock().await.finish();
     }
 
+    /// How long this stream's datagrams may wait to be sent before they are dropped
+    /// instead ([`crate::transport::router::DEFAULT_MAX_AGE`] until set). A call keeps the
+    /// default; a transfer that would rather arrive late than not at all sets it high.
+    pub fn set_datagram_max_age(&self, max_age: Duration) {
+        if let Some(tx) = &self.inner.flow_tx {
+            tx.set_max_age(max_age);
+        }
+    }
+
     /// Send one datagram on the flow.
     ///
     /// # Errors

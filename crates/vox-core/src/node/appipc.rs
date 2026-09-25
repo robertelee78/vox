@@ -23,7 +23,9 @@
 //!   stream; the peer finishing it shuts the connection's write side.
 //! - **with datagrams**, frames `u32 length ‖ u8 kind ‖ payload`, kind 0 stream bytes,
 //!   1 one datagram, 2 end of stream. Datagrams and stream bytes interleave on one
-//!   connection, so each must say which it is.
+//!   connection, so each must say which it is. Kind 3, from the client only, is the flow's
+//!   max age (`u32` milliseconds): how long a datagram may wait to be sent before it is
+//!   dropped instead (ADR-022 decision 5).
 //!
 //! The connection closes when both halves of the stream have ended, or at once when the
 //! stream fails — including when trust is withdrawn on either side.
@@ -55,6 +57,7 @@ const T_APP_SPLICE: u64 = 2212;
 const K_DATA: u8 = 0;
 const K_DATAGRAM: u8 = 1;
 const K_FIN: u8 = 2;
+const K_MAX_AGE: u8 = 3;
 
 /// The largest splice frame: a datagram is at most 64 KiB.
 const MAX_SPLICE_FRAME: usize = 70 * 1024;
@@ -327,6 +330,8 @@ pub enum SpliceFrame {
     Datagram(Vec<u8>),
     /// The sender's half of the stream has ended.
     Fin,
+    /// From the client: its datagrams' max age, in milliseconds.
+    MaxAge(u32),
 }
 
 /// Write one splice frame.
@@ -341,6 +346,16 @@ pub async fn write_splice<W: tokio::io::AsyncWrite + Unpin>(
         SpliceFrame::Data(d) => (K_DATA, d),
         SpliceFrame::Datagram(d) => (K_DATAGRAM, d),
         SpliceFrame::Fin => (K_FIN, &[]),
+        SpliceFrame::MaxAge(ms) => {
+            let mut out = Vec::with_capacity(9);
+            out.extend_from_slice(&5u32.to_be_bytes());
+            out.push(K_MAX_AGE);
+            out.extend_from_slice(&ms.to_be_bytes());
+            return w
+                .write_all(&out)
+                .await
+                .map_err(|_| Error::MalformedBundle("splice write"));
+        }
     };
     let len = u32::try_from(payload.len() + 1).map_err(|_| Error::SizeLimitExceeded("splice"))?;
     let mut out = Vec::with_capacity(5 + payload.len());
@@ -378,6 +393,13 @@ pub async fn read_splice<R: tokio::io::AsyncRead + Unpin>(
         K_DATA => Ok(Some(SpliceFrame::Data(payload))),
         K_DATAGRAM => Ok(Some(SpliceFrame::Datagram(payload))),
         K_FIN => Ok(Some(SpliceFrame::Fin)),
+        K_MAX_AGE => {
+            let ms: [u8; 4] = payload
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::MalformedBundle("splice max age"))?;
+            Ok(Some(SpliceFrame::MaxAge(u32::from_be_bytes(ms))))
+        }
         _ => Err(Error::MalformedBundle("splice kind")),
     }
 }
@@ -400,6 +422,8 @@ async fn splice(mut unix: UnixStream, app: AppStream) -> Result<()> {
                         SpliceFrame::Data(d) => up_app.write_all(&d).await?,
                         SpliceFrame::Datagram(d) => up_app.send_datagram(&d)?,
                         SpliceFrame::Fin => up_app.finish().await,
+                        SpliceFrame::MaxAge(ms) => up_app
+                            .set_datagram_max_age(std::time::Duration::from_millis(u64::from(ms))),
                     }
                 }
             } else {

@@ -173,8 +173,9 @@ async fn pipe(stream: tokio::net::UnixStream, datagrams: bool) -> Result<(), App
                     out.write_all(&d)?;
                     out.flush()?;
                 }
-                // The peer finished its half; datagrams may still come.
-                SpliceFrame::Fin => {}
+                // The peer finished its half; datagrams may still come. A max age is
+                // something this side says, never hears.
+                SpliceFrame::Fin | SpliceFrame::MaxAge(_) => {}
             }
         }
         out.flush()?;

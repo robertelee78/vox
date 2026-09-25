@@ -522,7 +522,18 @@ impl StatusReport {
                 + d.reassembly_expired
                 + d.reassembly_evicted
                 + d.reassembly_rejected
-                + d.send_dropped,
+                + d.send_dropped
+                + d.aged_out,
+        );
+        counter(
+            "vox_datagrams_aged_out_total",
+            "Datagrams dropped because they waited longer than their flow's max age to be sent.",
+            d.aged_out,
+        );
+        counter(
+            "vox_datagrams_displaced_total",
+            "Datagrams a stalled path held too long, replaced by a younger one rather than sent late.",
+            d.displaced,
         );
         let a = &self.app;
         counter(
@@ -583,14 +594,16 @@ fn list(items: impl Iterator<Item = String>) -> String {
 
 fn dgram_json(d: &DatagramStats) -> String {
     format!(
-        "{{\"sent\":{},\"delivered\":{},\"fragmented\":{},\"unknown_flow\":{},\"inbox_full\":{},\"malformed\":{},\"send_dropped\":{}}}",
+        "{{\"sent\":{},\"delivered\":{},\"fragmented\":{},\"unknown_flow\":{},\"inbox_full\":{},\"malformed\":{},\"send_dropped\":{},\"aged_out\":{},\"displaced\":{}}}",
         d.sent,
         d.delivered,
         d.fragmented,
         d.unknown_flow,
         d.inbox_full,
         d.malformed + d.unknown_context,
-        d.send_dropped
+        d.send_dropped,
+        d.aged_out,
+        d.displaced
     )
 }
 
@@ -607,6 +620,9 @@ pub fn add_stats(a: &mut DatagramStats, b: &DatagramStats) {
     a.sent += b.sent;
     a.fragmented += b.fragmented;
     a.send_dropped += b.send_dropped;
+    a.aged_out += b.aged_out;
+    a.displaced += b.displaced;
+    a.padding += b.padding;
 }
 
 // ---- IPC -------------------------------------------------------------------

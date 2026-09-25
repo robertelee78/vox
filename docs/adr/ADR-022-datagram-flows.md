@@ -137,6 +137,31 @@ behind it.
 
 What does not change: the relay is still ciphertext-only by construction.
 
+**A datagram that cannot go now is dropped, never sent late (2026-09-25, `transport::router`).**
+The problem, found by M22.6: quinn's congestion controller counts datagrams against the window. When
+a path's acknowledgements are lost, the window fills and every datagram waits in quinn's queue. When
+the path returns they all arrive together, late: 27–368 ms in the direction opposite a black relay
+leg. The rule:
+
+- **The router keeps the send queue.** quinn's own datagram buffer is 900 bytes
+  (`QUIC_DATAGRAM_BUFFER`). Every datagram records when it was queued. One pump per connection hands
+  datagrams to quinn only while quinn has room, and drops (and counts) any whose time is up.
+- **Max age is per flow**, default 100 ms (`DEFAULT_MAX_AGE`), about a voice call's mouth-to-ear
+  budget less the network's share.
+  - A flow sets its own with `DatagramFlow::set_max_age`; an app with `AppStream::set_datagram_max_age`,
+    or over IPC with splice frame kind 3 (`MaxAge`, `u32` ms).
+  - A relay forwards at the default: it cannot see the ends' settings.
+- **What quinn already holds cannot be taken back through its API.** When quinn sends nothing for
+  `STALL_FLUSH` (50 ms), the pump pushes two padding datagrams on `PAD_FLOW`. Each is larger than
+  quinn's buffer, so quinn discards everything older to take each one. The peer's router discards the
+  padding and counts it.
+- **50 ms, because a healthy path pauses up to 25 ms.** That is QUIC's delayed acknowledgement, while
+  a keyframe burst waits on the window. At 20 ms, healthy keyframes were flushed.
+- **The age budget accounts for the flush.** A datagram is handed to quinn only while it is younger
+  than its max age less `STALL_FLUSH`, so nothing can then wait long enough to arrive late.
+- **Counted in `vox status`:** `aged_out` and `stall_flushes` in JSON, and
+  `vox_datagrams_aged_out_total` and `vox_datagram_stall_flushes_total` in the metrics.
+
 ### 6. UDP tunnels (R25)
 
 - **Service label.** A UDP service is served as `udp/<port>`; a bare `<port>` stays TCP. So TCP 53
@@ -447,20 +472,35 @@ Each proof runs on a direct path **and** on a forced-relay path.
   - **Head-of-line, the black leg (R27, relayed arm):** the guest's leg to the anchor drops everything
     for 500 ms. Its frames from that window are **lost, 0 of the call's frames arrive later than
     150 ms**, and its frames after the blackout are on time (worst 0.7–8.2 ms).
-  - **Recorded, not bounded: the opposite direction during the black leg.** Its frames are not lost.
-    They are held and delivered late together when the leg returns: 0 frames over 40 ms in the final
-    runs, but 20.14 s → 368 ms … 20.48 s → 27 ms in one earlier run and a 46 ms worst in another.
-    - The likely cause (not instrumented): QUIC counts datagrams against the congestion window, the
-      window fills while the black leg's acknowledgements are lost, and later datagrams wait in the send
-      queue. UDP would not hold them.
-    - The fix is a congestion-control or queue-staleness decision, not a calls-path one. It is open for
-      the decider.
-    - The blackout window is excluded from both directions' p99 and reported on its own.
+  - **The opposite direction during the black leg: on time or dropped, never late** (fixed 2026-09-25,
+    decision 5's send queue).
+    - Before the fix, its frames were held and delivered late together when the leg returned: 20.14 s →
+      368 ms … 20.48 s → 27 ms in one run, a 46 ms worst in another.
+    - Now the gate asserts that no frame in either direction, anywhere in the call, arrives later than
+      the 100 ms max age plus that direction's median one-way time (≈ 100.4 ms). The blackout is no
+      longer left out of p99.
+    - **Runs:** the bound held in all 9 relayed runs on the final router that reached it, under the
+      box-wide timing lock at load 2–60. The other runs stopped earlier, on gate faults since fixed: a
+      window mismatch in the drop count, and anchor drops not yet counted.
+    - **Counters:** in the runs where the path stalled, the routers counted it, e.g. host 49 aged out /
+      15 stall flushes and guest 55 / 15. In the runs where it did not stall, nothing was held and every
+      frame arrived.
+    - **One loss window is left out, and only of loss:** half a second after the leg returns. QUIC backs
+      its probe timer off while every probe is lost, so a sender whose window filled learns the leg is
+      back only at its next probe. That took up to 260 ms after the leg returned, and the frames in
+      between are dropped for age and counted.
+    - **Keyframes stay whole** on the healthy path (29/29 per direction). At a 20 ms stall-flush
+      threshold they did not (27/29), which is why it is 50 ms.
+  - **The anchor says its drops.** `vox node` prints `datagrams dropped for age N, stall flushes M` on
+    change, and the gate counts it with the members'.
 
   Mutations, each run and red for its own reason:
   - **(a)** datagrams carried on the app stream instead (`appipc` splice): 25 black-window frames
     delivered late, worst 829 ms; 34 frames later than 150 ms.
   - **(b)** fragmentation disabled: keyframes 0 of 30, video loss 3.4%.
+  - **Age drop disabled** (the pump hands every datagram to quinn however old): red, voice p99 470 ms,
+    frames delivered up to 767 ms late, in 1 of 2 runs. The other run's path never stalled, since
+    whether the window fills depends on its size when the leg goes black. So this mutation is statistical.
   - The three product defects this proof found, each fixed and each mutation-checked:
     1. **A fresh daemon refused to place calls** (`open_channel` now refreshes the app/tunnel gate).
        The first daemon up, alone, opens to a member who is not up. Fixed: `peer unreachable`.
@@ -473,6 +513,20 @@ Each proof runs on a direct path **and** on a forced-relay path.
     3. **App streams did not hold their connection** (`StreamInner` now holds the
        `Arc<VoxConnection>`, as a tunnel does). Mutation: 6 of 24 mesh directions stopped about 57 s
        into the 75 s call, at the retire grace.
+
+  **Open: the crossing mesh sometimes cannot place every call.** 2 of the 9 mesh runs since crossing
+  dials were added failed before the call started, with a flow that never came up:
+  - qfinal1: a flow was dead at `go`, 0 frames sent;
+  - qfinal5: the host's open to the member that started last was answered `refused by the peer` for
+    180 s.
+
+  The daemons' logs in both runs show the session layer churning under four simultaneous dials:
+  - `did not take our key … its hello was not accepted`;
+  - `the key did not open under the session it holds`;
+  - `relay cannot reach the peer`.
+
+  No datagram was involved. This is the pairwise-session and connection-liveness area, recorded here
+  and not yet diagnosed.
 
   **Not covered:**
   - **The harness stops `vox serve` with SIGINT.** Killed with SIGKILL, the anchor keeps routing
