@@ -270,9 +270,9 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     carried packets it cannot read. A second connection over the same forward works too. `ssh` over Vox is
     this test with `sshd` in place of the echo, which is why the echo is enough.
 - **Tunnel honesty (2026-09-24, PRD-001 R22–R24; defects D6, D7, D11).** Each fixed property below
-  is proved by a shipped-binary gate that was mutation-checked red on the defect. The `tunnel_honesty_proof`
-  harness waits 35 s after its guest joins before dialling the host, to step around D8 (the inline accept
-  loop's 30 s deafness after a one-shot `vox connect`); that wait is to be removed once the loop is split.
+  is proved by a shipped-binary gate that was mutation-checked red on the defect. (Built on a tree
+  with the serial accept loop, the harness first waited 35 s after each join to step around D8; on
+  v0.2.8, which splits the loop, the wait is gone and every gate below passed 3 of 3 without it.)
   - **The SOCKS reply is the host's answer (R23, D6).** `session::dial` is split into `request` (send the
     request, await `TunnelStatus`) and `splice`; `vox up` replies only after `request` returns, `NotAllowed`
     for a host refusal and `GeneralFailure` for an unreachable host, and prints the reason on the
@@ -281,9 +281,7 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     Gates: `tunnel_honesty_proof::a_refused_socks_connect_is_refused_in_the_reply_and_says_why` (code 2 in
     1.6–18 ms; mutation — reply "succeeded" before asking — returns code 0 and goes red), and
     `service_rehearsal_proof`, whose untrusted-joiner control used to accept the early success and now
-    requires code 2 and the `the host refused` line. That control sits behind the rehearsal's second
-    `vox connect`, which the inline accept loop locks out (`:490`, PRD-001 D8, owned elsewhere), so on this
-    tree it is not reached; it was green 5/5 with the loop split.
+    requires code 2 and the `the host refused` line: 3 of 3 on v0.2.8 (refused in 2–10 ms).
   - **A refused forward resets the application (R23).** Gate: `tunnel_honesty_proof::
     a_refused_forward_resets_the_application_and_says_why` — the application reads a reset, not an EOF,
     and `vox forward` prints the reason.
