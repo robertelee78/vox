@@ -76,21 +76,16 @@ jobs:
       # both `main` and v0.2.5's commit; 6 of 6 after, at loads 4-45 — and high load is the *harder*
       # condition for this race, since a quiet box is what packs a claim and a release into one second.
       # It is back in the blocking set, which is where a proof belongs once it can pass for a reason.
-      # `service_rehearsal_proof` is excluded from 2026-09-23 with its cause IDENTIFIED, which is the
-      # only reason excluding it is a decision rather than a dodge. It fails at the stranger's join
-      # (`:490`) because a host that has answered one joiner answers nobody for the next 30 seconds:
-      # `spawn_accept_loop` awaits `finish_incoming` inline, so one handshake occupies the accept path
-      # for up to `HANDSHAKE_TIMEOUT`. Measured deterministically — a lone joiner 35s in gets in in 2s,
-      # a second joiner immediately after the first is locked out, the same joiner 40s later gets in.
-      # It is PRE-EXISTING: 5 of 5 failures on 0590cdc (v0.2.4's commit), and in CI history on v0.2.3.
-      # It is ADR-017's "Open proof gap", recorded there and in ADR-018 §"Root cause of
-      # service_rehearsal_proof:490" with the controls. Removing this name must fail until that loop is
-      # fixed; the release notes say plainly that a second joiner cannot join for 30s.
+      # `service_rehearsal_proof` was excluded here on 2026-09-23 and the exclusion is now REMOVED,
+      # because its cause is fixed rather than tolerated. It failed at the stranger's join (`:490`):
+      # `spawn_accept_loop` awaited `finish_incoming` inline, so a host that had answered one joiner
+      # answered nobody for up to `HANDSHAKE_TIMEOUT` (30s), and `vox connect` exits the moment it has
+      # joined, which leaves the host mid-handshake. v0.2.8 spawns each handshake on its own bounded
+      # task, which closes ADR-017's "Open proof gap". Back in the blocking set.
       - run: |
           cargo test --release --workspace -- --ignored \
             --skip two_agents_on_separate_processes_join_through_an_anchor_and_talk \
-            --skip a_relayed_pair_finds_a_direct_path_once_one_becomes_possible \
-            --skip a_room_bound_service_carries_real_bytes_through_the_real_binaries
+            --skip a_relayed_pair_finds_a_direct_path_once_one_becomes_possible
 
   # **Reporting only, and in its OWN job on purpose.** These are the proofs excluded from the gate
   # above. Every command here ends in `|| echo "::warning::"`, so none of them can fail a release —
@@ -98,7 +93,8 @@ jobs:
   # out `gates` blocks the release completely. A step forbidden from failing the release could
   # nonetheless kill it, by spending a budget it shared with the real gate.
   #
-  # That very nearly happened: adding a third proof here (`service_rehearsal_proof`, whose failing
+  # That very nearly happened: adding a third proof here (`service_rehearsal_proof`, since restored to
+  # the gate, whose failing
   # path burns its whole timeout) lengthened this work inside a 45-minute budget that the blocking
   # steps had already spent 32 minutes of.
   #
@@ -127,9 +123,6 @@ jobs:
           cargo test --release --workspace -- --ignored \
             a_relayed_pair_finds_a_direct_path_once_one_becomes_possible \
             || echo "::warning::relayed_path_is_retried failed — known flake, ADR-018"
-          cargo test --release --workspace -- --ignored \
-            a_room_bound_service_carries_real_bytes_through_the_real_binaries \
-            || echo "::warning::service_rehearsal_proof failed — the 30s accept serialisation, ADR-017/ADR-018"
 
   build-linux-x64:
     needs: [gates]

@@ -50,6 +50,31 @@ use crate::node::syncstream::{SyncSchedule, SyncTrigger};
 use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
 
+/// A pairwise session this node opened (ADR-021 F12).
+#[derive(Debug, Clone)]
+struct Initiated {
+    /// The hello that lets the peer accept it; `None` for a session opened on the join
+    /// path, which the join protocol itself delivered.
+    initial: Option<InitialMessage>,
+    /// Whether that hello has reached the peer. Until it has, every delivery over the
+    /// session carries it again — a peer cannot open anything sealed under a session it
+    /// was never offered.
+    hello_delivered: bool,
+}
+
+/// **Which of two competing sessions for one pair both ends keep** (ADR-021 F12): the
+/// one opened by the lower fingerprint. Two members that opened a session to each other
+/// at the same moment each hold their own; both apply this rule and so keep the same
+/// one. `existing_mine` says whether the session already held was opened by `me`; the
+/// incoming one was opened by `peer`.
+///
+/// A second session from the same opener replaces the first: a peer only opens a
+/// session when it holds none, so a new hello from the peer that opened ours means it
+/// lost its state (a restart — sessions are not persisted), and the old one is dead.
+fn incoming_session_wins(me: &Digest32, peer: &Digest32, existing_mine: bool) -> bool {
+    !existing_mine || peer < me
+}
+
 /// Command queue depth (commands beyond it apply backpressure to the client).
 const COMMAND_QUEUE: usize = 64;
 /// Event buffer depth, per subscriber (ADR-020 §7).
@@ -686,104 +711,70 @@ fn spawn_stream_loop(
 /// Accept connections and their streams forever, forwarding to the actor the ones
 /// that need channel state. The board is served inside `accept_stream`.
 ///
-/// **Each connection's handshake runs on its own task** (M17.17). This loop used to call
-/// `accept`, which performs the TLS handshake inline, so the loop serialised on handshakes:
-/// one peer that opened a connection and then stalled its handshake blocked **every** other
-/// inbound connection — with no credential at all, because authentication had not happened
-/// yet. A pre-authentication denial of service, and worst against the node most likely to be
-/// always-on and public, which is an anchor. The loop's own comment claimed a slow peer could
-/// not stall the others; that was true only of the stream loop, after the handshake.
-/// The node's inbound accept loop.
+/// **Each connection's handshake runs on its own task, bounded, and the accept loop
+/// never waits for one.** Phase two (`finish_incoming`: the TLS handshake and admission,
+/// itself bounded at `HANDSHAKE_TIMEOUT`) is spawned per attempt, which is quinn's own
+/// documented shape — `finish_incoming` says "Spawn this; do not await it in an accept
+/// loop".
 ///
-/// **This performs each handshake inline, and that is a known denial-of-service gap**
-/// (finding #3): one peer that opens a connection and then stalls its TLS handshake blocks
-/// every other inbound connection, with no credential of any kind, because authentication
-/// has not happened yet. It matters most for an always-on node, which is what an anchor is.
+/// # What awaiting it inline cost
+/// Until v0.2.8 this loop awaited phase two, so it handled one handshake at a time. Two
+/// consequences, both measured:
 ///
-/// The two-phase API that fixes it exists and is tested — [`ConnectionManager::accept_incoming`]
-/// and [`ConnectionManager::finish_incoming`], the handshake bounded at 30 seconds — but it is
-/// **deliberately not wired in here yet.** Spawning phase two per attempt makes
-/// `m15_two_clients_behind_symmetric_nats_form_a_swarm_through_their_anchor` and
-/// `m16_a_tcp_service_is_reached_across_the_overlay_between_two_nated_clients` time out, while
-/// `m15_members_never_online_together_converge_through_the_anchor` keeps passing. Measured, not
-/// suspected: serialising this loop again and changing nothing else turns both back green, and
-/// clean upstream passes all three in 40s.
+/// - **A pre-authentication denial of service.** One peer that opened a connection and
+///   stalled its handshake blocked every other inbound connection for up to 30s, with no
+///   credential of any kind. Worst against an anchor, the node most likely to be public.
+/// - **The same stall with no attacker at all.** `vox connect` exits the moment it has
+///   joined, which leaves the host mid-handshake, so a second person joining right after
+///   the first was locked out for 30s. `order4.sh` (a host and two back-to-back joiners)
+///   locked the second joiner out 5 of 5 on a quiet box, and the stranger's join in
+///   `service_rehearsal_proof` failed the same way.
 ///
-/// The two that break both carry a **relayed circuit** between peers behind symmetric NATs,
-/// where no punch is possible; the one that survives converges through the anchor without a
-/// live circuit. So something in circuit establishment depends on the ordering this loop
-/// currently imposes, and the mechanism is not yet understood.
+/// # Why it stayed inline so long
+/// ADR-017 recorded the split as tried and reverted: `m15_two_clients_behind_symmetric_
+/// nats…` timed out at 247s with it and passed serialised. That 247s was **not** the split.
+/// It was sync starvation — a room's in-flight mark let a failing anchor session take the
+/// room first every round, so the direct member session never ran — and it hit the
+/// serialised loop too, in 9 of ~15 CI runs on `main`. The evidence against the split was
+/// a different defect with the same signature.
 ///
-/// Shipping the split would trade a pre-authentication DoS for an overlay that cannot form a
-/// swarm through an anchor, which is a worse product. The ordering is deliberate: an
-/// authorization bypass outranks a DoS, and a DoS outranks not working. Those two NAT gates are
-/// now the acceptance test for the real fix.
+/// With that fixed (the owed-room change in `run_due_syncs`) the split exposed one real
+/// dependency on the serial order, and it was not in this loop: `ConnectionManager`'s
+/// duplicate tie-break was "the held connection wins", which the two ends of a pair only
+/// agree on if they file the pair in the same order. Concurrent handshakes broke that, and a
+/// node could be left holding a connection its peer had closed (see `tie_key` in
+/// `node::net`). Measured with both ends logging each connection's exporter tag: 2 of 5
+/// duplicate pairs disagreed before the tie-break became order-independent, 0 of 28 after.
+///
+/// # The bound, and what a flood costs
+/// At most [`HANDSHAKES_IN_FLIGHT`] handshakes run at once. At the cap an attempt is never
+/// queued — queueing would put the wait back into this loop:
+///
+/// - an attempt whose source address is **not yet validated** gets `retry()`, a QUIC Retry
+///   packet that makes the client prove it can receive at the address it claims before
+///   anything is allocated. A spoofed flood cannot answer one; a real peer pays one round
+///   trip. Before this, one spoofed packet cost an attacker a packet and cost the node a
+///   handshake slot.
+/// - an attempt that **is** validated gets `refuse()`, because for a peer that has proven
+///   itself the honest answer is "not now", not another round trip.
+///
+/// **Residual, stated rather than implied:** 64 *validated* handshakes that stall still
+/// deny service for up to `HANDSHAKE_TIMEOUT` each. Bounded, and far better than a single
+/// slot, but not nothing.
 fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     tokio::spawn(async move {
-        // **Experiment scaffolding, to be removed once ADR-017's open gap is settled.**
-        //
-        // `VOX_SPLIT_ACCEPT=1` runs phase two on its own task instead of inline. Both
-        // shapes exist in one binary **on purpose**: the measurement that reverted the
-        // split compared runs taken at different times, and the whole question is whether
-        // the 68s/140s/247s spread belongs to the split or to a flaky long tail. One
-        // binary lets the arms be interleaved A/B/A/B in a single window, which is the
-        // only way to control for the box drifting underneath — this machine has carried
-        // 324 orphaned processes and a wedged compiler cache in one evening.
-        //
-        // Whichever arm wins, this switch goes and the loser's code goes with it. A
-        // permanent environment variable choosing between two security-relevant shapes is
-        // a configuration bug waiting to happen.
-        let split = std::env::var("VOX_SPLIT_ACCEPT").is_ok_and(|v| v == "1");
-        // Bounded, because "spawn per connection" without a ceiling is the DoS the
-        // serialised loop was protecting against by accident. At the cap an attempt is
-        // **refused**, not queued: queueing would put the wait back in the accept path and
-        // reintroduce exactly the stall being removed.
         let gate = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_IN_FLIGHT));
         loop {
             let Some(incoming) = net.manager().accept_incoming().await else {
                 break;
             };
-            if !split {
-                // **Awaited here, not spawned — ADR-017's recorded decision.** Spawning phase
-                // two is quinn's own documented shape (`finish_incoming` says "Spawn this; do
-                // not await it in an accept loop") and removes a 30s serialisation window, but
-                // ADR-017 "Open proof gap" records it measured: serialised 40-52s consistently
-                // green on `m15_two_clients_behind_symmetric_nats`, split 68s, 140s and a
-                // timeout at 247s. The unbounded case is gone either way: `finish_incoming`
-                // bounds the handshake at `HANDSHAKE_TIMEOUT`.
-                if let Some(filed) = finish_one(&net, incoming).await {
-                    if !serve_filed(&net, &tx, filed).await {
-                        break;
-                    }
-                }
-                continue;
-            }
             let Ok(permit) = Arc::clone(&gate).try_acquire_owned() else {
-                // **At capacity, and what we do here decides what a flood costs.**
-                //
-                // This codebase has never used quinn's address-validation tools —
-                // `retry`, `refuse`, `ignore` and `remote_address_validated` appear
-                // nowhere else — so today a spoofed source address costs an attacker one
-                // packet and costs us a whole handshake slot. Refusing at the cap keeps
-                // that property: 64 spoofed packets and every real peer is turned away.
-                //
-                // `retry` sends a Retry packet, which makes the client prove it can
-                // receive at the address it claims before we allocate anything. A spoofed
-                // flood cannot answer one; a real peer pays a single round trip. So the
-                // cost inverts, using quinn's own anti-amplification mechanism rather
-                // than something invented here.
-                //
-                // An already-validated peer gets `refuse` instead, because for them the
-                // honest answer is "not now" rather than another round trip.
-                //
-                // **The residual, stated rather than implied:** 64 *validated* handshakes
-                // that stall still deny service for up to `HANDSHAKE_TIMEOUT` each. That
-                // is bounded and far better than a single slot, and it is not nothing.
                 if incoming.remote_address_validated() {
                     incoming.refuse();
-                } else if incoming.retry().is_err() {
-                    // Already a retried attempt; validating it again would loop.
-                    continue;
+                } else {
+                    // `Err` means this attempt is already a retried one; retrying it again
+                    // would loop, so it is simply dropped.
+                    let _ = incoming.retry();
                 }
                 continue;
             };
@@ -800,11 +791,11 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     });
 }
 
-/// How many inbound handshakes may run at once when the accept loop is split.
+/// How many inbound handshakes may run at once.
 ///
-/// The serialised loop's ceiling is one, which is the defect. This is the same bound in
-/// spirit as [`JOINS_IN_FLIGHT`]: enough that ordinary use never reaches it, small enough
-/// that an attacker cannot make a node hold unbounded state.
+/// Inline, the ceiling was one, which was the defect. This is the same bound in spirit as
+/// [`JOINS_IN_FLIGHT`]: enough that ordinary use never reaches it, small enough that an
+/// attacker cannot make a node hold unbounded state.
 const HANDSHAKES_IN_FLIGHT: usize = 64;
 
 /// Phase two for one connection: complete the handshake and admission, or drop it.
@@ -1165,6 +1156,22 @@ pub struct Node {
     /// process only: persisting ratchet state is not part of M14, so a restart
     /// re-establishes a session on the next join or key exchange.
     sessions: BTreeMap<(Digest32, Digest32), crate::pairwise::session::Session>,
+    /// The sessions in [`Self::sessions`] that **this node opened**, and whether the
+    /// peer has been sent the hello that lets it accept them (ADR-021 F12).
+    ///
+    /// Two members can open a session to each other at the same moment — both
+    /// auto-consent when they trust each other, and each finds no session and opens
+    /// one. Each then holds its own and ignores the other's hello, and neither can
+    /// open the key the other sent. Knowing which sessions are ours is what lets both
+    /// ends apply one rule and converge: [`incoming_session_wins`].
+    initiated: BTreeMap<(Digest32, Digest32), Initiated>,
+    /// The hello each peer-opened session was accepted from, by hash, so a peer
+    /// re-sending the same hello is recognised and does not re-consume a one-time
+    /// prekey or reset a session that is already in use.
+    accepted_hello: BTreeMap<(Digest32, Digest32), Digest32>,
+    /// Sessions this node kept against a peer's competing hello, whose peer must now
+    /// be sent this node's hello so it adopts the same session; drained on the tick.
+    reopen: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// The identity's key-agreement keys (ADR-002 §2), held only while unlocked:
     /// loaded (or generated on first use) by [`crate::node::prekeys::load_or_create`]
     /// after the identity unlocks and dropped on lock, so no prekey secret is in
@@ -1304,6 +1311,9 @@ impl Node {
             syncing: std::collections::BTreeSet::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            initiated: BTreeMap::new(),
+            accepted_hello: BTreeMap::new(),
+            reopen: std::collections::BTreeSet::new(),
             prekeys: None,
             channels: BTreeMap::new(),
             clock,
@@ -1834,6 +1844,16 @@ impl Node {
         let mut mirrored_why = String::new();
         for wire in net.board_records(channel_id, epoch) {
             if let Err(e) = client.put(&wire).await {
+                // A board that already holds something newer from that member has fresher news
+                // than the copy we vouch with: nothing was refused that anyone needed. For our
+                // *own* records, above, the same answer is real and still reported.
+                if matches!(
+                    e,
+                    Error::RendezvousRejected(r)
+                        if r == crate::nat::service::RejectReason::Stale.as_str()
+                ) {
+                    continue;
+                }
                 mirrored_refused += 1;
                 if mirrored_why.is_empty() {
                     mirrored_why = e.to_string();
@@ -2635,10 +2655,18 @@ impl Node {
             // there now goes up, and what arrives later goes with the next mirror.
             self.publish_channel_to_anchors(&channel_id).await;
         }
-        self.sessions.insert((channel_id, peer), outcome.session);
+        self.adopt_join_session(channel_id, peer, outcome.session, false)
+            .await;
         if let Some(net) = self.net.as_ref() {
             net.policy().forget_joiner(&peer);
         }
+        // **Consent at admission, not on the tick** (ADR-021 F12). A room is ForwardOnly:
+        // a newcomer reads only what is sealed after the key is released to it. With the
+        // joiner already in this node's trust ring, leaving the release to the next tick
+        // opened a window in which anything this node posted was unreadable to the
+        // joiner for good. The actor is serial, so releasing here — before any later
+        // command is served — means everything posted after the join is readable.
+        self.deliver_owed_consents().await;
         let _ = self
             .event_tx
             .send(NodeEvent::PeerJoined { channel_id, peer });
@@ -3273,8 +3301,8 @@ impl Node {
         }
         // An admission changes a room's author set, the other half of the reacher join.
         self.refresh_reachers().await;
-        self.sessions
-            .insert((parsed.channel_id, responder), joined.session);
+        self.adopt_join_session(parsed.channel_id, responder, joined.session, true)
+            .await;
         // The link's anchors are this channel's anchors from now on (persisted, so a
         // restart still knows where the swarm's board is), together with our own.
         let mut learned = BootstrapSet::new();
@@ -3384,6 +3412,9 @@ impl Node {
         .await
         {
             return Outcome::Failed(fault_of(&e));
+        }
+        if hello.is_some() {
+            self.hello_delivered(channel_id, target);
         }
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
@@ -3516,7 +3547,11 @@ impl Node {
     /// act — the SKDM rides a pairwise session — so a trusted member that is
     /// offline right now is skipped, not failed, and picked up when it returns.
     async fn deliver_owed_consents(&mut self) {
-        if self.net.is_none() || self.trust.is_empty() {
+        if self.net.is_none() {
+            return;
+        }
+        self.deliver_reopens().await;
+        if self.trust.is_empty() {
             return;
         }
         let trusted = self.trust.trusted();
@@ -3630,6 +3665,9 @@ impl Node {
             .is_err()
             {
                 continue;
+            }
+            if hello.is_some() {
+                self.hello_delivered(channel_id, target);
             }
             // Recorded only after the bytes went out, so a failed delivery stays owed.
             let noted = {
@@ -4148,8 +4186,33 @@ impl Node {
     /// An existing session is never replaced: a peer cannot reset our ratchet by
     /// sending a fresh `Hello`.
     async fn accept_hello(&mut self, channel_id: Digest32, peer: Digest32, initial: &[u8]) -> bool {
-        if self.sessions.contains_key(&(channel_id, peer)) {
-            return true;
+        let key = (channel_id, peer);
+        let hello_hash = crate::hash::sha256(initial);
+        let mut replaces = false;
+        if self.sessions.contains_key(&key) {
+            // The same hello again — the peer re-sending what we already accepted. The
+            // session is the one we hold; accepting it twice would re-consume a one-time
+            // prekey and reset a ratchet that is already in use.
+            if self.accepted_hello.get(&key) == Some(&hello_hash) {
+                return true;
+            }
+            // **Two sessions for one pair** (ADR-021 F12). Keep the one both ends will
+            // keep. It used to keep whichever it held, and so did the peer — each kept its
+            // own, and neither could open the key the other sent.
+            let me = self.profile.as_ref().map(|p| p.fingerprint());
+            let existing_mine = self.initiated.contains_key(&key);
+            if let Some(me) = me {
+                if !incoming_session_wins(&me, &peer, existing_mine) {
+                    // Ours wins. The peer is holding its own, so it must be offered ours
+                    // again: until it adopts it, nothing we seal can be opened there.
+                    if let Some(i) = self.initiated.get_mut(&key) {
+                        i.hello_delivered = false;
+                    }
+                    self.reopen.insert(key);
+                    return false;
+                }
+            }
+            replaces = true;
         }
         let Ok(init) = InitialMessage::from_wire(initial) else {
             return false;
@@ -4223,8 +4286,130 @@ impl Node {
         ) else {
             return false;
         };
-        self.sessions.insert((channel_id, peer), session);
+        self.sessions.insert(key, session);
+        self.initiated.remove(&key);
+        self.reopen.remove(&key);
+        self.accepted_hello.insert(key, hello_hash);
+        if replaces {
+            // Whatever this node sent under the session it just dropped was sealed where
+            // the peer cannot open it: forget that it was delivered, so the tick re-sends
+            // the current key over the session both ends now hold.
+            self.forget_delivery(&channel_id, &peer).await;
+        }
         true
+    }
+
+    /// Forget that `peer` holds this identity's current sender key in `channel_id`, so
+    /// the next re-key round delivers it again (ADR-021 F12).
+    async fn forget_delivery(&mut self, channel_id: &Digest32, peer: &Digest32) {
+        let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
+            return;
+        };
+        let _ = shared.lock().await.forget_delivery(profile.store(), peer);
+    }
+
+    /// File the session a join just established — `mine` when this node was the joiner,
+    /// which opened it — applying the same rule as [`Self::accept_hello`] when a session
+    /// for that pair already exists (ADR-021 F12).
+    ///
+    /// A join can race an auto-consent: the member answering a join may, on its own
+    /// tick, have already opened a session to the joiner from its bundle record, because
+    /// a trust entry for the joiner predates the join. Keeping whichever arrived last on
+    /// one side and whichever arrived first on the other is exactly the split this rule
+    /// exists to prevent.
+    async fn adopt_join_session(
+        &mut self,
+        channel_id: Digest32,
+        peer: Digest32,
+        session: crate::pairwise::session::Session,
+        mine: bool,
+    ) {
+        let key = (channel_id, peer);
+        if self.sessions.contains_key(&key) {
+            let me = self.profile.as_ref().map(|p| p.fingerprint());
+            let existing_mine = self.initiated.contains_key(&key);
+            // The rule is stated for an incoming session the PEER opened; a join session
+            // this node opened wins exactly when the existing one would lose to ours.
+            let incoming_wins = match me {
+                Some(me) if mine => existing_mine || me < peer,
+                Some(me) => incoming_session_wins(&me, &peer, existing_mine),
+                None => true,
+            };
+            if !incoming_wins {
+                if existing_mine {
+                    // Ours stands: make sure the peer is offered it.
+                    if let Some(i) = self.initiated.get_mut(&key) {
+                        i.hello_delivered = false;
+                    }
+                    self.reopen.insert(key);
+                }
+                return;
+            }
+            self.forget_delivery(&channel_id, &peer).await;
+        }
+        self.sessions.insert(key, session);
+        self.accepted_hello.remove(&key);
+        self.reopen.remove(&key);
+        if mine {
+            self.initiated.insert(
+                key,
+                Initiated {
+                    initial: None,
+                    hello_delivered: true,
+                },
+            );
+        } else {
+            self.initiated.remove(&key);
+        }
+    }
+
+    /// Offer this node's hello again to every peer that kept a competing session
+    /// (ADR-021 F12), with the empty ratchet message behind it that gives the peer a
+    /// sending direction — so it adopts the session both ends will keep even when this
+    /// node owes it nothing else.
+    async fn deliver_reopens(&mut self) {
+        let pending: Vec<(Digest32, Digest32)> = self.reopen.iter().copied().collect();
+        for (channel_id, peer) in pending {
+            let Some(initial) = self
+                .initiated
+                .get(&(channel_id, peer))
+                .and_then(|i| i.initial.clone())
+            else {
+                // Nothing to offer — a session the join protocol opened, which the peer
+                // already holds.
+                self.reopen.remove(&(channel_id, peer));
+                continue;
+            };
+            let Some(conn) = self.reach_member(&channel_id, peer).await else {
+                continue;
+            };
+            let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
+                self.reopen.remove(&(channel_id, peer));
+                continue;
+            };
+            if crate::node::pairwise_stream::open_sending_direction(
+                &conn,
+                &channel_id,
+                session,
+                Some(&initial),
+            )
+            .await
+            .is_ok()
+            {
+                self.reopen.remove(&(channel_id, peer));
+                self.hello_delivered(&channel_id, peer);
+            }
+        }
+    }
+
+    /// Record that the peer now holds the hello for a session this node opened.
+    fn hello_delivered(&mut self, channel_id: &Digest32, peer: Digest32) {
+        if let Some(i) = self.initiated.get_mut(&(*channel_id, peer)) {
+            i.hello_delivered = true;
+        }
     }
 
     /// A connection to `target`: the live one if there is one, otherwise dialled
@@ -4279,7 +4464,14 @@ impl Node {
         target: Digest32,
     ) -> Option<InitialMessage> {
         if self.sessions.contains_key(&(*channel_id, target)) {
-            return None;
+            // Ours, and the peer has not yet been sent its hello — a delivery that failed
+            // after the session was opened. Offer it again, or nothing sealed under it
+            // can be opened there.
+            return self
+                .initiated
+                .get(&(*channel_id, target))
+                .filter(|i| !i.hello_delivered)
+                .and_then(|i| i.initial.clone());
         }
         let net = self.net.as_ref().map(Arc::clone)?;
         let shared = self.channels.get(channel_id).map(Arc::clone)?;
@@ -4296,6 +4488,14 @@ impl Node {
         )
         .ok()?;
         self.sessions.insert((*channel_id, target), session);
+        self.accepted_hello.remove(&(*channel_id, target));
+        self.initiated.insert(
+            (*channel_id, target),
+            Initiated {
+                initial: Some(initial.clone()),
+                hello_delivered: false,
+            },
+        );
         Some(initial)
     }
 
@@ -4423,6 +4623,9 @@ impl Node {
         // Pairwise sessions hold ratchet key material: drop them with everything else
         // (their secrets zeroize on drop).
         self.sessions.clear();
+        self.initiated.clear();
+        self.accepted_hello.clear();
+        self.reopen.clear();
         // And take the network down: a locked node has no identity to present, so it
         // must not keep serving or holding connections (M14.7d).
         self.stop_network();
