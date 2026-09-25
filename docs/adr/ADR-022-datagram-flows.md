@@ -419,3 +419,66 @@ Each proof runs on a direct path **and** on a forced-relay path.
     no app streams at all (measured). The gate bounds it at 1.5 s.
 
   Not built: the counters are not in `vox status`.
+- **M22.6** Calls on the app API (decision 8, PRD-001 R32) — **the transport a call needs, proved**.
+  The calls themselves are the decider's next project; what is proved is that app datagram flows carry
+  one. The proof is `crates/vox-tui/tests/calls_foundation_proof.rs`. Its structure:
+  - every member runs the shipped `vox daemon`;
+  - each app is a separate process (the test binary re-run as `app_role`) speaking IPC protocol 6 to
+    its own daemon: listen, accept, open with a datagram flow;
+  - voice is 160 B every 20 ms, and video runs on a second flow at the same time: 1200 B at 30 fps,
+    with every 30th frame a 24 000 B keyframe, which is larger than any datagram here (loopback's
+    16 KiB MTU carried 8000 B whole);
+  - frames carry a sequence number and the send time, on one clock.
+
+  Final tree, 2 of 2 full runs green:
+
+  | Arm | Call | Loss | p99 one-way | Other |
+  |---|---|---|---|---|
+  | Direct | 30 s | 0% | ≤ 6.0 ms (bar 20 ms) | keyframes 30/30 |
+  | Relayed | 30 s | 0% | ≤ 1.2 ms (bar 40 ms) | the call crossed the proxy-counted leg: 5520 and 5677 datagrams |
+  | Mesh | 75 s, 24 directions | 0% | ≤ 6.5 ms | every scheduled frame sent and delivered |
+
+  - **Relayed arm:** the host is on IPv6 loopback only and the guest on IPv4 only.
+  - **Mesh arm:** 4 members each open their own flows to the other 3 **at once**, so every pair's
+    daemons dial each other simultaneously. 75 s is `RETIRE_GRACE_SECS` + 15, so every call outlives
+    the moment a displaced connection would be closed.
+  - **Head-of-line, the sender pause:** one sender pausing 500 ms leaves the other direction at worst
+    0.3–1.0 ms.
+  - **Head-of-line, the black leg (R27, relayed arm):** the guest's leg to the anchor drops everything
+    for 500 ms. Its frames from that window are **lost, 0 of the call's frames arrive later than
+    150 ms**, and its frames after the blackout are on time (worst 0.7–8.2 ms).
+  - **Recorded, not bounded: the opposite direction during the black leg.** Its frames are not lost.
+    They are held and delivered late together when the leg returns: 0 frames over 40 ms in the final
+    runs, but 20.14 s → 368 ms … 20.48 s → 27 ms in one earlier run and a 46 ms worst in another.
+    - The likely cause (not instrumented): QUIC counts datagrams against the congestion window, the
+      window fills while the black leg's acknowledgements are lost, and later datagrams wait in the send
+      queue. UDP would not hold them.
+    - The fix is a congestion-control or queue-staleness decision, not a calls-path one. It is open for
+      the decider.
+    - The blackout window is excluded from both directions' p99 and reported on its own.
+
+  Mutations, each run and red for its own reason:
+  - **(a)** datagrams carried on the app stream instead (`appipc` splice): 25 black-window frames
+    delivered late, worst 829 ms; 34 frames later than 150 ms.
+  - **(b)** fragmentation disabled: keyframes 0 of 30, video loss 3.4%.
+  - The three product defects this proof found, each fixed and each mutation-checked:
+    1. **A fresh daemon refused to place calls** (`open_channel` now refreshes the app/tunnel gate).
+       The first daemon up, alone, opens to a member who is not up. Fixed: `peer unreachable`.
+       Mutation: `this node does not hold that room`, deterministically. Before the fix a call could
+       not be placed for minutes.
+    2. **App dials ran on the actor** (the `AppDial` handler now reaches on its own task, and the
+       connection returns as `NetEvent::Dialed`). One mesh member leaves and another keeps calling it;
+       a call to a member who is still there, placed while that ladder is in flight, opens in
+       0.49–0.64 ms. Mutation: 9.96 s, behind the ladder.
+    3. **App streams did not hold their connection** (`StreamInner` now holds the
+       `Arc<VoxConnection>`, as a tunnel does). Mutation: 6 of 24 mesh directions stopped about 57 s
+       into the 75 s call, at the retire grace.
+
+  **Not covered:**
+  - **The harness stops `vox serve` with SIGINT.** Killed with SIGKILL, the anchor keeps routing
+    circuits into the dead connection, and the replacement daemon cannot be reached over the relay
+    (2 of 2 runs, logs kept). That is the restart-liveness defect `prd1/restart-probe` owns.
+  - **The proof is to be run again when v0.3.0 carries that probe**, so the probe's rule and the
+    app-stream hold meet in one tree.
+  - In the dead-peer check, a member stopped by SIGINT was still answered through its old connection
+    for 15 s (`refused by the peer`) before the ladder ran. That is the same liveness gap.
