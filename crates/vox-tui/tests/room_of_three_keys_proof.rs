@@ -1,17 +1,29 @@
-//! ADR-021 F12 — **every member of a room of three reads every other**, through the
-//! shipped binaries: a real `vox node` anchor and three real `vox daemon`s.
+//! ADR-021 F12 — **every member of a room of three eventually reads every other
+//! member**, through the shipped binaries: a real `vox node` anchor and three real
+//! `vox daemon`s, every trust edge added before the daemons start, in both join orders.
 //!
-//! What F12 was: two members who opened a pairwise session to each other at the same
-//! moment each kept their own and ignored the other's hello, so neither could open the
-//! sender key the other released. It met users two ways, both covered here:
+//! ## What forward-only promises, and why an early post may stay unreadable
 //!
-//! - **joiner ↔ joiner** — bob and carol both joined alice's room; each auto-consents to
-//!   the other the moment it learns of it, and they race;
-//! - **creator → joiner with trust before the join** — alice already trusts bob when he
-//!   joins, so her tick opens a session to him while his join opens another.
+//! A room is **ForwardOnly** (ADR-006; confirmed by the decider): a member reads another
+//! member's messages from the moment that author releases its key to it, never before.
+//! Two members who both joined learn of each other only when the board brings the
+//! other's record in, and each releases its key to the other only then. A post an
+//! author makes in the second or so before it has released its key to a reader is
+//! sealed where that reader can never open it — **by design**, not by defect. So this
+//! proof does not demand that the first post be read. It demands what forward-only
+//! does promise: once the keys have flowed, **every author's later posts reach every
+//! reader**. Each author keeps posting fresh, uniquely tagged messages until each reader
+//! has rendered one of them, bounded at 60 s for every ordered pair.
 //!
-//! Every trust edge is added **before the daemons start**, which is how an operator sets
-//! up agents in advance and the case that was reported failing.
+//! What F12 was, and what this still catches: members that opened pairwise sessions to
+//! each other at the same moment each kept their own and could never open the other's
+//! key; and a host that trusted a joiner released its key only on its next tick. Either
+//! defect leaves a pair unable to read **anything**, however long the author keeps
+//! posting — which is what this asserts against.
+//!
+//! **Mutation** (`VOX_PROOF_F12_MUTATE=carol-never-trusts-bob`): carol never adds bob to
+//! her trust ring, so she never releases her key to him. The proof must then go red on
+//! exactly one ordered pair, `bob cannot read carol`.
 
 #![cfg(unix)]
 
@@ -134,32 +146,13 @@ impl Member {
         }
         Proc(child)
     }
-
-    fn reads(&self, room: &str, text: &str, secs: u64) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        while Instant::now() < deadline {
-            let (_, out, _) = self.vox(&["room", "read", room], None);
-            if out.contains(text) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        false
-    }
 }
 
-#[test]
-#[ignore = "a real anchor and three real daemons with production Argon2id; CI runs it in release"]
-fn every_member_of_a_room_of_three_reads_every_other() {
-    watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-
-    // ---- a real anchor ----
+fn spawn_anchor(root: &Path) -> (Proc, String) {
     let (a_data, a_cfg) = (root.join("anchor/data"), root.join("anchor/cfg"));
     std::fs::create_dir_all(&a_cfg).unwrap();
     let anchor_out = root.join("anchor.out");
-    let _anchor = Proc(
+    let anchor = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &a_data)
@@ -170,22 +163,31 @@ fn every_member_of_a_room_of_three_reads_every_other() {
             .expect("spawn vox node"),
     );
     let deadline = Instant::now() + Duration::from_secs(60);
-    let spec = loop {
+    loop {
         let text = std::fs::read_to_string(&anchor_out).unwrap_or_default();
         if let Some(s) = text
             .split_whitespace()
             .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
         {
-            break s.to_owned();
+            return (anchor, s.to_owned());
         }
         assert!(
             Instant::now() < deadline,
             "the anchor never printed its spec"
         );
         std::thread::sleep(Duration::from_millis(250));
-    };
+    }
+}
 
-    // ---- three identities, every trust edge added before any daemon starts ----
+/// Stand up the room with the joiners joining in `order`, then keep every author
+/// posting until every reader has rendered one of its posts, or 60 s pass.
+fn every_member_eventually_reads_every_other(order: [&'static str; 2]) {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (_anchor, spec) = spawn_anchor(root);
+    let mutate = std::env::var("VOX_PROOF_F12_MUTATE").unwrap_or_default();
+
     let members = [
         Member::new(root, "alice"),
         Member::new(root, "bob"),
@@ -194,30 +196,35 @@ fn every_member_of_a_room_of_three_reads_every_other() {
     let fps: Vec<String> = members.iter().map(Member::fingerprint).collect();
     for (i, m) in members.iter().enumerate() {
         for (j, other) in members.iter().enumerate() {
-            if i != j {
-                let (ok, _, err) = m.vox(
-                    &[
-                        "trust",
-                        "add",
-                        &fps[j],
-                        "--name",
-                        other.name,
-                        "--identity-passphrase-file",
-                        m.pass.to_str().unwrap(),
-                    ],
-                    None,
-                );
-                assert!(ok, "{} trusts {}: {err}", m.name, other.name);
+            if i == j {
+                continue;
             }
+            if mutate == "carol-never-trusts-bob" && m.name == "carol" && other.name == "bob" {
+                eprintln!("[mutation] carol never trusts bob");
+                continue;
+            }
+            let (ok, _, err) = m.vox(
+                &[
+                    "trust",
+                    "add",
+                    &fps[j],
+                    "--name",
+                    other.name,
+                    "--identity-passphrase-file",
+                    m.pass.to_str().unwrap(),
+                ],
+                None,
+            );
+            assert!(ok, "{} trusts {}: {err}", m.name, other.name);
         }
     }
     let _daemons: Vec<Proc> = members
         .iter()
         .map(|m| m.daemon(&spec, &root.join(format!("{}.err", m.name))))
         .collect();
-    let [alice, bob, carol] = &members;
+    let by_name = |n: &str| members.iter().find(|m| m.name == n).unwrap();
+    let alice = by_name("alice");
 
-    // ---- alice creates; bob and carol join ----
     let (ok, _, err) = alice.vox(&["room", "create", "--name", "mission"], Some(ROOM_PASS));
     assert!(ok, "create: {err}");
     let room = alice
@@ -232,7 +239,8 @@ fn every_member_of_a_room_of_three_reads_every_other() {
         .1
         .trim()
         .to_owned();
-    for m in [bob, carol] {
+    for name in order {
+        let m = by_name(name);
         // A join can be turned away while the room's host is busy admitting another
         // joiner — a separate, known defect, not this one. Retry it, and say so.
         let mut joined = false;
@@ -251,32 +259,52 @@ fn every_member_of_a_room_of_three_reads_every_other() {
         }
         assert!(
             joined,
-            "{} never joined — the join itself failed, which is not what this proves",
-            m.name
+            "{name} never joined — the join failed, which is not what this proves"
         );
     }
 
-    // ---- everyone speaks; everyone must read everyone ----
-    for m in &members {
-        let (ok, _, err) = m.vox(
-            &["room", "post", &room, &format!("hello from {}", m.name)],
-            None,
-        );
-        assert!(ok, "{} posts: {err}", m.name);
-    }
-    let mut missing = Vec::new();
-    for reader in &members {
-        for writer in &members {
-            if reader.name != writer.name
-                && !reader.reads(&room, &format!("hello from {}", writer.name), 90)
-            {
-                missing.push(format!("{} cannot read {}", reader.name, writer.name));
+    // Every ordered (reader, writer) pair still waiting.
+    let mut pending: Vec<(&str, &str)> = Vec::new();
+    for r in &members {
+        for w in &members {
+            if r.name != w.name {
+                pending.push((r.name, w.name));
             }
         }
     }
+    let start = Instant::now();
+    let mut round = 0u32;
+    while !pending.is_empty() && start.elapsed() < Duration::from_secs(60) {
+        round += 1;
+        // Only authors someone is still waiting on keep posting — fresh, unique tags.
+        for w in &members {
+            if pending.iter().any(|(_, pw)| *pw == w.name) {
+                let (ok, _, err) = w.vox(
+                    &["room", "post", &room, &format!("tag-{}-{round}", w.name)],
+                    None,
+                );
+                assert!(ok, "{} posts: {err}", w.name);
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        for r in &members {
+            let (_, out, _) = r.vox(&["room", "read", &room], None);
+            pending.retain(|(pr, pw)| {
+                let met = *pr == r.name && out.contains(&format!("tag-{pw}-"));
+                if met {
+                    eprintln!("[receipt] {pr} reads {pw} at {:?}", start.elapsed());
+                }
+                !met
+            });
+        }
+    }
+    let missing: Vec<String> = pending
+        .iter()
+        .map(|(r, w)| format!("{r} cannot read {w}"))
+        .collect();
     assert!(
         missing.is_empty(),
-        "F12: {missing:?}; daemon logs:\n{}",
+        "F12 (join order {order:?}): {missing:?} after 60 s of fresh posts; daemon logs:\n{}",
         members
             .iter()
             .map(|m| format!(
@@ -287,4 +315,16 @@ fn every_member_of_a_room_of_three_reads_every_other() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+#[test]
+#[ignore = "a real anchor and three real daemons with production Argon2id; CI runs it in release"]
+fn every_member_eventually_reads_every_other_bob_joins_first() {
+    every_member_eventually_reads_every_other(["bob", "carol"]);
+}
+
+#[test]
+#[ignore = "a real anchor and three real daemons with production Argon2id; CI runs it in release"]
+fn every_member_eventually_reads_every_other_carol_joins_first() {
+    every_member_eventually_reads_every_other(["carol", "bob"]);
 }
