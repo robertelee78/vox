@@ -35,6 +35,9 @@ use support::{post_raw, resource, until, Out, Worker, HARNESS_SESSION_VARS, VOX}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// How many times section (4) races two conflicting posts.
+const RACE_ROUNDS: u32 = 20;
+
 fn rows_with_op(w: &Worker, r: &str, op: &str) -> Vec<serde_json::Value> {
     let o = w.vox(None, &["room", "read", r, "--json"]);
     assert!(o.ok, "{o:?}");
@@ -292,56 +295,61 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
     );
 
     // ---- (4) two conflicting posts racing never both succeed ----
-    let spawn = |n: u32| {
-        let mut cmd = Command::new(VOX);
-        cmd.args([
-            "room",
-            "post",
-            r,
-            "--type",
-            "status",
-            "--op",
-            "op-race-conflict-4",
-            "--data",
-            &format!("{{\"n\":{n}}}"),
-            "note",
-        ])
-        .env("VOX_DATA_DIR", &alice.data)
-        .env("VOX_CONFIG_DIR", &alice.cfg)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-        for v in HARNESS_SESSION_VARS {
-            cmd.env_remove(v);
-        }
-        cmd.env("VOX_SESSION", "a1");
-        cmd.spawn().unwrap()
-    };
-    let (p1, p2) = (spawn(1), spawn(2));
-    let (o1, o2) = (
-        p1.wait_with_output().unwrap(),
-        p2.wait_with_output().unwrap(),
-    );
-    eprintln!(
-        "[receipt] racing posts: exit {:?} {:?}",
-        o1.status.code(),
-        o2.status.code()
-    );
-    assert!(
-        !(o1.status.success() && o2.status.success()),
-        "two conflicting posts under one op both reported success"
-    );
-    assert!(
-        [o1.status.code(), o2.status.code()].contains(&Some(4)),
-        "the loser of a conflicting race must exit 4: {:?} {:?}",
-        String::from_utf8_lossy(&o1.stderr),
-        String::from_utf8_lossy(&o2.stderr)
-    );
-    let entries = rows_with_op(alice, r, "op-race-conflict-4");
-    if entries.len() == 2 {
-        assert!(
-            entries.iter().all(|x| x["op"]["status"] == "conflict"),
-            "{entries:?}"
+    // Raced repeatedly: one race is a coin toss about whether the node's view was one publish
+    // behind when a racer read back (the v0.2.9 macOS gate saw both succeed once in one race).
+    for round in 0..RACE_ROUNDS {
+        let race_op = format!("op-race-conflict-4-{round}");
+        let spawn = |n: u32| {
+            let mut cmd = Command::new(VOX);
+            cmd.args([
+                "room",
+                "post",
+                r,
+                "--type",
+                "status",
+                "--op",
+                &race_op,
+                "--data",
+                &format!("{{\"n\":{n}}}"),
+                "note",
+            ])
+            .env("VOX_DATA_DIR", &alice.data)
+            .env("VOX_CONFIG_DIR", &alice.cfg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            for v in HARNESS_SESSION_VARS {
+                cmd.env_remove(v);
+            }
+            cmd.env("VOX_SESSION", "a1");
+            cmd.spawn().unwrap()
+        };
+        let (p1, p2) = (spawn(1), spawn(2));
+        let (o1, o2) = (
+            p1.wait_with_output().unwrap(),
+            p2.wait_with_output().unwrap(),
         );
+        eprintln!(
+            "[receipt] race {round}: exit {:?} {:?}",
+            o1.status.code(),
+            o2.status.code()
+        );
+        assert!(
+            !(o1.status.success() && o2.status.success()),
+            "two conflicting posts under one op both reported success"
+        );
+        assert!(
+            [o1.status.code(), o2.status.code()].contains(&Some(4)),
+            "the loser of a conflicting race must exit 4: {:?} {:?}",
+            String::from_utf8_lossy(&o1.stderr),
+            String::from_utf8_lossy(&o2.stderr)
+        );
+        let entries = rows_with_op(alice, r, &race_op);
+        if entries.len() == 2 {
+            assert!(
+                entries.iter().all(|x| x["op"]["status"] == "conflict"),
+                "{entries:?}"
+            );
+        }
     }
 }

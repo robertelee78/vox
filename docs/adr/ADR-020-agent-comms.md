@@ -1105,6 +1105,9 @@ Both unknowns are already spiked; neither remains open.
   > match; any path ending `/vox`; directory flags allowed; unknown flags; unchecked values. **Not proved:** that a trusted hook then fires in a
   > live Codex turn — that needs a model login in the isolated home, and the proof does not take the
   > operator's credentials. `vox agent plugin codex` now says to run it.
+
+  > **Named gap, 2026-09-25 — a trusted Codex hook firing in a live turn is not proved.** `codex_trust_proof` shows Codex reports Vox's entry `trusted`, through Codex's own API. It does not run a model turn, because that needs a model login inside the isolated `CODEX_HOME`, and the proof does not take the operator's credentials. Open (v0.2.10); remove when a live Codex turn in an isolated home, with credentials the operator provides for the purpose, shows the drain hook's output in the turn.
+
 - **M19.12 — the Codex mid-turn claim is corrected.** Decided 2026-09-24; **text corrected 2026-09-25** in
   §6 and M19.6, not re-measured here — it rests on Orca's and ctm's measurements, cited in place. §6 and M19.6 said
   app-server `turn/start` works mid-turn (corrected 2026-09-25). Orca measured (codex-cli 0.147.0, 0.150.1 and 0.153.4) that a

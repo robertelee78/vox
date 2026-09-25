@@ -91,6 +91,10 @@ jobs:
             brew install fish
           fi
           zsh --version && fish --version && bash --version | head -1
+      # `codex_trust_proof` asks Codex itself whether Vox's hook is trusted and refuses to pass
+      # without `codex` on PATH. Pinned to the version it was measured on (see release.yml).
+      - name: Install the Codex the trust proof measures
+        run: npm install -g @openai/codex@0.157.0 && codex --version
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Format check

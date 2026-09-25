@@ -51,6 +51,10 @@ jobs:
       # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
       # See ci.yml: the proofs measure real shells, so the runner installs them.
       - run: sudo apt-get update && sudo apt-get install -y zsh fish
+      # `codex_trust_proof` asks Codex itself whether Vox's hook is trusted, and refuses to pass
+      # without `codex` on PATH (an absent Codex is not a pass). Pinned to the version it was
+      # measured on: the app-server's `hooks/list` statuses are Codex's, not Vox's, to change.
+      - run: npm install -g @openai/codex@0.157.0 && codex --version
       - run: rustc --version && cargo --version
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
