@@ -357,13 +357,14 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   of the TLS exporter, identical at both ends, v0.2.8), with one exception: a held connection that has
   received nothing for `SILENCE_IS_DEATH` (1.5 × the 20 s keep-alive = 30 s) is dead, so a newcomer
   replaces it and it is closed; and when the held connection crosses that line later, a retired
-  connection to the same peer that is still being heard from is promoted in its place — by the node's
-  tick (`tend_liveness`) or on the next lookup (`existing`). That second half is what a restart needs: the
+  connection to the same peer that is still being heard from is promoted in its place, or, with none,
+  the silent one is closed — by a once-a-second task of its own (`tend_liveness`; not the actor's tick,
+  which a dead connection can stall for the whole idle timeout) or on the next lookup (`existing`). That second half is what a restart needs: the
   restarted process's connection usually arrives while the old one has been silent only seconds, so it
   goes to the tie-break and loses it half the time. Liveness is the count of datagrams quinn has routed
-  to the connection, sampled every tick. A live connection cannot cross the line: quinn re-arms its
+  to the connection, sampled every second. A live connection cannot cross the line: quinn re-arms its
   keep-alive on every received packet, so each end of an idle live connection hears the other at most
-  about 20 s apart, and the 10 s margin covers a round trip, a lost PING and the 1 s tick. A dead one
+  about 20 s apart, and the 10 s margin covers a round trip, a lost PING and the 1 s sampling. A dead one
   cannot vote, so both ends agree without a protocol: the restarted end holds only the new connection.
   An address rule — "a direct newcomer from a different address than the held one means the peer moved"
   — was proposed and **withdrawn**: NAT rebinding under a live process gives a live duplicate a new
@@ -371,9 +372,13 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   fixed port gives the same address; a restart onto another network a different one. Proved by
   `a_restarted_host_is_reached_through_its_anchor` (a host crash-restarted three times on the same
   address and three times on a new one, behind symmetric NATs, reached by a relayed client through the
-  anchor: in three runs, 18 of 18 restarts were reachable again within 33.7 s of the crash, the ones where
-  the new connection won the tie-break within 1–6 s; with the rule off, 4 of 6 restarts took 63.3–63.6 s,
-  QUIC's idle timeout, or never came back) and
+  anchor: in three runs, 18 of 18 restarts were reachable again within 32.3 s of the crash, the ones where
+  the new connection won the tie-break within 1.3 s; with the rule off, restarts took 63.3 s — QUIC's
+  idle timeout — or never came back), `tunnel_honesty_proof::a_forward_carries_a_new_connection_after_
+  its_host_restarts` merged onto this rule (a real `vox forward` whose host is killed: 5 of 5 carried the
+  new connection 29.9–31.2 s after the restart, against 59.1–60.3 s with the rule off or run on the
+  actor's tick, which the dead connection stalled — that gate asserts only its 300 s patience, so the
+  timing is measured, not gated) and
   `a_live_duplicate_is_decided_alike` (a member whose NAT rebinds dials the anchor twice: 0 of 24
   trials disagree; with the address rule, 12 of 24). Residual: the datagram count is taken before
   authentication, so an on-path attacker that knows a connection ID can keep a dead connection looking

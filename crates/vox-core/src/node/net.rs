@@ -307,7 +307,7 @@ pub const RETIRE_GRACE_SECS: u64 = 60;
 /// has heard nothing for 20s sends a PING, and a live peer ACKs it within a round trip and its
 /// ACK delay (25ms). Both ends run the same timer, so on an idle path each hears from the other
 /// at most about 20s apart. 30s leaves 10s for the round trip, a lost PING and its PTO
-/// retransmit, and the node's 1s tick — and is still half the idle timeout, which is the whole
+/// retransmit, and the 1s sampling — and is still half the idle timeout, which is the whole
 /// point: a restart is recognised in 30s instead of 60s.
 ///
 /// A dead connection cannot vote, which is why this needs no protocol. The end that restarted
@@ -462,11 +462,12 @@ impl ConnectionManager {
             .is_some_and(|c| Arc::ptr_eq(c, conn))
     }
 
-    /// Sample every connection's liveness and let a heard connection take over from a silent
-    /// one. The node's tick calls this, which is what keeps the silence measurement honest: a
-    /// connection sampled only when somebody asks for it would look freshly heard after any
-    /// gap, and its death would be noticed one [`SILENCE_IS_DEATH`] late. Returns how many peers
-    /// changed connection.
+    /// Sample every connection's liveness, let a heard connection take over from a silent one,
+    /// and close a silent one nothing can replace. A task of its own calls this every second —
+    /// not the actor's tick, which a dead connection can stall. Sampling on a clock is what keeps
+    /// the silence measurement honest: a connection sampled only when somebody asks for it would
+    /// look freshly heard after any gap, and its death would be noticed one [`SILENCE_IS_DEATH`]
+    /// late. Returns how many peers changed connection.
     pub fn tend_liveness(&self) -> usize {
         let peers: Vec<(Digest32, Arc<VoxConnection>)> = lock(&self.conns)
             .iter()
@@ -476,18 +477,40 @@ impl ConnectionManager {
             .iter()
             .map(|(c, _)| Arc::clone(c))
             .collect();
-        for c in &retired {
-            let _ = self.silent_for(c);
-        }
         let mut changed = 0;
         for (peer, conn) in &peers {
             if is_live(conn) && !self.is_silent(conn) {
                 continue;
             }
-            if let Some(now) = self.promote_heard(peer) {
-                if !Arc::ptr_eq(&now, conn) {
-                    changed += 1;
+            match self.promote_heard(peer) {
+                Some(now) => {
+                    if !Arc::ptr_eq(&now, conn) {
+                        changed += 1;
+                    }
                 }
+                // Nothing live to take over: close the dead one anyway. Hiding it from
+                // `existing` is not enough, because whatever is **already** waiting on it — a
+                // tunnel's stream open, a request sent into it — waits for the 60s idle
+                // timeout otherwise, and an application that sent a request just before the
+                // peer restarted is kept waiting twice as long as the rule says it should be.
+                // Closing ends those waits now, with an error their callers already handle
+                // by dialling again.
+                None => {
+                    let mut map = lock(&self.conns);
+                    if map.get(peer).is_some_and(|held| Arc::ptr_eq(held, conn)) {
+                        map.remove(peer);
+                        drop(map);
+                        conn.close(WireError::AuthenticatorInvalid);
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        // A retired connection that has gone silent is as dead as a primary one, and anything
+        // still carried on it is waiting on nothing.
+        for c in &retired {
+            if is_live(c) && self.is_silent(c) {
+                c.close(WireError::AuthenticatorInvalid);
             }
         }
         // Forget connections that are gone, so the table is bounded by what is held.
