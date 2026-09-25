@@ -218,6 +218,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::PushRetry { .. } => "retrying a push that failed",
         NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
+        NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
@@ -511,6 +512,13 @@ enum NetEvent {
         peer: Digest32,
         /// What the session did, or why it failed.
         outcome: crate::error::Result<crate::node::channel::SyncOutcome>,
+    },
+    /// A sender key written to `peer` was taken: any backoff on re-sending to it ends.
+    SkdmTaken {
+        /// The room.
+        channel_id: Digest32,
+        /// The member that took it.
+        peer: Digest32,
     },
     /// A sender key written to `peer` was not taken (see `pairwise_stream::refused`): it is owed
     /// again, and the tick re-sends it.
@@ -1628,6 +1636,10 @@ pub struct Node {
     /// Peers that were skipped behind a busy room or had a push re-owed: served first on the next
     /// pass, so a peer that always takes the room cannot always go first.
     owed_first: std::collections::BTreeSet<Digest32>,
+    /// Per `(room, member)`: consecutive keys not taken, and the unix second before which the
+    /// tick does not send it another. Without it, a pair that could not converge was sent a key
+    /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
+    key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012).
     record_seq: BTreeMap<Digest32, u64>,
@@ -1780,6 +1792,7 @@ impl Node {
             member_dialed_at: BTreeMap::new(),
             push_failures: BTreeMap::new(),
             owed_first: std::collections::BTreeSet::new(),
+            key_backoff: BTreeMap::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
             prekeys: None,
@@ -3002,11 +3015,21 @@ impl Node {
                     .lock()
                     .await
                     .note_undelivered(profile.store(), peer, chain_id);
+                // 2, 4, 8 … 64s: a refusal that cures (a session that converges, a member learnt
+                // from the board) is retried promptly, and one that does not stops costing a
+                // stream every second.
+                let now = self.now();
+                let entry = self.key_backoff.entry((channel_id, peer)).or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = now.saturating_add(1u64 << entry.0.min(6));
                 let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
                     channel_id,
                     peer,
                     why,
                 });
+            }
+            NetEvent::SkdmTaken { channel_id, peer } => {
+                self.key_backoff.remove(&(channel_id, peer));
             }
             NetEvent::PushRetry { channel_id, peer } => {
                 self.pending_push.insert(channel_id);
@@ -4132,7 +4155,17 @@ impl Node {
             }
         };
         let mut delivered = 0u64;
+        let now_secs = self.now();
         for target in owed {
+            // A member whose last keys were not taken waits out its backoff, unless a person asked.
+            if !wait
+                && self
+                    .key_backoff
+                    .get(&(*channel_id, target))
+                    .is_some_and(|(_, until)| now_secs < *until)
+            {
+                continue;
+            }
             // Open a session from the member's bundle record if none exists, and reach
             // them through the ladder rather than requiring a live connection: a re-key
             // that only reaches members this process happened to join with is the M15
@@ -4863,18 +4896,20 @@ impl Node {
     ) {
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
-            if let Some(why) =
-                crate::node::pairwise_stream::refused(sent, KEY_DELIVERY_PATIENCE).await
-            {
-                let _ = tx
-                    .send(NetEvent::SkdmRefused {
+            let event =
+                match crate::node::pairwise_stream::refused(sent, KEY_DELIVERY_PATIENCE).await {
+                    Some(why) => NetEvent::SkdmRefused {
                         channel_id,
                         peer: target,
                         chain_id,
                         why,
-                    })
-                    .await;
-            }
+                    },
+                    None => NetEvent::SkdmTaken {
+                        channel_id,
+                        peer: target,
+                    },
+                };
+            let _ = tx.send(event).await;
         });
     }
 
