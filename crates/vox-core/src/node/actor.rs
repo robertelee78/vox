@@ -120,8 +120,11 @@ const MEMBER_REDIAL_SECS: u64 = 30;
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
-/// How long building the view waits for a room a sync session holds before using that room's previous
-/// entry. A session holds a room for one protocol step at a time. See `Node::view_of`.
+/// How long building the view may wait, in total across every room, for rooms sync sessions hold
+/// before using those rooms' previous entries. A session holds a room for one protocol step at a
+/// time. One deadline for the whole view, not one per room: with `SYNCS_IN_FLIGHT` sessions each
+/// holding a room, a wait per room would park the actor for seconds on a single publish. See
+/// `Node::view_of`.
 const VIEW_LOCK_PATIENCE: Duration = Duration::from_millis(250);
 
 /// A room's detail for the view, from its state.
@@ -140,11 +143,13 @@ fn detail_of(ch: &ChannelState) -> ChannelDetail {
     }
 }
 
-/// A room's lock if it can be had within `VIEW_LOCK_PATIENCE`.
-async fn briefly<T>(m: &tokio::sync::Mutex<T>) -> Option<tokio::sync::MutexGuard<'_, T>> {
-    tokio::time::timeout(VIEW_LOCK_PATIENCE, m.lock())
-        .await
-        .ok()
+/// A room's lock if it can be had by `deadline`. A free lock is taken even once the deadline has
+/// passed: only a held one is given up.
+async fn by<T>(
+    deadline: tokio::time::Instant,
+    m: &tokio::sync::Mutex<T>,
+) -> Option<tokio::sync::MutexGuard<'_, T>> {
+    tokio::time::timeout_at(deadline, m.lock()).await.ok()
 }
 /// How long one publish round to one board may take before it is given up until the next round: a
 /// live board answers each put in milliseconds. See `publish_channel_to_anchor`.
@@ -1733,7 +1738,9 @@ pub struct Node {
     push_failures: BTreeMap<(Digest32, Digest32), u32>,
     /// Each room's view detail as this node's own latest write left it, taken under the room's lock
     /// by the write itself. `view_of` uses it when a session holds the room, so a person always sees
-    /// their own post in what they read straight after, however long that session holds on.
+    /// their own post in what they read straight after, however long that session holds on. A room's
+    /// entry is removed once a view reads the room under its lock, since that read includes the
+    /// write: an entry here is therefore always newer than the published one.
     fresh_details: BTreeMap<Digest32, ChannelDetail>,
     /// Peers that were skipped behind a busy room or had a push re-owed: served first on the next
     /// pass, so a peer that always takes the room cannot always go first.
@@ -6408,8 +6415,10 @@ impl Node {
         });
     }
 
-    async fn publish(&self) {
-        let view = self.view_of().await;
+    async fn publish(&mut self) {
+        let (view, read) = self.view_of().await;
+        self.fresh_details
+            .retain(|id, _| self.channels.contains_key(id) && !read.contains(id));
         self.view_tx.send_replace(view);
     }
 
@@ -6426,12 +6435,15 @@ impl Node {
     ///
     /// **Briefly, not never.** Since sync sessions lock a room per protocol step (3f95b57), a holder
     /// keeps it for milliseconds, not across a network wait, so the view waits up to
-    /// `VIEW_LOCK_PATIENCE` before falling back. Falling back at once served a stale view whenever a
-    /// session happened to be mid-step, and a person's own post could be missing from what they read
-    /// straight after posting: `vox room post` then read back a view without its entry, reported a
-    /// successful post as failed, and let two racing posts under one op both succeed (PR #14's
-    /// work_op proof, on macOS and Linux).
-    async fn view_of(&self) -> NodeView {
+    /// `VIEW_LOCK_PATIENCE`, in total across all rooms, before falling back. Falling back at once
+    /// served a stale view whenever a session happened to be mid-step, and a person's own post could
+    /// be missing from what they read straight after posting: `vox room post` then read back a view
+    /// without its entry, reported a successful post as failed, and let two racing posts under one
+    /// op both succeed (PR #14's work_op proof, on macOS and Linux).
+    ///
+    /// Returns the view and the rooms read under their lock.
+    async fn view_of(&self) -> (NodeView, std::collections::BTreeSet<Digest32>) {
+        let deadline = tokio::time::Instant::now() + VIEW_LOCK_PATIENCE;
         let prev = self.view_tx.borrow().clone();
         let identity = self.profile.as_ref().map(|p| IdentityInfo {
             fingerprint: p.fingerprint(),
@@ -6456,7 +6468,7 @@ impl Node {
             .unwrap_or_default();
         for a in &mut anchoring {
             if let Some(state) = self.anchored.get(&a.channel_id) {
-                a.entries = match briefly(state).await {
+                a.entries = match by(deadline, state).await {
                     Some(st) => Some(st.entries() as u64),
                     None => prev
                         .anchoring
@@ -6466,16 +6478,44 @@ impl Node {
                 };
             }
         }
+        // Each open room's lock is taken once, for both its summary and its detail.
+        let mut read = std::collections::BTreeSet::new();
+        let mut summaries = BTreeMap::new();
+        let mut open_channels = Vec::with_capacity(self.channels.len());
+        let mut mlock_active = true;
+        for (id, shared) in &self.channels {
+            let Some(ch) = by(deadline, shared).await else {
+                // The detail taken under this room's lock by this node's own latest write, if any, is
+                // newer than the one last published (see `fresh_details`): a person reads their own
+                // post (read-your-writes).
+                let newest = self
+                    .fresh_details
+                    .get(id)
+                    .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id));
+                if let Some(d) = newest {
+                    open_channels.push(d.clone());
+                }
+                mlock_active &= prev.mlock_active;
+                continue;
+            };
+            read.insert(*id);
+            summaries.insert(
+                *id,
+                ChannelSummary {
+                    channel_id: *id,
+                    local_name: Some(ch.local_name().to_owned()),
+                    open: true,
+                    entries: ch.entry_count() as u64,
+                },
+            );
+            mlock_active &= ch.mlock_active();
+            open_channels.push(detail_of(&ch));
+        }
         let mut channels = Vec::with_capacity(known.len());
         for id in &known {
             channels.push(match self.channels.get(id) {
-                Some(shared) => match briefly(shared).await {
-                    Some(ch) => ChannelSummary {
-                        channel_id: *id,
-                        local_name: Some(ch.local_name().to_owned()),
-                        open: true,
-                        entries: ch.entry_count() as u64,
-                    },
+                Some(_) => match summaries.remove(id) {
+                    Some(summary) => summary,
                     None => prev
                         .channels
                         .iter()
@@ -6496,31 +6536,8 @@ impl Node {
                 },
             });
         }
-        let mut open_channels = Vec::with_capacity(self.channels.len());
-        let mut mlock_active = true;
-        for (id, shared) in &self.channels {
-            let Some(ch) = briefly(shared).await else {
-                // The detail taken under this room's lock by this node's own latest write, if any, is
-                // newer than the one last published: a person reads their own post (read-your-writes).
-                // Whichever is newer: a later publish may have read the room after that write. A room's
-                // timeline only grows, so the longer one is the newer.
-                let published = prev.open_channels.iter().find(|d| d.channel_id == *id);
-                let newest = match (self.fresh_details.get(id), published) {
-                    (Some(f), Some(p)) if p.timeline.len() > f.timeline.len() => Some(p),
-                    (Some(f), _) => Some(f),
-                    (None, p) => p,
-                };
-                if let Some(d) = newest {
-                    open_channels.push(d.clone());
-                }
-                mlock_active &= prev.mlock_active;
-                continue;
-            };
-            mlock_active &= ch.mlock_active();
-            open_channels.push(detail_of(&ch));
-        }
         let (relayed_peers, relaying) = self.path_view();
-        NodeView {
+        let view = NodeView {
             identity,
             locked,
             mlock_active,
@@ -6545,7 +6562,8 @@ impl Node {
                 .net
                 .as_ref()
                 .map_or(0, |net| net.manager().peers().len()),
-        }
+        };
+        (view, read)
     }
 
     /// Whether the connections and circuits the published view shows are no longer the ones
