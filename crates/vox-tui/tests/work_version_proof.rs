@@ -61,7 +61,7 @@ fn claims_by(w: &Worker, reader: &Worker, r: &str) -> usize {
 }
 
 #[test]
-#[ignore = "two networked nodes, production Argon2id, and a published release; CI runs it in release"]
+#[ignore = "two networked nodes and production Argon2id; CI runs it in release"]
 fn a_worker_on_another_version_is_refused_by_name() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
