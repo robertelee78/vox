@@ -417,11 +417,17 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
       restarts on the same port and then on a new port. A message posted while it was down and one
       it posts once back must cross within 10 s of it answering.
     - **Mutation, nothing persisted:** red. Neither message crossed in 60 s in either case.
-    - **Not yet within 10 s on this base.** Both directions took 29.4–30.1 s: the survivor's old
-      connection to the dead process holds its sync for the room until `SILENCE_IS_DEATH` promotes
-      the new one. With `prd1/restart-probe`'s 582f18a (a held connection is probed when a newcomer
-      is filed) applied as well, the same gate measured 0.23–0.38 s, 2 of 2. The bar is met only
-      once that change is merged with this one.
+    - **Not within 10 s on this base; not DONE.** The 10 s bar must be met through
+      `prd1/restart-probe` (582f18a, 3d7ab3f), which is to reach v0.3.0 through v0.2.10. Until
+      then the gate is red here. Measured:
+      - this branch alone: 0 of 2 within 10 s. Both directions took 29.4–30.1 s. With timestamps,
+        the surviving member's push to the dead process held the room's sync for 30.45 s (same
+        port) and 30.64 s (new port), until `SILENCE_IS_DEATH` closed that connection. Meanwhile it
+        refused the restarted member's sync and all 3 of its retries, which were spent in the first
+        200 ms;
+      - with 4742e0c, 582f18a and 3d7ab3f cherry-picked over it (evidence only, not on this
+        branch): 2 of 2, 0.35–0.38 s. With 582f18a alone: 2 of 2, 0.23–0.38 s;
+      - the nothing-persisted mutation: red in both builds, with neither message crossing in 60 s.
   - **A retired connection is let go (2026-09-25, v0.2.9).** "Closed by the node's tick" did not
     happen. `retire_expired` closes a retired connection once the grace is up **and** nothing holds its
     `Arc` — the strong count is how a path still carrying a tunnel is told from one that is not — and
