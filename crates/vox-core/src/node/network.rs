@@ -597,9 +597,11 @@ impl NodeNet {
                 //
                 // `ask_observed` returns a `Result` and its callers tolerate failure,
                 // falling back to local endpoints.
+                //
+                // Asked of the connection, not the mux table: a circuit the table has since
+                // detached still left a synthetic address here (V29-15).
                 let remote = conn.quinn().remote_address();
-                let observed =
-                    (!self.manager.endpoint().is_circuit(remote)).then(|| Multiaddr::from(remote));
+                let observed = (!conn.via_circuit()).then(|| Multiaddr::from(remote));
                 let manager = Arc::clone(&self.manager);
                 match coordstream::serve_coord(
                     peer,
