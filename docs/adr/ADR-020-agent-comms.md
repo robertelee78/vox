@@ -433,7 +433,7 @@ conventions and vocabulary; a hook guarantees the read.
 | Harness | Drain at turn start | Push into a live session |
 | --- | --- | --- |
 | Claude Code | `UserPromptSubmit` hook returning `hookSpecificOutput.additionalContext` | `CLAUDE_CODE_MESSAGING_SOCKET` (between tool calls; new turn if idle) |
-| Codex | `UserPromptSubmit` hook; plain stdout becomes `additionalContext`. **MUST** be synchronous (`async: true` is observation-only) | `turn/start` — ungated, valid both idle and mid-turn at `rust-v0.155.1` |
+| Codex | `UserPromptSubmit` hook; plain stdout becomes `additionalContext`. **MUST** be synchronous (`async: true` is observation-only) | `turn/start` when idle. **Mid-turn, `turn/start` is accepted but folded into the running turn** (no new turn; measured by Orca on codex-cli 0.147.0, 0.150.1 and 0.153.4), so a mid-turn delivery uses `turn/steer` with `expectedTurnId` (ctm's path). Corrected 2026-09-25 (M19.12); this row said "`turn/start` — ungated, valid both idle and mid-turn at `rust-v0.155.1`" |
 | OpenCode | plugin `chat.message`, mutating `output.parts` | `POST /session/:id/prompt_async` — valid mid-turn |
 
 Claude Code and Codex share the hook name *and* the injection field, so one mechanism covers both.
@@ -887,7 +887,9 @@ Both unknowns are already spiked; neither remains open.
     ```
 
     The binary documents this form itself, so it is an affordance rather than an internal.
-  - **Codex** — app-server `turn/start` over JSON-RPC, which works mid-turn.
+  - **Codex** — app-server `turn/start` over JSON-RPC when the thread is idle; mid-turn, `turn/start` is
+    folded into the running turn rather than starting one, so delivery into a running turn is `turn/steer`
+    with `expectedTurnId`. (Corrected 2026-09-25, M19.12: this said `turn/start` "works mid-turn".)
   - **OpenCode** — `POST /session/:id/prompt_async`, also mid-turn; `noReply: true` appends
     *without* waking the model. A bare `opencode` has no TCP listener, so this needs the in-process
     plugin to relay it.
@@ -965,7 +967,8 @@ Both unknowns are already spiked; neither remains open.
   grant trust the way Codex's own "trust all" does — app-server `hooks/list`, then `config/batchWrite` of
   the entry's `trusted_hash` — as ctm and Orca both do, and **MUST** re-grant it when a new binary
   changes the hash.
-- **M19.12 — the Codex mid-turn claim is corrected.** Decided 2026-09-24, not built. §6 and M19.6 say
+- **M19.12 — the Codex mid-turn claim is corrected.** Decided 2026-09-24; **text corrected 2026-09-25** in
+  §6 and M19.6, not re-measured here — it rests on Orca's and ctm's measurements, cited in place. §6 and M19.6 say
   app-server `turn/start` works mid-turn. Orca measured (codex-cli 0.147.0, 0.150.1 and 0.153.4) that a
   mid-turn `turn/start` is **folded into the running turn**, and ctm delivers mid-turn with `turn/steer`
   and `expectedTurnId`. The text **MUST** say so, and any Codex wake **MUST** use `turn/steer` for a
