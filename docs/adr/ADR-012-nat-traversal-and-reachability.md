@@ -530,6 +530,21 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   UPnP-IGD was built the same day, M15.1c — its validation against real router hardware is pending,
   the network it was built on having no UPnP device to answer.)
 
+- **A failed publish round is not retried on its own — gap identified, fix parked, NOT built into
+  main (2026-09-25).** A round of a room's records to a board ends without them when the stream will not
+  open, a put dies on the transport, or the board answers nothing within `ANCHOR_PUBLISH_PATIENCE`.
+  Nothing then schedules another round; the next comes only from a trigger (the board growing, a sync
+  that applied entries, a join, the room reopening, `AnchorConnected`, address discovery), and a host with
+  a new room and nobody in it has none. A fix — retry per (room, board) at 1, 2, 4 … 30 s, jittered,
+  until a round finishes; cancelled if the room or board goes — is parked on `prd1/publish-retries`,
+  unmerged, because no staging makes the current code lose a room: a round that times out on a stalled
+  but surviving connection still lands when QUIC delivers the finished stream (12.0 s and 12.4 s after a
+  stalled anchor resumed, both logging the failed round), and a replaced connection republishes through
+  `AnchorConnected`. A lost round needs a surviving connection, nothing in flight and no trigger, which
+  nothing outside the product can force. One unexplained join in the relayed-restart gate found its
+  anchor's board without the room (1 in 12 runs, none in 60 focused publish-landing trials); it is
+  tracked as a lost event, not attributed to this gap.
+
 - **A dial that failed reported nothing (2026-09-23).** Connecting runs the ladder with all of its
   timeouts and the actor may not await that, so every dial is spawned and its result returned through
   a channel. Three of those spawns kept the connection on success and dropped the `Err`: the startup

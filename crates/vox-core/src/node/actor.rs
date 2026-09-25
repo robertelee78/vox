@@ -164,6 +164,20 @@ async fn by<T>(
 /// How long one publish round to one board may take before it is given up until the next round: a
 /// live board answers each put in milliseconds. See `publish_channel_to_anchor`.
 const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
+
+/// How long after its `failures`-th failure in a row a `(room, board)` publish is retried: 1, 2, 4,
+/// 8, 16, then 30s for good — each **shortened** by up to a quarter at random, so rooms that failed
+/// to one board together spread their retries out and the cap is never exceeded. See
+/// `note_publish_round`.
+fn publish_retry_after(failures: u32) -> Duration {
+    let base =
+        Duration::from_secs(1u64 << failures.saturating_sub(1).min(5)).min(PUBLISH_RETRY_CAP);
+    let jitter = crate::identity::rng::random_array::<1>().map_or(0, |b| b[0]);
+    base.mul_f64(1.0 - f64::from(jitter) / 255.0 / 4.0)
+}
+
+/// The longest a failed publish waits before it is tried again.
+const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
 /// How long a delivered sender key may go unanswered before it is counted as not taken and sent
 /// again. See `pairwise_stream::refused`.
 const KEY_DELIVERY_PATIENCE: Duration = Duration::from_secs(30);
@@ -288,6 +302,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::PushRetry { .. } => "retrying a push that failed",
         NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
         NetEvent::PublishDone { .. } => "filing what a board said to a publish",
+        NetEvent::PublishRetry { .. } => "retrying a publish round that failed",
         NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
@@ -610,6 +625,17 @@ enum NetEvent {
         board: Digest32,
         /// Each kind of record and the board's refusal of it, if any.
         outcomes: Vec<(&'static str, Option<String>)>,
+        /// Whether the round **failed** rather than finished: the stream would not open, a put
+        /// died on the transport, or the board answered nothing within `ANCHOR_PUBLISH_PATIENCE`.
+        /// A refusal is an answer, not a failure — retrying one would be asked the same thing.
+        failed: bool,
+    },
+    /// A failed publish round's backoff is up: try that `(room, board)` again.
+    PublishRetry {
+        /// The room.
+        channel_id: Digest32,
+        /// The board.
+        board: Digest32,
     },
     /// A push whose session failed is due again for that peer — sent after a short random wait by
     /// the `SyncDone` handler, so two ends that collided do not retry together.
@@ -1730,6 +1756,9 @@ pub struct Node {
     publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// Publishes asked for while that `(room, board)` round was in flight: run when it ends.
     publish_again: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// `(room, board)` pairs whose last publish round **failed**, with how many times in a row. A
+    /// retry for each is scheduled on a backoff; see [`publish_retry_after`].
+    publish_failures: std::collections::BTreeMap<(Digest32, Digest32), u32>,
     /// Creates and joins answered once their room's publish rounds have ended: see
     /// `answer_when_published`.
     publish_waiters: Vec<(Digest32, oneshot::Sender<Outcome>, Outcome)>,
@@ -1930,6 +1959,7 @@ impl Node {
             publish_owed: std::collections::BTreeSet::new(),
             publishing: std::collections::BTreeSet::new(),
             publish_again: std::collections::BTreeSet::new(),
+            publish_failures: std::collections::BTreeMap::new(),
             publish_waiters: Vec::new(),
             push_now: false,
             member_dialed_at: BTreeMap::new(),
@@ -2537,10 +2567,17 @@ impl Node {
             let conn = &conn;
             let round = async {
                 let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
-                // A stream that will not open is the next round's business, as it always was.
-                let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await else {
-                    return outcomes;
+                // **A stream that will not open is a failed round, and says so.** It used to return
+                // no outcomes at all — "the next round's business" — which reported nothing and, for
+                // a room nothing else triggers a publish for, left it off that board indefinitely.
+                let client = match crate::nat::service::RendezvousClient::open(conn).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        outcomes.push(("this publish round", Some(format!("no stream: {e}"))));
+                        return (outcomes, true);
+                    }
                 };
+                let mut client = client;
                 // **Said, not swallowed.** A refused bundle is a member no other member can admit as a
                 // log author; each kind's outcome is carried, success as well as failure, so a refusal
                 // that *stops* clears its memo below.
@@ -2554,7 +2591,7 @@ impl Node {
                         matches!(&result, Err(e) if !matches!(e, Error::RendezvousRejected(_)));
                     outcomes.push((kind, result.err().map(|e| e.to_string())));
                     if dead {
-                        return outcomes;
+                        return (outcomes, true);
                     }
                 }
                 // And every other member's records this node's board holds: an anchor learns a
@@ -2566,6 +2603,7 @@ impl Node {
                 // `publishing` is what holds it back now.
                 let mut mirrored_refused = 0usize;
                 let mut mirrored_why = String::new();
+                let mut mirrored_dead = false;
                 for wire in &mirrored {
                     match client.put(wire).await {
                         Ok(()) => {}
@@ -2580,6 +2618,7 @@ impl Node {
                                 mirrored_why = e.to_string();
                             }
                             if dead {
+                                mirrored_dead = true;
                                 break;
                             }
                         }
@@ -2591,23 +2630,28 @@ impl Node {
                     (mirrored_refused > 0)
                         .then(|| format!("{mirrored_refused} refused, first: {mirrored_why}")),
                 ));
-                outcomes
+                (outcomes, mirrored_dead)
             };
-            let outcomes = match tokio::time::timeout(ANCHOR_PUBLISH_PATIENCE, round).await {
-                Ok(outcomes) => outcomes,
-                Err(_) => vec![(
-                    "this publish round",
-                    Some(format!(
-                        "the board answered nothing within {}s",
-                        ANCHOR_PUBLISH_PATIENCE.as_secs()
-                    )),
-                )],
-            };
+            let (outcomes, failed) =
+                match tokio::time::timeout(ANCHOR_PUBLISH_PATIENCE, round).await {
+                    Ok(done) => done,
+                    Err(_) => (
+                        vec![(
+                            "this publish round",
+                            Some(format!(
+                                "the board answered nothing within {}s",
+                                ANCHOR_PUBLISH_PATIENCE.as_secs()
+                            )),
+                        )],
+                        true,
+                    ),
+                };
             let _ = tx
                 .send(NetEvent::PublishDone {
                     channel_id: cid,
                     board: board_id,
                     outcomes,
+                    failed,
                 })
                 .await;
         });
@@ -2633,6 +2677,37 @@ impl Node {
         }
         self.publish().await;
         let _ = reply.send(outcome);
+    }
+
+    /// Keep a failed publish round from being the last word for that `(room, board)`.
+    ///
+    /// **A failed round used to be retried only if something else asked for a publish.** The next
+    /// round came from a trigger — the board growing, a sync that applied entries, a join, the room
+    /// reopening, the anchor connecting again — and a host that has just created a room, with nobody
+    /// in it yet, has none of those. If its first round to its anchor failed (a stream that would
+    /// not open, a put that died, a board that answered nothing within `ANCHOR_PUBLISH_PATIENCE`), the
+    /// room stayed off that board, and a joiner reaching the board found nothing for the room.
+    ///
+    /// So a failed round schedules its own retry, per `(room, board)`: after 1, 2, 4 … up to 30s
+    /// ([`publish_retry_after`]), jittered so many rooms failing to one board together do not retry
+    /// together, until a round finishes. A round that finished — even one the board refused — clears
+    /// the count: a refusal is an answer, and asking again would get the same one. One retry is
+    /// pending per pair at most; the event carries only the pair, and [`NetEvent::PublishRetry`]
+    /// drops it if the room or the board has gone meanwhile.
+    fn note_publish_round(&mut self, channel_id: Digest32, board: Digest32, failed: bool) {
+        let key = (channel_id, board);
+        if !failed {
+            self.publish_failures.remove(&key);
+            return;
+        }
+        let failures = self.publish_failures.entry(key).or_insert(0);
+        *failures = failures.saturating_add(1);
+        let wait = publish_retry_after(*failures);
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let _ = tx.send(NetEvent::PublishRetry { channel_id, board }).await;
+        });
     }
 
     /// What a board said to one publish round (`NetEvent::PublishDone`), reported the way a
@@ -3309,9 +3384,11 @@ impl Node {
                 channel_id,
                 board,
                 outcomes,
+                failed,
             } => {
                 self.publishing.remove(&(channel_id, board));
                 self.report_publish(&channel_id, board, outcomes);
+                self.note_publish_round(channel_id, board, failed);
                 if !self.publishing.iter().any(|(room, _)| *room == channel_id) {
                     let (ready, waiting): (Vec<_>, Vec<_>) =
                         std::mem::take(&mut self.publish_waiters)
@@ -3333,6 +3410,21 @@ impl Node {
                 }
                 // A session with that board for this room was held back while the round ran.
                 self.push_now = true;
+            }
+            NetEvent::PublishRetry { channel_id, board } => {
+                // **Cancelled if the room or the board has gone.** A room closed since, or a board
+                // this node no longer holds a connection to, is not retried: the board is published
+                // to again by `AnchorConnected` when it comes back, and a closed room has nothing to
+                // publish. Its failure count goes with it.
+                let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
+                match conn {
+                    Some(conn) if self.channels.contains_key(&channel_id) => {
+                        self.publish_channel_to_anchor(&channel_id, &conn).await;
+                    }
+                    _ => {
+                        self.publish_failures.remove(&(channel_id, board));
+                    }
+                }
             }
             NetEvent::SkdmTaken { channel_id, peer } => {
                 self.key_backoff.remove(&(channel_id, peer));
