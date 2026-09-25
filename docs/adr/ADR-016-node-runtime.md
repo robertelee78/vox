@@ -266,6 +266,22 @@ Two supporting facts follow from moving it:
   stored pre-join / bundle records (each embeds the full composite key), so it verifies and stores
   entries it can never read.
 
+  **A peer skipped behind a busy room is owed, not synced (2026-09-24).** One session per room runs
+  at a time — that is the deadlock guard, and it is per room rather than per `(room, peer)` because a
+  per-peer mark lets three nodes each hold their room's lock for a session with the next and wait in a
+  cycle. The schedule used to record a peer skipped for that reason as synced, at the same instant as
+  the peer that took the room, so the two came due together forever and the same one lost every round.
+  With an anchor whose fingerprint sorted first for both members, both direct legs lost to anchor legs
+  that were failing, and the room never synced: `node_m15_anchor_gate` red about half the time in CI
+  since before v0.2.5, deterministically red with the order forced. A skipped room is now retried on
+  the next tick. Forced-order measurement: v0.2.7 red 2/2; the fix green with both messages seen
+  **2.05s** after sending — and a first version of the fix, which lost the owed push at the end of the
+  pass, green at **32.09s**, one full interval late. Pass/fail could not tell those two apart; the
+  latency could.
+
+  Still open: the member→anchor session in that gate fails every time (`sync failed: transport`),
+  in greens as well as reds; and opening a stream has no deadline.
+
 ### Milestones and gates
 
 Each milestone ships complete and is proven by an automated test that exercises the composed

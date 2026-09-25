@@ -616,6 +616,11 @@ mechanism is a hypothesis, and the only thing that ever separated them was a mea
 
 ## Root cause of `service_rehearsal_proof:490`: a host serves one joiner, then no one for 30s (2026-09-23)
 
+> **CLOSED 2026-09-24 (v0.2.8)** — the accept loop no longer serialises handshakes; see ADR-017
+> "Open proof gap" for the change and its measurement. `service_rehearsal_proof` is back in the
+> blocking `--ignored` step of `release.yml` (3/3 locally), and `order4.sh`'s second joiner is in
+> 5/5 where pristine `main` locked it out 5/5.
+
 `:490` — "the stranger must still be able to JOIN" — is **not** a flaky proof and **not** about the
 stranger. It reproduces deterministically with two joiners and no trust involved at all:
 

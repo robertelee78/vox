@@ -12,9 +12,12 @@
 //! - **One current record per `(author, channel, epoch)`.** A newly admitted record
 //!   replaces the prior one; there is never more than one current record per author.
 //! - **Monotone freshness.** A replacement must strictly advance both `seq` and
-//!   `timestamp`; an equal-or-older `(seq, timestamp)` is a replay and is rejected.
-//! - **Rate floor.** A refresh faster than [`MIN_REFRESH_SECS`] is rejected
-//!   (bounds rendezvous-record spam even from a joined member).
+//!   `timestamp`; an equal-or-older `(seq, timestamp)` is a replay and is rejected — except a
+//!   record making the same claim as the held one inside the refresh floor, which is already held.
+//! - **Rate floor.** A *refresh* — the same claim re-announced — inside [`MIN_REFRESH_SECS`] is a
+//!   no-op: the held record stands and nothing is reported. A *changed* claim (new endpoints, new
+//!   prekeys) is accepted as soon as it is strictly newer, which the monotone timestamp bounds to
+//!   one per second per author.
 //! - **TTL.** Member records carry a `ttl_secs` capped at [`MAX_TTL_SECS`]; pre-join
 //!   records (no TTL field, ADR-012) get [`DEFAULT_TTL_SECS`]. Expired records are
 //!   never served and are pruned.
@@ -98,7 +101,61 @@ fn bundle_expiry(rec: &MemberBundleRecord) -> u64 {
 }
 
 /// Shared freshness checks for a replacement against the current record's
-/// `(seq, timestamp)`. Enforces strict monotonicity and the refresh-rate floor.
+/// `(seq, timestamp)`: strict monotonicity, so a record is never replaced by an older one and
+/// an author can change its claim at most once a second.
+///
+/// **The refresh floor governs refreshes, not changes.** [`MIN_REFRESH_SECS`] is ADR-012's cap
+/// on how often a member re-announces; the callers apply it to a record whose claim is the same
+/// as the held one, where arriving early makes it a no-op. It is not applied here, to a record
+/// whose claim *changed*, because that is where it did harm: a node publishes its first address
+/// record before its address discovery finishes, so the first record is loopback-only, and the
+/// update carrying its routable address arrived seconds later and was refused for a minute — 62
+/// times in one measured session, the node unreachable from any other machine meanwhile. Its
+/// updated prekey bundle was refused the same way, 131 times. ADR-012 called that refusal benign
+/// because "the previous announcement is still live"; the previous announcement was the wrong one.
+/// A changed claim is still bounded to one per second per author by the strict timestamp, and
+/// the board keeps one current record per author, so the anti-spam bound stands.
+///
+/// **Not reached for a record identical to the one held**: the callers accept that as a no-op
+/// first. A board is re-offered records it already has all the time — a member vouching for
+/// another re-sends that member's record to every board it knows, and every board growth
+/// triggers the round again — and treating an exact duplicate as a replay made each of them a
+/// refusal. Measured through the real binaries: 122 of 123 board refusals in one session were
+/// records the board already held, and each was reported to the person as "a board would not
+/// take our member bundle".
+///
+/// "The same" means the same **claim**, not the same bytes: a node re-signs its own record with a
+/// fresh `seq` and `timestamp` every time it publishes, so its own republish never matches byte for
+/// byte, and comparing bytes removed almost none of the false reports. Accepting a same-claim
+/// record as a no-op leaves the board exactly as refusing it did — the held record, its timestamp
+/// and its expiry are untouched — so the only thing that changes is that nobody is told a board
+/// refused what it already has. A record whose claim **differs** still meets every check below,
+/// and a changed claim refused for arriving too soon is still reported, because that one is real.
+fn same_member_claim(cur: &RendezvousRecord, new: &RendezvousRecord) -> bool {
+    cur.author_id == new.author_id
+        && cur.channel_id == new.channel_id
+        && cur.epoch == new.epoch
+        && cur.endpoints == new.endpoints
+        && cur.ttl_secs == new.ttl_secs
+}
+
+/// See [`same_member_claim`].
+fn same_bundle_claim(cur: &MemberBundleRecord, new: &MemberBundleRecord) -> bool {
+    cur.author_id == new.author_id
+        && cur.channel_id == new.channel_id
+        && cur.epoch == new.epoch
+        && cur.prekey_bundle == new.prekey_bundle
+        && cur.ttl_secs == new.ttl_secs
+        && cur.admission == new.admission
+}
+
+/// See [`same_member_claim`].
+fn same_prejoin_claim(cur: &PreJoinRecord, new: &PreJoinRecord) -> bool {
+    cur.asserted_pubkey == new.asserted_pubkey
+        && cur.channel_id == new.channel_id
+        && cur.prekey_bundle == new.prekey_bundle
+        && cur.endpoints == new.endpoints
+}
 fn check_replacement(new_seq: u64, new_ts: u64, cur_seq: u64, cur_ts: u64) -> Result<()> {
     if new_seq <= cur_seq {
         return Err(Error::RendezvousRejected("non-increasing seq (replay)"));
@@ -108,12 +165,13 @@ fn check_replacement(new_seq: u64, new_ts: u64, cur_seq: u64, cur_ts: u64) -> Re
             "non-increasing timestamp (replay)",
         ));
     }
-    if new_ts < cur_ts.saturating_add(MIN_REFRESH_SECS) {
-        return Err(Error::RendezvousRejected(
-            "refresh faster than minimum interval",
-        ));
-    }
     Ok(())
+}
+
+/// Whether a same-claim record arrived inside the [`MIN_REFRESH_SECS`] floor, which makes it a
+/// no-op rather than a renewal.
+fn within_refresh_floor(new_ts: u64, cur_ts: u64) -> bool {
+    new_ts < cur_ts.saturating_add(MIN_REFRESH_SECS)
 }
 
 /// Common time-sanity checks applied to every incoming record before it can be
@@ -199,6 +257,11 @@ impl RendezvousStore {
 
         // 4. Freshness vs the current record for this author (if any).
         if let Some(cur) = bucket.get(&record.author_id) {
+            if same_member_claim(cur, &record)
+                && within_refresh_floor(record.timestamp, cur.timestamp)
+            {
+                return Ok(()); // already held: see `check_replacement`
+            }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
         } else if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
             // New author would exceed the bucket cap: only admit if pruning expired
@@ -253,6 +316,11 @@ impl RendezvousStore {
 
         // 4. Freshness vs the current bundle for this author (if any).
         if let Some(cur) = bucket.get(&record.author_id) {
+            if same_bundle_claim(cur, &record)
+                && within_refresh_floor(record.timestamp, cur.timestamp)
+            {
+                return Ok(()); // already held: see `check_replacement`
+            }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
         } else if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
             bucket.retain(|_, r| now < bundle_expiry(r));
@@ -344,6 +412,11 @@ impl RendezvousStore {
 
         // 3. Freshness vs the current record for this asserted identity.
         if let Some(cur) = bucket.get(&asserted_id) {
+            if same_prejoin_claim(cur, &record)
+                && within_refresh_floor(record.timestamp, cur.timestamp)
+            {
+                return Ok(()); // already held: see `check_replacement`
+            }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
         } else if bucket.len() >= MAX_PREJOIN_PER_CHANNEL {
             bucket.retain(|_, r| now < prejoin_expiry(r));

@@ -425,6 +425,33 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   three-process room actually produces are `rejected: policy` (the floor, benign) and `rejected: author is
   not a channel member` (the vouching rule, ADR-016 M15.2a), and telling them apart is what found the
   board-growth defect recorded there.
+- **The refresh floor was not benign, and `policy` was hiding it (2026-09-24).** The paragraph above
+  calls a refresh-floor decline benign because "the previous announcement is still live". Measured
+  through the real binaries with the board's reasons printed, the previous announcement was the wrong
+  one. A node publishes its first address record before its address discovery finishes, so that record
+  is loopback-only; the update carrying its routable address arrived seconds later and was refused for
+  the rest of the 60 s floor — **62 times in one short session**, the node unreachable from any other
+  machine meanwhile. Updated prekey bundles were refused the same way, **131 times**. And of 123
+  `rejected: policy` reports before any change, **122 were records the board already held** (the same
+  record re-offered by a vouching mirror, or a node re-signing its own unchanged record), each told to the
+  person as "a board would not take our member bundle". `policy` is the wire code for every reason but
+  two, so none of this was distinguishable from outside.
+
+  The cap is now applied to what it was written for — *refreshing* an announcement — and not to changing
+  one. A record whose claim (endpoints, prekeys, TTL, admission) matches the held one inside the floor is
+  a no-op success: the held record, its timestamp and its expiry are untouched, exactly as a refusal left
+  them, and nobody is told a board refused what it already has. A record whose claim **changed** is
+  accepted as soon as it strictly advances `(seq, timestamp)`, which bounds it to one per second per
+  author; the board keeps one current record per author, so the anti-spam bound in §"Caps" stands.
+  A non-advancing `(seq, timestamp)` now has its own wire code, `Stale` (6), instead of `policy`: for a
+  record a node mirrors on another member's behalf it means the board already has fresher news and is
+  not reported; for the node's own record it means the board holds something newer from us, which is
+  real and still is.
+
+  Measured after, same scenario: `refresh faster than minimum interval` refusals **193 → 0**, and the
+  person-facing "a board would not take …" lines **4** and **0** in two runs, the four all transport
+  failures of the stream itself (a connection the other end had retired — the duplicate-connection
+  tie-break fixed alongside), none of them a board refusing a record.
 - **Known gaps, after rung 4 (2026-09-20).** The ladder is complete and every rung is proved against a
   middlebox that behaves like the real one. What remains is around it, not in it: a helper (coordinator or
   relay) must already be connected to both peers, and is found by trial over current connections —
