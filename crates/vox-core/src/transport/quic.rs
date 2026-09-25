@@ -220,13 +220,18 @@ pub const DEFAULT_UDP_PAYLOAD: u16 = 1_452;
 /// loopback proof pinned the dialler at 1200.
 ///
 /// So the larger ceiling is taken only when the buffer the OS actually granted is at least the
-/// one it was measured with. Linux reports double the value set (it counts its own bookkeeping),
-/// so a granted request reads as 8 MiB there and a capped one as about 416 KiB; macOS reports
-/// what it granted. Anything short of [`UDP_SOCKET_BUFFER`] keeps quinn's default ceiling, which
-/// is what every other QUIC endpoint on that host runs with.
+/// one it was measured with, read back in each OS's own units ([`GRANTED_WHEN_FULL`]):
+/// - **Linux** reports twice what it granted (it counts its own bookkeeping): the read-back is
+///   `2 × min(requested, net.core.rmem_max)`. A full grant reads as 8 MiB, and a cap at the
+///   default reads as about 416 KiB. Comparing against 4 MiB there would be wrong: a host with
+///   `rmem_max` between 2 and 4 MiB reads back 4–8 MiB and would take 8192 on half the buffer.
+/// - **Other platforms** (macOS) report what they granted.
+///
+/// Anything short keeps quinn's default ceiling, which is what every other QUIC endpoint on that
+/// host runs with.
 #[must_use]
 pub fn mtu_ceiling_for(effective: usize) -> (u16, &'static str) {
-    if effective >= UDP_SOCKET_BUFFER {
+    if effective >= GRANTED_WHEN_FULL {
         (
             MAX_UDP_PAYLOAD,
             "the receive buffer takes a burst of 8192-byte datagrams",
@@ -239,6 +244,14 @@ pub fn mtu_ceiling_for(effective: usize) -> (u16, &'static str) {
         )
     }
 }
+
+/// What `SO_RCVBUF` reads back when the full [`UDP_SOCKET_BUFFER`] was granted: Linux doubles the
+/// value it stores (`sock_setsockopt`: `sk_rcvbuf = 2 * min(val, rmem_max)`), other platforms do
+/// not.
+#[cfg(target_os = "linux")]
+const GRANTED_WHEN_FULL: usize = 2 * UDP_SOCKET_BUFFER;
+#[cfg(not(target_os = "linux"))]
+const GRANTED_WHEN_FULL: usize = UDP_SOCKET_BUFFER;
 
 /// The endpoint parameters every Vox endpoint runs with.
 fn endpoint_config(mtu_ceiling: u16) -> quinn::EndpointConfig {
