@@ -150,6 +150,7 @@ pub async fn up(
     _channel_id: vox_core::hash::Digest32,
     _socket: std::path::PathBuf,
     _stats_file: Option<std::path::PathBuf>,
+    _allow: std::collections::BTreeSet<u16>,
 ) -> Result<(), AppError> {
     Err(AppError::Usage(NOT_HERE.into()))
 }
@@ -464,7 +465,12 @@ mod mac {
             .unwrap_or_default()
     }
 
-    fn stats_json(name: &str, me: &Digest32, lan: &Lan<Utun>) -> serde_json::Value {
+    fn stats_json(
+        name: &str,
+        me: &Digest32,
+        lan: &Lan<Utun>,
+        allow: &std::collections::BTreeSet<u16>,
+    ) -> serde_json::Value {
         let plan = lan.plan();
         let s = lan.stats();
         let addrs = |m: &Digest32| {
@@ -501,6 +507,8 @@ mod mac {
             "not_for_me": s.not_for_me,
             "rate_capped": s.rate_capped,
             "device_full": s.device_full,
+            "filtered": s.filtered,
+            "allow": allow.iter().collect::<Vec<_>>(),
         })
     }
 
@@ -523,6 +531,7 @@ mod mac {
         channel_id: Digest32,
         socket: PathBuf,
         stats_file: Option<PathBuf>,
+        allow: std::collections::BTreeSet<u16>,
     ) -> Result<(), AppError> {
         let me = node
             .view()
@@ -545,7 +554,7 @@ mod mac {
         let utun = Utun {
             fd: AsyncFd::new(fd)?,
         };
-        let lan = Lan::start(node, channel_id, utun)?;
+        let lan = Lan::start(node, channel_id, utun, allow.clone())?;
         let v4 = mine.v4.map_or_else(
             || "no IPv4 (past 254 members)".to_owned(),
             |a| a.to_string(),
@@ -554,6 +563,15 @@ mod mac {
             "vox lan up on {name} — this node is {v4} and {}; the room's LAN is {}/24 and {}/64",
             mine.v6, plan.subnet_v4, plan.prefix_v6
         );
+        if allow.is_empty() {
+            println!(
+                "nothing on this machine is reachable over the LAN (discovery still flows); \
+                 `--allow <port>,…` opens ports"
+            );
+        } else {
+            let ports: Vec<String> = allow.iter().map(u16::to_string).collect();
+            println!("reachable over the LAN: ports {}", ports.join(", "));
+        }
         println!("Ctrl-C to stop; the interface goes with it");
         let mut linked: Vec<Digest32> = Vec::new();
         let mut moved_said = false;
@@ -579,7 +597,7 @@ mod mac {
                         );
                     }
                     if let Some(p) = &stats_file {
-                        write_stats(p, &stats_json(&name, &me, &lan));
+                        write_stats(p, &stats_json(&name, &me, &lan, &allow));
                     }
                 }
             }

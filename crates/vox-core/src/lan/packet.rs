@@ -154,3 +154,69 @@ pub fn to_limited_broadcast(p: &mut [u8]) -> bool {
     }
     true
 }
+
+/// What a packet carries above IP, as far as the family LAN's port whitelist needs to know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// TCP to `dport`. `opens` is a bare SYN (SYN without ACK): the segment that asks for a
+    /// new connection. Every other segment belongs to a connection that already exists, or
+    /// is answered by a reset.
+    Tcp {
+        /// The destination port.
+        dport: u16,
+        /// Whether this is a connection-opening SYN.
+        opens: bool,
+    },
+    /// UDP from `sport` to `dport`.
+    Udp {
+        /// The source port.
+        sport: u16,
+        /// The destination port.
+        dport: u16,
+    },
+    /// ICMP or ICMPv6: echo, and the errors path-MTU discovery and TCP rely on.
+    Icmp,
+    /// A fragment that is not the first, so its ports are not in it.
+    Fragment,
+    /// Anything else: another protocol, an IPv6 extension header, or a header too short
+    /// to read.
+    Other,
+}
+
+/// Read the transport header of a whole IPv4 or IPv6 packet.
+#[must_use]
+pub fn transport(p: &[u8]) -> Transport {
+    let (proto, at) = match p.first().map(|b| b >> 4) {
+        Some(4) if p.len() >= 20 => {
+            if u16::from_be_bytes([p[6], p[7]]) & 0x1fff != 0 {
+                return Transport::Fragment;
+            }
+            (p[9], usize::from(p[0] & 0x0f) * 4)
+        }
+        Some(6) if p.len() >= 40 => match p[6] {
+            44 => return Transport::Fragment,
+            58 => return Transport::Icmp,
+            n => (n, 40),
+        },
+        _ => return Transport::Other,
+    };
+    let port = |i: usize| {
+        p.get(at + i..at + i + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+    };
+    match proto {
+        1 => Transport::Icmp,
+        6 => match (port(2), p.get(at + 13)) {
+            (Some(dport), Some(flags)) => Transport::Tcp {
+                dport,
+                opens: flags & 0x02 != 0 && flags & 0x10 == 0,
+            },
+            _ => Transport::Other,
+        },
+        17 => match (port(0), port(2)) {
+            (Some(sport), Some(dport)) => Transport::Udp { sport, dport },
+            _ => Transport::Other,
+        },
+        _ => Transport::Other,
+    }
+}

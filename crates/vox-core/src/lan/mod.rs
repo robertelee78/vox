@@ -32,6 +32,26 @@
 //! one who decides what reaches its kernel. So a trusted member can impersonate nobody,
 //! and cannot use this node as a router to anywhere.
 //!
+//! ## Nothing on the machine is reachable unless its port is whitelisted
+//! The decider's rule (2026-09-25): a LAN is for discovery and for the services the host
+//! names, not for everything that happens to listen on the wildcard address. So the
+//! receiving node — the one whose machine is exposed — filters what reaches its kernel,
+//! with the whitelist `vox lan up --allow` gave it and **nothing by default**:
+//!
+//! - a TCP SYN opening a connection passes only to a whitelisted port. Every other TCP
+//!   segment passes: it belongs to a connection this machine opened or accepted, and one
+//!   that belongs to nothing is answered with a reset by the kernel;
+//! - UDP passes to a whitelisted port, **or** as a reply: to a local port this machine
+//!   sent from, from the address it sent to (or from anyone, if it sent to a group — an
+//!   SSDP search is answered by unicast from whoever heard it), within [`UDP_REPLY_WINDOW`];
+//! - ICMP passes — echo, and the errors path-MTU discovery and TCP depend on;
+//! - broadcast and multicast pass whatever their port: they are the discovery the LAN
+//!   exists for, and they are capped;
+//! - anything else — another protocol, a fragment past the first, an IPv6 extension
+//!   header — is dropped, because its ports cannot be read.
+//!
+//! What this node sends is not filtered here: the peer's own whitelist governs it.
+//!
 //! ## Why floods are rate-capped
 //! A flood costs one datagram per member, and it is the one kind of packet a member
 //! receives without having asked. So each direction has a token bucket: what this node
@@ -49,7 +69,7 @@
 pub mod packet;
 pub mod plan;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -63,7 +83,7 @@ use crate::node::actor::NodeHandle;
 use crate::node::api::NodeView;
 use crate::node::app::{AppHub, AppStream};
 
-use packet::{is_group, parse, to_limited_broadcast};
+use packet::{is_group, parse, to_limited_broadcast, transport, Transport};
 use plan::LanPlan;
 
 /// The app label the LAN speaks (ADR-022 decision 7).
@@ -79,6 +99,13 @@ pub const FLOOD_RATE: f64 = 100.0;
 
 /// The burst either flood bucket allows.
 pub const FLOOD_BURST: f64 = 200.0;
+
+/// How long a UDP send from a local port admits replies to it.
+pub const UDP_REPLY_WINDOW: Duration = Duration::from_secs(120);
+
+/// The most UDP sends remembered for replies. Past it, expired entries are dropped, and if
+/// none have expired the new one is not remembered (its replies are filtered).
+const UDP_REPLY_ENTRIES: usize = 4096;
 
 /// The first wait before dialling a member again after a failed open.
 const REDIAL_MIN: Duration = Duration::from_millis(500);
@@ -175,6 +202,8 @@ pub struct LanStats {
     pub rate_capped: u64,
     /// Arrivals the operating system's side had no room for.
     pub device_full: u64,
+    /// Arrivals dropped by the port whitelist.
+    pub filtered: u64,
     /// The members this node has a live link to, in fingerprint order.
     pub links: Vec<Digest32>,
 }
@@ -194,6 +223,7 @@ struct Counters {
     not_for_me: AtomicU64,
     rate_capped: AtomicU64,
     device_full: AtomicU64,
+    filtered: AtomicU64,
 }
 
 fn bump(c: &AtomicU64) {
@@ -257,6 +287,9 @@ struct State {
     backoff: HashMap<Digest32, Backoff>,
     floods: Bucket,
     next_id: u64,
+    /// UDP this machine sent: (local port, the address it went to, or `None` for a group)
+    /// and when, so replies can come back through the whitelist.
+    udp_out: HashMap<(u16, Option<IpAddr>), Instant>,
 }
 
 struct Shared<T: Tun> {
@@ -264,6 +297,8 @@ struct Shared<T: Tun> {
     channel_id: Digest32,
     hub: Arc<AppHub>,
     tun: T,
+    /// Local ports reachable over the LAN.
+    allow: BTreeSet<u16>,
     state: Mutex<State>,
     c: Counters,
 }
@@ -307,11 +342,17 @@ fn wanted(view: &NodeView, channel_id: &Digest32, me: &Digest32) -> (Vec<Digest3
 }
 
 impl<T: Tun> Lan<T> {
-    /// Bring the LAN of `channel_id` up on `tun`, over `node`.
+    /// Bring the LAN of `channel_id` up on `tun`, over `node`, with the local ports in
+    /// `allow` reachable by members (empty: none — discovery still flows).
     ///
     /// # Errors
     /// If the node has no identity, or something here already runs this room's LAN.
-    pub fn start(node: &NodeHandle, channel_id: Digest32, tun: T) -> Result<Self> {
+    pub fn start(
+        node: &NodeHandle,
+        channel_id: Digest32,
+        tun: T,
+        allow: BTreeSet<u16>,
+    ) -> Result<Self> {
         let view = node.view();
         let me = view
             .identity
@@ -326,6 +367,7 @@ impl<T: Tun> Lan<T> {
             channel_id,
             hub,
             tun,
+            allow,
             state: Mutex::new(State {
                 plan: LanPlan::new(channel_id, &members),
                 links: HashMap::new(),
@@ -333,6 +375,7 @@ impl<T: Tun> Lan<T> {
                 backoff: HashMap::new(),
                 floods: Bucket::full(),
                 next_id: 0,
+                udp_out: HashMap::new(),
             }),
             c: Counters::default(),
         });
@@ -383,6 +426,7 @@ impl<T: Tun> Lan<T> {
             not_for_me: g(&c.not_for_me),
             rate_capped: g(&c.rate_capped),
             device_full: g(&c.device_full),
+            filtered: g(&c.filtered),
             links,
         }
     }
@@ -557,13 +601,17 @@ fn arrive<T: Tun>(sh: &Shared<T>, peer: &Digest32, link: &Link, mut p: Vec<u8>) 
         return;
     };
     let (flood, subnet_broadcast) = {
-        let st = lock(&sh.state);
+        let mut st = lock(&sh.state);
         if !st.plan.of(peer).is_some_and(|a| a.holds(h.src)) {
             bump(&sh.c.spoofed);
             return;
         }
         let subnet_broadcast = matches!(h.dst, IpAddr::V4(a) if a == st.plan.broadcast_v4());
         if st.plan.of(&sh.me).is_some_and(|a| a.holds(h.dst)) {
+            if !admitted(&sh.allow, &mut st.udp_out, &p, h.src) {
+                bump(&sh.c.filtered);
+                return;
+            }
             (false, false)
         } else if subnet_broadcast || is_group(h.dst) {
             (true, subnet_broadcast)
@@ -584,6 +632,47 @@ fn arrive<T: Tun>(sh: &Shared<T>, peer: &Digest32, link: &Link, mut p: Vec<u8>) 
     } else {
         bump(&sh.c.device_full);
     }
+}
+
+/// Whether a packet addressed to this node passes the port whitelist (module docs).
+fn admitted(
+    allow: &BTreeSet<u16>,
+    udp_out: &mut HashMap<(u16, Option<IpAddr>), Instant>,
+    p: &[u8],
+    src: IpAddr,
+) -> bool {
+    match transport(p) {
+        Transport::Icmp => true,
+        Transport::Tcp { dport, opens } => !opens || allow.contains(&dport),
+        Transport::Udp { dport, .. } => {
+            if allow.contains(&dport) {
+                return true;
+            }
+            let now = Instant::now();
+            [Some(src), None].into_iter().any(|to| {
+                udp_out
+                    .get(&(dport, to))
+                    .is_some_and(|at| now.duration_since(*at) < UDP_REPLY_WINDOW)
+            })
+        }
+        Transport::Fragment | Transport::Other => false,
+    }
+}
+
+/// Remember a UDP send from this machine, so its replies pass the whitelist.
+fn remember_udp(st: &mut State, p: &[u8], to: Option<IpAddr>) {
+    let Transport::Udp { sport, .. } = transport(p) else {
+        return;
+    };
+    let now = Instant::now();
+    if st.udp_out.len() >= UDP_REPLY_ENTRIES && !st.udp_out.contains_key(&(sport, to)) {
+        st.udp_out
+            .retain(|_, at| now.duration_since(*at) < UDP_REPLY_WINDOW);
+        if st.udp_out.len() >= UDP_REPLY_ENTRIES {
+            return;
+        }
+    }
+    st.udp_out.insert((sport, to), now);
 }
 
 enum Route {
@@ -622,6 +711,7 @@ fn depart<T: Tun>(sh: &Shared<T>, p: &[u8]) {
                 bump(&sh.c.rate_capped);
                 return;
             }
+            remember_udp(&mut st, p, None);
             Route::Flood(st.links.values().cloned().collect())
         } else if !in_lan {
             bump(&sh.c.off_lan);
@@ -629,8 +719,11 @@ fn depart<T: Tun>(sh: &Shared<T>, p: &[u8]) {
         } else {
             match st.plan.owner(h.dst) {
                 Some(m) if m == sh.me => Route::Loop,
-                Some(m) => match st.links.get(&m) {
-                    Some(l) => Route::To(Arc::clone(l)),
+                Some(m) => match st.links.get(&m).cloned() {
+                    Some(l) => {
+                        remember_udp(&mut st, p, Some(h.dst));
+                        Route::To(l)
+                    }
                     None => {
                         bump(&sh.c.no_route);
                         return;
