@@ -3211,6 +3211,23 @@ impl Node {
                         self.refresh_reachers().await;
                         self.publish_channel_to_anchors(&channel_id).await;
                     }
+                    // **A newcomer this session admitted is consented to now, not on the tick.** Two
+                    // members who joined the same room learn of each other only here, from the board.
+                    // Under ForwardOnly a post sealed before the author consents to a reader is never
+                    // readable to it, so every tick of delay is a window of posts lost to the
+                    // newcomer. Measured in room_of_three_keys_proof: the joiners' keys to each other
+                    // landed 388ms and 846ms after their posts. This shrinks the window; it cannot
+                    // close it, since nobody can consent to a member it has not yet heard of.
+                    if !self.trust.is_empty() {
+                        let trusted = self.trust.trusted();
+                        let owes = match self.channels.get(&channel_id).map(Arc::clone) {
+                            Some(shared) => !shared.lock().await.owed_consents(&trusted).is_empty(),
+                            None => false,
+                        };
+                        if owes {
+                            self.deliver_owed_consents(None).await;
+                        }
+                    }
                     if o.rendered > 0 || o.governance > 0 {
                         let _ = self.event_tx.send(NodeEvent::Synced {
                             channel_id,
