@@ -161,6 +161,8 @@ pub(crate) const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_sec
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
+    // EXPERIMENT (not for merge): BBR instead of the default Cubic, for the lossy-link arm of R41.
+    cfg.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     // `From<VarInt>` rather than `try_from(Duration)`: the millisecond value is a compile-
     // time constant inside the varint range, so there is no error case to handle.
     cfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
