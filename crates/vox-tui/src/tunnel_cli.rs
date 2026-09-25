@@ -191,7 +191,7 @@ pub async fn open_profile(
     };
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot open this profile's identity: {out:?}"
+            "cannot open this profile's identity: {out}"
         )));
     }
     Ok(node)
@@ -220,7 +220,7 @@ async fn open_room(
         .await;
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot unlock this profile: {out:?}"
+            "cannot unlock this profile: {out}"
         )));
     }
     let known: Vec<Digest32> = node.view().channels.iter().map(|c| c.channel_id).collect();
@@ -235,7 +235,7 @@ async fn open_room(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot open that room: {out:?}")));
+        return Err(AppError::Usage(format!("cannot open that room: {out}")));
     }
     Ok((node, channel_id))
 }
@@ -255,9 +255,7 @@ pub async fn service_add(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!(
-            "cannot offer {tag:?}: {out:?} — you need bind:{tag} in this room"
-        )));
+        return Err(AppError::Usage(format!("cannot offer {tag:?}: {out}")));
     }
     println!(
         "vox: offering {tag:?} at {local} in room {}",
@@ -357,7 +355,13 @@ pub async fn forward(
                 local,
             })
             .await;
-        if out.is_done() || Instant::now() >= deadline {
+        // Only a missing path is worth waiting out. A port in use, a closed room or a
+        // non-loopback address is this machine's to fix, and five minutes of "waiting for a
+        // path" hid it (PRD-001 R36).
+        if out.is_done()
+            || Instant::now() >= deadline
+            || !matches!(out, Outcome::Failed(Fault::Unreachable))
+        {
             break out;
         }
         // Drain whatever the node has to say about the attempt that just failed, so a person
@@ -384,8 +388,11 @@ pub async fn forward(
         // and cannot be granted — `vox grant`, the only thing that issued it, is
         // withdrawn too. What actually decides is the host's keyring, and the host is
         // the only one who can change it.
+        if !matches!(out, Outcome::Failed(Fault::Unreachable | Fault::Refused)) {
+            return Err(AppError::Usage(format!("cannot forward to {local}: {out}")));
+        }
         return Err(AppError::Usage(format!(
-            "cannot forward: {out:?}\n       Two things it could be: {} is not reachable \
+            "cannot forward: {out}\n       Two things it could be: {} is not reachable \
              right now, or they have not run `vox trust add` on you.\n       Reach is \
              the HOST's decision (ADR-017 decision 3) — there is nothing you can grant \
              yourself.",
@@ -471,9 +478,7 @@ pub async fn serve(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!(
-            "cannot serve port {port}: {out:?}"
-        )));
+        return Err(AppError::Usage(format!("cannot serve port {port}: {out}")));
     }
     let channel_id = node
         .view()
@@ -485,7 +490,7 @@ pub async fn serve(
 
     let out = node.apply(NodeCommand::Invite { channel_id }).await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot mint an address: {out:?}")));
+        return Err(AppError::Usage(format!("cannot mint an address: {out}")));
     }
     let url = loop {
         match node.next_event().await {
@@ -585,7 +590,7 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     let out = node.apply(NodeCommand::Up { channel_id, bind }).await;
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot bring the proxy up: {out:?} — is the room a `vox serve` room, and is its host reachable?"
+            "cannot bring the proxy up on {bind}: {out}"
         )));
     }
     let (hostname, bound) = loop {
@@ -917,7 +922,7 @@ pub async fn trust_add(
         .await;
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot trust that identity: {out:?}"
+            "cannot trust that identity: {out}"
         )));
     }
     println!("vox: trusting {} as {petname:?}", short(&target));
@@ -941,9 +946,15 @@ pub async fn trust_remove(node: &NodeHandle, fingerprint: &str) -> Result<(), Ap
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!(
-            "cannot stop trusting that identity: {out:?}"
-        )));
+        // `NotConsented` from `Untrust` has one meaning: the identity is not in the ring.
+        return Err(AppError::Usage(match out {
+            Outcome::Failed(Fault::NotConsented) => format!(
+                "{} is not in your trust keyring, so there is nothing to remove\n       \
+                 `vox trust list` shows who is",
+                short(&target)
+            ),
+            other => format!("cannot stop trusting that identity: {other}"),
+        }));
     }
     println!("vox: no longer trusting {}", short(&target));
     println!("     it reads nothing you write from now on, in any room you share");

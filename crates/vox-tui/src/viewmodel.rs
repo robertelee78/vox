@@ -242,6 +242,10 @@ pub enum UiError {
     NotConsented,
     /// This client is not networked, or is locked, so it cannot reach anyone.
     NotNetworked,
+    /// A local address the node needs (its listen port) is already in use.
+    AddressInUse,
+    /// A join named a room this profile already holds.
+    AlreadyMember,
     /// An unexpected internal error (never carries detail).
     Internal,
 }
@@ -281,6 +285,8 @@ impl UiError {
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",
+            UiError::AddressInUse => "a local port it needs is in use — pick another --listen",
+            UiError::AlreadyMember => "you already hold that room — it is in your list",
             UiError::Internal => "internal error",
         }
     }
