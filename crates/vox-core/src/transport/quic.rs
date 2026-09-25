@@ -183,6 +183,7 @@ const MAX_UDP_PAYLOAD: u16 = 8_192;
 /// The OS may grant less; that is not an error.
 const UDP_SOCKET_BUFFER: usize = 4 << 20;
 
+
 /// The endpoint parameters every Vox endpoint runs with.
 fn endpoint_config() -> quinn::EndpointConfig {
     let mut cfg = quinn::EndpointConfig::default();

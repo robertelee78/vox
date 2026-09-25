@@ -31,6 +31,7 @@ blake2b_simd.workspace = true
 # Transport substrate (ADR-011, M9).
 quinn.workspace = true
 socket2.workspace = true
+quinn-udp.workspace = true
 rustls.workspace = true
 rustls-post-quantum.workspace = true
 rustls-pki-types.workspace = true
