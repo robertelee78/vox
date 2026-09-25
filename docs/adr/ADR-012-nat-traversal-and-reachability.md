@@ -372,11 +372,11 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   fixed port gives the same address; a restart onto another network a different one. Proved by
   `a_restarted_host_is_reached_through_its_anchor` (a host crash-restarted three times on the same
   address and three times on a new one, behind symmetric NATs, reached by a relayed client through the
-  anchor: in three runs, 18 of 18 restarts were reachable again within 32.3 s of the crash, the ones where
-  the new connection won the tie-break within 1.3 s; with the rule off, restarts took 63.3 s — QUIC's
-  idle timeout — or never came back), `tunnel_honesty_proof::a_forward_carries_a_new_connection_after_
-  its_host_restarts` merged onto this rule (a real `vox forward` whose host is killed: 5 of 5 carried the
-  new connection 29.9–31.2 s after the restart, against 59.1–60.3 s with the rule off or run on the
+  anchor, probed once a second as a retrying client would: in three runs, 18 of 18 restarts were
+  reachable again within 31.3 s of the crash, the ones where the new connection won the tie-break within
+  1.4 s; with the rule off, 3 of 6 took 60.5 s, QUIC's idle timeout), `tunnel_honesty_proof::a_forward_carries_a_new_connection_after_
+  its_host_restarts` merged onto this rule (a real `vox forward` whose host is killed: 8 of 8 that got
+  past the harness's own `vox connect` carried the new connection 30.1–30.8 s after the restart, against 59.1–60.3 s with the rule off or run on the
   actor's tick, which the dead connection stalled — that gate asserts only its 300 s patience, so the
   timing is measured, not gated) and
   `a_live_duplicate_is_decided_alike` (a member whose NAT rebinds dials the anchor twice: 0 of 24
