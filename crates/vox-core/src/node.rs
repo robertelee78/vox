@@ -35,6 +35,7 @@ pub mod coordstream;
 pub mod headless;
 pub mod ipc;
 pub mod joinstream;
+pub mod keypackage;
 pub mod link;
 pub mod net;
 pub mod network;

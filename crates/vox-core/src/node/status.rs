@@ -139,6 +139,9 @@ pub struct MemberStatus {
     pub last_seen: Option<u64>,
     /// When a sync session with it last ran.
     pub last_sync: Option<u64>,
+    /// Whether this node holds its sender key, so can read what it writes. `None` when the
+    /// room was busy (mid-sync) as the report was taken.
+    pub has_key: Option<bool>,
 }
 
 /// One open room.
@@ -256,6 +259,28 @@ impl StatusReport {
                 });
             }
             for m in &room.members {
+                // ADR-023 decision 4: a trusted member whose sender key this node does not
+                // hold. Keys reach an offline member through the log, carried by any member
+                // that is online with both — so with nobody like that, they wait. Said, because
+                // otherwise the room simply shows nothing from that member and looks broken.
+                if !m.me && m.trusted && m.has_key == Some(false) {
+                    out.push(Unhealthy {
+                        key: format!(
+                            "keys-waiting:{}:{}",
+                            b32_encode(&room.id),
+                            b32_encode(&m.id)
+                        ),
+                        message: format!(
+                            "room {} ({}): no key yet from trusted member {} — keys wait for \
+                             overlap: one arrives when {} or an always-on member of this room \
+                             is online at the same time as you",
+                            short(&room.id),
+                            room.name,
+                            short(&m.id),
+                            short(&m.id)
+                        ),
+                    });
+                }
                 if m.me || !m.trusted || m.connected {
                     continue;
                 }
