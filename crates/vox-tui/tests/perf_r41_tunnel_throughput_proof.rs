@@ -83,6 +83,11 @@ const LINKS: [Link; 4] = [
     },
 ];
 
+/// Packets the emulator dropped because its queue was full (not the link's deliberate loss). A
+/// loss-based congestion controller halves its window on each, and the raw arm (terminated at a
+/// TCP proxy) never sees one, so they are reported beside every figure.
+static TAIL_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The link both shapers apply now; `None` passes traffic through unshaped.
 type Shared = Arc<Mutex<Option<Link>>>;
 
@@ -150,6 +155,7 @@ fn udp_direction(
                         * l.bits_per_sec
                         / 8.0;
                     if backlog > bdp + 4e6 {
+                        TAIL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue; // drop-tail
                     }
                     pacer.release(&l, now, n + 28)
@@ -205,7 +211,8 @@ fn udp_shaper(
                             * l.bits_per_sec
                             / 8.0;
                         if backlog > bdp + 4e6 {
-                            continue;
+                            TAIL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue; // drop-tail
                         }
                         pacer.release(&l, now, n + 28)
                     }
@@ -681,7 +688,9 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         );
         *link.lock().unwrap() = Some(l);
         std::thread::sleep(Duration::from_millis(500));
+        let drops_before = TAIL_DROPS.load(std::sync::atomic::Ordering::Relaxed);
         let (t, r) = measure(tunnel, raw, &done, &carried, Some(l));
+        let tail_drops = TAIL_DROPS.load(std::sync::atomic::Ordering::Relaxed) - drops_before;
         let ratio = t / r;
         let verdict = if !l.gated {
             "reported".to_owned()
@@ -693,7 +702,7 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         };
         report.push(format!(
             "{}: tunnel {:.1} MB/s ({:.0} Mbit/s), raw {:.1} MB/s ({:.0} Mbit/s), {:.1}% — {verdict}; \
-             emulator fidelity {:.1}%",
+             emulator fidelity {:.1}%; queue drops {tail_drops}",
             l.name, t / 1e6, t * 8.0 / 1e6, r / 1e6, r * 8.0 / 1e6, 100.0 * ratio, fidelity * 100.0
         ));
     }
