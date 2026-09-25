@@ -171,7 +171,7 @@ pub(crate) const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_sec
 /// `net.inet.udp.maxdgram` (9216 by default), and with the ceiling at 16356 connections
 /// failed outright on this machine rather than falling back — measured, not reasoned. 8192
 /// stays under that limit on every platform Vox builds for.
-const MAX_UDP_PAYLOAD: u16 = 8_192;
+pub const MAX_UDP_PAYLOAD: u16 = 8_192;
 
 /// The UDP socket buffers a node asks for, each way.
 ///
@@ -185,7 +185,17 @@ const UDP_SOCKET_BUFFER: usize = 4 << 20;
 
 /// Per-stream flow-control window (and half the connection's send window), sized for the
 /// bandwidth-delay product of a 1 Gbit/s path at ~130 ms, or 10 Gbit/s at ~13 ms.
-const STREAM_WINDOW: u32 = 16 << 20;
+pub const STREAM_WINDOW: u32 = 16 << 20;
+
+/// Flow-control credit a peer gets for the whole connection, across all its streams: what this
+/// node will buffer for one peer that sends and is not read.
+///
+/// quinn's default is unlimited, which is safe only while the per-stream window is small. At
+/// [`STREAM_WINDOW`] a peer may open quinn's default 100 concurrent bidirectional streams, so an
+/// unlimited connection window let one peer park 100 × 16 MiB = 1.6 GiB in this node's memory
+/// by writing into streams nobody reads. Two full stream windows keeps a single tunnel at full
+/// speed, and lets a second one run beside it.
+pub const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
 
 /// The endpoint parameters every Vox endpoint runs with.
 fn endpoint_config() -> quinn::EndpointConfig {
@@ -213,6 +223,7 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     // receiver grants, not memory it allocates up front.
     cfg.stream_receive_window(quinn::VarInt::from_u32(STREAM_WINDOW));
     cfg.send_window(2 * u64::from(STREAM_WINDOW));
+    cfg.receive_window(quinn::VarInt::from_u32(CONNECTION_WINDOW));
     Arc::new(cfg)
 }
 
