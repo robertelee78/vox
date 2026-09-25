@@ -7,6 +7,7 @@ and is now genuinely built, with a real-binary proof. Decisions 1, 3, 4, 8, 9,
 10 and 11 are **proposed and not built**; what ships today implements the withdrawn model and is a live
 vulnerability until M17.6–M17.13 land.
 **Date**: 2026-09-21
+**Updated**: 2026-09-24 — PRD-001: refusals through `vox up`/`vox forward` are honest, removing a service cuts its live sessions, and forwards survive a host restart (ADR-013 "Tunnel honesty").
 **Updated**: 2026-09-21 (third revision, then revised again the same day after independent review) —
 **capability-bearing rooms are withdrawn.** Decision 3 held that *"'may this member dial it' and 'is this
 person a member' are the same question, asked once."* That is refuted: admission to a room is passphrase +
@@ -1205,14 +1206,18 @@ New work, in dependency order:
     is `send_replace`, which both updates the value the gate reads and wakes every serving task.
   - **A pending request** is judged after it is parsed, from that live set
     (`tunnel::session::accept_reporting`), so a stream parked across the withdrawal is refused.
-  - **A live session** is cut: `splice_until_withdrawn` selects between the byte copy and the watch, and
-    leaves the moment the client is no longer in the set. The QUIC stream is **reset** with
+  - **A live session** is cut: the serving task selects between the byte copy and the watch, and
+    leaves the moment the client is no longer in the set. *(Since 2026-09-24 the function is
+    `session::splice_until`, and it also watches the live service offer, so removing the service cuts the
+    session too — PRD-001 R22; ADR-013 "Tunnel honesty".)* The QUIC stream is **reset** with
     `REACH_WITHDRAWN_CODE` (`0x1711`), not finished, because a clean close is indistinguishable from the
     carried service hanging up.
   - **The reason reaches the far end.** The dialer maps that reset code to `Error::TunnelRevoked`; the proxy
     reports it through `up::serve_reporting`; the node turns it into `NodeEvent::ReachWithdrawn`; and
     `vox up` prints that the host withdrew access and that there is nothing to retry. A *refused dial* still
-    says nothing (dark services), and that asymmetry is deliberate: a peer whose established session is cut
+    says nothing *to the peer* (dark services) — though since 2026-09-24 the refusing SOCKS reply is code 2
+    rather than an early "succeeded", and the dialing node prints the reason locally (PRD-001 R23) — and that
+    asymmetry is deliberate: a peer whose established session is cut
     already knows it had reach, so naming the reason leaks nothing and saves it retrying against a decision
     that will not change.
   - Proof: `crates/vox-core/tests/m17_11_parked_stream_proof.rs`, two tests over real QUIC with a real TCP

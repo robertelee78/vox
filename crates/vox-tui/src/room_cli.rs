@@ -500,6 +500,35 @@ pub async fn release_resource(paths: &Paths, room: &str, resource: &str) -> Resu
     .await
 }
 
+/// `vox service remove`, asked of the node already running this profile.
+///
+/// The one-shot form opens the profile itself, which redb refuses while a daemon holds it
+/// — and a running host is exactly when removing a service matters, because that is when
+/// it is carrying sessions the removal must cut (PRD-001 R22). The request is the one
+/// `vox room send` already makes when its offer ends; it only ever narrows what is exposed.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, or the service was not offered.
+pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client
+        .request(&Request::RemoveService {
+            channel_id,
+            service_tag: tag.to_owned(),
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!("vox: no longer offering {tag:?}; its live sessions were cut");
+            Ok(())
+        }
+        Ok(Frame::Error { .. }) => Err(AppError::Usage(format!("{tag:?} was not offered here"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
 /// `vox room handoff` — pass a resource to someone by petname.
 ///
 /// # Errors

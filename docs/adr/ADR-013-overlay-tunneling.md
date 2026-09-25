@@ -2,7 +2,7 @@
 
 **Status**: implemented and **reachable** — the per-stream port-forward model runs end to end through the node (`crates/vox-core/src/{tunnel,node/tunnel}.rs`, `crates/vox-tui` `service`/`grant`/`forward`), gated by a release test that reaches a TCP service between two symmetric-NAT clients through an anchor; SOCKS front-end, signed session events, the SSH-CA binding and the TUN datapath remain (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-21 (later the same day) — **tunnel authorization is per-sender consent, not a per-member capability.** ADR-017's third revision withdraws the genesis service grant, `0x0013` and `vox grant`; this ADR's invariant that *"tunnel capabilities are never inherited from membership"* is restored **unqualified**, and its claim that message consent and tunnel access are *orthogonal* is **reversed** — they are one axis. See the Authorization model bullets and the `node_m15_anchor_gate` note. 2026-09-21 — the **SOCKS5 front-end is built and is the person-facing entry point** (`node::up`, ADR-017 decision 5 / M17.3): it resolves `.vox` names and needs no privilege, which is what this ADR listed as primary from the start. The TUN model stays optional and unbuilt. (A brief revision promoting TUN to the primary path was reverted the same day — see ADR-017 decision 5.) 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
+**Updated**: 2026-09-24 — **a tunnel tells the truth about how it ended** (PRD-001 R22–R24): a SOCKS reply is the host's answer, a refused or cut forward resets the application's socket, an abortive close is carried as one, removing a service cuts its live sessions, and a forward reaches its host afresh per connection; `tunnel::authz`, `grant_capabilities`, `NodeCommand::GrantTunnel`, IPC `T_GRANT` and the `vox grant` verb are removed. See "Tunnel honesty" under Implementation notes. 2026-09-21 (later the same day) — **tunnel authorization is per-sender consent, not a per-member capability.** ADR-017's third revision withdraws the genesis service grant, `0x0013` and `vox grant`; this ADR's invariant that *"tunnel capabilities are never inherited from membership"* is restored **unqualified**, and its claim that message consent and tunnel access are *orthogonal* is **reversed** — they are one axis. See the Authorization model bullets and the `node_m15_anchor_gate` note. 2026-09-21 — the **SOCKS5 front-end is built and is the person-facing entry point** (`node::up`, ADR-017 decision 5 / M17.3): it resolves `.vox` names and needs no privilege, which is what this ADR listed as primary from the start. The TUN model stays optional and unbuilt. (A brief revision promoting TUN to the primary path was reverted the same day — see ADR-017 decision 5.) 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-21 — the **SSH certificate authority is narrowed to an optional later capability** (decider, see the note below); the per-stream port-forward model is the specified one, and the person-facing surface moves to ADR-017 (room-bound services). 2026-09-20 — the tunnel request names its channel and capabilities are issued as log facts (M16.1a); the node serves tunnels, offers services and forwards ports, with the `vox service` / `vox grant` / `vox forward` verbs (M16.1b) — Status updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: tunneling, tcp, ssh, tun, socks, authorization, zero-trust
 
@@ -180,7 +180,7 @@ are engineering design from the ADR-011 substrate; the authorization model is re
 
 Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
 
-- **Authorization reuses the single ADR-007 evaluator** (`tunnel::authz`): `can_dial`/`can_bind`/`authorize_dial`/`authorize_bind`/`dial_audience` are thin wrappers over `Evaluator::grants(key, Capability::Dial/Bind(tag))`. No second engine — the one golden-vector suite covers tunnel authz. The `Bind`/`Dial`/`Role` capability vocabulary was pre-provisioned in the M6 lattice (`governance::capability`), so M11 only consumes it. Default-deny, Bind≠Dial, and "chat membership grants no tunnel reach" all fall out of consulting only the capability lattice.
+- ~~**Authorization reuses the single ADR-007 evaluator** (`tunnel::authz`)~~ — **removed 2026-09-24** with the rest of the withdrawn capability model (ADR-017 decision 3); reach is the host's reacher set, enforced in `session::accept`. As first written: `can_dial`/`can_bind`/`authorize_dial`/`authorize_bind`/`dial_audience` are thin wrappers over `Evaluator::grants(key, Capability::Dial/Bind(tag))`. No second engine — the one golden-vector suite covers tunnel authz. The `Bind`/`Dial`/`Role` capability vocabulary was pre-provisioned in the M6 lattice (`governance::capability`), so M11 only consumes it. Default-deny, Bind≠Dial, and "chat membership grants no tunnel reach" all fall out of consulting only the capability lattice.
 - **Discovery-gating by encryption** (`tunnel::service`): `ServiceAdvertisement { member_id, service_tag, endpoint }` is a composite-signed struct framed under `StructTag::ServiceAdvertisement` (`0x000F`). **Domain label:** the registry label is `vox/service-advertisement/v1` (already in `wire.rs`); the ADR body's earlier `vox/service-ad/v1` was shorthand — the registry label is authoritative and is what the code signs. The host seals an ad to each Dial-grant holder over that member's authenticated pairwise channel (ADR-004) via `seal_to_recipient`; a recipient `open_from_recipient`s it (decrypt → parse → verify author binding). No cleartext on the log; no responder-side filter.
 - **Per-stream data path** (`tunnel::session`): one QUIC stream per tunneled TCP connection. The dialer sends a length-delimited `TunnelRequest{service_tag}`; `accept()` **itself enforces** `dial:<service_tag>` for the transport-authenticated peer (`VoxConnection::peer_id` + the ADR-007 `Evaluator`) *before any local connect* — the authorization gate lives in the module, not in a caller closure, so a misconfigured resolver cannot grant reach. The resolver is reduced to pure host-side Bind config (service tag → local endpoint, no auth). Unauthorized, unknown, and connect-failed all return a uniform `Denied` (dark services). Splice uses `tokio::io::copy_bidirectional` over a `tokio::io::join` of the QUIC `(recv, send)` pair (correct half-close). Verified by a real end-to-end test: a TCP app → local forward → QUIC tunnel → host → real TCP echo server → back, with authorization decided by a real evaluator; plus a denial test where an uncapability'd peer is refused.
 - **ssh over Vox** (`tunnel::sshca`): issues a standard `ssh-ed25519-cert-v01@openssh.com` user certificate with the ADR-013 field mapping (`key_id`=Vox fingerprint hex; `valid_principals`=role/service tags verbatim incl. the `#`; the governing `dial:<service>` as a `vox-capability@vox.lux` extension; short validity window). The certified key is the **Ed25519 half** of the composite identity (OpenSSH speaks Ed25519; the full-composite binding is carried by `key_id` + transport auth). Signed by the channel SSH-CA Ed25519 key; `@cert-authority` line provided for host trust (no host-key TOFU). Issue→parse→verify round-trips; tamper and wrong-CA are rejected.
@@ -199,7 +199,7 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
   in another. Refusals stay uniform (`TunnelStatus::Denied`) — unauthorized, unknown-channel,
   unknown-service and connect-failed remain indistinguishable on the wire. This is the same correction
   ADR-016 M14.7 made for the join, pairwise and sync streams, for the same reason.
-- **Capabilities are issued as log facts (2026-09-20, M16.1).** `ChannelState::grant_capabilities` issues
+- ~~**Capabilities are issued as log facts (2026-09-20, M16.1).**~~ **Removed 2026-09-24** (`grant_capabilities`, `can_dial`/`can_bind`, `exclude_from_service_grant`, `NodeCommand::GrantTunnel`, IPC `T_GRANT` — tag 10 retired, never reused). As first written: `ChannelState::grant_capabilities` issues
   an ADR-007 `AdminCert` delegating exactly the `bind:`/`dial:` capabilities asked for, appends it as a
   governance entry, and folds it into the evaluator — so a grant is a fact every member converges on
   through ordinary sync, not local configuration, and the evaluator's `is_within` check means no issuer can
@@ -250,10 +250,11 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     without the passphrase), does its work and leaves; `forward` serves until interrupted and prints the
     `ssh -p <port>` line. Ids are given as unique prefixes of the base32 rendering, refused with a count
     rather than a guess when ambiguous. Passphrases are prompted for unechoed (crossterm raw mode) and
-    read from a pipe when stdin is not a terminal, so nothing lands in shell history. **`vox grant` is to be
-    withdrawn** under M17.7 with the per-member capability model it served — there will be nothing left for
-    it to grant, because approving a reader is the grant (ADR-017 decision 3, revised). It is **still in the
-    tree** (`vox-tui/src/cli.rs:397`); recorded as required work, not as done.
+    read from a pipe when stdin is not a terminal, so nothing lands in shell history. **`vox grant` is
+    removed** (2026-09-24): it had been reduced to a refusal stub, and before that it wrote capabilities
+    nothing consulted. Approving a reader (`vox trust add`) is the grant (ADR-017 decision 3, revised).
+    `vox service remove` asks the running node over its control socket when one holds the profile, so a
+    service can be withdrawn from a live host (PRD-001 R22).
   - **Gate** (`node_m15_anchor_gate.rs`, release): Alice offers a localhost TCP service in a room, Bob
     joins through the anchor, and **before any grant his forward binds but carries nothing** — the service
     is dark to a member. Alice grants `dial:ssh`; the grant reaches Bob by ordinary sync, with nobody
@@ -268,6 +269,52 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
     holds the passphrase and paid the proof of work. Both clients are behind symmetric NATs, so the path is a relayed circuit and the anchor
     carried packets it cannot read. A second connection over the same forward works too. `ssh` over Vox is
     this test with `sshd` in place of the echo, which is why the echo is enough.
+- **Tunnel honesty (2026-09-24, PRD-001 R22–R24; defects D6, D7, D11).** Each fixed property below
+  is proved by a shipped-binary gate that was mutation-checked red on the defect. (Built on a tree
+  with the serial accept loop, the harness first waited 35 s after each join to step around D8; on
+  v0.2.8, which splits the loop, the wait is gone and every gate below passed 3 of 3 without it.)
+  - **The SOCKS reply is the host's answer (R23, D6).** `session::dial` is split into `request` (send the
+    request, await `TunnelStatus`) and `splice`; `vox up` replies only after `request` returns, `NotAllowed`
+    for a host refusal and `GeneralFailure` for an unreachable host, and prints the reason on the
+    operator's own terminal (`NodeEvent::ProxyRefused`). The early "succeeded" it replaced rested on a
+    deadlock that does not exist: `accept` writes its status straight after its local connect.
+    Gates: `tunnel_honesty_proof::a_refused_socks_connect_is_refused_in_the_reply_and_says_why` (code 2 in
+    1.6–18 ms; mutation — reply "succeeded" before asking — returns code 0 and goes red), and
+    `service_rehearsal_proof`, whose untrusted-joiner control used to accept the early success and now
+    requires code 2 and the `the host refused` line: 3 of 3 on v0.2.8 (refused in 2–10 ms).
+  - **A refused forward resets the application (R23).** Gate: `tunnel_honesty_proof::
+    a_refused_forward_resets_the_application_and_says_why` — the application reads a reset, not an EOF,
+    and `vox forward` prints the reason.
+  - **An abortive close is carried as one (R22/R23, D11).** The splice is no longer
+    `copy_bidirectional`: a TCP read or write error on either end resets the QUIC stream with
+    `TUNNEL_ABORT_CODE` (`0x1712`) and stops its receive half, and a reset arriving from the far end closes
+    the local socket with zero linger, so the kernel sends RST. Previously the error path dropped the
+    `SendStream`, which quinn finishes, so a backend reset reached the client as a clean EOF after a
+    truncated reply. Gate: `tunnel_honesty_proof::a_backend_reset_reaches_the_far_client_as_a_reset`.
+  - **Removing a service cuts its live sessions (R22).** The actor keeps a live `Offered` watch per
+    channel beside `Reachers`; each serving task ends its session, reset with `REACH_WITHDRAWN_CODE`, the
+    moment its tag leaves it. Gate: `tunnel_honesty_proof::
+    removing_a_service_cuts_its_live_sessions_within_a_second`.
+  - **A forward survives its host restarting (R24, D7).** `Forward::bind` takes a `HostDialer` instead of
+    one `VoxConnection` and reaches the host per accepted connection through `up::open_tunnel`, which
+    retries a path failure on a fresh connection within `HOST_PATIENCE` and never retries a refusal. A
+    failed `accept` backs off (`ACCEPT_BACKOFF`) instead of ending the forward or spinning. Gate:
+    `tunnel_honesty_proof::a_forward_carries_a_new_connection_after_its_host_restarts` — the host's
+    `vox serve` is killed and the room brought back by `vox daemon` on a new port; the same forward carries
+    a new connection. Mutation (the forward pins its first connection): red, `Connection reset by peer`
+    at 59 s.
+    - **The gate found a second defect, below the forward.** Instrumented, the forward re-reached the
+      host every 10 s and every rung failed for five minutes: the board still named the old port, and the
+      anchor said `relay cannot reach the peer`. `ConnectionManager::file` kept the *held* connection on
+      a tie, so the anchor, holding a dead connection to the old host process that it would only learn
+      was dead at the 60 s idle timeout, **retired the restarted host's live connection and closed it
+      after the grace**. A rule that preferred a newcomer from a different direct address was built and
+      **withdrawn**; a liveness-based replacement is v0.2.9 item #6, not built here. Until it lands this
+      gate can fail for that reason: the restarted host unreachable through the anchor for as long as
+      the anchor holds the dead connection.
+    - **Residual, stated:** those 60 s are the dialer's own stale connection. A request opened on it
+      waits for QUIC's idle timeout before `open_tunnel` retries on a fresh one, so the first connection
+      after a host restart takes about a minute. Bounding that wait is not done.
 - **The SSH CA is narrowed to optional (decider, 2026-09-21).** The Decision above offers "`ssh` over Vox"
   partly as a Vox-issued OpenSSH certificate bound to the Vox identity, replacing host-key TOFU and
   `authorized_keys`. That is **no longer a requirement of this ADR.** The decider's reasoning, recorded
@@ -293,7 +340,8 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
   (no capability-tree binding, `verify_user_cert` ignoring extensions/critical options, the capability in
   an extension rather than a critical option) would be that future ADR's to close, not this one's. **SOCKS** is still a codec with no listener
   composing negotiate → CONNECT → service map → `session::dial` → reply, and `Reply::NotAllowed` is never
-  emitted. Service **advertisements** exist only pairwise (the audience-encrypted `0x000F` entry does not),
+  emitted. *(Stale: `vox up` is that listener (ADR-017 decision 5), and since 2026-09-24 it replies
+  `NotAllowed` when the host refuses — see "Tunnel honesty".)* Service **advertisements** exist only pairwise (the audience-encrypted `0x000F` entry does not),
   so a member learns another's service tags out of band — **ADR-017 M17.4** owns closing this, having
   chosen the audience-encrypted form over a room-wide announcement. The person-facing surface
   (`vox serve` / `vox connect`, capability-bearing rooms, anchors as configuration) is ADR-017's. The TUN/VPN datapath remains ADR-014's, as the

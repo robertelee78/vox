@@ -372,6 +372,34 @@ impl World {
         self.host = Some(daemon);
     }
 
+    /// `vox up <room>` from `dir`; returns it and the SOCKS address it bound.
+    pub fn up(&self, name: &str, dir: &Path) -> (VoxProc, SocketAddr) {
+        let mut up = VoxProc::spawn(
+            name,
+            dir,
+            &args(&[
+                "up",
+                &self.room,
+                "--passphrase",
+                &self.passphrase,
+                "--bind",
+                "127.0.0.1:0",
+                "--anchor",
+                &self.anchor_spec,
+                "--listen",
+                "127.0.0.1:0",
+            ]),
+        );
+        let line = up.expect_line("the proxy's bound address", |l| l.starts_with("vox up on "));
+        let bound: SocketAddr = line
+            .split_whitespace()
+            .nth(3)
+            .expect("an address in the up line")
+            .parse()
+            .expect("a socket address");
+        (up, bound)
+    }
+
     /// `vox forward <room> <host> <port>` from `dir`; returns it and the address it bound.
     pub fn forward(&self, name: &str, dir: &Path) -> (VoxProc, SocketAddr) {
         let mut fwd = VoxProc::spawn(
@@ -402,6 +430,36 @@ impl World {
             .expect("a socket address");
         (fwd, bound)
     }
+}
+
+/// Speak RFC 1928 to `proxy` and CONNECT to `host:port` **by name** (`socks5h`), returning
+/// the reply code — `0` is success — and the stream positioned at the payload.
+pub fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> (u8, TcpStream) {
+    let mut s = TcpStream::connect(proxy).expect("connect to the proxy");
+    // Longer than the proxy's own patience, so its verdict is what this reports.
+    s.set_read_timeout(Some(
+        vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
+    ))
+    .unwrap();
+    s.write_all(&[0x05, 0x01, 0x00]).unwrap();
+    let mut hello = [0u8; 2];
+    s.read_exact(&mut hello).unwrap();
+    assert_eq!(hello, [0x05, 0x00], "proxy refused the no-auth method");
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, u8::try_from(host.len()).unwrap()];
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req).unwrap();
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head).unwrap();
+    assert_eq!(head[0], 0x05, "not a SOCKS5 reply");
+    let skip = match head[3] {
+        0x01 => 4 + 2,
+        0x04 => 16 + 2,
+        other => panic!("unexpected address type {other} in reply"),
+    };
+    let mut sink = vec![0u8; skip];
+    s.read_exact(&mut sink).unwrap();
+    (head[1], s)
 }
 
 /// Connect through `at`, send `payload`, and read the echo, waiting up to `patience` for the

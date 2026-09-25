@@ -1754,6 +1754,10 @@ pub struct Node {
     /// Kept out of `Channel` because it is a *join* of channel state with the node-wide
     /// keyring, and the keyring is not a property of any one room.
     reachers: std::collections::BTreeMap<Digest32, crate::node::tunnel::Reachers>,
+    /// Each channel's live offer of services (PRD-001 R22), kept beside `reachers` and for
+    /// the same reason: serving tasks hold these handles, so removing a service reaches
+    /// the sessions it is carrying.
+    offered: std::collections::BTreeMap<Digest32, crate::node::tunnel::Offered>,
 }
 
 impl Node {
@@ -1887,6 +1891,7 @@ impl Node {
             trust: crate::node::trust::Keyring::new(),
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
+            offered: std::collections::BTreeMap::new(),
         };
         let view_rx = node.view_tx.subscribe();
         // A headless node has nothing to unlock: it is on the network from the start.
@@ -2143,16 +2148,6 @@ impl Node {
                 channel_id,
                 service_tag,
             } => self.remove_service(&channel_id, &service_tag).await,
-            NodeCommand::GrantTunnel {
-                channel_id,
-                target,
-                service_tag,
-                may_bind,
-                expiry,
-            } => {
-                self.grant_tunnel(&channel_id, &target, &service_tag, may_bind, expiry)
-                    .await
-            }
             NodeCommand::Forward {
                 channel_id,
                 host,
@@ -5954,12 +5949,21 @@ impl Node {
             channel.add_service(profile.store(), profile, service_tag, local)
         };
         match outcome {
-            Ok(_) => Outcome::Done,
+            Ok(_) => {
+                self.refresh_reachers().await;
+                Outcome::Done
+            }
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
     }
 
-    /// Stop offering a service.
+    /// Stop offering a service, and **cut every session carried on it** (PRD-001 R22).
+    ///
+    /// The cut is the live offer changing: each serving task watches it and resets its
+    /// stream the moment its tag leaves, exactly as it does when its dialer leaves the
+    /// reacher set. Removing the service used to change only the stored configuration, so
+    /// a new dial was refused while an `ssh` session opened a minute earlier carried on
+    /// for as long as it liked.
     async fn remove_service(&mut self, channel_id: &Digest32, service_tag: &str) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -5972,53 +5976,11 @@ impl Node {
             channel.remove_service(profile.store(), service_tag)
         };
         match outcome {
-            Ok(true) => Outcome::Done,
-            Ok(false) => Outcome::Failed(Fault::UnknownChannel),
-            Err(e) => Outcome::Failed(fault_of(&e)),
-        }
-    }
-
-    /// Grant a member `dial:<tag>` (and optionally `bind:<tag>`) in a channel, as an
-    /// ADR-007 certificate on the log. The grant is pushed to peers like any other
-    /// local append, so it converges without anyone being told.
-    async fn grant_tunnel(
-        &mut self,
-        channel_id: &Digest32,
-        target: &Digest32,
-        service_tag: &str,
-        may_bind: bool,
-        expiry: u64,
-    ) -> Outcome {
-        use crate::governance::capability::{Capability, CapabilitySet};
-        let now = self.now();
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return Outcome::Failed(Fault::ChannelNotOpen);
-        };
-        let mut caps = CapabilitySet::from_iter_caps([Capability::dial(service_tag)]);
-        if may_bind {
-            caps.insert(Capability::bind(service_tag));
-        }
-        let outcome = {
-            let mut channel = shared.lock().await;
-            // The target must be an admitted author: a certificate naming an identity
-            // the channel does not know could never be verified by anyone.
-            let Some(key) = channel
-                .author_keys()
-                .into_iter()
-                .find(|k| k.fingerprint() == *target)
-            else {
-                return Outcome::Failed(Fault::UnknownChannel);
-            };
-            channel.grant_capabilities(profile, &key, caps, expiry, now)
-        };
-        match outcome {
-            Ok(_) => {
-                self.note_local_append(channel_id);
+            Ok(true) => {
+                self.refresh_reachers().await;
                 Outcome::Done
             }
+            Ok(false) => Outcome::Failed(Fault::UnknownChannel),
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
     }
@@ -6146,8 +6108,30 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         };
-        match crate::node::tunnel::Forward::bind(conn, *channel_id, service_tag.to_owned(), local)
-            .await
+        // The first dial above is kept for what it tells the caller — a forward to a host that
+        // cannot be reached at all fails here, with the ladder's words — but the forward does
+        // not keep `conn`. It reaches the host afresh for every connection (PRD-001 R24), and
+        // `reach` hands back this same connection for as long as it lives.
+        drop(conn);
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return Outcome::Failed(Fault::NotNetworked);
+        };
+        let dialer = Arc::new(NodeDialer {
+            net,
+            channel_id: *channel_id,
+        });
+        let events = self.event_tx.clone();
+        match crate::node::tunnel::Forward::bind(
+            dialer,
+            *host,
+            *channel_id,
+            service_tag.to_owned(),
+            local,
+            move |reason: String| {
+                let _ = events.send(NodeEvent::ProxyRefused { reason });
+            },
+        )
+        .await
         {
             Ok(fwd) => {
                 let (channel_id, host, service_tag, bound) =
@@ -6174,18 +6158,17 @@ impl Node {
         self.refresh_reachers().await;
         let mut out = crate::node::tunnel::HostSnapshot::new();
         for (cid, shared) in &self.channels {
-            let ch = shared.lock().await;
-            if ch.services().is_empty() {
+            if shared.lock().await.services().is_empty() {
                 continue;
             }
-            let Some(reachers) = self.reachers.get(cid) else {
+            let (Some(reachers), Some(offered)) = (self.reachers.get(cid), self.offered.get(cid))
+            else {
                 continue;
             };
             out.insert(
                 *cid,
                 crate::node::tunnel::ChannelServices {
-                    evaluator: ch.evaluator_handle(),
-                    services: ch.services().clone(),
+                    offered: Arc::clone(offered),
                     reachers: Arc::clone(reachers),
                 },
             );
@@ -6230,6 +6213,11 @@ impl Node {
             // A recompute is not a decision: this wakes the serving tasks only if the set
             // really moved. The rule and its reason live in `publish_reachers`.
             crate::node::tunnel::publish_reachers(slot, next);
+            let offer = self
+                .offered
+                .entry(*cid)
+                .or_insert_with(crate::node::tunnel::empty_offered);
+            crate::node::tunnel::publish_offered(offer, ch.services().clone());
         }
         // A channel this node no longer holds must deny, including to tasks still holding
         // the handle: empty it before letting go, or they would read the last value forever.
@@ -6237,6 +6225,13 @@ impl Node {
             let held = self.channels.contains_key(cid);
             if !held {
                 crate::node::tunnel::publish_reachers(slot, std::collections::BTreeSet::new());
+            }
+            held
+        });
+        self.offered.retain(|cid, slot| {
+            let held = self.channels.contains_key(cid);
+            if !held {
+                crate::node::tunnel::publish_offered(slot, std::collections::BTreeMap::new());
             }
             held
         });

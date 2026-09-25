@@ -40,7 +40,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
-use crate::node::resolver::{ServiceRoom, VoxResolver};
+use crate::node::resolver::VoxResolver;
 use crate::transport::quic::VoxConnection;
 use crate::tunnel::socks::{self, Reply, Target};
 
@@ -133,8 +133,14 @@ where
         return Err(Error::MalformedTunnel("vox up binds loopback only"));
     }
     loop {
-        let Ok((stream, from)) = listener.accept().await else {
-            continue;
+        let (stream, from) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            // Back off rather than spin: a failed accept is almost always `EMFILE`, and
+            // retrying at once fails again at once (see `tunnel::ACCEPT_BACKOFF`).
+            Err(_) => {
+                tokio::time::sleep(crate::node::tunnel::ACCEPT_BACKOFF).await;
+                continue;
+            }
         };
         if !from.ip().is_loopback() {
             continue;
@@ -221,6 +227,62 @@ async fn reach_host_with_patience<D: HostDialer>(
     }
 }
 
+/// Reach `host` and open a tunnel to `service_tag` in `channel_id`, returning the stream
+/// pair **once the host has accepted** — so a caller can tell its application the truth.
+///
+/// Patient in the same way and for the same reasons as [`reach_host_with_patience`], and
+/// patient about the *path* too: an attempt that fails before the host answered — the
+/// connection was stale because the host restarted, or the path changed under it — is
+/// retried on whatever connection reaches the host now, until [`HOST_PATIENCE`] runs out
+/// (PRD-001 R24). A **refusal** is never retried: the host has decided, and asking again
+/// would only make a refused application wait five minutes to be told so.
+///
+/// # Errors
+/// [`Error::TunnelDenied`] when the host refused; otherwise the last reason the host could
+/// not be reached.
+pub async fn open_tunnel<D: HostDialer>(
+    dialer: &D,
+    host: &Digest32,
+    channel_id: &Digest32,
+    service_tag: &str,
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
+    loop {
+        let attempt = async {
+            let conn = reach_host_with_patience(dialer, host).await?;
+            let (mut send, mut recv) = crate::transport::streams::open_typed(
+                &conn,
+                crate::transport::streams::StreamKind::Tunnel,
+            )
+            .await?;
+            crate::tunnel::session::request(&mut send, &mut recv, channel_id, service_tag).await?;
+            Ok::<_, Error>((send, recv))
+        };
+        match attempt.await {
+            Ok(streams) => return Ok(streams),
+            Err(e @ Error::TunnelDenied(_)) => return Err(e),
+            Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
+            Err(_) => tokio::time::sleep(HOST_POLL).await,
+        }
+    }
+}
+
+/// What to tell the operator when [`open_tunnel`] failed for `what`.
+///
+/// Said on this node only. The host's refusal is deliberately uniform — untrusted, no such
+/// service and a service that would not answer look the same on the wire (ADR-013) — so
+/// this names all three rather than guessing, and says nothing the host did not say.
+#[must_use]
+pub fn refusal(e: &Error, what: &str) -> String {
+    match e {
+        Error::TunnelDenied(_) => format!(
+            "the host refused {what} — it has not trusted this identity (`vox trust add`), \
+             or offers nothing there, or its service did not answer"
+        ),
+        other => format!("could not reach the host for {what}: {other}"),
+    }
+}
+
 /// The bound address reported back to a SOCKS client. The proxy does not bind a per-
 /// connection address, and RFC 1928 lets a server report all-zeroes for that.
 const UNSPECIFIED: SocketAddr =
@@ -255,22 +317,34 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
         socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
         return Err(Error::MalformedTunnel("no such .vox name on this machine"));
     };
-    let conn = match reach_host_with_patience(dialer, &room.host).await {
-        Ok(conn) => conn,
+    // **Reply only once the host has answered** (PRD-001 R23). This used to say
+    // "succeeded" before dialling, on the belief that the host waits for the client's
+    // first bytes and so holding the reply would deadlock against `ssh`, which sends
+    // nothing until it is told the connection is up. The host waits for nothing of the
+    // kind — it writes its verdict straight after its own local connect — so the early
+    // reply bought nothing and cost the truth: every refused CONNECT looked connected and
+    // then hung up, and neither the tool nor the person could tell a refusal from a
+    // network fault.
+    //
+    // **The port is the service tag** (ADR-017 decision 4), so nothing here invents a name,
+    // and the **host** decides whether the dial is allowed — this side claims nothing.
+    let tag = port.to_string();
+    let (send, recv) = match open_tunnel(dialer, &room.host, &room.channel_id, &tag).await {
+        Ok(streams) => streams,
         Err(why) => {
-            // The ladder's own verdict, which `reach_host_with_patience` kept for exactly this.
-            refused(&format!("could not reach this room's host: {why}"));
-            socks::write_reply(&mut stream, Reply::GeneralFailure, UNSPECIFIED).await?;
+            // The SOCKS reply is a code, and a coarse one; the sentence goes to this node's
+            // own operator. Neither says anything the host did not.
+            refused(&refusal(&why, &format!("{name}:{port}")));
+            let reply = match why {
+                Error::TunnelDenied(_) => Reply::NotAllowed,
+                _ => Reply::GeneralFailure,
+            };
+            socks::write_reply(&mut stream, reply, UNSPECIFIED).await?;
             return Err(why);
         }
     };
-
-    // Reply *before* the tunnel is dialled, because a SOCKS client sends nothing until it
-    // has been told the connection succeeded — `ssh` waits for the reply before its
-    // version banner, so a dial that waits for bytes would deadlock against a client that
-    // waits for this.
     socks::write_reply(&mut stream, Reply::Succeeded, UNSPECIFIED).await?;
-    match carry(&conn, &room, port, stream).await {
+    match crate::tunnel::session::splice(send, recv, stream).await {
         // The session was established and then cut by a decision. Report it; every other
         // ending is silent (M17.11).
         Err(Error::TunnelRevoked(why)) => {
@@ -279,27 +353,6 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
         }
         other => other,
     }
-}
-
-/// Open a tunnel stream to the room's host and splice `local` into it.
-///
-/// **The port is the service tag** (ADR-017 decision 4), so nothing here invents a name,
-/// and the **host** decides whether the dial is allowed — this side claims nothing. Since
-/// M17.7 that decision is the host's trust keyring intersected with the room's author set,
-/// not a capability this side could hold or present. A refusal closes the local connection,
-/// which the tool sees as the peer hanging up, and says nothing about why (dark services,
-/// ADR-013); a *withdrawal mid-session* is the one ending that names itself, because a peer
-/// whose established session is cut already knows it had one.
-async fn carry(
-    conn: &Arc<VoxConnection>,
-    room: &ServiceRoom,
-    port: u16,
-    local: TcpStream,
-) -> Result<()> {
-    let (send, recv) =
-        crate::transport::streams::open_typed(conn, crate::transport::streams::StreamKind::Tunnel)
-            .await?;
-    crate::tunnel::session::dial(send, recv, &room.channel_id, &port.to_string(), local).await
 }
 
 /// The `~/.ssh/config` block that makes `ssh user@<name>.vox` work, for `vox up` to print.
