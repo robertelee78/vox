@@ -37,6 +37,10 @@ pub struct Yield {
     pub have: Vec<(Digest32, u64)>,
     /// How many `ENTRY` frames the victim sent.
     pub entries: usize,
+    /// How many of them were different entries: `entries` minus the ones served twice.
+    pub distinct: usize,
+    /// The entries seen so far, by content hash, to count `distinct`.
+    seen: std::collections::HashSet<[u8; 32]>,
     /// Why the session ended, if not cleanly.
     pub ended: Option<String>,
 }
@@ -158,7 +162,12 @@ pub fn session(
     loop {
         match t.recv() {
             Ok(Some(f)) => match decode_frame(&f) {
-                Ok(SyncFrame::Entry(_)) => y.entries += 1,
+                Ok(SyncFrame::Entry(wire)) => {
+                    y.entries += 1;
+                    if y.seen.insert(vox_core::hash::sha256(&wire)) {
+                        y.distinct += 1;
+                    }
+                }
                 other => {
                     y.ended = Some(format!("unexpected frame: {other:?}"));
                     return y;
