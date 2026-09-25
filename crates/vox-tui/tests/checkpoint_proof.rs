@@ -104,9 +104,18 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
     )
 }
 
-/// Start `vox daemon` on `dir` at `listen`, optionally with its millisecond clock skewed
-/// (test-only).
-fn daemon(dir: &Path, tag: &str, listen: &str, stdin_lines: &str, skew_ms: Option<i64>) -> Daemon {
+/// The **test-only** override of how long a room must be quiet before a backlog under a
+/// checkpoint batch is closed anyway (production: ten minutes).
+const IDLE_ENV: &str = "VOX_TEST_CHECKPOINT_IDLE_SECS";
+
+/// Start `vox daemon` on `dir` at `listen`, optionally with a short checkpoint idle time.
+fn daemon(
+    dir: &Path,
+    tag: &str,
+    listen: &str,
+    stdin_lines: &str,
+    idle_secs: Option<u64>,
+) -> Daemon {
     let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
     let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
     let mut cmd = Command::new(VOX);
@@ -115,11 +124,12 @@ fn daemon(dir: &Path, tag: &str, listen: &str, stdin_lines: &str, skew_ms: Optio
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_ROOM")
         .env_remove(vox_core::time::TEST_CLOCK_SKEW_ENV)
+        .env_remove(IDLE_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    if let Some(skew) = skew_ms {
-        cmd.env(vox_core::time::TEST_CLOCK_SKEW_ENV, skew.to_string());
+    if let Some(idle) = idle_secs {
+        cmd.env(IDLE_ENV, idle.to_string());
     }
     let mut child = cmd.spawn().expect("spawn vox daemon");
     let mut pipe = child.stdin.take().expect("daemon stdin");
@@ -483,5 +493,136 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
     assert!(
         j_small >= POSTS,
         "the newcomer received {j_small} unsigned skeletons for {POSTS} checkpointed entries"
+    );
+}
+
+/// A room of one: alice creates it on a fresh daemon and posts `n` messages `"old <i>"`.
+/// Returns the running daemon and the room id.
+fn room_with_posts(alice: &Path, n: usize, idle_secs: Option<u64>) -> (Daemon, String) {
+    let alice_d = daemon(
+        alice,
+        "alice",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n"),
+        idle_secs,
+    );
+    attached(alice, "alice");
+    let (ok, _, err) = vox(
+        alice,
+        &["room", "create", "--name", "r"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "vox room create: {err}");
+    let room = attached(alice, "alice")
+        .split_whitespace()
+        .next()
+        .expect("a room id")
+        .to_owned();
+    for i in 1..=n {
+        post(alice, &room, &format!("old {i}"));
+    }
+    (alice_d, room)
+}
+
+/// Poll `vox room read` until none of the `"old "` messages is shown.
+fn until_expired(alice: &Path, room: &str, secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while texts(&read(alice, room))
+        .iter()
+        .any(|t| t.starts_with("old "))
+    {
+        assert!(Instant::now() < deadline, "the old messages never expired");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Fewer expired entries than a checkpoint batch (32) are still checkpointed once nothing new
+/// has expired for the idle time — a **closing** checkpoint — so none keeps its signature
+/// indefinitely. The idle time is the test-only 15 s instead of production's ten minutes; the
+/// gate first shows that nothing is shed before it passes.
+#[test]
+#[ignore = "one real vox daemon and real seconds (about a minute); CI runs it in release"]
+fn a_backlog_under_a_batch_is_checkpointed_once_the_room_goes_quiet() {
+    const FEW: usize = 10;
+    const IDLE: u64 = 15;
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = &members(tmp.path(), &["alice"])[0];
+    let (alice_d, room) = room_with_posts(alice, FEW, Some(IDLE));
+    std::thread::sleep(Duration::from_secs(RETENTION + 2));
+    let (ok, _, err) = vox(
+        alice,
+        &["room", "retention", &room, &RETENTION.to_string()],
+        None,
+    );
+    assert!(ok, "vox room retention: {err}");
+    until_expired(alice, &room, 60);
+    stop_all(vec![alice_d]);
+    let (_, _, before) = page_stats(&log_pages(alice));
+    println!("just after the {FEW} expired: {before} pages smaller than a signature");
+    assert_eq!(
+        before, 0,
+        "a backlog under a batch was checkpointed before the room went quiet"
+    );
+
+    let alice_d = daemon(
+        alice,
+        "alice-2",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        Some(IDLE),
+    );
+    attached(alice, "alice");
+    std::thread::sleep(Duration::from_secs(IDLE + 5));
+    stop_all(vec![alice_d]);
+    let (pages, bytes, after) = page_stats(&log_pages(alice));
+    println!(
+        "{} s quiet: {pages} log pages, {bytes} bytes, {after} smaller than a signature",
+        IDLE + 5
+    );
+    assert_eq!(after, FEW, "the closing checkpoint did not shed all {FEW}");
+}
+
+/// A backlog that expired while the room still kept everything (a node's own shorter limit
+/// pruned it, and a room that keeps everything is never checkpointed) is checkpointed as soon as
+/// the room starts disappearing, and after a restart, **without another prune**: nothing is left
+/// to prune.
+#[test]
+#[ignore = "one real vox daemon and real seconds (about a minute); CI runs it in release"]
+fn an_expired_backlog_is_checkpointed_without_waiting_for_another_prune() {
+    const MANY: usize = 40;
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = &members(tmp.path(), &["alice"])[0];
+    // The node keeps 20 s; the room keeps everything.
+    std::fs::write(
+        alice.join("cfg").join("retention"),
+        format!("default {RETENTION}\n"),
+    )
+    .unwrap();
+    let (alice_d, room) = room_with_posts(alice, MANY, None);
+    until_expired(alice, &room, 90);
+    // Nothing more can expire now; the room starts disappearing only afterwards.
+    let (ok, out, err) = vox(alice, &["room", "retention", &room, "1w"], None);
+    assert!(ok, "vox room retention 1w: {err}");
+    println!("{}", out.trim());
+    stop_all(vec![alice_d]);
+    let alice_d = daemon(
+        alice,
+        "alice-2",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        None,
+    );
+    attached(alice, "alice");
+    std::thread::sleep(Duration::from_secs(5));
+    stop_all(vec![alice_d]);
+    let (pages, bytes, shed) = page_stats(&log_pages(alice));
+    println!(
+        "after the restart: {pages} log pages, {bytes} bytes, {shed} smaller than a signature"
+    );
+    assert_eq!(
+        shed, MANY,
+        "the expired backlog was not checkpointed without another prune"
     );
 }

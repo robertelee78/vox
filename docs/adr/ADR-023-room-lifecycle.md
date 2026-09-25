@@ -151,8 +151,13 @@ proposal is **author checkpoints**:
 - **When the author posts one.** The room's retention is not forever. A node's own shorter limit
   does not count, because it is not the room's business. And at least 32 more of the author's
   entries have expired on its node since its last checkpoint. A checkpoint is itself a signed
-  entry about the size one skeleton saves, so one per 32 costs about 3% of what it frees. The
-  check runs only on a sweep that pruned something: entries expire only by being pruned.
+  entry about the size one skeleton saves, so one per 32 costs about 3% of what it frees.
+  - **Or a closing checkpoint:** fewer than 32 have expired, and nothing new has expired on its
+    node for ten minutes. No expired entry keeps its signature indefinitely.
+  - **Asked on every tick, not only after a prune.** The check looks only past the last checkpoint
+    and stops at the author's first entry still holding a body, so it costs almost nothing. That is
+    what checkpoints a backlog that is already expired when the room is opened after a restart, or
+    one that expired while the room still kept everything, without waiting for another prune.
 - **Which position it names.** The highest one below which every content entry of the author has
   had its body pruned there. Governance and earlier checkpoints keep their bodies and never hold it
   back.
@@ -356,6 +361,17 @@ covers only the approver's own messages, as consent always has.
       one is refused too.
     - **Mutation, pre-checkpoint refusal removed:** red, with the equivocation taken to the fork
       path ("entry failed the acceptance predicate").
+  - **Closing checkpoint:** `a_backlog_under_a_batch_is_checkpointed_once_the_room_goes_quiet`.
+    - 10 messages expire together, and just after, 0 pages are smaller than a signature.
+    - After 20 s quiet (idle set to 15 s by the test-only `VOX_TEST_CHECKPOINT_IDLE_SECS`;
+      production is 10 min), 10 of 12 pages are.
+    - Mutation, no closing checkpoint: red, 0 of 11.
+  - **Without another prune:** `an_expired_backlog_is_checkpointed_without_waiting_for_another_prune`.
+    - The node keeps 20 s and the room keeps everything, so 40 messages are pruned and not
+      checkpointed.
+    - The room is then set to a week and the node restarted. Nothing is left to prune, and 40 of
+      42 pages are smaller than a signature.
+    - Mutation, checkpoint asked only after a prune (the first M23.6 trigger): red, 0 of 41.
 
 ## Questions the decider answered (2026-09-25)
 

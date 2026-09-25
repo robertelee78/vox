@@ -299,6 +299,21 @@ pub struct NodeConfig {
     /// the copy holds nothing this node could read. `vox node` turns it on; a client
     /// leaves it off, so a stranger's genesis on its board costs it nothing.
     pub anchor_logs: bool,
+    /// How long nothing new must have expired before a backlog of this identity's expired
+    /// entries smaller than a checkpoint batch is checkpointed anyway (ADR-023 decision 3).
+    /// Production is [`crate::node::channel::CHECKPOINT_IDLE_SECS`]; only the test-only
+    /// `VOX_TEST_CHECKPOINT_IDLE_SECS` changes it, so a proof need not wait ten minutes.
+    pub checkpoint_idle_secs: u64,
+}
+
+/// [`crate::node::channel::CHECKPOINT_IDLE_SECS`], unless the **test-only**
+/// `VOX_TEST_CHECKPOINT_IDLE_SECS` says otherwise. Nothing in a real deployment sets it; a proof of
+/// the closing checkpoint drives the shipped binary and cannot wait ten minutes per run.
+fn checkpoint_idle_from_env() -> u64 {
+    std::env::var("VOX_TEST_CHECKPOINT_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(crate::node::channel::CHECKPOINT_IDLE_SECS)
 }
 
 impl std::fmt::Debug for NodeConfig {
@@ -332,6 +347,7 @@ impl NodeConfig {
             anchors: BootstrapSet::new(),
             headless: None,
             anchor_logs: false,
+            checkpoint_idle_secs: checkpoint_idle_from_env(),
         }
     }
 
@@ -1205,6 +1221,8 @@ pub struct Node {
     /// half the ADR-020 claim ordering key, where whole seconds put two racing agents in one
     /// bucket and let a hash decide.
     millis_clock: crate::time::MillisClock,
+    /// See [`NodeConfig::checkpoint_idle_secs`].
+    checkpoint_idle_secs: u64,
     argon2: Argon2Profile,
     view_tx: watch::Sender<NodeView>,
     event_tx: broadcast::Sender<NodeEvent>,
@@ -1290,6 +1308,7 @@ impl Node {
             anchors,
             headless,
             anchor_logs,
+            checkpoint_idle_secs,
         } = cfg;
         let profile = if Profile::exists(&paths) {
             Some(Profile::open(paths.clone())?)
@@ -1306,6 +1325,7 @@ impl Node {
             paths,
             profile,
             millis_clock,
+            checkpoint_idle_secs,
             net: None,
             net_tx,
             bind,
@@ -4956,14 +4976,16 @@ impl Node {
             ch.set_node_retention(self.node_retention.for_room(cid));
             let here = ch.sweep_retention(&store, now).unwrap_or(0);
             pruned += here;
-            // Entries only newly expire by being pruned, so that is when a checkpoint of this
-            // identity's own may have become due. Then every checkpoint held sheds the
-            // signatures below it (ADR-023 decision 3); between checkpoints that costs nothing.
-            if here > 0 {
-                if let Some(profile) = self.profile.as_ref() {
-                    if ch.checkpoint_if_due(profile, now).unwrap_or(false) {
-                        checkpointed.push(*cid);
-                    }
+            // Asked every tick, not only after a prune: a room opened with an expired backlog
+            // (after a restart) or one idle with a backlog under the batch size is checkpointed
+            // without waiting for another prune. The check stops at this identity's first entry
+            // still holding a body, so it costs almost nothing. Then every checkpoint held sheds
+            // the signatures below it (ADR-023 decision 3).
+            let _ = here;
+            ch.set_checkpoint_idle(self.checkpoint_idle_secs);
+            if let Some(profile) = self.profile.as_ref() {
+                if ch.checkpoint_if_due(profile, now).unwrap_or(false) {
+                    checkpointed.push(*cid);
                 }
             }
             let _ = ch.drop_checkpointed_signatures(&store);

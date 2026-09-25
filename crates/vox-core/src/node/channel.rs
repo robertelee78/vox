@@ -305,6 +305,12 @@ pub struct Rendered {
 /// that expires slowly is not filled with checkpoints.
 pub const CHECKPOINT_EVERY: usize = 32;
 
+/// How long nothing new must have expired before an author closes a backlog smaller than
+/// [`CHECKPOINT_EVERY`] with a checkpoint anyway: ten minutes. Long enough that a room expiring
+/// steadily batches its checkpoints; short enough that a quiet room's last few entries do not
+/// keep their signatures indefinitely.
+pub const CHECKPOINT_IDLE_SECS: u64 = 600;
+
 /// How long a row must have been on screen before something landing above it counts as a
 /// late arrival rather than ordinary concurrency: ten seconds. A push delivers a member's
 /// post in about a second, so two people typing at once never trip it; a member returning
@@ -384,6 +390,12 @@ pub struct ChannelState {
     /// This node's own retention for the room, seconds; `0` is no node limit. Set by the
     /// actor from the node's config; the room's own lives in the evaluator's policy.
     node_retention: u64,
+    /// When this node last pruned anything in the room (seconds), or opened it: what a closing
+    /// checkpoint waits [`ChannelState::set_checkpoint_idle`] past (ADR-023 decision 3).
+    last_pruned_at: u64,
+    /// How long nothing new must have expired before an author closes a backlog smaller than
+    /// [`CHECKPOINT_EVERY`] with a checkpoint anyway. [`CHECKPOINT_IDLE_SECS`] unless set.
+    checkpoint_idle: u64,
     poisoned: bool,
 }
 
@@ -884,6 +896,8 @@ impl ChannelState {
             delivered: BTreeMap::new(),
             retention: RetentionIndex::default(),
             node_retention: 0,
+            last_pruned_at: now_secs,
+            checkpoint_idle: CHECKPOINT_IDLE_SECS,
             poisoned: false,
         })
     }
@@ -1113,6 +1127,8 @@ impl ChannelState {
             delivered,
             retention,
             node_retention: 0,
+            last_pruned_at: now_secs,
+            checkpoint_idle: CHECKPOINT_IDLE_SECS,
             poisoned: false,
         })
     }
@@ -1287,6 +1303,8 @@ impl ChannelState {
             delivered: BTreeMap::new(),
             retention: RetentionIndex::default(),
             node_retention: 0,
+            last_pruned_at: now_secs,
+            checkpoint_idle: CHECKPOINT_IDLE_SECS,
             poisoned: false,
         })
     }
@@ -2050,7 +2068,17 @@ impl ChannelState {
             return Ok(0);
         }
         let due = self.retention.take_due(now_secs.saturating_sub(ttl));
-        self.prune(store, &due, false)
+        let pruned = self.prune(store, &due, false)?;
+        if pruned > 0 {
+            self.last_pruned_at = now_secs;
+        }
+        Ok(pruned)
+    }
+
+    /// How long nothing new must have expired before a backlog smaller than
+    /// [`CHECKPOINT_EVERY`] is checkpointed anyway (seconds). Set by the actor.
+    pub fn set_checkpoint_idle(&mut self, secs: u64) {
+        self.checkpoint_idle = secs;
     }
 
     /// Post a checkpoint on this identity's **own** feed when one is due (ADR-023 decision 3,
@@ -2058,9 +2086,15 @@ impl ChannelState {
     /// whether one was posted — a local append the caller pushes like any other.
     ///
     /// Due when the **room** keeps messages for a while (its retention is not forever; a
-    /// node's own shorter limit does not make it the room's business), and at least
+    /// node's own shorter limit does not make it the room's business), and either at least
     /// [`CHECKPOINT_EVERY`] more of this author's entries have expired here since its last
-    /// checkpoint. The position named is the highest one below which every content entry of
+    /// checkpoint, or fewer have and nothing new has expired for the checkpoint idle time — a
+    /// **closing** checkpoint, so no expired entry keeps its signature indefinitely.
+    ///
+    /// Cheap enough to ask on every tick: it looks only past the last checkpoint and stops at
+    /// the first of this author's entries still holding a body. Asking every tick, not only
+    /// after a prune, is what checkpoints a room opened with a backlog already expired (after a
+    /// restart, or pruned while the room kept everything) without waiting for another prune. The position named is the highest one below which every content entry of
     /// this author has had its body pruned on this node; governance and earlier checkpoints
     /// keep their bodies and never hold it back.
     pub fn checkpoint_if_due(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
@@ -2089,7 +2123,8 @@ impl ChannelState {
         let Some((seq, entry_hash)) = below else {
             return Ok(false);
         };
-        if seq <= already || expired < CHECKPOINT_EVERY {
+        let idle = now_secs.saturating_sub(self.last_pruned_at) >= self.checkpoint_idle;
+        if seq <= already || (expired < CHECKPOINT_EVERY && !idle) {
             return Ok(false);
         }
         let payload = crate::log::checkpoint::Checkpoint { seq, entry_hash }.to_wire();
