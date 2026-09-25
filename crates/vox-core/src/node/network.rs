@@ -57,7 +57,7 @@ use crate::node::prekeys::PrekeyRing;
 use crate::node::store::Store;
 use crate::time::Clock;
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
-use crate::transport::streams::accept_typed;
+use crate::transport::streams::accept_typed_on;
 use crate::transport::streams::StreamKind;
 
 /// The peer classification the accept path reads, refreshed by the actor whenever
@@ -425,7 +425,7 @@ impl NodeNet {
     /// Accept the next stream on `conn`, authorize it against the shared policy, and
     /// serve it if it is the board. Anything the actor must handle comes back as an
     /// [`Inbound`].
-    pub async fn accept_stream(&self, conn: &VoxConnection) -> Result<Inbound> {
+    pub async fn accept_stream(&self, conn: &Arc<VoxConnection>) -> Result<Inbound> {
         // **Authorize when the stream arrives, not before.** Accepting blocks until
         // the peer opens something, which may be long after this loop iteration began
         // — and in that window the peer can become a member (a join completes, a
@@ -450,8 +450,18 @@ impl NodeNet {
         &self,
         conn: &VoxConnection,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
-        let peer = conn.peer_id();
-        let (kind, mut send, mut recv) = accept_typed(conn).await?;
+        self.accept_authorized_on(conn.quinn(), conn.peer_id())
+            .await
+    }
+
+    /// [`Self::accept_authorized`] on the bare quinn handle of a connection to `peer`, so the
+    /// waiting does not hold the [`VoxConnection`] — see `actor::spawn_stream_loop`.
+    pub async fn accept_authorized_on(
+        &self,
+        conn: &quinn::Connection,
+        peer: Digest32,
+    ) -> Result<(StreamKind, SendStream, RecvStream)> {
+        let (kind, mut send, mut recv) = accept_typed_on(conn).await?;
         if !PeerPolicy::allows(self.classify(&peer), kind) {
             crate::node::net::refuse_stream(&mut send, &mut recv);
             return Err(crate::error::Error::StreamRefused(
@@ -527,7 +537,7 @@ impl NodeNet {
     /// that maintain their own view; the node uses [`NodeNet::accept_stream`]).
     pub async fn accept_stream_with(
         &self,
-        conn: &VoxConnection,
+        conn: &Arc<VoxConnection>,
         policy: &PeerPolicy,
     ) -> Result<Inbound> {
         let (kind, send, recv) = accept_authorized(conn, policy).await?;
@@ -538,7 +548,7 @@ impl NodeNet {
     /// loop — see [`Self::accept_authorized`].
     pub async fn dispatch(
         &self,
-        conn: &VoxConnection,
+        conn: &Arc<VoxConnection>,
         kind: StreamKind,
         send: SendStream,
         recv: RecvStream,
@@ -598,7 +608,7 @@ impl NodeNet {
             StreamKind::Circuit => {
                 let manager = Arc::clone(&self.manager);
                 circuitstream::serve_circuit(
-                    peer,
+                    conn,
                     &|p| self.classify(p),
                     send,
                     recv,
@@ -776,6 +786,15 @@ impl NodeNet {
         {
             return Err(Error::Unreachable("the path is already direct"));
         }
+        // **Held weakly: the ladder only needs to know which connection it is replacing.** A
+        // strong hold is a claim that the path is carrying something, and the ladder runs for
+        // as long as its slowest rung — seconds past the moment another rung, or the peer's own
+        // ladder, has already displaced this connection. Holding it kept a retired relayed
+        // connection open, and its circuit on the relay, until every rung had given up.
+        let current = {
+            let held = current;
+            Arc::downgrade(&held)
+        };
         let mut set: JoinSet<Result<VoxConnection>> = JoinSet::new();
         let candidates = direct_candidates(endpoints);
         if !candidates.is_empty() {
@@ -816,7 +835,7 @@ impl NodeNet {
                     let filed = self.manager.adopt(conn);
                     // `adopt` keeps the better of the two; only a real replacement is an
                     // upgrade.
-                    if !Arc::ptr_eq(&filed, &current) {
+                    if !std::ptr::eq(Arc::as_ptr(&filed), current.as_ptr()) {
                         return Ok(filed);
                     }
                     why.push("a better path landed but the manager kept the held one".to_owned());
@@ -871,7 +890,7 @@ impl NodeNet {
     /// forwards packets it cannot read.
     pub async fn circuit_through(
         &self,
-        relay: &VoxConnection,
+        relay: &Arc<VoxConnection>,
         peer: Digest32,
     ) -> Result<Arc<VoxConnection>> {
         let conn = circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now())

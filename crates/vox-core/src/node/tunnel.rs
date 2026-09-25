@@ -299,7 +299,8 @@ impl Forward {
                 tokio::spawn(async move {
                     // One stream per connection, on whatever connection reaches the host now.
                     match up::open_tunnel(dialer.as_ref(), &host, &channel_id, &tag).await {
-                        Ok((send, recv)) => {
+                        // `_carried` is held for the whole splice: see `up::open_tunnel`.
+                        Ok((send, recv, _carried)) => {
                             if let Err(Error::TunnelRevoked(_)) =
                                 session::splice(send, recv, app).await
                             {

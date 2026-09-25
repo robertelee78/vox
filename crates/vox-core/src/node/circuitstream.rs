@@ -271,10 +271,14 @@ impl Drop for CircuitSlot {
 /// establishes — a relayed circuit, or a circuit terminating at this node — then runs
 /// on its own task, so the stream loop that accepted it is free at once.
 ///
-/// `connected` resolves a fingerprint to a live connection (the relay's own peer
-/// table); `endpoint` is where a circuit terminating here is attached.
+/// `carrier` is the connection the stream arrived on, and whatever the circuit becomes
+/// holds it — and the target's connection too, when this node relays — for as long as the
+/// circuit runs: that is what marks those connections as carrying, so a retired one is
+/// not closed under a live circuit. `connected` resolves a fingerprint to a live
+/// connection (the relay's own peer table); `endpoint` is where a circuit terminating
+/// here is attached.
 pub async fn serve_circuit<F>(
-    peer: Digest32,
+    carrier: &Arc<VoxConnection>,
     classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
     mut send: SendStream,
     mut recv: RecvStream,
@@ -285,6 +289,7 @@ pub async fn serve_circuit<F>(
 where
     F: FnOnce(&Digest32) -> Option<Arc<VoxConnection>>,
 {
+    let peer = carrier.peer_id();
     match opening_answer(&mut recv).await? {
         CircuitFrame::Open { peer: target } => {
             if !relays_for(classify(&peer)) || !relays_for(classify(&target)) {
@@ -313,7 +318,8 @@ where
                 _ => return Err(Error::Unreachable("circuit: target did not answer")),
             }
             send_frame(&mut send, &CircuitFrame::Opened).await?;
-            tokio::spawn(relay(slot, send, recv, target_send, target_recv));
+            let carriers = [Arc::clone(carrier), target_conn];
+            tokio::spawn(relay(slot, carriers, send, recv, target_send, target_recv));
             Ok(())
         }
         CircuitFrame::Incoming { peer: origin } => {
@@ -325,7 +331,7 @@ where
             }
             send_frame(&mut send, &CircuitFrame::Opened).await?;
             let port = endpoint.attach_circuit(&origin)?;
-            tokio::spawn(terminate(port, send, recv));
+            tokio::spawn(terminate(port, Arc::clone(carrier), send, recv));
             Ok(())
         }
         _ => Err(Error::Unreachable("circuit: unexpected opening frame")),
@@ -336,7 +342,7 @@ where
 /// The connection that comes back is pinned to `peer` and authenticated by it, the
 /// same as a direct one.
 pub async fn connect_through(
-    relay: &VoxConnection,
+    relay: &Arc<VoxConnection>,
     peer: Digest32,
     endpoint: &Arc<VoxEndpoint>,
     now_secs: u64,
@@ -366,13 +372,32 @@ pub async fn connect_through(
     // succeeds: a failed dial — or an attempt abandoned because another rung won the
     // race (M15.1b) — aborts it on drop, which drops the port, which detaches the
     // circuit and closes the stream, which tells the relay and the far side to let go.
-    let driver = DriverGuard::new(tokio::spawn(terminate(port, send, recv)));
+    let driver = DriverGuard::new(tokio::spawn(terminate(port, Arc::clone(relay), send, recv)));
     let conn =
         crate::nat::reachability::connect_direct(Arc::clone(endpoint), &[target], peer, now_secs)
             .await?;
-    driver.keep();
+    // **The circuit ends when the connection it carries does.** Nothing else ends it: the
+    // relay forwards the inner connection's packets without reading them, so it cannot see
+    // a CONNECTION_CLOSE go by, and neither end's driver looks. A connection that lost a
+    // race to a direct one, or was displaced by one and retired, was closed at both ends
+    // while its circuit sat on the relay for `CIRCUIT_IDLE_TIMEOUT` — five minutes of a
+    // relay slot, and of the relay's connections to both ends held as carrying.
+    //
+    // A short linger first, so the close itself crosses the circuit before it goes.
+    if let Some(abort) = driver.keep() {
+        let inner = conn.quinn().clone();
+        tokio::spawn(async move {
+            inner.closed().await;
+            tokio::time::sleep(CIRCUIT_CLOSE_LINGER).await;
+            abort.abort();
+        });
+    }
     Ok(conn)
 }
+
+/// How long a circuit outlives the connection it carried, so that connection's
+/// CONNECTION_CLOSE reaches the far side through it.
+const CIRCUIT_CLOSE_LINGER: Duration = Duration::from_secs(1);
 
 /// A circuit driver that is aborted when this is dropped, unless [`DriverGuard::keep`]
 /// let it live on.
@@ -383,9 +408,10 @@ impl DriverGuard {
         Self(Some(handle))
     }
 
-    /// The circuit is in use: the driver runs until the stream ends.
-    fn keep(mut self) {
-        self.0.take();
+    /// The circuit is in use: the driver runs until the stream ends, or until the
+    /// returned handle aborts it.
+    fn keep(mut self) -> Option<tokio::task::AbortHandle> {
+        self.0.take().map(|h| h.abort_handle())
     }
 }
 
@@ -401,8 +427,14 @@ impl Drop for DriverGuard {
 /// circuit's address goes out as `DATAGRAM` frames, and `DATAGRAM` frames coming in
 /// are handed to the endpoint as arrivals from that address. Ends when the stream
 /// does, or after [`CIRCUIT_IDLE_TIMEOUT`] without traffic; the port — and with it
-/// the circuit — is dropped then.
-async fn terminate(mut port: CircuitPort, mut send: SendStream, mut recv: RecvStream) {
+/// the circuit — is dropped then. `_carrier`, the connection the circuit rides, is held
+/// until then.
+async fn terminate(
+    mut port: CircuitPort,
+    _carrier: Arc<VoxConnection>,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) {
     let Some(mut outbound) = port.take_outbound() else {
         return;
     };
@@ -438,9 +470,11 @@ async fn terminate(mut port: CircuitPort, mut send: SendStream, mut recv: RecvSt
 
 /// Carry `DATAGRAM` frames between the asker's stream and the target's, both ways,
 /// until either side is done or the circuit idles out. The slot in the ledger is
-/// given back when this returns.
+/// given back when this returns, and the two connections the circuit rides are held until
+/// then.
 async fn relay(
     slot: CircuitSlot,
+    _carriers: [Arc<VoxConnection>; 2],
     asker_send: SendStream,
     asker_recv: RecvStream,
     target_send: SendStream,

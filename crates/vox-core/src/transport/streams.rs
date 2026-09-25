@@ -91,7 +91,19 @@ pub async fn open_typed(
 /// Accept the next bi-stream on `conn` and read its kind frame. A stream the peer
 /// closes before typing it, or types with an unknown kind, is an error.
 pub async fn accept_typed(conn: &VoxConnection) -> Result<(StreamKind, SendStream, RecvStream)> {
-    let (send, mut recv) = conn.accept_stream().await?;
+    accept_typed_on(conn.quinn()).await
+}
+
+/// [`accept_typed`] on the bare quinn handle, for a caller that must wait for streams
+/// **without holding the [`VoxConnection`]** — the node's per-connection stream loop, which
+/// would otherwise count as a user of the connection for as long as the connection lives.
+pub async fn accept_typed_on(
+    conn: &quinn::Connection,
+) -> Result<(StreamKind, SendStream, RecvStream)> {
+    let (send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|_| Error::Unreachable("quic stream: the connection is closed"))?;
     let frame = read_frame(&mut recv, MAX_KIND_FRAME)
         .await?
         .ok_or(Error::MalformedBundle("stream closed before kind"))?;
