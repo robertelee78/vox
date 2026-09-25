@@ -138,7 +138,7 @@ where
         }
     };
     let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(crate::app::runtime_workers())
+        .worker_threads(2)
         .enable_all()
         .build()
     {
@@ -208,7 +208,7 @@ where
         }
     };
     let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(crate::app::runtime_workers())
+        .worker_threads(2)
         .enable_all()
         .build()
     {
@@ -300,7 +300,7 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
         }
     };
     let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(crate::app::runtime_workers())
+        .worker_threads(2)
         .enable_all()
         .build()
     {
@@ -1332,7 +1332,7 @@ pub fn run() -> ExitCode {
                 }
             };
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(crate::app::runtime_workers())
+                .worker_threads(2)
                 .enable_all()
                 .build()
             else {
