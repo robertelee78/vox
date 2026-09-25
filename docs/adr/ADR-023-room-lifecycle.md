@@ -184,23 +184,39 @@ proposal is **author checkpoints**:
 
 - **An owed sender-key message goes into the log.** When a member owes another member a sender key
   (consent granted, or a rotation), it seals the SKDM to the recipient and posts it as a log entry of
-  a new kind, `key-package` (struct tag assigned when built). The seal uses the pairwise channel's
-  keys if a session exists, and otherwise a one-shot PQXDH to the recipient's published prekey
-  (ADR-004).
+  a new kind, `key-package` (struct tag `0x0015`, domain `vox/key-package/v1`).
+- **The seal is always a one-shot PQXDH** to the recipient's published prekey bundle (ADR-004): the
+  package carries the PQXDH initial message and the first ratchet message, which seals the SKDM.
+  **This deviates from the plan above**, which said to use the pairwise session's keys when one exists.
+  Pairwise sessions live in memory only and are never persisted, so a package sealed in one could not
+  be opened by a recipient that restarted before reading it, and a recipient that restarted is exactly
+  the offline member this delivery is for. The one-shot seal needs nothing but the prekey ring, which
+  does persist. Cost: it uses one of the recipient's one-time prekeys when one is published.
+- **Direct delivery stays the fast path.** The package is posted only when the sender cannot reach the
+  recipient (the dial reports it unreachable). A reachable recipient still gets its key over the
+  pairwise stream, as F12 left it.
+- **Forward-only is preserved.** A package for a consent releases the sender key at its current
+  position, as direct delivery does (R12); a package for a rotation releases the new generation at its
+  origin, as the M18.1 re-key does. A message sealed before the grant stays unreadable to the recipient.
 - **Every member node replicates it** like any entry. An always-on member, the NAS for example,
   holds it and delivers it when the recipient next syncs. **No store-and-forward service is added**:
   the log already is one.
 - **What it reveals.** A `key-package` shows who is sending keys to whom, and when. The consent
   entries already reveal that, so it adds no new metadata to a member.
-- **Size.** It is roughly one SKDM, a few hundred bytes plus the signature.
+- **Size.** With the one-shot seal it is the SKDM plus a PQXDH initial message, which carries an
+  ML-KEM-768 ciphertext (1088 bytes) alone: more than 1 KiB. This follows from the parameters; it was
+  not measured.
 - **Retention.** A `key-package` is pruned once its recipient has acknowledged it. The recipient's
   next entry lists it in `seen`, which is the acknowledgement.
+  **Not built:** `seen` is M23.2 and is not on the base M23.3 was built on, so packages are kept.
 - **R14, pruning.** A sender keeps only the origin key of the generation in use, plus any generation
   a *full-history* grant still has to release (decision 5). `prune_before` runs when a generation is
   superseded. Zeroization on drop is already in place (`Zeroizing`).
 - **The consequence the decider accepted (PRD-001 §7 Q7).** A room with **no** always-on member,
   whose members are never online together, cannot deliver keys. `vox status` must say so for that
-  room ("no always-on member: keys wait for overlap").
+  room ("no always-on member: keys wait for overlap"). The `vox status` line is not built
+  (`status` is not on the v0.2.9 base); proof 5 shows the reason from the recipient's own log
+  instead.
 
 ### 5. History per grant (R12)
 
@@ -263,7 +279,7 @@ covers only the approver's own messages, as consent always has.
 5. **Offline keys through a member:**
    - A and B are never up together, and C is always on;
    - B reads every message of A's, including across a rotation;
-   - with C removed, B reads none, and `vox status` says why.
+   - with C removed, B reads none, and B's log says why (`vox status` is to say it once built).
 6. **Anchors hold nothing:** after a full session through a non-member anchor, its data directory has
    zero pages for the room.
 7. **R14:** after two rotations, the sender's key store holds one generation (read by a diagnostic).
@@ -338,7 +354,19 @@ covers only the approver's own messages, as consent always has.
       stopped stores through `ChannelState::sync_over` converges them at once.
     - It is skipped by name in release.yml and ci.yml with this cause, and reported as a v0.2.9
       defect.
-- **M23.3** `key-package` log entries and R14 pruning (decision 4). Proof 5. This replaces F12's
+- **M23.3** `key-package` log entries and R14 pruning (decision 4). Proof 5. **Key-packages
+  BUILT on `prd1/key-packages-v029`** (on `integrate/v0.2.9`; a v0.3.0 feature):
+  `crates/vox-tui/tests/key_package_proof.rs`, shipped binary. A and B never up
+  together, C always on: B read 6 of 6 of A's messages across a rotation and 0 of 1 sealed before the
+  grant; of the 2 packages A posted for B, C holds 2 and opens 0, B holds 2 and opens 2. C removed: B
+  read 0 of 3, holds 0 packages, and its log says it could not reach A with no peer to carry a
+  circuit. Mutations, each red: no package posted (B read 0 of 6); a consent package released from
+  the chain origin (B read the pre-grant message, 1 of 1). Known red, not in M23.3: the proof's setup
+  loses a sync between two live members in about 3 runs of 10, because a member's session with a
+  member that is down holds the room until the frame timeout and refuses the live member meanwhile.
+  Not built within it: R14 pruning, pruning packages on `seen`, and the `vox status` line. Only
+  forward-only grants are proved; `--history full` is not on the base. F12's direct delivery is kept as
+  the fast path rather than replaced. This replaces F12's
   delivery mechanism: F12 is a narrow v0.2.8 fix of SKDMs sent over pairwise sessions, covering the
   simultaneous-initiation race and trust-before-join. F12's proofs are to be kept as regression
   gates:
