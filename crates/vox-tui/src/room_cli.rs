@@ -237,6 +237,7 @@ pub async fn read(
     room: &str,
     since: Option<&str>,
     limit: u64,
+    only_late: bool,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
@@ -254,7 +255,7 @@ pub async fn read(
     {
         Ok(Frame::Rows { rows }) => {
             let mut out = std::io::stdout().lock();
-            for r in rows {
+            for r in rows.into_iter().filter(|r| r.late || !only_late) {
                 let _ = writeln!(out, "{} {} {}", id(&r.entry_hash), short(&r.author), r.text);
             }
             Ok(())

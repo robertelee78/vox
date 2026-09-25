@@ -81,6 +81,9 @@ pub struct MessageView {
     pub timestamp: u64,
     /// The rendered body if decryptable to you, else `None` (shown as a marker).
     pub body: Option<String>,
+    /// It arrived after rows below it had already been shown: a member who was offline,
+    /// or a sync that caught up (ADR-023 decision 1). Shown in its true place, marked.
+    pub late: bool,
 }
 
 impl MessageView {

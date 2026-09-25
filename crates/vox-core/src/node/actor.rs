@@ -4946,6 +4946,7 @@ impl Node {
             return false;
         };
         let mut pruned = 0usize;
+        let mut checkpointed: Vec<Digest32> = Vec::new();
         for (cid, shared) in &self.channels {
             // A room mid-session is skipped, not waited for: the actor must not park behind a
             // sync, and the next tick comes round in a second.
@@ -4953,9 +4954,26 @@ impl Node {
                 continue;
             };
             ch.set_node_retention(self.node_retention.for_room(cid));
-            pruned += ch.sweep_retention(&store, now).unwrap_or(0);
+            let here = ch.sweep_retention(&store, now).unwrap_or(0);
+            pruned += here;
+            // Entries only newly expire by being pruned, so that is when a checkpoint of this
+            // identity's own may have become due. Then every checkpoint held sheds the
+            // signatures below it (ADR-023 decision 3); between checkpoints that costs nothing.
+            if here > 0 {
+                if let Some(profile) = self.profile.as_ref() {
+                    if ch.checkpoint_if_due(profile, now).unwrap_or(false) {
+                        checkpointed.push(*cid);
+                    }
+                }
+            }
+            let _ = ch.drop_checkpointed_signatures(&store);
         }
-        pruned > 0
+        // A checkpoint is a local append: pushed like a post, so the other members can shed
+        // their copies' signatures too.
+        for cid in &checkpointed {
+            self.note_local_append(cid);
+        }
+        pruned > 0 || !checkpointed.is_empty()
     }
 
     async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {
@@ -4971,7 +4989,7 @@ impl Node {
         // composed from two clock reads can go backwards across a second boundary, which is the
         // ordering inversion this change exists to remove.
         let now_millis = (self.millis_clock)();
-        let appended = match ch.append_text(profile, text, now_millis) {
+        let appended = match ch.append_text(profile, text, now_millis, now) {
             Ok(r) => row_of(r),
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };

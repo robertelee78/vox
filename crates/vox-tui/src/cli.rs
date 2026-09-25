@@ -664,6 +664,10 @@ pub struct RoomReadArgs {
     /// and the one that must be identical on every node (PRD-001 R13).
     #[arg(long, hide = true, conflicts_with_all = ["since", "limit"])]
     pub hashes: bool,
+    /// Print only the messages marked late: they arrived after rows below them had already
+    /// been shown, and sit in their true place in history (ADR-023 decision 1).
+    #[arg(long, hide = true, conflicts_with = "hashes")]
+    pub late: bool,
 }
 
 /// Selecting a room, by the prefix of its channelID as `vox` prints it.
@@ -1198,7 +1202,8 @@ pub fn run() -> ExitCode {
                     }
                     RoomCmd::Read(a) if a.hashes => crate::room_cli::order(&paths, &a.room).await,
                     RoomCmd::Read(a) => {
-                        crate::room_cli::read(&paths, &a.room, a.since.as_deref(), a.limit).await
+                        crate::room_cli::read(&paths, &a.room, a.since.as_deref(), a.limit, a.late)
+                            .await
                     }
                     RoomCmd::Tail(a) => crate::room_cli::tail(&paths, &a.room).await,
                     RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,

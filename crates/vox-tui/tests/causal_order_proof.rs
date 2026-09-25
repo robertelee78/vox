@@ -70,6 +70,15 @@ impl Drop for Daemon {
 }
 
 impl Daemon {
+    /// Send it a signal by its PID (`-STOP` freezes it, `-CONT` thaws it).
+    fn signal(&self, sig: &str) {
+        let ok = Command::new("kill")
+            .args([sig, &self.0.id().to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "kill {sig} {} failed", self.0.id());
+    }
+
     /// Kill it by its PID and report whether it is gone (reaped): the check that nothing
     /// was left running.
     fn stop(mut self) -> bool {
@@ -711,4 +720,125 @@ fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
          did not reach the entry, so this run proved nothing about clocks"
     );
     stop_all(vec![alice_d]);
+}
+
+/// `vox room read --late`: the texts of the rows marked late.
+fn late(dir: &Path, room: &str) -> Vec<String> {
+    let (ok, out, err) = vox(dir, &["room", "read", room, "--late"], None);
+    assert!(ok, "vox room read --late: {err}");
+    out.lines()
+        .filter_map(|l| l.splitn(3, ' ').nth(2).map(str::to_owned))
+        .collect()
+}
+
+#[test]
+#[ignore = "two real vox daemons (about a minute); CI runs it in release"]
+fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = members(tmp.path(), &["alice", "bob"]);
+    let (alice, bob) = (&dirs[0], &dirs[1]);
+    let alice_d = daemon(
+        alice,
+        "alice",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n"),
+        None,
+    );
+    attached(alice, "alice");
+    let bob_d = daemon(bob, "bob", "127.0.0.1:0", &format!("{IDENTITY}\n"), None);
+    attached(bob, "bob");
+    let room = room(alice, &[bob]);
+    // Bob must read alice for the crossing posts to be counted on his side too.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        post(bob, &room, "bob probe");
+        std::thread::sleep(Duration::from_millis(500));
+        if texts(&read(alice, &room)).contains(&"bob probe") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "alice never read bob");
+    }
+
+    // ---- posts that cross in flight are ordinary concurrency: nothing is late -------------
+    round(&room, "cross", &[(alice, "alice"), (bob, "bob")]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    for (dir, who) in [(alice, "alice"), (bob, "bob")] {
+        while texts(&read(dir, &room))
+            .iter()
+            .filter(|t| t.starts_with("cross "))
+            .count()
+            < 2 * PER_ROUND
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{who} never showed all crossing posts"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    for (dir, who) in [(alice, "alice"), (bob, "bob")] {
+        let l = late(dir, &room);
+        println!(
+            "{who}: {} of {} crossing posts marked late",
+            l.len(),
+            2 * PER_ROUND
+        );
+        assert!(l.is_empty(), "{who} marks crossing posts late: {l:?}");
+    }
+
+    // ---- a post that did not get out at once is late when it does ------------------------
+    // Bob posts and his daemon is frozen (SIGSTOP) straight away, before its push; retried if
+    // the push won the race. It is thawed, not restarted, so the same node on the same address
+    // delivers it: what arrives late is the post, not a different node.
+    let mut attempt = 0;
+    let away = loop {
+        attempt += 1;
+        assert!(
+            attempt <= 5,
+            "bob's post got out before his node froze, 5 times"
+        );
+        let text = format!("while away {attempt}");
+        post(bob, &room, &text);
+        bob_d.signal("-STOP");
+        std::thread::sleep(Duration::from_secs(2));
+        if !texts(&read(alice, &room)).contains(&text.as_str()) {
+            break text;
+        }
+        bob_d.signal("-CONT");
+    };
+    for i in 1..=3 {
+        post(alice, &room, &format!("meanwhile {i}"));
+    }
+    // What alice has now been shown for longer than the late threshold; under the transport's
+    // 60 s idle limit, so the connection outlives the freeze.
+    std::thread::sleep(Duration::from_secs(12));
+    bob_d.signal("-CONT");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !texts(&read(alice, &room)).contains(&away.as_str()) {
+        assert!(
+            Instant::now() < deadline,
+            "alice never received {away:?}\n{}",
+            daemon_logs(&[(alice.as_path(), "alice"), (bob.as_path(), "bob")])
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let shown = texts(&read(alice, &room))
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let at = shown.iter().position(|t| *t == away).unwrap();
+    let meanwhile = shown.iter().position(|t| t == "meanwhile 1").unwrap();
+    let l = late(alice, &room);
+    println!(
+        "alice: {away:?} at {at}, above \"meanwhile 1\" at {meanwhile}; marked late: {l:?} \
+         (after {attempt} attempt(s))"
+    );
+    assert!(at < meanwhile, "the late post is not in its true place");
+    assert_eq!(
+        l,
+        vec![away.clone()],
+        "exactly the late post is marked late"
+    );
+    stop_all(vec![alice_d, bob_d]);
 }

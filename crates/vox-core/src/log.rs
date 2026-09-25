@@ -12,6 +12,9 @@
 //!   signed 10-field skeleton over a payload **hash** (so payloads prune while the
 //!   skeleton stays verifiable), and the [`entry::Authenticator`] (composite,
 //!   always attributable).
+//! - [`checkpoint`] — an author's checkpoint on its own feed (tag `0x0015`, ADR-023
+//!   decision 3): the position below which its expired skeletons may lose their
+//!   signatures and stay authentic through the hash chain alone.
 //! - [`feed`] — the per-author append-only feed (Bamboo-derived): `prev_hash`
 //!   contiguous chaining plus the [`feed::lipmaa`] skip-link, full verification,
 //!   and logarithmic skip-link certificates for partial replication.
@@ -44,6 +47,7 @@
 //!   models the admitted set as an input to the acceptance predicate
 //!   ([`dag::AdmissionPolicy`]).
 
+pub mod checkpoint;
 pub mod dag;
 pub mod entry;
 pub mod feed;

@@ -118,8 +118,9 @@ What the code does today (`origin/main` 671527a):
   asking for one gets the skeleton.
 - **Not a security property.** A modified or malicious node can keep everything. The UI and docs say
   so.
-- **Claims and work items** are entries like any other, and they expire with the room. (Open
-  question 1 below.)
+- **Claims and work items** are entries like any other, and they expire with the room. **Decided
+  2026-09-25:** "Agent communication is not meant to be a source of truth… it's a communications
+  coordination layer; the source of truth is the accountability skill and GitHub."
 
 ### 3. Skeleton growth: checkpoints (R1)
 
@@ -137,7 +138,38 @@ proposal is **author checkpoints**:
 - This applies only to rooms with a non-zero effective retention. A forever room keeps everything,
   because its bodies are kept too.
 
-(Open question 2 below: build checkpoints now, or when a real room gets large?)
+**Decided 2026-09-25: build checkpoints now** (M23.6). As built:
+
+- **Only the author checkpoints, and only its own feed.**
+  - The checkpoint is the payload of an ordinary entry in the author's own feed (struct tag
+    `0x0015`, body `[seq, entry_hash]`), signed like any entry. It names a position on the same
+    hash chain its signatures already vouch for, so it adds no trust.
+  - A checkpoint by anyone else would let one member make every node forget another member's
+    signatures, which are the evidence a fork proof needs.
+  - The cost: an author who never returns never checkpoints, and its old skeletons keep their
+    signatures. That is the conservative failure.
+- **When the author posts one.** The room's retention is not forever. A node's own shorter limit
+  does not count, because it is not the room's business. And at least 32 more of the author's
+  entries have expired on its node since its last checkpoint. A checkpoint is itself a signed
+  entry about the size one skeleton saves, so one per 32 costs about 3% of what it frees. The
+  check runs only on a sweep that pruned something: entries expire only by being pruned.
+- **Which position it names.** The highest one below which every content entry of the author has
+  had its body pruned there. Governance and earlier checkpoints keep their bodies and never hold it
+  back.
+- **Shedding.** A node sheds the signature of an entry at or below its author's checkpoint whose
+  body it has pruned, and only when its effective retention is not forever. It does so when the
+  checkpoint arrives, or when it prunes such an entry afterwards.
+  - The shed entry is stored with authenticator type `0` and no bytes.
+  - It stays authentic through the chain: the signed checkpoint names its position's hash, and
+    each entry's successor names it in `prev_hash`.
+  - An unsigned entry never verifies on its own. The DAG takes one only inside a sync session or
+    a reload, provisionally. It becomes authentic once a signed entry of the same feed chains to
+    it, and whatever never does is taken back at the end of the session.
+  - A newcomer therefore syncs signed entries from the checkpoint onward and hash-chained skeletons
+    below it. It holds the same entry set, so it holds the same order.
+- **Refusal below the line.** An entry for a position at or below its author's checkpoint that the
+  node does not hold as it is refused as pre-checkpoint, never classified as a fork. In a sync
+  session the refusal is not fatal.
 
 ### 4. Key delivery through members (R11, R14) — and why the anchor needs nothing
 
@@ -245,9 +277,21 @@ covers only the approver's own messages, as consent always has.
   - **The order:** the hybrid logical clock with the ten-minute cap, sorted by `(clock, hash)`. An
     unknown `seen` hash never blocks acceptance. When it arrives, what named it is recomputed, and
     whatever moved takes its descendants along.
-  - **The timeline:** kept in that order. A late row is inserted at its place and flagged `late`.
-    The flag means "rendered here after a row now below it", so ordinary concurrency sets it too,
-    not only an offline member's return.
+  - **The timeline:** kept in that order. A late row is inserted at its place and flagged `late`,
+    and the TUI prefixes it `[late]`.
+    - **Revised 2026-09-25:** a row is late only when it lands above a row the reader was already
+      shown, meaning one placed at least 10 s before it arrived. Rows loaded at open count as shown
+      before the restart.
+    - The first definition ("rendered after a row now below it") also flagged ordinary
+      concurrency. Posts crossing in flight land within a second, above one another.
+    - **Proof:** `causal_order_proof::a_late_arrival_is_marked_and_posts_that_cross_are_not`,
+      shipped binary, 3 of 3 green.
+      - Crossing posts: 0 of 12 marked late on either node.
+      - Bob posts and his daemon is frozen (SIGSTOP) before its push. Alice posts 3, waits 12 s,
+        and then bob is thawed. His post lands at 15, above "meanwhile 1" at 16, and `vox room
+        read --late` lists exactly it.
+    - **Mutations, each red:** the first definition gives "alice marks crossing posts late"
+      (6 of 12); never-late gives "exactly the late post is marked late", left `[]`.
   - **`vox room read --since` is arrival-based:** a late row lands above the cursor, and a
     positional read would skip it forever.
   - **`vox room read --hashes` (hidden):** prints `<hash> <clock-ms>` for every held entry, in
@@ -294,10 +338,28 @@ covers only the approver's own messages, as consent always has.
   - trust-before-join.
 - **M23.4** Per-grant history (decision 5).
 - **M23.5** Delete the anchor log (decision 6). Rewrite `node_m15_anchor_gate`. Proof 6.
-- **M23.6** Checkpoints (decision 3), if open question 2 says now.
+- **M23.6** Checkpoints (decision 3). **DONE** on `prd1/causal-order` (commit in the report).
+  - `crates/vox-tui/tests/checkpoint_proof.rs`
+    `a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it`, shipped
+    binary, one author with 100 messages and then a 20 s retention.
+    - **Store bytes:** measured stopped. Before: 100 log pages, 709,945 bytes, 0 smaller than a
+      signature. After: 102 pages, 32,359 bytes, 100 smaller than a signature.
+    - **Mutation, shedding disabled:** red, "only 0 of alice's 100 expired entries shed their
+      signature". Its store held 369,859 bytes after the same expiry. The shed room is
+      337,500 bytes smaller, 3,375 per entry: the 3,373-byte signature and its CBOR length.
+    - **Restart:** alice's room reopens from the shed store.
+    - **Cold joiner:** bob joins after the shedding. He holds 104 entries in an order identical to
+      alice's 104, and his own store has 100 pages smaller than a signature. He received the
+      skeletons below the checkpoint hash-chained, not signed.
+    - **Forged entries:** a conflicting entry signed with alice's own key at seq 5 is refused with
+      "entry is at or below its author's checkpoint", and the room keeps 102 entries. An unsigned
+      one is refused too.
+    - **Mutation, pre-checkpoint refusal removed:** red, with the equivocation taken to the fork
+      path ("entry failed the acceptance predicate").
 
-## Open questions for the decider
+## Questions the decider answered (2026-09-25)
 
-1. Do claims and work items expire with a disappearing room, or are they exempt?
-2. Checkpoints now, or when a real room gets large?
-3. Is a late arrival shown in its causal place (proposed), or at the bottom with a marker?
+1. **Claims and work items expire with a disappearing room.** Agent communication is a
+   coordination layer, not a source of truth; that is the accountability skill and GitHub.
+2. **Checkpoints now** (M23.6).
+3. **A late arrival is shown in its true causal position, marked late** (built in M23.2).

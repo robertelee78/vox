@@ -67,6 +67,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
+use crate::log::checkpoint::Checkpoint;
 use crate::log::entry::{Entry, EntryKind, MAX_SEEN};
 
 /// How far an entry's claimed time may run ahead of the latest entry it names (or of the room's
@@ -164,6 +165,11 @@ pub enum Rejected {
     Feed(Error),
     /// A duplicate of an already-stored entry (same hash) — idempotently ignored.
     Duplicate,
+    /// A position at or below its author's checkpoint that this node does not hold as
+    /// this entry (ADR-023 decision 3). Refused, never classified as a fork: below the line
+    /// the body is expired, so it could never be shown, and a fork proof would need the
+    /// very signature the checkpoint lets nodes drop.
+    PreCheckpoint,
 }
 
 /// The replicated log store: per-author feeds, a hash index, and frozen authors.
@@ -187,6 +193,18 @@ pub struct Dag {
     /// `(author, other author)` -> the highest seq of `other` that one of `author`'s
     /// entries names in its `seen`. What [`Dag::seen_for`] need not name again.
     referenced: HashMap<(Digest32, Digest32), u64>,
+    /// author -> the highest checkpoint its own signed feed carries: `(seq, entry_hash)`
+    /// (ADR-023 decision 3).
+    checkpoints: HashMap<Digest32, (u64, Digest32)>,
+    /// author -> the lowest seq of the run of **unsigned** entries at the top of its feed:
+    /// skeletons that arrived with their signature dropped and have no signed successor
+    /// yet. They are authentic only once one arrives; [`Dag::discard_unverified`] takes
+    /// back whatever never is.
+    unverified_from: HashMap<Digest32, u64>,
+    /// author -> the seq through which [`Dag::drop_checkpointed_signatures`] has looked, so
+    /// each checkpoint's range is walked once. An entry there that still had its body is
+    /// handled when it is pruned ([`Dag::drop_signature_if_checkpointed`]).
+    swept_to: HashMap<Digest32, u64>,
     /// Bumped whenever an already-stored entry's clock moves (a late parent arrived),
     /// so a timeline can tell a re-sort is due without recomputing anything.
     reorder_generation: u64,
@@ -329,6 +347,17 @@ impl Dag {
             return Err(Rejected::Duplicate);
         }
 
+        // Below its author's checkpoint, nothing new is taken: every position there is
+        // already held (the feed is contiguous), so a different entry for one is refused as
+        // pre-checkpoint — not raised as a fork.
+        if self
+            .checkpoints
+            .get(&author)
+            .is_some_and(|(below, _)| seq <= *below)
+        {
+            return Err(Rejected::PreCheckpoint);
+        }
+
         // Admission.
         if !admission.is_admitted(&channel, epoch, &author) {
             return Err(Rejected::NotAdmitted);
@@ -337,11 +366,28 @@ impl Dag {
         // Authenticator + structure. This precedes equivocation classification on
         // purpose: only an entry that is admitted AND authenticates may surface a
         // fork proof.
-        entry.verify(author_root).map_err(Rejected::Verification)?;
+        //
+        // A skeleton whose signature was dropped under a checkpoint cannot verify on its own.
+        // It is taken provisionally, body-less only, and becomes authentic when a signed
+        // entry of the same feed chains to it (module docs, "Checkpoints").
+        let signed = entry.is_signed();
+        if signed {
+            entry.verify(author_root).map_err(Rejected::Verification)?;
+        } else if entry.payload.is_some() {
+            return Err(Rejected::Verification(Error::MalformedBundle(
+                "an unsigned log entry must carry no body",
+            )));
+        }
 
         // Equivocation: a *different* entry already occupies (author, seq)?
         if let Some(feed) = self.feeds.get(&author) {
             if let Some(existing) = feed.get(seq) {
+                // An unsigned entry proves nothing: it can conflict, never incriminate.
+                if !signed {
+                    return Err(Rejected::Verification(Error::MalformedBundle(
+                        "an unsigned log entry conflicts with a held one",
+                    )));
+                }
                 // Same seq, different hash (duplicate handled above) ⇒ a fork.
                 let outcome = self.classify_fork(existing.clone(), entry);
                 let ForkOutcome::Attributable(ref proof) = outcome;
@@ -356,6 +402,21 @@ impl Dag {
             }
         }
 
+        // A checkpoint must name its own feed truthfully: a position below this entry,
+        // with the hash this node holds there.
+        let checkpoint = match entry.payload.as_deref() {
+            Some(p) if signed => Checkpoint::from_payload(p).map_err(Rejected::Verification)?,
+            _ => None,
+        };
+        if let Some(cp) = checkpoint {
+            let named = self.feeds.get(&author).and_then(|f| f.get(cp.seq));
+            if cp.seq >= seq || named.map(Entry::entry_hash) != Some(cp.entry_hash) {
+                return Err(Rejected::Verification(Error::MalformedBundle(
+                    "checkpoint names a position its own feed does not hold",
+                )));
+            }
+        }
+
         // Feed link: `append` validates seq/prev_hash/lipmaa_backlink/end-of-feed
         // and leaves the feed untouched on a rejection. Then index by hash.
         self.feeds
@@ -364,8 +425,97 @@ impl Dag {
             .append(entry)
             .map_err(Rejected::Feed)?;
         self.by_hash.insert(hash, (author, seq));
+        if signed {
+            // Chains every unsigned entry below it to a signature.
+            self.unverified_from.remove(&author);
+        } else {
+            self.unverified_from.entry(author).or_insert(seq);
+        }
+        if let Some(cp) = checkpoint {
+            let held = self.checkpoints.entry(author).or_insert((0, cp.entry_hash));
+            if cp.seq > held.0 {
+                *held = (cp.seq, cp.entry_hash);
+            }
+        }
         self.place(hash);
         Ok(hash)
+    }
+
+    /// Take back every unsigned skeleton no signed entry has chained to (ADR-023 decision
+    /// 3): what a sync session or a reload leaves provisional at its end. They are not
+    /// authentic, and keeping them would block the real entries at those positions.
+    /// Returns how many were removed.
+    pub fn discard_unverified(&mut self) -> usize {
+        let mut removed = 0usize;
+        for (author, from) in std::mem::take(&mut self.unverified_from) {
+            let Some(feed) = self.feeds.get_mut(&author) else {
+                continue;
+            };
+            for entry in feed.truncate_from(from) {
+                let h = entry.entry_hash();
+                self.by_hash.remove(&h);
+                if let Some(c) = self.clock.remove(&h) {
+                    self.ordered.remove(&(c, h));
+                }
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.reorder_generation = self.reorder_generation.wrapping_add(1);
+        }
+        removed
+    }
+
+    /// Drop the signature of `hash` if its author's checkpoint covers it and its body is gone
+    /// — for an entry pruned after the checkpoint arrived. Returns whether one was dropped.
+    pub fn drop_signature_if_checkpointed(&mut self, hash: &Digest32) -> bool {
+        let Some((author, seq)) = self.by_hash.get(hash).copied() else {
+            return false;
+        };
+        if self.checkpoints.get(&author).is_none_or(|(b, _)| seq > *b) {
+            return false;
+        }
+        let Some(feed) = self.feeds.get_mut(&author) else {
+            return false;
+        };
+        feed.get(seq).is_some_and(|e| e.payload.is_none()) && feed.drop_signature(seq)
+    }
+
+    /// The highest checkpoint `author` has posted on its own feed: `(seq, entry_hash)`.
+    #[must_use]
+    pub fn checkpoint(&self, author: &Digest32) -> Option<(u64, Digest32)> {
+        self.checkpoints.get(author).copied()
+    }
+
+    /// Drop the signatures of every entry at or below its author's checkpoint whose body is
+    /// already pruned (ADR-023 decision 3), returning their hashes so the caller can rewrite
+    /// what it stores. An entry with a body keeps its signature: governance is never pruned,
+    /// and content keeps it until it expires here.
+    ///
+    /// Walks only what no earlier call covered, so it costs nothing between checkpoints.
+    pub fn drop_checkpointed_signatures(&mut self) -> Vec<Digest32> {
+        let mut dropped = Vec::new();
+        for (author, (below, _)) in &self.checkpoints {
+            let Some(feed) = self.feeds.get_mut(author) else {
+                continue;
+            };
+            let from = self.swept_to.get(author).map_or(1, |s| s + 1);
+            if from > *below {
+                continue;
+            }
+            self.swept_to.insert(*author, *below);
+            for seq in from..=*below {
+                let eligible = feed
+                    .get(seq)
+                    .is_some_and(|e| e.is_signed() && e.payload.is_none());
+                if eligible && feed.drop_signature(seq) {
+                    if let Some(e) = feed.get(seq) {
+                        dropped.push(e.entry_hash());
+                    }
+                }
+            }
+        }
+        dropped
     }
 
     /// Give a just-stored entry its clock, record its `seen` edges, and lift every

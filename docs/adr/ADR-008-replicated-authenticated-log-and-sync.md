@@ -386,6 +386,25 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   names. `Dag::happened_before` walks parents with clock pruning. No backwards compatibility: an
   entry in the 10-field shape is refused at decode. Gates: ADR-023 M23.2.
 
+- **Checkpoints and shed signatures (2026-09-25, ADR-023 M23.6).**
+  - **Wire:** the entry wire gains authenticator type `0`, "dropped under a checkpoint", which
+    carries an empty byte string. Type `2`, the removed deniable authenticator, stays refused.
+  - **Struct tag `0x0015`** (`vox/checkpoint/v1`) is an author's checkpoint on its own feed,
+    `[seq, entry_hash]`, carried as the payload of an ordinary signed entry of that feed.
+  - **What `Dag::accept` does with them:**
+    - An unsigned entry is taken only body-less and only provisionally. It becomes authentic when
+      a signed entry of the same feed chains to it. `Dag::discard_unverified` takes back whatever
+      never is, at the end of every sync session and of every reload. A reload that finds one
+      refuses the store.
+    - An entry for a position at or below its author's checkpoint that is not already held is
+      `Rejected::PreCheckpoint`, never a fork. `apply_entry` reports it as
+      `ApplyOutcome::PreCheckpoint` and the session continues.
+    - A checkpoint that names a position its own feed does not hold, with that hash, is refused.
+  - **Shedding:** `Dag::drop_checkpointed_signatures` walks each checkpoint's new range once, and
+    `drop_signature_if_checkpointed` handles an entry pruned afterwards.
+  - **Checking a whole feed:** `Feed::verify_all_signatures` accepts an unsigned run only if a
+    signed entry follows it.
+
 ## Links
 **Depends on**: ADR-002, ADR-006.
 - Depended on by: ADR-007, ADR-009, ADR-010, ADR-011.

@@ -70,6 +70,10 @@ const SKELETON_ARITY: usize = 12;
 /// Wire discriminant for [`Authenticator::Composite`] (attributable).
 const AUTH_TYPE_COMPOSITE: u64 = 1;
 
+/// Wire discriminant for [`Authenticator::Dropped`]: no signature bytes follow (an empty
+/// byte string). `0`, not the removed deniable type `2`, which stays refused.
+const AUTH_TYPE_DROPPED: u64 = 0;
+
 /// The kind of entry, which fixes how it is authenticated (ADR-008
 /// §"Per-entry-type authentication"). Authentication is chosen by entry TYPE,
 /// not merely by channel mode.
@@ -83,6 +87,10 @@ pub enum EntryKind {
     Governance,
     /// Message content, root-composite-signed like governance.
     Content,
+    /// An author's checkpoint on its own feed (ADR-023 decision 3,
+    /// [`crate::log::checkpoint`]). Control, not governance: it grants nothing, so it never
+    /// reaches the ADR-007 evaluator, and like governance it is never pruned.
+    Checkpoint,
 }
 
 /// The authenticator over an entry's signing input.
@@ -96,6 +104,13 @@ pub enum Authenticator {
     /// genuinely incriminates the author on a fork. Boxed because the composite
     /// signature is multi-kilobyte.
     Composite(Box<CompositeSignature>),
+    /// The signature was **dropped under a checkpoint** (ADR-023 decision 3): the entry's
+    /// body expired, and its author's own signed checkpoint names a position at or above it.
+    /// Such an entry is authentic only through the hash chain — its hash is the `prev_hash`
+    /// (or checkpoint hash) of a signed entry above it — so it never verifies on its own
+    /// ([`Entry::verify`] refuses it) and the DAG accepts it only as a chain-authenticated
+    /// skeleton ([`crate::log::dag::Dag::accept`]).
+    Dropped,
 }
 
 impl Authenticator {
@@ -103,6 +118,7 @@ impl Authenticator {
     fn type_id(&self) -> u64 {
         match self {
             Authenticator::Composite(_) => AUTH_TYPE_COMPOSITE,
+            Authenticator::Dropped => AUTH_TYPE_DROPPED,
         }
     }
 
@@ -112,6 +128,7 @@ impl Authenticator {
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Authenticator::Composite(sig) => sig.to_bytes().to_vec(),
+            Authenticator::Dropped => Vec::new(),
         }
     }
 }
@@ -120,6 +137,7 @@ impl core::fmt::Debug for Authenticator {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Authenticator::Composite(_) => f.write_str("Authenticator::Composite(..)"),
+            Authenticator::Dropped => f.write_str("Authenticator::Dropped"),
         }
     }
 }
@@ -419,6 +437,11 @@ impl Entry {
             Authenticator::Composite(sig) => {
                 author_root.verify(&self.skeleton.signing_input(), sig)?;
             }
+            Authenticator::Dropped => {
+                return Err(Error::MalformedBundle(
+                    "log-entry signature was dropped under a checkpoint",
+                ));
+            }
         }
         self.verify_payload_binding()
     }
@@ -445,6 +468,22 @@ impl Entry {
     /// history. Returns whether a body was actually dropped.
     pub fn prune_payload(&mut self) -> bool {
         self.payload.take().is_some()
+    }
+
+    /// Whether the entry still carries its signature (it was not dropped under a checkpoint).
+    #[must_use]
+    pub fn is_signed(&self) -> bool {
+        !matches!(self.authenticator, Authenticator::Dropped)
+    }
+
+    /// Drop the signature (ADR-023 decision 3), keeping the skeleton — and so the entry's
+    /// hash and its links. Only a caller holding the author's checkpoint above it may: after
+    /// this the entry is authentic only through the hash chain. Returns whether a signature
+    /// was actually dropped.
+    pub fn drop_signature(&mut self) -> bool {
+        let had = self.is_signed();
+        self.authenticator = Authenticator::Dropped;
+        had
     }
 
     /// The entry's hash (over the canonical body) — its DAG/Negentropy key.
@@ -573,6 +612,7 @@ fn decode_authenticator(d: &mut Decoder<'_>, auth_type: u64) -> Result<Authentic
                 CompositeSignature::from_bytes(&auth_arr)?,
             )))
         }
+        AUTH_TYPE_DROPPED if auth_bytes.is_empty() => Ok(Authenticator::Dropped),
         _ => Err(Error::MalformedBundle(
             "log-entry unknown authenticator type",
         )),

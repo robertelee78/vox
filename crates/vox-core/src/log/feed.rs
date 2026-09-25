@@ -177,6 +177,21 @@ impl Feed {
         self.entries.get_mut(&seq).is_some_and(Entry::prune_payload)
     }
 
+    /// Drop the signature of the entry at `seq`, keeping its skeleton (ADR-023 decision 3).
+    /// Returns whether a signature was dropped. The caller holds the author's checkpoint.
+    pub fn drop_signature(&mut self, seq: u64) -> bool {
+        self.entries
+            .get_mut(&seq)
+            .is_some_and(Entry::drop_signature)
+    }
+
+    /// Remove every entry at `seq` and above, returning them. Used only to take back
+    /// skeletons that arrived without a signature and were never chained to a signed one.
+    pub fn truncate_from(&mut self, seq: u64) -> Vec<Entry> {
+        let tail = self.entries.split_off(&seq);
+        tail.into_values().collect()
+    }
+
     /// Append `entry` as the next contiguous entry, validating it links correctly.
     ///
     /// Enforces, in order: single author; `seq == max_seq + 1` (contiguous,
@@ -308,9 +323,25 @@ impl Feed {
 
     /// Verify every entry's composite authenticator under `author_root`. Combined
     /// with [`Feed::verify`], this is a complete cryptographic feed check.
+    ///
+    /// An entry whose signature was dropped under a checkpoint (ADR-023 decision 3) is
+    /// authentic through the chain instead, which holds only if a **signed** entry sits above
+    /// it: [`Feed::verify`] checks the links, and this checks that the top of every unsigned
+    /// run is followed by a signature.
     pub fn verify_all_signatures(&self, author_root: &CompositePublicKey) -> Result<()> {
+        let mut unchained = false;
         for entry in self.entries.values() {
-            entry.verify(author_root)?;
+            if entry.is_signed() {
+                entry.verify(author_root)?;
+                unchained = false;
+            } else {
+                unchained = true;
+            }
+        }
+        if unchained {
+            return Err(Error::MalformedBundle(
+                "feed ends in unsigned entries no signature chains to",
+            ));
         }
         Ok(())
     }
