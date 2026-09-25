@@ -192,22 +192,24 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
     Ok(())
 }
 
-/// `vox room post` — append a message.
-///
-/// `text` of `-`, or omitted entirely, reads the message from stdin. That is the
-/// form an agent uses: an agent-comms envelope is JSON, and JSON on a command
-/// line is where quoting goes wrong.
-pub async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Result<(), AppError> {
-    let body = match text {
+/// Read a message body: the argument, or stdin when it is omitted or `-`.
+fn body_of(text: Option<&str>) -> Result<String, AppError> {
+    match text {
         Some("-") | None => {
             let mut buf = String::new();
             std::io::stdin()
                 .read_to_string(&mut buf)
                 .map_err(|e| AppError::Usage(format!("reading stdin: {e}")))?;
-            buf
+            Ok(buf)
         }
-        Some(t) => t.to_owned(),
-    };
+        Some(t) => Ok(t.to_owned()),
+    }
+}
+
+/// Append raw text, exactly as given. The internal path for verbs that build their
+/// own envelope (a file offer), and what `vox room post` does with no structured flag.
+async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Result<(), AppError> {
+    let body = body_of(text)?;
     if body.trim().is_empty() {
         return Err(AppError::Usage("refusing to post an empty message".into()));
     }
@@ -227,45 +229,462 @@ pub async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Result<(), A
     }
 }
 
+/// The structured half of `vox room post` (ADR-021 §7).
+#[derive(Debug, Clone, Default)]
+pub struct PostOpts {
+    /// The envelope type. Any structured flag makes the post structured; `say` when
+    /// none is given.
+    pub kind: Option<String>,
+    /// The work item this is about, carried in `data.work`; its shape is checked.
+    pub work: Option<String>,
+    /// The attempt, carried in `data.attempt`; defaults to this session's claim.
+    pub attempt: Option<String>,
+    /// Addressees, by petname.
+    pub to: Vec<String>,
+    /// May interrupt an addressed session.
+    pub urgent: bool,
+    /// Reply-to entry hash.
+    pub re: Option<String>,
+    /// Thread root entry hash.
+    pub thread: Option<String>,
+    /// Extra payload, as a JSON object.
+    pub data: Option<String>,
+    /// Session, operation id, JSON output.
+    pub coord: CoordOpts,
+}
+
+impl PostOpts {
+    fn is_structured(&self) -> bool {
+        self.kind.is_some()
+            || self.work.is_some()
+            || self.attempt.is_some()
+            || !self.to.is_empty()
+            || self.urgent
+            || self.re.is_some()
+            || self.thread.is_some()
+            || self.data.is_some()
+            || self.coord.op.is_some()
+            || self.coord.json
+    }
+}
+
+/// `vox room post` — append a message.
+///
+/// With no structured flag, the text is posted exactly as given: prose is a `say`, and
+/// an agent may paste an envelope. **Except a claim-protocol operation**, which is
+/// refused: it would lack the session, the operation id and the version stamp that
+/// make it valid, and the dedicated verbs exist to set them.
+///
+/// With any structured flag, the CLI builds the envelope itself: it fills `from` and
+/// `at`, stamps the version, and posts under an operation id exactly once in effect.
+/// A post carrying `--work` takes part in work coordination, so it passes the version
+/// gate first (exit 3). A reused `--op` with different content is refused (exit 4).
+///
+/// # Errors
+/// As above, or if the node cannot be reached.
+pub async fn post_cmd(
+    paths: &Paths,
+    room: &str,
+    text: Option<&str>,
+    opts: &PostOpts,
+) -> Result<(), AppError> {
+    let body = body_of(text)?;
+    if !opts.is_structured() {
+        if body.trim().is_empty() {
+            return Err(AppError::Usage("refusing to post an empty message".into()));
+        }
+        if let Ok(env) = Envelope::parse(&body) {
+            if claim::is_claim_protocol(&env) {
+                return Err(AppError::Usage(format!(
+                    "refusing a raw `{}`: claim-protocol operations need a session, an \
+                     operation id and a version stamp. Use `vox room {}`.",
+                    env.kind, env.kind
+                )));
+            }
+        }
+        return post(paths, room, Some(&body)).await;
+    }
+
+    let kind = opts.kind.clone().unwrap_or_else(|| "say".into());
+    let mut data = match &opts.data {
+        None => serde_json::Map::new(),
+        Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => return Err(AppError::Usage("--data must be a JSON object".into())),
+        },
+    };
+    for reserved in [
+        vox_agentcomms::version::VOX_KEY,
+        vox_agentcomms::ops::OP_KEY,
+    ] {
+        if data.contains_key(reserved) {
+            return Err(AppError::Usage(format!(
+                "--data may not set {reserved:?}: this binary sets it (use --op for the \
+                 operation id; the version is never the caller's)"
+            )));
+        }
+    }
+    if let Some(w) = &opts.work {
+        match data.get(vox_agentcomms::envelope::WORK_KEY) {
+            Some(d) if d.as_str() != Some(w) => {
+                return Err(AppError::Usage(format!(
+                    "--work {w:?} and --data's work {d} differ; name the work item once"
+                )))
+            }
+            _ => {}
+        }
+        data.insert(vox_agentcomms::envelope::WORK_KEY.into(), w.clone().into());
+    }
+    // **Whichever flag set it.** The work reference is checked where it lands, not
+    // where it was typed: `--data '{"work":…}'` is the same message as `--work`, and
+    // checking only the flag let a malformed reference, and the version gate below,
+    // be skipped by spelling it the other way.
+    let work = match data.get(vox_agentcomms::envelope::WORK_KEY) {
+        None => None,
+        Some(serde_json::Value::String(w)) if vox_agentcomms::envelope::is_valid_work(w) => {
+            Some(w.clone())
+        }
+        Some(bad) => {
+            return Err(AppError::Usage(format!(
+                "{bad} is not a work reference: use <scheme>:<id>, the scheme \
+                 [a-z][a-z0-9-]{{0,15}} and the id 1–{} of [A-Za-z0-9._~/#:-] \
+                 (ADR-021 §3)",
+                vox_agentcomms::envelope::MAX_WORK_ID
+            )))
+        }
+    };
+    if let Some(a) = &opts.attempt {
+        data.insert("attempt".into(), a.clone().into());
+    }
+    if coord::is_claim_type(&kind, &serde_json::Value::Object(data.clone())) {
+        return Err(AppError::Usage(format!(
+            "`{kind}` is a claim-protocol operation; use `vox room {kind}`"
+        )));
+    }
+    if body.trim().is_empty() && data.is_empty() {
+        return Err(AppError::Usage("refusing to post an empty message".into()));
+    }
+
+    let session = coord::require_session(opts.coord.session.as_deref())?;
+    let op = match &opts.coord.op {
+        Some(op) if vox_agentcomms::ops::is_valid_op(op) => op.clone(),
+        Some(op) => {
+            return Err(AppError::Usage(format!(
+                "--op {op:?} is not an operation id: use 8–64 of [A-Za-z0-9._-]"
+            )))
+        }
+        None => coord::new_op()?,
+    };
+    let (mut client, cid, room_key) = open_room(paths, room).await?;
+    let snap = if work.is_some() {
+        coord::participate(&mut client, cid, &room_key, &session).await?
+    } else {
+        coord::snapshot(&mut client, cid).await?
+    };
+    // **The attempt id, when the caller did not name one** (ADR-021 §2). It is seeded
+    // from the log alone — the hash of this session's claim on the work item, or of its
+    // own latest `failed` for that item since the claim — so an agent never mints one and
+    // a tracker can correlate every post of one attempt. **Seeding starts nothing**: an
+    // attempt becomes active only when the holder posts `working` (§3), and that entry is
+    // its start evidence; a `failed` seeds the id of a retry that does not exist until the
+    // next `working`. A retried `--op` keeps the id its first post carried — the claim may
+    // have been renewed, re-taken or failed since, and a different id would make the retry
+    // a conflict rather than the same message.
+    if let (Some(w), None) = (&work, data.get("attempt")) {
+        let earlier = snap
+            .posted
+            .iter()
+            .find(|p| p.author == snap.me && vox_agentcomms::ops::op_of(&p.envelope) == Some(&op))
+            .and_then(|p| p.envelope.data.get("attempt").cloned());
+        let seeded = match snap.fold.resources.get(w) {
+            Some(State::Held {
+                owner, acquisition, ..
+            }) if owner.author == snap.me && owner.session == session => {
+                Some(seeded_attempt_id(&snap, w, &session, *acquisition))
+            }
+            _ => None,
+        };
+        if let Some(a) = earlier.or(seeded.map(|h| claim::b32(&h).into())) {
+            data.insert("attempt".into(), a);
+        }
+    }
+    let draft = Draft {
+        kind,
+        to: opts.to.clone(),
+        urgent: opts.urgent,
+        re: opts.re.clone(),
+        thread: opts.thread.clone(),
+        body: body.trim_end().to_owned(),
+        data,
+    };
+    let is_result = draft.kind == vox_agentcomms::envelope::work::RESULT;
+    let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;
+    // **A `result` says what it has not read** (ADR-021 M21.10). A redirect addressed
+    // to this session can land after its last drain and before it reports; the result
+    // still posts, and the caller is shown every such message so it can follow up.
+    let unread = if is_result {
+        unread_addressed(paths, &room_key, &session, &posting)
+    } else {
+        Vec::new()
+    };
+    if opts.coord.json {
+        let mut out = serde_json::json!({
+            "schema": "vox.room.post/1",
+            "room": room_key,
+            "entry_hash": claim::b32(&posting.entry_hash),
+            "op": posting.op,
+            "status": posting.status,
+            "session": session,
+        });
+        if is_result {
+            out["unread_addressed"] = serde_json::Value::Array(
+                unread
+                    .iter()
+                    .map(|(h, from, kind, body)| {
+                        serde_json::json!({"entry_hash": h, "from": from, "type": kind, "body": body})
+                    })
+                    .collect(),
+            );
+        }
+        println!("{out}");
+    }
+    if !unread.is_empty() {
+        eprintln!(
+            "vox: your result is posted, but {} message(s) addressed to you are unread — \
+             read them before moving on:",
+            unread.len()
+        );
+        for (h, from, kind, body) in &unread {
+            eprintln!("  {} {from} [{kind}] {body}", &h[..12]);
+        }
+    }
+    Ok(())
+}
+
+/// Messages addressed to this session that its drain has not delivered yet: past its
+/// drain cursor, not its own, naming it in `to` — by `VOX_AGENT_NAME`, the name it is
+/// addressed by, or by its session id. The one just posted is excluded.
+fn unread_addressed(
+    paths: &Paths,
+    room_key: &str,
+    session: &str,
+    posting: &coord::Posting,
+) -> Vec<(String, String, String, String)> {
+    let snap = &posting.after;
+    let names: Vec<String> = std::iter::once(session.to_owned())
+        .chain(
+            std::env::var("VOX_AGENT_NAME")
+                .ok()
+                .filter(|n| !n.trim().is_empty()),
+        )
+        .collect();
+    let start = crate::agent_hook::load_cursor(paths, room_key, session)
+        .and_then(|c| snap.rows.iter().position(|r| r.entry_hash == c))
+        .map_or(0, |i| i + 1);
+    snap.rows[start..]
+        .iter()
+        .filter(|r| r.entry_hash != posting.entry_hash)
+        .filter_map(|r| {
+            let env = Envelope::parse(&r.text).ok()?;
+            let own = r.author == snap.me && env.from == session;
+            (!own && names.iter().any(|n| env.is_addressed_to(n))).then(|| {
+                let body: String = env
+                    .body
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(160)
+                    .collect();
+                (
+                    claim::b32(&r.entry_hash),
+                    env.from.clone(),
+                    env.kind.clone(),
+                    body,
+                )
+            })
+        })
+        .collect()
+}
+
+/// The entry that seeds the holder's default attempt id on `work`: its claim's
+/// acquisition, or its own latest `failed` for `work` after it, in canonical order
+/// `(created_millis, entry_hash)`. A `failed` whose operation is void (a conflict, §6)
+/// never happened, so it seeds nothing; a retried one is its first entry, not the retry.
+fn seeded_attempt_id(
+    snap: &coord::Snapshot,
+    work: &str,
+    session: &str,
+    acquisition: [u8; 32],
+) -> [u8; 32] {
+    let Some(start) = snap.posted.iter().find(|p| p.entry_hash == acquisition) else {
+        return acquisition;
+    };
+    let ops = snap.ops();
+    snap.posted
+        .iter()
+        .filter(|p| {
+            p.author == snap.me
+                && p.envelope.from == session
+                && p.envelope.kind == vox_agentcomms::envelope::work::FAILED
+                && coord::work_of(&p.envelope) == Some(work)
+                && (p.created_millis, p.entry_hash) > (start.created_millis, start.entry_hash)
+                && !matches!(
+                    ops.verdict(p.author, &p.envelope, p.entry_hash),
+                    Some(
+                        vox_agentcomms::ops::Verdict::Conflict { .. }
+                            | vox_agentcomms::ops::Verdict::Duplicate { .. }
+                    )
+                )
+        })
+        .max_by_key(|p| (p.created_millis, p.entry_hash))
+        .map_or(acquisition, |p| p.entry_hash)
+}
+
+/// One row as `vox.room.row/1` NDJSON (ADR-021 §7).
+///
+/// `op.status` is `ok`, `duplicate` or `conflict` against everything the node holds.
+/// Rows are in the node's local order, **which is not the canonical order** — sort by
+/// `(created_millis, entry_hash)` for a total order.
+fn row_json(
+    room_key: &str,
+    r: &vox_core::node::api::MessageRow,
+    ops: &vox_agentcomms::ops::OpIndex,
+    status_override: Option<&str>,
+) -> String {
+    let parsed = Envelope::parse(&r.text);
+    let (envelope, parse_error) = match &parsed {
+        Ok(e) => (
+            serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
+            None,
+        ),
+        Err(e) => (serde_json::Value::Null, Some(e.to_string())),
+    };
+    let op = parsed.as_ref().ok().and_then(|e| {
+        let id = vox_agentcomms::ops::op_of(e)?;
+        let (status, group) = match ops.verdict(r.author, e, r.entry_hash) {
+            Some(vox_agentcomms::ops::Verdict::Conflict { group }) => ("conflict", group),
+            Some(vox_agentcomms::ops::Verdict::Duplicate { .. }) => {
+                ("duplicate", ops.group_of(r.author, e))
+            }
+            _ => ("ok", ops.group_of(r.author, e)),
+        };
+        Some(serde_json::json!({
+            "id": id,
+            "status": status_override.unwrap_or(status),
+            "group": group.iter().map(claim::b32).collect::<Vec<_>>(),
+        }))
+    });
+    serde_json::json!({
+        "schema": "vox.room.row/1",
+        "room": room_key,
+        "entry_hash": claim::b32(&r.entry_hash),
+        "author": claim::b32(&r.author),
+        "created_millis": r.created_millis,
+        "text": r.text,
+        "envelope": envelope,
+        "parse_error": parse_error,
+        "op": op,
+    })
+    .to_string()
+}
+
+/// Where in the timeline `cursor` sits, or a refusal: an unknown cursor is never
+/// silently treated as "from the beginning", which would re-deliver or skip without
+/// anyone knowing.
+fn after_cursor(
+    rows: &[vox_core::node::api::MessageRow],
+    cursor: Option<Digest32>,
+) -> Result<usize, AppError> {
+    match cursor {
+        None => Ok(0),
+        Some(c) => rows
+            .iter()
+            .position(|r| r.entry_hash == c)
+            .map(|i| i + 1)
+            .ok_or_else(|| {
+                AppError::Usage(format!("cursor {} is not in this room's timeline", id(&c)))
+            }),
+    }
+}
+
+/// One row as `vox room read` and `tail` print it: `<entry-hash> <author-prefix> <text>`.
+///
+/// **No message can forge a row** (PRD-001 R19). A row starts at the beginning of a line,
+/// so a message carrying a newline followed by `<hash> <author> …` would otherwise print a
+/// second row attributed to someone else — and agents read this output. Every continuation
+/// line is therefore indented with `  | `, which no row begins with, and every other
+/// control character (a carriage return, an escape sequence) is shown escaped rather than
+/// passed to the terminal. `--json` needs none of this: each row is one JSON-escaped line.
+fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
+    let mut text = String::with_capacity(r.text.len());
+    for c in r.text.chars() {
+        match c {
+            '\n' => text.push_str("\n  | "),
+            '\t' => text.push('\t'),
+            c if c.is_control() => text.push_str(&c.escape_unicode().to_string()),
+            c => text.push(c),
+        }
+    }
+    format!("{} {} {}", id(&r.entry_hash), short(&r.author), text)
+}
+
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
 ///
-/// Each line is `<entry-hash> <author-prefix> <text>`. The entry hash leads
-/// because it **is** the cursor: an agent reads, keeps the last hash, and passes
-/// it back as `--since` next time. Nothing else needs to be remembered.
+/// Each line is `<entry-hash> <author-prefix> <text>`; with `--json`, one
+/// `vox.room.row/1` object per line. The entry hash **is** the cursor.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, or the cursor is not in it.
 pub async fn read(
     paths: &Paths,
     room: &str,
     since: Option<&str>,
     limit: u64,
+    json: bool,
 ) -> Result<(), AppError> {
-    let mut client = attach(paths).await?;
-    let channel_id = room_of(&mut client, room).await?;
+    let (mut client, channel_id, room_key) = open_room(paths, room).await?;
     let since = match since {
         None => None,
         Some(s) => Some(parse_cursor(s)?),
     };
-    match client
-        .request(&Request::Read {
-            channel_id,
-            since,
-            limit,
-        })
-        .await
-    {
-        Ok(Frame::Rows { rows }) => {
-            let mut out = std::io::stdout().lock();
-            for r in rows {
-                let _ = writeln!(out, "{} {} {}", id(&r.entry_hash), short(&r.author), r.text);
-            }
-            Ok(())
+    if !json {
+        let rows = coord::read_all(&mut client, channel_id, since).await?;
+        let mut out = std::io::stdout().lock();
+        let take = if limit == 0 {
+            rows.len()
+        } else {
+            usize::try_from(limit).unwrap_or(usize::MAX)
+        };
+        for r in rows.iter().take(take) {
+            let _ = writeln!(out, "{}", plain_row(r));
         }
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => Err(AppError::Usage(e.to_string())),
+        return Ok(());
     }
+    // The operation index needs the whole room, not only what follows the cursor: an
+    // entry after it may repeat, or conflict with, one before it.
+    let all = coord::read_all(&mut client, channel_id, None).await?;
+    let from = after_cursor(&all, since)?;
+    let mut ops = vox_agentcomms::ops::OpIndex::new();
+    for p in coord::posted_of(&all) {
+        ops.insert(p.entry_hash, p.author, p.created_millis, &p.envelope);
+    }
+    let take = if limit == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX)
+    };
+    let mut out = std::io::stdout().lock();
+    for r in all[from..].iter().take(take) {
+        let _ = writeln!(out, "{}", row_json(&room_key, r, &ops, None));
+    }
+    Ok(())
 }
 
 /// `vox room roster` — who is in the room.
+///
+/// # Errors
+/// If the node cannot be reached or the room is unknown.
 pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
@@ -282,53 +701,152 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
     }
 }
 
-/// `vox room tail` — print new messages as they arrive, until interrupted.
+/// `vox room tail` — every row after a cursor, then every row as it lands, **with no
+/// gap across a lag or a restart** (ADR-021 §7).
 ///
-/// Prints in the same shape as `read`, so a cursor taken from either works with
-/// the other. A **lag report is printed, not swallowed**: it means this client
-/// fell behind and the durable log is the truth, so the right response is to
-/// `read --since` the last hash rather than to assume the stream was complete.
-pub async fn tail(paths: &Paths, room: &str) -> Result<(), AppError> {
-    // Resolve the room on one connection, then take a second for the stream:
-    // subscribing is terminal, so a subscribed connection can answer nothing.
-    let mut lookup = attach(paths).await?;
-    let channel_id = room_of(&mut lookup, room).await?;
-    drop(lookup);
+/// How the gap is closed: subscribe **first**, then read from the cursor, then emit
+/// the read rows followed by the live ones, dropping any entry already emitted. A row
+/// that lands between the subscription and the read arrives twice and is emitted once;
+/// a row cannot land in neither. On `Lagged` — the node dropped events for this
+/// subscriber — re-read from the last emitted entry rather than trusting the stream.
+///
+/// Duplicates across a *restart* are permitted and gaps are not: the caller persists
+/// its cursor after processing, and resumes from it.
+///
+/// With `--json`, rows are `vox.room.row/1`, and an arrival that turns an operation
+/// into a conflict re-emits every earlier row of that operation with `conflict`, so a
+/// consumer learns of the change from the stream alone.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, or the cursor is not in it.
+pub async fn tail(
+    paths: &Paths,
+    room: &str,
+    since: Option<&str>,
+    json: bool,
+) -> Result<(), AppError> {
+    let (mut lookup, channel_id, room_key) = open_room(paths, room).await?;
+    let cursor = match since {
+        None => None,
+        Some(s) => Some(parse_cursor(s)?),
+    };
 
-    let mut client = attach(paths).await?;
-    client
+    // Subscribe BEFORE reading. Subscribing is terminal for a connection, so the
+    // stream gets a connection of its own and `lookup` keeps answering reads.
+    let mut stream = attach(paths).await?;
+    stream
         .subscribe()
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
 
+    let all = coord::read_all(&mut lookup, channel_id, None).await?;
+    // With no cursor, a tail starts at the live edge, as it always has; everything
+    // already in the room is context for the operation index, not output.
+    let from = match cursor {
+        None => all.len(),
+        Some(_) => after_cursor(&all, cursor)?,
+    };
+
+    let mut ops = vox_agentcomms::ops::OpIndex::new();
+    let mut seen: std::collections::HashSet<Digest32> = std::collections::HashSet::new();
+    let mut by_hash: std::collections::HashMap<Digest32, vox_core::node::api::MessageRow> =
+        std::collections::HashMap::new();
+    let mut last: Option<Digest32> = None;
     let mut out = std::io::stdout().lock();
+
+    // Index everything, emit only what follows the cursor.
+    for (i, r) in all.iter().enumerate() {
+        seen.insert(r.entry_hash);
+        by_hash.insert(r.entry_hash, r.clone());
+        if let Ok(e) = Envelope::parse(&r.text) {
+            ops.insert(r.entry_hash, r.author, r.created_millis, &e);
+        }
+        if i >= from {
+            emit_row(&mut out, &room_key, r, &ops, json, None);
+        }
+        last = Some(r.entry_hash);
+    }
+
+    let mut deliver = |r: vox_core::node::api::MessageRow,
+                       out: &mut std::io::StdoutLock<'_>,
+                       ops: &mut vox_agentcomms::ops::OpIndex,
+                       last: &mut Option<Digest32>| {
+        if !seen.insert(r.entry_hash) {
+            return;
+        }
+        let mut newly_conflicted = false;
+        let parsed = Envelope::parse(&r.text).ok();
+        if let Some(e) = &parsed {
+            newly_conflicted = ops.insert(r.entry_hash, r.author, r.created_millis, e);
+        }
+        by_hash.insert(r.entry_hash, r.clone());
+        emit_row(out, &room_key, &r, ops, json, None);
+        if newly_conflicted && json {
+            if let Some(e) = &parsed {
+                for earlier in ops.group_of(r.author, e) {
+                    if earlier == r.entry_hash {
+                        continue;
+                    }
+                    if let Some(row) = by_hash.get(&earlier) {
+                        emit_row(out, &room_key, row, ops, json, Some("conflict"));
+                    }
+                }
+            }
+        }
+        *last = Some(r.entry_hash);
+    };
+
+    // **An event is a wake, never the data** (ADR-020 §6). Only this node's own posts
+    // arrive as `NewEntry`; an entry that arrives from another member by sync is
+    // announced as `Synced`, and one that becomes readable when a sender key arrives as
+    // `SenderKeyReceived` — neither carries the row. So on any of them, and on
+    // `Lagged`, the room is re-read and whatever this stream has not emitted is emitted.
+    // A full re-read rather than `since <last>`, because an entry rendered late (its key
+    // arrived after it did) is not guaranteed to sit after the last one emitted.
     loop {
-        match client.next().await {
+        let reread = match stream.next().await {
             Ok(Some(Frame::Event(vox_core::node::api::NodeEvent::NewEntry {
                 channel_id: c,
                 row,
             }))) if c == channel_id => {
-                let _ = writeln!(
-                    out,
-                    "{} {} {}",
-                    id(&row.entry_hash),
-                    short(&row.author),
-                    row.text
-                );
-                let _ = out.flush();
+                deliver(row, &mut out, &mut ops, &mut last);
+                false
             }
+            Ok(Some(Frame::Event(
+                vox_core::node::api::NodeEvent::Synced { channel_id: c, .. }
+                | vox_core::node::api::NodeEvent::SenderKeyReceived { channel_id: c, .. },
+            ))) => c == channel_id,
             Ok(Some(Frame::Lagged { missed })) => {
-                let _ = writeln!(
-                    out,
-                    "-- fell behind by {missed}; re-read with `vox room read --since <last-hash>` --"
-                );
-                let _ = out.flush();
+                eprintln!("vox: this stream fell behind by {missed} events; re-reading the room");
+                true
             }
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => false,
             Ok(None) => return Ok(()), // the node stopped
             Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
+        if reread {
+            for r in coord::read_all(&mut lookup, channel_id, None).await? {
+                deliver(r, &mut out, &mut ops, &mut last);
+            }
         }
     }
+}
+
+fn emit_row(
+    out: &mut std::io::StdoutLock<'_>,
+    room_key: &str,
+    r: &vox_core::node::api::MessageRow,
+    ops: &vox_agentcomms::ops::OpIndex,
+    json: bool,
+    status: Option<&str>,
+) {
+    let line = if json {
+        row_json(room_key, r, ops, status)
+    } else {
+        plain_row(r)
+    };
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
 }
 
 /// Parse a full entry hash, in the same base32 the first column prints.
@@ -354,150 +872,347 @@ fn parse_cursor(s: &str) -> Result<Digest32, AppError> {
 }
 
 // ---------------------------------------------------------------------------
-// The work board (ADR-020 §5, M19.9)
+// Live coordination claims (ADR-020 §5, as corrected by ADR-021 §4–§6)
 // ---------------------------------------------------------------------------
 //
-// The decider's requirement is that agents "communicate **and split work loads**".
-// `vox-agentcomms` has carried the whole model since M19.3 — the claim vocabulary,
-// the operations and a resolver that folds a room's claims into one owner per
-// resource — and until now nothing in the shipped binary called any of it. An agent
-// could speak but could not take a piece of work, give it up, hand it over, or ask
-// what was already taken. These four verbs are that model made reachable.
-//
 // Claims are **messages, not locks**. Nothing here reserves anything in the node:
-// ownership is whatever `resolve` computes from the room's log, so two agents that
-// both post a claim converge on the same answer without either asking a coordinator
-// — and an agent that dies holding a resource releases it by its claim's `--ttl`
-// lapsing, with nobody acting.
+// the state is whatever `claim::fold` computes from the room's log, so two workers
+// on one version converge on the same answer without either asking a coordinator.
+//
+// What ADR-021 changed, and why each verb now carries so much:
+//
+// - **the owner is `(author, session)`** — two sessions on one harness are two owners,
+//   so every verb needs a session and refuses without one;
+// - **every operation is stamped with this binary's version** and a worker refuses to
+//   coordinate at all while any participant runs another — exit 3, naming it;
+// - **every operation carries an operation id**, so a retry is one operation and a
+//   conflicting reuse is explicit — exit 4;
+// - **a handoff names a fingerprint**, never a petname a reader resolves differently,
+//   and leaves the resource *pending* until an eligible session claims it.
+//
+// None of this is work tracking. `--work` is carried opaquely for a tracker that owns
+// the work (ADR-021 §1); nothing here reads it.
 
-use vox_agentcomms::claim::{self, Posted};
+use vox_agentcomms::claim::{self, Outcome, Owner, Posted, State};
 use vox_agentcomms::envelope::Envelope;
 
-/// Read a room's claims and fold them into one owner per resource.
-///
-/// A pure function of the log, so every member computes the same board with nobody
-/// being authoritative — which is the property that lets agents split work without
-/// a coordinator.
-async fn read_board(
-    client: &mut IpcClient,
-    channel_id: Digest32,
-) -> Result<std::collections::BTreeMap<String, claim::Ownership>, AppError> {
-    let rows = match client
-        .request(&Request::Read {
-            channel_id,
-            since: None,
-            limit: 0,
-        })
-        .await
-    {
-        Ok(Frame::Rows { rows }) => rows,
-        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => return Err(AppError::Usage(e.to_string())),
-    };
-    let posted: Vec<Posted> = rows
-        .iter()
-        .filter_map(|r| {
-            Envelope::parse(&r.text).ok().map(|envelope| Posted {
-                entry_hash: r.entry_hash,
-                author: r.author,
-                created_millis: r.created_millis,
-                envelope,
-            })
-        })
-        .collect();
-    Ok(claim::resolve(&posted, now_secs()))
+use crate::coord::{self, Draft};
+
+/// Options every coordinating verb shares.
+#[derive(Debug, Clone, Default)]
+pub struct CoordOpts {
+    /// The session to act as, overriding the environment.
+    pub session: Option<String>,
+    /// The operation id to post under — pass the same one on every retry.
+    pub op: Option<String>,
+    /// Print one JSON object instead of prose.
+    pub json: bool,
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// Attach to the node and resolve the room: the client, the room's id and its key.
+async fn open_room(paths: &Paths, room: &str) -> Result<(IpcClient, Digest32, String), AppError> {
+    let mut client = attach(paths).await?;
+    let cid = room_of(&mut client, room).await?;
+    Ok((client, cid, id(&cid)))
 }
 
-/// Post a claim operation as an envelope.
-async fn post_claim_op(
+/// What one coordinating verb did: the post, what it did in the fold, and who asked.
+struct Done {
+    posting: coord::Posting,
+    outcome: Option<Outcome>,
+    session: String,
+    room: String,
+}
+
+/// Run one claim-protocol operation end to end: session, version gate, post exactly
+/// once in effect, read back, and what it did.
+async fn run_op(
     paths: &Paths,
     room: &str,
+    opts: &CoordOpts,
     kind: &str,
-    data: serde_json::Value,
-    body: &str,
-) -> Result<(), AppError> {
-    let mut env = Envelope::new(kind, body);
-    env.data = data;
-    post(paths, room, Some(&env.to_text())).await
+    data: serde_json::Map<String, serde_json::Value>,
+    body: String,
+) -> Result<Done, AppError> {
+    let session = coord::require_session(opts.session.as_deref())?;
+    let op = match &opts.op {
+        Some(op) if vox_agentcomms::ops::is_valid_op(op) => op.clone(),
+        Some(op) => {
+            return Err(AppError::Usage(format!(
+                "--op {op:?} is not an operation id: use 8–64 of [A-Za-z0-9._-]"
+            )))
+        }
+        None => coord::new_op()?,
+    };
+    let (mut client, cid, room_key) = open_room(paths, room).await?;
+    let snap = coord::participate(&mut client, cid, &room_key, &session).await?;
+    let draft = Draft {
+        kind: kind.into(),
+        body,
+        data,
+        ..Draft::default()
+    };
+    let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;
+    let outcome = posting
+        .after
+        .fold
+        .outcomes
+        .get(&posting.entry_hash)
+        .cloned();
+    Ok(Done {
+        posting,
+        outcome,
+        session,
+        room: room_key,
+    })
 }
 
-/// `vox room claim` — take a resource.
+fn millis_as_time(ms: u64) -> String {
+    held_since(ms / 1_000)
+}
+
+/// One resource's state as JSON — the shape `board --json` and every verb's `--json`
+/// share, so a consumer parses one thing.
+fn state_json(resource: &str, s: &State, me: &Owner) -> serde_json::Value {
+    match s {
+        State::Held {
+            owner,
+            acquisition,
+            since_millis,
+            ttl_secs,
+            expires_millis,
+        } => serde_json::json!({
+            "resource": resource,
+            "state": "held",
+            "owner_fp": claim::b32(&owner.author),
+            "owner_session": owner.session,
+            "acquisition": claim::b32(acquisition),
+            "since_millis": since_millis,
+            "ttl_secs": ttl_secs,
+            "expires_millis": expires_millis,
+            "mine": owner == me,
+        }),
+        State::Pending {
+            from,
+            to_fp,
+            to_session,
+            to_name,
+            handoff,
+            since_millis,
+            deadline_millis,
+        } => serde_json::json!({
+            "resource": resource,
+            "state": "pending",
+            "from_fp": claim::b32(&from.author),
+            "from_session": from.session,
+            "to_fp": claim::b32(to_fp),
+            "to_session": to_session,
+            "to_name": to_name,
+            "handoff": claim::b32(handoff),
+            "since_millis": since_millis,
+            "deadline_millis": deadline_millis,
+            "eligible": s.is_eligible(me),
+        }),
+    }
+}
+
+fn outcome_json(o: Option<&Outcome>) -> serde_json::Value {
+    match o {
+        None => serde_json::Value::Null,
+        Some(Outcome::Applied) => "applied".into(),
+        Some(Outcome::Lost) => "lost".into(),
+        Some(Outcome::NoEffect(why)) => serde_json::json!({"no_effect": why}),
+        Some(Outcome::Invalid(why)) => serde_json::json!({"invalid": why}),
+        Some(Outcome::OtherVersion(s)) => serde_json::json!({"other_version": s.token()}),
+        Some(Outcome::Duplicate { of }) => serde_json::json!({"duplicate_of": claim::b32(of)}),
+        Some(Outcome::Conflict { group }) => {
+            serde_json::json!({"conflict": group.iter().map(claim::b32).collect::<Vec<_>>()})
+        }
+    }
+}
+
+/// Report a coordinating verb: JSON for a program, a sentence for a person, and the
+/// exit status that is the machine-readable half of whether it did what was asked.
+fn report(
+    done: &Done,
+    kind: &str,
+    resource: &str,
+    opts: &CoordOpts,
+    ok: bool,
+    said: &str,
+) -> Result<(), AppError> {
+    let me = Owner {
+        author: done.posting.after.me,
+        session: done.session.clone(),
+    };
+    if opts.json {
+        let state = done
+            .posting
+            .after
+            .fold
+            .resources
+            .get(resource)
+            .map(|s| state_json(resource, s, &me));
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "vox.room.op/1",
+                "room": done.room,
+                "type": kind,
+                "resource": resource,
+                "session": done.session,
+                "entry_hash": claim::b32(&done.posting.entry_hash),
+                "op": done.posting.op,
+                "status": done.posting.status,
+                "outcome": outcome_json(done.outcome.as_ref()),
+                "ok": ok,
+                "state": state,
+            })
+        );
+    } else if ok {
+        println!("{said}");
+    }
+    if ok {
+        Ok(())
+    } else if opts.json {
+        Err(AppError::Refused {
+            code: 1,
+            message: said.to_owned(),
+        })
+    } else {
+        Err(AppError::Usage(said.to_owned()))
+    }
+}
+
+fn who(o: &Owner) -> String {
+    format!("{}/{}", &claim::b32(&o.author)[..12], o.session)
+}
+
+fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, AppError> {
+    match (resource, work) {
+        (Some(r), Some(w)) if r != w => Err(AppError::Usage(format!(
+            "the resource {r:?} and --work {w:?} differ; a claim on a work item uses the \
+             reference as its resource (ADR-021 §2)"
+        ))),
+        (_, Some(w)) if !vox_agentcomms::envelope::is_valid_work(w) => {
+            Err(AppError::Usage(format!(
+                "--work {w:?} is not a work reference: use <scheme>:<id>, the scheme \
+                 [a-z][a-z0-9-]{{0,15}} and the id 1–{} of [A-Za-z0-9._~/#:-] (ADR-021 §3)",
+                vox_agentcomms::envelope::MAX_WORK_ID
+            )))
+        }
+        (Some(r), _) | (None, Some(r)) if !r.trim().is_empty() => Ok(r.to_owned()),
+        _ => Err(AppError::Usage("name a resource, or pass --work".into())),
+    }
+}
+
+/// `vox room claim` — take a resource, or complete a handoff pending for this session.
 ///
 /// # Errors
-/// If the node cannot be reached, the room is unknown, or the post is refused.
+/// Exit 1 if somebody else holds it, 3 on a version refusal, 4 on an op conflict.
 pub async fn claim_resource(
     paths: &Paths,
     room: &str,
-    resource: &str,
+    resource: Option<&str>,
+    work: Option<&str>,
     ttl_secs: Option<u64>,
+    opts: &CoordOpts,
 ) -> Result<(), AppError> {
-    if resource.trim().is_empty() {
-        return Err(AppError::Usage("a claim needs a resource".into()));
+    let resource = resource_of(resource, work)?;
+    let mut data = serde_json::Map::new();
+    data.insert("resource".into(), resource.clone().into());
+    if let Some(w) = work {
+        data.insert(vox_agentcomms::envelope::WORK_KEY.into(), w.into());
     }
-    let mut data = serde_json::json!({ "resource": resource });
-    if let Some(ttl) = ttl_secs {
-        data["ttl_secs"] = serde_json::json!(ttl);
+    if let Some(t) = ttl_secs {
+        data.insert("ttl_secs".into(), t.into());
     }
-    post_claim_op(
+    let done = run_op(
         paths,
         room,
+        opts,
         claim::CLAIM,
         data,
-        &format!("claiming {resource}"),
+        format!("claiming {resource}"),
     )
     .await?;
-
-    // **Then say whether it was won.** A claim is a message, not a lock, so posting
-    // one is not taking the resource — the log decides, and an earlier claim beats
-    // this one. An agent that cannot tell the difference would start work somebody
-    // else is already doing, which is the exact failure claims exist to prevent.
-    // The exit status is the machine-readable half: 0 means it is yours.
-    let mut client = attach(paths).await?;
-    let channel_id = room_of(&mut client, room).await?;
-    let board = read_board(&mut client, channel_id).await?;
-    let me = client.me();
-    match board.get(resource) {
-        Some(own) if Some(own.owner) == me => {
-            println!("you hold {resource}");
-            Ok(())
-        }
-        Some(own) => Err(AppError::Usage(format!(
-            "{resource} is held by {} since {} — you did not get it",
-            short(&own.owner),
-            held_since(own.since_secs)
-        ))),
-        // Resolvable only if the post has not converged yet; treat it as not held
-        // rather than claiming success we cannot see.
-        None => Err(AppError::Usage(format!(
-            "{resource} is not held by anyone, including you — the claim has not \
-             converged yet; run `vox room board {room}` to check"
-        ))),
-    }
+    let me = Owner {
+        author: done.posting.after.me,
+        session: done.session.clone(),
+    };
+    // **Say whether it was won.** A claim is a message, not a lock: an earlier claim
+    // beats this one, and an agent that cannot tell would start work somebody else is
+    // already doing. The current state is the answer, not this post's own outcome —
+    // on a retry the resource may have moved on since the first attempt.
+    let (ok, said) = match done.posting.after.fold.resources.get(&resource) {
+        Some(State::Held { owner, .. }) if *owner == me => (true, format!("you hold {resource}")),
+        Some(State::Held {
+            owner,
+            since_millis,
+            ..
+        }) => (
+            false,
+            format!(
+                "{resource} is held by {} since {} — you did not get it",
+                who(owner),
+                millis_as_time(*since_millis)
+            ),
+        ),
+        Some(State::Pending {
+            to_fp, to_session, ..
+        }) => (
+            false,
+            format!(
+                "{resource} is reserved by a handoff for {}{} — you did not get it",
+                &claim::b32(to_fp)[..12],
+                to_session
+                    .as_ref()
+                    .map(|s| format!("/{s}"))
+                    .unwrap_or_default()
+            ),
+        ),
+        None => (
+            false,
+            format!(
+                "{resource} is not held by anyone, including you — the claim has not \
+                 converged yet; run `vox room board {room}` to check"
+            ),
+        ),
+    };
+    report(&done, claim::CLAIM, &resource, opts, ok, &said)
 }
 
-/// `vox room release` — give a resource up.
+/// `vox room release` — give a resource up. Only the exact holding session's release
+/// counts, and releasing means neither done nor failed (ADR-021 §3).
 ///
 /// # Errors
-/// If the node cannot be reached, the room is unknown, or the post is refused.
-pub async fn release_resource(paths: &Paths, room: &str, resource: &str) -> Result<(), AppError> {
+/// Exit 1 if this session did not hold it, 3 on a version refusal, 4 on an op conflict.
+pub async fn release_resource(
+    paths: &Paths,
+    room: &str,
+    resource: &str,
+    opts: &CoordOpts,
+) -> Result<(), AppError> {
     if resource.trim().is_empty() {
         return Err(AppError::Usage("a release needs a resource".into()));
     }
-    post_claim_op(
+    let mut data = serde_json::Map::new();
+    data.insert("resource".into(), resource.into());
+    let done = run_op(
         paths,
         room,
+        opts,
         claim::RELEASE,
-        serde_json::json!({ "resource": resource }),
-        &format!("releasing {resource}"),
+        data,
+        format!("releasing {resource}"),
     )
-    .await
+    .await?;
+    let (ok, said) = match &done.outcome {
+        Some(Outcome::Applied) => (true, format!("released {resource}")),
+        Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not released: {why}")),
+        other => (false, format!("{resource} was not released: {other:?}")),
+    };
+    report(&done, claim::RELEASE, resource, opts, ok, &said)
 }
 
 /// `vox service remove`, asked of the node already running this profile.
@@ -529,76 +1244,320 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
     }
 }
 
-/// `vox room handoff` — pass a resource to someone by petname.
+/// `vox room handoff` — relinquish a resource and reserve it for another harness,
+/// named by fingerprint (a unique prefix of a room member's), and optionally one exact
+/// session of it.
 ///
 /// # Errors
-/// If the node cannot be reached, the room is unknown, or the post is refused.
+/// Exit 1 if this session does not hold it, 3 on a version refusal, 4 on a conflict.
+#[allow(clippy::too_many_arguments)]
 pub async fn handoff_resource(
     paths: &Paths,
     room: &str,
     resource: &str,
     to: &str,
+    to_session: Option<&str>,
+    ttl_secs: Option<u64>,
+    opts: &CoordOpts,
 ) -> Result<(), AppError> {
     if resource.trim().is_empty() {
         return Err(AppError::Usage("a handoff needs a resource".into()));
     }
-    if to.trim().is_empty() {
-        return Err(AppError::Usage("a handoff needs a recipient".into()));
+    // Resolve the recipient **here, once, by the sender**, to a full fingerprint. A
+    // petname is local to whoever typed it, so a handoff that named one would resolve
+    // to different owners on different nodes (ADR-021 F2).
+    let to_fp = {
+        let (mut client, cid, _) = open_room(paths, room).await?;
+        let members = match client.request(&Request::Roster { channel_id: cid }).await {
+            Ok(Frame::Members { members }) => members,
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
+        resolve_prefix(to, &members).map_err(|e| {
+            AppError::Usage(format!(
+                "--to names a room member by fingerprint (a unique prefix of one in \
+                 `vox room roster`): {e}"
+            ))
+        })?
+    };
+    let ttl = ttl_secs.unwrap_or(claim::DEFAULT_HANDOFF_TTL_SECS);
+    if ttl == 0 {
+        return Err(AppError::Usage(
+            "--ttl 0 would make a handoff that is over before it begins".into(),
+        ));
     }
-    post_claim_op(
+    let mut data = serde_json::Map::new();
+    data.insert("resource".into(), resource.into());
+    data.insert("to_fp".into(), claim::b32(&to_fp).into());
+    data.insert("to".into(), to.into());
+    data.insert("ttl_secs".into(), ttl.into());
+    if let Some(s) = to_session.filter(|s| !s.is_empty()) {
+        data.insert("to_session".into(), s.into());
+    }
+    let done = run_op(
         paths,
         room,
+        opts,
         claim::HANDOFF,
-        serde_json::json!({ "resource": resource, "to": to }),
-        &format!("handing {resource} to {to}"),
+        data,
+        format!("handing {resource} to {}", &claim::b32(&to_fp)[..12]),
     )
-    .await
+    .await?;
+    let (ok, said) = match (&done.outcome, done.posting.after.fold.resources.get(resource)) {
+        (Some(Outcome::Applied), Some(State::Pending { deadline_millis, .. })) => (
+            true,
+            format!(
+                "{resource} is reserved for {}{} until {}; it completes when that session claims it",
+                &claim::b32(&to_fp)[..12],
+                to_session.map(|s| format!("/{s}")).unwrap_or_default(),
+                millis_as_time(*deadline_millis)
+            ),
+        ),
+        (Some(Outcome::Applied), _) => (true, format!("{resource} was handed off and has since moved on")),
+        (Some(Outcome::NoEffect(why)), _) => (false, format!("{resource} was not handed off: {why}")),
+        (other, _) => (false, format!("{resource} was not handed off: {other:?}")),
+    };
+    report(&done, claim::HANDOFF, resource, opts, ok, &said)
 }
 
-/// `vox room board` — what is taken, by whom, and until when.
+/// `vox room decline` — refuse a handoff pending for this session. The resource is
+/// **freed**, not returned to the sender.
 ///
-/// Reads the whole room and folds its claims. The result is a pure function of the
-/// log, so every member computes the same board without anyone being authoritative.
+/// # Errors
+/// Exit 1 if no handoff is pending for this session, 3 or 4 as the other verbs.
+pub async fn decline_resource(
+    paths: &Paths,
+    room: &str,
+    resource: &str,
+    opts: &CoordOpts,
+) -> Result<(), AppError> {
+    let mut data = serde_json::Map::new();
+    data.insert("resource".into(), resource.into());
+    let done = run_op(
+        paths,
+        room,
+        opts,
+        vox_agentcomms::envelope::work::DECLINE,
+        data,
+        format!("declining the handoff of {resource}"),
+    )
+    .await?;
+    let (ok, said) = match &done.outcome {
+        Some(Outcome::Applied) => (true, format!("declined {resource}; it is free")),
+        Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not declined: {why}")),
+        other => (false, format!("{resource} was not declined: {other:?}")),
+    };
+    report(
+        &done,
+        vox_agentcomms::envelope::work::DECLINE,
+        resource,
+        opts,
+        ok,
+        &said,
+    )
+}
+
+/// `vox room renew` — extend this session's current holding of a resource.
 ///
-/// **Handoffs are shown by the name the sender used, not resolved to a
-/// fingerprint.** A petname is local to whoever typed it, and resolving one needs
-/// the trust keyring, which has no control-socket request yet — that arrives with
-/// `vox trust`. Until then a handoff is displayed as the intent it is, marked so,
-/// rather than guessed at.
+/// The renewal names the acquisition it extends, read from the board at the moment of
+/// asking, so a renewal that arrives late cannot revive an expired holding or extend
+/// a later one (ADR-021 §4).
+///
+/// # Errors
+/// Exit 1 if this session does not hold it, 3 or 4 as the other verbs.
+pub async fn renew_resource(
+    paths: &Paths,
+    room: &str,
+    resource: &str,
+    opts: &CoordOpts,
+) -> Result<(), AppError> {
+    let session = coord::require_session(opts.session.as_deref())?;
+    let acquisition = {
+        let (mut client, cid, _) = open_room(paths, room).await?;
+        let snap = coord::snapshot(&mut client, cid).await?;
+        let me = Owner {
+            author: snap.me,
+            session: session.clone(),
+        };
+        match snap.fold.resources.get(resource) {
+            Some(State::Held {
+                owner, acquisition, ..
+            }) if *owner == me => *acquisition,
+            _ => {
+                return Err(AppError::Usage(format!(
+                    "this session ({session}) does not hold {resource}, so there is \
+                     nothing to renew"
+                )))
+            }
+        }
+    };
+    let mut data = serde_json::Map::new();
+    data.insert("resource".into(), resource.into());
+    data.insert("acquisition".into(), claim::b32(&acquisition).into());
+    let done = run_op(
+        paths,
+        room,
+        opts,
+        claim::RENEW,
+        data,
+        format!("renewing {resource}"),
+    )
+    .await?;
+    let (ok, said) = match (
+        &done.outcome,
+        done.posting.after.fold.resources.get(resource),
+    ) {
+        (
+            Some(Outcome::Applied),
+            Some(State::Held {
+                expires_millis: Some(e),
+                ..
+            }),
+        ) => (
+            true,
+            format!("renewed {resource} until {}", millis_as_time(*e)),
+        ),
+        (Some(Outcome::NoEffect(why)), _) => (false, format!("{resource} was not renewed: {why}")),
+        (other, _) => (false, format!("{resource} was not renewed: {other:?}")),
+    };
+    report(&done, claim::RENEW, resource, opts, ok, &said)
+}
+
+/// `vox room board` — what is held or pending, by whom, until when; whether
+/// coordination is allowed at all; and every operation that had no effect and why.
+///
+/// A pure function of the log under this version, so every worker on it computes the
+/// same board.
 ///
 /// # Errors
 /// If the node cannot be reached or the room is unknown.
-pub async fn board(paths: &Paths, room: &str) -> Result<(), AppError> {
-    let mut client = attach(paths).await?;
-    let channel_id = room_of(&mut client, room).await?;
-    let owned = read_board(&mut client, channel_id).await?;
-    let me = client.me();
-    let now = now_secs();
+pub async fn board(
+    paths: &Paths,
+    room: &str,
+    json: bool,
+    session: Option<&str>,
+) -> Result<(), AppError> {
+    let (mut client, cid, room_key) = open_room(paths, room).await?;
+    let snap = coord::snapshot(&mut client, cid).await?;
+    let session = coord::session(session).unwrap_or_default();
+    let me = Owner {
+        author: snap.me,
+        session: session.clone(),
+    };
+
+    if json {
+        let resources: Vec<serde_json::Value> = snap
+            .fold
+            .resources
+            .iter()
+            .map(|(r, s)| state_json(r, s, &me))
+            .collect();
+        let by_hash: std::collections::BTreeMap<[u8; 32], &Posted> =
+            snap.posted.iter().map(|p| (p.entry_hash, p)).collect();
+        let violations: Vec<serde_json::Value> = snap
+            .fold
+            .outcomes
+            .iter()
+            .filter(|(_, o)| !matches!(o, Outcome::Applied | Outcome::Lost))
+            .map(|(h, o)| {
+                let p = by_hash.get(h);
+                serde_json::json!({
+                    "entry_hash": claim::b32(h),
+                    "author": p.map(|p| claim::b32(&p.author)),
+                    "session": p.map(|p| p.envelope.from.clone()),
+                    "type": p.map(|p| p.envelope.kind.clone()),
+                    "outcome": outcome_json(Some(o)),
+                })
+            })
+            .collect();
+        let participants: Vec<serde_json::Value> = snap
+            .table
+            .participants
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "author": claim::b32(&p.author),
+                    "session": p.session,
+                    "stamp": p.stamp.token(),
+                    "version": p.stamp.carried(&snap.table.mine),
+                    "last_millis": p.last_millis,
+                    "entry_hash": claim::b32(&p.entry_hash),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "vox.room.board/1",
+                "room": room_key,
+                "me": { "author": claim::b32(&snap.me), "session": session },
+                "version": coord::VERSION,
+                "coordination": if snap.table.refused() { "refused" } else { "ok" },
+                "participants": participants,
+                "resources": resources,
+                "violations": violations,
+                "position": {
+                    "entries": snap.rows.len(),
+                    "last": snap.rows.last().map(|r| claim::b32(&r.entry_hash)),
+                },
+                "now_millis": snap.now_millis,
+            })
+        );
+        return Ok(());
+    }
 
     let mut out = std::io::stdout().lock();
-    if owned.is_empty() {
+    if snap.table.refused() {
+        writeln!(out, "{}", coord::refusal(&room_key, &snap.table)).map_err(AppError::Io)?;
+    }
+    if snap.fold.resources.is_empty() {
         writeln!(out, "nothing is claimed").map_err(AppError::Io)?;
         return Ok(());
     }
-    for (resource, own) in &owned {
-        let expiry = match own.expires_secs {
-            // Seconds remaining, not an absolute time: "in 240s" is actionable and
-            // a Unix timestamp is not.
-            Some(e) if e > now => format!(" expires in {}s", e - now),
-            Some(_) => " expired".to_owned(),
-            None => String::new(),
+    for (resource, s) in &snap.fold.resources {
+        let line = match s {
+            State::Held {
+                owner,
+                expires_millis,
+                ..
+            } => {
+                let mine = if *owner == me { " (you)" } else { "" };
+                let expiry = match expires_millis {
+                    // Time remaining, not an absolute time: "in 240s" is actionable.
+                    Some(e) if *e > snap.now_millis => {
+                        format!(" expires in {}s", (e - snap.now_millis).div_ceil(1_000))
+                    }
+                    Some(_) => " expired".to_owned(),
+                    None => String::new(),
+                };
+                format!("{resource}\t{}{mine}{expiry}", who(owner))
+            }
+            State::Pending {
+                from,
+                to_fp,
+                to_session,
+                deadline_millis,
+                ..
+            } => format!(
+                "{resource}\tpending handoff from {} to {}{}{} (lapses in {}s)",
+                who(from),
+                &claim::b32(to_fp)[..12],
+                to_session
+                    .as_ref()
+                    .map(|s| format!("/{s}"))
+                    .unwrap_or_default(),
+                if s.is_eligible(&me) {
+                    " — you may claim or decline it"
+                } else {
+                    ""
+                },
+                deadline_millis
+                    .saturating_sub(snap.now_millis)
+                    .div_ceil(1_000)
+            ),
         };
-        let named = match &own.named {
-            Some(n) => format!(" (handed to {n}, unresolved)"),
-            None => String::new(),
-        };
-        let mine = if Some(own.owner) == me { " (you)" } else { "" };
-        writeln!(
-            out,
-            "{resource}\t{}{mine}{expiry}{named}",
-            short(&own.owner)
-        )
-        .map_err(AppError::Io)?;
+        writeln!(out, "{line}").map_err(AppError::Io)?;
     }
     Ok(())
 }
