@@ -217,6 +217,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AddressesDiscovered { .. } => "publishing every room at a new address",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::PushRetry { .. } => "retrying a push that failed",
+        NetEvent::PublishDone { .. } => "filing what a board said to a publish",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
@@ -510,6 +511,15 @@ enum NetEvent {
         peer: Digest32,
         /// What the session did, or why it failed.
         outcome: crate::error::Result<crate::node::channel::SyncOutcome>,
+    },
+    /// A publish round to a board ended (see `publish_channel_to_anchor`).
+    PublishDone {
+        /// The room.
+        channel_id: Digest32,
+        /// The board it went to.
+        board: Digest32,
+        /// Each kind of record and the board's refusal of it, if any.
+        outcomes: Vec<(&'static str, Option<String>)>,
     },
     /// A push whose session failed is due again for that peer — sent after a short random wait by
     /// the `SyncDone` handler, so two ends that collided do not retry together.
@@ -1609,6 +1619,13 @@ pub struct Node {
     /// Rooms whose anchor publish found them mid-session: run when that session's `SyncDone`
     /// lands. See `publish_channel_to_anchors`.
     publish_owed: std::collections::BTreeSet<Digest32>,
+    /// `(room, board)` publish rounds in flight on their own tasks; see `publish_channel_to_anchor`.
+    publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// Publishes asked for while that `(room, board)` round was in flight: run when it ends.
+    publish_again: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// Creates and joins answered once their room's publish rounds have ended: see
+    /// `answer_when_published`.
+    publish_waiters: Vec<(Digest32, oneshot::Sender<Outcome>, Outcome)>,
     /// A local append (or a finished session with pushes still owed) wants `run_due_syncs` now
     /// rather than at the next tick. See `push_if_owed`.
     push_now: bool,
@@ -1768,6 +1785,9 @@ impl Node {
             joining: std::collections::BTreeSet::new(),
             held_pairwise: Vec::new(),
             publish_owed: std::collections::BTreeSet::new(),
+            publishing: std::collections::BTreeSet::new(),
+            publish_again: std::collections::BTreeSet::new(),
+            publish_waiters: Vec::new(),
             push_now: false,
             member_dialed_at: BTreeMap::new(),
             push_failures: BTreeMap::new(),
@@ -2322,79 +2342,139 @@ impl Node {
             ("our address", address.to_wire()),
         ];
         let mirrored = net.board_records(channel_id, epoch);
-        let round = async {
-            let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
-            // A stream that will not open is the next round's business, as it always was.
-            let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await else {
-                return outcomes;
-            };
-            // **Said, not swallowed.** A refused bundle is a member no other member can admit as a
-            // log author; each kind's outcome is carried, success as well as failure, so a refusal
-            // that *stops* clears its memo below.
-            //
-            // **Our bundle before our address**: an address record carries no key, so a board can
-            // only verify it against a bundle it already holds (`network.rs` `board_records` emits
-            // bundles first for the same reason).
-            for (kind, wire) in &own {
-                let result = client.put(wire).await;
-                let dead = matches!(&result, Err(e) if !matches!(e, Error::RendezvousRejected(_)));
-                outcomes.push((kind, result.err().map(|e| e.to_string())));
-                if dead {
+        // **Off the actor, and still in order.** The round awaits a board's answers, which on a
+        // connection that died without saying so is `ANCHOR_PUBLISH_PATIENCE` of waiting, and that
+        // was on the actor: `busy 5.0s — filing a sync that finished`, a person's post held behind
+        // it (the V29-21 verdict: every run still had posts over 1s). The ordering the round exists
+        // for, these records on the board before a session with that board reads it, is kept
+        // explicitly instead: while a round to a board is in flight, `run_due_syncs` owes that
+        // board the room rather than starting a session (`publishing`). One round per
+        // (room, board) at a time; a publish asked for meanwhile runs once the round ends.
+        let board_id = conn.peer_id();
+        if !self.publishing.insert((*channel_id, board_id)) {
+            self.publish_again.insert((*channel_id, board_id));
+            return;
+        }
+        let conn = Arc::clone(conn);
+        let tx = self.net_tx.clone();
+        let cid = *channel_id;
+        tokio::spawn(async move {
+            let conn = &conn;
+            let round = async {
+                let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
+                // A stream that will not open is the next round's business, as it always was.
+                let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await else {
                     return outcomes;
+                };
+                // **Said, not swallowed.** A refused bundle is a member no other member can admit as a
+                // log author; each kind's outcome is carried, success as well as failure, so a refusal
+                // that *stops* clears its memo below.
+                //
+                // **Our bundle before our address**: an address record carries no key, so a board can
+                // only verify it against a bundle it already holds (`network.rs` `board_records` emits
+                // bundles first for the same reason).
+                for (kind, wire) in &own {
+                    let result = client.put(wire).await;
+                    let dead =
+                        matches!(&result, Err(e) if !matches!(e, Error::RendezvousRejected(_)));
+                    outcomes.push((kind, result.err().map(|e| e.to_string())));
+                    if dead {
+                        return outcomes;
+                    }
                 }
-            }
-            // And every other member's records this node's board holds: an anchor learns a
-            // channel's members only from a member that vouches for them (M15.2a).
-            //
-            // **Awaited, and it has to be.** Sending this off the actor was tried: convergence
-            // depends on these records being on the anchor's board before the next step reads it,
-            // and spawning the send dropped the anchor-convergence gate from 3 runs in 5 to 1 in 6.
-            let mut mirrored_refused = 0usize;
-            let mut mirrored_why = String::new();
-            for wire in &mirrored {
-                match client.put(wire).await {
-                    Ok(()) => {}
-                    // A board that already holds something newer from that member has fresher news
-                    // than the copy we vouch with: nothing was refused that anyone needed.
-                    Err(Error::RendezvousRejected(r))
-                        if r == crate::nat::service::RejectReason::Stale.as_str() => {}
-                    Err(e) => {
-                        let dead = !matches!(e, Error::RendezvousRejected(_));
-                        mirrored_refused += 1;
-                        if mirrored_why.is_empty() {
-                            mirrored_why = e.to_string();
-                        }
-                        if dead {
-                            break;
+                // And every other member's records this node's board holds: an anchor learns a
+                // channel's members only from a member that vouches for them (M15.2a).
+                //
+                // **In order.** Convergence depends on these records being on the board before the
+                // next session with it reads them: spawning the send with nothing holding that
+                // session back once dropped the anchor-convergence gate from 3 runs in 5 to 1 in 6.
+                // `publishing` is what holds it back now.
+                let mut mirrored_refused = 0usize;
+                let mut mirrored_why = String::new();
+                for wire in &mirrored {
+                    match client.put(wire).await {
+                        Ok(()) => {}
+                        // A board that already holds something newer from that member has fresher news
+                        // than the copy we vouch with: nothing was refused that anyone needed.
+                        Err(Error::RendezvousRejected(r))
+                            if r == crate::nat::service::RejectReason::Stale.as_str() => {}
+                        Err(e) => {
+                            let dead = !matches!(e, Error::RendezvousRejected(_));
+                            mirrored_refused += 1;
+                            if mirrored_why.is_empty() {
+                                mirrored_why = e.to_string();
+                            }
+                            if dead {
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            client.finish();
-            outcomes.push((
-                "another member's record we vouch for",
-                (mirrored_refused > 0)
-                    .then(|| format!("{mirrored_refused} refused, first: {mirrored_why}")),
-            ));
-            outcomes
-        };
-        let outcomes = match tokio::time::timeout(ANCHOR_PUBLISH_PATIENCE, round).await {
-            Ok(outcomes) => outcomes,
-            Err(_) => vec![(
-                "this publish round",
-                Some(format!(
-                    "the board answered nothing within {}s",
-                    ANCHOR_PUBLISH_PATIENCE.as_secs()
-                )),
-            )],
-        };
+                client.finish();
+                outcomes.push((
+                    "another member's record we vouch for",
+                    (mirrored_refused > 0)
+                        .then(|| format!("{mirrored_refused} refused, first: {mirrored_why}")),
+                ));
+                outcomes
+            };
+            let outcomes = match tokio::time::timeout(ANCHOR_PUBLISH_PATIENCE, round).await {
+                Ok(outcomes) => outcomes,
+                Err(_) => vec![(
+                    "this publish round",
+                    Some(format!(
+                        "the board answered nothing within {}s",
+                        ANCHOR_PUBLISH_PATIENCE.as_secs()
+                    )),
+                )],
+            };
+            let _ = tx
+                .send(NetEvent::PublishDone {
+                    channel_id: cid,
+                    board: board_id,
+                    outcomes,
+                })
+                .await;
+        });
+    }
+
+    /// Answer a create or join once the room's first publish rounds have ended.
+    ///
+    /// **`Done` has always meant "others can find it".** A create or join awaited its first publish
+    /// to the anchors before answering. Once that round moved onto its own task, `vox room create`
+    /// answered before the room was on any anchor's board, and a join straight after the invite
+    /// found nothing: perf_r40_relayed_chat_gate, `bob's join failed: Failed(BadLink)`, 2 of 2.
+    /// The reply now waits for the room's rounds, bounded by `ANCHOR_PUBLISH_PATIENCE` each, and
+    /// the actor serves everyone else meanwhile.
+    async fn answer_when_published(
+        &mut self,
+        room: Digest32,
+        reply: oneshot::Sender<Outcome>,
+        outcome: Outcome,
+    ) {
+        if outcome.is_done() && self.publishing.iter().any(|(r, _)| *r == room) {
+            self.publish_waiters.push((room, reply, outcome));
+            return;
+        }
+        self.publish().await;
+        let _ = reply.send(outcome);
+    }
+
+    /// What a board said to one publish round (`NetEvent::PublishDone`), reported the way a
+    /// person can act on: once per standing refusal, and not while a join is still curing it.
+    fn report_publish(
+        &mut self,
+        channel_id: &Digest32,
+        board_id: Digest32,
+        outcomes: Vec<(&'static str, Option<String>)>,
+    ) {
         // **Keyed per board, not per room.** A node publishes the same record to several boards and
         // they answer differently — an anchor that has not been vouched this author says "not a
         // channel member" while the node's own board says "policy" — so a memo keyed only by room
         // and record kind alternates between the two reasons and reports on every publish round,
         // which is the spam it was added to stop. It also matters to whoever reads the line: "some
         // board refused this" is not actionable and "that board refused this" is.
-        let board = crate::node::network::short_id(conn.peer_id());
+        let board = crate::node::network::short_id(board_id);
         for (kind, why) in outcomes {
             let what = format!("{kind} (board {board})");
             let key = (*channel_id, what.clone());
@@ -2889,8 +2969,7 @@ impl Node {
                 }
                 // The view first, then the answer: whoever hears `Done` reads the view next, and a
                 // room that is joined but not yet in it reads as a join that did nothing.
-                self.publish().await;
-                let _ = reply.send(outcome);
+                self.answer_when_published(room, reply, outcome).await;
             }
             NetEvent::ChannelSealed {
                 reply,
@@ -2900,6 +2979,7 @@ impl Node {
                 now,
                 sealed,
             } => {
+                let room = genesis.channel_id();
                 let outcome = match sealed {
                     Err(e) => Outcome::Failed(fault_of(&e)),
                     Ok((sek, wrap)) => match self.profile.as_ref() {
@@ -2919,8 +2999,7 @@ impl Node {
                     },
                 };
                 // The view first, then the answer — as for a join above.
-                self.publish().await;
-                let _ = reply.send(outcome);
+                self.answer_when_published(room, reply, outcome).await;
             }
             NetEvent::BoardGrew { channel_id } => {
                 // Pass it on, which for a member means its anchors. A node that is not a member of
@@ -2978,6 +3057,35 @@ impl Node {
                 self.schedules
                     .entry(peer)
                     .or_insert_with(SyncSchedule::connected);
+            }
+            NetEvent::PublishDone {
+                channel_id,
+                board,
+                outcomes,
+            } => {
+                self.publishing.remove(&(channel_id, board));
+                self.report_publish(&channel_id, board, outcomes);
+                if !self.publishing.iter().any(|(room, _)| *room == channel_id) {
+                    let (ready, waiting): (Vec<_>, Vec<_>) =
+                        std::mem::take(&mut self.publish_waiters)
+                            .into_iter()
+                            .partition(|(room, _, _)| *room == channel_id);
+                    self.publish_waiters = waiting;
+                    if !ready.is_empty() {
+                        self.publish().await;
+                        for (_, reply, outcome) in ready {
+                            let _ = reply.send(outcome);
+                        }
+                    }
+                }
+                if self.publish_again.remove(&(channel_id, board)) {
+                    let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
+                    if let Some(conn) = conn {
+                        self.publish_channel_to_anchor(&channel_id, &conn).await;
+                    }
+                }
+                // A session with that board for this room was held back while the round ran.
+                self.push_now = true;
             }
             NetEvent::PushRetry { channel_id, peer } => {
                 self.pending_push.insert(channel_id);
@@ -4281,7 +4389,7 @@ impl Node {
                 {
                     continue;
                 }
-                if self.syncing.contains(cid) {
+                if self.syncing.contains(cid) || self.publishing.contains(&(*cid, peer)) {
                     owed.push(*cid);
                     continue;
                 }
