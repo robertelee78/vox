@@ -237,6 +237,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// How a connection reaches its peer, in preference order (ADR-012: prefer direct).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PathClass {
+    /// Set up over a relay circuit that this node **no longer has**: the mux detached it (a
+    /// second circuit to the same peer replaces the first) or its driver ended. Nothing this
+    /// node sends on it leaves the socket, so it is dead whatever it last heard, and it is never
+    /// kept over anything — least of all read as direct, which is what asking the mux's table
+    /// alone made of it (V29-15).
+    Severed,
     /// Through a relay circuit (rung 4): works anywhere, costs a third party.
     Relayed,
     /// Straight to the peer — dialled, or punched (rungs 1–3).
@@ -245,16 +251,24 @@ pub enum PathClass {
 
 /// The path a connection is on.
 ///
-/// Asked of the endpoint whose socket carries it, because a circuit's address is random:
-/// only the mux's table knows which addresses are circuits, and a guess from the address
-/// would be wrong in both directions — a real address can fall inside the subnet, and a
-/// circuit's address looks like nothing in particular.
+/// **Relayed or direct is the connection's own, fixed fact** ([`VoxConnection::via_circuit`]),
+/// recorded when it was made and identical at both ends. Only whether a relayed connection's
+/// circuit is *still attached* is asked of the endpoint's mux table — the only authority on
+/// which addresses are circuits, since a circuit's address is random and a guess from its shape
+/// would be wrong in both directions.
+///
+/// Asking the table for the whole answer was the defect (V29-15): a circuit detached by a second
+/// circuit to the same peer left its connection's address in nobody's table, so a relayed
+/// connection that could no longer send read as **direct**, beat the live circuit on "better
+/// path", and was kept by both ends.
 #[must_use]
 pub fn path_class(endpoint: &VoxEndpoint, conn: &VoxConnection) -> PathClass {
-    if endpoint.is_circuit(conn.quinn().remote_address()) {
+    if !conn.via_circuit() {
+        PathClass::Direct
+    } else if endpoint.is_circuit(conn.quinn().remote_address()) {
         PathClass::Relayed
     } else {
-        PathClass::Direct
+        PathClass::Severed
     }
 }
 
@@ -392,7 +406,7 @@ impl ConnectionManager {
             lock(&self.conns).remove(peer);
             return self.promote_heard(peer);
         }
-        if self.is_silent(&conn) {
+        if self.is_dead(&conn) {
             return self.promote_heard(peer);
         }
         Some(conn)
@@ -418,6 +432,13 @@ impl ConnectionManager {
         self.silent_for(conn) > SILENCE_IS_DEATH
     }
 
+    /// Whether `conn` can no longer be used, though it may not be closed: silent past
+    /// [`SILENCE_IS_DEATH`], or relayed over a circuit this node no longer has
+    /// ([`PathClass::Severed`]), which can send nothing however recently it heard something.
+    fn is_dead(&self, conn: &VoxConnection) -> bool {
+        path_class(&self.endpoint, conn) == PathClass::Severed || self.is_silent(conn)
+    }
+
     /// Replace `peer`'s silent (or closed) primary with a retired connection to the same peer
     /// that is still being heard from, if there is one. The dead primary is closed: if anything
     /// is still behind it the close tells it which connection this end chose, and if nothing is
@@ -432,7 +453,7 @@ impl ConnectionManager {
     fn promote_heard(&self, peer: &Digest32) -> Option<Arc<VoxConnection>> {
         let mut map = lock(&self.conns);
         if let Some(held) = map.get(peer) {
-            if is_live(held) && !self.is_silent(held) {
+            if is_live(held) && !self.is_dead(held) {
                 return Some(Arc::clone(held)); // somebody else promoted it first
             }
         }
@@ -440,7 +461,7 @@ impl ConnectionManager {
         let best = retiring
             .iter()
             .enumerate()
-            .filter(|(_, (c, _))| c.peer_id() == *peer && is_live(c) && !self.is_silent(c))
+            .filter(|(_, (c, _))| c.peer_id() == *peer && is_live(c) && !self.is_dead(c))
             .min_by_key(|(_, (c, _))| tie_key(c))
             .map(|(i, _)| i)?;
         let (conn, _) = retiring.swap_remove(best);
@@ -479,7 +500,7 @@ impl ConnectionManager {
             .collect();
         let mut changed = 0;
         for (peer, conn) in &peers {
-            if is_live(conn) && !self.is_silent(conn) {
+            if is_live(conn) && !self.is_dead(conn) {
                 continue;
             }
             match self.promote_heard(peer) {
@@ -509,7 +530,7 @@ impl ConnectionManager {
         // A retired connection that has gone silent is as dead as a primary one, and anything
         // still carried on it is waiting on nothing.
         for c in &retired {
-            if is_live(c) && self.is_silent(c) {
+            if is_live(c) && self.is_dead(c) {
                 c.close(WireError::AuthenticatorInvalid);
             }
         }
@@ -657,11 +678,15 @@ impl ConnectionManager {
         let peer = conn.peer_id();
         let mut map = lock(&self.conns);
         if let Some(existing) = map.get(&peer) {
-            // **A held connection that has gone silent is not a rival.** The process behind it
-            // is gone (see [`SILENCE_IS_DEATH`]), so the newcomer is filed and the dead one
-            // closed, whatever the tie-break would have said. Everything else is decided by
-            // path class and then by `tie_key`, which both ends compute identically.
-            if is_live(existing) && self.is_silent(existing) {
+            // **A held connection that is dead is not a rival.** Silent: the process behind it
+            // is gone (see [`SILENCE_IS_DEATH`]). Severed: its circuit is gone, so it can send
+            // nothing — and a second circuit to this peer is exactly what severs it, so it is
+            // severed at both ends by the time either files the newcomer that replaced it. The
+            // newcomer is filed and the dead one closed, whatever the tie-break would have said.
+            // Everything else is decided by path class and then by `tie_key`, which both ends
+            // compute identically; the class is the connection's own recorded fact (see
+            // [`path_class`]), not a reading of a table that changes underneath it.
+            if is_live(existing) && self.is_dead(existing) {
                 existing.close(WireError::AuthenticatorInvalid);
             } else if is_live(existing) {
                 let existing = Arc::clone(existing);
@@ -771,7 +796,7 @@ impl ConnectionManager {
             .map(|(p, c)| (*p, Arc::clone(c)))
             .collect();
         held.into_iter()
-            .filter(|(_, c)| is_live(c) && !self.is_silent(c))
+            .filter(|(_, c)| is_live(c) && !self.is_dead(c))
             .map(|(p, _)| p)
             .collect()
     }
