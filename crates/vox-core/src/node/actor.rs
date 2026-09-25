@@ -7185,7 +7185,7 @@ impl Node {
         // composed from two clock reads can go backwards across a second boundary, which is the
         // ordering inversion this change exists to remove.
         let now_millis = (self.millis_clock)();
-        let appended = match ch.append_text(profile, text, now_millis, now) {
+        let appended = match ch.append_text(profile, text, now_millis) {
             Ok(r) => row_of(r),
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };

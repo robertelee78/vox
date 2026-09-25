@@ -3038,7 +3038,7 @@ impl ChannelState {
         self.next_log_id = id.saturating_add(1);
         self.retention
             .rendered(&entry_hash, rendered.created_millis / 1_000, id);
-        self.place_rendered(rendered, now_secs.saturating_mul(1_000));
+        self.place_rendered(rendered);
         Ok(true)
     }
 
@@ -3046,10 +3046,15 @@ impl ChannelState {
     /// rows already shown when it arrived late (ADR-023 decision 1) — and re-sort first
     /// if a late parent has moved rows since the last sort.
     ///
-    /// `now_ms` is this node's wall clock — the seconds clock every other local decision
-    /// uses, not the (possibly skewed) clock an author stamps its messages with.
-    fn place_rendered(&mut self, mut rendered: Rendered, now_ms: u64) {
-        rendered.shown_at_ms = now_ms;
+    /// The row's shown time is read **now**, from the system clock, not from the caller. A sync
+    /// session hands its render the time the session *began*, and since v0.2.9 a session locks the
+    /// room per step, so one that stalls on a peer can span rows posted meanwhile: a post it
+    /// delivers late was stamped as shown before them, and was never marked late (measured on
+    /// the v0.3.0 integration). "When the reader could first see it" is this moment.
+    fn place_rendered(&mut self, mut rendered: Rendered) {
+        rendered.shown_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         self.settle_timeline();
         let dag = &self.dag;
         let key = dag.order_key(&rendered.entry_hash);
@@ -3225,8 +3230,6 @@ impl ChannelState {
         // converted at the call site: this value becomes half the ADR-020 claim ordering key, and a
         // caller still thinking in seconds should fail to compile rather than stamp 1970.
         now_millis: u64,
-        // This node's seconds clock, for local decisions (when the row was shown).
-        now_secs: u64,
     ) -> Result<&Rendered> {
         if self.poisoned {
             return Err(Error::Profile(
@@ -3321,7 +3324,7 @@ impl ChannelState {
         );
         // Its `seen` names every head this node holds, so it sorts after all of them;
         // placed through the same path as any row all the same.
-        self.place_rendered(rendered, now_secs.saturating_mul(1_000));
+        self.place_rendered(rendered);
         self.timeline
             .iter()
             .find(|r| r.entry_hash == entry_hash)

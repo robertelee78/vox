@@ -468,15 +468,17 @@ fn every_common_failure_names_its_cause() {
         refused,
         "CANNOT MEASURE (7): an untrusted guest's connection went through"
     );
+    // v0.3.0 integration: the guest's words are v0.2.9's (`up::refusal`, tunnel-honesty-v029),
+    // which say the same thing as this branch's did: the host refused, and trusting you is theirs.
     let guest_said = forward.expect_err("why the connection was refused", 30, |e| {
-        e.contains("refused a connection")
+        e.contains("the host refused")
     });
     assert_says(
         "forward, host has not trusted you (guest)",
         &guest_said,
         &[
-            "refused a connection",
-            "have not run `vox trust add` on you",
+            "the host refused",
+            "has not trusted this identity (`vox trust add`)",
         ],
     );
     let host_said = host.expect_err("whom it refused", 30, |e| e.contains("refused"));
