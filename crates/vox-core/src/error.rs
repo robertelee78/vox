@@ -350,4 +350,39 @@ pub enum Error {
         /// The underlying OS message.
         detail: String,
     },
+
+    /// Attaching to a node's control socket failed before any request: the connect, or
+    /// the node's greeting. Said in a person's words, because each one needs a different
+    /// remedy and they used to share one sentence (#191).
+    #[error("{0}")]
+    Ipc(IpcHandshake),
+}
+
+/// How an attach to a node's control socket failed ([`Error::Ipc`]).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum IpcHandshake {
+    /// The connect itself failed: nothing is listening on the socket.
+    #[error("nothing is listening on the control socket ({reason})")]
+    Unreachable {
+        /// The OS message.
+        reason: String,
+    },
+    /// Something accepted the connection and closed it without greeting.
+    #[error("the node closed the connection before greeting")]
+    ClosedBeforeHello,
+    /// The node greeted in another control protocol: the two are different vox versions.
+    #[error(
+        "the node speaks a different control protocol (this vox is protocol {mine}, the node is \
+         protocol {theirs}); update one of them"
+    )]
+    Protocol {
+        /// The protocol this vox speaks.
+        mine: u64,
+        /// The protocol the node greeted with.
+        theirs: u64,
+    },
+    /// What answered did not greet at all.
+    #[error("what answered on the control socket did not greet like a vox node")]
+    NotHello,
 }
