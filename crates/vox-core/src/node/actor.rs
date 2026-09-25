@@ -2871,6 +2871,9 @@ impl Node {
                 for (_, peer, first, recv) in held {
                     self.handle_pairwise(peer, first, recv).await;
                 }
+                // The view first, then the answer: whoever hears `Done` reads the view next, and a
+                // room that is joined but not yet in it reads as a join that did nothing.
+                self.publish().await;
                 let _ = reply.send(outcome);
             }
             NetEvent::ChannelSealed {
@@ -2899,6 +2902,8 @@ impl Node {
                         },
                     },
                 };
+                // The view first, then the answer — as for a join above.
+                self.publish().await;
                 let _ = reply.send(outcome);
             }
             NetEvent::BoardGrew { channel_id } => {
