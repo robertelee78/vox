@@ -120,6 +120,32 @@ const MEMBER_REDIAL_SECS: u64 = 30;
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+/// How long building the view waits for a room a sync session holds before using that room's previous
+/// entry. A session holds a room for one protocol step at a time. See `Node::view_of`.
+const VIEW_LOCK_PATIENCE: Duration = Duration::from_millis(250);
+
+/// A room's detail for the view, from its state.
+fn detail_of(ch: &ChannelState) -> ChannelDetail {
+    ChannelDetail {
+        channel_id: ch.channel_id(),
+        local_name: ch.local_name().to_owned(),
+        epoch: ch.epoch(),
+        members: ch.members(),
+        timeline: ch.timeline().iter().map(row_of).collect(),
+        services: ch
+            .services()
+            .iter()
+            .map(|(tag, addr)| (tag.clone(), *addr))
+            .collect(),
+    }
+}
+
+/// A room's lock if it can be had within `VIEW_LOCK_PATIENCE`.
+async fn briefly<T>(m: &tokio::sync::Mutex<T>) -> Option<tokio::sync::MutexGuard<'_, T>> {
+    tokio::time::timeout(VIEW_LOCK_PATIENCE, m.lock())
+        .await
+        .ok()
+}
 /// How long one publish round to one board may take before it is given up until the next round: a
 /// live board answers each put in milliseconds. See `publish_channel_to_anchor`.
 const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
@@ -1705,6 +1731,10 @@ pub struct Node {
     pending_consents: Vec<(Digest32, Digest32, oneshot::Sender<Outcome>, u8)>,
     /// Consecutive failed sessions per `(room, peer)`; see `MAX_PUSH_RETRIES`.
     push_failures: BTreeMap<(Digest32, Digest32), u32>,
+    /// Each room's view detail as this node's own latest write left it, taken under the room's lock
+    /// by the write itself. `view_of` uses it when a session holds the room, so a person always sees
+    /// their own post in what they read straight after, however long that session holds on.
+    fresh_details: BTreeMap<Digest32, ChannelDetail>,
     /// Peers that were skipped behind a busy room or had a push re-owed: served first on the next
     /// pass, so a peer that always takes the room cannot always go first.
     owed_first: std::collections::BTreeSet<Digest32>,
@@ -1888,6 +1918,7 @@ impl Node {
             member_dialed_at: BTreeMap::new(),
             pending_consents: Vec::new(),
             push_failures: BTreeMap::new(),
+            fresh_details: BTreeMap::new(),
             owed_first: std::collections::BTreeSet::new(),
             key_backoff: BTreeMap::new(),
             record_seq: BTreeMap::new(),
@@ -6314,6 +6345,7 @@ impl Node {
         // append is still reported as the success it was.
         let rotated =
             ch.should_rotate_sender(now) && ch.rotate_sender(profile.store(), now).is_ok();
+        self.fresh_details.insert(*channel_id, detail_of(&ch));
         drop(ch);
         let channel_id = *channel_id;
         let _ = self.event_tx.send(NodeEvent::NewEntry {
@@ -6381,7 +6413,7 @@ impl Node {
         self.view_tx.send_replace(view);
     }
 
-    /// The node's view, built **without waiting on any room a session holds.**
+    /// The node's view, built **without waiting long on any room a session holds.**
     ///
     /// `publish()` runs this after every command and every event, and it took each room's lock in
     /// turn — the lock a sync session holds for its whole run, across its network waits. So while
@@ -6391,6 +6423,14 @@ impl Node {
     /// actor silent 19.9s, both sessions ending `sync failed: transport` at exactly the timeout). A
     /// room that is held now keeps its entry from the view already published — at most one event old
     /// — and is refreshed on the next publish after the session hands it back.
+    ///
+    /// **Briefly, not never.** Since sync sessions lock a room per protocol step (3f95b57), a holder
+    /// keeps it for milliseconds, not across a network wait, so the view waits up to
+    /// `VIEW_LOCK_PATIENCE` before falling back. Falling back at once served a stale view whenever a
+    /// session happened to be mid-step, and a person's own post could be missing from what they read
+    /// straight after posting: `vox room post` then read back a view without its entry, reported a
+    /// successful post as failed, and let two racing posts under one op both succeed (PR #14's
+    /// work_op proof, on macOS and Linux).
     async fn view_of(&self) -> NodeView {
         let prev = self.view_tx.borrow().clone();
         let identity = self.profile.as_ref().map(|p| IdentityInfo {
@@ -6416,9 +6456,9 @@ impl Node {
             .unwrap_or_default();
         for a in &mut anchoring {
             if let Some(state) = self.anchored.get(&a.channel_id) {
-                a.entries = match state.try_lock() {
-                    Ok(st) => Some(st.entries() as u64),
-                    Err(_) => prev
+                a.entries = match briefly(state).await {
+                    Some(st) => Some(st.entries() as u64),
+                    None => prev
                         .anchoring
                         .iter()
                         .find(|p| p.channel_id == a.channel_id)
@@ -6429,14 +6469,14 @@ impl Node {
         let mut channels = Vec::with_capacity(known.len());
         for id in &known {
             channels.push(match self.channels.get(id) {
-                Some(shared) => match shared.try_lock() {
-                    Ok(ch) => ChannelSummary {
+                Some(shared) => match briefly(shared).await {
+                    Some(ch) => ChannelSummary {
                         channel_id: *id,
                         local_name: Some(ch.local_name().to_owned()),
                         open: true,
                         entries: ch.entry_count() as u64,
                     },
-                    Err(_) => prev
+                    None => prev
                         .channels
                         .iter()
                         .find(|c| c.channel_id == *id)
@@ -6459,26 +6499,25 @@ impl Node {
         let mut open_channels = Vec::with_capacity(self.channels.len());
         let mut mlock_active = true;
         for (id, shared) in &self.channels {
-            let Ok(ch) = shared.try_lock() else {
-                if let Some(d) = prev.open_channels.iter().find(|d| d.channel_id == *id) {
+            let Some(ch) = briefly(shared).await else {
+                // The detail taken under this room's lock by this node's own latest write, if any, is
+                // newer than the one last published: a person reads their own post (read-your-writes).
+                // Whichever is newer: a later publish may have read the room after that write. A room's
+                // timeline only grows, so the longer one is the newer.
+                let published = prev.open_channels.iter().find(|d| d.channel_id == *id);
+                let newest = match (self.fresh_details.get(id), published) {
+                    (Some(f), Some(p)) if p.timeline.len() > f.timeline.len() => Some(p),
+                    (Some(f), _) => Some(f),
+                    (None, p) => p,
+                };
+                if let Some(d) = newest {
                     open_channels.push(d.clone());
                 }
                 mlock_active &= prev.mlock_active;
                 continue;
             };
             mlock_active &= ch.mlock_active();
-            open_channels.push(ChannelDetail {
-                channel_id: ch.channel_id(),
-                local_name: ch.local_name().to_owned(),
-                epoch: ch.epoch(),
-                members: ch.members(),
-                timeline: ch.timeline().iter().map(row_of).collect(),
-                services: ch
-                    .services()
-                    .iter()
-                    .map(|(tag, addr)| (tag.clone(), *addr))
-                    .collect(),
-            });
+            open_channels.push(detail_of(&ch));
         }
         let (relayed_peers, relaying) = self.path_view();
         NodeView {
