@@ -488,6 +488,10 @@ Measured: a broadcast fan-out delivered 1024 events in 125 µs without blocking,
 The IPC socket **MUST** be a Unix domain socket with `0600` permissions (ctm's precedent, ADR-009 of
 that project). Each client **MUST** have its own cursor.
 
+*Protocol 6 (ADR-022 M22.5)* adds the app API to the same socket: a connection whose first request is
+`AppListen`, `AppAccept` or `AppOpen` becomes a listener registration or a splice of one app stream
+for its whole life. The requests are additive; nothing earlier changed shape.
+
 ### 8. The agent-facing surface is a CLI plus a skill
 
 Agents **MUST** be served by CLI verbs — `vox room post` (JSON on stdin, so no shell-quoting hazard),
