@@ -53,9 +53,12 @@ pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
             paths.socket_file().display()
         )));
     }
-    IpcClient::open(&sock).await.map_err(|_| {
+    // The cause is carried, not replaced: a refused connect, a hello that never came and a
+    // protocol mismatch all read as "nothing answered" otherwise, and one of them (a live node,
+    // answering the harness before and after) was reported as a stale socket.
+    IpcClient::open(&sock).await.map_err(|e| {
         AppError::Usage(format!(
-            "a control socket exists at {} but nothing answered — the node may have \
+            "a control socket exists at {} but nothing answered ({e}) — the node may have \
              stopped without cleaning up. Starting a node again replaces it.",
             sock.display()
         ))
