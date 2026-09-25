@@ -3,19 +3,20 @@
 //!
 //! - **Host side** — [`serve`]: an inbound `StreamKind::Tunnel` stream goes to
 //!   [`session::accept`], which reads the request, asks the actor's snapshot about the
-//!   `(channel, service)` it names, and enforces `dial:` against *that channel's*
-//!   evaluator. Nothing here can grant reach: this supplies host configuration and
-//!   the authority to ask, never a decision.
+//!   `(channel, service)` it names, and checks the dialer against *that channel's* live
+//!   reacher set (ADR-017 decision 3). Nothing here can grant reach: this supplies host
+//!   configuration and the live sets, never a decision.
 //! - **Dial side** — [`Forward`]: a local TCP listener. Every accepted connection
-//!   opens its own tunnel stream and splices, so a forward carries as many
-//!   connections as the application makes and a dead one takes nothing else with it
-//!   (ADR-013: one QUIC stream per tunneled TCP connection).
+//!   reaches the host afresh, opens its own tunnel stream and splices, so a forward
+//!   carries as many connections as the application makes, a dead one takes nothing
+//!   else with it (ADR-013: one QUIC stream per tunneled TCP connection), and a host that
+//!   restarted is reached again (PRD-001 R24).
 //!
 //! ## What is dark stays dark
-//! A missing capability, a channel this node does not hold, a service it does not
-//! offer, and a local service that refuses the connection all end the same way: the
-//! accepted TCP connection closes. `TunnelStatus::Denied` distinguishes none of them,
-//! and neither does this.
+//! An untrusted dialer, a channel this node does not hold, a service it does not offer,
+//! and a local service that refuses the connection all end the same way on the wire:
+//! `TunnelStatus::Denied`, which distinguishes none of them. The dialing node resets the
+//! application's connection and says, locally, that the host refused (PRD-001 R23).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -25,11 +26,9 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
-use crate::governance::evaluator::Evaluator;
 use crate::hash::Digest32;
 use crate::node::api::NodeEvent;
-use crate::transport::quic::VoxConnection;
-use crate::transport::streams::{open_typed, StreamKind};
+use crate::node::up;
 use crate::tunnel::session::{self, HostService};
 
 /// The set of identities that may reach a host's services in one channel, shared live
@@ -72,14 +71,41 @@ pub fn publish_reachers(handle: &Reachers, next: BTreeSet<Digest32>) -> bool {
     })
 }
 
+/// The services a host offers in one channel, `service_tag → local address`, shared live
+/// between the actor (which writes) and the serving tasks (which read) — the same shape,
+/// and for the same reason, as [`Reachers`].
+///
+/// Live because removing a service has to reach the sessions it is already carrying
+/// (PRD-001 R22). A copy taken when the stream opened would keep serving a port the host
+/// has stopped offering for as long as the session lasted, which for `ssh` is hours.
+pub type Offered = Arc<tokio::sync::watch::Sender<BTreeMap<String, SocketAddr>>>;
+
+/// A fresh, empty offer: the state that serves nothing.
+#[must_use]
+pub fn empty_offered() -> Offered {
+    Arc::new(tokio::sync::watch::Sender::new(BTreeMap::new()))
+}
+
+/// Publish a newly computed offer, waking the serving tasks **only if it changed** — the
+/// rule [`publish_reachers`] states, for the same reason: every wake re-evaluates whether
+/// to tear a live session down.
+pub fn publish_offered(handle: &Offered, next: BTreeMap<String, SocketAddr>) -> bool {
+    handle.send_if_modified(|current| {
+        if *current == next {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    })
+}
+
 /// One channel's host-side facts, as the actor snapshots them for the serving task:
-/// the authority that decides, and the services this node offers there.
+/// the services this node offers there, and who may reach them.
 #[derive(Clone)]
 pub struct ChannelServices {
-    /// The channel's ADR-007 evaluator.
-    pub evaluator: Arc<Evaluator>,
-    /// `service_tag → local address` (this node's Bind configuration).
-    pub services: BTreeMap<String, SocketAddr>,
+    /// `service_tag → local address` (this node's Bind configuration), live.
+    pub offered: Offered,
     /// The identities that may reach this node's services **in this channel** (ADR-017
     /// decision 3, M17.7): the intersection of this node's trust keyring with this
     /// channel's current author set.
@@ -99,7 +125,7 @@ pub struct ChannelServices {
 impl std::fmt::Debug for ChannelServices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChannelServices")
-            .field("services", &self.services.len())
+            .field("services", &self.offered.borrow().len())
             .finish_non_exhaustive()
     }
 }
@@ -148,11 +174,13 @@ pub async fn serve_reporting(
         &client,
         |channel_id, tag| {
             let channel = snapshot.get(channel_id)?;
-            let endpoint = *channel.services.get(tag)?;
+            // Read from the live offer, not a copy: a service removed while this stream sat
+            // unread is refused like one that was never offered.
+            let endpoint = *channel.offered.borrow().get(tag)?;
             Some(HostService {
-                evaluator: Arc::clone(&channel.evaluator),
                 endpoint,
                 reachers: Arc::clone(&channel.reachers),
+                offered: Arc::clone(&channel.offered),
             })
         },
         |channel_id, tag| {
@@ -173,7 +201,7 @@ pub async fn serve_reporting(
 /// Dropping it stops the listener. Connections already spliced run to their own end:
 /// a forward is a door, not a leash.
 pub struct Forward {
-    /// The channel whose capability this forward claims.
+    /// The channel whose reach this forward uses.
     pub channel_id: Digest32,
     /// The member hosting the service.
     pub host: Digest32,
@@ -200,25 +228,51 @@ impl Drop for Forward {
     }
 }
 
+/// How long an accept loop waits after the listener fails before trying again.
+///
+/// A failed `accept` is almost always the process running out of descriptors (`EMFILE`),
+/// and retrying at once fails again at once: the loop spins a core and never gives the
+/// connections holding those descriptors a chance to close. Exiting instead — which the
+/// forward used to do, `while let Ok(..) = accept()` — turns a moment of pressure into a
+/// port that is still bound and never answers again.
+pub(crate) const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl Forward {
-    /// Bind `local` and forward every connection to `service_tag` on `host`, over
-    /// `conn` — the live connection to that member, which the ADR-012 ladder produced.
+    /// Bind `local` and forward every connection to `service_tag` on `host`, reaching the
+    /// host through `dialer` — **per connection**.
     ///
     /// Binding happens here, so a port already in use is an error the caller sees
     /// rather than a task that dies silently. Each accepted connection gets its own
     /// tunnel stream on its own task.
+    ///
+    /// Per connection, not once (PRD-001 R24). This used to take the one `VoxConnection`
+    /// the ladder produced when the forward started and keep it for the forward's whole
+    /// life, so when the host restarted, or the path to it changed, every later connection
+    /// was opened on a connection that no longer went anywhere and the forward was dead
+    /// while still bound. `vox up` already asked its dialer per request; the forward now
+    /// does the same, through the same [`up::open_tunnel`].
+    ///
+    /// `report` hears, in words, why a connection was refused or cut — the application only
+    /// sees its socket reset, and the host's refusal is uniform on purpose, but this node is
+    /// the operator's own and knows what it was told (PRD-001 R23).
     ///
     /// `local` must be a loopback address. This is the structural backstop for the rule
     /// the node actor enforces on the way in: the socket is created here and nowhere
     /// else, so no caller can bind a forward where the network can reach it. Reaching
     /// this refusal means a caller bypassed the actor, which is a bug rather than user
     /// input — hence a fault rather than a message about what to type.
-    pub async fn bind(
-        conn: Arc<VoxConnection>,
+    pub async fn bind<D, F>(
+        dialer: Arc<D>,
+        host: Digest32,
         channel_id: Digest32,
         service_tag: String,
         local: SocketAddr,
-    ) -> Result<Self> {
+        report: F,
+    ) -> Result<Self>
+    where
+        D: up::HostDialer + 'static,
+        F: Fn(String) + Send + Sync + 'static,
+    {
         if !local.ip().is_loopback() {
             return Err(Error::MalformedTunnel("a forward binds loopback only"));
         }
@@ -228,17 +282,40 @@ impl Forward {
         let bound = listener
             .local_addr()
             .map_err(|_| Error::TunnelDenied("forward: bound port unknown"))?;
-        let host = conn.peer_id();
         let tag = service_tag.clone();
+        let report = Arc::new(report);
         let task = tokio::spawn(async move {
-            while let Ok((app, _)) = listener.accept().await {
-                let conn = Arc::clone(&conn);
+            loop {
+                let app = match listener.accept().await {
+                    Ok((app, _)) => app,
+                    Err(_) => {
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                };
+                let dialer = Arc::clone(&dialer);
+                let report = Arc::clone(&report);
                 let tag = tag.clone();
                 tokio::spawn(async move {
-                    // One stream per connection. A refusal closes this connection and
-                    // says nothing about why (dark services).
-                    if let Ok((send, recv)) = open_typed(&conn, StreamKind::Tunnel).await {
-                        let _ = session::dial(send, recv, &channel_id, &tag, app).await;
+                    // One stream per connection, on whatever connection reaches the host now.
+                    match up::open_tunnel(dialer.as_ref(), &host, &channel_id, &tag).await {
+                        // `_carried` is held for the whole splice: see `up::open_tunnel`.
+                        Ok((send, recv, _carried)) => {
+                            if let Err(Error::TunnelRevoked(_)) =
+                                session::splice(send, recv, app).await
+                            {
+                                report(format!(
+                                    "the host withdrew access to {tag:?} — that session was cut"
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            // Reset, not close: an application that sees a clean close after
+                            // its connect succeeded reads it as the service hanging up, and
+                            // retries a thing that will never work.
+                            session::abort_local(&app);
+                            report(up::refusal(&e, &format!("{tag:?}")));
+                        }
                     }
                 });
             }

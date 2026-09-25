@@ -36,8 +36,19 @@
 //! ## Modules
 //!
 //! - [`envelope`] — the message: parsing, addressing, interrupting, loop control.
-//! - [`claim`] — work assignment as claims, resolved by the log with no
-//!   coordinator.
+//! - [`claim`] — live ownership as claims, resolved by the log with no
+//!   coordinator: session-scoped owners, pending handoffs, bound renewals
+//!   (ADR-020 §5 as corrected by ADR-021 §4).
+//! - [`ops`] — operation ids: a retry is one operation, a conflict is explicit and
+//!   voids it (ADR-021 §6).
+//! - [`version`] — workers must run the same Vox version, and refuse to coordinate
+//!   when one does not (ADR-021 §5).
+//!
+//! ## What this crate is not
+//!
+//! A work tracker. Work items, their phase, health, priority, acceptance and
+//! delivery belong to an external tracker (ADR-021 §1). `data.work` is a reference
+//! this crate carries and never interprets.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -45,6 +56,8 @@
 
 pub mod claim;
 pub mod envelope;
+pub mod ops;
+pub mod version;
 
-pub use claim::{ClaimOp, Ownership, Posted};
+pub use claim::{ClaimOp, Fold, Outcome, Owner, Posted, State};
 pub use envelope::{Context, Envelope, ParseError, BYE, HELLO, SAY};

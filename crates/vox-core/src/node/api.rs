@@ -326,9 +326,9 @@ pub enum NodeCommand {
         /// Where to listen. Loopback only; `0` picks a port.
         bind: std::net::SocketAddr,
     },
-    /// Offer a local TCP service to a channel (ADR-013 Bind). Host configuration:
-    /// what a peer may *reach* is the `dial:` capability on the log, granted with
-    /// [`NodeCommand::GrantTunnel`]. Requires `bind:<service_tag>` in that channel.
+    /// Offer a local TCP service to a channel (ADR-013 Bind). Host configuration only:
+    /// who may *reach* it is this node's trust keyring intersected with the room's
+    /// authors (ADR-017 decision 3), never anything on the room's log.
     AddService {
         /// The channel the service is offered in.
         channel_id: Digest32,
@@ -343,21 +343,6 @@ pub enum NodeCommand {
         channel_id: Digest32,
         /// The service tag.
         service_tag: String,
-    },
-    /// Grant a member the capability to dial (and optionally to offer) a service in a
-    /// channel, as an ADR-007 admin certificate on the log — a fact every member
-    /// converges on, not local configuration (ADR-013).
-    GrantTunnel {
-        /// The channel.
-        channel_id: Digest32,
-        /// The member being granted.
-        target: Digest32,
-        /// The service tag.
-        service_tag: String,
-        /// Also grant `bind:<tag>`, so the member may offer the service too.
-        may_bind: bool,
-        /// When the grant stops counting (unix seconds).
-        expiry: u64,
     },
     /// Forward a local TCP port to a member's service over the overlay (ADR-013
     /// Dial). Answers [`NodeEvent::Forwarding`] with the port actually bound.
@@ -491,6 +476,17 @@ pub enum NodeEvent {
         /// The joiner's verified identity fingerprint.
         peer: Digest32,
     },
+    /// A sender key this node delivered was not taken by `peer`, so it is owed again and
+    /// re-sent on the tick. Said rather than hidden: a member who never gets the key cannot
+    /// read, and the cause is on the recipient's side.
+    KeyNotTaken {
+        /// The channel.
+        channel_id: Digest32,
+        /// The member it was for.
+        peer: Digest32,
+        /// What the recipient's side said.
+        why: String,
+    },
     /// A peer's sender key arrived, so that peer's messages become readable. Any
     /// message already held as ciphertext was backfilled.
     SenderKeyReceived {
@@ -557,6 +553,14 @@ pub enum NodeEvent {
         /// What each responder reported, as this node saw it.
         reason: String,
     },
+    /// Where a join's time went, step by step — raised for every join this node starts, whether
+    /// it got in or not, so a slow or failed join carries its own breakdown.
+    JoinSteps {
+        /// Whether the join got in.
+        joined: bool,
+        /// Each step and how long it took, in order.
+        steps: String,
+    },
     /// An upgrade off a relayed path was tried and nothing better landed, with what each rung
     /// reported.
     ///
@@ -570,10 +574,12 @@ pub enum NodeEvent {
         /// What each rung reported, as this node saw it.
         reason: String,
     },
-    /// The proxy refused a CONNECT, with the reason **this node** saw.
+    /// The proxy refused a CONNECT, or a forward refused or lost a connection, with the reason
+    /// **this node** saw.
     ///
-    /// The SOCKS reply the client gets stays uniform — one code covers unauthorized, no such
-    /// service and could-not-get-there, so a peer learns nothing (ADR-013 dark services). This is
+    /// What the application gets stays coarse — a SOCKS failure code, or a reset socket for a
+    /// forward — and the host's refusal is uniform, so a peer learns nothing (ADR-013 dark
+    /// services). This is
     /// the other side of that: the operator's own node telling them what happened, which is the
     /// difference between a diagnosable failure and `ssh` failing for no stated reason. Measured:
     /// a real SOCKS5 client got "SOCKS reply code 1" and the ladder's actual verdict — which

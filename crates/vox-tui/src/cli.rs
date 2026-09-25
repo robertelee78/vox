@@ -112,7 +112,7 @@ where
     // **Not `passphrase_or_prompt`.** Removing clap's `env` from the flag — so a flag
     // could be refused while the variable still worked — left this caller reading the
     // flag only, and the flag is now always `None`. So `VOX_IDENTITY_PASSPHRASE` stopped
-    // working for every tunnel verb (`service`, `forward`, `grant`, `up`) and they
+    // working for every tunnel verb (`service`, `forward`, `up`) and they
     // answered `Failed(WrongPassphrase)`, which sends a person to check a passphrase that
     // was never read. One helper reads the flag, the file, the variable and the prompt,
     // in that order; every caller uses it.
@@ -356,7 +356,12 @@ enum RoomCmd {
     /// cursor: pass the last one back as `--since` to read only what is new.
     Read(RoomReadArgs),
     /// Print new messages as they arrive, until interrupted.
-    Tail(RoomRefArgs),
+    ///
+    /// With `--since`, first every message after that cursor, then every new one —
+    /// **with no gap across a lag or a restart** (ADR-021 §7). Persist the last entry
+    /// hash you processed and pass it back to resume. `--json` prints one
+    /// `vox.room.row/1` object per line.
+    Tail(RoomTailArgs),
     /// Print the fingerprints of the room's members.
     Roster(RoomRefArgs),
     /// List the rooms this node holds.
@@ -367,13 +372,25 @@ enum RoomCmd {
     /// Ownership is whatever the room's log resolves to, so every member computes
     /// the same answer with nobody coordinating. `--ttl` is what makes an agent
     /// that dies holding work release it without anyone noticing it died.
+    ///
+    /// Ownership is per **session** (ADR-021 §4): the session comes from `--session`,
+    /// `VOX_SESSION`, or the harness (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`).
+    /// Every participant must run this exact vox version, or the claim is refused
+    /// with exit status 3. A claim also completes a handoff pending for this session.
     Claim(ClaimArgs),
-    /// Give a unit of work up. Only the current owner's release counts.
+    /// Give a unit of work up. Only the exact holding session's release counts, and
+    /// releasing means neither done nor failed.
     Release(ResourceArgs),
-    /// Pass a unit of work to another agent by petname.
+    /// Relinquish a unit of work and reserve it for another harness, named by
+    /// fingerprint; it completes when an eligible session of it claims it.
     Handoff(HandoffArgs),
-    /// Show what is taken, by whom, and until when.
-    Board(RoomRefArgs),
+    /// Refuse a handoff pending for this session. The work is freed, not returned.
+    Decline(ResourceArgs),
+    /// Extend this session's current holding by its original `--ttl`.
+    Renew(ResourceArgs),
+    /// Show what is held or pending, by whom, until when — and whether coordination
+    /// is refused because a participant runs another vox version.
+    Board(RoomBoardArgs),
     /// Offer a file to the room and announce it (ADR-020 §11).
     ///
     /// The bytes never enter the log: they ride a room-bound service, and what
@@ -473,6 +490,34 @@ pub struct DaemonArgs {
     pub passphrase_file: Option<PathBuf>,
 }
 
+/// Session, operation id and output shape, shared by every coordinating verb
+/// (ADR-021 §4, §6).
+#[derive(Args, Debug, Clone, Default)]
+pub struct CoordArgs {
+    /// The session to act as. Defaults to `VOX_SESSION`, then the harness's own
+    /// session id. Ownership is per session.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// The operation id to post under: 8–64 of `[A-Za-z0-9._-]`. Choose it before
+    /// the first attempt and pass the same one on every retry — a retry is then one
+    /// operation, and reusing it for different content is refused (exit 4).
+    #[arg(long)]
+    pub op: Option<String>,
+    /// Print one JSON object instead of prose.
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl CoordArgs {
+    fn opts(&self) -> crate::room_cli::CoordOpts {
+        crate::room_cli::CoordOpts {
+            session: self.session.clone(),
+            op: self.op.clone(),
+            json: self.json,
+        }
+    }
+}
+
 /// `vox room claim`
 #[derive(Args, Debug, Clone)]
 pub struct ClaimArgs {
@@ -481,22 +526,30 @@ pub struct ClaimArgs {
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// What is being claimed — a file, a milestone, a crate, whatever the room
-    /// has agreed to name.
-    pub resource: String,
-    /// Seconds after which the claim lapses on its own.
+    /// has agreed to name. Optional with `--work`, which is then the resource.
+    pub resource: Option<String>,
+    /// The tracker's reference for the work item, `<scheme>:<id>` (the id may
+    /// contain `:`), carried in `data.work` and used as the resource (ADR-021 §2).
+    #[arg(long)]
+    pub work: Option<String>,
+    /// Seconds after which the claim lapses on its own unless renewed.
     #[arg(long)]
     pub ttl: Option<u64>,
+    #[command(flatten)]
+    pub coord: CoordArgs,
 }
 
-/// `vox room release`
+/// `vox room release`, `decline` and `renew`
 #[derive(Args, Debug, Clone)]
 pub struct ResourceArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// What is being released.
+    /// The resource.
     pub resource: String,
+    #[command(flatten)]
+    pub coord: CoordArgs,
 }
 
 /// `vox room handoff`
@@ -508,9 +561,49 @@ pub struct HandoffArgs {
     pub room: String,
     /// What is being handed off.
     pub resource: String,
-    /// The recipient's petname, as you know them.
+    /// The recipient: a room member's fingerprint, or a unique prefix of one as
+    /// `vox room roster` prints it. Resolved here, once, so every node agrees.
     #[arg(long)]
     pub to: String,
+    /// Reserve it for one exact session of the recipient, rather than any.
+    #[arg(long)]
+    pub to_session: Option<String>,
+    /// Seconds until the pending handoff lapses and the work is free. Default 3600.
+    #[arg(long)]
+    pub ttl: Option<u64>,
+    #[command(flatten)]
+    pub coord: CoordArgs,
+}
+
+/// `vox room board`
+#[derive(Args, Debug, Clone)]
+pub struct RoomBoardArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// Print one `vox.room.board/1` JSON object.
+    #[arg(long)]
+    pub json: bool,
+    /// The session whose view to mark as "you". Defaults as for the other verbs.
+    #[arg(long)]
+    pub session: Option<String>,
+}
+
+/// `vox room tail`
+#[derive(Args, Debug, Clone)]
+pub struct RoomTailArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// Start after this entry hash — the full 52 characters — rather than at the
+    /// live edge.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// One `vox.room.row/1` JSON object per line.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `vox agent` — wiring an agent session into a room.
@@ -554,6 +647,28 @@ enum AgentCmd {
     /// vox agent skill > .claude/skills/vox-agent-comms/SKILL.md
     /// ```
     Skill,
+    /// Trust Vox's drain hook in a harness that gates hooks on trust. Only Codex
+    /// does: it runs a `hooks.json` entry only once its hash is recorded as trusted.
+    ///
+    /// Asks Codex's own app-server (`hooks/list`, then `config/batchWrite`) — the
+    /// same calls Codex's "Trust all" makes — for **only** the entries that run `vox
+    /// agent hook`. Idempotent; run it again after changing the entry's command.
+    /// Honours `CODEX_HOME`.
+    ///
+    /// ```text
+    /// vox agent trust codex
+    /// ```
+    Trust(AgentTrustArgs),
+}
+
+/// `vox agent trust`
+#[derive(Args, Debug, Clone)]
+pub struct AgentTrustArgs {
+    /// The harness whose trust to grant. Only `codex` gates hooks on trust.
+    pub harness: String,
+    /// The Codex executable to ask. Defaults to `codex` on `PATH`.
+    #[arg(long, default_value = "codex")]
+    pub codex: String,
 }
 
 /// `vox agent plugin`
@@ -614,6 +729,37 @@ pub struct RoomPostArgs {
     pub room: String,
     /// The message. Omit it, or pass `-`, to read from stdin.
     pub text: Option<String>,
+    /// The envelope type (`assign`, `working`, `blocked`, `result`, `failed`,
+    /// `status`, …). Any structured flag makes vox build the envelope itself.
+    #[arg(long = "type")]
+    pub kind: Option<String>,
+    /// The tracker's work-item reference, `<scheme>:<id>` (the id may contain `:`),
+    /// carried in `data.work`. A post with `--work` takes part in work coordination
+    /// and passes the version gate.
+    #[arg(long)]
+    pub work: Option<String>,
+    /// The attempt id, carried in `data.attempt`. Defaults, with `--work`, to an id
+    /// seeded from this session's claim (or its latest `failed`) on that item. An id
+    /// starts nothing: an attempt becomes active on `--type working`.
+    #[arg(long)]
+    pub attempt: Option<String>,
+    /// Address a session by petname; repeat for several.
+    #[arg(long)]
+    pub to: Vec<String>,
+    /// May interrupt an addressed session mid-turn.
+    #[arg(long)]
+    pub urgent: bool,
+    /// The entry hash this replies to.
+    #[arg(long)]
+    pub re: Option<String>,
+    /// The entry hash of the conversation root.
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Extra payload, as a JSON object. May not set `vox` or `op`.
+    #[arg(long)]
+    pub data: Option<String>,
+    #[command(flatten)]
+    pub coord: CoordArgs,
 }
 
 /// `vox room read`
@@ -623,7 +769,7 @@ pub struct RoomReadArgs {
     pub profile: ProfileArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// Return only what follows this entry hash — the full 64 characters, as the
+    /// Return only what follows this entry hash — the full 52 characters, as the
     /// first column prints it. Not prefix-matched: a cursor comes from previous
     /// output, and a prefix that matched the wrong entry would silently skip or
     /// repeat messages.
@@ -632,6 +778,9 @@ pub struct RoomReadArgs {
     /// At most this many messages. 0 means no limit.
     #[arg(long, default_value_t = 0)]
     pub limit: u64,
+    /// One `vox.room.row/1` JSON object per line.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Selecting a room, by the prefix of its channelID as `vox` prints it.
@@ -783,23 +932,6 @@ pub struct ForwardArgs {
     /// Where to listen locally; port 0 picks one.
     #[arg(default_value = "127.0.0.1:0")]
     pub local: SocketAddr,
-}
-
-/// `vox grant`
-#[derive(Args, Debug, Clone)]
-pub struct GrantArgs {
-    #[command(flatten)]
-    pub room: RoomArgs,
-    /// The member being granted (fingerprint or unique prefix).
-    pub member: String,
-    /// The service tag they may dial.
-    pub tag: String,
-    /// Also let them offer the service themselves.
-    #[arg(long)]
-    pub may_bind: bool,
-    /// How long the grant lasts, in days.
-    #[arg(long, default_value_t = 365)]
-    pub days: u64,
 }
 
 /// `vox serve`
@@ -968,22 +1100,6 @@ enum Cmd {
     /// Forward a local port to a member's service over the overlay — `ssh` over Vox
     /// (ADR-013). Runs until interrupted.
     Forward(ForwardArgs),
-    /// **Withdrawn.** Refuses, and says what to run instead.
-    ///
-    /// It issued `dial:` and `bind:` capabilities as facts on the room's log. ADR-017's
-    /// third revision withdrew that whole model — the genesis service grant, `0x0013`,
-    /// `bind:` and this verb — and nothing has consulted those capabilities since M17.7:
-    /// a service's reach is `reachers`, the intersection of the host's trust keyring with
-    /// the room's authors. `vox service --help` has said `vox grant` is withdrawn for some
-    /// time while this verb went on accepting arguments and reporting success.
-    ///
-    /// That is worse than a stale help string, because it is an act. A person granted a
-    /// colleague ssh, was told it worked, and it granted nothing — and they had no reason
-    /// to look for the `vox trust add` that would have.
-    ///
-    /// Kept in the parser so that anything scripted against it fails with a message naming
-    /// the replacement, rather than failing to parse..
-    Grant(GrantArgs),
     /// Print this profile's own identity fingerprint — what to send someone so they can
     /// trust you (ADR-002).
     ///
@@ -1130,10 +1246,12 @@ pub fn run() -> ExitCode {
             let profile = match &sub {
                 RoomCmd::Post(a) => &a.profile,
                 RoomCmd::Read(a) => &a.profile,
-                RoomCmd::Tail(a) | RoomCmd::Roster(a) | RoomCmd::Board(a) => &a.profile,
+                RoomCmd::Roster(a) => &a.profile,
+                RoomCmd::Tail(a) => &a.profile,
+                RoomCmd::Board(a) => &a.profile,
                 RoomCmd::List(p) => p,
                 RoomCmd::Claim(a) => &a.profile,
-                RoomCmd::Release(a) => &a.profile,
+                RoomCmd::Release(a) | RoomCmd::Decline(a) | RoomCmd::Renew(a) => &a.profile,
                 RoomCmd::Handoff(a) => &a.profile,
                 RoomCmd::Send(a) => &a.profile,
                 RoomCmd::Get(a) => &a.profile,
@@ -1161,24 +1279,81 @@ pub fn run() -> ExitCode {
             let outcome = rt.block_on(async {
                 match &sub {
                     RoomCmd::Post(a) => {
-                        crate::room_cli::post(&paths, &a.room, a.text.as_deref()).await
+                        let opts = crate::room_cli::PostOpts {
+                            kind: a.kind.clone(),
+                            work: a.work.clone(),
+                            attempt: a.attempt.clone(),
+                            to: a.to.clone(),
+                            urgent: a.urgent,
+                            re: a.re.clone(),
+                            thread: a.thread.clone(),
+                            data: a.data.clone(),
+                            coord: a.coord.opts(),
+                        };
+                        crate::room_cli::post_cmd(&paths, &a.room, a.text.as_deref(), &opts).await
                     }
                     RoomCmd::Read(a) => {
-                        crate::room_cli::read(&paths, &a.room, a.since.as_deref(), a.limit).await
+                        crate::room_cli::read(&paths, &a.room, a.since.as_deref(), a.limit, a.json)
+                            .await
                     }
-                    RoomCmd::Tail(a) => crate::room_cli::tail(&paths, &a.room).await,
+                    RoomCmd::Tail(a) => {
+                        crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
+                    }
                     RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
                     RoomCmd::List(_) => crate::room_cli::list(&paths).await,
                     RoomCmd::Claim(a) => {
-                        crate::room_cli::claim_resource(&paths, &a.room, &a.resource, a.ttl).await
+                        crate::room_cli::claim_resource(
+                            &paths,
+                            &a.room,
+                            a.resource.as_deref(),
+                            a.work.as_deref(),
+                            a.ttl,
+                            &a.coord.opts(),
+                        )
+                        .await
                     }
                     RoomCmd::Release(a) => {
-                        crate::room_cli::release_resource(&paths, &a.room, &a.resource).await
+                        crate::room_cli::release_resource(
+                            &paths,
+                            &a.room,
+                            &a.resource,
+                            &a.coord.opts(),
+                        )
+                        .await
+                    }
+                    RoomCmd::Decline(a) => {
+                        crate::room_cli::decline_resource(
+                            &paths,
+                            &a.room,
+                            &a.resource,
+                            &a.coord.opts(),
+                        )
+                        .await
+                    }
+                    RoomCmd::Renew(a) => {
+                        crate::room_cli::renew_resource(
+                            &paths,
+                            &a.room,
+                            &a.resource,
+                            &a.coord.opts(),
+                        )
+                        .await
                     }
                     RoomCmd::Handoff(a) => {
-                        crate::room_cli::handoff_resource(&paths, &a.room, &a.resource, &a.to).await
+                        crate::room_cli::handoff_resource(
+                            &paths,
+                            &a.room,
+                            &a.resource,
+                            &a.to,
+                            a.to_session.as_deref(),
+                            a.ttl,
+                            &a.coord.opts(),
+                        )
+                        .await
                     }
-                    RoomCmd::Board(a) => crate::room_cli::board(&paths, &a.room).await,
+                    RoomCmd::Board(a) => {
+                        crate::room_cli::board(&paths, &a.room, a.json, a.session.as_deref()).await
+                    }
                     RoomCmd::Send(a) => crate::room_cli::send_file(&paths, &a.room, &a.path).await,
                     RoomCmd::Join(a) => crate::room_cli::join(&paths, &a.link, &a.name).await,
                     RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
@@ -1192,7 +1367,8 @@ pub fn run() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox: {e}");
-                    ExitCode::FAILURE
+                    // 3 = version refusal, 4 = operation conflict (ADR-021 §5, §6).
+                    e.exit_code()
                 }
             }
         }
@@ -1260,6 +1436,44 @@ pub fn run() -> ExitCode {
             print!("{}", crate::agent_hook::AGENT_SKILL);
             ExitCode::SUCCESS
         }
+        Cmd::Agent(AgentCmd::Trust(args)) => match args.harness.to_ascii_lowercase().as_str() {
+            "codex" => match crate::codex_trust::trust(&args.codex) {
+                Ok(r) if r.found == 0 => {
+                    eprintln!(
+                        "vox: Codex has no hook running `vox agent hook` — add the entry \
+                         `vox agent plugin codex` prints to its hooks.json first."
+                    );
+                    ExitCode::FAILURE
+                }
+                Ok(r) => {
+                    for (key, command) in &r.entries {
+                        println!("vox: trusted {command:?} ({key})");
+                    }
+                    println!(
+                        "vox: {} Vox hook entr{} in Codex; {} newly trusted, the rest already were.",
+                        r.found,
+                        if r.found == 1 { "y" } else { "ies" },
+                        r.trusted_now
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            "claude" | "claude-code" | "opencode" => {
+                println!(
+                    "vox: {} does not gate hooks on trust; nothing to do.",
+                    args.harness
+                );
+                ExitCode::SUCCESS
+            }
+            other => {
+                eprintln!("vox: no integration for {other:?}. Known: claude, codex, opencode.");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::Agent(AgentCmd::Plugin(args)) => match args.harness.to_ascii_lowercase().as_str() {
             "opencode" => {
                 print!("{}", crate::agent_hook::OPENCODE_PLUGIN);
@@ -1292,10 +1506,11 @@ pub fn run() -> ExitCode {
                      }}\n}}"
                 );
                 eprintln!(
-                    "vox: merge that into Codex's hooks.json.\n     `async` MUST be false: an \
-                     async hook's output is observed and discarded, so the room would drain \
-                     into nothing.\n     Set VOX_ROOM in the session's environment, or pass \
-                     --room to the hook."
+                    "vox: merge that into Codex's hooks.json, then run `vox agent trust codex` \
+                     — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
+                     an async hook's output is observed and discarded, so the room would \
+                     drain into nothing.\n     Set VOX_ROOM in the session's environment, or \
+                     pass --room to the hook."
                 );
                 ExitCode::SUCCESS
             }
@@ -1304,6 +1519,38 @@ pub fn run() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Ask the running node when there is one, like `vox trust`: the profile is not ours to
+        // open while it runs, and a running host is the case R22 is about.
+        Cmd::Service(ServiceCmd::Remove(r)) if node_answers(&r.room.profile) => {
+            let paths = match r.room.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(crate::room_cli::service_remove(
+                &paths,
+                &r.room.room,
+                &r.tag,
+            )) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
             let sub = sub.clone();
             async move {
@@ -1410,25 +1657,6 @@ pub fn run() -> ExitCode {
                     crate::tunnel_cli::trust_remove(&node, &a.fingerprint).await
                 },
             )
-        }
-        // Refused, not run. It wrote `dial:`/`bind:` capability facts that nothing has
-        // consulted since M17.7 — and reported success, so a person believed they had
-        // granted reach they had not. Unlocking the profile to do nothing would also make
-        // it fail differently depending on whether a daemon happened to be running, which
-        // is the wrong thing to vary on.
-        Cmd::Grant(args) => {
-            eprintln!(
-                "vox: `vox grant` is withdrawn, and granted nothing for some time before \
-                 this said so.\n\
-                 \x20      It issued a `dial:` capability on the room's log; a service's \
-                 reach has been the host's trust keyring since M17.7 (ADR-017 decision 3), \
-                 and the capability was never consulted.\n\
-                 \x20      To let {} reach your services:  vox trust add {}\n\
-                 \x20      That decides who may read you and reach you, in every room you \
-                 share — it is not per-service and not per-room.",
-                args.member, args.member
-            );
-            ExitCode::FAILURE
         }
         Cmd::Up(args) => {
             let bind = args.bind;

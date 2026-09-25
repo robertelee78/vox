@@ -155,7 +155,54 @@ const OPEN_STREAM_PATIENCE: std::time::Duration = std::time::Duration::from_secs
 /// `iroh-relay`). Without this quinn sends nothing on an idle path and the connection dies
 /// at the idle timeout, which for a tunnel means a person's session dropping while they
 /// read.
-const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The largest UDP payload a Vox endpoint accepts, and the ceiling path-MTU discovery
+/// searches up to (PRD-001 R41).
+///
+/// quinn's default ceiling is 1452 — Ethernet's — so every path, loopback and jumbo-frame
+/// links included, ran at 1452-byte packets, and a tunnel on this machine spent most of its
+/// time in one `sendmsg` per packet: profiled, the sending node sat in `__sendmsg` and in
+/// the connection lock that `sendmsg` is made under, with encryption at a few percent.
+/// Discovery is probing, not assuming: a path that will not carry a larger packet loses the
+/// probe and keeps what it had, so a 1500-byte link is exactly where it was.
+///
+/// **8192, not the loopback MTU (16384).** macOS refuses a UDP datagram over
+/// `net.inet.udp.maxdgram` (9216 by default), and with the ceiling at 16356 connections
+/// failed outright on this machine rather than falling back — measured, not reasoned. 8192
+/// stays under that limit on every platform Vox builds for.
+pub const MAX_UDP_PAYLOAD: u16 = 8_192;
+
+/// The UDP socket buffers a node asks for, each way.
+///
+/// The OS default (768 KiB receive on macOS) overflowed during a burst, and a large packet
+/// lost to overflow reads to quinn as a black hole: it drops the path MTU back to 1200 and
+/// does not probe again for a minute. Measured with the larger ceiling and larger stream
+/// windows (an experiment since dropped): without these buffers the MTU fell back to 1200 in
+/// 3 of 3 runs (`black_holes_detected` 1–9); with them, 0 black holes in 3 of 3.
+/// The OS may grant less; that is not an error.
+const UDP_SOCKET_BUFFER: usize = 4 << 20;
+
+/// Per-stream flow-control window (and half the connection's send window), sized for the
+/// bandwidth-delay product of a 1 Gbit/s path at ~130 ms, or 10 Gbit/s at ~13 ms.
+pub const STREAM_WINDOW: u32 = 16 << 20;
+
+/// Flow-control credit a peer gets for the whole connection, across all its streams: what this
+/// node will buffer for one peer that sends and is not read.
+///
+/// quinn's default is unlimited, which is safe only while the per-stream window is small. At
+/// [`STREAM_WINDOW`] a peer may open quinn's default 100 concurrent bidirectional streams, so an
+/// unlimited connection window let one peer park 100 × 16 MiB = 1.6 GiB in this node's memory
+/// by writing into streams nobody reads. Two full stream windows keeps a single tunnel at full
+/// speed, and lets a second one run beside it.
+pub const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
+
+/// The endpoint parameters every Vox endpoint runs with.
+fn endpoint_config() -> quinn::EndpointConfig {
+    let mut cfg = quinn::EndpointConfig::default();
+    let _ = cfg.max_udp_payload_size(MAX_UDP_PAYLOAD);
+    cfg
+}
 
 /// The transport parameters every Vox connection runs with, in both directions.
 fn transport_config() -> Arc<quinn::TransportConfig> {
@@ -166,6 +213,22 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     cfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
         MAX_IDLE_MS,
     ))));
+    let mut mtu = quinn::MtuDiscoveryConfig::default();
+    mtu.upper_bound(MAX_UDP_PAYLOAD);
+    cfg.mtu_discovery_config(Some(mtu));
+    // Enough flow-control credit to fill a long, fast path (PRD-001 R41). quinn's default
+    // stream window is 1.25 MB, sized for 100 Mbit/s at 100 ms; at 1 Gbit/s and 20 ms RTT that
+    // caps a tunnel at ~500 Mbit/s whatever the link does. Measured over a shaped 1 Gbit/s,
+    // 20 ms path: 414 Mbit/s with the default, ~940 with these. The window is credit the
+    // receiver grants, not memory it allocates up front.
+    cfg.stream_receive_window(quinn::VarInt::from_u32(STREAM_WINDOW));
+    cfg.send_window(2 * u64::from(STREAM_WINDOW));
+    cfg.receive_window(quinn::VarInt::from_u32(CONNECTION_WINDOW));
+    // Cubic, restarted after the connection idles: a tunnel's transfer must not inherit the
+    // congestion history of an older one on the same long-lived connection (PRD-001 R41).
+    cfg.congestion_controller_factory(Arc::new(
+        crate::transport::congestion::IdleRestartConfig::default(),
+    ));
     Arc::new(cfg)
 }
 
@@ -198,6 +261,11 @@ impl VoxEndpoint {
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
+        {
+            let sock = socket2::SockRef::from(&socket);
+            let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
+            let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER);
+        }
         let wrapped = quinn::TokioRuntime
             .wrap_udp_socket(socket)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
@@ -222,7 +290,7 @@ impl VoxEndpoint {
             Arc::clone(&mux) as Arc<dyn quinn::AsyncUdpSocket>;
         Self::bind_with(signer, mux, |cfg| {
             Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::default(),
+                endpoint_config(),
                 Some(cfg),
                 for_endpoint,
                 Arc::new(quinn::TokioRuntime),
@@ -461,63 +529,6 @@ impl VoxEndpoint {
     /// Clone the private key (rustls `PrivateKeyDer` is clone-by-method).
     fn clone_key(&self) -> rustls_pki_types::PrivateKeyDer<'static> {
         self.leaf_key.clone_key()
-    }
-
-    /// **Test-only.** Attempt to connect with a deliberately *classical-only* TLS
-    /// key-exchange group (no X25519MLKEM768), to prove the PQ-only server refuses
-    /// to negotiate it — i.e. there is no silent downgrade. Returns `Err` on the
-    /// (expected) handshake failure.
-    ///
-    /// This is the only place a non-hybrid provider is constructed, and it exists
-    /// solely so the downgrade-rejection property is testable through the real
-    /// handshake. Production code never offers a classical group.
-    #[cfg(test)]
-    pub async fn connect_classical_only(
-        &self,
-        addr: SocketAddr,
-        expected_peer: Digest32,
-    ) -> Result<VoxConnection> {
-        use rustls::crypto::aws_lc_rs;
-
-        // A provider whose ONLY kx group is classical X25519 (TLS 0x001D) — no
-        // hybrid group offered.
-        let classical_x25519 = aws_lc_rs::default_provider()
-            .kx_groups
-            .into_iter()
-            .find(|g| u16::from(g.name()) == 0x001D)
-            .ok_or(Error::MalformedBundle("classical X25519 group unavailable"))?;
-        let provider = Arc::new(rustls::crypto::CryptoProvider {
-            kx_groups: vec![classical_x25519],
-            ..aws_lc_rs::default_provider()
-        });
-        let supported = provider.signature_verification_algorithms;
-        let verified = VerifiedPeer::new();
-        let verifier = Arc::new(VoxServerCertVerifier::pinned(
-            supported,
-            expected_peer,
-            verified.clone(),
-        ));
-
-        // Build the client config by hand over the classical provider.
-        let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| Error::MalformedBundle("classical client provider/version"))?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-        cfg.alpn_protocols = vec![crate::transport::provider::VOX_ALPN.to_vec()];
-        cfg.enable_early_data = false;
-
-        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(cfg)
-            .map_err(|_| Error::MalformedBundle("classical quic client config"))?;
-        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
-        client_cfg.transport_config(transport_config());
-        let connecting = self
-            .endpoint
-            .connect_with(client_cfg, addr, "vox.invalid")
-            .map_err(|_| Error::MalformedBundle("classical connect"))?;
-        let connection = connecting.await.map_err(|_| Error::SignatureInvalid)?;
-        finish_connection(connection, &verified, 0)
     }
 }
 

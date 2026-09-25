@@ -168,6 +168,11 @@ fn vox(dir: &std::path::Path, args: &[String], stdin: Option<&str>) -> (bool, St
         // runs, so the flag is refused (ADR-015).
         .env("VOX_IDENTITY_PASSPHRASE", "an identity passphrase")
         .env_remove("VOX_ROOM")
+        // Work coordination is owned per session (ADR-021 §4). Name one, and never let
+        // a session the test process inherited from its own harness leak in.
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .env("VOX_SESSION", "cross-process")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {

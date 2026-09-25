@@ -67,6 +67,8 @@ fn secret(s: &str) -> Secret {
 
 /// One agent's view of the machine: a profile directory pair and a node.
 struct Agent {
+    /// The one session this agent speaks as.
+    session: String,
     data: std::path::PathBuf,
     cfg: std::path::PathBuf,
     paths: Paths,
@@ -81,6 +83,12 @@ impl Agent {
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
             .env_remove("VOX_ROOM")
+            // Ownership is per session (ADR-021 §4): each agent here is one session,
+            // named after it, and a session inherited from the test's own harness must
+            // never leak in.
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("CODEX_THREAD_ID")
+            .env("VOX_SESSION", &self.session)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -114,6 +122,7 @@ async fn agent(tmp: &tempfile::TempDir, name: &str) -> Agent {
         "{name} listens once unlocked"
     );
     Agent {
+        session: name.to_owned(),
         data,
         cfg,
         paths,

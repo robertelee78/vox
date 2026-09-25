@@ -57,7 +57,7 @@ use crate::node::prekeys::PrekeyRing;
 use crate::node::store::Store;
 use crate::time::Clock;
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
-use crate::transport::streams::accept_typed;
+use crate::transport::streams::accept_typed_on;
 use crate::transport::streams::StreamKind;
 
 /// The peer classification the accept path reads, refreshed by the actor whenever
@@ -76,6 +76,22 @@ impl std::fmt::Debug for SharedPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedPolicy").finish_non_exhaustive()
     }
+}
+
+/// **For proofs only.** When set, a comma-separated list of `ip:port`: this node advertises exactly
+/// those addresses instead of what the ADR-012 ladder found. The R41 throughput proof points a host at
+/// a link emulator this way, so the tunnel's packets cross the same emulated link as the raw
+/// transfer it is compared with. Nothing a person runs sets it; unset, nothing changes.
+pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
+
+fn test_advertise() -> Option<EndpointList> {
+    let value = std::env::var(TEST_ADVERTISE_ENV).ok()?;
+    let addrs: Vec<crate::nat::multiaddr::Multiaddr> = value
+        .split(',')
+        .filter_map(|a| a.trim().parse::<std::net::SocketAddr>().ok())
+        .map(crate::nat::multiaddr::Multiaddr::from)
+        .collect();
+    EndpointList::new(addrs).ok()
 }
 
 impl SharedPolicy {
@@ -98,6 +114,16 @@ impl SharedPolicy {
     /// Stop expecting a join from `joiner`.
     pub fn forget_joiner(&self, joiner: &Digest32) -> bool {
         lock(&self.inner).forget_joiner(joiner)
+    }
+
+    /// Accept `responder`'s sender key while this node joins through it.
+    pub fn expect_join_responder(&self, responder: Digest32) {
+        lock(&self.inner).expect_join_responder(responder);
+    }
+
+    /// No join is in flight: stop treating anyone as a join responder.
+    pub fn forget_join_responders(&self) {
+        lock(&self.inner).forget_join_responders();
     }
 
     /// A snapshot to authorize one stream against.
@@ -366,6 +392,9 @@ impl NodeNet {
     /// node bound to a concrete address and merely useless for one bound to the
     /// wildcard.
     pub fn local_endpoints(&self) -> Result<EndpointList> {
+        if let Some(list) = test_advertise() {
+            return Ok(list);
+        }
         if let Some(list) = lock(&self.advertised).clone() {
             return Ok(list);
         }
@@ -415,7 +444,7 @@ impl NodeNet {
     /// Accept the next stream on `conn`, authorize it against the shared policy, and
     /// serve it if it is the board. Anything the actor must handle comes back as an
     /// [`Inbound`].
-    pub async fn accept_stream(&self, conn: &VoxConnection) -> Result<Inbound> {
+    pub async fn accept_stream(&self, conn: &Arc<VoxConnection>) -> Result<Inbound> {
         // **Authorize when the stream arrives, not before.** Accepting blocks until
         // the peer opens something, which may be long after this loop iteration began
         // — and in that window the peer can become a member (a join completes, a
@@ -440,8 +469,18 @@ impl NodeNet {
         &self,
         conn: &VoxConnection,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
-        let peer = conn.peer_id();
-        let (kind, mut send, mut recv) = accept_typed(conn).await?;
+        self.accept_authorized_on(conn.quinn(), conn.peer_id())
+            .await
+    }
+
+    /// [`Self::accept_authorized`] on the bare quinn handle of a connection to `peer`, so the
+    /// waiting does not hold the [`VoxConnection`] — see `actor::spawn_stream_loop`.
+    pub async fn accept_authorized_on(
+        &self,
+        conn: &quinn::Connection,
+        peer: Digest32,
+    ) -> Result<(StreamKind, SendStream, RecvStream)> {
+        let (kind, mut send, mut recv) = accept_typed_on(conn).await?;
         if !PeerPolicy::allows(self.classify(&peer), kind) {
             crate::node::net::refuse_stream(&mut send, &mut recv);
             return Err(crate::error::Error::StreamRefused(
@@ -517,7 +556,7 @@ impl NodeNet {
     /// that maintain their own view; the node uses [`NodeNet::accept_stream`]).
     pub async fn accept_stream_with(
         &self,
-        conn: &VoxConnection,
+        conn: &Arc<VoxConnection>,
         policy: &PeerPolicy,
     ) -> Result<Inbound> {
         let (kind, send, recv) = accept_authorized(conn, policy).await?;
@@ -528,7 +567,7 @@ impl NodeNet {
     /// loop — see [`Self::accept_authorized`].
     pub async fn dispatch(
         &self,
-        conn: &VoxConnection,
+        conn: &Arc<VoxConnection>,
         kind: StreamKind,
         send: SendStream,
         recv: RecvStream,
@@ -588,7 +627,7 @@ impl NodeNet {
             StreamKind::Circuit => {
                 let manager = Arc::clone(&self.manager);
                 circuitstream::serve_circuit(
-                    peer,
+                    conn,
                     &|p| self.classify(p),
                     send,
                     recv,
@@ -766,6 +805,15 @@ impl NodeNet {
         {
             return Err(Error::Unreachable("the path is already direct"));
         }
+        // **Held weakly: the ladder only needs to know which connection it is replacing.** A
+        // strong hold is a claim that the path is carrying something, and the ladder runs for
+        // as long as its slowest rung — seconds past the moment another rung, or the peer's own
+        // ladder, has already displaced this connection. Holding it kept a retired relayed
+        // connection open, and its circuit on the relay, until every rung had given up.
+        let current = {
+            let held = current;
+            Arc::downgrade(&held)
+        };
         let mut set: JoinSet<Result<VoxConnection>> = JoinSet::new();
         let candidates = direct_candidates(endpoints);
         if !candidates.is_empty() {
@@ -806,7 +854,7 @@ impl NodeNet {
                     let filed = self.manager.adopt(conn);
                     // `adopt` keeps the better of the two; only a real replacement is an
                     // upgrade.
-                    if !Arc::ptr_eq(&filed, &current) {
+                    if !std::ptr::eq(Arc::as_ptr(&filed), current.as_ptr()) {
                         return Ok(filed);
                     }
                     why.push("a better path landed but the manager kept the held one".to_owned());
@@ -861,7 +909,7 @@ impl NodeNet {
     /// forwards packets it cannot read.
     pub async fn circuit_through(
         &self,
-        relay: &VoxConnection,
+        relay: &Arc<VoxConnection>,
         peer: Digest32,
     ) -> Result<Arc<VoxConnection>> {
         let conn = circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now())
@@ -970,6 +1018,21 @@ impl NodeNet {
             }
         }
         out
+    }
+
+    /// Every live bundle record this node's board holds for `(channel, epoch)`, as
+    /// records. Local, so cheap: it is what lets the sync gate learn a member that
+    /// joined through somebody else before refusing it (`run_sync_session`).
+    #[must_use]
+    pub fn board_bundles(&self, channel_id: &Digest32, epoch: u64) -> Vec<MemberBundleRecord> {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .current_bundles(channel_id, epoch, now)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// The live bundle record this node's board holds for one member of `(channel,

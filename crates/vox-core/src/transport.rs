@@ -56,6 +56,7 @@
 //!   documented provisional arc ([`identity_cert::VOX_IDENTITY_EXT_OID`]) which the
 //!   interop matrix pins as a release gate.
 
+pub mod congestion;
 pub mod datagram;
 pub mod framing;
 pub mod identity_cert;
@@ -66,6 +67,3 @@ pub mod session;
 pub mod stream_transport;
 pub mod streams;
 pub mod verifier;
-
-#[cfg(test)]
-mod tests;

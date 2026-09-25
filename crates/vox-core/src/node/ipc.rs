@@ -104,6 +104,10 @@ const T_STALLED: u64 = 1715;
 const T_PEER_UNREACHABLE: u64 = 1716;
 /// `NodeEvent::PublishRefused`. Additive, and deliberately away from the sequential range.
 const T_PUBLISH_REFUSED: u64 = 1717;
+/// [`NodeEvent::JoinSteps`]: where a join's time went.
+const T_JOIN_STEPS: u64 = 1718;
+/// `NodeEvent::KeyNotTaken`.
+const T_KEY_NOT_TAKEN: u64 = 1719;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -130,7 +134,7 @@ const T_ADD_SERVICE: u64 = 6;
 const T_REMOVE_SERVICE: u64 = 7;
 const T_FORWARD: u64 = 8;
 const T_STOP_FORWARD: u64 = 9;
-const T_GRANT: u64 = 10;
+// 10 was `T_GRANT`, the withdrawn `dial:`/`bind:` grant (ADR-017 decision 3). Never reuse it.
 // Protocol 4 — joining and creating a room over the socket (ADR-020 §12).
 // Without these, a room can only be created or joined from the TUI, so an agent on
 // a host with no terminal has a daemon that can *hold* rooms and no way to ever
@@ -276,19 +280,6 @@ pub enum Request {
         /// The identity passphrase.
         identity_passphrase: String,
     },
-    /// Grant a member the capability to dial (and optionally offer) a service.
-    Grant {
-        /// The room.
-        channel_id: Digest32,
-        /// Who is being granted.
-        target: Digest32,
-        /// The service's tag.
-        service_tag: String,
-        /// Whether they may also offer it.
-        may_bind: bool,
-        /// When the grant lapses, in seconds since the Unix epoch.
-        expiry: u64,
-    },
 }
 
 impl Request {
@@ -402,21 +393,6 @@ impl Request {
                 identity_passphrase,
             } => {
                 e.array(2).uint(T_TRUST_LIST).text(identity_passphrase);
-            }
-            Request::Grant {
-                channel_id,
-                target,
-                service_tag,
-                may_bind,
-                expiry,
-            } => {
-                e.array(6)
-                    .uint(T_GRANT)
-                    .bytes(channel_id)
-                    .bytes(target)
-                    .text(service_tag)
-                    .uint(u64::from(*may_bind))
-                    .uint(*expiry);
             }
         }
         e.finish()
@@ -579,25 +555,6 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
-            }
-            (T_GRANT, 6) => {
-                let channel_id = digest(&mut d)?;
-                let target = digest(&mut d)?;
-                let service_tag = text(&mut d, "ipc service tag")?;
-                let may_bind = d
-                    .uint()
-                    .map_err(|_| Error::MalformedBundle("ipc may_bind"))?
-                    != 0;
-                let expiry = d.uint().map_err(|_| Error::MalformedBundle("ipc expiry"))?;
-                d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
-                Ok(Request::Grant {
-                    channel_id,
-                    target,
-                    service_tag,
-                    may_bind,
-                    expiry,
-                })
             }
             _ => Err(Error::MalformedBundle("ipc request unknown tag")),
         }
@@ -803,6 +760,17 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::PeerJoined { channel_id, peer } => {
             e.array(3).uint(T_PEER_JOINED).bytes(channel_id).bytes(peer);
         }
+        NodeEvent::KeyNotTaken {
+            channel_id,
+            peer,
+            why,
+        } => {
+            e.array(4)
+                .uint(T_KEY_NOT_TAKEN)
+                .bytes(channel_id)
+                .bytes(peer)
+                .text(why);
+        }
         NodeEvent::SenderKeyReceived {
             channel_id,
             peer,
@@ -843,6 +811,12 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         }
         NodeEvent::JoinFailed { reason } => {
             e.array(2).uint(T_JOIN_FAILED).text(reason);
+        }
+        NodeEvent::JoinSteps { joined, steps } => {
+            e.array(3)
+                .uint(T_JOIN_STEPS)
+                .uint(u64::from(*joined))
+                .text(steps);
         }
         NodeEvent::StillRelayed { peer, reason } => {
             e.array(3).uint(T_STILL_RELAYED).bytes(peer).text(reason);
@@ -1070,6 +1044,14 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             channel_id: digest(d)?,
             peer: digest(d)?,
         },
+        (T_KEY_NOT_TAKEN, 4) => NodeEvent::KeyNotTaken {
+            channel_id: digest(d)?,
+            peer: digest(d)?,
+            why: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc why"))?
+                .to_owned(),
+        },
         (T_SENDER_KEY, 4) => NodeEvent::SenderKeyReceived {
             channel_id: digest(d)?,
             peer: digest(d)?,
@@ -1102,6 +1084,17 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             why: d
                 .text()
                 .map_err(|_| Error::MalformedBundle("ipc publish why"))?
+                .to_owned(),
+        },
+        (T_JOIN_STEPS, 3) => NodeEvent::JoinSteps {
+            joined: match d.uint()? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::MalformedBundle("ipc join steps flag")),
+            },
+            steps: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc join steps"))?
                 .to_owned(),
         },
         (T_JOIN_FAILED, 2) => NodeEvent::JoinFailed {
@@ -1678,27 +1671,6 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             }
         }
-        Request::Grant {
-            channel_id,
-            target,
-            service_tag,
-            may_bind,
-            expiry,
-        } => match handle
-            .apply(crate::node::api::NodeCommand::GrantTunnel {
-                channel_id,
-                target,
-                service_tag,
-                may_bind,
-                expiry,
-            })
-            .await
-        {
-            crate::node::api::Outcome::Done => Frame::Ok,
-            other => Frame::Error {
-                reason: format!("{other:?}"),
-            },
-        },
         Request::Rooms => {
             let view = handle.view();
             Frame::Rooms {

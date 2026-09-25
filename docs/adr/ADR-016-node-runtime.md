@@ -126,7 +126,8 @@ decrypt/author paths require — not a configuration flag.
 
 - **Engine.** `redb` (pure Rust, copy-on-write B-tree, ACID, single writer / MVCC readers, single
   file, stable on-disk format). It was chosen over `fjall` (pure-Rust LSM): Vox's write rate is
-  bounded by design (ADR-008 quotas), every stored value is an already-sealed blob, the single-writer
+  that of people and agents in invited rooms (the ADR-008 quotas that once capped it were removed
+  2026-09-24, PRD-001 R3), every stored value is an already-sealed blob, the single-writer
   constraint matches the actor, and a two-crate dependency with no background threads and a
   one-sentence crash model ("the last committed state is what you get") is the right posture for a
   file that holds sealed key material. Space reclamation is an explicit `compact()` the node runs
@@ -258,8 +259,11 @@ Two supporting facts follow from moving it:
   tunnel or stream through the anchor when both direct and punched paths fail) remains ADR-013's
   mechanism and is a named later capability; ADR-012's availability model does not need it —
   a channel's log reaches an offline member through the anchor's *store*, not through a live relay.
-- **Sync scheduling (ADR-008).** On every new connection, a frontier session for each channel both
-  peers hold; every 30 seconds while connected; and a push immediately after a local append. Range
+- **Sync scheduling (ADR-008).** An inbound session for a room is answered only for a peer that is
+  an admitted author of that room or one of its anchors — checked after the stream-kind gate, because
+  the room is only named in the stream's preamble (ADR-008 §"Who is served", PRD-001 R5). Sessions
+  this node starts are not yet checked. On every new connection, a frontier session for each channel
+  both peers hold; every 30 seconds while connected; and a push immediately after a local append. Range
   reconciliation (`range_reconcile_exchange`) is wired over `QuicStreamTransport` and selected when a
   channel exceeds 100 authors, as the ADR requires at scale. The anchor participates as an ordinary
   peer whose `AuthorResolver` is built from the channel's genesis, admin certificates and the
@@ -278,6 +282,15 @@ Two supporting facts follow from moving it:
   **2.05s** after sending — and a first version of the fix, which lost the owed push at the end of the
   pass, green at **32.09s**, one full interval late. Pass/fail could not tell those two apart; the
   latency could.
+
+  **Owed is per `(room, peer)` (2026-09-25, v0.2.9).** The session mark stays per room, for the reason
+  above. What a push *owes* is per pair: the node records which peers each room's latest append has
+  reached. The next append clears the room's record, and a failed push clears that peer. Before, a room
+  still owed to one peer was pushed again to every peer, so a member who already had it took the room
+  again. With two shared rooms that became a livelock: each `SyncDone` freed one room, the member who
+  sorted first took it back, and the other member never got a session. `node_m19_untrust_lock_gate` on
+  the v0.2.9 integration tree failed 0 of 2 (Alice ran ~40,000 empty sessions with Carol in two
+  minutes; Bob ran none). With the fix it passed 3 of 3 in 10–12s.
 
   Still open: the member→anchor session in that gate fails every time (`sync failed: transport`),
   in greens as well as reds; and opening a stream has no deadline.
@@ -617,7 +630,8 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   state from two threads. To make that possible the channel's persistence-only methods now take `&Store`
   rather than `&Profile` (signing still needs the signer), and `ChannelState::me` comes from its own sender
   chain, so rendering needs no signer at all.
-  **The gate is met** (`tests/node_m14_gate.rs`, production Argon2id + `(200,9)` PoW, ≈ 11 s in release):
+  **The gate is met** (`tests/node_m14_gate.rs` — replaced in V29-17 by the real-binary
+  `vox-tui/tests/a_room_admits_the_passphrase_and_authors_decide_readers.rs` — production Argon2id + `(200,9)` PoW, ≈ 11 s in release):
   three nodes create, invite, join with an out-of-band passphrase, consent, exchange messages both ways,
   and the third — which joined and was consented to by nobody — receives the entire log and renders
   **nothing**. Writing it exposed four more things the Decision had wrong or unstated, all now fixed:
@@ -630,6 +644,11 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
      grant is a key the recipient must not use), which also unblocks the responder.
   3. **A pending joiner needed the `pairwise` stream too**, not "the join stream only": the instant a join
      completes the newcomer must deliver that key, before the responder has reclassified it as a member.
+     **The same holds in the other direction (2026-09-25, v0.2.9):** the responder releases *its* key the
+     moment it admits the joiner, before the joiner holds the room or knows the responder as a member. So
+     the joiner classifies the member it is joining through as `JoinResponder` (pairwise, plus what an
+     unknown peer may already open) from just before the exchange until `JoinerDone`. Without that, a
+     joiner's first room was the one room whose key was refused at accept.
   4. **A node must publish its records to the *anchors*, not only to its own board**, and must **learn the
      current members from the board before syncing**. A key nobody can find cannot be admitted, and an
      ADR-008 session hard-fails on the first entry from an unadmitted author — so a member who joined after

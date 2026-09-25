@@ -131,8 +131,8 @@ hostile or absent bootstrap degrades availability but never confidentiality or a
 replaces the earlier "possibly piggyback public DHT" wording, which was a false deferral.)
 
 **Anti-abuse.** Join-attempt abuse is bounded by the layered controls in ADR-005 (per-sender consent
-gate + `(channelID, epoch)`-bound PoW join tokens + identity-bound log acceptance with per-author
-quotas), not by rate-limiting alone. There is no admin admission step (ADR-007).
+gate + `(channelID, epoch)`-bound PoW join tokens + identity-bound log acceptance; the per-author
+quotas once listed here were removed 2026-09-24, PRD-001 R3), not by rate-limiting alone. There is no admin admission step (ADR-007).
 
 **Honest limit (documented).** Two peers both behind CGNAT/symmetric NAT with no IPv6 and no
 reachable coordinator cannot connect. Global joint-IPv6 probability for a random pair is only
@@ -167,6 +167,14 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   round trip has to be exact.
 - **`endpoints` = `nat::multiaddr::EndpointList`.** A capped (`MAX_ENDPOINTS = 8`), ordered list of `Multiaddr` (`Ip6` / `Ip4` / `Relay(fingerprint)`), each a strictly-decoded CBOR array led by a kind discriminant. Order is preference order (IPv6 first); `direct_candidates()` yields the Happy-Eyeballs dial order.
 - **Store policy (`nat::store::RendezvousStore`).** The reader-side gate: monotone strict `(seq, timestamp)` anti-replay, a `MIN_REFRESH_SECS = 60` rate floor, `MAX_TTL_SECS = 2 h` (member `ttl_secs` capped; pre-join gets the `DEFAULT_TTL_SECS = 2 h` since its body has no TTL field, matching "same TTL caps"), a `MAX_CLOCK_SKEW_SECS = 300` future-timestamp bound, `(channelID, epoch)` bucketing for epoch-scoping, and anti-spam capacity (`MAX_PREJOIN_PER_CHANNEL`, `MAX_AUTHORS_PER_BUCKET`). All time is caller-supplied (`now`) so the store is deterministic and clock-free.
+  > **A publisher's `seq` must keep rising across its restarts (2026-09-25, v0.2.9, V29-23).** The store's
+  > anti-replay is right; the publisher broke it. `seq` was an in-memory counter that began again at 1 in
+  > every process, so after a restart every record a member published was older than the one each board
+  > already held, and was refused (`the board holds a newer record from that author`). A restarted member
+  > could not be found at its new address until the counter caught up. The node now uses
+  > `max(previous + 1, now in ms)`, which keeps rising without a store write per publish. Measured through
+  > the real binaries (Alice and Bob, Bob posts and is SIGKILLed before his push, then restarts at a new
+  > port): the refusal was logged in 4 of 5 runs before and 0 of 5 after.
 - **Member bundle record (`nat::record::MemberBundleRecord`, tag `0x0012`, ADR-016 M14.1).** The third record kind: a member's current `PrekeyBundlePublic`, root-signed under `vox/member-bundle-record/v1` over the 8-field body `[author_id, channelID, epoch, prekey_bundle, seq, timestamp, ttl_secs, [sign_algo]]` (wire arity 9, composite signature appended — the `0x0007` shape with `endpoints` replaced by the canonical bundle bytes, capped at `MAX_PREKEY_BUNDLE_BYTES`). Like `0x0007` it carries the fingerprint only and is verified against the membership-resolved key; `verify` additionally requires `prekey_bundle.root_pub == author` and the bundle's internal signatures, and `build` refuses a bundle whose root is not the signer, so a member cannot publish another identity's prekeys under its own name (a store test forges the record by hand and confirms the store also refuses it). `RendezvousStore::accept_bundle` applies the member-only / `(seq, timestamp)` anti-replay / `MIN_REFRESH_SECS` / clock-skew / `MAX_AUTHORS_PER_BUCKET` policy of `accept_member` with the TTL capped at `BUNDLE_MAX_TTL_SECS = 7 days` (the ADR-002 signed-prekey cadence) instead of `MAX_TTL_SECS = 2 h`; bundles live in their own `(channelID, epoch)` buckets so an address refresh never displaces a bundle. Queries: `current_bundles`, `bundle`; `prune_expired` covers all three kinds.
 - **A fourth board kind: the channel genesis (M14.7b).** ADR-007 §Genesis says a cold-joining node
   *fetches the genesis from the rendezvous*, and the board had no way to serve it — so a joiner could find
@@ -352,7 +360,37 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   replaces the held connection, and the displaced one is **retired**, not closed: kept open for
   `RETIRE_GRACE_SECS` (60 s) so whatever is in flight on it — a join exchange, a sync session with its
   20 s frame bound — finishes, then closed by the node's tick. A worse newcomer is closed as before, which
-  is also what settles a simultaneous dial. Both ends apply the same rule, so the upgrade lands with no
+  is also what settles a simultaneous dial. *(Amended 2026-09-25, v0.2.9 #6 — **a dead connection is
+  decided by silence, never by address**. On an equal path the survivor is the lower `tie_key` (16 bytes
+  of the TLS exporter, identical at both ends, v0.2.8), with one exception: a held connection that has
+  received nothing for `SILENCE_IS_DEATH` (1.5 × the 20 s keep-alive = 30 s) is dead, so a newcomer
+  replaces it and it is closed; and when the held connection crosses that line later, a retired
+  connection to the same peer that is still being heard from is promoted in its place, or, with none,
+  the silent one is closed — by a once-a-second task of its own (`tend_liveness`; not the actor's tick,
+  which a dead connection can stall for the whole idle timeout) or on the next lookup (`existing`). That second half is what a restart needs: the
+  restarted process's connection usually arrives while the old one has been silent only seconds, so it
+  goes to the tie-break and loses it half the time. Liveness is the count of datagrams quinn has routed
+  to the connection, sampled every second. A live connection cannot cross the line: quinn re-arms its
+  keep-alive on every received packet, so each end of an idle live connection hears the other at most
+  about 20 s apart, and the 10 s margin covers a round trip, a lost PING and the 1 s sampling. A dead one
+  cannot vote, so both ends agree without a protocol: the restarted end holds only the new connection.
+  An address rule — "a direct newcomer from a different address than the held one means the peer moved"
+  — was proposed and **withdrawn**: NAT rebinding under a live process gives a live duplicate a new
+  port that only the receiving end sees, so the two ends keep different connections; a restart on a
+  fixed port gives the same address; a restart onto another network a different one. Proved by
+  `a_restarted_host_is_reached_through_its_anchor` (a host crash-restarted three times on the same
+  address and three times on a new one, behind symmetric NATs, reached by a relayed client through the
+  anchor, probed once a second as a retrying client would: in three runs, 18 of 18 restarts were
+  reachable again within 31.3 s of the crash, the ones where the new connection won the tie-break within
+  1.4 s; with the rule off, 3 of 6 took 60.5 s, QUIC's idle timeout), `tunnel_honesty_proof::a_forward_carries_a_new_connection_after_
+  its_host_restarts` merged onto this rule (a real `vox forward` whose host is killed: 8 of 8 that got
+  past the harness's own `vox connect` carried the new connection 30.1–30.8 s after the restart, against 59.1–60.3 s with the rule off or run on the
+  actor's tick, which the dead connection stalled — that gate asserts only its 300 s patience, so the
+  timing is measured, not gated) and
+  `a_live_duplicate_is_decided_alike` (a member whose NAT rebinds dials the anchor twice: 0 of 24
+  trials disagree; with the address rule, 12 of 24). Residual: the datagram count is taken before
+  authentication, so an on-path attacker that knows a connection ID can keep a dead connection looking
+  alive — which returns the node to the 60 s idle timeout, no worse than before.)* Both ends apply the same rule, so the upgrade lands with no
   protocol: the side that punched files the direct connection as an improvement, and the side that
   accepted it does too. A circuit attempt abandoned because another rung won tears itself down on drop
   (its driver is aborted, the port detaches, the stream closes, and the relay and the far side let go).
@@ -361,6 +399,35 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   sides with the relayed one retiring on each; behind symmetric NATs `reach` is as fast and `upgrade`
   comes back empty; a private-only address record no longer costs the dial timeout. ADR-016's M15.1 gate
   went from 22.9 s to 7.9 s, the join itself now bounded at 12 s.
+  - **A retired connection is let go (2026-09-25, v0.2.9).** "Closed by the node's tick" did not
+    happen. `retire_expired` closes a retired connection once the grace is up **and** nothing holds its
+    `Arc` — the strong count is how a path still carrying a tunnel is told from one that is not — and
+    every connection's stream loop held that `Arc` for the connection's life, so the count never fell
+    below two and no retired connection was ever closed. A pair that went direct kept its relayed
+    connection, and the relay kept its circuit, for as long as both nodes ran: keep-alives crossing
+    the relay every few seconds kept the circuit's idle timeout from ever firing. Two more holds did the
+    same for shorter spells: `upgrade` held the connection it was replacing for the whole ladder
+    (`PUNCH_ATTEMPT_TIMEOUT`), and nothing ended a circuit when the connection it carried closed.
+    Now:
+    - the stream loop holds a `Weak` and the quinn handle, and upgrades the `Weak` per stream, so the
+      count is the manager plus whatever is serving a stream or splicing a tunnel on it;
+    - a tunnel holds its connection for as long as it splices, on both ends (`up::open_tunnel`
+      returns it; the host's tunnel task keeps the one it arrived on), and a circuit holds the
+      connections it rides;
+    - `upgrade` holds the connection it replaces weakly;
+    - the initiator's circuit driver ends 1 s (`CIRCUIT_CLOSE_LINGER`) after the connection it carries
+      closes, which ends the relay's forwarding and the far driver;
+    - a node republishes its view on the tick when its connections or circuits changed, so a relay
+      with no rooms no longer reports a circuit it stopped carrying.
+
+    Proved on real nodes over the virtual NAT network
+    (`crates/vox-core/tests/displaced_relay_is_let_go.rs`): a relayed pair goes direct; with nothing
+    carried, the anchor reports 0 circuits 1.52–1.63 s after the grace is up (5 runs; the bound is
+    two ticks, the linger and 1 s of slack). With a tunnel open, the relayed connection outlives the
+    grace, the tunnel still echoes, and the anchor reports 0 circuits 1.47–1.63 s after the tunnel
+    closes (5 runs). Before the change both stayed at 1 circuit for the full 15 s watched; with the stream loop
+    holding the `Arc` again, both go red the same way; with the tunnels not holding their connection,
+    the tunnel is cut when the grace runs out.
   - **Proved on the virtual NAT network.** With both peers behind *symmetric* NATs — every earlier rung
     defeated, which the same file demonstrates — `reach` returns a connection pinned to and authenticated
     by the far peer, its remote address is the circuit's, the relay reports carrying exactly one

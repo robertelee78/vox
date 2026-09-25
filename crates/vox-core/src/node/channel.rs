@@ -48,7 +48,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::governance::capability::CapabilitySet;
-use crate::governance::cert::AdminCert;
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::entry::GovEntry;
 use crate::governance::evaluator::Evaluator;
@@ -56,7 +55,6 @@ use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, Histor
 use crate::governance::membership::{
     issue_consent_grant, issue_consent_revocation, MembershipView,
 };
-use crate::governance::servicegrant::ServiceGrantExclusion;
 use crate::group::history::OriginKeyStore;
 use crate::group::message::GroupMessage;
 use crate::group::skdm::Skdm;
@@ -176,7 +174,6 @@ pub(crate) fn sync_failure(code: crate::wire::WireError) -> Error {
         crate::wire::WireError::UnknownStructTag => "sync failed: unknown struct tag",
         crate::wire::WireError::UnknownAlgoId => "sync failed: unknown algo id",
         crate::wire::WireError::AuthenticatorInvalid => "sync failed: authenticator invalid",
-        crate::wire::WireError::QuotaExceeded => "sync failed: quota exceeded",
         crate::wire::WireError::SyncModeUnsupported => "sync failed: sync mode unsupported",
         crate::wire::WireError::EpochMismatch => "sync failed: epoch mismatch",
         crate::wire::WireError::TransportFailed => "sync failed: transport",
@@ -673,8 +670,7 @@ impl ChannelState {
     ///
     /// The grant is immutable, being part of the genesis and therefore of the
     /// channelID — a room cannot silently *become* an access list, and one created as
-    /// an access list cannot stop being one. Taking it back from a single member is
-    /// [`ChannelState::exclude_from_service_grant`].
+    /// an access list cannot stop being one.
     pub fn create_with_grant(
         profile: &Profile,
         local_name: &str,
@@ -683,6 +679,36 @@ impl ChannelState {
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
+        let (genesis, sek) = Self::create_genesis(profile, local_name, service_grant, now_secs)?;
+        let signer = profile.signer()?;
+        let factor = SignatureIdentityFactor::new(signer);
+        let wrap = sek.seal(&factor, &genesis.channel_id(), channel_passphrase, argon2)?;
+        Self::create_from_sealed(
+            profile,
+            local_name,
+            channel_passphrase,
+            genesis,
+            sek,
+            &wrap,
+            now_secs,
+        )
+    }
+
+    /// The fast first step of creating a room: its genesis and a fresh room key.
+    ///
+    /// Split from [`ChannelState::create_with_grant`] so the slow middle step — sealing the room
+    /// key under the passphrase with production Argon2id, seconds of CPU — can run off the node's
+    /// actor, which answers nothing while it works. [`ChannelState::create_from_sealed`] is the
+    /// last step.
+    ///
+    /// # Errors
+    /// A local name over the limit, no unlocked signer, or a genesis or key that cannot be made.
+    pub fn create_genesis(
+        profile: &Profile,
+        local_name: &str,
+        service_grant: CapabilitySet,
+        now_secs: u64,
+    ) -> Result<(Genesis, Sek)> {
         if local_name.len() > MAX_LOCAL_NAME_LEN {
             return Err(Error::SizeLimitExceeded("channel local name"));
         }
@@ -694,13 +720,27 @@ impl ChannelState {
             min_suite: SuiteFloor::DAY_ONE.id(),
         };
         let genesis = Genesis::create_with_grant(signer, now_secs, policy, service_grant)?;
+        Ok((genesis, Sek::generate()?))
+    }
+
+    /// The last step of creating a room, from a genesis and a room key already sealed under the
+    /// passphrase. See [`ChannelState::create_genesis`].
+    ///
+    /// # Errors
+    /// No unlocked signer, a segment that cannot be sealed, or a store write that fails.
+    pub fn create_from_sealed(
+        profile: &Profile,
+        local_name: &str,
+        channel_passphrase: &[u8],
+        genesis: Genesis,
+        sek: Sek,
+        wrap: &crate::atrest::SekWrap,
+        now_secs: u64,
+    ) -> Result<Self> {
+        let signer = profile.signer()?;
         let channel_id = genesis.channel_id();
         let epoch = 0u64;
         let me = signer.fingerprint();
-
-        let sek = Sek::generate()?;
-        let factor = SignatureIdentityFactor::new(signer);
-        let wrap = sek.seal(&factor, &channel_id, channel_passphrase, argon2)?;
         let sender = SenderChain::new(&channel_id, epoch, &me, 0, now_secs)?;
         // Retain generation 0's origin at the moment it is minted: once the live
         // chain ratchets past iteration 0 the origin is unrecoverable, so it is kept
@@ -732,7 +772,7 @@ impl ChannelState {
         )?;
 
         let mut batch = profile.store().batch()?;
-        batch.put_sek_wrap(&channel_id, &wrap)?;
+        batch.put_sek_wrap(&channel_id, wrap)?;
         batch.put_segment(
             &channel_id,
             SegmentKind::KeyMaterial,
@@ -865,7 +905,7 @@ impl ChannelState {
                     Default::default(),
                 )?);
             }
-            dag.accept(entry, kind, &key, &admission, now_secs)
+            dag.accept(entry, kind, &key, &admission)
                 .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
             next_log_id = id.saturating_add(1);
         }
@@ -1041,11 +1081,37 @@ impl ChannelState {
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
+        Self::join_checks(profile, genesis, channel_id, local_name)?;
+        let sek = Sek::generate()?;
+        let signer = profile.signer()?;
+        let factor = SignatureIdentityFactor::new(signer);
+        let wrap = sek.seal(&factor, channel_id, channel_passphrase, argon2)?;
+        Self::join_channel_from_sealed(
+            profile,
+            genesis,
+            channel_id,
+            local_name,
+            channel_passphrase,
+            now_secs,
+            (sek, wrap),
+        )
+    }
+
+    /// What must hold before a joined room is made: a name within the limit, an unlocked signer,
+    /// a genesis that verifies and names this room, and no copy of the room already in the profile.
+    ///
+    /// # Errors
+    /// The first of those that does not hold.
+    pub fn join_checks(
+        profile: &Profile,
+        genesis: &Genesis,
+        channel_id: &Digest32,
+        local_name: &str,
+    ) -> Result<()> {
         if local_name.len() > MAX_LOCAL_NAME_LEN {
             return Err(Error::SizeLimitExceeded("channel local name"));
         }
-        let signer = profile.signer()?;
-        let me = signer.fingerprint();
+        profile.signer()?;
         genesis.verify()?;
         if genesis.channel_id() != *channel_id {
             return Err(Error::MalformedGovernance(
@@ -1055,10 +1121,29 @@ impl ChannelState {
         if profile.store().get_sek_wrap(channel_id)?.is_some() {
             return Err(Error::Profile("this channel is already in the profile"));
         }
+        Ok(())
+    }
+
+    /// Make a joined room from a room key already sealed under the passphrase — the slow step,
+    /// which the node runs off its actor. The checks of [`ChannelState::join_checks`] are repeated
+    /// here, because time passed while the seal ran.
+    ///
+    /// # Errors
+    /// A failed check, a segment that cannot be sealed, or a store write that fails.
+    pub fn join_channel_from_sealed(
+        profile: &Profile,
+        genesis: &Genesis,
+        channel_id: &Digest32,
+        local_name: &str,
+        channel_passphrase: &[u8],
+        now_secs: u64,
+        sealed: (Sek, crate::atrest::SekWrap),
+    ) -> Result<Self> {
+        Self::join_checks(profile, genesis, channel_id, local_name)?;
+        let (sek, wrap) = sealed;
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
         let epoch = 0u64;
-        let sek = Sek::generate()?;
-        let factor = SignatureIdentityFactor::new(signer);
-        let wrap = sek.seal(&factor, channel_id, channel_passphrase, argon2)?;
         let sender = SenderChain::new(channel_id, epoch, &me, 0, now_secs)?;
         let mut origins = OriginKeyStore::new();
         retain_generation(&mut origins, channel_id, epoch, &me, &sender, now_secs)?;
@@ -1621,6 +1706,29 @@ impl ChannelState {
 
     /// Record that `target` has been delivered generation `chain_id` of this
     /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
+    pub fn note_undelivered(
+        &mut self,
+        store: &Store,
+        target: Digest32,
+        chain_id: u64,
+    ) -> Result<()> {
+        // Only the generation that was refused: a later one that did land stays recorded.
+        if self.delivered.get(&target) != Some(&chain_id) {
+            return Ok(());
+        }
+        match chain_id.checked_sub(1) {
+            Some(before) => {
+                self.delivered.insert(target, before);
+            }
+            None => {
+                self.delivered.remove(&target);
+            }
+        }
+        self.persist_delivered(store)
+    }
+
+    /// Record that `target` has been delivered generation `chain_id` of this
+    /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
     pub fn note_delivered(&mut self, store: &Store, target: Digest32, chain_id: u64) -> Result<()> {
         let entry = self.delivered.entry(target).or_default();
         if *entry >= chain_id {
@@ -1736,6 +1844,21 @@ impl ChannelState {
         Ok(revocation)
     }
 
+    /// Forget that `target` holds this identity's current sender key, so the next
+    /// re-key round delivers it again (ADR-021 F12).
+    ///
+    /// For when the pairwise session a key was delivered over has been replaced by the
+    /// one both ends keep: what was sealed under the dropped session cannot be opened.
+    ///
+    /// # Errors
+    /// If the ledger cannot be persisted.
+    pub fn forget_delivery(&mut self, store: &Store, target: &Digest32) -> Result<()> {
+        if self.delivered.remove(target).is_some() {
+            self.persist_delivered(store)?;
+        }
+        Ok(())
+    }
+
     fn persist_delivered(&mut self, store: &Store) -> Result<()> {
         let seg = seal_segment(
             &self.sek,
@@ -1755,96 +1878,10 @@ impl ChannelState {
         Ok(())
     }
 
-    /// Grant `target` a set of **tunnel capabilities** (ADR-013 authorization over the
-    /// single ADR-007 evaluator): issue an [`AdminCert`] delegating exactly those
-    /// capabilities, append it as a governance entry, and fold it into the evaluator,
-    /// so the grant is a log fact every member converges on rather than local
-    /// configuration.
-    ///
-    /// The caller must hold the capabilities being delegated — the evaluator enforces
-    /// `is_within` on the issuer's own set, so this cannot widen anyone's reach — and
-    /// `expiry` is the certificate's, after which the grant simply stops counting.
-    ///
-    /// Chat and tunnel axes stay independent (ADR-013): this grants no message
-    /// consent, and consent grants no tunnel reach.
-    pub fn grant_capabilities(
-        &mut self,
-        profile: &Profile,
-        target: &CompositePublicKey,
-        capabilities: CapabilitySet,
-        expiry: u64,
-        now_secs: u64,
-    ) -> Result<AdminCert> {
-        if capabilities.is_empty() {
-            return Err(Error::MalformedGovernance("a grant with no capabilities"));
-        }
-        let signer = profile.signer()?;
-        let cert = AdminCert::build(
-            signer,
-            &self.channel_id,
-            self.epoch,
-            target.clone(),
-            capabilities,
-            expiry,
-        )?;
-        self.append_governance(profile, &cert.to_wire(), now_secs)?;
-        Ok(cert)
-    }
-
-    /// Withdraw the genesis service grant from `member` (ADR-017 decision 3): append
-    /// the signed [`ServiceGrantExclusion`] and fold it into the evaluator, so the
-    /// member stops holding what membership alone conferred.
-    ///
-    /// This is the counterpart a capability-bearing room needs. A genesis grant issues
-    /// nobody a certificate, so there is no delegation for ADR-007's
-    /// admin-delegation-revocation to name — without this, adding a genesis grant
-    /// would take away the per-member control the channel already had.
-    ///
-    /// It suppresses **only** the genesis-conferred capabilities: an explicit
-    /// [`AdminCert`] issued to the same identity is governed by its own revocation, so
-    /// an admin who excludes a member and then deliberately certifies them again has
-    /// done exactly that. The caller must hold `delegate` — the evaluator checks it
-    /// from the entry's strict causal past, so an unauthorized exclusion is simply
-    /// inert rather than rejected here.
-    pub fn exclude_from_service_grant(
-        &mut self,
-        profile: &Profile,
-        member: Digest32,
-        now_secs: u64,
-    ) -> Result<ServiceGrantExclusion> {
-        if self.genesis.body.service_grant.is_empty() {
-            return Err(Error::MalformedGovernance(
-                "channel has no genesis service grant to exclude from",
-            ));
-        }
-        if member == self.me() {
-            return Err(Error::MalformedGovernance(
-                "an identity cannot exclude itself from the service grant",
-            ));
-        }
-        let signer = profile.signer()?;
-        let exclusion = ServiceGrantExclusion::build(signer, &self.channel_id, self.epoch, member)?;
-        self.append_governance(profile, &exclusion.to_wire(), now_secs)?;
-        Ok(exclusion)
-    }
-
     /// The capabilities this channel's genesis confers on every member (ADR-017).
     #[must_use]
     pub fn service_grant(&self) -> &CapabilitySet {
         &self.genesis.body.service_grant
-    }
-
-    /// Whether `member` may **dial** `service_tag` in this channel, by this node's
-    /// evaluator (ADR-013 `dial:` capability).
-    #[must_use]
-    pub fn can_dial(&self, member: &Digest32, service_tag: &str) -> bool {
-        crate::tunnel::authz::can_dial(&self.evaluator, member, service_tag)
-    }
-
-    /// Whether `member` may **bind** (offer) `service_tag` in this channel.
-    #[must_use]
-    pub fn can_bind(&self, member: &Digest32, service_tag: &str) -> bool {
-        crate::tunnel::authz::can_bind(&self.evaluator, member, service_tag)
     }
 
     /// Append an already-built governance struct as a signed log entry.
@@ -1876,13 +1913,7 @@ impl ChannelState {
         let gov =
             GovEntry::from_verified_log_entry(&entry, &key, &self.channel_id, self.gov_heads())?;
         self.dag
-            .accept(
-                entry,
-                EntryKind::Governance,
-                &key,
-                &self.admission,
-                now_secs,
-            )
+            .accept(entry, EntryKind::Governance, &key, &self.admission)
             .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
         if let Err(e) =
             profile
@@ -1961,18 +1992,37 @@ impl ChannelState {
             .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
             .collect();
         let resolver = self.resolver();
-        let session = frontier_session_peer(
-            transport,
-            &mut self.dag,
-            &resolver,
-            &self.admission,
-            now_secs,
-        );
+        let session = frontier_session_peer(transport, &mut self.dag, &resolver, &self.admission);
 
         // Collect what arrived, in per-author sequence order, before touching the
         // store (the borrow of `self.dag` ends here).
+        let mut out = self.absorb_arrived(store, &before, now_secs)?;
+        if let Ok(n) = session {
+            out.applied = n;
+        }
+        match session {
+            Ok(_) => Ok(out),
+            Err(code) => Err(sync_failure(code)),
+        }
+    }
+
+    /// Each author's head, for [`ChannelState::absorb_arrived`] to find what a sync added.
+    fn heads(&self) -> BTreeMap<Digest32, u64> {
+        self.authors
+            .keys()
+            .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
+            .collect()
+    }
+
+    /// Persist, fold and render every entry a sync added past `before`'s heads.
+    fn absorb_arrived(
+        &mut self,
+        store: &Store,
+        before: &BTreeMap<Digest32, u64>,
+        now_secs: u64,
+    ) -> Result<SyncOutcome> {
         let mut arrived: Vec<(Digest32, Digest32, Vec<u8>)> = Vec::new();
-        for (author, head) in &before {
+        for (author, head) in before {
             let Some(feed) = self.dag.feed(author) else {
                 continue;
             };
@@ -1987,7 +2037,7 @@ impl ChannelState {
         }
 
         let mut out = SyncOutcome {
-            applied: session.unwrap_or(arrived.len()),
+            applied: arrived.len(),
             ..SyncOutcome::default()
         };
         for (author, entry_hash, payload) in arrived {
@@ -2041,8 +2091,47 @@ impl ChannelState {
         }
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
+        Ok(out)
+    }
+
+    /// Reconcile the room with a peer over `transport`, holding `shared`'s lock only inside each
+    /// protocol step — never across a send or a receive. See [`crate::log::sync::SessionRoom`].
+    ///
+    /// # Errors
+    /// The room is poisoned, a persist fails, or the session hard-fails.
+    pub fn sync_over_room<T: Transport>(
+        shared: &tokio::sync::Mutex<Self>,
+        store: &Store,
+        transport: &mut T,
+        now_secs: u64,
+    ) -> Result<SyncOutcome> {
+        let epoch = {
+            let ch = shared.blocking_lock();
+            if ch.poisoned {
+                return Err(Error::Profile(
+                    "channel is poisoned after a failed persist; reopen it",
+                ));
+            }
+            ch.epoch
+        };
+        let room = ChannelSessionRoom {
+            shared,
+            store,
+            now_secs,
+            epoch,
+            out: std::cell::RefCell::new(SyncOutcome::default()),
+            fatal: std::cell::RefCell::new(None),
+        };
+        let session = crate::log::sync::frontier_session_room(transport, &room);
+        if let Some(e) = room.fatal.take() {
+            return Err(e);
+        }
+        let mut out = room.out.into_inner();
         match session {
-            Ok(_) => Ok(out),
+            Ok(n) => {
+                out.applied = n;
+                Ok(out)
+            }
             Err(code) => Err(sync_failure(code)),
         }
     }
@@ -2285,7 +2374,7 @@ impl ChannelState {
         let id = self.next_log_id;
         let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
         self.dag
-            .accept(entry, kind, &key, &self.admission, now_secs)
+            .accept(entry, kind, &key, &self.admission)
             .map_err(|_| Error::MalformedGovernance("entry failed the acceptance predicate"))?;
         if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg) {
             self.poisoned = true;
@@ -2341,11 +2430,6 @@ impl ChannelState {
         // caller still thinking in seconds should fail to compile rather than stamp 1970.
         now_millis: u64,
     ) -> Result<&Rendered> {
-        // Admission and quota are specified in whole seconds (ADR-007), so they get seconds —
-        // derived from the same value rather than passed alongside it, so the two can never
-        // disagree about when "now" was. That disagreement is the defect that made the first
-        // version of this change wrong: a timestamp composed from two separate clock reads.
-        let now_secs = now_millis / 1_000;
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
@@ -2393,7 +2477,7 @@ impl ChannelState {
         // to memory. A persist failure poisons the channel (see module docs).
         let key = signer.public_key();
         self.dag
-            .accept(entry, EntryKind::Content, &key, &self.admission, now_secs)
+            .accept(entry, EntryKind::Content, &key, &self.admission)
             .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
         let persisted = (|| -> Result<()> {
             let mut batch = profile.store().batch()?;
@@ -2559,5 +2643,89 @@ impl ChannelState {
     #[must_use]
     pub fn can_answer_join(&self) -> bool {
         !self.passphrase.is_empty()
+    }
+}
+
+/// A channel as a [`crate::log::sync::SessionRoom`]: each step locks the room, does its work, and
+/// lets go. See [`ChannelState::sync_over_room`].
+struct ChannelSessionRoom<'a> {
+    shared: &'a tokio::sync::Mutex<ChannelState>,
+    store: &'a Store,
+    now_secs: u64,
+    /// The epoch the session began at; a room that has moved on refuses what was staged for it.
+    epoch: u64,
+    out: std::cell::RefCell<SyncOutcome>,
+    /// A local failure (a persist that failed) that must reach the caller as itself, not as a code.
+    fatal: std::cell::RefCell<Option<Error>>,
+}
+
+impl ChannelSessionRoom<'_> {
+    fn room(
+        &self,
+    ) -> std::result::Result<tokio::sync::MutexGuard<'_, ChannelState>, crate::wire::WireError>
+    {
+        let ch = self.shared.blocking_lock();
+        if ch.poisoned {
+            return Err(crate::wire::WireError::TransportFailed);
+        }
+        if ch.epoch != self.epoch {
+            return Err(crate::wire::WireError::EpochMismatch);
+        }
+        Ok(ch)
+    }
+}
+
+impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
+    fn frontiers(
+        &self,
+    ) -> std::result::Result<Vec<crate::log::sync::FeedFrontier>, crate::wire::WireError> {
+        Ok(crate::log::sync::frontiers_of(&self.room()?.dag))
+    }
+
+    fn wants(
+        &self,
+        remote: &[crate::log::sync::FeedFrontier],
+    ) -> std::result::Result<Vec<crate::log::sync::WantRange>, crate::wire::WireError> {
+        Ok(crate::log::sync::wants_for(&self.room()?.dag, remote))
+    }
+
+    fn entries(
+        &self,
+        wants: &[crate::log::sync::WantRange],
+    ) -> std::result::Result<Vec<Vec<u8>>, crate::wire::WireError> {
+        Ok(crate::log::sync::entries_for_wants(
+            &self.room()?.dag,
+            wants,
+        ))
+    }
+
+    fn apply(&self, staged: Vec<Vec<u8>>) -> std::result::Result<usize, crate::wire::WireError> {
+        let mut guard = self.room()?;
+        let ch = &mut *guard;
+        let before = ch.heads();
+        // The resolver as it is *now*: an author revoked while this batch was on the wire is not
+        // an author of this room any more, and its entries are refused.
+        let resolver = ch.resolver();
+        // **Absorb what was stored, then report the failure.** `apply_staged` stores entries one
+        // at a time and stops at the first it refuses; those before it are already in the log.
+        // Returning the refusal first skipped persisting and rendering them, yet the log now held
+        // them, so every later session saw nothing to send and they were never shown: one joiner
+        // read nothing from the host in a room, silently, about one run in four (tworooms.sh). The
+        // refusal was the other joiner's entry, from an author this node had not admitted yet.
+        // `sync_over` always did it in this order ("reconciliation done; only now surface a
+        // session failure"); the per-step path lost it.
+        let stored = crate::log::sync::apply_staged(&mut ch.dag, &resolver, &ch.admission, &staged);
+        match ch.absorb_arrived(self.store, &before, self.now_secs) {
+            Ok(got) => {
+                let mut out = self.out.borrow_mut();
+                out.rendered += got.rendered;
+                out.governance += got.governance;
+                stored
+            }
+            Err(e) => {
+                *self.fatal.borrow_mut() = Some(e);
+                Err(crate::wire::WireError::TransportFailed)
+            }
+        }
     }
 }

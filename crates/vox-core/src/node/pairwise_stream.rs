@@ -193,8 +193,8 @@ pub async fn deliver_skdm(
     session: &mut Session,
     skdm: &Skdm,
     hello: Option<&InitialMessage>,
-) -> Result<()> {
-    let (mut send, _recv) = open_typed(conn, StreamKind::Pairwise).await?;
+) -> Result<quinn::RecvStream> {
+    let (mut send, recv) = open_typed(conn, StreamKind::Pairwise).await?;
     if let Some(initial) = hello {
         let frame = PairwiseFrame::Hello {
             channel_id: *channel_id,
@@ -204,7 +204,72 @@ pub async fn deliver_skdm(
     }
     send_skdm(&mut send, channel_id, session, skdm).await?;
     let _ = send.finish();
-    Ok(())
+    // Returned so the caller can learn whether the key was taken: see `refused`.
+    Ok(recv)
+}
+
+/// The recipient's answer on a pairwise stream that carried a key it took.
+pub const KEY_TAKEN: u8 = 1;
+
+/// Why a recipient did not take a key, sent as the stream's reset code so the sender can say.
+///
+/// One code per cause, on purpose: a single "refused" made every cause look alike, and the one
+/// case this exists for (two joiners whose keys never land) could not be told apart from the others.
+/// Chosen above every `WireError` code, which a refusal at accept still uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRefusal {
+    /// No pairwise session with the sender for that room.
+    NoSession = 0x21,
+    /// A session exists, but the key did not open under it (the two ends hold different sessions).
+    CannotOpen = 0x22,
+    /// The key opened, but the room would not take it (not held, or refused by the room).
+    NotAccepted = 0x23,
+    /// The hello in front of the key was not accepted, so the key behind it was never read.
+    HelloRefused = 0x24,
+}
+
+impl KeyRefusal {
+    /// The stream reset code.
+    #[must_use]
+    pub fn code(self) -> quinn::VarInt {
+        quinn::VarInt::from_u32(self as u32)
+    }
+
+    /// Words for a reset code a recipient sent back.
+    #[must_use]
+    pub fn describe(code: u64) -> String {
+        match code {
+            0x21 => "no pairwise session for that room".into(),
+            0x22 => "the key did not open under the session it holds".into(),
+            0x23 => "the room would not take the key".into(),
+            0x24 => "its hello was not accepted".into(),
+            0x05 => "refused at accept: it may not take a key from us yet".into(),
+            other => format!("reset with code {other}"),
+        }
+    }
+}
+
+/// Whether the far side refused a delivered key: `Some(why)` if so, `None` if it took it.
+///
+/// **Written is not delivered.** QUIC acknowledges the bytes before the recipient has decided
+/// anything, so the transport cannot say whether a key was taken. The recipient answers instead,
+/// with [`KEY_TAKEN`] once the key is taken, or by resetting the stream with a wire code when it
+/// is not: refused at accept, no session to open it with, or a key it could not open. Anything
+/// but that one byte (a reset, the stream ending unanswered, the connection lost, or no answer
+/// within `patience`) counts as not taken. Sending a key twice is harmless; never sending it
+/// leaves a member unable to read. Awaited on its own task, never on the actor: the answer
+/// comes after the recipient's actor has handled the key.
+pub async fn refused(mut recv: quinn::RecvStream, patience: std::time::Duration) -> Option<String> {
+    let mut byte = [0u8; 1];
+    match tokio::time::timeout(patience, recv.read_exact(&mut byte)).await {
+        Ok(Ok(())) if byte[0] == KEY_TAKEN => None,
+        Ok(Ok(())) => Some(format!("answered {}", byte[0])),
+        Ok(Err(quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)))) => {
+            Some(KeyRefusal::describe(code.into_inner()))
+        }
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some(format!("no answer within {}s", patience.as_secs())),
+    }
 }
 
 /// Open a `pairwise` stream, give the far side the ratchet message its sending

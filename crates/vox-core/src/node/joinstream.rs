@@ -368,6 +368,35 @@ async fn recv_frame(recv: &mut RecvStream) -> Result<JoinFrame> {
     JoinFrame::from_frame(&bytes)
 }
 
+/// How long one expected Equihash solve may take on a slow joiner.
+///
+/// Measured on a developer machine run 2–3.5× over its cores: 0.9–2.0s a nonce, 1–3 nonces at the
+/// base difficulty. A Raspberry-Pi-class device is an order slower on this memory-hard (200,9)
+/// solve, so this is sized for that rather than for the machine that measured it.
+const SOLVE_BUDGET_PER_EXPECTED_SOLVE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How far past the expected number of solves an honest joiner may run: the nonce search is
+/// geometric, and this covers its tail.
+const SOLVE_TAIL: u32 = 4;
+
+/// How long the responder waits for the joiner's `Solve`, derived from the difficulty it demanded.
+///
+/// **Not the general frame bound.** The `Solve` was read with the same 30s as every other frame,
+/// while the time to produce it depends on the joiner's hardware and on the difficulty — which
+/// adapts upward under load, exactly when the responder is busiest. Measured through the real
+/// binaries: 1 join in 16 failed at ~37s with the responder reporting `peer sent no frame in time`
+/// while the joiner was still grinding. A stranger gains nothing from the longer wait: holding a
+/// join slot never required solving, so the slot cap and refuse-not-queue are the defence against
+/// that, as they were at 30s.
+fn solve_patience(difficulty: crate::join::pow::Difficulty) -> std::time::Duration {
+    // `expected_solves` is ≥ 1 and bounded by the difficulty cap, so this cannot overflow in
+    // practice; saturate anyway rather than trust that.
+    let solves = difficulty.expected_solves().ceil().min(f64::from(u32::MAX)) as u32;
+    SOLVE_BUDGET_PER_EXPECTED_SOLVE
+        .saturating_mul(solves.max(1))
+        .saturating_mul(SOLVE_TAIL)
+}
+
 /// A completed join: the pairwise session, the peer identity the PoP proved, and
 /// whether the session is last-resort-grade (ADR-004 one-time-prekey reuse).
 pub struct JoinOutcome {
@@ -460,16 +489,32 @@ pub async fn run_initiator(
 
     // 2. SOLVE — `join_initiate` verifies the signature, the binding and the
     //    difficulty cap before grinding, then solves and starts CPace.
-    let (initiator, token, share) = join_initiate(
-        ctx,
-        passphrase,
-        &sid,
-        &challenge,
-        &responder_pub,
-        &challenge_sig,
-        root,
-        ik,
-    )?;
+    //
+    //    **Ground off the runtime's worker.** The solve is Equihash — seconds of CPU — and this is
+    //    an async function, so it ran on one of the daemon's two runtime workers and took it away
+    //    from everything else scheduled there: measured through the real binary, a `vox room list`
+    //    issued during a join waited 0.8–17.5s, tracking the join's own length, although it needs
+    //    nothing but the published view. `block_in_place` moves this worker's other tasks elsewhere
+    //    for the duration. It panics on a current-thread runtime, which grinds inline as before.
+    let grind = || {
+        join_initiate(
+            ctx,
+            passphrase,
+            &sid,
+            &challenge,
+            &responder_pub,
+            &challenge_sig,
+            root,
+            ik,
+        )
+    };
+    let (initiator, token, share) = if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(grind)?
+    } else {
+        grind()?
+    };
     send_frame(
         &mut send,
         &JoinFrame::Solve {
@@ -703,11 +748,18 @@ async fn responder_exchange(
     .await?;
 
     // 2. SOLVE — `join_accept` verifies the PoW before any CPace work.
+    let solve = crate::transport::framing::read_frame_within(
+        recv,
+        MAX_JOIN_FRAME,
+        solve_patience(challenge.difficulty),
+    )
+    .await?
+    .ok_or(Error::MalformedJoin("join stream closed early"))?;
     let JoinFrame::Solve {
         equihash_nonce,
         solution,
         share: joiner_share,
-    } = recv_frame(recv).await?
+    } = JoinFrame::from_frame(&solve)?
     else {
         return Err(Error::MalformedJoin("expected solve"));
     };

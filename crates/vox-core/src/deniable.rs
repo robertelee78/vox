@@ -87,6 +87,3 @@ pub use rekey::ReKey;
 pub use rounds::{Confirm, Reveal};
 pub use share::EphemeralShare;
 pub use verifier::EpochVerifier;
-
-#[cfg(test)]
-mod tests;

@@ -134,7 +134,7 @@ pub enum Error {
 
     /// A framed structure exceeded a hard size limit before any allocation
     /// proportional to attacker-declared counts/lengths was performed (ADR-008
-    /// anti-abuse: the per-author quota must not be the first line of defense).
+    /// anti-abuse: a declared length is never trusted ahead of the bytes behind it).
     /// Carries a static label naming the limit that was exceeded.
     #[error("declared size exceeds hard limit: {0}")]
     SizeLimitExceeded(&'static str),

@@ -38,6 +38,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use quinn::{RecvStream, SendStream};
 
@@ -46,7 +47,7 @@ use crate::hash::Digest32;
 use crate::nat::multiaddr::EndpointList;
 use crate::nat::reachability::{connect_direct, direct_candidates};
 use crate::time::Clock;
-use crate::transport::quic::{close_code, Admission, VoxConnection, VoxEndpoint};
+use crate::transport::quic::{close_code, Admission, VoxConnection, VoxEndpoint, KEEP_ALIVE};
 use crate::transport::streams::{accept_typed, StreamKind};
 use crate::wire::WireError;
 
@@ -61,6 +62,9 @@ pub enum PeerClass {
     /// An identity this node is currently expecting a join from (its pre-join
     /// record was accepted, or a link names it).
     PendingJoiner,
+    /// A member this node is joining a room *through* right now. It sends its sender key the
+    /// moment it admits us, before this node holds the room or knows it as a member.
+    JoinResponder,
     /// Authenticated, but otherwise unknown to us.
     Unknown,
 }
@@ -73,6 +77,7 @@ pub struct PeerPolicy {
     members: HashSet<Digest32>,
     anchors: HashSet<Digest32>,
     pending_joiners: HashSet<Digest32>,
+    join_responders: HashSet<Digest32>,
 }
 
 impl PeerPolicy {
@@ -102,6 +107,23 @@ impl PeerPolicy {
         self.pending_joiners.remove(joiner)
     }
 
+    /// Accept a join responder's sender key while this node joins through it (until
+    /// [`PeerPolicy::forget_join_responders`]).
+    pub fn expect_join_responder(&mut self, responder: Digest32) {
+        self.join_responders.insert(responder);
+    }
+
+    /// No join is in flight any more: its responders are members now, or were never admitted.
+    pub fn forget_join_responders(&mut self) {
+        self.join_responders.clear();
+    }
+
+    /// The members this node is joining through right now.
+    #[must_use]
+    pub fn join_responders(&self) -> Vec<Digest32> {
+        self.join_responders.iter().copied().collect()
+    }
+
     /// Classify a peer. Membership wins over every other class: a member that is
     /// also an anchor or a pending joiner is a member.
     #[must_use]
@@ -112,6 +134,8 @@ impl PeerPolicy {
             PeerClass::Anchor
         } else if self.pending_joiners.contains(peer) {
             PeerClass::PendingJoiner
+        } else if self.join_responders.contains(peer) {
+            PeerClass::JoinResponder
         } else {
             PeerClass::Unknown
         }
@@ -168,6 +192,18 @@ impl PeerPolicy {
                     | StreamKind::Coord
                     | StreamKind::Circuit
             ),
+            // **Its sender key, and nothing an unknown peer could not already open.** The responder
+            // releases its key the moment it admits us, which is before this node holds the room
+            // or knows the responder as a member. Judged as `Unknown`, that pairwise stream was
+            // refused at accept — `stream refused: peer may not open this stream kind` — while
+            // the responder counted the write as delivered and never sent it again. So a trusted
+            // member could never read the first room it joined: measured through the real
+            // binaries, both members had nothing in the first of two rooms after 90s, 3 runs of 3,
+            // while the second room — joined when the responder was already a member — worked.
+            PeerClass::JoinResponder => matches!(
+                kind,
+                StreamKind::Pairwise | StreamKind::Rendezvous | StreamKind::Coord
+            ),
             // An unknown peer reaches the board — and the coord stream, where the only
             // verb open to it is `WHOAMI`, whose answer is its own address (enforced in
             // `node::coordstream`). A NATed client cannot learn its reflexive address
@@ -187,6 +223,7 @@ impl PeerPolicy {
             .iter()
             .chain(self.anchors.iter())
             .chain(self.pending_joiners.iter())
+            .chain(self.join_responders.iter())
             .copied()
             .collect();
         Admission::Pinned(known)
@@ -246,6 +283,44 @@ fn tie_key(conn: &VoxConnection) -> [u8; 16] {
 /// frames are bounded at 20 s) — to finish, because the peer's streams do not move.
 pub const RETIRE_GRACE_SECS: u64 = 60;
 
+/// How long a connection may receive **nothing at all** before it is treated as dead: one and
+/// a half keep-alive intervals, 30s.
+///
+/// # Why silence, and not the address a newcomer came from
+/// A peer that restarts leaves this node holding a connection to a process that no longer
+/// exists. Nothing tells us: the old process's close never left the box if it crashed, and a
+/// restarted process answers the old connection's packets with a stateless reset this node
+/// cannot authenticate. So the held connection looks live until QUIC's idle timeout (60s), and
+/// the tie-break keeps it over the new process's connection half the time. An anchor then
+/// relays onto a dead connection — "relay cannot reach the peer" — for up to a minute.
+///
+/// The address the newcomer came from was tried as the signal and withdrawn, because it is
+/// wrong in all three directions that matter: NAT rebinding under a **live** process gives the
+/// same IP a new port for a live duplicate; a restart on a fixed port gives the **same** IP and
+/// port; and a restart onto a different network gives a different IP. An address says where a
+/// packet came from, not whether the process behind the old connection is still there. And
+/// because only one end of a live duplicate sees the address change, a rule on it makes the two
+/// ends keep different connections — each then uses one the other has retired.
+///
+/// Silence is the evidence that the process is gone. A live peer is heard from at least every
+/// `KEEP_ALIVE`: quinn re-arms the keep-alive on every packet it *receives*, so the side that
+/// has heard nothing for 20s sends a PING, and a live peer ACKs it within a round trip and its
+/// ACK delay (25ms). Both ends run the same timer, so on an idle path each hears from the other
+/// at most about 20s apart. 30s leaves 10s for the round trip, a lost PING and its PTO
+/// retransmit, and the 1s sampling — and is still half the idle timeout, which is the whole
+/// point: a restart is recognised in 30s instead of 60s.
+///
+/// A dead connection cannot vote, which is why this needs no protocol. The end that restarted
+/// holds only the new connection; the end that kept the old one stops hearing from it; so both
+/// ends agree on the new one. Two **live** connections both keep hearing keep-alives, so a
+/// live duplicate still goes to `tie_key`, which both ends compute identically.
+///
+/// **Residual, stated rather than implied:** the count is of datagrams routed to the
+/// connection, before authentication, so an on-path attacker that knows a connection ID can
+/// keep a dead connection looking alive. That only returns the node to the idle timeout it had
+/// before this rule; it cannot make a live connection look dead.
+pub const SILENCE_IS_DEATH: Duration = Duration::from_secs(KEEP_ALIVE.as_secs() * 3 / 2);
+
 /// One QUIC connection per peer fingerprint (see the module docs).
 pub struct ConnectionManager {
     endpoint: Arc<VoxEndpoint>,
@@ -253,6 +328,9 @@ pub struct ConnectionManager {
     /// Connections a better path displaced, with the time each may be closed. They
     /// keep serving what is already on them; nothing new is opened on them.
     retiring: Mutex<Vec<(Arc<VoxConnection>, u64)>>,
+    /// Per connection (by quinn's stable id): how many datagrams it had received when last
+    /// sampled, and when that count last moved. The evidence [`SILENCE_IS_DEATH`] reads.
+    heard: Mutex<HashMap<usize, (u64, Instant)>>,
     retire_grace_secs: u64,
     clock: Clock,
 }
@@ -280,6 +358,7 @@ impl ConnectionManager {
             endpoint,
             conns: Mutex::new(HashMap::new()),
             retiring: Mutex::new(Vec::new()),
+            heard: Mutex::new(HashMap::new()),
             retire_grace_secs: grace_secs,
             clock,
         }
@@ -299,15 +378,149 @@ impl ConnectionManager {
     }
 
     /// The live connection to `peer`, if any.
+    ///
+    /// **Live means heard from**, not merely unclosed: a connection silent past
+    /// [`SILENCE_IS_DEATH`] is not handed out, because what is behind it is a process that has
+    /// gone (see there). If a connection this node retired for the peer *is* still being heard
+    /// from, it becomes the peer's connection here — that is how a restarted peer's connection
+    /// takes over when it lost the tie-break to the dead one. Otherwise the answer is `None`,
+    /// so a caller dials afresh rather than opening streams into nothing for half a minute.
     #[must_use]
     pub fn existing(&self, peer: &Digest32) -> Option<Arc<VoxConnection>> {
         let conn = lock(&self.conns).get(peer).cloned()?;
-        if is_live(&conn) {
-            Some(conn)
-        } else {
+        if !is_live(&conn) {
             lock(&self.conns).remove(peer);
-            None
+            return self.promote_heard(peer);
         }
+        if self.is_silent(&conn) {
+            return self.promote_heard(peer);
+        }
+        Some(conn)
+    }
+
+    /// How long `conn` has received nothing, sampling its datagram count now. A connection
+    /// never sampled before counts as heard this instant: the first sample is the baseline.
+    fn silent_for(&self, conn: &VoxConnection) -> Duration {
+        let received = conn.quinn().stats().udp_rx.datagrams;
+        let now = Instant::now();
+        let mut heard = lock(&self.heard);
+        let entry = heard
+            .entry(conn.quinn().stable_id())
+            .or_insert((received, now));
+        if entry.0 != received {
+            *entry = (received, now);
+        }
+        now.saturating_duration_since(entry.1)
+    }
+
+    /// Whether `conn` has been silent past [`SILENCE_IS_DEATH`].
+    fn is_silent(&self, conn: &VoxConnection) -> bool {
+        self.silent_for(conn) > SILENCE_IS_DEATH
+    }
+
+    /// Replace `peer`'s silent (or closed) primary with a retired connection to the same peer
+    /// that is still being heard from, if there is one. The dead primary is closed: if anything
+    /// is still behind it the close tells it which connection this end chose, and if nothing is
+    /// there it costs a packet. Among several candidates the lowest [`tie_key`] wins, the same
+    /// order the far end uses.
+    ///
+    /// This is the half of the rule the filing cannot do alone. A restarted peer's connection
+    /// arrives while the old one has been silent only a few seconds, so it goes to the
+    /// tie-break, and loses it half the time: it is retired and served, and the far end — which
+    /// holds nothing else — uses it. Once the old one passes [`SILENCE_IS_DEATH`] the two ends
+    /// must converge on the survivor, and this is where they do.
+    fn promote_heard(&self, peer: &Digest32) -> Option<Arc<VoxConnection>> {
+        let mut map = lock(&self.conns);
+        if let Some(held) = map.get(peer) {
+            if is_live(held) && !self.is_silent(held) {
+                return Some(Arc::clone(held)); // somebody else promoted it first
+            }
+        }
+        let mut retiring = lock(&self.retiring);
+        let best = retiring
+            .iter()
+            .enumerate()
+            .filter(|(_, (c, _))| c.peer_id() == *peer && is_live(c) && !self.is_silent(c))
+            .min_by_key(|(_, (c, _))| tie_key(c))
+            .map(|(i, _)| i)?;
+        let (conn, _) = retiring.swap_remove(best);
+        drop(retiring);
+        if let Some(dead) = map.insert(*peer, Arc::clone(&conn)) {
+            dead.close(WireError::AuthenticatorInvalid);
+        }
+        Some(conn)
+    }
+
+    /// Whether `conn` is the connection currently filed for its peer. A reader serving a
+    /// retired connection asks this before it gives up at the grace: a retired connection can be
+    /// promoted (see [`Self::existing`]), and then it is the peer's connection and must be read
+    /// for as long as it lives.
+    #[must_use]
+    pub fn is_primary(&self, conn: &Arc<VoxConnection>) -> bool {
+        lock(&self.conns)
+            .get(&conn.peer_id())
+            .is_some_and(|c| Arc::ptr_eq(c, conn))
+    }
+
+    /// Sample every connection's liveness, let a heard connection take over from a silent one,
+    /// and close a silent one nothing can replace. A task of its own calls this every second —
+    /// not the actor's tick, which a dead connection can stall. Sampling on a clock is what keeps
+    /// the silence measurement honest: a connection sampled only when somebody asks for it would
+    /// look freshly heard after any gap, and its death would be noticed one [`SILENCE_IS_DEATH`]
+    /// late. Returns how many peers changed connection.
+    pub fn tend_liveness(&self) -> usize {
+        let peers: Vec<(Digest32, Arc<VoxConnection>)> = lock(&self.conns)
+            .iter()
+            .map(|(p, c)| (*p, Arc::clone(c)))
+            .collect();
+        let retired: Vec<Arc<VoxConnection>> = lock(&self.retiring)
+            .iter()
+            .map(|(c, _)| Arc::clone(c))
+            .collect();
+        let mut changed = 0;
+        for (peer, conn) in &peers {
+            if is_live(conn) && !self.is_silent(conn) {
+                continue;
+            }
+            match self.promote_heard(peer) {
+                Some(now) => {
+                    if !Arc::ptr_eq(&now, conn) {
+                        changed += 1;
+                    }
+                }
+                // Nothing live to take over: close the dead one anyway. Hiding it from
+                // `existing` is not enough, because whatever is **already** waiting on it — a
+                // tunnel's stream open, a request sent into it — waits for the 60s idle
+                // timeout otherwise, and an application that sent a request just before the
+                // peer restarted is kept waiting twice as long as the rule says it should be.
+                // Closing ends those waits now, with an error their callers already handle
+                // by dialling again.
+                None => {
+                    let mut map = lock(&self.conns);
+                    if map.get(peer).is_some_and(|held| Arc::ptr_eq(held, conn)) {
+                        map.remove(peer);
+                        drop(map);
+                        conn.close(WireError::AuthenticatorInvalid);
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        // A retired connection that has gone silent is as dead as a primary one, and anything
+        // still carried on it is waiting on nothing.
+        for c in &retired {
+            if is_live(c) && self.is_silent(c) {
+                c.close(WireError::AuthenticatorInvalid);
+            }
+        }
+        // Forget connections that are gone, so the table is bounded by what is held.
+        let present: HashSet<usize> = peers
+            .iter()
+            .map(|(_, c)| c.quinn().stable_id())
+            .chain(retired.iter().map(|c| c.quinn().stable_id()))
+            .collect();
+        lock(&self.heard).retain(|id, _| present.contains(id));
+        changed
     }
 
     /// The live connection to `peer`, dialling its advertised `endpoints` if there
@@ -384,7 +597,14 @@ impl ConnectionManager {
     ///   it, so a tunnel that took the old path is not cut when a better one appears;
     /// - on an **equal** path, the one with the lower [`tie_key`] is kept and the other is
     ///   the loser (a simultaneous dial from both sides, or two dials from one side, lands
-    ///   here).
+    ///   here);
+    /// - except that a held connection **silent past [`SILENCE_IS_DEATH`]** is no rival at
+    ///   all: its process is gone, so the newcomer is filed and the dead one closed. A held
+    ///   connection that is still being heard from is live, whatever address the newcomer came
+    ///   from, and goes to the rules above. A restarted peer whose connection arrives *before*
+    ///   the old one has been silent that long can still lose the tie-break; it is retired and
+    ///   served, and [`Self::existing`] / [`Self::tend_liveness`] promote it once the old one
+    ///   crosses the line.
     ///
     /// Both ends apply the same rule, which is what lets an upgrade land without a
     /// protocol: the side that punched files the direct connection as an improvement,
@@ -437,7 +657,13 @@ impl ConnectionManager {
         let peer = conn.peer_id();
         let mut map = lock(&self.conns);
         if let Some(existing) = map.get(&peer) {
-            if is_live(existing) {
+            // **A held connection that has gone silent is not a rival.** The process behind it
+            // is gone (see [`SILENCE_IS_DEATH`]), so the newcomer is filed and the dead one
+            // closed, whatever the tie-break would have said. Everything else is decided by
+            // path class and then by `tie_key`, which both ends compute identically.
+            if is_live(existing) && self.is_silent(existing) {
+                existing.close(WireError::AuthenticatorInvalid);
+            } else if is_live(existing) {
                 let existing = Arc::clone(existing);
                 let (new_class, held_class) = (
                     path_class(&self.endpoint, &conn),
@@ -467,6 +693,8 @@ impl ConnectionManager {
             }
         }
         let conn = Arc::new(conn);
+        // The baseline for its silence: it has just completed a handshake, so it was heard now.
+        let _ = self.silent_for(&conn);
         map.insert(peer, Arc::clone(&conn));
         Filed {
             kept: conn,
@@ -538,10 +766,13 @@ impl ConnectionManager {
     /// The peers with a live connection, in unspecified order.
     #[must_use]
     pub fn peers(&self) -> Vec<Digest32> {
-        lock(&self.conns)
+        let held: Vec<(Digest32, Arc<VoxConnection>)> = lock(&self.conns)
             .iter()
-            .filter(|(_, c)| is_live(c))
-            .map(|(p, _)| *p)
+            .map(|(p, c)| (*p, Arc::clone(c)))
+            .collect();
+        held.into_iter()
+            .filter(|(_, c)| is_live(c) && !self.is_silent(c))
+            .map(|(p, _)| p)
             .collect()
     }
 

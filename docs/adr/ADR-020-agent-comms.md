@@ -687,7 +687,7 @@ Both unknowns are already spiked; neither remains open.
   independent `EventStream` per client; emission is a non-blocking broadcast; `EventStreamItem::
   Lagged(n)` surfaces lag instead of hiding it. `next_event()`/`try_next_event()` keep their
   signatures, so the TUI, `tunnel_cli` and every existing gate were untouched.
-  *Gate* `node_m19_fanout_gate` (release, ≈2.9 s): with a client wedged from the start, 400 appends
+  *Gate* `node_m19_fanout_gate` (release, ≈2.9 s; in-process, kept until its real-binary replacement lands — RP-45): with a client wedged from the start, 400 appends
   all succeed and the node still answers afterwards; a second client draining concurrently sees the
   whole burst; the wedged client is told it lagged and then resumes; the log holds every entry.
   Mutation-checked twice — swallowing the lag report, and a 100 000-event buffer — both caught.
@@ -718,6 +718,21 @@ Both unknowns are already spiked; neither remains open.
   auto-consent retried on the tick beside `deliver_owed_rekeys` — consent *is* a network act (the
   SKDM rides a pairwise session), so a trusted member that is offline is skipped and picked up when
   it returns, exactly as a re-key is.
+  > **Off the actor 2026-09-25 (v0.2.9).** No member is dialled on the actor any more, for automatic
+  > work or for a command. Before, every owed consent dialled inline, so `vox trust add` with K trusted
+  > members offline across R rooms froze the whole node for up to K×R×`PER_ATTEMPT_TIMEOUT` (10s).
+  > Now the dial runs in the background and `Dialed` delivers what that member is owed at once; a
+  > command dials immediately rather than after `MEMBER_REDIAL_SECS`, and an explicit `consent` keeps
+  > its reply until the dial's outcome is known, so the person still gets the true answer.
+  > *Measured* through the real binaries (anchor, Alice, and Bob and Carol, who joined three rooms
+  > untrusted and then went offline): `vox trust add` for each took 31s and then 62s before, while a
+  > post from another shell waited 29s and 60s (`busy 61545ms — a client command`); after, 0.29–0.73s,
+  > a concurrent post ≤95ms, and no busy line (2 runs per arm).
+  > An explicit consent to a member whose bundle record is not yet on this node's board (a node that
+  > has just started holds only what its first sessions bring in) starts a sync with that member,
+  > which fetches it, and is retried when the room's session ends, up to three times (V29-19). Through
+  > the real `vox tui`, a consent to an online member right after start went from `no reachable peer`
+  > in 0.75s to granted in 0.76–0.80s, 5 runs of 5. An offline member still gets `no reachable peer`.
   **At rest**: sealed under a key derived from the identity (`vox/trust-keyring-sek/v1`, the same
   shape as an anchor's log key), kept as a ciphertext blob in the store's public `meta` table — which
   stays honest, since ciphertext *is* a public fact. Two intended consequences: a stolen disk yields
@@ -979,13 +994,27 @@ Both unknowns are already spiked; neither remains open.
   > **Built on PR #14, 2026-09-25**: `vox agent trust codex` (proof `codex_trust_proof`, against the
   > installed codex-cli 0.157.0 in an isolated `CODEX_HOME`, read back through Codex's own `hooks/list`).
   > It starts a short-lived `codex app-server` over stdio, lists hooks, and writes `trusted_hash =
-  > currentHash` for every **Vox** entry (`vox agent hook`) that is not `trusted` — another tool's entry is
-  > left alone. Measured along the way: the hash covers the entry's definition, not the binary, so a
+  > currentHash` for every **Vox** entry that is not `trusted` — another tool's entry is left alone.
+  > **"Vox's entry" is an exact grammar**, not a substring: bare `vox` or, **as written, never resolved**, the
+  > canonical path of this `vox` binary — not a path ending in `/vox`, and not a symlink to it, which
+  > could be retargeted later under the same trusted text — then `agent hook`, then only `--room`, `--session`,
+  > `--profile` (plain values) and `--format`; no shell metacharacter. `--data-dir`/`--config-dir` are
+  > refused — they would let a tampered entry aim the hook at another profile's rooms — and the plugin
+  > never emits them. Codex runs a
+  > hook's command through a shell, so trusting `curl … | sh; vox agent hook` would authorise it to run
+  > every turn — the first version did exactly that and was **rejected in independent review**
+  > (agent_comms, 2026-09-25). A trusted entry tampered into anything else lists `modified` and is not
+  > re-trusted. Each trusted entry is printed. Measured along the way: the hash covers the entry's definition, not the binary, so a
   > `vox` upgrade keeps trust; a trusted entry whose command changes lists as `modified`, and running the
   > command again re-grants it. Proved: Vox's entry goes untrusted → trusted and a foreign entry stays
   > untrusted; a second run changes `config.toml` not at all; a changed entry reads `modified` and is
-  > re-trusted; with no Vox entry the command fails and says why. Three mutants caught (never writes;
-  > trusts every hook; `modified` counted as trusted). **Not proved:** that a trusted hook then fires in a
+  > re-trusted; with no Vox entry the command fails and says why; five hostile look-alikes (pipe, `;`,
+  > `$(…)`, another binary, an unknown flag) stay untrusted; a trusted entry tampered into a hostile
+  > command stays `modified`; a real file at `…/evil/vox` stays untrusted, and a trusted entry retargeted
+  > from this `vox` to it stays `modified`. a symlink to this `vox` stays untrusted. Rejected three times in
+  > independent review (substring match; any `…/vox` path and the directory flags; symlink resolution)
+  > before this form. Mutants caught: never writes; substring
+  > match; any path ending `/vox`; directory flags allowed; unknown flags; unchecked values. **Not proved:** that a trusted hook then fires in a
   > live Codex turn — that needs a model login in the isolated home, and the proof does not take the
   > operator's credentials. `vox agent plugin codex` now says to run it.
 - **M19.12 — the Codex mid-turn claim is corrected.** Decided 2026-09-24; **text corrected 2026-09-25** in

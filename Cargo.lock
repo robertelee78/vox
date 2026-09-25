@@ -2536,7 +2536,6 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
- "log",
  "pin-project-lite",
  "tracing-core",
 ]
@@ -2651,7 +2650,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vox-agentcomms"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -2659,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "vox-core"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2675,6 +2674,8 @@ dependencies = [
  "ml-dsa",
  "ml-kem",
  "quinn",
+ "quinn-proto",
+ "quinn-udp",
  "rcgen",
  "redb",
  "region",
@@ -2683,6 +2684,7 @@ dependencies = [
  "rustls-post-quantum",
  "sha1",
  "sha2",
+ "socket2",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
@@ -2694,12 +2696,13 @@ dependencies = [
 
 [[package]]
 name = "vox-tui"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
  "crossterm",
+ "getrandom 0.3.4",
  "qrcode",
  "ratatui",
  "reqwest",

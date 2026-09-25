@@ -31,9 +31,21 @@
 //!
 //! ## Acceptance
 //! Received entries pass through the same DAG acceptance predicate as local ones
-//! ([`crate::log::dag::Dag::accept`]): admission, authenticator, quota, feed link,
-//! and fork handling. A peer never trusts an entry merely because it arrived over
+//! ([`crate::log::dag::Dag::accept`]): admission, authenticator, feed link, and
+//! fork handling. A peer never trusts an entry merely because it arrived over
 //! sync.
+//!
+//! ## Serving is bounded by what is held, never by what is asked
+//! A `WANT` is the peer's to write, so nothing in it is trusted for size: each
+//! range is clamped to the entries this node actually holds, overlapping and
+//! duplicate ranges are merged so no entry is sent twice, and one session serves
+//! at most [`MAX_SERVE_ENTRIES`] entries / [`MAX_SERVE_BYTES`] bytes within
+//! [`SERVE_BUDGET`]. That is correctness, not a quota (PRD-001 R4): a session that
+//! stops at the bound still sends what it served, the requester applies it, and
+//! because it applied something it syncs again at once and asks for the rest. A
+//! history of any size therefore still catches up — in as many sessions as it
+//! takes — while no single request can hold the room's lock for longer than the
+//! bound.
 
 use std::collections::VecDeque;
 
@@ -59,6 +71,28 @@ use crate::wire::{FrameId, WireError, SYNC_MODE_FRONTIER, SYNC_MODE_RANGE_RECONC
 /// reclaims a circuit on total idle. A per-frame bound alone defends only against a peer that
 /// stops, never against one that drips.
 const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most entries one session serves to a peer's `WANT`.
+///
+/// The session holds the room's lock throughout, so what one peer may ask for is
+/// what every other operation on the room waits behind. This bounds one session,
+/// not a catch-up: the requester applies what it got and, because it applied
+/// something, syncs again at once for the rest (see the module docs). A thousand
+/// entries verify and file in well under the requester's `DRAIN_BUDGET`.
+pub const MAX_SERVE_ENTRIES: usize = 1024;
+
+/// The most entry bytes one session serves, for the same reason as
+/// [`MAX_SERVE_ENTRIES`]: a single entry may be up to [`MAX_PAYLOAD_LEN`], so a
+/// count alone would still let one `WANT` pull gigabytes into memory. At least one
+/// entry is always served, so an entry larger than this still gets through.
+pub const MAX_SERVE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The serve phase's wall-clock budget. Each frame is bounded by the transport,
+/// but a peer that *reads* one frame every nineteen seconds would otherwise keep
+/// the room's lock for as long as there are entries to send — the drip that
+/// `DRAIN_BUDGET` closes on the other direction. Stopping here is not a failure:
+/// what was served is kept, and the requester comes back for the rest.
+pub const SERVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Hard upper bound on an `ENTRY` frame's carried wire bytes, checked **before**
 /// `to_vec` so a hostile frame cannot force a large allocation ahead of
@@ -442,20 +476,67 @@ pub fn wants_for(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
 }
 
 /// Collect the `ENTRY` wire frames satisfying a peer's `WANT` ranges from the
-/// local [`Dag`]. Entries the local peer does not hold are simply omitted.
+/// local [`Dag`], in per-author seq order, up to [`MAX_SERVE_ENTRIES`] /
+/// [`MAX_SERVE_BYTES`].
+///
+/// **The work is bounded by what this node holds, never by the ranges' numbers.**
+/// This used to loop `from_seq..=to_seq` doing one lookup per number, collecting
+/// into memory with the room's lock held, so a single `WANT (author, 1,
+/// u64::MAX)` — any member may send one — pinned a core on a loop that would not
+/// finish in the life of the machine, and nothing else could touch that room
+/// again (PRD-001 D2). Now each author's ranges are merged, so duplicates and
+/// overlaps cost nothing and serve nothing twice, and each merged range walks
+/// only the entries the feed actually has. Entries not held are simply omitted.
 #[must_use]
 pub fn entries_for_wants(dag: &Dag, wants: &[WantRange]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    for w in wants {
-        if let Some(feed) = dag.feed(&w.author_id) {
-            for seq in w.from_seq..=w.to_seq {
-                if let Some(entry) = feed.get(seq) {
-                    out.push(entry.to_wire());
+    let mut bytes = 0usize;
+    for (author, ranges) in merged_wants(wants) {
+        let Some(feed) = dag.feed(&author) else {
+            continue;
+        };
+        for (from, to) in ranges {
+            for entry in feed.range(from, to) {
+                let wire = entry.to_wire();
+                if !out.is_empty()
+                    && (out.len() >= MAX_SERVE_ENTRIES
+                        || bytes.saturating_add(wire.len()) > MAX_SERVE_BYTES)
+                {
+                    return out;
                 }
+                bytes = bytes.saturating_add(wire.len());
+                out.push(wire);
             }
         }
     }
     out
+}
+
+/// A `WANT`'s ranges grouped by author (in author order) with each author's
+/// ranges sorted and merged, so the ranges are disjoint and ascending. Inverted
+/// ranges are dropped. The cost is `O(n log n)` in the number of ranges, which
+/// the frame size already bounds.
+fn merged_wants(wants: &[WantRange]) -> std::collections::BTreeMap<Digest32, Vec<(u64, u64)>> {
+    let mut by_author: std::collections::BTreeMap<Digest32, Vec<(u64, u64)>> =
+        std::collections::BTreeMap::new();
+    for w in wants.iter().filter(|w| w.from_seq <= w.to_seq) {
+        by_author
+            .entry(w.author_id)
+            .or_default()
+            .push((w.from_seq, w.to_seq));
+    }
+    for ranges in by_author.values_mut() {
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for &(from, to) in ranges.iter() {
+            match merged.last_mut() {
+                Some(last) if from <= last.1.saturating_add(1) => last.1 = last.1.max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+        *ranges = merged;
+    }
+    by_author
 }
 
 /// Map a parse/verify [`Error`] to the M0 wire application-error code (ADR-008
@@ -483,7 +564,6 @@ pub fn wire_error_for(err: &Error) -> WireError {
 pub fn wire_error_for_rejected(rej: &Rejected) -> WireError {
     match rej {
         Rejected::NotAdmitted => WireError::EpochMismatch,
-        Rejected::Quota(_) => WireError::QuotaExceeded,
         Rejected::Verification(e) => wire_error_for(e),
         Rejected::Feed(_) => WireError::AuthenticatorInvalid,
         Rejected::Fork(_) => WireError::AuthenticatorInvalid,
@@ -516,7 +596,7 @@ pub enum ApplyOutcome {
 /// Returns [`ApplyOutcome`] for the non-fatal cases (stored / duplicate / fork)
 /// and `Err(WireError)` only for a *hard wire fail* that must close the stream —
 /// mapped to the exact M0 code via [`wire_error_for`] / [`wire_error_for_rejected`]
-/// (unknown tag, unsupported version, unknown algo, authenticator, quota, …). A
+/// (unknown tag, unsupported version, unknown algo, authenticator, …). A
 /// **fork is not a wire fail**: it is surfaced and sync continues, so two
 /// partitions can exchange conflicting heads and form the proof.
 pub fn apply_entry<R: AuthorResolver>(
@@ -524,14 +604,13 @@ pub fn apply_entry<R: AuthorResolver>(
     resolver: &R,
     admission: &AdmissionPolicy,
     entry_wire: &[u8],
-    now_secs: u64,
 ) -> std::result::Result<ApplyOutcome, WireError> {
     let entry = Entry::from_wire(entry_wire).map_err(|e| wire_error_for(&e))?;
     let key = resolver
         .key_for(&entry.skeleton.author_id)
         .ok_or(WireError::AuthenticatorInvalid)?;
     let kind = resolver.kind_for(&entry);
-    match dag.accept(entry, kind, &key, admission, now_secs) {
+    match dag.accept(entry, kind, &key, admission) {
         Ok(_) => Ok(ApplyOutcome::Stored),
         Err(Rejected::Duplicate) => Ok(ApplyOutcome::Duplicate),
         // A fork is recorded by `accept` (freeze / proof) and surfaced; it does
@@ -561,7 +640,6 @@ pub fn frontier_session<TA, TB, R, P>(
     b: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
     pump: P,
 ) -> std::result::Result<(usize, usize), WireError>
 where
@@ -573,7 +651,7 @@ where
     // Centralized fail-and-close: ANY hard fail closes BOTH endpoints with the
     // exact coded reason (ADR-008 §"Abort / error signalling" — never a silent
     // downgrade, never an unclosed stream).
-    match frontier_session_inner(ta, tb, a, b, resolver, admission, now_secs, pump) {
+    match frontier_session_inner(ta, tb, a, b, resolver, admission, pump) {
         Ok(counts) => Ok(counts),
         Err(code) => {
             ta.close(code);
@@ -591,7 +669,6 @@ fn frontier_session_inner<TA, TB, R, P>(
     b: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
     mut pump: P,
 ) -> std::result::Result<(usize, usize), WireError>
 where
@@ -641,8 +718,8 @@ where
     //    here as the conflicting entry is fed into DAG fork handling; an
     //    attributable fork freezes the equivocator (its WireError is the coded
     //    close). Both peers drain independently.
-    let into_a = drain_entries(ta, a, resolver, admission, now_secs)?;
-    let into_b = drain_entries(tb, b, resolver, admission, now_secs)?;
+    let into_a = drain_entries(ta, a, resolver, admission)?;
+    let into_b = drain_entries(tb, b, resolver, admission)?;
     Ok((into_a, into_b))
 }
 
@@ -668,13 +745,12 @@ pub fn frontier_session_peer<T, R>(
     dag: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
 ) -> std::result::Result<usize, WireError>
 where
     T: Transport,
     R: AuthorResolver,
 {
-    match frontier_session_peer_inner(t, dag, resolver, admission, now_secs) {
+    match frontier_session_peer_inner(t, dag, resolver, admission) {
         Ok(applied) => Ok(applied),
         Err(code) => {
             t.close(code);
@@ -688,7 +764,6 @@ fn frontier_session_peer_inner<T, R>(
     dag: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
 ) -> std::result::Result<usize, WireError>
 where
     T: Transport,
@@ -715,7 +790,13 @@ where
     //    `Transport::close` here (that is the hard-fail path); a clean FIN is the
     //    success terminator. The QUIC mapping finishes the send stream; the
     //    in-memory duplex relies on the drain loop observing an empty inbox.
+    //    Bounded in count, bytes and time (see the module docs); stopping at the
+    //    time bound is a clean end, not a failure — the peer keeps what it got.
+    let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
     for wire in entries_for_wants(dag, &their_wants) {
+        if std::time::Instant::now() >= serve_deadline {
+            break;
+        }
         send(t, encode_entry(&wire))?;
     }
     // Signal a clean end-of-stream on our send side (success terminator, not a
@@ -724,7 +805,138 @@ where
 
     // 5. Drain and apply the entries the peer serves us, until the peer's clean
     //    half-close (recv → Ok(None)).
-    drain_entries(t, dag, resolver, admission, now_secs)
+    drain_entries(t, dag, resolver, admission)
+}
+
+/// What a frontier session may do to a room, **one step at a time**. Each method takes the room's
+/// lock, does its step, releases the lock and returns owned data; none of them sees the transport.
+/// [`frontier_session_room`] sees the transport and never the room. So no lock can be held across a
+/// network wait, and the compiler keeps it that way: there is no scope in which both exist.
+///
+/// This replaces a session that held the room's mutex from its first frame to its last. A peer that
+/// was slow to answer then held the room for up to the frame timeout, and every other use of the
+/// room — a message being posted, the node's view being published after every event — waited
+/// behind it (ADR-008's own implementation note named the fix).
+pub trait SessionRoom {
+    /// The room's frontiers, for `HAVE`.
+    ///
+    /// # Errors
+    /// The room is unusable (poisoned, or moved to another epoch).
+    fn frontiers(&self) -> std::result::Result<Vec<FeedFrontier>, WireError>;
+    /// What to ask the peer for, given its `HAVE`.
+    ///
+    /// # Errors
+    /// As [`SessionRoom::frontiers`].
+    fn wants(&self, remote: &[FeedFrontier]) -> std::result::Result<Vec<WantRange>, WireError>;
+    /// The entries to serve for the peer's `WANT` — owned and bounded.
+    ///
+    /// # Errors
+    /// As [`SessionRoom::frontiers`].
+    fn entries(&self, wants: &[WantRange]) -> std::result::Result<Vec<Vec<u8>>, WireError>;
+    /// Apply a batch of received entries under a fresh lock, **against the room's current rules**: an
+    /// author revoked while the batch was on the wire is refused, and a room that moved to another
+    /// epoch refuses the whole batch. Returns how many were newly stored.
+    ///
+    /// # Errors
+    /// A hard sync failure from an entry, or the room is unusable.
+    fn apply(&self, staged: Vec<Vec<u8>>) -> std::result::Result<usize, WireError>;
+}
+
+/// How many received entries are staged before a batch is applied. Bounds what a session holds in
+/// memory between locks; each batch is one short hold of the room.
+pub const MAX_STAGED: usize = 256;
+
+/// One peer's half of a frontier session, over `t`, against `room` — the same protocol as
+/// [`frontier_session_peer`], with the room locked only inside each [`SessionRoom`] step and never
+/// across a send or a receive.
+///
+/// # Errors
+/// The coded [`WireError`] of a hard fail; the transport is closed with it.
+pub fn frontier_session_room<T, S>(t: &mut T, room: &S) -> std::result::Result<usize, WireError>
+where
+    T: Transport,
+    S: SessionRoom + ?Sized,
+{
+    match frontier_session_room_inner(t, room) {
+        Ok(applied) => Ok(applied),
+        Err(code) => {
+            t.close(code);
+            Err(code)
+        }
+    }
+}
+
+fn frontier_session_room_inner<T, S>(t: &mut T, room: &S) -> std::result::Result<usize, WireError>
+where
+    T: Transport,
+    S: SessionRoom + ?Sized,
+{
+    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
+
+    send(t, encode_hello(SYNC_MODE_FRONTIER))?;
+    let remote_hello = expect_hello(t.recv())?;
+    negotiate_mode(SYNC_MODE_FRONTIER, remote_hello)?;
+
+    send(t, encode_have(&room.frontiers()?))?;
+    let remote_have = expect_have(t.recv())?;
+
+    send(t, encode_want(&room.wants(&remote_have)?))?;
+    let their_wants = expect_want(t.recv())?;
+
+    let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
+    for wire in room.entries(&their_wants)? {
+        if std::time::Instant::now() >= serve_deadline {
+            break;
+        }
+        send(t, encode_entry(&wire))?;
+    }
+    t.finish();
+
+    // Drained with no lock held; applied a batch at a time under a fresh one.
+    let deadline = std::time::Instant::now() + DRAIN_BUDGET;
+    let mut staged: Vec<Vec<u8>> = Vec::new();
+    let mut applied = 0;
+    while let Some(frame) = t.recv().map_err(|_| WireError::TransportFailed)? {
+        if std::time::Instant::now() >= deadline {
+            return Err(WireError::SyncModeUnsupported);
+        }
+        match decode_frame(&frame) {
+            Ok(SyncFrame::Entry(wire)) => {
+                staged.push(wire);
+                if staged.len() >= MAX_STAGED {
+                    applied += room.apply(std::mem::take(&mut staged))?;
+                }
+            }
+            Ok(_) | Err(_) => return Err(WireError::SyncModeUnsupported),
+        }
+    }
+    if !staged.is_empty() {
+        applied += room.apply(staged)?;
+    }
+    Ok(applied)
+}
+
+/// Apply staged entries into `dag`, returning how many were newly stored — the apply half of
+/// [`SessionRoom::apply`], for a caller that already holds its room.
+///
+/// # Errors
+/// The first hard sync failure.
+pub fn apply_staged<R: AuthorResolver>(
+    dag: &mut Dag,
+    resolver: &R,
+    admission: &AdmissionPolicy,
+    staged: &[Vec<u8>],
+) -> std::result::Result<usize, WireError> {
+    let mut stored = 0;
+    for wire in staged {
+        if matches!(
+            apply_entry(dag, resolver, admission, wire)?,
+            ApplyOutcome::Stored
+        ) {
+            stored += 1;
+        }
+    }
+    Ok(stored)
 }
 
 /// Read and apply every queued `ENTRY` frame on `t` into `dag`. A hard fail
@@ -738,7 +950,6 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
     dag: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
 ) -> std::result::Result<usize, WireError> {
     let mut applied = 0;
     // **The whole phase is bounded, not just the gap between frames.**
@@ -760,7 +971,7 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
         match decode_frame(&frame) {
             Ok(SyncFrame::Entry(wire)) => {
                 if matches!(
-                    apply_entry(dag, resolver, admission, &wire, now_secs)?,
+                    apply_entry(dag, resolver, admission, &wire)?,
                     ApplyOutcome::Stored
                 ) {
                     applied += 1;
@@ -768,8 +979,8 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
             }
             // **A protocol violation, not something to ignore.** This phase is defined as entries
             // only, and silently accepting anything else is what made the hold above free: a
-            // non-entry frame costs the sender nothing, never reaches `apply_entry`, and therefore
-            // never touches the quota that is supposed to bound this exchange.
+            // non-entry frame costs the sender nothing and never reaches `apply_entry`, so it
+            // would buy the whole budget for free.
             Ok(_) => return Err(WireError::SyncModeUnsupported),
             Err(_) => return Err(WireError::SyncModeUnsupported),
         }
@@ -824,7 +1035,6 @@ pub fn range_reconcile_exchange<R: AuthorResolver>(
     b: &mut Dag,
     resolver: &R,
     admission: &AdmissionPolicy,
-    now_secs: u64,
 ) -> std::result::Result<(usize, usize), WireError> {
     let _mode = negotiate_mode(
         SYNC_MODE_FRONTIER | SYNC_MODE_RANGE_RECONCILIATION,
@@ -864,8 +1074,8 @@ pub fn range_reconcile_exchange<R: AuthorResolver>(
     }
 
     // Apply: a pulls its `need` from b; b pulls its `need` (= a's `have`) from a.
-    let applied_into_a = apply_hashes(a, b, resolver, admission, &a_need, now_secs)?;
-    let applied_into_b = apply_hashes(b, a, resolver, admission, &a_have, now_secs)?;
+    let applied_into_a = apply_hashes(a, b, resolver, admission, &a_need)?;
+    let applied_into_b = apply_hashes(b, a, resolver, admission, &a_have)?;
     Ok((applied_into_a, applied_into_b))
 }
 
@@ -893,7 +1103,6 @@ fn apply_hashes<R: AuthorResolver>(
     resolver: &R,
     admission: &AdmissionPolicy,
     hashes: &[Digest32],
-    now_secs: u64,
 ) -> std::result::Result<usize, WireError> {
     // Gather the source entries, then order by (author, seq) so prev/lipmaa links
     // are satisfiable as they are appended.
@@ -908,7 +1117,7 @@ fn apply_hashes<R: AuthorResolver>(
     let mut applied = 0;
     for (_, _, wire) in wires {
         if matches!(
-            apply_entry(dst, resolver, admission, &wire, now_secs)?,
+            apply_entry(dst, resolver, admission, &wire)?,
             ApplyOutcome::Stored
         ) {
             applied += 1;

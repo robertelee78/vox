@@ -50,6 +50,31 @@ use crate::node::syncstream::{SyncSchedule, SyncTrigger};
 use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
 
+/// A pairwise session this node opened (ADR-021 F12).
+#[derive(Debug, Clone)]
+struct Initiated {
+    /// The hello that lets the peer accept it; `None` for a session opened on the join
+    /// path, which the join protocol itself delivered.
+    initial: Option<InitialMessage>,
+    /// Whether that hello has reached the peer. Until it has, every delivery over the
+    /// session carries it again — a peer cannot open anything sealed under a session it
+    /// was never offered.
+    hello_delivered: bool,
+}
+
+/// **Which of two competing sessions for one pair both ends keep** (ADR-021 F12): the
+/// one opened by the lower fingerprint. Two members that opened a session to each other
+/// at the same moment each hold their own; both apply this rule and so keep the same
+/// one. `existing_mine` says whether the session already held was opened by `me`; the
+/// incoming one was opened by `peer`.
+///
+/// A second session from the same opener replaces the first: a peer only opens a
+/// session when it holds none, so a new hello from the peer that opened ours means it
+/// lost its state (a restart — sessions are not persisted), and the old one is dead.
+fn incoming_session_wins(me: &Digest32, peer: &Digest32, existing_mine: bool) -> bool {
+    !existing_mine || peer < me
+}
+
 /// Command queue depth (commands beyond it apply backpressure to the client).
 const COMMAND_QUEUE: usize = 64;
 /// Event buffer depth, per subscriber (ADR-020 §7).
@@ -86,6 +111,25 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// immediately after a local append" means *within one tick* — authoring never waits
 /// on the network.
 const TICK: Duration = Duration::from_secs(1);
+
+/// How often automatic work (a rotation's rekeys, a trusted member's consent) may start a background
+/// dial to one member it cannot currently reach. See `reach_member`.
+const MEMBER_REDIAL_SECS: u64 = 30;
+
+/// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
+/// thread, an aborted join — to let go of the profile's store before answering. With the network
+/// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+/// How long one publish round to one board may take before it is given up until the next round: a
+/// live board answers each put in milliseconds. See `publish_channel_to_anchor`.
+const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
+/// How long a delivered sender key may go unanswered before it is counted as not taken and sent
+/// again. See `pairwise_stream::refused`.
+const KEY_DELIVERY_PATIENCE: Duration = Duration::from_secs(30);
+/// How many failed sessions in a row a `(room, peer)` push is retried on the next tick before it is
+/// left to the periodic interval. Enough to ride out a collision (both sides pushing at once); few
+/// enough that a peer whose sessions always fail cannot hold the room.
+const MAX_PUSH_RETRIES: u32 = 3;
 
 /// How often a peer reached over a relay is retried for a direct path.
 ///
@@ -200,8 +244,15 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AnchorConnected { .. } => "publishing every room to an anchor that answered",
         NetEvent::AddressesDiscovered { .. } => "publishing every room at a new address",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
+        NetEvent::PushRetry { .. } => "retrying a push that failed",
+        NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
+        NetEvent::PublishDone { .. } => "filing what a board said to a publish",
+        NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
+        NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
+        NetEvent::Dialed { .. } => "adopting a connection a join dialled",
+        NetEvent::JoinerDone { .. } => "finishing a join",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped => "shutting the network down",
     }
@@ -486,8 +537,46 @@ enum NetEvent {
     SyncDone {
         /// The channel that was reconciled.
         channel_id: Digest32,
+        /// The peer it was reconciled with.
+        peer: Digest32,
         /// What the session did, or why it failed.
         outcome: crate::error::Result<crate::node::channel::SyncOutcome>,
+    },
+    /// A sender key written to `peer` was taken: any backoff on re-sending to it ends.
+    SkdmTaken {
+        /// The room.
+        channel_id: Digest32,
+        /// The member that took it.
+        peer: Digest32,
+    },
+    /// A sender key written to `peer` was not taken (see `pairwise_stream::refused`): it is owed
+    /// again, and the tick re-sends it.
+    SkdmRefused {
+        /// The room.
+        channel_id: Digest32,
+        /// The member it was for.
+        peer: Digest32,
+        /// The generation that did not land.
+        chain_id: u64,
+        /// What the recipient's side said.
+        why: String,
+    },
+    /// A publish round to a board ended (see `publish_channel_to_anchor`).
+    PublishDone {
+        /// The room.
+        channel_id: Digest32,
+        /// The board it went to.
+        board: Digest32,
+        /// Each kind of record and the board's refusal of it, if any.
+        outcomes: Vec<(&'static str, Option<String>)>,
+    },
+    /// A push whose session failed is due again for that peer — sent after a short random wait by
+    /// the `SyncDone` handler, so two ends that collided do not retry together.
+    PushRetry {
+        /// The room.
+        channel_id: Digest32,
+        /// The peer the push failed to.
+        peer: Digest32,
     },
     /// A join exchange finished on its own task and is handing back what the actor must
     /// apply: the admission, the session, and the event a person sees.
@@ -529,6 +618,49 @@ enum NetEvent {
         /// Answered once the admission is applied, which releases the acceptance frame. A dropped
         /// sender answers too — the slot must never wait on an actor that has moved on.
         ack: tokio::sync::oneshot::Sender<()>,
+    },
+    /// A joiner's task dialled a peer: adopt the connection now, so its streams are served while
+    /// the join is still running over it.
+    Dialed {
+        /// The connection.
+        conn: Arc<crate::transport::quic::VoxConnection>,
+        /// The endpoints it was dialled at, for a later path upgrade.
+        endpoints: crate::nat::multiaddr::EndpointList,
+        /// Whether it is the board the join reads from (and so an anchor of ours).
+        board: bool,
+    },
+    /// A joiner's task finished: make the room, or say why not, and answer the command.
+    JoinerDone {
+        /// The `JoinChannel` command's reply.
+        reply: oneshot::Sender<Outcome>,
+        /// The link joined with.
+        parsed: Box<crate::node::link::InviteLink>,
+        /// The room's local name.
+        local_name: String,
+        /// The passphrase, kept by the room's state.
+        passphrase: Secret,
+        /// When the join began.
+        now: u64,
+        /// This node's fingerprint.
+        me: Digest32,
+        /// What the join came to. Boxed: a won join carries a whole session.
+        result: Box<std::result::Result<JoinerWon, JoinerLost>>,
+    },
+    /// A room's key was sealed under its passphrase on a blocking thread (the slow part of
+    /// creating a room): finish the room and answer the command that asked for it.
+    ChannelSealed {
+        /// The `CreateChannel` command's reply, answered once the room exists.
+        reply: oneshot::Sender<Outcome>,
+        /// The room's local name.
+        local_name: String,
+        /// The passphrase, kept by the room's state.
+        passphrase: Secret,
+        /// The genesis made before the seal.
+        genesis: Box<crate::governance::genesis::Genesis>,
+        /// When the room was begun.
+        now: u64,
+        /// The room key and its sealed wrap, or why sealing failed.
+        sealed: crate::error::Result<(crate::atrest::sek::Sek, crate::atrest::SekWrap)>,
     },
     /// A record by another author was admitted to this node's board, so what this node can
     /// vouch for has grown and its anchors do not know it yet.
@@ -573,6 +705,20 @@ fn spawn_stream_loop(
             let _ = net.learn_observed(peer).await;
         });
     }
+    // **The loop does not hold the connection; it holds a way to reach it.** Waiting for
+    // streams needs only the quinn handle, and a stream that arrives needs the
+    // `VoxConnection` only for as long as it is served, so the loop keeps a `Weak` and
+    // upgrades it per stream.
+    //
+    // Holding the `Arc` here made every connection look carried for its whole life. A
+    // connection's strong count is how `ConnectionManager::retire_expired` tells a retired
+    // path that is still carrying a tunnel from one that is not, and with this loop in the
+    // count it was never below two: a relayed connection displaced by a direct one was
+    // never closed, and its circuit held a relay slot until the relay's idle timeout. With
+    // the loop out of the count, what remains is what the count is meant to measure — the
+    // manager, and whatever is serving a stream or splicing a tunnel on it.
+    let quic = conn.quinn().clone();
+    let conn = Arc::downgrade(&conn);
     tokio::spawn(async move {
         // One stream failing is **not** the connection failing. A refused kind, a
         // malformed frame or a peer that abandons a stream must not stop the others
@@ -597,10 +743,10 @@ fn spawn_stream_loop(
             // Only these three. Every other kind is handed on in the order it arrived, as before:
             // a pairwise hello and the key that follows it are separate streams, and reordering
             // them is exactly the race F12 was.
-            let (kind, send, recv) = match net.accept_authorized(&conn).await {
+            let (kind, send, recv) = match net.accept_authorized_on(&quic, peer).await {
                 Ok(accepted) => accepted,
                 Err(_) => {
-                    if conn.quinn().close_reason().is_some() {
+                    if quic.close_reason().is_some() {
                         break; // the peer or the network closed it
                     }
                     failures += 1;
@@ -609,6 +755,11 @@ fn spawn_stream_loop(
                     }
                     continue;
                 }
+            };
+            // Nobody holds the connection any more: the node has let it go, and a stream
+            // arriving on it has nothing to be served against.
+            let Some(conn) = conn.upgrade() else {
+                break;
             };
             if matches!(
                 kind,
@@ -719,7 +870,7 @@ fn spawn_stream_loop(
                     }
                 }
                 Err(_) => {
-                    if conn.quinn().close_reason().is_some() {
+                    if quic.close_reason().is_some() {
                         break; // the peer or the network closed it
                     }
                     failures += 1;
@@ -850,17 +1001,11 @@ async fn serve_filed(
     // we preferred another, so it opens streams there — and serving only the kept
     // connection leaves the retired one transport-alive and application-deaf, which is
     // worse than the close it replaced.
+    //
+    // The reader needs no bound of its own: a stream loop does not hold its connection, so
+    // it ends when `retire_expired` closes the retired one and cannot keep it from closing.
     if let Some(also) = filed.also_serve {
-        // Bounded by the retirement grace: `retire_expired` will not close a connection
-        // while anything still holds it, and a stream loop holds its `Arc` for the
-        // connection's life — so an unbounded reader would pin the very thing whose
-        // purpose is to be let go.
-        let grace = Duration::from_secs(net.manager().retire_grace_secs());
-        let loop_task = spawn_stream_loop(Arc::clone(net), also, tx.clone());
-        tokio::spawn(async move {
-            tokio::time::sleep(grace).await;
-            loop_task.abort();
-        });
+        spawn_stream_loop(Arc::clone(net), also, tx.clone());
     }
     spawn_stream_loop(Arc::clone(net), filed.kept, tx.clone());
     tx.send(NetEvent::Connected { peer }).await.is_ok()
@@ -912,6 +1057,350 @@ const PUBLISH_REFUSAL_GRACE: u64 = 60;
 /// Named here because each would fail identically against every member of the room, and
 /// retrying would multiply the proof-of-work cost while changing nothing — and for a
 /// passphrase it would look from the outside like an attempt to guess it.
+/// Everything the network half of a join needs, captured on the actor so the half can run on a
+/// task of its own. See `Node::begin_join_channel`.
+struct Joiner {
+    net: Arc<NodeNet>,
+    tx: mpsc::Sender<NetEvent>,
+    me: Digest32,
+    parsed: crate::node::link::InviteLink,
+    routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)>,
+    signer: Arc<crate::atrest::vault::VaultRootSigner>,
+    ring: Arc<tokio::sync::Mutex<PrekeyRing>>,
+    seq: u64,
+    now: u64,
+    pow_params: Option<crate::join::pow::PowParams>,
+    argon2: Argon2Profile,
+    passphrase: Secret,
+}
+
+/// A join that got in: what the actor needs to make the room.
+struct JoinerWon {
+    joined: crate::node::joinstream::JoinOutcome,
+    responder: Digest32,
+    conn: Arc<VoxConnection>,
+    set: crate::nat::service::RecordSet,
+    genesis: crate::governance::genesis::Genesis,
+    sealed: (crate::atrest::sek::Sek, crate::atrest::SekWrap),
+    /// How long each step took: see `JoinSteps`.
+    steps: JoinSteps,
+}
+
+/// A join that did not: the fault to answer with, and each responder's reason.
+struct JoinerLost {
+    fault: Fault,
+    why: Vec<String>,
+    steps: JoinSteps,
+}
+
+impl JoinerLost {
+    fn of(fault: Fault) -> Self {
+        Self {
+            fault,
+            why: Vec::new(),
+            steps: JoinSteps::default(),
+        }
+    }
+}
+
+/// How long each step of a join took, carried on the join's own outcome so a join that failed —
+/// or took 30s — says where its time went. The join ranged 1.3–33.6s end to end with the node
+/// answering throughout, and "somewhere in the join" is not a diagnosis.
+#[derive(Default)]
+struct JoinSteps(Vec<String>);
+
+impl JoinSteps {
+    fn took(&mut self, what: &str, since: std::time::Instant) {
+        self.0
+            .push(format!("{what} {:.2}s", since.elapsed().as_secs_f64()));
+    }
+    fn note(&mut self, what: String) {
+        self.0.push(what);
+    }
+    fn render(&self) -> String {
+        self.0.join(", ")
+    }
+}
+
+impl Joiner {
+    /// Dial a peer, and tell the actor at once so it serves the connection's streams — the
+    /// responder talks to us over it during the join itself.
+    async fn dial(
+        &self,
+        peer: Digest32,
+        endpoints: &crate::nat::multiaddr::EndpointList,
+        board: bool,
+    ) -> crate::error::Result<Arc<VoxConnection>> {
+        let conn = self.net.reach(peer, endpoints).await?;
+        let _ = self
+            .tx
+            .send(NetEvent::Dialed {
+                conn: Arc::clone(&conn),
+                endpoints: endpoints.clone(),
+                board,
+            })
+            .await;
+        Ok(conn)
+    }
+
+    async fn reach_a_board(&self) -> Option<Arc<VoxConnection>> {
+        let deadline = tokio::time::Instant::now() + Node::BOARD_PATIENCE;
+        loop {
+            for (id, endpoints) in &self.routes {
+                if let Ok(conn) = self.dial(*id, endpoints, true).await {
+                    return Some(conn);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Node::BOARD_RETRY).await;
+        }
+    }
+
+    /// The network half of a join, and the room key's seal: the old inline `join_channel` from
+    /// reaching a board to the end of the exchange, unchanged in order and in its refusals.
+    async fn run(self) -> std::result::Result<JoinerWon, JoinerLost> {
+        let mut steps = JoinSteps::default();
+        let result = self.run_steps(&mut steps).await;
+        match result {
+            Ok(mut won) => {
+                won.steps = steps;
+                Ok(won)
+            }
+            Err(mut lost) => {
+                lost.steps = steps;
+                Err(lost)
+            }
+        }
+    }
+
+    async fn run_steps(&self, steps: &mut JoinSteps) -> std::result::Result<JoinerWon, JoinerLost> {
+        let parsed = &self.parsed;
+        let net = Arc::clone(&self.net);
+        let t = std::time::Instant::now();
+        let Some(board) = self.reach_a_board().await else {
+            steps.took("board (unreached)", t);
+            return Err(JoinerLost::of(Fault::Unreachable));
+        };
+        steps.took("board", t);
+        let t = std::time::Instant::now();
+        let mut set = net
+            .fetch_channel(&board, &parsed.channel_id, 0)
+            .await
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        steps.took("fetch", t);
+        let Some(genesis) = set.genesis.clone() else {
+            return Err(JoinerLost::of(Fault::BadLink));
+        };
+        let me = self.me;
+        let candidates: Vec<Digest32> = {
+            use std::collections::BTreeSet;
+            let with_address: BTreeSet<Digest32> = set
+                .members
+                .iter()
+                .filter(|r| !r.endpoints.is_empty())
+                .map(|r| r.author_id)
+                .collect();
+            let mut known: BTreeSet<Digest32> = set.members.iter().map(|r| r.author_id).collect();
+            known.extend(set.bundles.iter().map(|b| b.author_id));
+            if let Some(g) = set.genesis.as_ref() {
+                known.insert(g.body.creator_pubkey.fingerprint());
+            }
+            known.remove(&me);
+            let mut reachable: Vec<Digest32> = known.intersection(&with_address).copied().collect();
+            let mut awaited: Vec<Digest32> = known.difference(&with_address).copied().collect();
+            reachable.sort_unstable();
+            awaited.sort_unstable();
+            let mut ordered = Vec::with_capacity(known.len() + 1);
+            if let Some(r) = parsed.responder {
+                ordered.push(r);
+                reachable.retain(|m| *m != r);
+                awaited.retain(|m| *m != r);
+            }
+            ordered.extend(reachable);
+            ordered.extend(awaited);
+            if ordered.is_empty() {
+                return Err(JoinerLost::of(Fault::BadLink));
+            }
+            ordered.truncate(MAX_JOIN_RESPONDERS);
+            ordered
+        };
+        let prejoin_wire = {
+            let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
+            let ring = self.ring.lock().await;
+            let bundle = ring
+                .bundle(&crate::identity::composite::RootSigner::public_key(signer))
+                .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+            let endpoints = net
+                .local_endpoints()
+                .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+            crate::nat::record::PreJoinRecord::build(
+                signer,
+                &parsed.channel_id,
+                bundle,
+                endpoints,
+                self.seq,
+                self.now,
+            )
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?
+            .to_wire()
+        };
+        announce(&board, &prejoin_wire)
+            .await
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        let mut why: Vec<String> = Vec::new();
+        let mut last_fault = Fault::Unreachable;
+        let mut joined_outcome = None;
+        for responder in candidates {
+            let mut responder_endpoints = set
+                .members
+                .iter()
+                .find(|r| r.author_id == responder)
+                .map(|r| r.endpoints.clone())
+                .unwrap_or_default();
+            let short = crate::node::network::short_id(responder);
+            if responder_endpoints.is_empty() && board.peer_id() != responder {
+                let t = std::time::Instant::now();
+                let mut polls = 0u32;
+                let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
+                while tokio::time::Instant::now() < deadline {
+                    polls += 1;
+                    tokio::time::sleep(JOIN_ADDRESS_POLL).await;
+                    let Ok(fresh) = net.fetch_channel(&board, &parsed.channel_id, 0).await else {
+                        continue;
+                    };
+                    let found = fresh
+                        .members
+                        .iter()
+                        .find(|r| r.author_id == responder)
+                        .map(|r| r.endpoints.clone())
+                        .unwrap_or_default();
+                    if !found.is_empty() {
+                        responder_endpoints = found;
+                        set = fresh;
+                        break;
+                    }
+                }
+                steps.note(format!(
+                    "{short}: address poll ×{polls} {:.2}s{}",
+                    t.elapsed().as_secs_f64(),
+                    if responder_endpoints.is_empty() {
+                        " (none)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            // Before the exchange: its key comes back the moment it admits us (see
+            // `PeerClass::JoinResponder`).
+            self.net.policy().expect_join_responder(responder);
+            let conn = if board.peer_id() == responder {
+                Arc::clone(&board)
+            } else {
+                let t = std::time::Instant::now();
+                let dialled = self.dial(responder, &responder_endpoints, false).await;
+                steps.took(&format!("{short}: dial"), t);
+                match dialled {
+                    Ok(c) => {
+                        if let Err(e) = announce(&c, &prejoin_wire).await {
+                            last_fault = fault_of(&e);
+                            if !worth_another_responder(last_fault) {
+                                return Err(JoinerLost {
+                                    fault: last_fault,
+                                    why,
+                                    steps: JoinSteps::default(),
+                                });
+                            }
+                            continue;
+                        }
+                        c
+                    }
+                    Err(e) => {
+                        last_fault = fault_of(&e);
+                        why.push(format!(
+                            "{}: {e}",
+                            crate::node::network::short_id(responder)
+                        ));
+                        if !worth_another_responder(last_fault) {
+                            return Err(JoinerLost {
+                                fault: last_fault,
+                                why,
+                                steps: JoinSteps::default(),
+                            });
+                        }
+                        continue;
+                    }
+                }
+            };
+            let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
+            let dh = *signer.x25519_identity_secret();
+            let mut ctx = crate::node::channel::join_context_from_genesis(&genesis, 0)
+                .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+            if let Some(pow) = self.pow_params {
+                ctx.pow_params = pow;
+            }
+            let ik = crate::identity::keyagreement::X25519IdentityKey::from_secret_bytes(dh);
+            let t = std::time::Instant::now();
+            let exchanged = net
+                .start_join(&conn, ctx, &self.passphrase, signer, &ik)
+                .await;
+            steps.took(&format!("{short}: exchange (incl. solve)"), t);
+            match exchanged {
+                Ok(o) => {
+                    joined_outcome = Some((o, responder, conn));
+                    break;
+                }
+                Err(e) => {
+                    last_fault = fault_of(&e);
+                    if !worth_another_responder(last_fault) {
+                        return Err(JoinerLost {
+                            fault: last_fault,
+                            why,
+                            steps: JoinSteps::default(),
+                        });
+                    }
+                }
+            }
+        }
+        let Some((joined, responder, conn)) = joined_outcome else {
+            return Err(JoinerLost {
+                fault: last_fault,
+                why,
+                steps: JoinSteps::default(),
+            });
+        };
+        // The room key, sealed under the passphrase with production Argon2id — seconds of CPU,
+        // on a blocking thread and not the actor.
+        let sek = crate::atrest::sek::Sek::generate().map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        let (signer, channel_id, passphrase, argon2) = (
+            Arc::clone(&self.signer),
+            parsed.channel_id,
+            self.passphrase.clone(),
+            self.argon2,
+        );
+        let t = std::time::Instant::now();
+        let sealed = tokio::task::spawn_blocking(move || {
+            let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
+            sek.seal(&factor, &channel_id, &passphrase, argon2)
+                .map(|wrap| (sek, wrap))
+        })
+        .await
+        .unwrap_or(Err(Error::Argon2Failed))
+        .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        steps.took("seal", t);
+        Ok(JoinerWon {
+            joined,
+            responder,
+            conn,
+            set,
+            genesis,
+            sealed,
+            steps: JoinSteps::default(),
+        })
+    }
+}
+
 const fn worth_another_responder(fault: Fault) -> bool {
     !matches!(
         fault,
@@ -1117,6 +1606,14 @@ pub struct Node {
     schedules: BTreeMap<Digest32, SyncSchedule>,
     /// Channels with a local append not yet pushed to peers.
     pending_push: std::collections::BTreeSet<Digest32>,
+    /// Which peers each room's latest append has already gone to. **Owed is per (room, peer).**
+    /// With only `pending_push`, a room still owed to *one* peer was pushed again to *every* peer:
+    /// a member that had it already took the room again, and each `SyncDone` freed a room only for
+    /// the peer that sorted first to take it back. Measured in `node_m19_untrust_lock_gate` on
+    /// v0.2.9's integration tree: Alice ran ~40,000 empty sessions (`Ok((0, 0, 0))`) with Carol in
+    /// two minutes while Bob found both rooms mid-session on every pass and never got one, so he
+    /// never read the post. Cleared for a room by its next append, and for a peer by a failed push.
+    pushed_to: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// Slots for sync setups and sessions; see [`SYNCS_IN_FLIGHT`].
     sync_slots: Arc<tokio::sync::Semaphore>,
     /// The last refusal reported per room and record kind, so a standing one is said once.
@@ -1174,14 +1671,71 @@ pub struct Node {
     /// message posted right after a join crossed in 20s or 40s — one and two frame timeouts — instead
     /// of the 0-1s it takes when the rooms are free.
     syncing: std::collections::BTreeSet<Digest32>,
+    /// Rooms this node is joining right now (their join is on a `Joiner` task).
+    joining: std::collections::BTreeSet<Digest32>,
+    /// Pairwise streams for a room still being joined, held until the join reports back: see
+    /// `take_inbound_skdm`.
+    held_pairwise: Vec<(
+        Digest32,
+        Digest32,
+        crate::node::pairwise_stream::PairwiseFrame,
+        quinn::SendStream,
+        quinn::RecvStream,
+    )>,
+    /// Rooms whose anchor publish found them mid-session: run when that session's `SyncDone`
+    /// lands. See `publish_channel_to_anchors`.
+    publish_owed: std::collections::BTreeSet<Digest32>,
+    /// `(room, board)` publish rounds in flight on their own tasks; see `publish_channel_to_anchor`.
+    publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// Publishes asked for while that `(room, board)` round was in flight: run when it ends.
+    publish_again: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// Creates and joins answered once their room's publish rounds have ended: see
+    /// `answer_when_published`.
+    publish_waiters: Vec<(Digest32, oneshot::Sender<Outcome>, Outcome)>,
+    /// A local append (or a finished session with pushes still owed) wants `run_due_syncs` now
+    /// rather than at the next tick. See `push_if_owed`.
+    push_now: bool,
+    /// When a background dial to each member was last started: see `reach_member`.
+    member_dialed_at: BTreeMap<Digest32, u64>,
+    /// Explicit consents waiting on the network: for a member's dial (answered on `Dialed` by
+    /// delivering, or on `ReachFailed` as `Unreachable`), or for that member's bundle record to
+    /// reach this node's board (retried on the room's `SyncDone`). Each carries its attempts so
+    /// far, so one that cannot succeed is answered rather than kept. The person gets the real
+    /// outcome and the node keeps answering meanwhile.
+    pending_consents: Vec<(Digest32, Digest32, oneshot::Sender<Outcome>, u8)>,
+    /// Consecutive failed sessions per `(room, peer)`; see `MAX_PUSH_RETRIES`.
+    push_failures: BTreeMap<(Digest32, Digest32), u32>,
+    /// Peers that were skipped behind a busy room or had a push re-owed: served first on the next
+    /// pass, so a peer that always takes the room cannot always go first.
+    owed_first: std::collections::BTreeSet<Digest32>,
+    /// Per `(room, member)`: consecutive keys not taken, and the unix second before which the
+    /// tick does not send it another. Without it, a pair that could not converge was sent a key
+    /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
+    key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
     /// Per-channel record sequence for board publishes (strictly increasing per
-    /// `(author, channel, epoch)`, ADR-012).
+    /// `(author, channel, epoch)`, ADR-012), across restarts too: see `next_record_seq`.
     record_seq: BTreeMap<Digest32, u64>,
     /// Pairwise ADR-004 sessions, keyed by `(channel, peer)` — a session is bound to
     /// a `(channelID, epoch)`, so one peer may have several. In memory for this
     /// process only: persisting ratchet state is not part of M14, so a restart
     /// re-establishes a session on the next join or key exchange.
     sessions: BTreeMap<(Digest32, Digest32), crate::pairwise::session::Session>,
+    /// The sessions in [`Self::sessions`] that **this node opened**, and whether the
+    /// peer has been sent the hello that lets it accept them (ADR-021 F12).
+    ///
+    /// Two members can open a session to each other at the same moment — both
+    /// auto-consent when they trust each other, and each finds no session and opens
+    /// one. Each then holds its own and ignores the other's hello, and neither can
+    /// open the key the other sent. Knowing which sessions are ours is what lets both
+    /// ends apply one rule and converge: [`incoming_session_wins`].
+    initiated: BTreeMap<(Digest32, Digest32), Initiated>,
+    /// The hello each peer-opened session was accepted from, by hash, so a peer
+    /// re-sending the same hello is recognised and does not re-consume a one-time
+    /// prekey or reset a session that is already in use.
+    accepted_hello: BTreeMap<(Digest32, Digest32), Digest32>,
+    /// Sessions this node kept against a peer's competing hello, whose peer must now
+    /// be sent this node's hello so it adopts the same session; drained on the tick.
+    reopen: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// The identity's key-agreement keys (ADR-002 §2), held only while unlocked:
     /// loaded (or generated on first use) by [`crate::node::prekeys::load_or_create`]
     /// after the identity unlocks and dropped on lock, so no prekey secret is in
@@ -1213,6 +1767,10 @@ pub struct Node {
     /// Kept out of `Channel` because it is a *join* of channel state with the node-wide
     /// keyring, and the keyring is not a property of any one room.
     reachers: std::collections::BTreeMap<Digest32, crate::node::tunnel::Reachers>,
+    /// Each channel's live offer of services (PRD-001 R22), kept beside `reachers` and for
+    /// the same reason: serving tasks hold these handles, so removing a service reaches
+    /// the sessions it is carrying.
+    offered: std::collections::BTreeMap<Digest32, crate::node::tunnel::Offered>,
 }
 
 impl Node {
@@ -1313,14 +1871,30 @@ impl Node {
             renew_mappings_at: None,
             schedules: BTreeMap::new(),
             pending_push: std::collections::BTreeSet::new(),
+            pushed_to: BTreeMap::new(),
             sync_slots: Arc::new(tokio::sync::Semaphore::new(SYNCS_IN_FLIGHT)),
             last_publish_refusal: BTreeMap::new(),
             publish_refusal_first_seen: BTreeMap::new(),
             join_slots: Arc::new(tokio::sync::Semaphore::new(JOINS_IN_FLIGHT)),
             join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
+            joining: std::collections::BTreeSet::new(),
+            held_pairwise: Vec::new(),
+            publish_owed: std::collections::BTreeSet::new(),
+            publishing: std::collections::BTreeSet::new(),
+            publish_again: std::collections::BTreeSet::new(),
+            publish_waiters: Vec::new(),
+            push_now: false,
+            member_dialed_at: BTreeMap::new(),
+            pending_consents: Vec::new(),
+            push_failures: BTreeMap::new(),
+            owed_first: std::collections::BTreeSet::new(),
+            key_backoff: BTreeMap::new(),
             record_seq: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            initiated: BTreeMap::new(),
+            accepted_hello: BTreeMap::new(),
+            reopen: std::collections::BTreeSet::new(),
             prekeys: None,
             channels: BTreeMap::new(),
             clock,
@@ -1330,6 +1904,7 @@ impl Node {
             trust: crate::node::trust::Keyring::new(),
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
+            offered: std::collections::BTreeMap::new(),
         };
         let view_rx = node.view_tx.subscribe();
         // A headless node has nothing to unlock: it is on the network from the start.
@@ -1363,6 +1938,8 @@ impl Node {
         // (ADR-016). The actor holds a `net_tx` clone, so `net_rx` never closes and
         // this select cannot spin on a dead branch.
         let mut ticker = tokio::time::interval(TICK);
+        // A `Shutdown`'s reply, held until the node is actually gone: see the end of this function.
+        let mut shutdown_reply: Option<oneshot::Sender<Outcome>> = None;
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -1371,14 +1948,54 @@ impl Node {
                     let shutdown = matches!(command, NodeCommand::Shutdown);
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
+                    // **Answered later, not here.** Creating a room seals its key under the
+                    // passphrase with production Argon2id — seconds of CPU — and this task answers
+                    // nothing while it runs. So the seal goes to a blocking thread and the reply
+                    // travels with it; `NetEvent::ChannelSealed` finishes the room and answers.
+                    if let NodeCommand::CreateChannel {
+                        local_name,
+                        passphrase,
+                    } = command
+                    {
+                        self.begin_create_channel(local_name, passphrase, reply).await;
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
+                        continue;
+                    }
+                    // Joining is answered later for the same reason, and for a longer wait: see
+                    // `begin_join_channel`.
+                    if let NodeCommand::JoinChannel {
+                        link,
+                        local_name,
+                        passphrase,
+                    } = command
+                    {
+                        self.begin_join_channel(link, local_name, passphrase, reply).await;
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
+                        continue;
+                    }
+                    // A consent to a member with no connection is answered when the dial it
+                    // started lands: see `pending_consents`.
+                    if let NodeCommand::Consent { channel_id, target } = command {
+                        let outcome = self.consent(&channel_id, target, true).await;
+                        self.settle_consent(channel_id, target, reply, outcome, 0)
+                            .await;
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
+                        self.push_if_owed().await;
+                        continue;
+                    }
                     let outcome = self.handle(command).await;
                     self.note_if_stalled(name, started);
                     self.publish().await;
-                    // A dropped reply receiver is the caller's choice, not an error.
-                    let _ = reply.send(outcome);
                     if shutdown {
+                        shutdown_reply = Some(reply);
                         break;
                     }
+                    // A dropped reply receiver is the caller's choice, not an error.
+                    let _ = reply.send(outcome);
+                    self.push_if_owed().await;
                 }
                 Some(event) = net_rx.recv() => {
                     let name = net_event_name(&event);
@@ -1386,6 +2003,7 @@ impl Node {
                     self.handle_net(event).await;
                     self.note_if_stalled(name, started);
                     self.publish().await;
+                    self.push_if_owed().await;
                 }
                 _ = ticker.tick() => {
                     if let Some(net) = self.net.as_ref() {
@@ -1404,18 +2022,44 @@ impl Node {
                     // Auto-consent for trusted identities, retried here for the
                     // same reason: a trusted member that was unreachable a moment
                     // ago is picked up as soon as it can be reached (ADR-020 §3).
-                    self.deliver_owed_consents().await;
-                    if self.run_due_syncs().await {
+                    self.deliver_owed_consents(None).await;
+                    // Paths change on the tick with no event to say so — a retired connection
+                    // closed, a circuit this node relayed ended — and a view published only on
+                    // events kept showing them: an anchor with no rooms reported a circuit it
+                    // no longer carried for as long as nothing else happened to it.
+                    if self.run_due_syncs().await || self.paths_moved() {
                         self.publish().await;
                     }
                 }
             }
         }
         // Channel closed or shutdown: lock (wipe every SEK + the signer) and stop.
+        let store = self.log_store();
         self.stop_network();
         self.lock_all().await;
         self.publish().await;
         let _ = self.event_tx.send(NodeEvent::Shutdown);
+        // **`Done` means gone.** `Shutdown` used to be answered before any of the above ran, and
+        // even after it the profile's store stayed open for a few milliseconds more — held by
+        // work that outlives the actor's own fields: an aborted join exchange drops its handle at
+        // its next await, and a sync session on a blocking thread when its read fails. A caller
+        // that opened the same profile the moment it was told `Done` found it busy: v0.2.8's gate
+        // went red on exactly that (`vox daemon` exiting `ProfileBusy` in `remote_interrupt_proof`),
+        // tolerated there by a retry. So the actor gives up its own handles, waits — bounded — until
+        // it holds the store's last reference, and answers only then.
+        self.profile = None;
+        self.anchor_store = None;
+        if let Some(store) = store {
+            let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN;
+            while std::sync::Arc::strong_count(&store) > 1 && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Dropped here: with no other holder, this closes the store.
+        }
+        if let Some(reply) = shutdown_reply {
+            let _ = reply.send(Outcome::Done);
+        }
     }
 
     async fn handle(&mut self, command: NodeCommand) -> Outcome {
@@ -1473,12 +2117,17 @@ impl Node {
             NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id).await,
             NodeCommand::SendText { channel_id, text } => self.send_text(&channel_id, &text).await,
             NodeCommand::Invite { channel_id } => self.invite(&channel_id).await,
-            NodeCommand::JoinChannel {
-                link,
-                local_name,
-                passphrase,
-            } => self.join_channel(&link, &local_name, &passphrase).await,
-            NodeCommand::Consent { channel_id, target } => self.consent(&channel_id, target).await,
+            // Answered through `begin_join_channel`, which the run loop calls instead of this; a
+            // join reaching here would have to be answered inline, which is the stall that
+            // function exists to remove.
+            NodeCommand::JoinChannel { .. } => {
+                debug_assert!(false, "JoinChannel is answered by begin_join_channel");
+                Outcome::Failed(Fault::Internal)
+            }
+            // Answered by the run loop, which can keep the reply until a dial lands.
+            NodeCommand::Consent { channel_id, target } => {
+                self.consent(&channel_id, target, true).await
+            }
             NodeCommand::Revoke { channel_id, target } => {
                 // A per-room revocation of a **trusted** identity does not hold: the ring
                 // still names it, so `deliver_owed_consents` re-issues consent on the next
@@ -1516,16 +2165,6 @@ impl Node {
                 channel_id,
                 service_tag,
             } => self.remove_service(&channel_id, &service_tag).await,
-            NodeCommand::GrantTunnel {
-                channel_id,
-                target,
-                service_tag,
-                may_bind,
-                expiry,
-            } => {
-                self.grant_tunnel(&channel_id, &target, &service_tag, may_bind, expiry)
-                    .await
-            }
             NodeCommand::Forward {
                 channel_id,
                 host,
@@ -1681,6 +2320,29 @@ impl Node {
         }
         let net = Arc::new(net);
         self.net = Some(Arc::clone(&net));
+        // **Liveness is tended off the actor.** A connection silent past `SILENCE_IS_DEATH` gives
+        // way to a live one to the same peer, or is closed — how a restarted peer's connection
+        // takes over from the dead one. That cannot ride the actor's tick, because the actor is
+        // exactly what a dead connection stalls: measured with a real `vox forward` whose host was
+        // killed, the actor sat 60s inside "publishing every room to an anchor that answered",
+        // awaiting a stream on the dead connection, and no tick ran until QUIC's idle timeout
+        // ended the wait — so the rule that would have ended it at 30s never got to run. Closing
+        // the connection from here is also what ends that wait. Held weakly, so the task ends
+        // with the network.
+        {
+            let manager = Arc::downgrade(net.manager());
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(TICK);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let Some(manager) = manager.upgrade() else {
+                        break;
+                    };
+                    manager.tend_liveness();
+                }
+            });
+        }
         // The configured anchors are dialled at once, each on its own task: they are
         // where this node's records go and the helpers its ladder climbs through, and
         // an anchor that is down must not hold up the ones that are not.
@@ -1744,6 +2406,7 @@ impl Node {
         self.renew_mappings_at = None;
         self.schedules.clear();
         self.pending_push.clear();
+        self.pushed_to.clear();
     }
 
     /// Put a channel's genesis and this node's records on an **anchor's** board
@@ -1763,11 +2426,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        let seq = {
-            let entry = self.record_seq.entry(*channel_id).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry
-        };
+        let seq = self.next_record_seq(channel_id);
         // The admission goes out with the bundle: a node that cannot say how it became
         // a member publishes nothing, rather than publishing an unevidenced key (M17.6).
         let (genesis_wire, epoch, admission) = match self.channels.get(channel_id) {
@@ -1794,92 +2453,155 @@ impl Node {
         let Ok((address, bundle)) = records else {
             return;
         };
-        let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await else {
+        // **Bounded, and it stops at the first dead stream.** Each put waits for the board's answer,
+        // which a live board gives in milliseconds, but a connection that died without saying so waits
+        // out the full frame patience (`SYNC_FRAME_TIMEOUT`, 20s) *per put*, and every one of those
+        // waits is on the actor. Measured in `perf_r40_relayed_chat_gate`: a member whose room's own
+        // anchor (another member) had just shut down published to it over the relayed connection still
+        // in the manager. The address put, then two mirrored records, each waited 20s:
+        // `busy 60s — filing a sync that finished`, one run in five, and nobody could be answered.
+        // The ordering above still holds whenever the board answers. A board that answers nothing within
+        // `ANCHOR_PUBLISH_PATIENCE` is given up on for this round. A transport error ends the round,
+        // since the rest would ride the same dead stream; a refusal does not.
+        let own = [
+            ("the room's genesis", genesis_wire),
+            ("our member bundle", bundle.to_wire()),
+            ("our address", address.to_wire()),
+        ];
+        let mirrored = net.board_records(channel_id, epoch);
+        // **Off the actor, and still in order.** The round awaits a board's answers, which on a
+        // connection that died without saying so is `ANCHOR_PUBLISH_PATIENCE` of waiting, and that
+        // was on the actor: `busy 5.0s — filing a sync that finished`, a person's post held behind
+        // it (the V29-21 verdict: every run still had posts over 1s). The ordering the round exists
+        // for, these records on the board before a session with that board reads it, is kept
+        // explicitly instead: while a round to a board is in flight, `run_due_syncs` owes that
+        // board the room rather than starting a session (`publishing`). One round per
+        // (room, board) at a time; a publish asked for meanwhile runs once the round ends.
+        let board_id = conn.peer_id();
+        if !self.publishing.insert((*channel_id, board_id)) {
+            self.publish_again.insert((*channel_id, board_id));
             return;
-        };
-        // **Said, not swallowed.** A refused bundle is a member no other member can admit as a
-        // log author, and every one of these was `let _ = ...` — so the board's reason existed,
-        // was specific, and was dropped on the floor at the one place that could report it.
-        //
-        // Each kind's outcome is carried, success as well as failure, because a refusal that
-        // *stops* has to clear its memo below — otherwise a standing refusal reported once would
-        // be silent the second time it mattered.
-        let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
-        outcomes.push((
-            "the room's genesis",
-            client.put(&genesis_wire).await.err().map(|e| e.to_string()),
-        ));
-        // **Our bundle before our address, for the reason this file already states about *other*
-        // members' records and did not apply to its own.** An address record carries no key, so a
-        // board can only verify it against a key it already holds — which is what the bundle
-        // carries. Published address-first, a member whose key the board does not know yet has its
-        // address refused with `author is not a channel member`, microseconds before the bundle
-        // that would have made it admissible arrives on the same connection; and nothing retries
-        // it until the next publish round. `network.rs` `board_records` has emitted bundles first
-        // all along and says why. This did the opposite for the records that matter most — a
-        // newcomer's own — so a member could be on an anchor's board with a key and no way to
-        // reach it, which a joiner reports as the member being unreachable.
-        outcomes.push((
-            "our member bundle",
-            client
-                .put(&bundle.to_wire())
-                .await
-                .err()
-                .map(|e| e.to_string()),
-        ));
-        outcomes.push((
-            "our address",
-            client
-                .put(&address.to_wire())
-                .await
-                .err()
-                .map(|e| e.to_string()),
-        ));
-        // And every other member's records this node's board holds: an anchor learns
-        // a channel's members only from a member that vouches for them (M15.2a), and
-        // a bundle carries the key an address record is verified against, so bundles
-        // go first.
-        //
-        // **Awaited, and it has to be.** Sending this off the actor was tried: it removed the
-        // measured `busy 19416ms — publishing every room at a new address` stall, and cost more
-        // than it saved. Convergence depends on these records actually being on the anchor's board
-        // before the next step reads it, so spawning the send dropped the anchor-convergence gate
-        // from 3 runs in 5 to 1 in 6 and the user-level rehearsal from 10 in 10 to 6 in 8. The
-        // stall is real and now *named* by `NodeEvent::Stalled`; removing it needs the ordering
-        // made explicit, not the wait deleted.
-        let mut mirrored_refused = 0usize;
-        let mut mirrored_why = String::new();
-        for wire in net.board_records(channel_id, epoch) {
-            if let Err(e) = client.put(&wire).await {
-                // A board that already holds something newer from that member has fresher news
-                // than the copy we vouch with: nothing was refused that anyone needed. For our
-                // *own* records, above, the same answer is real and still reported.
-                if matches!(
-                    e,
-                    Error::RendezvousRejected(r)
-                        if r == crate::nat::service::RejectReason::Stale.as_str()
-                ) {
-                    continue;
-                }
-                mirrored_refused += 1;
-                if mirrored_why.is_empty() {
-                    mirrored_why = e.to_string();
-                }
-            }
         }
-        client.finish();
-        outcomes.push((
-            "another member's record we vouch for",
-            (mirrored_refused > 0)
-                .then(|| format!("{mirrored_refused} refused, first: {mirrored_why}")),
-        ));
+        let conn = Arc::clone(conn);
+        let tx = self.net_tx.clone();
+        let cid = *channel_id;
+        tokio::spawn(async move {
+            let conn = &conn;
+            let round = async {
+                let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
+                // A stream that will not open is the next round's business, as it always was.
+                let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await else {
+                    return outcomes;
+                };
+                // **Said, not swallowed.** A refused bundle is a member no other member can admit as a
+                // log author; each kind's outcome is carried, success as well as failure, so a refusal
+                // that *stops* clears its memo below.
+                //
+                // **Our bundle before our address**: an address record carries no key, so a board can
+                // only verify it against a bundle it already holds (`network.rs` `board_records` emits
+                // bundles first for the same reason).
+                for (kind, wire) in &own {
+                    let result = client.put(wire).await;
+                    let dead =
+                        matches!(&result, Err(e) if !matches!(e, Error::RendezvousRejected(_)));
+                    outcomes.push((kind, result.err().map(|e| e.to_string())));
+                    if dead {
+                        return outcomes;
+                    }
+                }
+                // And every other member's records this node's board holds: an anchor learns a
+                // channel's members only from a member that vouches for them (M15.2a).
+                //
+                // **In order.** Convergence depends on these records being on the board before the
+                // next session with it reads them: spawning the send with nothing holding that
+                // session back once dropped the anchor-convergence gate from 3 runs in 5 to 1 in 6.
+                // `publishing` is what holds it back now.
+                let mut mirrored_refused = 0usize;
+                let mut mirrored_why = String::new();
+                for wire in &mirrored {
+                    match client.put(wire).await {
+                        Ok(()) => {}
+                        // A board that already holds something newer from that member has fresher news
+                        // than the copy we vouch with: nothing was refused that anyone needed.
+                        Err(Error::RendezvousRejected(r))
+                            if r == crate::nat::service::RejectReason::Stale.as_str() => {}
+                        Err(e) => {
+                            let dead = !matches!(e, Error::RendezvousRejected(_));
+                            mirrored_refused += 1;
+                            if mirrored_why.is_empty() {
+                                mirrored_why = e.to_string();
+                            }
+                            if dead {
+                                break;
+                            }
+                        }
+                    }
+                }
+                client.finish();
+                outcomes.push((
+                    "another member's record we vouch for",
+                    (mirrored_refused > 0)
+                        .then(|| format!("{mirrored_refused} refused, first: {mirrored_why}")),
+                ));
+                outcomes
+            };
+            let outcomes = match tokio::time::timeout(ANCHOR_PUBLISH_PATIENCE, round).await {
+                Ok(outcomes) => outcomes,
+                Err(_) => vec![(
+                    "this publish round",
+                    Some(format!(
+                        "the board answered nothing within {}s",
+                        ANCHOR_PUBLISH_PATIENCE.as_secs()
+                    )),
+                )],
+            };
+            let _ = tx
+                .send(NetEvent::PublishDone {
+                    channel_id: cid,
+                    board: board_id,
+                    outcomes,
+                })
+                .await;
+        });
+    }
+
+    /// Answer a create or join once the room's first publish rounds have ended.
+    ///
+    /// **`Done` has always meant "others can find it".** A create or join awaited its first publish
+    /// to the anchors before answering. Once that round moved onto its own task, `vox room create`
+    /// answered before the room was on any anchor's board, and a join straight after the invite
+    /// found nothing: perf_r40_relayed_chat_gate, `bob's join failed: Failed(BadLink)`, 2 of 2.
+    /// The reply now waits for the room's rounds, bounded by `ANCHOR_PUBLISH_PATIENCE` each, and
+    /// the actor serves everyone else meanwhile.
+    async fn answer_when_published(
+        &mut self,
+        room: Digest32,
+        reply: oneshot::Sender<Outcome>,
+        outcome: Outcome,
+    ) {
+        if outcome.is_done() && self.publishing.iter().any(|(r, _)| *r == room) {
+            self.publish_waiters.push((room, reply, outcome));
+            return;
+        }
+        self.publish().await;
+        let _ = reply.send(outcome);
+    }
+
+    /// What a board said to one publish round (`NetEvent::PublishDone`), reported the way a
+    /// person can act on: once per standing refusal, and not while a join is still curing it.
+    fn report_publish(
+        &mut self,
+        channel_id: &Digest32,
+        board_id: Digest32,
+        outcomes: Vec<(&'static str, Option<String>)>,
+    ) {
         // **Keyed per board, not per room.** A node publishes the same record to several boards and
         // they answer differently — an anchor that has not been vouched this author says "not a
         // channel member" while the node's own board says "policy" — so a memo keyed only by room
         // and record kind alternates between the two reasons and reports on every publish round,
         // which is the spam it was added to stop. It also matters to whoever reads the line: "some
         // board refused this" is not actionable and "that board refused this" is.
-        let board = crate::node::network::short_id(conn.peer_id());
+        let board = crate::node::network::short_id(board_id);
         for (kind, why) in outcomes {
             let what = format!("{kind} (board {board})");
             let key = (*channel_id, what.clone());
@@ -1918,6 +2640,23 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// The next board-record sequence number for `channel_id`: strictly above the last one this
+    /// process used, and never below the clock in milliseconds.
+    ///
+    /// **It must keep rising across a restart**, because a board accepts only a higher `seq` from
+    /// the same author (`non-increasing seq (replay)`). The counter started again at 1 in every
+    /// process, so after a restart every record this node published was older than the one the
+    /// board already held, and was refused. A member that restarted could not be reached at its
+    /// new address. vox-bc's causal-order proof measured it: the second joiner, restarted, logged
+    /// `a board would not take our address … the board holds a newer record from that author`,
+    /// and failed 5 of 9. The clock is what survives a restart without a store write per publish.
+    fn next_record_seq(&mut self, channel_id: &Digest32) -> u64 {
+        let floor = (self.millis_clock)();
+        let entry = self.record_seq.entry(*channel_id).or_insert(0);
+        *entry = entry.saturating_add(1).max(floor);
+        *entry
     }
 
     /// The store anchored logs and channels live in: the profile's, or the headless
@@ -1961,7 +2700,7 @@ impl Node {
         };
         let now = self.now();
         let opened =
-            crate::node::anchor::AnchorState::open(&store, sek, channel_id, now).or_else(|_| {
+            crate::node::anchor::AnchorState::open(&store, sek, channel_id).or_else(|_| {
                 let sek = self
                     .anchor_sek(channel_id)
                     .ok_or(Error::Profile("no anchor key"))?;
@@ -2020,12 +2759,11 @@ impl Node {
         let (Some(store), Some(net)) = (self.log_store(), self.net.as_ref().map(Arc::clone)) else {
             return Ok(());
         };
-        let now = self.now();
         for cid in store.anchored_channels()? {
             let Some(sek) = self.anchor_sek(&cid) else {
                 continue;
             };
-            if let Ok(state) = crate::node::anchor::AnchorState::open(&store, sek, &cid, now) {
+            if let Ok(state) = crate::node::anchor::AnchorState::open(&store, sek, &cid) {
                 let _ = net.publish_local(&state.genesis().to_wire());
                 self.anchored
                     .insert(cid, Arc::new(tokio::sync::Mutex::new(state)));
@@ -2128,6 +2866,20 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
+        // **Never wait on a room a session holds.** Building the records takes the room's lock, and
+        // a sync session holds that lock for its whole run on a blocking thread — bounded only by
+        // the 20s frame timeout when the peer is slow. Measured through the real binaries with the
+        // wait timed: `publish waited 19.9987s for the ROOM lock`, against `busy 20005ms — passing on
+        // a record that landed on our board`, while every put on the wire took under 22ms. It was
+        // also half of a cycle: this actor waiting on its room, whose session waited on a peer
+        // whose actor was waiting the same way, broken only by the frame timeout.
+        //
+        // Owed instead, and run the moment that session's `SyncDone` lands — still on the actor, so
+        // anything that follows a publish still follows it.
+        if self.syncing.contains(channel_id) {
+            self.publish_owed.insert(*channel_id);
+            return;
+        }
         let anchors: Vec<Arc<VoxConnection>> = self
             .anchor_ids
             .iter()
@@ -2146,11 +2898,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        let seq = {
-            let entry = self.record_seq.entry(*channel_id).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry
-        };
+        let seq = self.next_record_seq(channel_id);
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
@@ -2234,12 +2982,15 @@ impl Node {
         for anchor in &self.anchor_ids {
             policy.add_anchor(*anchor);
         }
-        // Replacing wholesale would drop the pending joiners the actor is expecting,
-        // so they are carried over.
+        // Replacing wholesale would drop the pending joiners the actor is expecting, and the
+        // responders a join in flight is waiting on, so both are carried over.
         let previous = net.policy().snapshot();
         net.policy().replace(policy);
         for joiner in previous.pending_joiners() {
             net.policy().expect_joiner(joiner);
+        }
+        for responder in previous.join_responders() {
+            net.policy().expect_join_responder(responder);
         }
     }
 
@@ -2288,6 +3039,133 @@ impl Node {
                 // the join's own outcome, which is the right place for it to learn.
                 let _ = ack.send(());
             }
+            NetEvent::Dialed {
+                conn,
+                endpoints,
+                board,
+            } => {
+                let peer = conn.peer_id();
+                self.adopt_connection(Arc::clone(&conn));
+                if let Some(net) = self.net.as_ref().map(Arc::clone) {
+                    if crate::node::net::path_class(net.manager().endpoint(), &conn)
+                        == crate::node::net::PathClass::Relayed
+                    {
+                        let tx = self.net_tx.clone();
+                        self.last_upgrade.insert(peer, self.now());
+                        tokio::spawn(async move {
+                            match net.upgrade(peer, &endpoints).await {
+                                Ok(better) => {
+                                    let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
+                                }
+                                Err(crate::error::Error::LadderExhausted(reason)) => {
+                                    let _ = tx.send(NetEvent::UpgradeFailed { peer, reason }).await;
+                                }
+                                Err(_) => {}
+                            }
+                        });
+                    }
+                }
+                if board {
+                    self.anchor_ids.insert(peer);
+                    self.refresh_network_view().await;
+                }
+                // Whatever this member is owed goes out now that it can be reached, rather than on
+                // the next tick: a dial `reach_member` started was started for exactly this.
+                self.answer_pending_consents(|_, target| *target == peer, None)
+                    .await;
+                self.deliver_owed_rekeys().await;
+                self.deliver_owed_consents(None).await;
+            }
+            NetEvent::JoinerDone {
+                reply,
+                parsed,
+                local_name,
+                passphrase,
+                now,
+                me,
+                result,
+            } => {
+                let room = parsed.channel_id;
+                let outcome = match *result {
+                    Ok(won) => {
+                        let _ = self.event_tx.send(NodeEvent::JoinSteps {
+                            joined: true,
+                            steps: won.steps.render(),
+                        });
+                        self.finish_join_channel(*parsed, local_name, passphrase, now, me, won)
+                            .await
+                    }
+                    Err(lost) => {
+                        let _ = self.event_tx.send(NodeEvent::JoinSteps {
+                            joined: false,
+                            steps: lost.steps.render(),
+                        });
+                        if !lost.why.is_empty() {
+                            self.say_why_the_join_failed(&lost.why);
+                        }
+                        Outcome::Failed(lost.fault)
+                    }
+                };
+                // Whatever arrived for this room while it was being joined, in arrival order — into
+                // the room if the join made one, or discarded as before if it did not.
+                self.joining.remove(&room);
+                if self.joining.is_empty() {
+                    if let Some(net) = self.net.as_ref() {
+                        net.policy().forget_join_responders();
+                    }
+                }
+                let (held, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_pairwise)
+                    .into_iter()
+                    .partition(|(r, ..)| *r == room);
+                self.held_pairwise = kept;
+                for (_, peer, first, send, recv) in held {
+                    self.handle_pairwise(peer, first, send, recv).await;
+                }
+                // **The joiner's consent at admission too, before `room join` is answered.** The same
+                // ForwardOnly window f4d13d8 closed on the host's side (see `apply_join_outcome`) was
+                // open on this side: a joiner that already trusted the host released its key on its
+                // next tick, from the chain's position *then*, so a post made the moment the join
+                // returned was sealed before the released key and unreadable to the host for good.
+                // Measured through `trust_before_join_proof`: the joiner posted at +0ms and consented
+                // at +743ms; `alice reads bob = false`, 3 runs of 3. Released here, the key goes out
+                // before the person hears the join succeeded, so it covers everything they post next.
+                if outcome.is_done() {
+                    self.deliver_owed_consents(None).await;
+                }
+                // The view first, then the answer: whoever hears `Done` reads the view next, and a
+                // room that is joined but not yet in it reads as a join that did nothing.
+                self.answer_when_published(room, reply, outcome).await;
+            }
+            NetEvent::ChannelSealed {
+                reply,
+                local_name,
+                passphrase,
+                genesis,
+                now,
+                sealed,
+            } => {
+                let room = genesis.channel_id();
+                let outcome = match sealed {
+                    Err(e) => Outcome::Failed(fault_of(&e)),
+                    Ok((sek, wrap)) => match self.profile.as_ref() {
+                        None => Outcome::Failed(Fault::NoIdentity),
+                        Some(profile) => match ChannelState::create_from_sealed(
+                            profile,
+                            &local_name,
+                            &passphrase,
+                            *genesis,
+                            sek,
+                            &wrap,
+                            now,
+                        ) {
+                            Ok(ch) => self.finish_create_channel(ch).await,
+                            Err(e) => Outcome::Failed(fault_of(&e)),
+                        },
+                    },
+                };
+                // The view first, then the answer — as for a join above.
+                self.answer_when_published(room, reply, outcome).await;
+            }
             NetEvent::BoardGrew { channel_id } => {
                 // Pass it on, which for a member means its anchors. A node that is not a member of
                 // this room falls out of `publish_channel_to_anchor` on its missing admission, so
@@ -2305,8 +3183,9 @@ impl Node {
                 send,
                 recv,
             } => {
-                let _ = (&conn, peer);
-                self.run_sync_session(channel_id, epoch, send, recv).await;
+                let _ = &conn;
+                self.run_sync_session(peer, channel_id, epoch, send, recv)
+                    .await;
             }
             NetEvent::AddressesDiscovered { mappings } => {
                 // Re-publish every open channel's records: the addresses in them were
@@ -2320,6 +3199,11 @@ impl Node {
                 }
             }
             NetEvent::ReachFailed { peer, why } => {
+                self.answer_pending_consents(
+                    |_, target| *target == peer,
+                    Some(Outcome::Failed(Fault::Unreachable)),
+                )
+                .await;
                 let _ = self.event_tx.send(NodeEvent::PeerUnreachable { peer, why });
             }
             NetEvent::UpgradeFailed { peer, reason } => {
@@ -2344,11 +3228,137 @@ impl Node {
                     .entry(peer)
                     .or_insert_with(SyncSchedule::connected);
             }
+            NetEvent::SkdmRefused {
+                channel_id,
+                peer,
+                chain_id,
+                why,
+            } => {
+                let (Some(profile), Some(shared)) = (
+                    self.profile.as_ref(),
+                    self.channels.get(&channel_id).map(Arc::clone),
+                ) else {
+                    return;
+                };
+                let _ = shared
+                    .lock()
+                    .await
+                    .note_undelivered(profile.store(), peer, chain_id);
+                // 2, 4, 8 … 64s: a refusal that cures (a session that converges, a member learnt
+                // from the board) is retried promptly, and one that does not stops costing a
+                // stream every second.
+                let now = self.now();
+                let entry = self.key_backoff.entry((channel_id, peer)).or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = now.saturating_add(1u64 << entry.0.min(6));
+                let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
+                    channel_id,
+                    peer,
+                    why,
+                });
+            }
+            NetEvent::PublishDone {
+                channel_id,
+                board,
+                outcomes,
+            } => {
+                self.publishing.remove(&(channel_id, board));
+                self.report_publish(&channel_id, board, outcomes);
+                if !self.publishing.iter().any(|(room, _)| *room == channel_id) {
+                    let (ready, waiting): (Vec<_>, Vec<_>) =
+                        std::mem::take(&mut self.publish_waiters)
+                            .into_iter()
+                            .partition(|(room, _, _)| *room == channel_id);
+                    self.publish_waiters = waiting;
+                    if !ready.is_empty() {
+                        self.publish().await;
+                        for (_, reply, outcome) in ready {
+                            let _ = reply.send(outcome);
+                        }
+                    }
+                }
+                if self.publish_again.remove(&(channel_id, board)) {
+                    let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
+                    if let Some(conn) = conn {
+                        self.publish_channel_to_anchor(&channel_id, &conn).await;
+                    }
+                }
+                // A session with that board for this room was held back while the round ran.
+                self.push_now = true;
+            }
+            NetEvent::SkdmTaken { channel_id, peer } => {
+                self.key_backoff.remove(&(channel_id, peer));
+            }
+            NetEvent::PushRetry { channel_id, peer } => {
+                self.pending_push.insert(channel_id);
+                // The failed session carried nothing, so this peer is owed the room again.
+                if let Some(to) = self.pushed_to.get_mut(&channel_id) {
+                    to.remove(&peer);
+                }
+                if let Some(schedule) = self.schedules.get_mut(&peer) {
+                    schedule.note_local_append();
+                }
+                self.owed_first.insert(peer);
+                self.push_now = true;
+            }
             NetEvent::SyncDone {
                 channel_id,
+                peer,
                 outcome,
             } => {
                 self.syncing.remove(&channel_id);
+                self.answer_pending_consents(|room, _| *room == channel_id, None)
+                    .await;
+                // **A session that failed delivered nothing, so its push is owed again.**
+                // `run_due_syncs` counts a push as done when the session *starts*, which is the
+                // only thing it can know then; a session the peer refused — because its own
+                // session for this room was running — or that died on the wire carried nothing, and
+                // the entry waited for the peer's next 30s interval. Measured over a forced relay
+                // once pushes went out at once instead of on the tick: median 40–110ms, and a tail
+                // at exactly 30s (p95 29.7–30.0s) — the collisions an immediate push makes more
+                // likely. Owed again, retried on the *next tick* and not at once: a peer that keeps
+                // refusing must not be answered with a tight loop.
+                //
+                // **Owed to that peer only, and not for ever.** The first version re-owed the room to
+                // *every* peer, every time any session failed. A peer whose sessions always fail —
+                // an anchor that keeps no log for the room refuses every one — was then re-owed
+                // every tick, sorted ahead of the member it shared the room with, took the room each
+                // pass, and the member's owed push lost every round: the independent verdict
+                // measured 2–3 relayed runs in 10 losing a message for 120s (vox-bc, #41). Now the
+                // retry goes to the peer that failed, at most `MAX_PUSH_RETRIES` times running; past
+                // that the pair waits for the periodic interval like any other.
+                //
+                // **After a short random wait, not the next tick.** The commonest failure is a
+                // collision: both ends push on the same event, each refuses the other because its
+                // own session for the room is running, and both fail. Retried on the tick, the two
+                // retries landed together again and a message took up to a second (median 364–531ms
+                // in 3 of 10 relayed runs, measured). A random 20–100ms wait desynchronises them.
+                if outcome.is_err() {
+                    let failures = self.push_failures.entry((channel_id, peer)).or_insert(0);
+                    *failures = failures.saturating_add(1);
+                    if *failures <= MAX_PUSH_RETRIES {
+                        let jitter = crate::identity::rng::random_array::<1>().map_or(0, |b| b[0]);
+                        let wait = Duration::from_millis(20 + u64::from(jitter) * 80 / 255);
+                        let tx = self.net_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(wait).await;
+                            let _ = tx.send(NetEvent::PushRetry { channel_id, peer }).await;
+                        });
+                    }
+                } else {
+                    self.push_failures.remove(&(channel_id, peer));
+                }
+                // The room is free now **whatever the outcome**: a push that found it mid-session
+                // is owed and goes at once. Gating this on success left an owed push waiting for the
+                // tick whenever the session that held the room failed — which a log-less anchor's
+                // always does — and put a 1.00s ceiling on exactly the messages it delayed.
+                if !self.pending_push.is_empty() {
+                    // A push that found this room mid-session is owed; the room is free now.
+                    self.push_now = true;
+                }
+                if self.publish_owed.remove(&channel_id) {
+                    self.publish_channel_to_anchors(&channel_id).await;
+                }
                 self.refresh_network_view().await;
                 if let Ok(o) = outcome {
                     // **Event, not interval.** Propagation was event-driven in one direction only:
@@ -2376,6 +3386,23 @@ impl Node {
                         self.refresh_reachers().await;
                         self.publish_channel_to_anchors(&channel_id).await;
                     }
+                    // **A newcomer this session admitted is consented to now, not on the tick.** Two
+                    // members who joined the same room learn of each other only here, from the board.
+                    // Under ForwardOnly a post sealed before the author consents to a reader is never
+                    // readable to it, so every tick of delay is a window of posts lost to the
+                    // newcomer. Measured in room_of_three_keys_proof: the joiners' keys to each other
+                    // landed 388ms and 846ms after their posts. This shrinks the window; it cannot
+                    // close it, since nobody can consent to a member it has not yet heard of.
+                    if !self.trust.is_empty() {
+                        let trusted = self.trust.trusted();
+                        let owes = match self.channels.get(&channel_id).map(Arc::clone) {
+                            Some(shared) => !shared.lock().await.owed_consents(&trusted).is_empty(),
+                            None => false,
+                        };
+                        if owes {
+                            self.deliver_owed_consents(None).await;
+                        }
+                    }
                     if o.rendered > 0 || o.governance > 0 {
                         let _ = self.event_tx.send(NodeEvent::Synced {
                             channel_id,
@@ -2388,14 +3415,14 @@ impl Node {
             NetEvent::Stream { conn, inbound } => {
                 // Held for the whole handler: the connection must outlive the streams
                 // opened on it, or the peer sees it close mid-exchange.
-                let _connection = conn;
+                let connection = conn;
                 match inbound {
                     Inbound::Join { .. } => {
                         // Unreachable: the stream loop turns these into
                         // `NetEvent::JoinRequest` once the request is read.
                     }
-                    Inbound::Pairwise { peer, recv, .. } => {
-                        self.take_inbound_skdm(peer, recv).await;
+                    Inbound::Pairwise { peer, send, recv } => {
+                        self.take_inbound_skdm(peer, send, recv).await;
                     }
                     Inbound::Sync { .. } => {
                         // Unreachable: the stream loop converts these into
@@ -2417,7 +3444,12 @@ impl Node {
                         // The host is told who reached what, because the carried
                         // service only ever sees loopback (ADR-017 decision 6).
                         let events = self.event_tx.clone();
+                        // **The tunnel holds its connection for as long as it runs.** That
+                        // is what tells `retire_expired` the path is still carrying, so a
+                        // better path appearing does not close it under a live session.
+                        let carried = Arc::clone(&connection);
                         tokio::spawn(async move {
+                            let _carried = carried;
                             let _ = crate::node::tunnel::serve_reporting(
                                 peer,
                                 send,
@@ -2662,10 +3694,18 @@ impl Node {
             // there now goes up, and what arrives later goes with the next mirror.
             self.publish_channel_to_anchors(&channel_id).await;
         }
-        self.sessions.insert((channel_id, peer), outcome.session);
+        self.adopt_join_session(channel_id, peer, outcome.session, false)
+            .await;
         if let Some(net) = self.net.as_ref() {
             net.policy().forget_joiner(&peer);
         }
+        // **Consent at admission, not on the tick** (ADR-021 F12). A room is ForwardOnly:
+        // a newcomer reads only what is sealed after the key is released to it. With the
+        // joiner already in this node's trust ring, leaving the release to the next tick
+        // opened a window in which anything this node posted was unreadable to the
+        // joiner for good. The actor is serial, so releasing here — before any later
+        // command is served — means everything posted after the join is readable.
+        self.deliver_owed_consents(None).await;
         let _ = self
             .event_tx
             .send(NodeEvent::PeerJoined { channel_id, peer });
@@ -2874,42 +3914,55 @@ impl Node {
     /// Interval between rounds. A board that is ready costs a joiner one dial.
     const BOARD_RETRY: Duration = Duration::from_millis(250);
 
-    /// A connection to something that can serve this channel's board, trying every route
-    /// this node has and retrying until [`Self::BOARD_PATIENCE`] runs out.
+    /// Join a channel from an invite link (ADR-016 §"Join over the network"): resolve
+    /// the anchor, read the board, announce a pre-join record, run the ADR-005 join,
+    /// then build local channel state and publish our own records.
+    /// Begin joining a room: capture what the join needs here, run the network half and the
+    /// Argon2id seal in a task, and answer through `NetEvent::JoinerDone`.
     ///
-    /// **A room address is a magnet link, and a magnet's trackers are hints, not the only
-    /// route.** This used to try only the anchors embedded in the link, once each, in order,
-    /// and refuse — so one hint that was stale, or merely not listening *yet*, ended the
-    /// join. `invite()` builds that list as [the channel's anchors, the configured set, this
-    /// node last], so a host whose only anchor is itself hands out a link naming only itself;
-    /// a joiner who arrives in the second before that host is accepting gets
-    /// `Failed(Unreachable)` and is told nothing useful. That is what made
-    /// `node_m15_session_from_bundle_gate` fail about two runs in five, on clean `main`,
-    /// long before either of the branches in flight — and it failed in under three seconds
-    /// against a 35-second happy path, which is how a deterministic refusal announces itself.
-    ///
-    /// Two things change. **Every route is tried, not just the link's:** the link's hints
-    /// first, because whoever wrote the link knows where that room lives; then this node's
-    /// configured anchors, which are the routes its operator chose; then any anchor it is
-    /// **already connected to** from an earlier join, which costs nothing to ask. Duplicates
-    /// are dialled once. **And it retries**, because "not yet" and "not there" are different
-    /// answers and only a deadline can tell them apart.
-    ///
-    /// The third tier carries no endpoints, deliberately: this node does not keep an address
-    /// book for anchors it met once, and inventing one here would be a second feature. An
-    /// empty endpoint list is exactly right for a peer that is already connected, because
-    /// `NodeNet::connect` returns the live connection before it looks at addresses — and for
-    /// one that is not, it fails, which is the honest answer.
-    ///
-    /// `None` means no route answered for the whole window, which is a refusal a person
-    /// should see: the room may genuinely have nobody serving it.
-    async fn reach_a_board(
+    /// **The joiner no longer holds its node still.** The whole joiner side ran on the actor —
+    /// reach a board, fetch, a poll of up to `JOIN_ADDRESS_PATIENCE` with `sleep` on the actor,
+    /// dial, announce, the exchange, and the room key sealed with production Argon2id — so a node
+    /// that was joining a room answered nothing else meanwhile: not its other rooms, not its
+    /// control socket, not the responder's own follow-ups. Measured through the real binaries:
+    /// `busy 9829–28943ms — joining a room`. The caller still waits for its join; nobody else does.
+    async fn begin_join_channel(
         &mut self,
-        parsed: &crate::node::link::InviteLink,
-    ) -> Option<Arc<VoxConnection>> {
-        let me = self.net.as_ref()?.local_id();
-        // Ordered, de-duplicated, best hint first. Collected up front so the set does not
-        // shift under the retry loop.
+        link: String,
+        local_name: String,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let parsed = match crate::node::link::InviteLink::parse(&link) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                return;
+            }
+        };
+        let (Some(net), Some(ring)) = (
+            self.net.as_ref().map(Arc::clone),
+            self.prekeys.as_ref().map(Arc::clone),
+        ) else {
+            let _ = reply.send(Outcome::Failed(Fault::NotNetworked));
+            return;
+        };
+        if self.channels.contains_key(&parsed.channel_id) {
+            let _ = reply.send(Outcome::Failed(Fault::IdentityExists));
+            return;
+        }
+        let Some(profile) = self.profile.as_ref() else {
+            let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
+            return;
+        };
+        let Ok(signer) = profile.signer_arc() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let now = self.now();
+        let me = net.local_id();
+        // The boards to try, in the order `reach_a_board` tried them: the link's anchors, this
+        // node's own, then any anchor it already holds a live connection to.
         let mut routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
         let mut seen: std::collections::BTreeSet<Digest32> = [me].into_iter().collect();
         for a in parsed
@@ -2920,334 +3973,85 @@ impl Node {
         {
             routes.push((a.id, a.endpoints.clone()));
         }
-        // Anchors from earlier joins that this node still holds a connection to.
         let live: std::collections::BTreeSet<Digest32> =
-            self.net.as_ref()?.manager().peers().into_iter().collect();
-        let empty = crate::nat::multiaddr::EndpointList::new(Vec::new()).ok()?;
-        let learned: Vec<Digest32> = self
-            .anchor_ids
-            .iter()
-            .copied()
-            .filter(|id| live.contains(id) && seen.insert(*id))
-            .collect();
-        for id in learned {
-            routes.push((id, empty.clone()));
+            net.manager().peers().into_iter().collect();
+        if let Ok(empty) = crate::nat::multiaddr::EndpointList::new(Vec::new()) {
+            for id in self.anchor_ids.iter().copied() {
+                if live.contains(&id) && seen.insert(id) {
+                    routes.push((id, empty.clone()));
+                }
+            }
         }
         if routes.is_empty() {
-            return None;
+            let _ = reply.send(Outcome::Failed(Fault::Unreachable));
+            return;
         }
-
-        let deadline = tokio::time::Instant::now() + Self::BOARD_PATIENCE;
-        loop {
-            for (id, endpoints) in &routes.clone() {
-                if let Ok(conn) = self.dial(*id, endpoints).await {
-                    self.anchor_ids.insert(*id);
-                    self.refresh_network_view().await;
-                    return Some(conn);
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(Self::BOARD_RETRY).await;
-        }
+        let seq = self.next_record_seq(&parsed.channel_id);
+        self.joining.insert(parsed.channel_id);
+        let job = Joiner {
+            net,
+            tx: self.net_tx.clone(),
+            me,
+            parsed: parsed.clone(),
+            routes,
+            signer,
+            ring,
+            seq,
+            now,
+            pow_params: self.pow_params,
+            argon2: self.argon2,
+            passphrase: passphrase.clone(),
+        };
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let result = job.run().await;
+            let _ = tx
+                .send(NetEvent::JoinerDone {
+                    reply,
+                    parsed: Box::new(parsed),
+                    local_name,
+                    passphrase,
+                    now,
+                    me,
+                    result: Box::new(result),
+                })
+                .await;
+        });
     }
 
-    /// Join a channel from an invite link (ADR-016 §"Join over the network"): resolve
-    /// the anchor, read the board, announce a pre-join record, run the ADR-005 join,
-    /// then build local channel state and publish our own records.
-    async fn join_channel(&mut self, link: &str, local_name: &str, passphrase: &Secret) -> Outcome {
-        let parsed = match crate::node::link::InviteLink::parse(link) {
-            Ok(p) => p,
-            Err(e) => return Outcome::Failed(fault_of(&e)),
-        };
-        let (Some(net), Some(_)) = (self.net.as_ref().map(Arc::clone), self.prekeys.as_ref())
-        else {
-            return Outcome::Failed(Fault::NotNetworked);
-        };
-        if self.channels.contains_key(&parsed.channel_id) {
-            return Outcome::Failed(Fault::IdentityExists);
-        }
-        let now = self.now();
-        let me = net.local_id();
-        let Some(board) = self.reach_a_board(&parsed).await else {
-            return Outcome::Failed(Fault::Unreachable);
-        };
-        self.refresh_network_view().await;
-        // The board tells us what the channel is and who is in it.
-        let mut set = match net.fetch_channel(&board, &parsed.channel_id, 0).await {
-            Ok(s) => s,
-            Err(e) => return Outcome::Failed(fault_of(&e)),
-        };
-        let Some(genesis) = set.genesis.clone() else {
-            return Outcome::Failed(Fault::BadLink);
-        };
-        // The member to join through: the pinned responder, else any member the board
-        // has an address record for. Its record's endpoints are dial hints — a wrong
-        // one just fails, the identity is pinned — and the ladder does the rest: the
-        // anchor we are connected to is exactly the helper a punch or a circuit
-        // through needs when the responder is behind a NAT too.
-        // **Every member the board knows is a candidate, not just the first one.**
-        //
-        // A link that pins a responder names exactly one, and that is the owner's choice.
-        // A link that pins none used to take `set.members.first()` and stop there, so one
-        // member being offline failed a join that any other member in the room could have
-        // served — and the room looked broken to the person joining it, with nothing to
-        // suggest that trying again later, or from a different link, would behave any
-        // differently.
-        //
-        // The walk is bounded. Each attempt runs the ADR-005 join, and that carries a proof
-        // of work, so an unbounded list would let a room with many members turn one join
-        // into minutes of hashing. `MAX_JOIN_RESPONDERS` is the bound, and an attempt is
-        // only retried when the fault says *this responder* could not serve it.
-        // **Sorted, because the board's order is not an order.** The members come from a
-        // `HashMap`'s `values()`, so which one a join reached was effectively random — and with
-        // no fallback, a room with one offline member failed joins at a rate nobody could
-        // reproduce and a retry could "fix" by chance. Sorting by fingerprint makes the walk the
-        // same every time, so a join that fails fails for a reason.
-        //
-        // **And a pinned responder is a preference, not the only candidate.** That fallback was
-        // added for exactly the reason above and then applied to only one of the two branches: a
-        // link naming a responder still produced a list of length one, so an invite whose author
-        // had since gone offline took the whole room down for the joiner while the anchor sat
-        // there reachable. Measured, with the node naming it rather than a timeout implying it:
-        // `bob's join outcome: Failed(Unreachable)` beside
-        // `Stalled { what: "joining a room", millis: 10005 }` — the whole dial budget spent on
-        // the one peer the link happened to name, and no second attempt.
-        //
-        // The pin is still tried first: whoever minted the link knows who is expected to answer.
-        //
-        // **Every member the board knows, not only the ones it has an address for.** The list was
-        // built from `set.members`, which is the *address records* — so a member the board knew by
-        // its **bundle**, or the **creator named by the genesis**, was not a candidate at all. The
-        // patience loop below exists precisely to wait for an address record that has not arrived
-        // yet, and a member in that state could never reach it: it was filtered out one step
-        // earlier, by the very condition the loop was written to tolerate.
-        //
-        // That is how a room with a live host became unjoinable. Measured, with the joiner naming
-        // what it tried: one candidate, both its paths dead, and the host — online, on loopback,
-        // the genesis creator — never in the list, because its address record had been refused on
-        // the anchor while its identity was never in question. The genesis is the one record whose
-        // author cannot be in doubt: its hash *is* the channelID, and it names the creator.
-        //
-        // **Ordered so that a member we can reach is tried before one we would have to wait for.**
-        // Mixing them without that gives a 20s `JOIN_ADDRESS_PATIENCE` stall in front of a peer
-        // that was dialable immediately, which is the cost this widening would otherwise add.
-        let candidates: Vec<crate::hash::Digest32> = {
-            use std::collections::BTreeSet;
-            let with_address: BTreeSet<crate::hash::Digest32> = set
-                .members
-                .iter()
-                .filter(|r| !r.endpoints.is_empty())
-                .map(|r| r.author_id)
-                .collect();
-            let mut known: BTreeSet<crate::hash::Digest32> =
-                set.members.iter().map(|r| r.author_id).collect();
-            known.extend(set.bundles.iter().map(|b| b.author_id));
-            if let Some(g) = set.genesis.as_ref() {
-                known.insert(g.body.creator_pubkey.fingerprint());
-            }
-            // Never ourselves: a node does not join a room by asking itself to answer.
-            known.remove(&me);
-            let mut reachable: Vec<crate::hash::Digest32> =
-                known.intersection(&with_address).copied().collect();
-            let mut awaited: Vec<crate::hash::Digest32> =
-                known.difference(&with_address).copied().collect();
-            reachable.sort_unstable();
-            awaited.sort_unstable();
-            let mut ordered = Vec::with_capacity(known.len() + 1);
-            if let Some(r) = parsed.responder {
-                ordered.push(r);
-                reachable.retain(|m| *m != r);
-                awaited.retain(|m| *m != r);
-            }
-            ordered.extend(reachable);
-            ordered.extend(awaited);
-            if ordered.is_empty() {
-                return Outcome::Failed(Fault::BadLink);
-            }
-            ordered.truncate(MAX_JOIN_RESPONDERS);
-            ordered
-        };
-
-        // The pre-join record does not depend on which member answers, so it is built once
-        // and announced to the board once, before any of them is reached (ADR-016): on the
-        // anchor it is what lets the anchor coordinate a punch or carry a circuit for us,
-        // and on the responder it is what authorizes the join stream.
-        let prejoin_wire = {
-            let Some(profile) = self.profile.as_ref() else {
-                return Outcome::Failed(Fault::NoIdentity);
-            };
-            let Ok(signer) = profile.signer() else {
-                return Outcome::Failed(Fault::Locked);
-            };
-            let ring = match self.prekeys.as_ref() {
-                Some(r) => r.lock().await,
-                None => return Outcome::Failed(Fault::NotNetworked),
-            };
-            let bundle =
-                match ring.bundle(&crate::identity::composite::RootSigner::public_key(signer)) {
-                    Ok(b) => b,
-                    Err(e) => return Outcome::Failed(fault_of(&e)),
-                };
-            let endpoints = match net.local_endpoints() {
-                Ok(e) => e,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            };
-            let seq = {
-                let entry = self.record_seq.entry(parsed.channel_id).or_insert(0);
-                *entry = entry.saturating_add(1);
-                *entry
-            };
-            match crate::nat::record::PreJoinRecord::build(
-                signer,
-                &parsed.channel_id,
-                bundle,
-                endpoints,
-                seq,
-                now,
-            ) {
-                Ok(r) => r.to_wire(),
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            }
-        };
-        if let Err(e) = announce(&board, &prejoin_wire).await {
-            return Outcome::Failed(fault_of(&e));
-        }
-
-        let mut why: Vec<String> = Vec::new();
-
-        let mut last_fault = Fault::Unreachable;
-        let mut joined_outcome = None;
-        for responder in candidates {
-            let mut responder_endpoints = set
-                .members
-                .iter()
-                .find(|r| r.author_id == responder)
-                .map(|r| r.endpoints.clone())
-                .unwrap_or_default();
-            // **An address we do not know yet is not an address that does not exist.**
-            //
-            // `unwrap_or_default()` above yields an *empty* endpoint list when the responder
-            // has no address record on this board, and dialling an empty list fails at once —
-            // which this returned to the caller as `Fault::Unreachable`, in under three
-            // seconds, for a member who was online and perfectly reachable. It made
-            // `node_m15_session_from_bundle_gate` fail about two runs in five on clean `main`.
-            //
-            // Measured, not deduced. On a failing run the board held `members=1, bundles=2`:
-            // the responder's *bundle* record had arrived but its *address* record had not.
-            // The two propagate separately, so a joiner who arrives in that window sees a
-            // member it has a key for and no way to reach — and concluded the member was
-            // unreachable.
-            //
-            // A deadline is what separates "not yet" from "not there", which is the same
-            // distinction `up::reach_host_with_patience` draws for a service host, and the
-            // same one every peer-to-peer client draws when a peer list is incomplete: keep
-            // asking the source, do not conclude absence from silence.
-            if responder_endpoints.is_empty() && board.peer_id() != responder {
-                let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
-                while tokio::time::Instant::now() < deadline {
-                    tokio::time::sleep(JOIN_ADDRESS_POLL).await;
-                    let Ok(fresh) = net.fetch_channel(&board, &parsed.channel_id, 0).await else {
-                        continue;
-                    };
-                    let found = fresh
-                        .members
-                        .iter()
-                        .find(|r| r.author_id == responder)
-                        .map(|r| r.endpoints.clone())
-                        .unwrap_or_default();
-                    if !found.is_empty() {
-                        // Take the fresher board too: it is a superset by construction, and
-                        // the records that arrived alongside the address are ones we are
-                        // about to want.
-                        responder_endpoints = found;
-                        set = fresh;
-                        break;
-                    }
-                }
-            }
-
-            let conn = if board.peer_id() == responder {
-                Arc::clone(&board)
-            } else {
-                match self.dial(responder, &responder_endpoints).await {
-                    Ok(c) => {
-                        if let Err(e) = announce(&c, &prejoin_wire).await {
-                            last_fault = fault_of(&e);
-                            if !worth_another_responder(last_fault) {
-                                return Outcome::Failed(last_fault);
-                            }
-                            continue;
-                        }
-                        c
-                    }
-                    Err(e) => {
-                        last_fault = fault_of(&e);
-                        // **Every rung's verdict, not the fault token.** `Outcome::Failed(Fault)` is
-                        // one word with no room for a reason, so a join that could not be carried
-                        // reported `Unreachable` and nothing else — and "that member is offline",
-                        // "no helper would relay" and "the board has not caught up" are three
-                        // different problems that all render as that one word.
-                        why.push(format!(
-                            "{}: {e}",
-                            crate::node::network::short_id(responder)
-                        ));
-                        if !worth_another_responder(last_fault) {
-                            self.say_why_the_join_failed(&why);
-                            return Outcome::Failed(last_fault);
-                        }
-                        continue;
-                    }
-                }
-            };
-
-            let Some(profile) = self.profile.as_ref() else {
-                return Outcome::Failed(Fault::NoIdentity);
-            };
-            let Ok(signer) = profile.signer() else {
-                return Outcome::Failed(Fault::Locked);
-            };
-            let dh = *signer.x25519_identity_secret();
-            let mut ctx = match crate::node::channel::join_context_from_genesis(&genesis, 0) {
-                Ok(c) => c,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            };
-            if let Some(pow) = self.pow_params {
-                ctx.pow_params = pow;
-            }
-            let ik = crate::identity::keyagreement::X25519IdentityKey::from_secret_bytes(dh);
-            match net.start_join(&conn, ctx, passphrase, signer, &ik).await {
-                Ok(o) => {
-                    joined_outcome = Some((o, responder, conn));
-                    break;
-                }
-                Err(e) => {
-                    last_fault = fault_of(&e);
-                    if !worth_another_responder(last_fault) {
-                        return Outcome::Failed(last_fault);
-                    }
-                }
-            }
-        }
-        let Some((joined, responder, conn)) = joined_outcome else {
-            self.say_why_the_join_failed(&why);
-            return Outcome::Failed(last_fault);
-        };
-
-        // Local state for the channel we just joined.
+    /// Everything after the join exchange: make the room from the sealed key, record how this
+    /// node was admitted, learn who else is in it, and publish — the part that has to be on the
+    /// actor, and was the tail of the old inline `join_channel`.
+    async fn finish_join_channel(
+        &mut self,
+        parsed: crate::node::link::InviteLink,
+        local_name: String,
+        passphrase: Secret,
+        now: u64,
+        me: Digest32,
+        won: JoinerWon,
+    ) -> Outcome {
+        let JoinerWon {
+            joined,
+            responder,
+            conn,
+            set,
+            genesis,
+            sealed,
+            steps: _,
+        } = won;
         let channel = {
             let Some(profile) = self.profile.as_ref() else {
                 return Outcome::Failed(Fault::NoIdentity);
             };
-            match ChannelState::join_channel_with_profile(
+            match ChannelState::join_channel_from_sealed(
                 profile,
                 &genesis,
                 &parsed.channel_id,
-                local_name,
-                passphrase,
+                &local_name,
+                &passphrase,
                 now,
-                self.argon2,
+                sealed,
             ) {
                 Ok(c) => c,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
@@ -3300,8 +4104,8 @@ impl Node {
         }
         // An admission changes a room's author set, the other half of the reacher join.
         self.refresh_reachers().await;
-        self.sessions
-            .insert((parsed.channel_id, responder), joined.session);
+        self.adopt_join_session(parsed.channel_id, responder, joined.session, true)
+            .await;
         // The link's anchors are this channel's anchors from now on (persisted, so a
         // restart still knows where the swarm's board is), together with our own.
         let mut learned = BootstrapSet::new();
@@ -3369,7 +4173,12 @@ impl Node {
     /// log is what makes a message *render*, because a reader requires both (ADR-007).
     /// Doing one without the other leaves a peer holding a key it must not use, or a
     /// grant it cannot act on.
-    async fn release_key_to(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
+    async fn release_key_to(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        asked: bool,
+    ) -> Outcome {
         if self.net.is_none() {
             return Outcome::Failed(Fault::NotNetworked);
         }
@@ -3395,13 +4204,13 @@ impl Node {
         // No session need exist yet: one is opened from this member's bundle record
         // if the join path never made one (ADR-016).
         let hello = self.ensure_session(channel_id, target).await;
-        let Some(conn) = self.reach_member(channel_id, target).await else {
+        let Some(conn) = self.reach_member(channel_id, target, asked).await else {
             return Outcome::Failed(Fault::Unreachable);
         };
         let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
             return Outcome::Failed(Fault::Unreachable);
         };
-        if let Err(e) = crate::node::pairwise_stream::deliver_skdm(
+        let sent = match crate::node::pairwise_stream::deliver_skdm(
             &conn,
             channel_id,
             session,
@@ -3410,7 +4219,11 @@ impl Node {
         )
         .await
         {
-            return Outcome::Failed(fault_of(&e));
+            Ok(sent) => sent,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        if hello.is_some() {
+            self.hello_delivered(channel_id, target);
         }
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
@@ -3418,20 +4231,109 @@ impl Node {
         ) else {
             return Outcome::Failed(Fault::UnknownChannel);
         };
-        if let Err(e) = shared
-            .lock()
-            .await
-            .issue_consent(profile, target, &skdm, now)
-        {
-            return Outcome::Failed(fault_of(&e));
-        }
+        let chain_id = {
+            let mut channel = shared.lock().await;
+            if let Err(e) = channel.issue_consent(profile, target, &skdm, now) {
+                return Outcome::Failed(fault_of(&e));
+            }
+            channel.sender_generation()
+        };
+        // The consent is a fact once decided; whether the key landed is learnt off the actor.
+        self.watch_delivery(sent, *channel_id, target, chain_id);
         Outcome::Done
+    }
+
+    /// Decide what an explicit consent's `outcome` means for the person waiting on it.
+    ///
+    /// `Unreachable` has two causes. With no connection to the member, `reach_member` has started
+    /// a dial, so the consent waits for `Dialed` or `ReachFailed`. With a connection but no pairwise
+    /// session, the member's bundle record is not on this node's board yet: a node that has just
+    /// started holds only what its first sessions bring in. V29-19 measured this through the real
+    /// `vox tui`: a consent to a member who was online failed at once, in 0.75s, with
+    /// `no reachable peer`, at 0, 3, 6 and 10s after the room opened, and succeeded from 15s. So a
+    /// sync with that member is started, since that is what fetches its records, and the consent
+    /// is retried when the room's session is done.
+    async fn settle_consent(
+        &mut self,
+        channel_id: Digest32,
+        target: Digest32,
+        reply: oneshot::Sender<Outcome>,
+        outcome: Outcome,
+        attempts: u8,
+    ) {
+        const MAX_CONSENT_ATTEMPTS: u8 = 3;
+        if !matches!(outcome, Outcome::Failed(Fault::Unreachable))
+            || attempts >= MAX_CONSENT_ATTEMPTS
+        {
+            let _ = reply.send(outcome);
+            return;
+        }
+        let connected = self
+            .net
+            .as_ref()
+            .is_some_and(|n| n.manager().existing(&target).is_some());
+        if connected {
+            // Started or not (the room may be mid-session with somebody else), the retry rides the
+            // room's next `SyncDone`.
+            let _ = self.sync_one(&channel_id, target).await;
+            if !self.syncing.contains(&channel_id) {
+                let _ = reply.send(outcome);
+                return;
+            }
+        } else if attempts > 0 {
+            // A dial already landed once for this consent and the connection is gone again.
+            let _ = reply.send(outcome);
+            return;
+        }
+        self.pending_consents
+            .push((channel_id, target, reply, attempts.saturating_add(1)));
+    }
+
+    /// Retry the explicit consents `matches` selects (`Dialed` passes its peer, `SyncDone` its
+    /// room), or answer them all with `failed` (`ReachFailed`).
+    async fn answer_pending_consents(
+        &mut self,
+        matches: impl Fn(&Digest32, &Digest32) -> bool,
+        failed: Option<Outcome>,
+    ) {
+        let (waiting, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_consents)
+            .into_iter()
+            .partition(|(room, target, _, _)| matches(room, target));
+        self.pending_consents = rest;
+        if waiting.is_empty() {
+            return;
+        }
+        for (channel_id, target, reply, attempts) in waiting {
+            match failed {
+                Some(o) => {
+                    let _ = reply.send(o);
+                }
+                None => {
+                    // Still waiting on its dial: that is `Dialed`'s or `ReachFailed`'s to answer, not
+                    // a session with somebody else that happened to finish first.
+                    let connected = self
+                        .net
+                        .as_ref()
+                        .is_some_and(|n| n.manager().existing(&target).is_some());
+                    if !connected {
+                        self.pending_consents
+                            .push((channel_id, target, reply, attempts));
+                        continue;
+                    }
+                    let outcome = self.consent(&channel_id, target, false).await;
+                    self.settle_consent(channel_id, target, reply, outcome, attempts)
+                        .await;
+                }
+            }
+        }
+        // The view reflects whatever was granted before anyone reads it.
+        self.publish().await;
     }
 
     /// Consent to `target` reading this identity's messages — ADR-007 step 3, the
     /// human decision, taken per sender.
-    async fn consent(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
-        let outcome = self.release_key_to(channel_id, target).await;
+    async fn consent(&mut self, channel_id: &Digest32, target: Digest32, asked: bool) -> Outcome {
+        let outcome = self.release_key_to(channel_id, target, asked).await;
         if outcome.is_done() {
             let _ = self.event_tx.send(NodeEvent::Consented {
                 channel_id: *channel_id,
@@ -3465,7 +4367,7 @@ impl Node {
         // inputs must push. Immediately, not on the tick: a stream parked open across
         // this instant is judged by the set as it stands when its request lands (M17.11).
         self.refresh_reachers().await;
-        self.deliver_owed_consents().await;
+        self.deliver_owed_consents(Some(fingerprint)).await;
         self.publish().await;
         Outcome::Done
     }
@@ -3542,12 +4444,22 @@ impl Node {
     /// Retried on the tick for the same reason a re-key is: consent *is* a network
     /// act — the SKDM rides a pairwise session — so a trusted member that is
     /// offline right now is skipped, not failed, and picked up when it returns.
-    async fn deliver_owed_consents(&mut self) {
-        if self.net.is_none() || self.trust.is_empty() {
+    ///
+    /// `asked_for` is the identity a person just trusted: it is dialled at once rather than after
+    /// the automatic spacing, and only once, since a connection is per member and not per room.
+    /// Nothing here waits for a dial (see `reach_member`); consent follows on `Dialed`. Waiting
+    /// made `vox trust add` freeze the node for 10s per offline trusted member per room.
+    async fn deliver_owed_consents(&mut self, asked_for: Option<Digest32>) {
+        if self.net.is_none() {
+            return;
+        }
+        self.deliver_reopens().await;
+        if self.trust.is_empty() {
             return;
         }
         let trusted = self.trust.trusted();
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+        let mut asked_for = asked_for;
         for channel_id in channels {
             let owed = {
                 let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
@@ -3559,7 +4471,11 @@ impl Node {
             for target in owed {
                 // `consent` emits `Consented` on success; a failure here is a peer
                 // that is not reachable yet, which the next tick retries.
-                let _ = self.consent(&channel_id, target).await;
+                let asked = asked_for == Some(target);
+                let outcome = self.consent(&channel_id, target, asked).await;
+                if asked && matches!(outcome, Outcome::Failed(Fault::Unreachable)) {
+                    asked_for = None;
+                }
             }
         }
     }
@@ -3589,7 +4505,7 @@ impl Node {
         };
         // The revocation is a log fact the whole channel converges on.
         self.note_local_append(channel_id);
-        let rekeyed = self.deliver_rekeys_for(channel_id).await;
+        let rekeyed = self.deliver_rekeys_for(channel_id, true).await;
         let _ = self.event_tx.send(NodeEvent::Revoked {
             channel_id: *channel_id,
             target,
@@ -3604,14 +4520,14 @@ impl Node {
     async fn deliver_owed_rekeys(&mut self) {
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         for channel_id in channels {
-            let _ = self.deliver_rekeys_for(&channel_id).await;
+            let _ = self.deliver_rekeys_for(&channel_id, false).await;
         }
     }
 
     /// Deliver the current generation to the members of one channel that are owed it,
     /// returning how many were re-keyed. A member with no live pairwise session is
     /// skipped, not failed: the tick tries again once there is one.
-    async fn deliver_rekeys_for(&mut self, channel_id: &Digest32) -> u64 {
+    async fn deliver_rekeys_for(&mut self, channel_id: &Digest32, asked: bool) -> u64 {
         if self.net.is_none() {
             return 0;
         }
@@ -3633,20 +4549,30 @@ impl Node {
             }
         };
         let mut delivered = 0u64;
+        let now_secs = self.now();
         for target in owed {
+            // A member whose last keys were not taken waits out its backoff, unless a person asked.
+            if !asked
+                && self
+                    .key_backoff
+                    .get(&(*channel_id, target))
+                    .is_some_and(|(_, until)| now_secs < *until)
+            {
+                continue;
+            }
             // Open a session from the member's bundle record if none exists, and reach
             // them through the ladder rather than requiring a live connection: a re-key
             // that only reaches members this process happened to join with is the M15
             // gap ADR-016 recorded, and it is what made revocation undeliverable after
             // a restart.
             let hello = self.ensure_session(channel_id, target).await;
-            let Some(conn) = self.reach_member(channel_id, target).await else {
+            let Some(conn) = self.reach_member(channel_id, target, asked).await else {
                 continue;
             };
             let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
                 continue;
             };
-            if crate::node::pairwise_stream::deliver_skdm(
+            let Ok(sent) = crate::node::pairwise_stream::deliver_skdm(
                 &conn,
                 channel_id,
                 session,
@@ -3654,10 +4580,13 @@ impl Node {
                 hello.as_ref(),
             )
             .await
-            .is_err()
-            {
+            else {
                 continue;
+            };
+            if hello.is_some() {
+                self.hello_delivered(channel_id, target);
             }
+            self.watch_delivery(sent, *channel_id, target, generation);
             // Recorded only after the bytes went out, so a failed delivery stays owed.
             let noted = {
                 let Some(profile) = self.profile.as_ref() else {
@@ -3681,7 +4610,10 @@ impl Node {
         if self.net.is_none() {
             return;
         }
+        self.push_now = true;
         self.pending_push.insert(*channel_id);
+        // Something new: every peer is owed it again, including those that had the last one.
+        self.pushed_to.remove(channel_id);
         for schedule in self.schedules.values_mut() {
             schedule.note_local_append();
         }
@@ -3720,16 +4652,40 @@ impl Node {
         });
     }
 
+    /// Push what a local append made due **now**, rather than at the next tick.
+    ///
+    /// A message was marked due by `note_local_append` and then waited for `TICK` — up to a full
+    /// second — before anything sent it: PRD-001 R40 asks for chat under a second, and measured
+    /// through the real binary the median was 322–894ms with a maximum of 1.021s, the tick's own
+    /// shape. Run after the command or event that made the push due, and after its reply, so the
+    /// command's own latency is unchanged.
+    ///
+    /// A burst coalesces for free: a room mid-session is owed rather than re-sent (see
+    /// `run_due_syncs`), and the session's `SyncDone` re-arms this while pushes are still owed, so
+    /// posts go out back to back instead of one per tick.
+    async fn push_if_owed(&mut self) {
+        if std::mem::take(&mut self.push_now) && self.run_due_syncs().await {
+            self.publish().await;
+        }
+    }
+
     async fn run_due_syncs(&mut self) -> bool {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return false;
         };
         let now = self.now();
-        let due: Vec<(Digest32, SyncTrigger)> = self
+        let mut due: Vec<(Digest32, SyncTrigger)> = self
             .schedules
             .iter()
             .filter_map(|(peer, s)| s.due(now).map(|t| (*peer, t)))
             .collect();
+        // **Owed peers first.** `schedules` is keyed by fingerprint, so without this every pass
+        // visited peers in the same order, and one that sorted first and took the room each time
+        // left the rest skipped each time. A stable sort keeps fingerprint order within each group.
+        due.sort_by_key(|(peer, _)| !self.owed_first.contains(peer));
+        for (peer, _) in &due {
+            self.owed_first.remove(peer);
+        }
         if due.is_empty() {
             return false;
         }
@@ -3751,9 +4707,9 @@ impl Node {
             // Rooms this pass wanted with this peer but found **already mid-session**. See the
             // `owed` handling after the loop: they are retried next tick, not forgotten.
             let mut owed: Vec<Digest32> = Vec::new();
-            // A member reconciles a channel with its co-authors — and with its
-            // anchors, which keep the log for whoever is away (M15.2b).
-            let peer_is_anchor = self.anchor_ids.contains(&peer);
+            // A member reconciles a channel with its co-authors — and with that channel's
+            // anchors, which keep the log for whoever is away (M15.2b). Both are decided per room
+            // by `may_sync` below.
 
             // **Learn who this peer is before deciding we share nothing with it.**
             //
@@ -3773,73 +4729,81 @@ impl Node {
             //
             // Done only on a connect, not every tick: this reads the board and admits authors, which
             // is exactly the work a new connection warrants and would be waste on the interval.
-            for (cid, shared) in &self.channels {
-                if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
+            // Candidates first, decided after: the membership test below needs `&mut self` (it may
+            // admit a member from this node's own board), which the maps cannot be borrowed across.
+            let mut member_rooms: Vec<Digest32> = Vec::new();
+            for cid in self.channels.keys() {
+                if trigger == SyncTrigger::LocalAppend
+                    && (!self.pending_push.contains(cid)
+                        || self.pushed_to.get(cid).is_some_and(|to| to.contains(&peer)))
+                {
                     continue;
                 }
-                // Checked **before** the `is_author` lock below: a session holds this room's
-                // mutex for its whole run, so taking it here would park the actor behind it.
-                if self.syncing.contains(cid) {
+                if self.syncing.contains(cid) || self.publishing.contains(&(*cid, peer)) {
                     owed.push(*cid);
                     continue;
                 }
-                // **A fresh connection is never filtered out.**
-                //
-                // The `is_author` test below is the right question on an interval pass and the wrong
-                // one here: a peer that has *just joined* is by definition not yet an author in this
-                // node's view, so the node holding the evidence that it belongs skipped it for not
-                // belonging. Worse, the code that admits it — `learn_members`, reading the bundle
-                // records off this node's own board — runs inside `sync_one`, which only executes for
-                // channels that already passed this filter. The precondition sat behind the check it
-                // was the precondition for.
-                //
-                // So on a connect, reconcile every open channel with the peer and let the ADR-008
-                // session decide: it verifies authorship per entry and hard-fails on an author it
-                // cannot verify, which is a real answer. Silently skipping is not — measured as a
-                // user, a message posted seconds after somebody joined was lost, not delayed.
-                if trigger == SyncTrigger::Connected
-                    || peer_is_anchor
-                    || shared.lock().await.is_author(&peer)
-                {
-                    channels.push(*cid);
+                member_rooms.push(*cid);
+            }
+            // **A room goes only to a peer that belongs to it.** On a fresh connection this pushed
+            // *every* open room to the peer — the inbound half of D5 refuses a non-member's request,
+            // and this was the outbound half handing the same log over unasked. The bypass existed
+            // because a peer that has just joined is not yet an author in this node's view;
+            // `may_sync` covers that case properly, by admitting the peer from this node's own board
+            // before deciding, which is the evidence the bypass was standing in for.
+            //
+            // **An anchor gets the rooms that name it, not every room** (V29-04, #39). An anchor was
+            // pushed every room this node held because `anchor_ids` held it, and `anchor_ids` holds
+            // the anchors named by ANY room's invite link: an anchor named only by room A's link was
+            // handed room B's log unasked, while that anchor's own `may_sync` would have refused B
+            // inbound. vox-bc's verifier reproduced it with real nodes: the other room's anchor was
+            // pushed room B, one session and five entries. `may_sync` already accepts a room's own
+            // anchors, and the configured ones are in every room's anchor set, so it decides alone.
+            for cid in member_rooms {
+                let belongs = {
+                    let Some(epoch) = (match self.channels.get(&cid) {
+                        Some(shared) => Some(shared.lock().await.epoch()),
+                        None => None,
+                    }) else {
+                        continue;
+                    };
+                    self.may_sync(&cid, &peer, epoch).await
+                };
+                if belongs {
+                    channels.push(cid);
                 }
             }
-            // An anchor reconciles every channel it keeps with each of that channel's
-            // known members.
-            for (cid, state) in &self.anchored {
-                // An anchored room takes part in a push: this skipped them on the reasoning that an
-                // anchor never appends locally — true, and beside the point, because an anchor is
-                // exactly the node that must forward what it was just given. The push trigger is now
-                // set by entries arriving as well as by a local append.
-                if trigger == SyncTrigger::LocalAppend && !self.pending_push.contains(cid) {
+            // An anchor forwards a room it keeps only to that room's authors — read fresh off its
+            // own board first, so a member that has just been vouched for is not skipped. It used to
+            // forward every kept room to any peer that connected or pushed.
+            let mut kept_rooms: Vec<Digest32> = Vec::new();
+            for cid in self.anchored.keys() {
+                if trigger == SyncTrigger::LocalAppend
+                    && (!self.pending_push.contains(cid)
+                        || self.pushed_to.get(cid).is_some_and(|to| to.contains(&peer)))
+                {
                     continue;
                 }
                 if self.syncing.contains(cid) {
                     owed.push(*cid);
                     continue;
                 }
-                // **An anchor does not filter out the member it is forwarding to.**
-                //
-                // `is_author` is the right question on an interval pass and the wrong one here, for
-                // the same reason it was wrong for an open room: a member that has just joined is not
-                // yet an author in this anchor's view, so the node whose entire job is holding the
-                // log for whoever is away declined to hand it over. Measured, timestamped on both
-                // sides: the anchor took the entry at **1s** and the member could not read it until
-                // **31s** — `SYNC_INTERVAL_SECS`, i.e. it arrived by the member's own periodic pull
-                // because the anchor never pushed. Not slow: not sent.
-                //
-                // On a connect or a push, reconcile and let the session decide — it verifies
-                // authorship per entry and hard-fails on one it cannot verify, which is an answer.
-                // The interval pass keeps the filter, where it costs nothing and bounds the work.
-                let forwarding =
-                    matches!(trigger, SyncTrigger::Connected | SyncTrigger::LocalAppend);
-                if forwarding || state.lock().await.is_author(&peer) {
-                    channels.push(*cid);
+                kept_rooms.push(*cid);
+            }
+            for cid in kept_rooms {
+                self.refresh_anchored_authors(&cid).await;
+                let Some(state) = self.anchored.get(&cid).map(Arc::clone) else {
+                    continue;
+                };
+                if state.lock().await.is_author(&peer) {
+                    channels.push(cid);
                 }
             }
             for channel_id in channels {
                 if self.sync_one(&channel_id, peer).await {
                     ran = true;
+                    // Any session carries the room's latest append, whatever triggered it.
+                    self.pushed_to.entry(channel_id).or_default().insert(peer);
                     if trigger == SyncTrigger::LocalAppend {
                         pushed.insert(channel_id);
                     }
@@ -3868,6 +4832,7 @@ impl Node {
                 if !owed.is_empty() {
                     owed_rooms.extend(owed.iter().copied());
                     schedule.note_local_append();
+                    self.owed_first.insert(peer);
                 }
             }
         }
@@ -3995,23 +4960,26 @@ impl Node {
                         let _ = tx
                             .send(NetEvent::SyncDone {
                                 channel_id: cid,
+                                peer,
                                 outcome: Err(e),
                             })
                             .await;
                         return;
                     }
                 };
-            // 3. Run the session. `blocking_lock` is the sanctioned way to take a tokio mutex off a
-            //    blocking thread; anything else wanting this room waits for the session rather than
-            //    finding it missing.
+            // 3. Run the session. It takes the room's lock inside each protocol step and never across
+            //    a send or a receive (`sync_over_room`), so a peer slow to answer no longer holds the
+            //    room — or, through `publish()` and every other lock on it, the actor.
             let joined = tokio::task::spawn_blocking(move || {
                 let mut t = transport;
                 match target {
                     SessionTarget::Channel(shared) => {
-                        shared.blocking_lock().sync_over(&store, &mut t, now)
+                        crate::node::channel::ChannelState::sync_over_room(
+                            &shared, &store, &mut t, now,
+                        )
                     }
                     SessionTarget::Anchored(state) => {
-                        state.blocking_lock().sync_over(&store, &mut t, now)
+                        crate::node::anchor::AnchorState::sync_over_room(&state, &store, &mut t)
                     }
                 }
             })
@@ -4023,6 +4991,7 @@ impl Node {
             let _ = tx
                 .send(NetEvent::SyncDone {
                     channel_id: cid,
+                    peer,
                     outcome,
                 })
                 .await;
@@ -4035,6 +5004,7 @@ impl Node {
     fn start_session(
         &mut self,
         channel_id: Digest32,
+        peer: Digest32,
         transport: crate::transport::quic::QuicStreamTransport,
     ) {
         let Some(store) = self.log_store() else {
@@ -4055,16 +5025,17 @@ impl Node {
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
             let joined = tokio::task::spawn_blocking(move || {
-                // `blocking_lock` is the sanctioned way to take a tokio mutex off a
-                // blocking thread. Anything else wanting this channel waits for the
-                // session — a few milliseconds — instead of finding it missing.
+                // The room is locked inside each protocol step only, never across the
+                // network (`sync_over_room`).
                 let mut t = transport;
                 match target {
                     SessionTarget::Channel(shared) => {
-                        shared.blocking_lock().sync_over(&store, &mut t, now)
+                        crate::node::channel::ChannelState::sync_over_room(
+                            &shared, &store, &mut t, now,
+                        )
                     }
                     SessionTarget::Anchored(state) => {
-                        state.blocking_lock().sync_over(&store, &mut t, now)
+                        crate::node::anchor::AnchorState::sync_over_room(&state, &store, &mut t)
                     }
                 }
             })
@@ -4075,6 +5046,7 @@ impl Node {
             let _ = tx
                 .send(NetEvent::SyncDone {
                     channel_id,
+                    peer,
                     outcome,
                 })
                 .await;
@@ -4115,8 +5087,15 @@ impl Node {
     /// actor is the only writer of channel state and anything it awaits inline stops the whole
     /// node, so it must never wait on an untrusted peer to speak. What it does here is local
     /// and ordered, which is what the single-task design is for.
+    /// **Only a member of *this* room is served its log** (PRD-001 R5). The stream-kind gate
+    /// in `node::net` asks whether the peer may open a sync stream *at all*, which any member
+    /// of any room this node holds may — and the preamble then names whichever channel the
+    /// peer likes. Nothing here checked the two against each other, so a member of room A who
+    /// had ever seen room B's `.vox` name was handed B's whole log (PRD-001 D5). See
+    /// [`Self::may_sync`] for who counts.
     async fn run_sync_session(
         &mut self,
+        peer: Digest32,
         channel_id: Digest32,
         epoch: u64,
         send: quinn::SendStream,
@@ -4155,11 +5134,78 @@ impl Node {
             (None, None) => false,
         };
 
+        // **Refused, not dropped.** A node asked for a room it does not hold — an anchor that keeps
+        // no log for it, most often — or at an epoch it is not at, returned here and let the streams
+        // fall, and the initiator learned only `sync failed: transport` — indistinguishable from a
+        // connection that died. Every push to an anchor that keeps no log for the room read as a
+        // network fault. A coded reset says what happened. (It does not recover time: a dropped
+        // stream already ended the initiator's session within milliseconds, measured; the long
+        // losses once blamed on this were the room-wide starvation v0.2.8 fixed.)
         if !matches_epoch {
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream(&mut send, &mut recv);
+            return;
+        }
+        if !self.may_sync(&channel_id, &peer, epoch).await {
+            // Refused explicitly, with the same coded reset as a stream kind the peer may not
+            // open, rather than left to read for a frame that never comes.
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream(&mut send, &mut recv);
             return;
         }
         let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
-        self.start_session(channel_id, transport);
+        self.start_session(channel_id, peer, transport);
+    }
+
+    /// Whether `peer` may reconcile `channel_id`'s log with this node.
+    ///
+    /// - An **admitted author** of that room. If it is not one yet, this node's own board is
+    ///   consulted first — local, so cheap — because a member that joined through somebody
+    ///   else is on the board before it is in this node's author table, and refusing it for
+    ///   that would be the "precondition behind its own check" defect `run_due_syncs` documents.
+    ///   Admission there takes the same M17.6 evidence as everywhere else.
+    /// - An **anchor of that room** — in the room's own anchor set, which holds this node's
+    ///   configured anchors and those the room's link named. It keeps the room's ciphertext by
+    ///   design (ADR-016 M15.2b) for members who are away. An anchor named only by *another*
+    ///   room's link is not an anchor of this one.
+    ///
+    /// For a room this node only anchors, the peer must be an author the board knows.
+    async fn may_sync(&mut self, channel_id: &Digest32, peer: &Digest32, epoch: u64) -> bool {
+        if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
+            {
+                let channel = shared.lock().await;
+                if channel.is_author(peer)
+                    || channel.anchors().nodes().iter().any(|a| a.id == *peer)
+                {
+                    return true;
+                }
+            }
+            let (Some(net), Some(store)) = (
+                self.net.as_ref().map(Arc::clone),
+                self.profile.as_ref().map(Profile::store_handle),
+            ) else {
+                return false;
+            };
+            let bundles = net.board_bundles(channel_id, epoch);
+            if !bundles.iter().any(|b| b.author_id == *peer) {
+                return false;
+            }
+            let now = self.now();
+            let mut channel = shared.lock().await;
+            let _ = admit_board_records(
+                &mut channel,
+                &store,
+                &bundles,
+                ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+                now,
+            )
+            .await;
+            return channel.is_author(peer);
+        }
+        if let Some(state) = self.anchored.get(channel_id) {
+            return state.lock().await.is_author(peer);
+        }
+        false
     }
 
     /// Accept an inbound [`PairwiseFrame::Hello`], establishing the responder half of
@@ -4175,8 +5221,33 @@ impl Node {
     /// An existing session is never replaced: a peer cannot reset our ratchet by
     /// sending a fresh `Hello`.
     async fn accept_hello(&mut self, channel_id: Digest32, peer: Digest32, initial: &[u8]) -> bool {
-        if self.sessions.contains_key(&(channel_id, peer)) {
-            return true;
+        let key = (channel_id, peer);
+        let hello_hash = crate::hash::sha256(initial);
+        let mut replaces = false;
+        if self.sessions.contains_key(&key) {
+            // The same hello again — the peer re-sending what we already accepted. The
+            // session is the one we hold; accepting it twice would re-consume a one-time
+            // prekey and reset a ratchet that is already in use.
+            if self.accepted_hello.get(&key) == Some(&hello_hash) {
+                return true;
+            }
+            // **Two sessions for one pair** (ADR-021 F12). Keep the one both ends will
+            // keep. It used to keep whichever it held, and so did the peer — each kept its
+            // own, and neither could open the key the other sent.
+            let me = self.profile.as_ref().map(|p| p.fingerprint());
+            let existing_mine = self.initiated.contains_key(&key);
+            if let Some(me) = me {
+                if !incoming_session_wins(&me, &peer, existing_mine) {
+                    // Ours wins. The peer is holding its own, so it must be offered ours
+                    // again: until it adopts it, nothing we seal can be opened there.
+                    if let Some(i) = self.initiated.get_mut(&key) {
+                        i.hello_delivered = false;
+                    }
+                    self.reopen.insert(key);
+                    return false;
+                }
+            }
+            replaces = true;
         }
         let Ok(init) = InitialMessage::from_wire(initial) else {
             return false;
@@ -4250,8 +5321,158 @@ impl Node {
         ) else {
             return false;
         };
-        self.sessions.insert((channel_id, peer), session);
+        self.sessions.insert(key, session);
+        self.initiated.remove(&key);
+        self.reopen.remove(&key);
+        self.accepted_hello.insert(key, hello_hash);
+        if replaces {
+            // Whatever this node sent under the session it just dropped was sealed where
+            // the peer cannot open it: forget that it was delivered, so the tick re-sends
+            // the current key over the session both ends now hold.
+            self.forget_delivery(&channel_id, &peer).await;
+        }
         true
+    }
+
+    /// Forget that `peer` holds this identity's current sender key in `channel_id`, so
+    /// the next re-key round delivers it again (ADR-021 F12).
+    async fn forget_delivery(&mut self, channel_id: &Digest32, peer: &Digest32) {
+        let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
+            return;
+        };
+        let _ = shared.lock().await.forget_delivery(profile.store(), peer);
+    }
+
+    /// File the session a join just established — `mine` when this node was the joiner,
+    /// which opened it — applying the same rule as [`Self::accept_hello`] when a session
+    /// for that pair already exists (ADR-021 F12).
+    ///
+    /// A join can race an auto-consent: the member answering a join may, on its own
+    /// tick, have already opened a session to the joiner from its bundle record, because
+    /// a trust entry for the joiner predates the join. Keeping whichever arrived last on
+    /// one side and whichever arrived first on the other is exactly the split this rule
+    /// exists to prevent.
+    async fn adopt_join_session(
+        &mut self,
+        channel_id: Digest32,
+        peer: Digest32,
+        session: crate::pairwise::session::Session,
+        mine: bool,
+    ) {
+        let key = (channel_id, peer);
+        if self.sessions.contains_key(&key) {
+            let me = self.profile.as_ref().map(|p| p.fingerprint());
+            let existing_mine = self.initiated.contains_key(&key);
+            // The rule is stated for an incoming session the PEER opened; a join session
+            // this node opened wins exactly when the existing one would lose to ours.
+            let incoming_wins = match me {
+                Some(me) if mine => existing_mine || me < peer,
+                Some(me) => incoming_session_wins(&me, &peer, existing_mine),
+                None => true,
+            };
+            if !incoming_wins {
+                if existing_mine {
+                    // Ours stands: make sure the peer is offered it.
+                    if let Some(i) = self.initiated.get_mut(&key) {
+                        i.hello_delivered = false;
+                    }
+                    self.reopen.insert(key);
+                }
+                return;
+            }
+            self.forget_delivery(&channel_id, &peer).await;
+        }
+        self.sessions.insert(key, session);
+        self.accepted_hello.remove(&key);
+        self.reopen.remove(&key);
+        if mine {
+            self.initiated.insert(
+                key,
+                Initiated {
+                    initial: None,
+                    hello_delivered: true,
+                },
+            );
+        } else {
+            self.initiated.remove(&key);
+        }
+    }
+
+    /// Offer this node's hello again to every peer that kept a competing session
+    /// (ADR-021 F12), with the empty ratchet message behind it that gives the peer a
+    /// sending direction — so it adopts the session both ends will keep even when this
+    /// node owes it nothing else.
+    async fn deliver_reopens(&mut self) {
+        let pending: Vec<(Digest32, Digest32)> = self.reopen.iter().copied().collect();
+        for (channel_id, peer) in pending {
+            let Some(initial) = self
+                .initiated
+                .get(&(channel_id, peer))
+                .and_then(|i| i.initial.clone())
+            else {
+                // Nothing to offer — a session the join protocol opened, which the peer
+                // already holds.
+                self.reopen.remove(&(channel_id, peer));
+                continue;
+            };
+            let Some(conn) = self.reach_member(&channel_id, peer, false).await else {
+                continue;
+            };
+            let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
+                self.reopen.remove(&(channel_id, peer));
+                continue;
+            };
+            if crate::node::pairwise_stream::open_sending_direction(
+                &conn,
+                &channel_id,
+                session,
+                Some(&initial),
+            )
+            .await
+            .is_ok()
+            {
+                self.reopen.remove(&(channel_id, peer));
+                self.hello_delivered(&channel_id, peer);
+            }
+        }
+    }
+
+    /// Record that the peer now holds the hello for a session this node opened.
+    fn hello_delivered(&mut self, channel_id: &Digest32, peer: Digest32) {
+        if let Some(i) = self.initiated.get_mut(&(*channel_id, peer)) {
+            i.hello_delivered = true;
+        }
+    }
+
+    /// Learn, off the actor, whether the key just written to `target` was taken; if it was not,
+    /// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
+    fn watch_delivery(
+        &self,
+        sent: quinn::RecvStream,
+        channel_id: Digest32,
+        target: Digest32,
+        chain_id: u64,
+    ) {
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let event =
+                match crate::node::pairwise_stream::refused(sent, KEY_DELIVERY_PATIENCE).await {
+                    Some(why) => NetEvent::SkdmRefused {
+                        channel_id,
+                        peer: target,
+                        chain_id,
+                        why,
+                    },
+                    None => NetEvent::SkdmTaken {
+                        channel_id,
+                        peer: target,
+                    },
+                };
+            let _ = tx.send(event).await;
+        });
     }
 
     /// A connection to `target`: the live one if there is one, otherwise dialled
@@ -4264,24 +5485,57 @@ impl Node {
         &mut self,
         channel_id: &Digest32,
         target: Digest32,
+        asked: bool,
     ) -> Option<Arc<crate::transport::quic::VoxConnection>> {
         let net = self.net.as_ref().map(Arc::clone)?;
         if let Some(conn) = net.manager().existing(&target) {
             return Some(conn);
         }
         let endpoints = net.board_endpoints(channel_id, &target);
-        // **Through `dial`, not `net.reach`.** This called `net.reach` directly and so
-        // produced a connection the actor had never adopted: no receive loop
-        // (`spawn_stream_loop`), no sync schedule, and no upgrade attempt behind a
-        // relayed path. A QUIC connection is bidirectional, so the peer uses that same
-        // connection to reach *back* — and nothing on this side was reading it. The
-        // outbound half worked, which is why the M15 bundle-record gate passed, and the
-        // inbound half silently did not: this node could deliver an SKDM to a member and
-        // then never see a word that member said.
+        // **Nothing dials a member on the actor.** A dial to a member that is not there waits out
+        // `PER_ATTEMPT_TIMEOUT` (10s), and the node answers nobody meanwhile. Measured through the
+        // real binaries: a room that had rotated its sender key answered nothing for 10s at a time
+        // while one member was offline (`busy 10013ms — sending a message`), and `vox trust add`
+        // with two trusted members offline across three rooms froze the node for 31s and then 62s
+        // (`busy 61545ms — a client command`) — a person's post from another shell waited 60s
+        // behind a dial to somebody else.
         //
-        // Delegating removes the divergence rather than patching it, so the two paths
-        // cannot drift again.
-        self.dial(target, &endpoints).await.ok()
+        // So the dial always runs in the background and reports `Dialed`/`ReachFailed`; `Dialed`
+        // adopts the connection and delivers whatever that member is owed at once. Automatic work
+        // (the tick, a post) dials at most once per `MEMBER_REDIAL_SECS`; a command the person
+        // gave (`asked`) dials now whatever the spacing, and an explicit consent keeps its reply
+        // until the dial's outcome is known (`pending_consents`).
+        let now = self.now();
+        let recent = self
+            .member_dialed_at
+            .get(&target)
+            .is_some_and(|t| now.saturating_sub(*t) < MEMBER_REDIAL_SECS);
+        if asked || !recent {
+            self.member_dialed_at.insert(target, now);
+            let tx = self.net_tx.clone();
+            tokio::spawn(async move {
+                match net.reach(target, &endpoints).await {
+                    Ok(conn) => {
+                        let _ = tx
+                            .send(NetEvent::Dialed {
+                                conn,
+                                endpoints,
+                                board: false,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(NetEvent::ReachFailed {
+                                peer: target,
+                                why: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            });
+        }
+        None
     }
 
     /// The pairwise session for `(channel, target)`, opening one from that member's
@@ -4306,7 +5560,14 @@ impl Node {
         target: Digest32,
     ) -> Option<InitialMessage> {
         if self.sessions.contains_key(&(*channel_id, target)) {
-            return None;
+            // Ours, and the peer has not yet been sent its hello — a delivery that failed
+            // after the session was opened. Offer it again, or nothing sealed under it
+            // can be opened there.
+            return self
+                .initiated
+                .get(&(*channel_id, target))
+                .filter(|i| !i.hello_delivered)
+                .and_then(|i| i.initial.clone());
         }
         let net = self.net.as_ref().map(Arc::clone)?;
         let shared = self.channels.get(channel_id).map(Arc::clone)?;
@@ -4323,16 +5584,88 @@ impl Node {
         )
         .ok()?;
         self.sessions.insert((*channel_id, target), session);
+        self.accepted_hello.remove(&(*channel_id, target));
+        self.initiated.insert(
+            (*channel_id, target),
+            Initiated {
+                initial: Some(initial.clone()),
+                hello_delivered: false,
+            },
+        );
         Some(initial)
     }
 
     /// Take an inbound sealed control message: an ADR-006 SKDM, which makes that
     /// author's messages readable and backfills any already held as ciphertext.
-    async fn take_inbound_skdm(&mut self, peer: Digest32, mut recv: quinn::RecvStream) {
-        use crate::node::pairwise_stream::{open_skdm, recv_pairwise, PairwiseFrame};
+    async fn take_inbound_skdm(
+        &mut self,
+        peer: Digest32,
+        send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+    ) {
+        use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
         let Ok(Some(first)) = recv_pairwise(&mut recv).await else {
             return;
         };
+        let room = match &first {
+            PairwiseFrame::Skdm { channel_id, .. }
+            | PairwiseFrame::Open { channel_id, .. }
+            | PairwiseFrame::Hello { channel_id, .. } => *channel_id,
+        };
+        // **Held, not dropped, while this node is still joining that room.** The join runs off the
+        // actor now, so the responder's key — sent the moment it admits us — can arrive before the
+        // room and the session to open it exist: the joiner's task reports back only after sealing
+        // the room key, 0.3–1.5s of Argon2id after the exchange. Handled then, it found no session
+        // and was silently discarded, and this node could never read the responder. While the join
+        // ran on the actor the stream waited in the queue until the room existed; this puts that
+        // ordering back. `JoinerDone` replays whatever was held.
+        if self.joining.contains(&room) && !self.channels.contains_key(&room) {
+            self.held_pairwise.push((room, peer, first, send, recv));
+            return;
+        }
+        self.handle_pairwise(peer, first, send, recv).await;
+    }
+
+    /// Act on a pairwise stream whose first frame has been read.
+    async fn handle_pairwise(
+        &mut self,
+        peer: Digest32,
+        first: crate::node::pairwise_stream::PairwiseFrame,
+        mut send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+    ) {
+        // **Taken, or said not to be.** A sender cannot learn from the transport whether its key
+        // was taken: QUIC acknowledges the bytes before this node decides anything. So a stream
+        // that carried a key is answered, one byte once the key is taken, and reset with a wire
+        // code when it is not. A stream that carried no key (a bare hello, an `Open`) is finished.
+        match self.take_pairwise(peer, first, &mut recv).await {
+            Some(Ok(())) => {
+                let _ = send
+                    .write_all(&[crate::node::pairwise_stream::KEY_TAKEN])
+                    .await;
+                let _ = send.finish();
+            }
+            Some(Err(why)) => {
+                let _ = send.reset(why.code());
+                let _ = recv.stop(why.code());
+            }
+            None => {
+                let _ = send.finish();
+            }
+        }
+    }
+
+    /// Act on a pairwise stream whose first frame has been read: `Some(Ok)` if it carried a key
+    /// and the key was taken, `Some(Err(why))` if it carried one that was not, `None` if it carried
+    /// none.
+    async fn take_pairwise(
+        &mut self,
+        peer: Digest32,
+        first: crate::node::pairwise_stream::PairwiseFrame,
+        recv: &mut quinn::RecvStream,
+    ) -> Option<Result<(), crate::node::pairwise_stream::KeyRefusal>> {
+        use crate::node::pairwise_stream::KeyRefusal;
+        use crate::node::pairwise_stream::{open_skdm, recv_pairwise, PairwiseFrame};
         // A `Hello` opens a session the join path never created (ADR-016): accept it
         // against our own prekey ring, exactly as the join responder does, then read
         // the SKDM it precedes.
@@ -4348,16 +5681,16 @@ impl Node {
                         let _ = session.decrypt(&message, now);
                     }
                 }
-                return;
+                return None;
             }
             PairwiseFrame::Hello {
                 channel_id,
                 initial,
             } => {
                 if !self.accept_hello(channel_id, peer, &initial).await {
-                    return;
+                    return Some(Err(KeyRefusal::HelloRefused));
                 }
-                match recv_pairwise(&mut recv).await {
+                match recv_pairwise(recv).await {
                     Ok(Some(PairwiseFrame::Skdm { channel_id, sealed })) => (channel_id, sealed),
                     Ok(Some(PairwiseFrame::Open { channel_id, sealed })) => {
                         let now = self.now();
@@ -4368,24 +5701,24 @@ impl Node {
                                 let _ = session.decrypt(&message, now);
                             }
                         }
-                        return;
+                        return None;
                     }
                     _ => {
                         // A session with nothing behind it is still progress: the peer
                         // may deliver over it later.
-                        return;
+                        return None;
                     }
                 }
             }
         };
         let now = self.now();
         let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
-            // No session with this peer for that channel: nothing can open it. The
-            // sender retries once a join or key exchange establishes one.
-            return;
+            // No session with this peer for that channel: nothing can open it. Said, so the
+            // sender sends it again once a join or key exchange establishes one.
+            return Some(Err(KeyRefusal::NoSession));
         };
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
-            return;
+            return Some(Err(KeyRefusal::CannotOpen));
         };
         let backfilled = match (
             self.profile.as_ref(),
@@ -4398,13 +5731,15 @@ impl Node {
                 .ok(),
             _ => None,
         };
-        if let Some(n) = backfilled {
-            let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
-                channel_id,
-                peer,
-                backfilled: n as u64,
-            });
-        }
+        let Some(n) = backfilled else {
+            return Some(Err(KeyRefusal::NotAccepted));
+        };
+        let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
+            channel_id,
+            peer,
+            backfilled: n as u64,
+        });
+        Some(Ok(()))
     }
 
     /// Load (or, on first use, generate) the prekey ring for the unlocked
@@ -4439,7 +5774,9 @@ impl Node {
         // drops both at the task's next await point, which is what makes ADR-015's
         // lock/zeroize still true now that the exchange runs off the actor.
         self.join_tasks.abort_all();
-        while self.join_tasks.try_join_next().is_some() {}
+        // Awaited, not polled: `try_join_next` collects only tasks that have already finished, and
+        // an aborted one drops its handles — the signer, the ring, the store — at its next await.
+        while self.join_tasks.join_next().await.is_some() {}
         // Drop the prekey ring: its secrets zeroize on drop, so a locked node holds
         // no key-agreement material (ADR-015 lock/zeroize).
         self.prekeys = None;
@@ -4450,6 +5787,9 @@ impl Node {
         // Pairwise sessions hold ratchet key material: drop them with everything else
         // (their secrets zeroize on drop).
         self.sessions.clear();
+        self.initiated.clear();
+        self.accepted_hello.clear();
+        self.reopen.clear();
         // And take the network down: a locked node has no identity to present, so it
         // must not keep serving or holding connections (M14.7d).
         self.stop_network();
@@ -4467,21 +5807,81 @@ impl Node {
             return Outcome::Failed(Fault::NoIdentity);
         };
         match ChannelState::create_with_profile(profile, local_name, passphrase, now, self.argon2) {
-            Ok(ch) => {
-                let id = ch.channel_id();
-                self.channels
-                    .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
-                self.adopt_channel_anchors(&id, None).await;
-                self.refresh_network_view().await;
-                self.publish_channel_locally(&id).await;
-                self.publish_channel_to_anchors(&id).await;
-                let _ = self
-                    .event_tx
-                    .send(NodeEvent::ChannelOpened { channel_id: id });
-                Outcome::Done
-            }
+            Ok(ch) => self.finish_create_channel(ch).await,
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
+    }
+
+    /// Everything after a room exists: hold it, give it anchors, publish it, say so.
+    async fn finish_create_channel(&mut self, ch: ChannelState) -> Outcome {
+        let id = ch.channel_id();
+        self.channels
+            .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
+        self.adopt_channel_anchors(&id, None).await;
+        self.refresh_network_view().await;
+        self.publish_channel_locally(&id).await;
+        self.publish_channel_to_anchors(&id).await;
+        let _ = self
+            .event_tx
+            .send(NodeEvent::ChannelOpened { channel_id: id });
+        Outcome::Done
+    }
+
+    /// Begin creating a room: the genesis here, the Argon2id seal on a blocking thread, and the
+    /// reply carried to `NetEvent::ChannelSealed`. Any failure before the seal answers at once.
+    async fn begin_create_channel(
+        &mut self,
+        local_name: String,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
+            return;
+        };
+        let (genesis, sek) = match ChannelState::create_genesis(
+            profile,
+            &local_name,
+            crate::governance::capability::CapabilitySet::new(),
+            now,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                return;
+            }
+        };
+        let signer = match profile.signer_arc() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                return;
+            }
+        };
+        let argon2 = self.argon2;
+        let tx = self.net_tx.clone();
+        let channel_id = genesis.channel_id();
+        let seal_passphrase = passphrase.clone();
+        tokio::spawn(async move {
+            let sealed = tokio::task::spawn_blocking(move || {
+                let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
+                sek.seal(&factor, &channel_id, &seal_passphrase, argon2)
+                    .map(|wrap| (sek, wrap))
+            })
+            .await
+            .unwrap_or(Err(Error::Argon2Failed));
+            let _ = tx
+                .send(NetEvent::ChannelSealed {
+                    reply,
+                    local_name,
+                    passphrase,
+                    genesis: Box::new(genesis),
+                    now,
+                    sealed,
+                })
+                .await;
+        });
     }
 
     /// Create a service room and offer its one service, atomically (ADR-017).
@@ -4599,12 +5999,21 @@ impl Node {
             channel.add_service(profile.store(), profile, service_tag, local)
         };
         match outcome {
-            Ok(_) => Outcome::Done,
+            Ok(_) => {
+                self.refresh_reachers().await;
+                Outcome::Done
+            }
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
     }
 
-    /// Stop offering a service.
+    /// Stop offering a service, and **cut every session carried on it** (PRD-001 R22).
+    ///
+    /// The cut is the live offer changing: each serving task watches it and resets its
+    /// stream the moment its tag leaves, exactly as it does when its dialer leaves the
+    /// reacher set. Removing the service used to change only the stored configuration, so
+    /// a new dial was refused while an `ssh` session opened a minute earlier carried on
+    /// for as long as it liked.
     async fn remove_service(&mut self, channel_id: &Digest32, service_tag: &str) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -4617,53 +6026,11 @@ impl Node {
             channel.remove_service(profile.store(), service_tag)
         };
         match outcome {
-            Ok(true) => Outcome::Done,
-            Ok(false) => Outcome::Failed(Fault::UnknownChannel),
-            Err(e) => Outcome::Failed(fault_of(&e)),
-        }
-    }
-
-    /// Grant a member `dial:<tag>` (and optionally `bind:<tag>`) in a channel, as an
-    /// ADR-007 certificate on the log. The grant is pushed to peers like any other
-    /// local append, so it converges without anyone being told.
-    async fn grant_tunnel(
-        &mut self,
-        channel_id: &Digest32,
-        target: &Digest32,
-        service_tag: &str,
-        may_bind: bool,
-        expiry: u64,
-    ) -> Outcome {
-        use crate::governance::capability::{Capability, CapabilitySet};
-        let now = self.now();
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return Outcome::Failed(Fault::ChannelNotOpen);
-        };
-        let mut caps = CapabilitySet::from_iter_caps([Capability::dial(service_tag)]);
-        if may_bind {
-            caps.insert(Capability::bind(service_tag));
-        }
-        let outcome = {
-            let mut channel = shared.lock().await;
-            // The target must be an admitted author: a certificate naming an identity
-            // the channel does not know could never be verified by anyone.
-            let Some(key) = channel
-                .author_keys()
-                .into_iter()
-                .find(|k| k.fingerprint() == *target)
-            else {
-                return Outcome::Failed(Fault::UnknownChannel);
-            };
-            channel.grant_capabilities(profile, &key, caps, expiry, now)
-        };
-        match outcome {
-            Ok(_) => {
-                self.note_local_append(channel_id);
+            Ok(true) => {
+                self.refresh_reachers().await;
                 Outcome::Done
             }
+            Ok(false) => Outcome::Failed(Fault::UnknownChannel),
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
     }
@@ -4791,8 +6158,30 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         };
-        match crate::node::tunnel::Forward::bind(conn, *channel_id, service_tag.to_owned(), local)
-            .await
+        // The first dial above is kept for what it tells the caller — a forward to a host that
+        // cannot be reached at all fails here, with the ladder's words — but the forward does
+        // not keep `conn`. It reaches the host afresh for every connection (PRD-001 R24), and
+        // `reach` hands back this same connection for as long as it lives.
+        drop(conn);
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return Outcome::Failed(Fault::NotNetworked);
+        };
+        let dialer = Arc::new(NodeDialer {
+            net,
+            channel_id: *channel_id,
+        });
+        let events = self.event_tx.clone();
+        match crate::node::tunnel::Forward::bind(
+            dialer,
+            *host,
+            *channel_id,
+            service_tag.to_owned(),
+            local,
+            move |reason: String| {
+                let _ = events.send(NodeEvent::ProxyRefused { reason });
+            },
+        )
+        .await
         {
             Ok(fwd) => {
                 let (channel_id, host, service_tag, bound) =
@@ -4819,18 +6208,17 @@ impl Node {
         self.refresh_reachers().await;
         let mut out = crate::node::tunnel::HostSnapshot::new();
         for (cid, shared) in &self.channels {
-            let ch = shared.lock().await;
-            if ch.services().is_empty() {
+            if shared.lock().await.services().is_empty() {
                 continue;
             }
-            let Some(reachers) = self.reachers.get(cid) else {
+            let (Some(reachers), Some(offered)) = (self.reachers.get(cid), self.offered.get(cid))
+            else {
                 continue;
             };
             out.insert(
                 *cid,
                 crate::node::tunnel::ChannelServices {
-                    evaluator: ch.evaluator_handle(),
-                    services: ch.services().clone(),
+                    offered: Arc::clone(offered),
                     reachers: Arc::clone(reachers),
                 },
             );
@@ -4875,6 +6263,11 @@ impl Node {
             // A recompute is not a decision: this wakes the serving tasks only if the set
             // really moved. The rule and its reason live in `publish_reachers`.
             crate::node::tunnel::publish_reachers(slot, next);
+            let offer = self
+                .offered
+                .entry(*cid)
+                .or_insert_with(crate::node::tunnel::empty_offered);
+            crate::node::tunnel::publish_offered(offer, ch.services().clone());
         }
         // A channel this node no longer holds must deny, including to tasks still holding
         // the handle: empty it before letting go, or they would read the last value forever.
@@ -4882,6 +6275,13 @@ impl Node {
             let held = self.channels.contains_key(cid);
             if !held {
                 crate::node::tunnel::publish_reachers(slot, std::collections::BTreeSet::new());
+            }
+            held
+        });
+        self.offered.retain(|cid, slot| {
+            let held = self.channels.contains_key(cid);
+            if !held {
+                crate::node::tunnel::publish_offered(slot, std::collections::BTreeMap::new());
             }
             held
         });
@@ -4924,7 +6324,7 @@ impl Node {
         // letting the tick do the work keeps authoring off the network path.
         self.note_local_append(&channel_id);
         if rotated {
-            let _ = self.deliver_rekeys_for(&channel_id).await;
+            let _ = self.deliver_rekeys_for(&channel_id, false).await;
         }
         Outcome::Done
     }
@@ -4981,7 +6381,18 @@ impl Node {
         self.view_tx.send_replace(view);
     }
 
+    /// The node's view, built **without waiting on any room a session holds.**
+    ///
+    /// `publish()` runs this after every command and every event, and it took each room's lock in
+    /// turn — the lock a sync session holds for its whole run, across its network waits. So while
+    /// any session was waiting on a peer, nearly every event left the actor parked here. When both
+    /// ends pushed at once, each actor parked on its own room while its session waited for the other
+    /// actor to answer, until the 20s frame timeout (the independent verdict on #41 traced it: an
+    /// actor silent 19.9s, both sessions ending `sync failed: transport` at exactly the timeout). A
+    /// room that is held now keeps its entry from the view already published — at most one event old
+    /// — and is refreshed on the next publish after the session hands it back.
     async fn view_of(&self) -> NodeView {
+        let prev = self.view_tx.borrow().clone();
         let identity = self.profile.as_ref().map(|p| IdentityInfo {
             fingerprint: p.fingerprint(),
             created: p.created(),
@@ -5005,21 +6416,38 @@ impl Node {
             .unwrap_or_default();
         for a in &mut anchoring {
             if let Some(state) = self.anchored.get(&a.channel_id) {
-                a.entries = Some(state.lock().await.entries() as u64);
+                a.entries = match state.try_lock() {
+                    Ok(st) => Some(st.entries() as u64),
+                    Err(_) => prev
+                        .anchoring
+                        .iter()
+                        .find(|p| p.channel_id == a.channel_id)
+                        .and_then(|p| p.entries),
+                };
             }
         }
         let mut channels = Vec::with_capacity(known.len());
         for id in &known {
             channels.push(match self.channels.get(id) {
-                Some(shared) => {
-                    let ch = shared.lock().await;
-                    ChannelSummary {
+                Some(shared) => match shared.try_lock() {
+                    Ok(ch) => ChannelSummary {
                         channel_id: *id,
                         local_name: Some(ch.local_name().to_owned()),
                         open: true,
                         entries: ch.entry_count() as u64,
-                    }
-                }
+                    },
+                    Err(_) => prev
+                        .channels
+                        .iter()
+                        .find(|c| c.channel_id == *id)
+                        .cloned()
+                        .unwrap_or(ChannelSummary {
+                            channel_id: *id,
+                            local_name: None,
+                            open: true,
+                            entries: 0,
+                        }),
+                },
                 None => ChannelSummary {
                     channel_id: *id,
                     local_name: None,
@@ -5030,8 +6458,14 @@ impl Node {
         }
         let mut open_channels = Vec::with_capacity(self.channels.len());
         let mut mlock_active = true;
-        for shared in self.channels.values() {
-            let ch = shared.lock().await;
+        for (id, shared) in &self.channels {
+            let Ok(ch) = shared.try_lock() else {
+                if let Some(d) = prev.open_channels.iter().find(|d| d.channel_id == *id) {
+                    open_channels.push(d.clone());
+                }
+                mlock_active &= prev.mlock_active;
+                continue;
+            };
             mlock_active &= ch.mlock_active();
             open_channels.push(ChannelDetail {
                 channel_id: ch.channel_id(),
@@ -5073,6 +6507,20 @@ impl Node {
                 .as_ref()
                 .map_or(0, |net| net.manager().peers().len()),
         }
+    }
+
+    /// Whether the connections and circuits the published view shows are no longer the ones
+    /// the connection manager holds.
+    fn paths_moved(&self) -> bool {
+        let (relayed_peers, relaying) = self.path_view();
+        let connected = self
+            .net
+            .as_ref()
+            .map_or(0, |net| net.manager().peers().len());
+        let shown = self.view_tx.borrow();
+        shown.relayed_peers != relayed_peers
+            || shown.relaying != relaying
+            || shown.connected != connected
     }
 
     /// Which peers are reached through a relay, and how many circuits this node carries for

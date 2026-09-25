@@ -18,9 +18,9 @@
 //!
 //! ## An address grants no reachability
 //! Holding (or verifying) a ULA address conveys **zero** ability to reach anything.
-//! Tunnel services are dark / default-deny and capability-gated (ADR-013
-//! §Authorization, [`crate::tunnel::authz`]); the address is an identifier for the
-//! TUN path, not an authorization.
+//! Tunnel services are dark / default-deny, and reach is the host's own decision
+//! (ADR-017 decision 3, enforced in [`crate::tunnel::session::accept`]); the address
+//! is an identifier for the TUN path, not an authorization.
 
 use std::net::Ipv6Addr;
 

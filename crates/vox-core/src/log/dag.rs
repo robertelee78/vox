@@ -31,7 +31,10 @@
 //! - The **acceptance predicate** (ADR-008 §"Abuse resistance"): an entry is
 //!   accepted only if (a) its author is in the admitted set for `(channelID,
 //!   epoch)` (M3/M6 input), (b) its per-author authenticator verifies, and (c) it
-//!   is within the author's quota ([`crate::log::quota`]).
+//!   links into the author's feed. There is **no rate or volume limit** on an
+//!   admitted author (PRD-001 R1/R3): members are invited and trusted, and a limit
+//!   here was re-applied on every reopen, so a room with more than a thousand
+//!   entries from one author could not be opened at all.
 //! - **Fork / equivocation handling** (ADR-008 §"Fork / equivocation handling"):
 //!   two distinct entries at the same `(author, seq)` with different hashes are an
 //!   equivocation. For **attributable** entries this is a self-authenticating
@@ -56,7 +59,6 @@ use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::log::entry::{DeniableVerifier, Entry, EntryKind};
 use crate::log::feed::Feed;
-use crate::log::quota::{QuotaReject, QuotaTracker};
 
 /// An uninhabited [`DeniableVerifier`] naming the concrete type for the `None`
 /// default in [`Dag::accept`] (which performs no deniable verification). Its
@@ -75,7 +77,7 @@ const NO_DENIABLE: Option<&NoDeniable> = None;
 /// this as an explicit input; the *population* of the set from authenticated join
 /// (CPace, ADR-005/M3) and consent (ADR-007/M6) is those milestones' job. An
 /// entry from an author not admitted for its `(channelID, epoch)` is rejected
-/// before any quota or DAG mutation.
+/// before any DAG mutation.
 #[derive(Debug, Default, Clone)]
 pub struct AdmissionPolicy {
     /// (channel, epoch) -> admitted author fingerprints.
@@ -150,8 +152,6 @@ pub enum Rejected {
     NotAdmitted,
     /// The entry's authenticator (or author/structure) failed verification.
     Verification(Error),
-    /// The entry exceeded the author's quota and was dropped (not relayed).
-    Quota(QuotaReject),
     /// The entry conflicts with a stored entry at the same `(author, seq)`
     /// (equivocation); the [`ForkOutcome`] carries the attributable-vs-deniable
     /// remedy.
@@ -167,8 +167,8 @@ pub enum Rejected {
     GovernanceNotAttributable,
 }
 
-/// The replicated log store: per-author feeds, a hash index, frozen authors, and
-/// the quota tracker. One [`Dag`] per channel.
+/// The replicated log store: per-author feeds, a hash index, and frozen authors.
+/// One [`Dag`] per channel.
 #[derive(Debug, Default)]
 pub struct Dag {
     /// author -> feed.
@@ -178,31 +178,13 @@ pub struct Dag {
     /// Authors frozen by an attributable fork proof; their later entries are
     /// refused (ADR-008 — members revoke/rotate to exclude the equivocator).
     frozen: HashMap<Digest32, ForkProof>,
-    /// Per-author quotas.
-    quota: QuotaTracker,
 }
 
 impl Dag {
-    /// An empty DAG with the ADR-008 default quota policy.
+    /// An empty DAG.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            feeds: HashMap::new(),
-            by_hash: HashMap::new(),
-            frozen: HashMap::new(),
-            quota: QuotaTracker::with_defaults(),
-        }
-    }
-
-    /// An empty DAG with an explicit quota tracker (policy from a channel policy).
-    #[must_use]
-    pub fn with_quota(quota: QuotaTracker) -> Self {
-        Self {
-            feeds: HashMap::new(),
-            by_hash: HashMap::new(),
-            frozen: HashMap::new(),
-            quota,
-        }
+        Self::default()
     }
 
     /// The number of entries stored across all authors.
@@ -271,7 +253,6 @@ impl Dag {
     /// 5. Equivocation: a different entry already occupies `(author, seq)` →
     ///    [`Rejected::Fork`]; for an attributable entry the author is frozen.
     /// 6. Feed link: `seq`/`prev_hash`/`lipmaa_backlink`/end-of-feed.
-    /// 7. Quota: within the author's rate/byte budget.
     ///
     /// Equivocation is classified **only after** admission and verification
     /// (steps 3–4 precede 5). An ADR-008 fork proof must be *self-authenticating*
@@ -284,7 +265,7 @@ impl Dag {
     ///
     /// `kind` selects the governance/content rule; fork attributability is then
     /// determined by the entry's authenticator type (governance is forced
-    /// composite above). `now_secs` feeds the quota clock.
+    /// composite above).
     ///
     /// Equivalent to [`Dag::accept_with_deniable`] with no deniable verifier, so a
     /// **deniable** content entry fails verification with
@@ -297,9 +278,8 @@ impl Dag {
         kind: EntryKind,
         author_root: &CompositePublicKey,
         admission: &AdmissionPolicy,
-        now_secs: u64,
     ) -> std::result::Result<Digest32, Rejected> {
-        self.accept_with_deniable(entry, kind, author_root, admission, now_secs, NO_DENIABLE)
+        self.accept_with_deniable(entry, kind, author_root, admission, NO_DENIABLE)
     }
 
     /// Accept an entry, verifying a [`crate::log::entry::Authenticator::Deniable`] authenticator with
@@ -312,7 +292,6 @@ impl Dag {
         kind: EntryKind,
         author_root: &CompositePublicKey,
         admission: &AdmissionPolicy,
-        now_secs: u64,
         deniable: Option<&V>,
     ) -> std::result::Result<Digest32, Rejected> {
         let author = entry.skeleton.author_id;
@@ -370,21 +349,13 @@ impl Dag {
             }
         }
 
-        // Feed link: validate (without mutating) BEFORE committing quota, so a
-        // structural rejection never consumes the author's quota budget. The feed
-        // enforces seq/prev_hash/lipmaa_backlink/end-of-feed.
-        let feed = self.feeds.entry(author).or_default();
-        feed.validate_next(&entry).map_err(Rejected::Feed)?;
-
-        // Quota (drop, do not relay, on breach).
-        self.quota
-            .admit(&author, epoch, entry.skeleton.payload_len, now_secs)
-            .map_err(Rejected::Quota)?;
-
-        // Commit: append (cannot fail — validate_next just succeeded and the feed
-        // was not mutated in between) and index by hash.
-        let feed = self.feeds.entry(author).or_default();
-        feed.append(entry).map_err(Rejected::Feed)?;
+        // Feed link: `append` validates seq/prev_hash/lipmaa_backlink/end-of-feed
+        // and leaves the feed untouched on a rejection. Then index by hash.
+        self.feeds
+            .entry(author)
+            .or_default()
+            .append(entry)
+            .map_err(Rejected::Feed)?;
         self.by_hash.insert(hash, (author, seq));
         Ok(hash)
     }

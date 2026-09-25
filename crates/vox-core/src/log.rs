@@ -2,8 +2,8 @@
 //!
 //! The replicated message store: per-author hash-linked logs merged into a
 //! causally-ordered Merkle-DAG (a CRDT for causal histories), with anti-entropy
-//! sync, render-gating, fork/equivocation handling, per-author quotas, and the
-//! personal multi-device self-channel. This is **not** a consensus blockchain
+//! sync, render-gating, fork/equivocation handling, and the personal
+//! multi-device self-channel. This is **not** a consensus blockchain
 //! (ADR-008 §Decision): there is no global total order and no mining — only
 //! per-feed integrity plus causal merge with Strong Eventual Consistency.
 //!
@@ -18,9 +18,6 @@
 //! - [`dag`] — the cross-author causal Merkle-DAG: causal (not total) ordering,
 //!   topological iteration, convergence (two replicas that receive the same
 //!   entries converge), and the acceptance predicate + fork/equivocation handling.
-//! - [`quota`] — the per-author abuse-resistance quotas (≤1000 entries/hour,
-//!   ≤50 MB/epoch, channel-policy-tunable): over-quota entries are dropped, not
-//!   relayed, and surfaced as an abuse signal.
 //! - [`sync`] — anti-entropy over an abstract byte-stream transport: the frontier
 //!   mode (default) and the Negentropy range-reconciliation mode, mode-negotiated
 //!   by the `HELLO` bitmap, honoring the M0 wire error codes on hard-fail.
@@ -53,6 +50,5 @@ pub mod dag;
 pub mod entry;
 pub mod feed;
 pub mod negentropy;
-pub mod quota;
 pub mod selfchannel;
 pub mod sync;

@@ -119,7 +119,7 @@ impl AnchorState {
 
     /// Reopen an anchored channel from `store`: the metadata, then every stored
     /// entry re-passes the acceptance predicate under the authors on file.
-    pub fn open(store: &Store, sek: Sek, channel_id: &Digest32, now_secs: u64) -> Result<Self> {
+    pub fn open(store: &Store, sek: Sek, channel_id: &Digest32) -> Result<Self> {
         let meta_seg = store
             .get_segment(channel_id, SegmentKind::AnchorMeta, SEG_META)?
             .ok_or(Error::Profile("channel is not anchored here"))?;
@@ -156,7 +156,7 @@ impl AnchorState {
             let kind = classify_payload(payload)?;
             state
                 .dag
-                .accept(entry, kind, &key, &state.admission, now_secs)
+                .accept(entry, kind, &key, &state.admission)
                 .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
             state.next_log_id = id.saturating_add(1);
         }
@@ -243,7 +243,6 @@ impl AnchorState {
         &mut self,
         store: &Store,
         transport: &mut T,
-        now_secs: u64,
     ) -> Result<SyncOutcome> {
         if self.poisoned {
             return Err(Error::Profile(
@@ -256,15 +255,32 @@ impl AnchorState {
             .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
             .collect();
         let resolver = ChannelAuthors::new(self.authors.clone());
-        let session = frontier_session_peer(
-            transport,
-            &mut self.dag,
-            &resolver,
-            &self.admission,
-            now_secs,
-        );
+        let session = frontier_session_peer(transport, &mut self.dag, &resolver, &self.admission);
+        let mut out = self.absorb_arrived(store, &before)?;
+        if let Ok(n) = session {
+            out.applied = n;
+        }
+        match session {
+            Ok(_) => Ok(out),
+            Err(code) => Err(sync_failure(code)),
+        }
+    }
+
+    fn heads(&self) -> BTreeMap<Digest32, u64> {
+        self.authors
+            .keys()
+            .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
+            .collect()
+    }
+
+    /// Persist every entry a sync added past `before`'s heads.
+    fn absorb_arrived(
+        &mut self,
+        store: &Store,
+        before: &BTreeMap<Digest32, u64>,
+    ) -> Result<SyncOutcome> {
         let mut arrived: Vec<Digest32> = Vec::new();
-        for (author, head) in &before {
+        for (author, head) in before {
             let Some(feed) = self.dag.feed(author) else {
                 continue;
             };
@@ -275,7 +291,7 @@ impl AnchorState {
             }
         }
         let mut out = SyncOutcome {
-            applied: session.unwrap_or(arrived.len()),
+            applied: arrived.len(),
             ..SyncOutcome::default()
         };
         for entry_hash in arrived {
@@ -301,8 +317,45 @@ impl AnchorState {
                 out.governance += 1;
             }
         }
+        Ok(out)
+    }
+
+    /// Reconcile with a peer over `transport`, holding `shared`'s lock only inside each protocol
+    /// step. See [`crate::log::sync::SessionRoom`] and `ChannelState::sync_over_room`.
+    ///
+    /// # Errors
+    /// The copy is poisoned, a persist fails, or the session hard-fails.
+    pub fn sync_over_room<T: Transport>(
+        shared: &tokio::sync::Mutex<Self>,
+        store: &Store,
+        transport: &mut T,
+    ) -> Result<SyncOutcome> {
+        let epoch = {
+            let st = shared.blocking_lock();
+            if st.poisoned {
+                return Err(Error::Profile(
+                    "anchored channel is poisoned after a failed persist; reopen it",
+                ));
+            }
+            st.epoch
+        };
+        let room = AnchorSessionRoom {
+            shared,
+            store,
+            epoch,
+            out: std::cell::RefCell::new(SyncOutcome::default()),
+            fatal: std::cell::RefCell::new(None),
+        };
+        let session = crate::log::sync::frontier_session_room(transport, &room);
+        if let Some(e) = room.fatal.take() {
+            return Err(e);
+        }
+        let mut out = room.out.into_inner();
         match session {
-            Ok(_) => Ok(out),
+            Ok(n) => {
+                out.applied = n;
+                Ok(out)
+            }
             Err(code) => Err(sync_failure(code)),
         }
     }
@@ -344,4 +397,72 @@ fn parse_meta(bytes: &[u8]) -> Result<(Genesis, BTreeMap<Digest32, CompositePubl
     let authors = parse_authors(d.bytes()?)?;
     d.finish()?;
     Ok((genesis, authors))
+}
+
+/// An anchored copy as a [`crate::log::sync::SessionRoom`]; see `AnchorState::sync_over_room`.
+struct AnchorSessionRoom<'a> {
+    shared: &'a tokio::sync::Mutex<AnchorState>,
+    store: &'a Store,
+    epoch: u64,
+    out: std::cell::RefCell<SyncOutcome>,
+    fatal: std::cell::RefCell<Option<Error>>,
+}
+
+impl AnchorSessionRoom<'_> {
+    fn copy(
+        &self,
+    ) -> std::result::Result<tokio::sync::MutexGuard<'_, AnchorState>, crate::wire::WireError> {
+        let st = self.shared.blocking_lock();
+        if st.poisoned {
+            return Err(crate::wire::WireError::TransportFailed);
+        }
+        if st.epoch != self.epoch {
+            return Err(crate::wire::WireError::EpochMismatch);
+        }
+        Ok(st)
+    }
+}
+
+impl crate::log::sync::SessionRoom for AnchorSessionRoom<'_> {
+    fn frontiers(
+        &self,
+    ) -> std::result::Result<Vec<crate::log::sync::FeedFrontier>, crate::wire::WireError> {
+        Ok(crate::log::sync::frontiers_of(&self.copy()?.dag))
+    }
+
+    fn wants(
+        &self,
+        remote: &[crate::log::sync::FeedFrontier],
+    ) -> std::result::Result<Vec<crate::log::sync::WantRange>, crate::wire::WireError> {
+        Ok(crate::log::sync::wants_for(&self.copy()?.dag, remote))
+    }
+
+    fn entries(
+        &self,
+        wants: &[crate::log::sync::WantRange],
+    ) -> std::result::Result<Vec<Vec<u8>>, crate::wire::WireError> {
+        Ok(crate::log::sync::entries_for_wants(
+            &self.copy()?.dag,
+            wants,
+        ))
+    }
+
+    fn apply(&self, staged: Vec<Vec<u8>>) -> std::result::Result<usize, crate::wire::WireError> {
+        let mut guard = self.copy()?;
+        let st = &mut *guard;
+        let before = st.heads();
+        let resolver = ChannelAuthors::new(st.authors.clone());
+        // Absorb what was stored, then report the failure: see `ChannelSessionRoom::apply`.
+        let stored = crate::log::sync::apply_staged(&mut st.dag, &resolver, &st.admission, &staged);
+        match st.absorb_arrived(self.store, &before) {
+            Ok(got) => {
+                self.out.borrow_mut().governance += got.governance;
+                stored
+            }
+            Err(e) => {
+                *self.fatal.borrow_mut() = Some(e);
+                Err(crate::wire::WireError::TransportFailed)
+            }
+        }
+    }
 }
