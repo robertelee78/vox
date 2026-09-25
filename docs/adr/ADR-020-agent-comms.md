@@ -968,8 +968,8 @@ Both unknowns are already spiked; neither remains open.
   the entry's `trusted_hash` — as ctm and Orca both do, and **MUST** re-grant it when a new binary
   changes the hash.
 - **M19.12 — the Codex mid-turn claim is corrected.** Decided 2026-09-24; **text corrected 2026-09-25** in
-  §6 and M19.6, not re-measured here — it rests on Orca's and ctm's measurements, cited in place. §6 and M19.6 say
-  app-server `turn/start` works mid-turn. Orca measured (codex-cli 0.147.0, 0.150.1 and 0.153.4) that a
+  §6 and M19.6, not re-measured here — it rests on Orca's and ctm's measurements, cited in place. §6 and M19.6 said
+  app-server `turn/start` works mid-turn (corrected 2026-09-25). Orca measured (codex-cli 0.147.0, 0.150.1 and 0.153.4) that a
   mid-turn `turn/start` is **folded into the running turn**, and ctm delivers mid-turn with `turn/steer`
   and `expectedTurnId`. The text **MUST** say so, and any Codex wake **MUST** use `turn/steer` for a
   running turn. Implementing the Codex wake is not decided here.

@@ -27,7 +27,9 @@
 //! - **OpenCode** — `POST /session/:id/prompt_async` against the server URL the
 //!   plugin is handed on startup. The plugin records it, because a bare `opencode`
 //!   has no listener an outside process could find.
-//! - **Codex** — reachable in principle through its app-server's `turn/start`, but
+//! - **Codex** — reachable in principle through its app-server: `turn/start` when the
+//!   thread is idle, `turn/steer` with `expectedTurnId` when a turn is running (a
+//!   mid-turn `turn/start` is folded into that turn — ADR-020 M19.12). But
 //!   this build has no verified path to that socket from a hook's environment, so
 //!   it is **named and not implemented**. A registration for it is written and
 //!   waking it reports plainly that it cannot, rather than failing silently or
