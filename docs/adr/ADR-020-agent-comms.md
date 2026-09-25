@@ -975,6 +975,19 @@ Both unknowns are already spiked; neither remains open.
   grant trust the way Codex's own "trust all" does — app-server `hooks/list`, then `config/batchWrite` of
   the entry's `trusted_hash` — as ctm and Orca both do, and **MUST** re-grant it when a new binary
   changes the hash.
+
+  > **Built on PR #14, 2026-09-25**: `vox agent trust codex` (proof `codex_trust_proof`, against the
+  > installed codex-cli 0.157.0 in an isolated `CODEX_HOME`, read back through Codex's own `hooks/list`).
+  > It starts a short-lived `codex app-server` over stdio, lists hooks, and writes `trusted_hash =
+  > currentHash` for every **Vox** entry (`vox agent hook`) that is not `trusted` — another tool's entry is
+  > left alone. Measured along the way: the hash covers the entry's definition, not the binary, so a
+  > `vox` upgrade keeps trust; a trusted entry whose command changes lists as `modified`, and running the
+  > command again re-grants it. Proved: Vox's entry goes untrusted → trusted and a foreign entry stays
+  > untrusted; a second run changes `config.toml` not at all; a changed entry reads `modified` and is
+  > re-trusted; with no Vox entry the command fails and says why. Three mutants caught (never writes;
+  > trusts every hook; `modified` counted as trusted). **Not proved:** that a trusted hook then fires in a
+  > live Codex turn — that needs a model login in the isolated home, and the proof does not take the
+  > operator's credentials. `vox agent plugin codex` now says to run it.
 - **M19.12 — the Codex mid-turn claim is corrected.** Decided 2026-09-24; **text corrected 2026-09-25** in
   §6 and M19.6, not re-measured here — it rests on Orca's and ctm's measurements, cited in place. §6 and M19.6 said
   app-server `turn/start` works mid-turn (corrected 2026-09-25). Orca measured (codex-cli 0.147.0, 0.150.1 and 0.153.4) that a

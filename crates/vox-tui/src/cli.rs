@@ -647,6 +647,28 @@ enum AgentCmd {
     /// vox agent skill > .claude/skills/vox-agent-comms/SKILL.md
     /// ```
     Skill,
+    /// Trust Vox's drain hook in a harness that gates hooks on trust. Only Codex
+    /// does: it runs a `hooks.json` entry only once its hash is recorded as trusted.
+    ///
+    /// Asks Codex's own app-server (`hooks/list`, then `config/batchWrite`) — the
+    /// same calls Codex's "Trust all" makes — for **only** the entries that run `vox
+    /// agent hook`. Idempotent; run it again after changing the entry's command.
+    /// Honours `CODEX_HOME`.
+    ///
+    /// ```text
+    /// vox agent trust codex
+    /// ```
+    Trust(AgentTrustArgs),
+}
+
+/// `vox agent trust`
+#[derive(Args, Debug, Clone)]
+pub struct AgentTrustArgs {
+    /// The harness whose trust to grant. Only `codex` gates hooks on trust.
+    pub harness: String,
+    /// The Codex executable to ask. Defaults to `codex` on `PATH`.
+    #[arg(long, default_value = "codex")]
+    pub codex: String,
 }
 
 /// `vox agent plugin`
@@ -1447,6 +1469,41 @@ pub fn run() -> ExitCode {
             print!("{}", crate::agent_hook::AGENT_SKILL);
             ExitCode::SUCCESS
         }
+        Cmd::Agent(AgentCmd::Trust(args)) => match args.harness.to_ascii_lowercase().as_str() {
+            "codex" => match crate::codex_trust::trust(&args.codex) {
+                Ok(r) if r.found == 0 => {
+                    eprintln!(
+                        "vox: Codex has no hook running `vox agent hook` — add the entry \
+                         `vox agent plugin codex` prints to its hooks.json first."
+                    );
+                    ExitCode::FAILURE
+                }
+                Ok(r) => {
+                    println!(
+                        "vox: {} Vox hook entr{} in Codex; {} newly trusted, the rest already were.",
+                        r.found,
+                        if r.found == 1 { "y" } else { "ies" },
+                        r.trusted_now
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            "claude" | "claude-code" | "opencode" => {
+                println!(
+                    "vox: {} does not gate hooks on trust; nothing to do.",
+                    args.harness
+                );
+                ExitCode::SUCCESS
+            }
+            other => {
+                eprintln!("vox: no integration for {other:?}. Known: claude, codex, opencode.");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::Agent(AgentCmd::Plugin(args)) => match args.harness.to_ascii_lowercase().as_str() {
             "opencode" => {
                 print!("{}", crate::agent_hook::OPENCODE_PLUGIN);
@@ -1479,10 +1536,11 @@ pub fn run() -> ExitCode {
                      }}\n}}"
                 );
                 eprintln!(
-                    "vox: merge that into Codex's hooks.json.\n     `async` MUST be false: an \
-                     async hook's output is observed and discarded, so the room would drain \
-                     into nothing.\n     Set VOX_ROOM in the session's environment, or pass \
-                     --room to the hook."
+                    "vox: merge that into Codex's hooks.json, then run `vox agent trust codex` \
+                     — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
+                     an async hook's output is observed and discarded, so the room would \
+                     drain into nothing.\n     Set VOX_ROOM in the session's environment, or \
+                     pass --room to the hook."
                 );
                 ExitCode::SUCCESS
             }
