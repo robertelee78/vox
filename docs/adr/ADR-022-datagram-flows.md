@@ -210,7 +210,13 @@ What does not change: the relay is still ciphertext-only by construction.
 - **Priority** is `-1`, below the default 0 every other stream runs at. **The stream limit** is 1024.
 - **Teardown** is a guardian per `AppStream` watching the live set; it resets both halves with
   `APP_WITHDRAWN_CODE` (`0x2207`) so the peer learns it was a decision, and every call on the stream
-  races the same watch.
+  races the same watch. **Whichever notices first tears down** (corrected 2026-09-25): a call used to
+  return its error and leave the reset to the guardian, and when the IPC splice then dropped the
+  stream the drop aborted the guardian first — the stream was *finished*, the peer read a clean end
+  and stayed open. 6 of 30 runs of `withdrawing_trust_tears_down_a_live_app_stream` on the v0.3.0
+  integration, each with one side cut in ~18 ms, the other still running 5 s later, `withdrawn: 0`.
+  Every call now tears down before returning, and a stream dropped after withdrawal resets rather
+  than finishes: 30/30 green; the old code again 5/30 red.
 - **IPC.** App requests use tags 2201–2212, away from the sequential range; a connection whose first
   request is one becomes an app connection for life. In the raw splice the node shuts down its write
   side when the peer finishes and closes the whole connection when the stream fails, and
