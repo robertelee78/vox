@@ -152,6 +152,10 @@ pub struct RoomStatus {
     pub epoch: u64,
     /// When a sync this node ran there last completed.
     pub last_sync: Option<u64>,
+    /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
+    /// and the node's own (ADR-023 decision 2). `None` when the room was mid-session and could
+    /// not be read without waiting.
+    pub retention: Option<u64>,
     /// Its members.
     pub members: Vec<MemberStatus>,
 }
@@ -315,11 +319,12 @@ impl StatusReport {
                 )
             });
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
                 opt(r.last_sync),
+                opt(r.retention),
                 list(members)
             )
         });

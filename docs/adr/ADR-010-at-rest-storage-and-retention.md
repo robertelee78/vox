@@ -127,7 +127,13 @@ plainly rather than implying a guarantee we cannot make.
   1h|1w|1m|<secs>|forever` by a holder of `policy` (refused to anyone else, and gated on the identity
   passphrase over the control socket because shortening it deletes stored history). The node's own is
   the `retention` file in its config directory (`default <dur>` and `<room-prefix> <dur>` lines),
-  re-read every minute. The effective retention is the shorter; `0` is forever.
+  re-read every minute. The effective retention is the shorter; `0` is forever. The node's own is
+  set on a room **when it is opened** (create, join, open), before anything can start a session on
+  it, and re-applied only when the file changes; `vox status --json` reports each room's effective
+  `retention`. *(2026-09-25: it used to be set only by the sweep, which skips a room a session
+  holds; on the v0.2.8 runtime a reopened room could sync before any sweep reached it, and a late
+  arrival was judged by the room's week alone and shown until the next sweep — measured
+  `node_retention=0` at render in the failing run.)*
 - A sweep runs on every tick (1 s) and after `vox room retention`: every content entry whose age is at
   or past the effective retention loses its payload body (`LogDb` page rewritten with the skeleton),
   its plaintext cache row and its first-seen record, and leaves the timeline. It is retroactive by
@@ -142,9 +148,11 @@ plainly rather than implying a guarantee we cannot make.
   read` show exactly the 60, both stores hold 60 cache rows and 107 log pages, the restarted node
   opens the room, and the 60 go at 28 s; shortest wins — room 1 week, one node 60 s: that node shows
   0 of 10 at 59 s while the other shows 10; late arrival — 5 messages synced to that node after 65 s
-  never shown in 248 reads. Mutations: sweep disabled (104 rows stay), reload refusing a pruned entry
-  (room comes back `[closed]`), node retention ignored (alice keeps 12 rows), arrival check removed
-  (the 5 shown).
+  are never shown and never rendered: the restarted node's first `vox status` already reports 60 s,
+  and its own event stream (subscribed before the peer returns) announces 1 rendered row, the live
+  one. Mutations: sweep disabled (104 rows stay), reload refusing a pruned entry (room comes back
+  `[closed]`), node retention ignored (alice keeps 12 rows), arrival check removed (the 5 shown,
+  6 announced), node retention not set at open (never applied: alice still shows 12 rows past her minute).
 - **Not built:** the genesis `ttl` is still `0` at creation (a room is created forever and set after);
   an anchor's log store keeps bodies regardless of retention (ADR-023 decision 6 removes that store);
   a peer is served the skeleton of a pruned entry because the DAG holds only the skeleton, but no gate

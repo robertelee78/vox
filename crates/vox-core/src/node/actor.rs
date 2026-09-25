@@ -1821,6 +1821,10 @@ pub struct Node {
     node_retention: crate::node::retention::RetentionConfig,
     /// When `node_retention` was last read; `0` before the first read.
     retention_read_at: u64,
+    /// Open rooms whose node retention must be re-applied because the file changed; applied by
+    /// the sweep as each room is free. A room gets its value when it is opened, so this only
+    /// ever carries an edit.
+    retention_dirty: std::collections::BTreeSet<Digest32>,
     /// When each peer was last tried for a better path, so a relayed connection is retried
     /// on a schedule rather than only at the moment it was made.
     last_upgrade: std::collections::BTreeMap<Digest32, u64>,
@@ -1971,6 +1975,7 @@ impl Node {
             trust: crate::node::trust::Keyring::new(),
             node_retention: crate::node::retention::RetentionConfig::default(),
             retention_read_at: 0,
+            retention_dirty: std::collections::BTreeSet::new(),
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
             offered: std::collections::BTreeMap::new(),
@@ -4232,6 +4237,8 @@ impl Node {
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
+        let mut channel = channel;
+        channel.set_node_retention(self.node_retention_for(&parsed.channel_id));
         self.channels.insert(
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
@@ -5983,8 +5990,11 @@ impl Node {
     }
 
     /// Everything after a room exists: hold it, give it anchors, publish it, say so.
-    async fn finish_create_channel(&mut self, ch: ChannelState) -> Outcome {
+    async fn finish_create_channel(&mut self, mut ch: ChannelState) -> Outcome {
+        // The node's own retention before the room is visible to anything that can start a
+        // session on it (the retention fix, e2a74b9): every creation path comes through here.
         let id = ch.channel_id();
+        ch.set_node_retention(self.node_retention_for(&id));
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
         self.adopt_channel_anchors(&id, None).await;
@@ -6092,6 +6102,7 @@ impl Node {
             // published, so forgetting it here is the whole of the rollback.
             return Outcome::Failed(fault_of(&e));
         }
+        channel.set_node_retention(self.node_retention_for(&id));
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(channel)));
         self.adopt_channel_anchors(&id, None).await;
@@ -6113,7 +6124,8 @@ impl Node {
             return Outcome::Failed(Fault::NoIdentity);
         };
         match ChannelState::open(profile, channel_id, passphrase, now) {
-            Ok(ch) => {
+            Ok(mut ch) => {
+                ch.set_node_retention(self.node_retention_for(channel_id));
                 self.channels
                     .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
                 self.adopt_channel_anchors(channel_id, None).await;
@@ -6458,6 +6470,10 @@ impl Node {
                 name: room.local_name.clone(),
                 epoch: room.epoch,
                 last_sync: self.status.room_synced.get(&room.channel_id).copied(),
+                retention: self
+                    .channels
+                    .get(&room.channel_id)
+                    .and_then(|shared| shared.try_lock().ok().map(|c| c.effective_retention())),
                 members,
             });
         }
@@ -6581,23 +6597,46 @@ impl Node {
         Outcome::Done
     }
 
+    /// Re-read the node's own retention file when it is due (first use, then every
+    /// [`RETENTION_REREAD_SECS`]). An unreadable file keeps the last policy read rather than
+    /// dropping to "no node limit", which would keep more than the operator asked for.
+    fn refresh_node_retention(&mut self, now: u64) {
+        if self.retention_read_at == 0
+            || now.saturating_sub(self.retention_read_at) >= RETENTION_REREAD_SECS
+        {
+            if let Ok(cfg) =
+                crate::node::retention::RetentionConfig::load(&self.paths.retention_file())
+            {
+                if cfg != self.node_retention {
+                    self.node_retention = cfg;
+                    self.retention_dirty = self.channels.keys().copied().collect();
+                }
+            }
+            self.retention_read_at = now.max(1);
+        }
+    }
+
+    /// This node's own retention for a room it is **about to open**, to be set on the room
+    /// before it is shared with anything that can start a session.
+    ///
+    /// **Not left to the sweep.** The sweep sets it on the tick, and skips a room whose lock a
+    /// session holds; since sessions start the moment a connection comes up (v0.2.8), a freshly
+    /// opened room could sync before any tick reached it. An entry that arrived then was judged
+    /// against the room's retention alone — a week — rendered, and pruned a second later by
+    /// the node's own minute: an expired message shown (measured: `node_retention=0` at render
+    /// in the failing run, `=60` in the passing ones).
+    fn node_retention_for(&mut self, channel_id: &Digest32) -> u64 {
+        let now = self.now();
+        self.refresh_node_retention(now);
+        self.node_retention.for_room(channel_id)
+    }
+
     /// Prune every open room to its effective retention — the shorter of the room's policy and
     /// this node's own (ADR-023 decision 2). `true` when anything was pruned, so the view is
     /// republished and `vox room read` stops showing it.
     async fn sweep_retention(&mut self) -> bool {
         let now = self.now();
-        if self.retention_read_at == 0
-            || now.saturating_sub(self.retention_read_at) >= RETENTION_REREAD_SECS
-        {
-            // An unreadable file keeps the last policy read rather than dropping to "no node
-            // limit", which would keep more than the operator asked for.
-            if let Ok(cfg) =
-                crate::node::retention::RetentionConfig::load(&self.paths.retention_file())
-            {
-                self.node_retention = cfg;
-            }
-            self.retention_read_at = now.max(1);
-        }
+        self.refresh_node_retention(now);
         let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
             return false;
         };
@@ -6609,7 +6648,9 @@ impl Node {
             let Ok(mut ch) = shared.try_lock() else {
                 continue;
             };
-            ch.set_node_retention(self.node_retention.for_room(cid));
+            if self.retention_dirty.remove(cid) {
+                ch.set_node_retention(self.node_retention.for_room(cid));
+            }
             let here = ch.sweep_retention(&store, now).unwrap_or(0);
             pruned += here;
             // Asked every tick, not only after a prune: a room opened with an expired backlog
