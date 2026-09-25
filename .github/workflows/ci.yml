@@ -76,7 +76,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # 120, not 45: both platforms were cancelled at 45 minutes on v0.2.9's merge with nothing red;
+    # the suite now includes the R41/R42 transport proofs.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml pins the channel + components (rustfmt, clippy).

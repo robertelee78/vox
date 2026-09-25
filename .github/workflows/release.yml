@@ -40,7 +40,10 @@ jobs:
     # which is ~20 minutes of the total on a developer machine and longer on a shared runner. At 45
     # a green release was a race against the clock — v0.2.5's run reached 32 minutes with the release
     # suite still going. A gate that fails on its own budget teaches nobody anything.
-    timeout-minutes: 60
+    # 120, not 60: v0.2.9's first run was cancelled at 60 minutes inside the R41 perf proof with 141
+    # results green and 0 failed; the release suite alone ran 54 minutes (the R42 relay proof ~11,
+    # a restarted host ~5) and had vox-tui still to go.
+    timeout-minutes: 120
     # Set once for the whole job so every step shares one flag set and nothing is rebuilt
     # between them. Deliberately NOT workflow-wide: a release build has no business failing on
     # a dependency's warning under a cross-compile.
