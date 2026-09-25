@@ -353,28 +353,35 @@ fn probe_patience(rtt: Duration) -> Duration {
 }
 
 /// Send one probe on `conn` and wait [`probe_patience`] for anything at all to arrive on it.
-/// `true` is an answer, or a connection that cannot be probed (no datagram support) or that
+///
+/// `None` is an answer, or a connection that cannot be probed (no datagram support) or that
 /// closed on its own meanwhile — none of which is evidence that a live peer is absent.
-async fn probe_answers(conn: &VoxConnection) -> bool {
+/// `Some(before)` is no answer, with the received-datagram count the probe started from, so the
+/// verdict can be re-checked at the moment it is acted on (see [`ConnectionManager::file_inner`]).
+async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     let quic = conn.quinn();
     let before = quic.stats().udp_rx.datagrams;
     if quic
         .send_datagram(bytes::Bytes::from_static(&[PROBE_BYTE]))
         .is_err()
     {
-        return true;
+        return None;
     }
     let deadline = tokio::time::Instant::now() + probe_patience(quic.rtt());
     loop {
         if quic.stats().udp_rx.datagrams != before || !is_live(conn) {
-            return true;
+            return None;
         }
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            return Some(before);
         }
         tokio::time::sleep(PROBE_POLL).await;
     }
 }
+
+/// Connections a probe found unanswered, each with the received-datagram count its probe started
+/// from. Closed only inside [`ConnectionManager::file_inner`], under the connection lock.
+type Unanswered = Vec<(Arc<VoxConnection>, u64)>;
 
 /// One QUIC connection per peer fingerprint (see the module docs).
 pub struct ConnectionManager {
@@ -508,7 +515,7 @@ impl ConnectionManager {
         let (conn, _) = retiring.swap_remove(best);
         drop(retiring);
         if let Some(dead) = map.insert(*peer, Arc::clone(&conn)) {
-            dead.close(WireError::AuthenticatorInvalid);
+            dead.close(WireError::Unresponsive);
         }
         Some(conn)
     }
@@ -562,7 +569,7 @@ impl ConnectionManager {
                     if map.get(peer).is_some_and(|held| Arc::ptr_eq(held, conn)) {
                         map.remove(peer);
                         drop(map);
-                        conn.close(WireError::AuthenticatorInvalid);
+                        conn.close(WireError::Unresponsive);
                         changed += 1;
                     }
                 }
@@ -572,7 +579,7 @@ impl ConnectionManager {
         // still carried on it is waiting on nothing.
         for c in &retired {
             if is_live(c) && self.is_dead(c) {
-                c.close(WireError::AuthenticatorInvalid);
+                c.close(WireError::Unresponsive);
             }
         }
         // Forget connections that are gone, so the table is bounded by what is held.
@@ -688,8 +695,8 @@ impl ConnectionManager {
         // leave it transport-alive and application-deaf, which is strictly worse than the close it
         // replaced. `connect`, the one-shot `accept` and `adopt` all arrive through here and none of
         // them serves a second connection, so for them the old behaviour is the correct one.
-        self.probe_held(&conn).await;
-        let filed = self.file_inner(conn, false);
+        let unanswered = self.probe_held(&conn).await;
+        let filed = self.file_inner(conn, false, unanswered);
         debug_assert!(filed.also_serve.is_none());
         filed.kept
     }
@@ -710,8 +717,8 @@ impl ConnectionManager {
     /// would be transport-alive and application-deaf, and the peer's request would never be
     /// answered at all.
     async fn file_reporting(&self, conn: VoxConnection) -> Filed {
-        self.probe_held(&conn).await;
-        self.file_inner(conn, true)
+        let unanswered = self.probe_held(&conn).await;
+        self.file_inner(conn, true, unanswered)
     }
 
     /// **Ask the connections held for a peer whether anyone is there**, before a newcomer for
@@ -746,7 +753,7 @@ impl ConnectionManager {
     ///
     /// A held connection that cannot carry a datagram (the peer disabled them) is assumed live:
     /// that is the old behaviour, and silence still catches it.
-    async fn probe_held(&self, newcomer: &VoxConnection) {
+    async fn probe_held(&self, newcomer: &VoxConnection) -> Unanswered {
         let peer = newcomer.peer_id();
         // **Every** connection held for the peer, not only the primary. A retired one — the
         // loser of an earlier tie-break, still served for its grace — is as dead as the primary
@@ -770,23 +777,44 @@ impl ConnectionManager {
         held.retain(|c| is_live(c) && !self.is_dead(c));
         // Probed at once, so a peer with a dead primary and a dead retired connection costs one
         // patience, not two.
+        //
+        // **Nothing is closed here.** The probes are awaited, and while they are another newcomer
+        // for the same peer can be filed and a retired connection promoted; closing on the spot
+        // would act on a verdict about a table that has since changed. The verdicts go to
+        // `file_inner`, which acts on them under the lock, re-checked (see there).
         let mut probes = tokio::task::JoinSet::new();
         for c in held {
-            probes.spawn(async move {
-                if !probe_answers(&c).await {
-                    c.close(WireError::AuthenticatorInvalid);
-                }
-            });
+            probes.spawn(async move { probe_unanswered(&c).await.map(|before| (c, before)) });
         }
-        while probes.join_next().await.is_some() {}
+        let mut unanswered = Vec::new();
+        while let Some(done) = probes.join_next().await {
+            if let Ok(Some(dead)) = done {
+                unanswered.push(dead);
+            }
+        }
+        unanswered
     }
 
     /// [`Self::file_reporting`]'s body. `serve_loser` says whether the caller will read a duplicate
     /// this keeps alive: with it the loser is retired and handed back, without it the loser is
     /// closed. There is no third option — a retired connection nobody reads is the worst of both.
-    fn file_inner(&self, conn: VoxConnection, serve_loser: bool) -> Filed {
+    ///
+    /// `unanswered` is what [`Self::probe_held`] found, and it is acted on **here, under the
+    /// lock**, not where it was found: the probes were awaited, and during that await another
+    /// newcomer can have been filed or a retired connection promoted. A connection is closed only
+    /// if it is still live and has received **nothing since its probe was sent** — so one that
+    /// answered late, or that became the peer's connection because it is live, is spared.
+    /// Newcomers filed during the await were never probed, so they cannot be closed by it.
+    /// `a_live_duplicate_is_decided_alike` covers the case this protects: two live newcomers
+    /// for one peer, filed concurrently at both ends, each probing the other's.
+    fn file_inner(&self, conn: VoxConnection, serve_loser: bool, unanswered: Unanswered) -> Filed {
         let peer = conn.peer_id();
         let mut map = lock(&self.conns);
+        for (dead, before) in unanswered {
+            if is_live(&dead) && dead.quinn().stats().udp_rx.datagrams == before {
+                dead.close(WireError::Unresponsive);
+            }
+        }
         if let Some(existing) = map.get(&peer) {
             // **A held connection that is dead is not a rival.** Silent: the process behind it
             // is gone (see [`SILENCE_IS_DEATH`]). Severed: its circuit is gone, so it can send
@@ -797,7 +825,7 @@ impl ConnectionManager {
             // compute identically; the class is the connection's own recorded fact (see
             // [`path_class`]), not a reading of a table that changes underneath it.
             if is_live(existing) && self.is_dead(existing) {
-                existing.close(WireError::AuthenticatorInvalid);
+                existing.close(WireError::Unresponsive);
             } else if is_live(existing) {
                 let existing = Arc::clone(existing);
                 let (new_class, held_class) = (

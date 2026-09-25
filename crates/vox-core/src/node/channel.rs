@@ -177,6 +177,7 @@ pub(crate) fn sync_failure(code: crate::wire::WireError) -> Error {
         crate::wire::WireError::SyncModeUnsupported => "sync failed: sync mode unsupported",
         crate::wire::WireError::EpochMismatch => "sync failed: epoch mismatch",
         crate::wire::WireError::TransportFailed => "sync failed: transport",
+        crate::wire::WireError::Unresponsive => "sync failed: the peer stopped answering",
     })
 }
 

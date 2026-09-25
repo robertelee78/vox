@@ -19,6 +19,14 @@
 //! anchor saw the two connections from different addresses — otherwise it would not be staging
 //! the case at all.
 //!
+//! **Since the active probe (#40)** this is also the gate for "a probe never kills a live
+//! duplicate". Each trial files two live connections for one peer, concurrently, at both ends, and
+//! each end probes the other's held connection before filing. Two things must hold, and a
+//! disagreement here is how either shows: the dialling end's probe is traffic the anchor hears
+//! (with the anchor's probe alone, a rebound NAT hides the old connection and 15/24 trials
+//! disagreed); and a verdict is re-checked under the lock when it is acted on, so a connection that
+//! answered late, or was filed while the probes were awaited, is not closed.
+//!
 //! Real QUIC, real handshakes, the real `ConnectionManager` on both ends, over the in-process
 //! NAT network. `#[ignore]`d in the debug suite; CI runs it in the release step.
 
