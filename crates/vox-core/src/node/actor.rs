@@ -95,6 +95,9 @@ const MEMBER_REDIAL_SECS: u64 = 30;
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+/// How long one publish round to one board may take before it is given up until the next round: a
+/// live board answers each put in milliseconds. See `publish_channel_to_anchor`.
+const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
 /// How many failed sessions in a row a `(room, peer)` push is retried on the next tick before it is
 /// left to the periodic interval. Enough to ride out a collision (both sides pushing at once); few
 /// enough that a peer whose sessions always fail cannot hold the room.
@@ -2303,85 +2306,88 @@ impl Node {
         let Ok((address, bundle)) = records else {
             return;
         };
-        let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await else {
-            return;
-        };
-        // **Said, not swallowed.** A refused bundle is a member no other member can admit as a
-        // log author, and every one of these was `let _ = ...` — so the board's reason existed,
-        // was specific, and was dropped on the floor at the one place that could report it.
-        //
-        // Each kind's outcome is carried, success as well as failure, because a refusal that
-        // *stops* has to clear its memo below — otherwise a standing refusal reported once would
-        // be silent the second time it mattered.
-        let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
-        outcomes.push((
-            "the room's genesis",
-            client.put(&genesis_wire).await.err().map(|e| e.to_string()),
-        ));
-        // **Our bundle before our address, for the reason this file already states about *other*
-        // members' records and did not apply to its own.** An address record carries no key, so a
-        // board can only verify it against a key it already holds — which is what the bundle
-        // carries. Published address-first, a member whose key the board does not know yet has its
-        // address refused with `author is not a channel member`, microseconds before the bundle
-        // that would have made it admissible arrives on the same connection; and nothing retries
-        // it until the next publish round. `network.rs` `board_records` has emitted bundles first
-        // all along and says why. This did the opposite for the records that matter most — a
-        // newcomer's own — so a member could be on an anchor's board with a key and no way to
-        // reach it, which a joiner reports as the member being unreachable.
-        outcomes.push((
-            "our member bundle",
-            client
-                .put(&bundle.to_wire())
-                .await
-                .err()
-                .map(|e| e.to_string()),
-        ));
-        outcomes.push((
-            "our address",
-            client
-                .put(&address.to_wire())
-                .await
-                .err()
-                .map(|e| e.to_string()),
-        ));
-        // And every other member's records this node's board holds: an anchor learns
-        // a channel's members only from a member that vouches for them (M15.2a), and
-        // a bundle carries the key an address record is verified against, so bundles
-        // go first.
-        //
-        // **Awaited, and it has to be.** Sending this off the actor was tried: it removed the
-        // measured `busy 19416ms — publishing every room at a new address` stall, and cost more
-        // than it saved. Convergence depends on these records actually being on the anchor's board
-        // before the next step reads it, so spawning the send dropped the anchor-convergence gate
-        // from 3 runs in 5 to 1 in 6 and the user-level rehearsal from 10 in 10 to 6 in 8. The
-        // stall is real and now *named* by `NodeEvent::Stalled`; removing it needs the ordering
-        // made explicit, not the wait deleted.
-        let mut mirrored_refused = 0usize;
-        let mut mirrored_why = String::new();
-        for wire in net.board_records(channel_id, epoch) {
-            if let Err(e) = client.put(&wire).await {
-                // A board that already holds something newer from that member has fresher news
-                // than the copy we vouch with: nothing was refused that anyone needed. For our
-                // *own* records, above, the same answer is real and still reported.
-                if matches!(
-                    e,
-                    Error::RendezvousRejected(r)
-                        if r == crate::nat::service::RejectReason::Stale.as_str()
-                ) {
-                    continue;
-                }
-                mirrored_refused += 1;
-                if mirrored_why.is_empty() {
-                    mirrored_why = e.to_string();
+        // **Bounded, and it stops at the first dead stream.** Each put waits for the board's answer,
+        // which a live board gives in milliseconds, but a connection that died without saying so waits
+        // out the full frame patience (`SYNC_FRAME_TIMEOUT`, 20s) *per put*, and every one of those
+        // waits is on the actor. Measured in `perf_r40_relayed_chat_gate`: a member whose room's own
+        // anchor (another member) had just shut down published to it over the relayed connection still
+        // in the manager. The address put, then two mirrored records, each waited 20s:
+        // `busy 60s — filing a sync that finished`, one run in five, and nobody could be answered.
+        // The ordering above still holds whenever the board answers. A board that answers nothing within
+        // `ANCHOR_PUBLISH_PATIENCE` is given up on for this round. A transport error ends the round,
+        // since the rest would ride the same dead stream; a refusal does not.
+        let own = [
+            ("the room's genesis", genesis_wire),
+            ("our member bundle", bundle.to_wire()),
+            ("our address", address.to_wire()),
+        ];
+        let mirrored = net.board_records(channel_id, epoch);
+        let round = async {
+            let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
+            // A stream that will not open is the next round's business, as it always was.
+            let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await else {
+                return outcomes;
+            };
+            // **Said, not swallowed.** A refused bundle is a member no other member can admit as a
+            // log author; each kind's outcome is carried, success as well as failure, so a refusal
+            // that *stops* clears its memo below.
+            //
+            // **Our bundle before our address**: an address record carries no key, so a board can
+            // only verify it against a bundle it already holds (`network.rs` `board_records` emits
+            // bundles first for the same reason).
+            for (kind, wire) in &own {
+                let result = client.put(wire).await;
+                let dead = matches!(&result, Err(e) if !matches!(e, Error::RendezvousRejected(_)));
+                outcomes.push((kind, result.err().map(|e| e.to_string())));
+                if dead {
+                    return outcomes;
                 }
             }
-        }
-        client.finish();
-        outcomes.push((
-            "another member's record we vouch for",
-            (mirrored_refused > 0)
-                .then(|| format!("{mirrored_refused} refused, first: {mirrored_why}")),
-        ));
+            // And every other member's records this node's board holds: an anchor learns a
+            // channel's members only from a member that vouches for them (M15.2a).
+            //
+            // **Awaited, and it has to be.** Sending this off the actor was tried: convergence
+            // depends on these records being on the anchor's board before the next step reads it,
+            // and spawning the send dropped the anchor-convergence gate from 3 runs in 5 to 1 in 6.
+            let mut mirrored_refused = 0usize;
+            let mut mirrored_why = String::new();
+            for wire in &mirrored {
+                match client.put(wire).await {
+                    Ok(()) => {}
+                    // A board that already holds something newer from that member has fresher news
+                    // than the copy we vouch with: nothing was refused that anyone needed.
+                    Err(Error::RendezvousRejected(r))
+                        if r == crate::nat::service::RejectReason::Stale.as_str() => {}
+                    Err(e) => {
+                        let dead = !matches!(e, Error::RendezvousRejected(_));
+                        mirrored_refused += 1;
+                        if mirrored_why.is_empty() {
+                            mirrored_why = e.to_string();
+                        }
+                        if dead {
+                            break;
+                        }
+                    }
+                }
+            }
+            client.finish();
+            outcomes.push((
+                "another member's record we vouch for",
+                (mirrored_refused > 0)
+                    .then(|| format!("{mirrored_refused} refused, first: {mirrored_why}")),
+            ));
+            outcomes
+        };
+        let outcomes = match tokio::time::timeout(ANCHOR_PUBLISH_PATIENCE, round).await {
+            Ok(outcomes) => outcomes,
+            Err(_) => vec![(
+                "this publish round",
+                Some(format!(
+                    "the board answered nothing within {}s",
+                    ANCHOR_PUBLISH_PATIENCE.as_secs()
+                )),
+            )],
+        };
         // **Keyed per board, not per room.** A node publishes the same record to several boards and
         // they answer differently — an anchor that has not been vouched this author says "not a
         // channel member" while the node's own board says "policy" — so a memo keyed only by room
