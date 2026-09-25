@@ -477,6 +477,10 @@ pub fn run_node(
 /// merging an address it already holds is a no-op.
 const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long `vox daemon` waits for its node to stop on SIGTERM or Ctrl-C before leaving anyway.
+/// A clean stop takes milliseconds; this is for a node stuck waiting on a peer that vanished.
+const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long one wake may take before it is abandoned.
 const WAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -996,8 +1000,27 @@ pub fn run_daemon(
             let _ = tokio::signal::ctrl_c().await;
         }
         println!("vox daemon: shutting down");
-        let _ = node.apply(NodeCommand::Shutdown).await;
+        // **Bounded.** The node handles one thing at a time, so `Shutdown` waits behind whatever
+        // it is doing — and it can be doing a network round trip to a peer that has vanished.
+        // Measured: a daemon that had joined a room through an anchor, with the anchor gone,
+        // printed this line and then sat for 59.6 s (the connection's idle timeout) while the
+        // node finished publishing to a board nobody was reading. A service manager's SIGTERM
+        // has to mean stop. Whatever the node was mid-way through is lost either way; its
+        // state on disk is committed per step, so nothing half-written is left by leaving.
+        if tokio::time::timeout(SHUTDOWN_PATIENCE, node.apply(NodeCommand::Shutdown))
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "vox daemon: the node did not stop within {}s — it was mid-way through a network \
+                 exchange with a peer that is not answering; stopping anyway",
+                SHUTDOWN_PATIENCE.as_secs()
+            );
+        }
     });
+    // The same bound on the runtime itself: dropping it waits for every blocking task, and a sync
+    // session runs on one.
+    rt.shutdown_timeout(SHUTDOWN_PATIENCE);
     Ok(())
 }
 
