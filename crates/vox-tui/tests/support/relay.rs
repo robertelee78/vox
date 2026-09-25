@@ -34,94 +34,20 @@ pub enum Split {
     None,
 }
 
-pub struct RelayWorld {
-    pub split: Split,
-    pub tmp: tempfile::TempDir,
-    pub anchor: VoxProc,
-    /// The anchor as the IPv4 host names it.
+/// A `vox node` anchor listening dual-stack on `[::]`, named in each family.
+pub struct Anchor {
+    pub proc: VoxProc,
+    /// The anchor as a node on an IPv4 socket names it.
     pub v4_spec: String,
-    /// The same anchor as the IPv6 guest names it.
+    /// The same anchor as a node on an IPv6 socket names it.
     pub v6_spec: String,
-    pub host_dir: PathBuf,
-    pub guest_dir: PathBuf,
-    pub host: Option<VoxProc>,
-    pub fwd: Option<VoxProc>,
-    pub host_fp: String,
-    pub room: String,
-    pub address: String,
-    pub passphrase: String,
-    pub service: String,
 }
 
-impl RelayWorld {
-    /// The guest's `--listen` and the anchor spec it can use.
-    fn guest_net(&self) -> (&'static str, &str) {
-        match self.split {
-            Split::Families => ("[::1]:0", &self.v6_spec),
-            Split::None => ("127.0.0.1:0", &self.v4_spec),
-        }
-    }
-
-    /// How many circuits the anchor says it carries, from the latest report it printed. It prints
-    /// on change, so this drains its output (waiting `settle` for a line in flight) and reads the
-    /// last one.
-    pub fn anchor_circuits(&mut self, settle: Duration) -> usize {
-        let deadline = Instant::now() + settle;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self
-                .anchor
-                .lines
-                .recv_timeout(left.min(Duration::from_millis(200)))
-            {
-                Ok(line) => {
-                    eprintln!("[anchor] {line}");
-                    self.anchor.seen.push(line);
-                }
-                Err(_) if left.is_zero() => break,
-                Err(_) => {}
-            }
-        }
-        self.anchor
-            .seen
-            .iter()
-            .rev()
-            .find_map(|l| {
-                let rest = l.strip_prefix("vox node: ")?;
-                let (_, after) = rest.split_once(" peer(s) connected, ")?;
-                after.split_whitespace().next()?.parse().ok()
-            })
-            .unwrap_or(0)
-    }
-
-    /// Assert the anchor is carrying a circuit **now** — before or after a measurement. `when`
-    /// names the moment, for the failure.
-    pub fn assert_relayed(&mut self, when: &str) {
-        let n = self.anchor_circuits(Duration::from_secs(2));
-        assert!(
-            n >= 1,
-            "NOT RELAYED {when}: the anchor reports {n} circuit(s) carried — this is not measuring \
-             a relayed path.\nanchor:\n{}",
-            self.anchor.transcript()
-        );
-    }
-
-    /// Anchor, and a host serving a loopback echo service with the guest already trusted.
-    pub fn new(split: Split) -> Self {
-        let tmp = tempfile::tempdir().unwrap();
-        let (anchor_dir, host_dir, guest_dir) = (
-            tmp.path().join("anchor"),
-            tmp.path().join("host"),
-            tmp.path().join("guest"),
-        );
-        for d in [&anchor_dir, &host_dir, &guest_dir] {
-            std::fs::create_dir_all(d.join("cfg")).unwrap();
-        }
-        let mut anchor = VoxProc::spawn(
-            "anchor",
-            &anchor_dir,
-            &args(&["node", "--listen", "[::]:0"]),
-        );
+impl Anchor {
+    /// Start an anchor with its data under `dir`.
+    pub fn start(dir: &std::path::Path) -> Self {
+        std::fs::create_dir_all(dir.join("cfg")).unwrap();
+        let mut anchor = VoxProc::spawn("anchor", dir, &args(&["node", "--listen", "[::]:0"]));
         let spec = anchor
             .expect_line("an --anchor spec", |l| {
                 !l.starts_with("! ")
@@ -136,9 +62,134 @@ impl RelayWorld {
             .next()
             .and_then(|p| p.parse().ok())
             .unwrap_or_else(|| panic!("no port in the anchor spec {spec:?}"));
-        // One anchor, named in each family: the host can only speak IPv4, the guest only IPv6.
-        let v4_spec = format!("{anchor_fp}@/ip4/127.0.0.1/udp/{port}");
-        let v6_spec = format!("{anchor_fp}@/ip6/::1/udp/{port}");
+        Self {
+            v4_spec: format!("{anchor_fp}@/ip4/127.0.0.1/udp/{port}"),
+            v6_spec: format!("{anchor_fp}@/ip6/::1/udp/{port}"),
+            proc: anchor,
+        }
+    }
+
+    /// How many circuits the anchor says it carries, from the latest report it printed. It prints
+    /// on change, so this drains its output (waiting `settle` for a line in flight) and reads the
+    /// last one.
+    pub fn circuits(&mut self, settle: Duration) -> usize {
+        let deadline = Instant::now() + settle;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self
+                .proc
+                .lines
+                .recv_timeout(left.min(Duration::from_millis(200)))
+            {
+                Ok(line) => {
+                    eprintln!("[anchor] {line}");
+                    self.proc.seen.push(line);
+                }
+                Err(_) if left.is_zero() => break,
+                Err(_) => {}
+            }
+        }
+        self.proc
+            .seen
+            .iter()
+            .rev()
+            .find_map(|l| {
+                let rest = l.strip_prefix("vox node: ")?;
+                let (_, after) = rest.split_once(" peer(s) connected, ")?;
+                after.split_whitespace().next()?.parse().ok()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Assert the anchor is carrying a circuit **now** — before or after a measurement. `when`
+    /// names the moment, for the failure.
+    pub fn assert_relayed(&mut self, when: &str) {
+        let n = self.circuits(Duration::from_secs(2));
+        assert!(
+            n >= 1,
+            "NOT RELAYED {when}: the anchor reports {n} circuit(s) carried — this is not measuring \
+             a relayed path.\nanchor:\n{}",
+            self.proc.transcript()
+        );
+    }
+
+    /// Assert the anchor carries **no** circuit now — for a control that must be direct.
+    pub fn assert_direct(&mut self, when: &str) {
+        let n = self.circuits(Duration::from_secs(2));
+        assert_eq!(
+            n,
+            0,
+            "NOT DIRECT {when}: the anchor reports {n} circuit(s) carried.\nanchor:\n{}",
+            self.proc.transcript()
+        );
+    }
+}
+
+impl Split {
+    /// The `--listen` for the side that moves to IPv6 under the split (the guest).
+    pub fn guest_listen(self) -> &'static str {
+        match self {
+            Split::Families => "[::1]:0",
+            Split::None => "127.0.0.1:0",
+        }
+    }
+
+    /// The anchor spec that side can use.
+    pub fn guest_spec(self, anchor: &Anchor) -> &str {
+        match self {
+            Split::Families => &anchor.v6_spec,
+            Split::None => &anchor.v4_spec,
+        }
+    }
+}
+
+pub struct RelayWorld {
+    pub split: Split,
+    pub tmp: tempfile::TempDir,
+    pub anchor: Anchor,
+    pub host_dir: PathBuf,
+    pub guest_dir: PathBuf,
+    pub host: Option<VoxProc>,
+    pub fwd: Option<VoxProc>,
+    pub host_fp: String,
+    pub room: String,
+    pub address: String,
+    pub passphrase: String,
+    pub service: String,
+}
+
+impl RelayWorld {
+    /// The guest's `--listen` and the anchor spec it can use.
+    fn guest_net(&self) -> (&'static str, &str) {
+        (
+            self.split.guest_listen(),
+            self.split.guest_spec(&self.anchor),
+        )
+    }
+
+    /// See [`Anchor::circuits`].
+    pub fn anchor_circuits(&mut self, settle: Duration) -> usize {
+        self.anchor.circuits(settle)
+    }
+
+    /// See [`Anchor::assert_relayed`].
+    pub fn assert_relayed(&mut self, when: &str) {
+        self.anchor.assert_relayed(when);
+    }
+
+    /// Anchor, and a host serving a loopback echo service with the guest already trusted.
+    pub fn new(split: Split) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let (anchor_dir, host_dir, guest_dir) = (
+            tmp.path().join("anchor"),
+            tmp.path().join("host"),
+            tmp.path().join("guest"),
+        );
+        for d in [&anchor_dir, &host_dir, &guest_dir] {
+            std::fs::create_dir_all(d.join("cfg")).unwrap();
+        }
+        let anchor = Anchor::start(&anchor_dir);
+        let v4_spec = anchor.v4_spec.clone();
 
         let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
         assert!(ok, "vox id (guest): {err}");
@@ -180,8 +231,6 @@ impl RelayWorld {
             split,
             tmp,
             anchor,
-            v4_spec,
-            v6_spec,
             host_dir,
             guest_dir,
             host: Some(host),
@@ -280,7 +329,7 @@ impl RelayWorld {
                 "--passphrase-file",
                 pass_file.to_str().unwrap(),
                 "--anchor",
-                &self.v4_spec,
+                &self.anchor.v4_spec,
                 "--listen",
                 "127.0.0.1:0",
             ]),
