@@ -322,16 +322,38 @@ fn a_room_admits_the_passphrase_and_each_author_decides_who_reads_them() {
     .expect("claim 3: alice reads bob");
 
     // ---- claim 4, positive control first: Carol receives the member who trusts her ----
-    let carol_view = until(&carol, "carol to read bob", &read, 90, |o| {
-        o.contains("FROM-BOB")
+    //
+    // A sender key is forward-only: Bob's key reaches Carol at some point after she joins, and
+    // only what Bob writes after that is readable to her, by design. So the control is not "Carol
+    // reads FROM-BOB" (posted before the release, it may never render) but "Carol reads *a* Bob
+    // post made after the release": Bob keeps posting until one arrives.
+    let control_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut n = 0;
+    loop {
+        n += 1;
+        post(&bob, &format!("FROM-BOB-LATE-{n}"));
+        if until(&carol, "carol to read a late bob post", &read, 5, |o| {
+            o.contains("FROM-BOB-LATE-")
+        })
+        .is_ok()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < control_deadline,
+            "claim 4's control failed: in 120s Carol never rendered any post from Bob, who trusts \
+             her, so an absence of Alice below would prove nothing"
+        );
+    }
+    // ...and only now does Alice's absence mean something. She posts *after* Carol is provably
+    // receiving keys, then Bob posts once more: once Carol renders Bob's last post she has synced
+    // past Alice's, so Alice's absence is her decision and not an unsynced log.
+    post(&alice, "FROM-ALICE-LATE");
+    post(&bob, "FROM-BOB-FINAL");
+    let carol_view = until(&carol, "carol to read bob's final post", &read, 90, |o| {
+        o.contains("FROM-BOB-FINAL")
     })
-    .unwrap_or_else(|e| {
-        panic!(
-            "claim 4's control failed: Carol never rendered Bob, who trusts her, so an absence of \
-             Alice below would prove nothing — {e}"
-        )
-    });
-    // ...and only now does Alice's absence mean something. Give it every chance to leak.
+    .unwrap_or_else(|e| panic!("claim 4's control failed after it had passed once: {e}"));
     assert!(
         !carol_view.contains("FROM-ALICE"),
         "claim 4: Carol rendered Alice, who never trusted her: {carol_view:?}"
