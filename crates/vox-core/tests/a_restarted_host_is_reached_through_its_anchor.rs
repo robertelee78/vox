@@ -172,17 +172,17 @@ async fn probe(proxy: SocketAddr, name: &str, port: u16, msg: &[u8]) -> Result<(
 /// Probe until an echo comes back or `within` runs out. Returns how long after `since` the first
 /// echo arrived, and how many attempts failed first (with the last reason).
 ///
-/// **One attempt at a time, none cut short.** One request through the proxy runs the node's whole
-/// ladder, and against a dead connection a ladder attempt can take longer than any short
-/// per-attempt timeout; cutting it off and starting over would measure the timeout, not the node.
+/// **A new attempt every second, and none is cut short**, which is how a person or a tool that
+/// retries behaves. One request through the proxy runs the node's whole ladder, and against a
+/// dead connection one attempt can take longer than any short per-attempt timeout; cutting it off
+/// and starting over would measure the timeout, not the node. Overlapping attempts with a long
+/// bound measure when the node could first carry an echo, to within a second.
 ///
-/// **And not faster than a person retries.** An earlier version overlapped an attempt every
-/// second. That tripped a separate defect, reported rather than fixed here: the anchor serves a
-/// client's circuit requests one at a time on that client's stream loop, so requests aimed at the
-/// dead connection queue behind each other, and once the dead connection closes the abandoned
-/// ones fail in a burst of more than `MAX_CONSECUTIVE_STREAM_FAILURES` (16). The anchor then stops
-/// reading that client's connection for good. That is worth a gate of its own, and it must not
-/// be what this gate measures.
+/// The rate is also a check of its own. Before v0.2.8 served circuit streams on their own tasks
+/// (56db6b1), an anchor handled one client's circuit requests one at a time, so requests at a dead
+/// target queued, failed in a burst when it closed, and tripped the stream loop's 16-failure limit:
+/// the anchor stopped reading that client for good and the host was never reached again. At this
+/// rate that defect fails this gate.
 async fn reach_again(
     proxy: SocketAddr,
     name: &str,
@@ -190,22 +190,39 @@ async fn reach_again(
     since: Instant,
     within: Duration,
 ) -> (Option<Duration>, usize, String) {
+    let mut attempts = tokio::task::JoinSet::new();
     let (mut failed, mut last) = (0, String::new());
-    while since.elapsed() < within {
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            probe(proxy, name, port, b"after the restart"),
-        )
-        .await
-        {
-            Ok(Ok(())) => return (Some(since.elapsed()), failed, last),
-            Ok(Err(why)) => last = why,
-            Err(_) => last = "no answer in 30s".into(),
+    let mut next = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = next.tick(), if since.elapsed() < within => {
+                let name = name.to_owned();
+                attempts.spawn(async move {
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        probe(proxy, &name, port, b"after the restart"),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err("no answer in 30s".into()),
+                    }
+                });
+            }
+            Some(done) = attempts.join_next() => match done.expect("probe task") {
+                Ok(()) => {
+                    let took = since.elapsed();
+                    attempts.abort_all();
+                    return (Some(took), failed, last);
+                }
+                Err(why) => {
+                    failed += 1;
+                    last = why;
+                }
+            },
+            else => return (None, failed, last),
         }
-        failed += 1;
-        tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    (None, failed, last)
 }
 
 /// Start a node that has run before in this directory: open its store (waiting for a previous
