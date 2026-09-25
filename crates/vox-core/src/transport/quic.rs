@@ -208,7 +208,7 @@ pub const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
 pub const DEFAULT_UDP_PAYLOAD: u16 = 1_452;
 
 /// The path-MTU ceiling for a socket whose receive buffer is `effective` bytes, as the OS
-/// reports it after [`UDP_SOCKET_BUFFER`] was asked for, and why.
+/// reports it after `UDP_SOCKET_BUFFER` was asked for, and why.
 ///
 /// **The 8192 ceiling needs the buffer it was measured with.** A burst of large datagrams that
 /// overflows the receive buffer loses a run of large packets and nothing small, which is exactly
@@ -220,7 +220,7 @@ pub const DEFAULT_UDP_PAYLOAD: u16 = 1_452;
 /// loopback proof pinned the dialler at 1200.
 ///
 /// So the larger ceiling is taken only when the buffer the OS actually granted is at least the
-/// one it was measured with, read back in each OS's own units ([`GRANTED_WHEN_FULL`]):
+/// one it was measured with, read back in each OS's own units (`GRANTED_WHEN_FULL`):
 /// - **Linux** reports twice what it granted (it counts its own bookkeeping): the read-back is
 ///   `2 × min(requested, net.core.rmem_max)`. A full grant reads as 8 MiB, and a cap at the
 ///   default reads as about 416 KiB. Comparing against 4 MiB there would be wrong: a host with
@@ -245,7 +245,7 @@ pub fn mtu_ceiling_for(effective: usize) -> (u16, &'static str) {
     }
 }
 
-/// What `SO_RCVBUF` reads back when the full [`UDP_SOCKET_BUFFER`] was granted: Linux doubles the
+/// What `SO_RCVBUF` reads back when the full `UDP_SOCKET_BUFFER` was granted: Linux doubles the
 /// value it stores (`sock_setsockopt`: `sk_rcvbuf = 2 * min(val, rmem_max)`), other platforms do
 /// not.
 #[cfg(target_os = "linux")]
