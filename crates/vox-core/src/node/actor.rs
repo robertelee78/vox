@@ -5036,18 +5036,15 @@ impl Node {
         // that carried a key is answered, one byte once the key is taken, and reset with a wire
         // code when it is not. A stream that carried no key (a bare hello, an `Open`) is finished.
         match self.take_pairwise(peer, first, &mut recv).await {
-            Some(true) => {
+            Some(Ok(())) => {
                 let _ = send
                     .write_all(&[crate::node::pairwise_stream::KEY_TAKEN])
                     .await;
                 let _ = send.finish();
             }
-            Some(false) => {
-                let code = crate::transport::quic::close_code(
-                    crate::wire::WireError::AuthenticatorInvalid,
-                );
-                let _ = send.reset(code);
-                let _ = recv.stop(code);
+            Some(Err(why)) => {
+                let _ = send.reset(why.code());
+                let _ = recv.stop(why.code());
             }
             None => {
                 let _ = send.finish();
@@ -5055,15 +5052,16 @@ impl Node {
         }
     }
 
-    /// Act on a pairwise stream whose first frame has been read: `Some(true)` if it carried a key
-    /// and the key was taken, `Some(false)` if it carried one that was not, `None` if it carried
+    /// Act on a pairwise stream whose first frame has been read: `Some(Ok)` if it carried a key
+    /// and the key was taken, `Some(Err(why))` if it carried one that was not, `None` if it carried
     /// none.
     async fn take_pairwise(
         &mut self,
         peer: Digest32,
         first: crate::node::pairwise_stream::PairwiseFrame,
         recv: &mut quinn::RecvStream,
-    ) -> Option<bool> {
+    ) -> Option<Result<(), crate::node::pairwise_stream::KeyRefusal>> {
+        use crate::node::pairwise_stream::KeyRefusal;
         use crate::node::pairwise_stream::{open_skdm, recv_pairwise, PairwiseFrame};
         // A `Hello` opens a session the join path never created (ADR-016): accept it
         // against our own prekey ring, exactly as the join responder does, then read
@@ -5087,7 +5085,7 @@ impl Node {
                 initial,
             } => {
                 if !self.accept_hello(channel_id, peer, &initial).await {
-                    return None;
+                    return Some(Err(KeyRefusal::HelloRefused));
                 }
                 match recv_pairwise(recv).await {
                     Ok(Some(PairwiseFrame::Skdm { channel_id, sealed })) => (channel_id, sealed),
@@ -5114,10 +5112,10 @@ impl Node {
         let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
             // No session with this peer for that channel: nothing can open it. Said, so the
             // sender sends it again once a join or key exchange establishes one.
-            return Some(false);
+            return Some(Err(KeyRefusal::NoSession));
         };
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
-            return Some(false);
+            return Some(Err(KeyRefusal::CannotOpen));
         };
         let backfilled = match (
             self.profile.as_ref(),
@@ -5131,14 +5129,14 @@ impl Node {
             _ => None,
         };
         let Some(n) = backfilled else {
-            return Some(false);
+            return Some(Err(KeyRefusal::NotAccepted));
         };
         let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
             channel_id,
             peer,
             backfilled: n as u64,
         });
-        Some(true)
+        Some(Ok(()))
     }
 
     /// Load (or, on first use, generate) the prekey ring for the unlocked

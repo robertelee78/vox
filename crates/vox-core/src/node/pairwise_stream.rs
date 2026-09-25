@@ -211,6 +211,44 @@ pub async fn deliver_skdm(
 /// The recipient's answer on a pairwise stream that carried a key it took.
 pub const KEY_TAKEN: u8 = 1;
 
+/// Why a recipient did not take a key, sent as the stream's reset code so the sender can say.
+///
+/// One code per cause, on purpose: a single "refused" made every cause look alike, and the one
+/// case this exists for (two joiners whose keys never land) could not be told apart from the others.
+/// Chosen above every `WireError` code, which a refusal at accept still uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRefusal {
+    /// No pairwise session with the sender for that room.
+    NoSession = 0x21,
+    /// A session exists, but the key did not open under it (the two ends hold different sessions).
+    CannotOpen = 0x22,
+    /// The key opened, but the room would not take it (not held, or refused by the room).
+    NotAccepted = 0x23,
+    /// The hello in front of the key was not accepted, so the key behind it was never read.
+    HelloRefused = 0x24,
+}
+
+impl KeyRefusal {
+    /// The stream reset code.
+    #[must_use]
+    pub fn code(self) -> quinn::VarInt {
+        quinn::VarInt::from_u32(self as u32)
+    }
+
+    /// Words for a reset code a recipient sent back.
+    #[must_use]
+    pub fn describe(code: u64) -> String {
+        match code {
+            0x21 => "no pairwise session for that room".into(),
+            0x22 => "the key did not open under the session it holds".into(),
+            0x23 => "the room would not take the key".into(),
+            0x24 => "its hello was not accepted".into(),
+            0x05 => "refused at accept: it may not take a key from us yet".into(),
+            other => format!("reset with code {other}"),
+        }
+    }
+}
+
 /// Whether the far side refused a delivered key: `Some(why)` if so, `None` if it took it.
 ///
 /// **Written is not delivered.** QUIC acknowledges the bytes before the recipient has decided
@@ -226,6 +264,9 @@ pub async fn refused(mut recv: quinn::RecvStream, patience: std::time::Duration)
     match tokio::time::timeout(patience, recv.read_exact(&mut byte)).await {
         Ok(Ok(())) if byte[0] == KEY_TAKEN => None,
         Ok(Ok(())) => Some(format!("answered {}", byte[0])),
+        Ok(Err(quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)))) => {
+            Some(KeyRefusal::describe(code.into_inner()))
+        }
         Ok(Err(e)) => Some(e.to_string()),
         Err(_) => Some(format!("no answer within {}s", patience.as_secs())),
     }
