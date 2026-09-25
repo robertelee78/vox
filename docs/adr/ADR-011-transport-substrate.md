@@ -2,7 +2,7 @@
 
 **Status**: implemented (M9, `crates/vox-core/src/transport/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline). 2026-09-20 — stream framing lifted into `transport::framing`; typed streams (`transport::streams`, ADR-016 M14.2).
+**Updated**: 2026-09-24 — the datagram sequence number and replay window are **removed** (ADR-022 M22.1): datagrams travel on stream-bound flows routed by one reader per connection; see §"Datagram flows". 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline). 2026-09-20 — stream framing lifted into `transport::framing`; typed streams (`transport::streams`, ADR-016 M14.2).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: transport, quic, tls, post-quantum, multiplexing, datagrams
 
@@ -68,9 +68,13 @@ Two distinct, separately-keyed layers, each binding the Vox identity:
 
 - **0-RTT is disabled.** QUIC/TLS 1.3 0-RTT early data is replayable; for a security overlay that
   risk is unacceptable, so Vox never offers or accepts 0-RTT.
-- **Datagram anti-replay.** RFC 9221 datagrams carry a Vox-framing 64-bit sequence number + a sliding
-  replay window (**default 1024 packets**, DTLS-style bitmap); out-of-window or duplicate datagrams are
-  dropped.
+- **Datagram flows, and no Vox replay window (ADR-022).** Each RFC 9221 datagram is
+  `varint flow_id ‖ varint context ‖ body` and belongs to a flow bound to a stream. Replay and
+  duplication are QUIC's concern: a datagram is a frame inside a protected QUIC packet, and QUIC
+  refuses a replayed or duplicated packet (RFC 9000 §12.3), so an on-path replay never reaches Vox.
+  *(Until 2026-09-24 datagrams carried an 8-byte sequence behind a 1024-packet DTLS-style window. It
+  protected nothing QUIC did not already, could wrongly drop legitimate packets that arrived far out of
+  order, and cost 8 bytes a packet; ADR-022 decision 2 removed it.)*
 - **Downgrade prevention.** TLS 1.3's Finished MAC already binds the full transcript (including the
   negotiated group); offering only hybrid PQ groups removes any downgrade target; the negotiated
   suite is additionally recorded in the application **session-establishment** entry (ADR-008 canonical
@@ -119,17 +123,19 @@ production-ready as of 2026.
 
 These record the concrete decisions made building this ADR (`crates/vox-core/src/transport/`), so the spec and code stay in lockstep:
 
-- **Datagram anti-replay is a property of the connection.** `VoxConnection` owns the outbound 64-bit
-  sequence counter and the inbound DTLS-style sliding window (default 1024 packets, per the rule above).
-  `send_datagram(payload)` prepends the next sequence; `recv_datagram()` parses the prefix, runs the
-  window, and **drops** — never returns — a datagram that is unframed (shorter than the 8-byte prefix),
-  a duplicate, or below the window, counting each in `datagrams_dropped()` so a live replay shows up
-  as a rising counter. The application only ever sees payloads and cannot choose or observe sequence
-  numbers. The framing/window primitives remain in `transport::datagram` for tests and vectors.
-  *(2026-09-19 review: previously the connection exposed raw datagram bytes and the window was applied
-  only by caller discipline — a byte-exact replay reached the application, proven over real loopback
-  QUIC and now pinned by a test.)* The raw `quinn()` accessor still exists for advanced callers (M11)
-  and bypasses this layer by construction; any such use must apply the same rule.
+- **Datagram flows are a property of the connection (ADR-022 M22.1).** `VoxConnection` starts a
+  `transport::router::DatagramRouter` with the connection; it is the **only** reader of the
+  connection's datagrams. It reads the flow ID off each one and hands it to that flow's bounded inbox,
+  and drops and counts (`datagram_stats()`) a datagram for an unknown or ended flow, one whose inbox is
+  full, one with an unknown context, and one it cannot parse. A flow is bound to a stream
+  (`bind_flow`), takes it, and ends when it ends — so ending a flow is not caller discipline. The flow
+  ID is the stream's full QUIC stream ID (ADR-022 §1 explains why not a quarter of it). Packets larger
+  than one datagram are fragmented and reassembled (`transport::datagram`, ≤255 fragments, 500 ms,
+  32 partial packets per flow, 1 MiB per connection), never retransmitted. The old
+  `send_datagram`/`recv_datagram`/`datagrams_dropped` and the sequence window are deleted, and so are
+  the two unit tests that asserted the window. Proved by `crates/vox-core/tests/datagram_flows_gate.rs`.
+  The raw `quinn()` accessor still exists for advanced callers (M11); reading datagrams through it
+  would race the router, and nothing does.
 - **Stream framing and typed streams (ADR-016 M14.2).** The u32-BE length prefix that
   `QuicStreamTransport` applied to M5 frames is now the async pair `transport::framing::{write_frame,
   read_frame}` (a clean FIN exactly at a frame boundary is the success half-close → `None`; a FIN

@@ -9,8 +9,12 @@
 //! [`VoxEndpoint::bind_abstract`](vox_core::transport::quic::VoxEndpoint::bind_abstract)),
 //! where each host may sit behind a NAT that maps and filters per RFC 4787.
 //!
-//! No packet is ever lost, reordered or delayed, so a failure is a real behavioural
-//! failure rather than a flake.
+//! By default no packet is ever lost, reordered or delayed, so a failure is a real
+//! behavioural failure rather than a flake. A test that is *about* a bad path shapes it
+//! explicitly and deterministically: [`VirtualNet::set_delay`] (a fixed one-way delay,
+//! order preserved), [`VirtualNet::set_loss`] (every Nth datagram on one directed link),
+//! and [`VirtualNet::set_mtu`] (datagrams past a size dropped, as a small-MTU path
+//! does). Each is counted, so a gate can show the shaping actually happened.
 
 // Shared by several test binaries, each of which uses a different part of it.
 #![allow(dead_code)]
@@ -22,6 +26,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
@@ -72,6 +77,28 @@ struct Inner {
     filtered: u64,
     /// Datagrams dropped because nothing is bound at the destination.
     unroutable: u64,
+    /// Fixed one-way delay applied to every datagram.
+    delay: Duration,
+    /// Where delayed datagrams wait, in the order they were sent.
+    delayed: Option<tokio::sync::mpsc::UnboundedSender<Delayed>>,
+    /// (sender's own address, destination) → (drop every Nth, datagrams seen so far).
+    loss: HashMap<(SocketAddr, SocketAddr), (u64, u64)>,
+    /// Datagrams dropped by [`VirtualNet::set_loss`].
+    lost: u64,
+    /// Datagrams larger than this are dropped, as a path with that MTU would.
+    mtu: Option<usize>,
+    /// Per-host MTU: the host's own access link, both directions.
+    host_mtu: HashMap<SocketAddr, usize>,
+    /// Datagrams dropped by [`VirtualNet::set_mtu`] or [`VirtualNet::set_host_mtu`].
+    too_big: u64,
+}
+
+/// A datagram waiting out [`VirtualNet::set_delay`].
+struct Delayed {
+    at: tokio::time::Instant,
+    socket: Arc<VirtualSocket>,
+    src: SocketAddr,
+    payload: Vec<u8>,
 }
 
 struct Nat {
@@ -216,6 +243,61 @@ impl VirtualNet {
         g.mappings.get(&(index, host, key)).copied()
     }
 
+    /// Delay every datagram by `delay`, one way, preserving order. Must be called inside
+    /// a tokio runtime: the datagrams wait on one task, so they come out in the order
+    /// they went in.
+    pub fn set_delay(&self, delay: Duration) {
+        let mut g = self.lock();
+        g.delay = delay;
+        if g.delayed.is_none() && !delay.is_zero() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Delayed>();
+            tokio::spawn(async move {
+                while let Some(d) = rx.recv().await {
+                    tokio::time::sleep_until(d.at).await;
+                    d.socket.deliver(d.src, d.payload);
+                }
+            });
+            g.delayed = Some(tx);
+        }
+    }
+
+    /// Drop every `every`th datagram the host bound at `from` sends to `to` (0 stops
+    /// it). Deterministic, so two runs lose the same datagrams, and never two in a row
+    /// unless `every` is 1.
+    pub fn set_loss(&self, from: SocketAddr, to: SocketAddr, every: u64) {
+        let mut g = self.lock();
+        if every == 0 {
+            g.loss.remove(&(from, to));
+        } else {
+            g.loss.insert((from, to), (every, 0));
+        }
+    }
+
+    /// How many datagrams [`VirtualNet::set_loss`] has dropped.
+    #[must_use]
+    pub fn lost(&self) -> u64 {
+        self.lock().lost
+    }
+
+    /// Drop every datagram larger than `mtu` bytes, as a path with that MTU does.
+    pub fn set_mtu(&self, mtu: Option<usize>) {
+        self.lock().mtu = mtu;
+    }
+
+    /// Give the host bound at `host` an access link of `mtu` bytes: every datagram it
+    /// sends or receives larger than that is dropped. How a path with a small MTU on one
+    /// side only — one leg of a relay circuit, say — is modelled.
+    pub fn set_host_mtu(&self, host: SocketAddr, mtu: usize) {
+        self.lock().host_mtu.insert(host, mtu);
+    }
+
+    /// How many datagrams [`VirtualNet::set_mtu`] and [`VirtualNet::set_host_mtu`] have
+    /// dropped.
+    #[must_use]
+    pub fn too_big(&self) -> u64 {
+        self.lock().too_big
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().expect("virtual net mutex")
     }
@@ -223,24 +305,46 @@ impl VirtualNet {
     /// Carry one datagram from `from` to `to`, translating and filtering as the hosts'
     /// NATs require.
     fn send(&self, from: SocketAddr, to: SocketAddr, payload: &[u8]) {
-        let delivery = {
+        let (delivery, delayed) = {
             let mut g = self.lock();
+            if g.mtu.is_some_and(|mtu| payload.len() > mtu) {
+                g.too_big += 1;
+                return;
+            }
+            if let Some((every, seen)) = g.loss.get_mut(&(from, to)) {
+                *seen += 1;
+                if *seen % *every == 0 {
+                    g.lost += 1;
+                    return;
+                }
+            }
             let src = g.translate_out(from, to);
-            g.route_in(from, src, to)
+            let routed = g.route_in(from, src, to);
+            let over = |host: &SocketAddr| g.host_mtu.get(host).is_some_and(|m| payload.len() > *m);
+            if over(&from) || routed.as_ref().is_some_and(|(sock, _)| over(&sock.addr)) {
+                g.too_big += 1;
+                return;
+            }
+            let delayed = g
+                .delayed
+                .clone()
+                .filter(|_| !g.delay.is_zero())
+                .map(|tx| (tx, tokio::time::Instant::now() + g.delay));
+            (routed, delayed)
         };
-        // The waker runs outside the network lock: a woken task may send immediately.
-        if let Some((socket, src)) = delivery {
-            if socket.severed.load(Ordering::SeqCst) {
-                return; // a crashed process receives nothing
+        let Some((socket, src)) = delivery else {
+            return;
+        };
+        match delayed {
+            Some((tx, at)) => {
+                let _ = tx.send(Delayed {
+                    at,
+                    socket,
+                    src,
+                    payload: payload.to_vec(),
+                });
             }
-            let waker = {
-                let mut inbox = socket.inbox.lock().expect("inbox mutex");
-                inbox.queue.push_back((src, payload.to_vec()));
-                inbox.waker.take()
-            };
-            if let Some(w) = waker {
-                w.wake();
-            }
+            None => socket.deliver(src, payload.to_vec()),
         }
     }
 }
@@ -326,6 +430,23 @@ pub struct VirtualSocket {
     inbox: Mutex<Inbox>,
     /// Set by [`VirtualNet::sever`]: the process behind this socket has crashed.
     severed: AtomicBool,
+}
+
+impl VirtualSocket {
+    fn deliver(&self, src: SocketAddr, payload: Vec<u8>) {
+        if self.severed.load(Ordering::SeqCst) {
+            return; // a crashed process receives nothing
+        }
+        // The waker runs outside the inbox lock: a woken task may send immediately.
+        let waker = {
+            let mut inbox = self.inbox.lock().expect("inbox mutex");
+            inbox.queue.push_back((src, payload));
+            inbox.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
 }
 
 impl std::fmt::Debug for VirtualSocket {
