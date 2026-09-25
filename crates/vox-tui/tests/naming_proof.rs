@@ -325,6 +325,34 @@ fn a_local_name_reaches_the_node_it_names() {
         }
         (alice, bob, carol)
     });
+    // **Precondition: alice knows carol is in `family`.** carol joined through bob, so alice
+    // learns her as a member from the board, not from a join of her own. On v0.2.9 that takes a
+    // sync interval (measured on the v0.3.0 integration: about 26 s; the naming branch's base was
+    // faster), and this proof is about names, not about how fast membership travels. Waited for,
+    // bounded, and timed, so a regression in that latency still shows here as a number.
+    {
+        let started = Instant::now();
+        let carol_fp = carol.fp();
+        let known = |alice: &Member| {
+            alice
+                .node
+                .view()
+                .open_channels
+                .iter()
+                .any(|d| d.local_name == "family" && d.members.contains(&carol_fp))
+        };
+        while !known(&alice) {
+            assert!(
+                started.elapsed() < Duration::from_secs(90),
+                "alice never learned that carol is in family"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!(
+            "alice learned carol is in family after {} ms",
+            started.elapsed().as_millis()
+        );
+    }
     let _sock = rt.block_on(async { vox_core::node::ipc::bind(alice.node.clone(), &alice.paths) });
 
     // `vox up`, no room: the proxy inside alice's node, across every room it holds.
