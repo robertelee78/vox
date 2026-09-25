@@ -177,10 +177,35 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     `fast-apple-datapath` (batched `sendmsg_x`, +18% at a 1452-byte MTU, +4% at 8192) — it calls a
     private Apple API, which an iOS build (PRD-001 R31) may not be allowed to ship, so it is left to
     the decider.
-  - **The result is ~1.1–1.2 GB/s (8.8–9.6 Gbit/s), about 11–12% of loopback TCP. R41's 80% of
-    loopback is not met**, and on this evidence cannot be met by tuning: what remains is one
-    userspace QUIC connection sending from one task. Whether "raw" means loopback or a real link is
-    the decider's question (PRD-001 §7).
+  - **Unshaped loopback, ~1.1–1.2 GB/s (8.8–9.6 Gbit/s), about 11–12% of loopback TCP** — which the
+    decider has since ruled is the wrong comparison (PRD-001 R41 as clarified 2026-09-25): R41 is
+    measured against a real link.
+- **R41 against a real link, 2026-09-25.** `perf_r41_tunnel_throughput_proof` emulates each link
+  class with macOS dummynet (`dnctl` + a `com.apple/vox-shaper` pf sub-anchor matching only the Vox
+  host's UDP port and a raw-TCP sink's port; root via `sudo -n`, CANNOT MEASURE without it) and
+  pushes raw TCP and a `vox forward` tunnel over the same pipes, interleaved. Medians of 3:
+
+  | link | Vox | raw TCP | ratio |
+  |---|---|---|---|
+  | 1 Gbit/s, 1 ms RTT | 984 Mbit/s | 990 | 0.994 (asserted ≥ 0.90) |
+  | 1 Gbit/s, 20 ms RTT | 841 | 830 | 1.013 (asserted ≥ 0.90) |
+  | 300 Mbit/s, 5 ms, 0.1% loss | 277 | 296 | 0.934 (reported) |
+  | "10 Gbit/s", 1 ms | 1394 | 1404 | 0.993 (reported; dummynet tops out at ~1.4 Gbit/s here) |
+
+  Two changes made that true:
+  - **quinn-udp `fast-apple-datapath`** (batched `sendmsg_x`), adopted by the decider for every
+    platform including iOS: on a 1 Gbit/s, 1 ms link the tunnel went from ~800 to ~987 Mbit/s.
+  - **Stream window 16 MiB, send window 32 MiB** (`quic::STREAM_WINDOW`). quinn's default 1.25 MB
+    window capped the 20 ms class at 414 Mbit/s (ratio 0.46); mutation-checked in the gate — with
+    the default restored that class goes red at 0.460.
+  - Not changed: a second send task (quinn drives each connection from one task; there is nowhere
+    to put one without forking quinn) and pacing (quinn already paces every connection).
+  - **Observed, unexplained:** on unshaped loopback, 2 of 54 transfers (in the last two A/B sets) collapsed to ~14 MB/s
+    for the whole transfer, with and without the window change. Not reproduced on a shaped link;
+    recorded, not investigated yet.
+- **The 8192 ceiling stays** (decider): it helps loopback and jumbo-frame links, and discovery
+  settles at 1452 on ordinary ones. macOS refuses UDP datagrams over `net.inet.udp.maxdgram`
+  (9216 by default); a 16356 ceiling broke connections there.
   - **Tried and removed:** capping a circuit's inner packets at 1452 bytes (dropping larger ones in
     the circuit driver, as a path drops a probe that does not fit), to stop an inner connection over
     a relay growing its packets to 8 KiB. It made `relay_drops_not_stalls` stall 4 of 4 runs

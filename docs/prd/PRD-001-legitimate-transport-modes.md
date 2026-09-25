@@ -136,7 +136,13 @@ friction for this audience can be fixed later.
 
 - **R40.** A chat message between two online nodes **must** arrive in **under 1 s**, whether direct or
   relayed.
-- **R41.** A tunnel on a direct path **must** run near line rate (within about 10–20% of raw).
+- **R41.** A tunnel on a direct path **must** run near line rate: over the same network link, a Vox
+  tunnel **must** deliver at least **90%** of what raw TCP gets at 1 Gbit/s, and is measured and
+  reported at other link classes. *Clarified by the decider, 2026-09-25:* "let's not be overly
+  pedantic… figure out what the maximum throughput is for a network connection and ensure that our
+  overlay system doesn't completely nuke that. We want vox to be as fast and efficient as possible…
+  Tor hidden services… felt like a 300 bps modem… I really want our solution to be elegant and fast
+  and wonderful to use." "Raw" is a real (emulated) link, not loopback TCP.
 - **R42.** A first connection to a peer, including NAT traversal, **must** complete in **under 2 s**.
 
 ### 3.11 Removals

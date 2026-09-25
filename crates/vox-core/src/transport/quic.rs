@@ -184,6 +184,10 @@ const MAX_UDP_PAYLOAD: u16 = 8_192;
 /// The OS may grant less; that is not an error.
 const UDP_SOCKET_BUFFER: usize = 4 << 20;
 
+/// Per-stream flow-control window (and half the connection's send window), sized for the
+/// bandwidth-delay product of a 1 Gbit/s path at ~130 ms, or 10 Gbit/s at ~13 ms.
+const STREAM_WINDOW: u32 = 16 << 20;
+
 /// The endpoint parameters every Vox endpoint runs with.
 fn endpoint_config() -> quinn::EndpointConfig {
     let mut cfg = quinn::EndpointConfig::default();
@@ -203,6 +207,13 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut mtu = quinn::MtuDiscoveryConfig::default();
     mtu.upper_bound(MAX_UDP_PAYLOAD);
     cfg.mtu_discovery_config(Some(mtu));
+    // Enough flow-control credit to fill a long, fast path (PRD-001 R41). quinn's default
+    // stream window is 1.25 MB, sized for 100 Mbit/s at 100 ms; at 1 Gbit/s and 20 ms RTT that
+    // caps a tunnel at ~500 Mbit/s whatever the link does. Measured over a dummynet-shaped
+    // 1 Gbit/s, 20 ms path: 414 Mbit/s with the default, ~940 with these (raw TCP ~890). The
+    // window is credit the receiver grants, not memory it allocates up front.
+    cfg.stream_receive_window(quinn::VarInt::from_u32(STREAM_WINDOW));
+    cfg.send_window(2 * u64::from(STREAM_WINDOW));
     Arc::new(cfg)
 }
 
