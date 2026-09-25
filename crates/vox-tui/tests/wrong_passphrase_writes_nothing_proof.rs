@@ -94,7 +94,11 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
 
     // A syntactically whole address, so `connect` gets as far as opening the profile.
     let link = format!("vox://{fp}?a={fp}&b=/ip4/127.0.0.1/udp/1");
-    let verbs: [(&str, Vec<&str>); 5] = [
+    let verbs: [(&str, Vec<&str>); 9] = [
+        ("id", vec!["id"]),
+        ("trust add", vec!["trust", "add", &fp, "--name", "self"]),
+        ("trust remove", vec!["trust", "remove", &fp]),
+        ("trust list", vec!["trust", "list"]),
         ("serve", vec!["serve", "9", "--listen", "127.0.0.1:0"]),
         (
             "forward",
