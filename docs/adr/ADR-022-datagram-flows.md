@@ -132,6 +132,22 @@ behind it.
 
 What does not change: the relay is still ciphertext-only by construction.
 
+*(Found 2026-09-25, PRD-001 R41's perf gate:)* **a circuit ends when the connection it carries
+closes.** The relay cannot see a CONNECTION_CLOSE go by, and the ends' drivers ran until their flow
+ended or the idle close, so a connection that lost a race to a direct one — closed at both ends —
+kept a relay slot, and kept the anchor reporting a circuit carried, for five minutes. The
+initiator's driver now ends one second after its connection closes (the linger lets the close cross
+the circuit), which ends the flow, the relay's forwarding, and the target's driver. Proved by
+`crates/vox-core/tests/circuit_ends_with_its_connection.rs`: the relay carries 0 circuits 1.04 s after
+the connection closes; mutation (the driver not ended) — still 1 after 5 s.
+
+And **an end lets a circuit go once nothing has arrived on it for 65 s** — the inner connection's
+own 60 s idle timeout plus a margin — rather than after five minutes of no traffic either way. When
+the far end simply exits (a one-shot `vox connect`), no close is ever sent; the near end keeps
+retransmitting to it until its own idle timeout, and that outbound traffic used to hold the circuit
+up for the full five minutes. *Not proved by a gate yet*: it was observed with the node's debug
+output on real binaries, not measured by one.
+
 ### 6. UDP tunnels (R25)
 
 - **Service label.** A UDP service is served as `udp/<port>`; a bare `<port>` stays TCP. So TCP 53

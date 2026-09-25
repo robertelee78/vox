@@ -398,9 +398,40 @@ pub async fn connect_through(
     let conn =
         crate::nat::reachability::connect_direct(Arc::clone(endpoint), &[target], peer, now_secs)
             .await?;
-    driver.keep();
+    // **The circuit ends when the connection it carries does.** Nothing else ends it: the
+    // relay forwards the inner connection's packets without reading them, so it cannot see
+    // a CONNECTION_CLOSE go by, and neither end's driver used to look. A connection that
+    // lost a race to a direct one, or was displaced by one and retired, was closed at both
+    // ends while its circuit sat on the relay for `CIRCUIT_IDLE_TIMEOUT` — five minutes of
+    // a relay slot, and five minutes of an anchor reporting a circuit carried for a pair
+    // that was talking directly (PRD-001 R41's perf gate failed on exactly that).
+    //
+    // A short linger first, so the close itself crosses the circuit before it goes.
+    if let Some(abort) = driver.keep() {
+        let inner = conn.quinn().clone();
+        tokio::spawn(async move {
+            inner.closed().await;
+            tokio::time::sleep(CIRCUIT_CLOSE_LINGER).await;
+            abort.abort();
+        });
+    }
     Ok(conn)
 }
+
+/// How long an end of a circuit waits with nothing arriving before it lets the circuit go.
+///
+/// The inner connection's own idle timeout (`quic::MAX_IDLE_MS`, 60 s) plus a margin. A live
+/// far end sends a keep-alive every 20 s, so an end that has heard nothing for this long is
+/// carrying a connection that has already timed out — typically one whose far end exited
+/// (a one-shot `vox connect`), where no close was ever sent to end the circuit sooner.
+/// Counting only what **arrives** matters: the near end keeps retransmitting to a dead peer
+/// until its own idle timeout, and that outbound traffic used to keep the circuit, and the
+/// relay's slot, alive for the full [`CIRCUIT_IDLE_TIMEOUT`].
+const CIRCUIT_END_IDLE: Duration = Duration::from_secs(65);
+
+/// How long a circuit outlives the connection it carried, so that connection's
+/// CONNECTION_CLOSE reaches the far side through it.
+const CIRCUIT_CLOSE_LINGER: Duration = Duration::from_secs(1);
 
 /// A circuit driver that is aborted when this is dropped, unless [`DriverGuard::keep`]
 /// let it live on.
@@ -411,9 +442,10 @@ impl DriverGuard {
         Self(Some(handle))
     }
 
-    /// The circuit is in use: the driver runs until the stream ends.
-    fn keep(mut self) {
-        self.0.take();
+    /// The circuit is in use: the driver runs until the stream ends, or until the
+    /// returned handle aborts it.
+    fn keep(mut self) -> Option<tokio::task::AbortHandle> {
+        self.0.take().map(|h| h.abort_handle())
     }
 }
 
@@ -429,14 +461,14 @@ impl Drop for DriverGuard {
 /// circuit's address goes out as datagrams on the circuit's flow, and datagrams
 /// arriving on the flow are handed to the endpoint as arrivals from that address.
 /// Ends when the flow does — its stream ended, here or anywhere along the circuit — or
-/// after [`CIRCUIT_IDLE_TIMEOUT`] without traffic; the port, and with it the circuit,
-/// is dropped then.
+/// once nothing has **arrived** for [`CIRCUIT_END_IDLE`]; the port, and with it the
+/// circuit, is dropped then.
 async fn terminate(mut port: CircuitPort, mut flow: DatagramFlow) {
     let Some(mut outbound) = port.take_outbound() else {
         return;
     };
     let inlet = port.inlet();
-    let idle = tokio::time::sleep(CIRCUIT_IDLE_TIMEOUT);
+    let idle = tokio::time::sleep(CIRCUIT_END_IDLE);
     tokio::pin!(idle);
     loop {
         // Both receivers are channels, so a branch that loses the race loses nothing.
@@ -450,11 +482,11 @@ async fn terminate(mut port: CircuitPort, mut flow: DatagramFlow) {
             inbound = flow.recv() => {
                 let Some(packet) = inbound else { break };
                 inlet.deliver(packet);
+                idle.as_mut()
+                    .reset(tokio::time::Instant::now() + CIRCUIT_END_IDLE);
             }
             () = &mut idle => break,
         }
-        idle.as_mut()
-            .reset(tokio::time::Instant::now() + CIRCUIT_IDLE_TIMEOUT);
     }
     drop(flow);
     drop(port);
