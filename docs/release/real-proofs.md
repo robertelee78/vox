@@ -218,3 +218,8 @@
 **Why.** `crates/vox-tui/tests/work_board_proof.rs` drives the shipped `vox` but also runs nodes in-process, so it is not proof that a person running `vox` gets this.
 **Acceptance.** A proof that drives only the shipped `vox` shows that two agents split work, goes red under a mutation that breaks it, and `crates/vox-tui/tests/work_board_proof.rs` is deleted.
 **Validation.** The new proof is green on `main` and red under its mutation; `crates/vox-tui/tests/work_board_proof.rs` no longer exists.
+
+### RP-44 — A .vox name for a room this machine never joined is refused at the proxy, through the shipped binary
+**Why.** `crates/vox-core/tests/node_m17_up_gate.rs` runs every node in-process, so it is not proof that a person running `vox` gets this.
+**Acceptance.** A proof that drives only the shipped `vox` shows that a .vox name for a room this machine never joined is refused at the proxy, goes red under a mutation that breaks it, and `crates/vox-core/tests/node_m17_up_gate.rs` is deleted.
+**Validation.** The new proof is green on `main` and red under its mutation; `crates/vox-core/tests/node_m17_up_gate.rs` no longer exists.
