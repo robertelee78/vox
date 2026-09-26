@@ -31,8 +31,14 @@ pub struct VoxProc {
 
 impl VoxProc {
     pub fn spawn(name: &str, data: &Path, args: &[String]) -> Self {
+        Self::spawn_env(name, data, args, &[])
+    }
+
+    /// [`VoxProc::spawn`] with extra environment, for the proofs' test-only knobs.
+    pub fn spawn_env(name: &str, data: &Path, args: &[String], env: &[(&str, &str)]) -> Self {
         let mut child = Command::new(VOX)
             .args(args)
+            .envs(env.iter().copied())
             .env("VOX_DATA_DIR", data)
             .env("VOX_CONFIG_DIR", data.join("cfg"))
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
