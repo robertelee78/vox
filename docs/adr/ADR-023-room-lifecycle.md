@@ -292,6 +292,42 @@ covers only the approver's own messages, as consent always has.
   ADR-010 §"Retention / TTL"). Not built within it: a room created with a retention (creation still
   writes `ttl` 0; `vox room retention` sets it after), and a gate isolating "a peer asking for a
   pruned body gets the skeleton" (the code path exists; nothing measures it alone).
+  - **R6, R7 and R10 gates** (`crates/vox-tui/tests/retention_requirements_proof.rs`, shipped
+    binary, each mutation-checked red):
+    - **R6, forever by default:** a room nobody set retention on reports `ttl` 0 on both members,
+      and after sweeps and a restart both read all 10 messages whose author's clock ran ten years
+      behind, plus 5 current ones. Mutation, room creation writes one year: red, status reads
+      `(31536000, 31536000)`.
+    - **R7, the admin's change reaches what every member already holds:**
+      - The presets are typed through the CLI's parser: `1h`, `1m` and `1w` put ttl 3600,
+        2592000 and 604800 on all three members. Mutation, a month parsed as a week: red (2592000
+        is never reported).
+      - A non-admin's `vox room retention` is refused with the admin message and changes nothing.
+      - The admin's later change from a week to 30 s leaves each member's whole `room read` as
+        exactly the 5 newer messages, with no older message and no probe. Setting forever again
+        keeps exactly those 5 past 40 s.
+      - Mutation, capability check skipped: red (the non-admin's change succeeds).
+      - Mutation, the sweep prunes nothing already held: red (alice still reads the probe, the
+        older 10 and the newer 5).
+    - **Found by R7:** a non-admin's refusal printed "the other side refused". It now says the
+      change is the room admin's (`Fault::NotAdmin`).
+    - **R10, an expired entry's skeleton still catches a fork:**
+      - Alice's node is stopped, a conflicting entry is signed with her own key and pushed to bob,
+        and her node is restarted.
+      - Bob's `vox status --json` now reports, per room, the authors it `frozen` for a fork and
+        the count it `refused_below_checkpoint`. From outside, a refusal and a fork whose held side
+        cannot incriminate look the same (both are dropped, and the session goes on), so the gate
+        reads these counts rather than waiting for a freeze that does not come.
+      - Below alice's checkpoint (seq 5, pruned, signature shed): refused 1, frozen none, and bob
+        still reads her next post.
+      - Above it (seq 52, pruned, signature kept): bob freezes alice (frozen = her fingerprint,
+        refused still 1). Carol reads her next post and bob reads it 0 times.
+      - Neither conflicting entry ends the session.
+      - Mutation, the pre-checkpoint refusal deleted (verifier-41's M10b): red, refused 0 and
+        frozen 0.
+      - Mutation, the fork check skipped for a pruned position: red, frozen `[]` above the
+        checkpoint.
+
 - **M23.2** `seen` and the deterministic causal order (decision 1). Proofs 1–2. R17's
   takeover-after-silence does not need it. Hard-lock claims (PRD-001 §7 Q5) are to be designed on it
   if the decider answers "wait for certainty". **Built on `prd1/causal-order` (on v0.2.8). Proofs 2

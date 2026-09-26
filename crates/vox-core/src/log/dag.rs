@@ -211,6 +211,11 @@ pub struct Dag {
     /// The room's genesis time in ms, the anchor for an entry with no parent
     /// ([`Dag::for_room`]).
     origin_ms: Option<u64>,
+    /// How many entries this node has refused as at or below their author's checkpoint since
+    /// it loaded the room. Counted so the refusal can be *seen*: from outside it looks exactly
+    /// like a fork whose held side cannot incriminate (both are dropped and the session goes
+    /// on), and a gate that can only watch for a freeze cannot tell the two apart.
+    refused_below_checkpoint: u64,
 }
 
 impl Dag {
@@ -262,6 +267,21 @@ impl Dag {
     #[must_use]
     pub fn is_frozen(&self, author: &Digest32) -> bool {
         self.frozen.contains_key(author)
+    }
+
+    /// Every author frozen by a fork proof, sorted.
+    #[must_use]
+    pub fn frozen_authors(&self) -> Vec<Digest32> {
+        let mut a: Vec<Digest32> = self.frozen.keys().copied().collect();
+        a.sort_unstable();
+        a
+    }
+
+    /// How many entries were refused as at or below their author's checkpoint since this
+    /// DAG was built (ADR-023 decision 3).
+    #[must_use]
+    pub fn refused_below_checkpoint(&self) -> u64 {
+        self.refused_below_checkpoint
     }
 
     /// The recorded fork proof for a frozen author, if any.
@@ -355,6 +375,7 @@ impl Dag {
             .get(&author)
             .is_some_and(|(below, _)| seq <= *below)
         {
+            self.refused_below_checkpoint = self.refused_below_checkpoint.saturating_add(1);
             return Err(Rejected::PreCheckpoint);
         }
 

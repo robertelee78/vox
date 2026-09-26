@@ -406,6 +406,28 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   sides with the relayed one retiring on each; behind symmetric NATs `reach` is as fast and `upgrade`
   comes back empty; a private-only address record no longer costs the dial timeout. ADR-016's M15.1 gate
   went from 22.9 s to 7.9 s, the join itself now bounded at 12 s.
+  - **A node remembers where it last reached each member (2026-09-25, PRD-001, found by ADR-023's
+    R10 gate).** Addresses came only from the rendezvous board, which lives in memory, so a member
+    that restarted in a room with no anchor knew no member's address and stayed alone. The node now
+    keeps each member's last direct addresses (at most 4 per member, each with the time last seen) in
+    `node::peer_book`, sealed under its identity in its own store. It records the address on every
+    direct connection, falls back to the book when the board has nothing for a member, and dials
+    every other member of a room when it opens the room. Relayed paths are not recorded.
+    - **Gate:** `a_member_that_restarts_finds_its_room_proof`. Two members and no anchor; one
+      restarts on the same port and then on a new port. A message posted while it was down and one
+      it posts once back must cross within 10 s of it answering.
+    - **Mutation, nothing persisted:** red. Neither message crossed in 60 s in either case.
+    - **Not within 10 s on this base; not DONE.** The 10 s bar must be met through
+      `prd1/restart-probe` (582f18a, 3d7ab3f), which is to reach v0.3.0 through v0.2.10. Until
+      then the gate is red here. Measured:
+      - this branch alone: 0 of 2 within 10 s. Both directions took 29.4–30.1 s. With timestamps,
+        the surviving member's push to the dead process held the room's sync for 30.45 s (same
+        port) and 30.64 s (new port), until `SILENCE_IS_DEATH` closed that connection. Meanwhile it
+        refused the restarted member's sync and all 3 of its retries, which were spent in the first
+        200 ms;
+      - with 4742e0c, 582f18a and 3d7ab3f cherry-picked over it (evidence only, not on this
+        branch): 2 of 2, 0.35–0.38 s. With 582f18a alone: 2 of 2, 0.23–0.38 s;
+      - the nothing-persisted mutation: red in both builds, with neither message crossing in 60 s.
   - **A retired connection is let go (2026-09-25, v0.2.9).** "Closed by the node's tick" did not
     happen. `retire_expired` closes a retired connection once the grace is up **and** nothing holds its
     `Arc` — the strong count is how a path still carrying a tunnel is told from one that is not — and

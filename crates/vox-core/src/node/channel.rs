@@ -2240,6 +2240,17 @@ impl ChannelState {
         self.evaluator.policy().ttl
     }
 
+    /// What this node's log has caught in the room: the authors it froze for a fork, and how
+    /// many entries it refused as at or below their author's checkpoint (ADR-008, ADR-023
+    /// decision 3). What `vox status` reports.
+    #[must_use]
+    pub fn fork_watch(&self) -> (Vec<Digest32>, u64) {
+        (
+            self.dag.frozen_authors(),
+            self.dag.refused_below_checkpoint(),
+        )
+    }
+
     /// The retention this node applies to the room: the shorter of the room's and its own
     /// (ADR-023 decision 2, PRD-001 R9). `0` is forever.
     #[must_use]
