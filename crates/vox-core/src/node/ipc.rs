@@ -74,6 +74,21 @@ pub const ROWS_BUDGET: usize = MAX_FRAME / 2;
 /// CBOR around them — rounded up.
 pub const ROW_OVERHEAD: usize = 128;
 
+/// At most this many entries in one page of a `Rooms` or `Trusted` reply. Bytes bound
+/// a page too ([`ROWS_BUDGET`]); the count keeps pages small enough that a proof can
+/// show paging with a hundred entries rather than thousands.
+pub const PAGE_ENTRIES: usize = 64;
+
+/// Everything a `Rooms` or `Trusted` entry carries besides its name — a 32-byte id,
+/// a flag and the CBOR around them — rounded up.
+pub const ENTRY_OVERHEAD: usize = 64;
+
+// A page always carries at least one entry, so the largest entry must fit by itself.
+const _: () = assert!(
+    crate::node::channel::MAX_LOCAL_NAME_LEN + ENTRY_OVERHEAD <= ROWS_BUDGET
+        && crate::node::trust::MAX_PETNAME + ENTRY_OVERHEAD <= ROWS_BUDGET
+);
+
 // A reply always carries at least one row, so the largest row must fit a frame by itself.
 const _: () = assert!(crate::node::content::MAX_TEXT_LEN + ROW_OVERHEAD <= ROWS_BUDGET);
 
@@ -204,8 +219,12 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
-    /// Every room this node holds.
-    Rooms,
+    /// The rooms this node holds, in room-id order, after `after` — one page of them.
+    /// [`IpcClient::rooms`] asks for every page.
+    Rooms {
+        /// The last room of the previous page, or `None` for the first.
+        after: Option<Digest32>,
+    },
     /// Offer a local TCP endpoint as a room-bound service (ADR-013).
     AddService {
         /// The room.
@@ -290,6 +309,8 @@ pub enum Request {
     TrustList {
         /// The identity passphrase.
         identity_passphrase: String,
+        /// The last fingerprint of the previous page, or `None` for the first.
+        after: Option<Digest32>,
     },
 }
 
@@ -321,8 +342,10 @@ impl Request {
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
             }
-            Request::Rooms => {
-                e.array(1).uint(T_ROOMS_REQ);
+            Request::Rooms { after } => {
+                e.array(2)
+                    .uint(T_ROOMS_REQ)
+                    .bytes(after.as_ref().map_or(&[][..], |d| &d[..]));
             }
             Request::AddService {
                 channel_id,
@@ -402,8 +425,12 @@ impl Request {
             }
             Request::TrustList {
                 identity_passphrase,
+                after,
             } => {
-                e.array(2).uint(T_TRUST_LIST).text(identity_passphrase);
+                e.array(3)
+                    .uint(T_TRUST_LIST)
+                    .text(identity_passphrase)
+                    .bytes(after.as_ref().map_or(&[][..], |d| &d[..]));
             }
         }
         e.finish()
@@ -462,10 +489,11 @@ impl Request {
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
             }
-            (T_ROOMS_REQ, 1) => {
+            (T_ROOMS_REQ, 2) => {
+                let after = optional_digest(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
-                Ok(Request::Rooms)
+                Ok(Request::Rooms { after })
             }
             (T_TRUST, 4) => {
                 let target = digest(&mut d)?;
@@ -489,12 +517,14 @@ impl Request {
                     identity_passphrase,
                 })
             }
-            (T_TRUST_LIST, 2) => {
+            (T_TRUST_LIST, 3) => {
                 let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                let after = optional_digest(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::TrustList {
                     identity_passphrase,
+                    after,
                 })
             }
             (T_ADD_SERVICE, 4) => {
@@ -726,6 +756,19 @@ fn digest(d: &mut Decoder<'_>) -> Result<Digest32> {
         .bytes()
         .map_err(|_| Error::MalformedBundle("ipc digest"))?;
     Digest32::try_from(b).map_err(|_| Error::MalformedBundle("ipc digest length"))
+}
+
+/// A page cursor: empty bytes for "from the start", else a digest.
+fn optional_digest(d: &mut Decoder<'_>) -> Result<Option<Digest32>> {
+    let b = d
+        .bytes()
+        .map_err(|_| Error::MalformedBundle("ipc cursor"))?;
+    if b.is_empty() {
+        return Ok(None);
+    }
+    Digest32::try_from(b)
+        .map(Some)
+        .map_err(|_| Error::MalformedBundle("ipc cursor length"))
 }
 
 /// A CBOR text string, named so a decode failure says which field it was.
@@ -1380,6 +1423,39 @@ async fn verify_operator(
     }
 }
 
+/// One page of a collection reply: entries in id order, strictly after `after`, at most
+/// [`PAGE_ENTRIES`] of them and at most [`ROWS_BUDGET`] bytes, and at least one while any
+/// remain.
+///
+/// **Every collection reply is paged** (V210-16). `Rooms` and `Trusted` used to be the
+/// whole list in one frame, and the client refuses a frame over `MAX_FRAME`: about 1,500
+/// rooms at the longest local name, or 2,600 trusted identities, and `vox room list`,
+/// every command that resolves a room by name, and `vox trust list` stopped working.
+/// Ordering by id rather than by position means a page boundary survives a room being
+/// added or removed between pages: the next page starts at the first id past the cursor.
+fn page<T>(
+    mut items: Vec<T>,
+    after: Option<Digest32>,
+    key: impl Fn(&T) -> (Digest32, usize),
+) -> Vec<T> {
+    items.sort_by_key(|t| key(t).0);
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for t in items {
+        let (id, len) = key(&t);
+        if after.is_some_and(|a| id <= a) {
+            continue;
+        }
+        let cost = len + ENTRY_OVERHEAD;
+        if !out.is_empty() && (out.len() >= PAGE_ENTRIES || bytes + cost > ROWS_BUDGET) {
+            break;
+        }
+        bytes += cost;
+        out.push(t);
+    }
+    out
+}
+
 /// Answer one request against the node.
 ///
 /// Every failure comes back as [`Frame::Error`] rather than ending the
@@ -1430,10 +1506,13 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         },
         Request::TrustList {
             identity_passphrase,
+            after,
         } => match verify_operator(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => Frame::Trusted {
-                entries: handle.view().trusted,
+                entries: page(handle.view().trusted, after, |(id, petname)| {
+                    (*id, petname.len())
+                }),
             },
         },
         Request::Post { channel_id, text } => {
@@ -1499,6 +1578,10 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }
             Frame::Rows { rows }
         }
+        // **Not paged, and bounded by the product's scale.** A room is at most 500 members
+        // (PRD-001's family scale); a member is a 32-byte key, so a roster is ~17 KiB of a
+        // 256 KiB frame. A frame would hold ~7,700; paging this is owed only if that scale
+        // ever rises past a few thousand (V210-16).
         Request::Roster { channel_id } => {
             let view = handle.view();
             match view
@@ -1697,20 +1780,21 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             }
         }
-        Request::Rooms => {
+        Request::Rooms { after } => {
             let view = handle.view();
+            let rooms = view
+                .channels
+                .iter()
+                .map(|c| {
+                    (
+                        c.channel_id,
+                        c.local_name.clone().unwrap_or_default(),
+                        c.open,
+                    )
+                })
+                .collect();
             Frame::Rooms {
-                rooms: view
-                    .channels
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.channel_id,
-                            c.local_name.clone().unwrap_or_default(),
-                            c.open,
-                        )
-                    })
-                    .collect(),
+                rooms: page(rooms, after, |(id, name, _)| (*id, name.len())),
             }
         }
     }
@@ -1815,6 +1899,56 @@ impl IpcClient {
                     };
                     cursor = Some(last.entry_hash);
                     all.extend(rows);
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// Every room this node holds, however many pages that takes — as one
+    /// [`Frame::Rooms`], or the first reply that was not rooms (an error).
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn rooms(&mut self) -> Result<Frame> {
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            match self.request(&Request::Rooms { after }).await? {
+                Frame::Rooms { rooms } => {
+                    let Some(last) = rooms.last() else {
+                        return Ok(Frame::Rooms { rooms: all });
+                    };
+                    after = Some(last.0);
+                    all.extend(rooms);
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// The whole trust keyring, however many pages that takes — as one
+    /// [`Frame::Trusted`], or the first reply that was not (an error).
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn trusted(&mut self, identity_passphrase: &str) -> Result<Frame> {
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            match self
+                .request(&Request::TrustList {
+                    identity_passphrase: identity_passphrase.to_owned(),
+                    after,
+                })
+                .await?
+            {
+                Frame::Trusted { entries } => {
+                    let Some(last) = entries.last() else {
+                        return Ok(Frame::Trusted { entries: all });
+                    };
+                    after = Some(last.0);
+                    all.extend(entries);
                 }
                 other => return Ok(other),
             }
