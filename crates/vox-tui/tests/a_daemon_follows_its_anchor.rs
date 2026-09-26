@@ -22,6 +22,14 @@
 //! resolves — but this machine has no DNS record it can move, so that step is reasoned
 //! rather than measured. Closing it needs a resolver the proof owns. Recorded here
 //! rather than implied by a passing test.
+//!
+//! **Every participant is the shipped binary**: the anchor is `vox node`, the client's
+//! identity is made by `vox id`, and the client is `vox daemon`. Nothing in this process
+//! runs a node.
+//!
+//! **Mutation.** Make the daemon's anchor refresh (`ANCHOR_REFRESH` in `app.rs`) an hour,
+//! or drop the refresh task, and this goes red after `FOLLOW_PATIENCE`: the invite never
+//! names the anchor's real port.
 
 #![cfg(unix)]
 
@@ -31,18 +39,11 @@ mod watchdog;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
-use vox_core::node::api::{NodeCommand, Secret};
-use vox_core::node::paths::Paths;
-
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "daemon passphrase";
 
 /// Longer than the daemon's own 30s refresh, with room for a dial afterwards.
 const FOLLOW_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
-
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
-}
 
 struct Proc(Child);
 
@@ -68,6 +69,8 @@ fn vox_stdin(
         .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
+        // In the environment, not argv: a command line is world-readable (ADR-015).
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM")
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -137,37 +140,9 @@ fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
     std::fs::create_dir_all(&cfg).unwrap();
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
-    {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let node = rt
-            .block_on(async {
-                vox_core::node::actor::Node::spawn_with(
-                    paths.clone(),
-                    std::sync::Arc::new(|| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs())
-                    }),
-                    vox_core::atrest::sek::Argon2Profile::default(),
-                )
-            })
-            .unwrap();
-        rt.block_on(async {
-            assert!(node
-                .apply(NodeCommand::CreateIdentity {
-                    passphrase: secret(IDENTITY),
-                })
-                .await
-                .is_done());
-            let _ = node.apply(NodeCommand::Shutdown).await;
-        });
-        drop(rt);
-    }
+    let (ok, fp, err) = vox(&data, &cfg, &["id"]);
+    assert!(ok, "vox id: {err}");
+    assert_eq!(fp.trim().len(), 52, "`vox id` prints a fingerprint: {fp:?}");
     // The same identity, a different port: reachable by nobody. This stands in for the
     // address a name used to resolve to.
     let wrong_spec = {
@@ -194,10 +169,12 @@ fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
     let _daemon = Proc(daemon);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while std::time::Instant::now() < deadline {
-        if vox(&data, &cfg, &["room", "list"]).0 {
-            break;
-        }
+    while !vox(&data, &cfg, &["room", "list"]).0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CANNOT MEASURE: the daemon never answered on its control socket; its stderr: {:?}",
+            std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default()
+        );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
@@ -256,6 +233,10 @@ fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
         std::thread::sleep(std::time::Duration::from_secs(2));
     };
 
+    println!(
+        "[proof] followed={followed} after {:?}: started against {wrong_spec}, file rewritten to {real_spec}",
+        started.elapsed()
+    );
     assert!(
         followed,
         "the daemon never reached the anchor its configuration now names, after {:?}. It \
