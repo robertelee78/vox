@@ -749,6 +749,15 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::BadLink) => {
             "that address will not parse, or names a room this node cannot use\n       this one IS the address — check you copied all of it"
         }
+        // **Do not claim the address is fine here.** A board with nothing for the room cannot tell
+        // "its host has not published it yet" from "that room does not exist": an invite link
+        // carries no checksum, so a room id with one mistyped character still parses, reaches the
+        // board, and finds nothing. The first version of this advice said "the address is fine",
+        // the same false confidence `Unreachable` below refuses about the passphrase. Name both
+        // causes and what settles each.
+        Some(Fault::RoomNotOnBoard) => {
+            "either its host has not published the room there yet (the host must be online; then run this again)\n       or the room part of the address is wrong: check it against the address you were sent"
+        }
         // **Do not claim the passphrase is fine here.** Nobody answered, so nobody
         // checked it — a wrong passphrase against an offline room reaches exactly this
         // branch. The first version of this fix said "NOT the address or the
@@ -783,6 +792,7 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
     Some(match name {
         "WrongPassphrase" => Fault::WrongPassphrase,
         "BadLink" => Fault::BadLink,
+        "RoomNotOnBoard" => Fault::RoomNotOnBoard,
         "Unreachable" => Fault::Unreachable,
         "Refused" => Fault::Refused,
         "NotNetworked" => Fault::NotNetworked,

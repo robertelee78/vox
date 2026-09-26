@@ -1231,8 +1231,21 @@ impl Joiner {
             .await
             .map_err(|e| JoinerLost::of(fault_of(&e)))?;
         steps.took("fetch", t);
+        // **A board that does not hold the room is not a malformed address.** The link parsed and
+        // named a room; the board we reached has nothing for it. That is either a room its host has
+        // not published there yet, or a room id mistyped into another valid one (a link carries no
+        // checksum), and the board cannot tell which. Say which board and which room, so the person
+        // can check both, and let the advice name the two causes.
         let Some(genesis) = set.genesis.clone() else {
-            return Err(JoinerLost::of(Fault::BadLink));
+            return Err(JoinerLost {
+                fault: Fault::RoomNotOnBoard,
+                why: vec![format!(
+                    "board {} has nothing for room {}",
+                    crate::node::network::short_id(board.peer_id()),
+                    crate::node::network::short_id(parsed.channel_id)
+                )],
+                steps: JoinSteps::default(),
+            });
         };
         let me = self.me;
         let candidates: Vec<Digest32> = {
