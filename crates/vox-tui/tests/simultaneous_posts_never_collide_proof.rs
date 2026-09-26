@@ -22,7 +22,7 @@
 //! ## Precondition (else CANNOT MEASURE)
 //! At least [`MIN_TOGETHER`] rounds whose two posts returned within [`TOGETHER`] of each other,
 //! which is well inside the loopback round trip plus a session, so the two ends' sessions
-//! overlapped; and each daemon opened at least [`ROUNDS`] sessions to the other.
+//! overlapped; and each daemon opened at least [`MIN_OPENED`] sessions to the other.
 //!
 //! ## Mutation
 //! Restore the busy refusal at the inbound check (refuse an inbound session while this side's
@@ -49,6 +49,9 @@ const BOUND: Duration = Duration::from_millis(250);
 const TOGETHER: Duration = Duration::from_millis(50);
 /// Rounds that must have been simultaneous for the run to measure anything.
 const MIN_TOGETHER: usize = 20;
+/// Sessions each end must have opened to the other over the rounds. Not one per round: on the
+/// base a post made while a session runs is owed to it rather than opening another.
+const MIN_OPENED: u64 = 20;
 const POLL: Duration = Duration::from_millis(5);
 
 #[test]
@@ -186,9 +189,9 @@ fn simultaneous_posts_never_collide() {
          {TOGETHER:?}"
     );
     assert!(
-        a_opened >= ROUNDS as u64 && b_opened >= ROUNDS as u64,
-        "CANNOT MEASURE: the daemons opened {a_opened} and {b_opened} sessions over {ROUNDS} \
-         rounds; each post should open one"
+        a_opened >= MIN_OPENED && b_opened >= MIN_OPENED,
+        "CANNOT MEASURE: the daemons opened {a_opened} and {b_opened} sessions to each other over \
+         {ROUNDS} rounds; both ends must have been opening sessions in most rounds"
     );
     assert_eq!(
         busy, 0,
