@@ -329,38 +329,63 @@ fn every_common_failure_names_its_cause() {
     assert_says("trust remove, never trusted", &said, &["never trusted"]);
 
     // ---- (9) trust past the keyring's limit ----
-    // Fill it with distinct identities until the first refusal. That refusal must come only
-    // once the keyring is full (whatever it held already), and must say so.
-    let mut added = 0usize;
-    let full = loop {
-        assert!(
-            added <= 1_100,
-            "CANNOT MEASURE (9): {added} identities were trusted and the keyring never filled"
-        );
-        let mut id = [0u8; 32];
-        id[..8].copy_from_slice(&(added as u64 + 1).to_be_bytes());
-        id[31] = 0x5A;
-        let fp = vox_core::node::link::b32_encode(&id);
-        let (ok, said, _) = vox(
-            &joiner_dir,
-            &["trust", "add", &fp, "--name", &format!("filler-{added}")],
-            "",
-            quick,
-        );
-        if !ok {
-            break said;
-        }
-        added += 1;
-    };
+    // 1,100 distinct identities, eight at a time: more than the keyring holds, whatever it
+    // held already. Enough must be trusted to fill it, at least one must be refused, and
+    // every refusal must say the keyring is full. Eight at a time is possible because a
+    // passphrase check no longer runs on the node's actor (V210-26); one at a time, it
+    // took longer than the test watchdog allows.
+    let tried = 1_100usize;
+    let refusals: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8usize)
+            .map(|t| {
+                let joiner_dir = &joiner_dir;
+                scope.spawn(move || {
+                    let mut refused = Vec::new();
+                    for n in (t..tried).step_by(8) {
+                        let mut id = [0u8; 32];
+                        id[..8].copy_from_slice(&(n as u64 + 1).to_be_bytes());
+                        id[31] = 0x5A;
+                        let fp = vox_core::node::link::b32_encode(&id);
+                        let (ok, said, _) = vox(
+                            joiner_dir,
+                            &["trust", "add", &fp, "--name", &format!("filler-{n}")],
+                            "",
+                            quick,
+                        );
+                        if !ok {
+                            refused.push(said);
+                        }
+                    }
+                    refused
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    let trusted = tried - refusals.len();
+    eprintln!(
+        "[keyring] {trusted} of {tried} trusted, {} refused",
+        refusals.len()
+    );
     assert!(
-        added >= 1_000,
-        "the keyring refused after only {added} additions, before it could be full: {full}"
+        trusted >= 1_000,
+        "only {trusted} identities were trusted before the refusals began; the keyring \
+         cannot have been full"
     );
-    assert_says(
-        "trust add, keyring full",
-        &full,
-        &["keyring is full", "vox trust remove"],
+    assert!(
+        !refusals.is_empty(),
+        "CANNOT MEASURE (9): {tried} identities were trusted and the keyring never filled"
     );
+    for said in &refusals {
+        assert_says(
+            "trust add, keyring full",
+            said,
+            &["keyring is full", "vox trust remove"],
+        );
+    }
 
     // ---- (8) a room that is not there ----
     let (ok, said, _) = vox(&joiner_dir, &["room", "post", "zzzzzzzz", "hi"], "", quick);
