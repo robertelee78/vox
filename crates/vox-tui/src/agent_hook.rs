@@ -220,11 +220,14 @@ const CONTINUATION: &str = "  | ";
 /// Not just `\n`: a model, a terminal and a JSON viewer each have their own idea of
 /// a line break, and a message only has to find one of them that this code did not
 /// indent to start a row of its own.
+/// Every character [`render_row`] treats as a line break. Public so the proof forges a row
+/// through each one: a break added here is exercised by the gate without anyone remembering to.
+pub const LINE_BREAKS: &[char] = &[
+    '\n', '\r', '\u{0b}', '\u{0c}', '\u{85}', '\u{2028}', '\u{2029}',
+];
+
 fn is_line_break(c: char) -> bool {
-    matches!(
-        c,
-        '\n' | '\r' | '\u{0b}' | '\u{0c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
-    )
+    LINE_BREAKS.contains(&c)
 }
 
 /// One message, attributed so that **no author can forge another's row**.
