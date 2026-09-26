@@ -121,26 +121,31 @@ impl Anchor {
     /// in 10 paired runs, on trees with and without #40. A probe of the red showed the circuit gone
     /// 39 s after the check, within the grace of a join-time upgrade.
     ///
-    /// So a direct pair is one whose anchor count reaches **0 within the grace plus a margin**. An
+    /// So a direct pair is one whose anchor count reaches **0 within the grace plus 15 s**. An
     /// upgrade that only lands on the 60 s retry (`UPGRADE_RETRY`) would keep the circuit for about
     /// 120 s, and a pair that never upgrades keeps it for good: both are still red.
     pub fn assert_direct(&mut self, when: &str) {
-        const WITHIN: Duration = Duration::from_secs(75);
+        // The grace plus 15 s of margin (status lines, a loaded box), never a literal: a change
+        // to the grace must move this gate with it, not silently break or loosen it.
+        let within = Duration::from_secs(vox_core::node::net::RETIRE_GRACE_SECS + 15);
         let t0 = Instant::now();
         let mut n = self.circuits(Duration::from_secs(2));
-        while n > 0 && t0.elapsed() < WITHIN {
+        let at_once = n == 0;
+        while n > 0 && t0.elapsed() < within {
             n = self.circuits(Duration::from_secs(1));
         }
-        if n == 0 && t0.elapsed() > Duration::from_secs(3) {
+        if at_once {
+            eprintln!("[relay] {when}: direct at once (no circuit at the anchor)");
+        } else if n == 0 {
             eprintln!(
-                "[relay] {when}: a retired circuit closed after {:?}",
+                "[relay] {when}: direct; a retired circuit closed after {:?}",
                 t0.elapsed()
             );
         }
         assert_eq!(
             n,
             0,
-            "NOT DIRECT {when}: the anchor still reports {n} circuit(s) carried after {WITHIN:?}, \
+            "NOT DIRECT {when}: the anchor still reports {n} circuit(s) carried after {within:?}, \
              past a retired circuit's grace.\nanchor:\n{}",
             self.proc.transcript()
         );
