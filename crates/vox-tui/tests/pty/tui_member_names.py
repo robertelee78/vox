@@ -19,6 +19,12 @@ for w in ("anchor", "alice", "bob", "carol"):
         os.makedirs(f"{S}/{w}/{d}")
 open(f"{S}/idpass", "w").write("id pass")
 PROCS = []
+if PY:
+    sys.path.insert(0, PY)
+try:
+    import pyte
+except ImportError:
+    print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)"); sys.exit(2)
 
 def env(w):
     e = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "USER") if k in os.environ}
@@ -103,7 +109,6 @@ try:
                     return
     def key(s, wait=1.0):
         os.write(fd, s.encode()); pump(wait)
-    sys.path.insert(0, PY); import pyte
     def screen():
         scr = pyte.Screen(160, 50); pyte.ByteStream(scr).feed(bytes(raw))
         return scr.display
