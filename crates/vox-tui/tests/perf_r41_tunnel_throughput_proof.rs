@@ -178,12 +178,34 @@ fn udp_direction(
 
 /// A UDP shaper in front of `upstream`: whoever sends to the returned address reaches `upstream`, and
 /// `upstream`'s replies go back, both ways across the link. Returns the address and a byte counter.
+/// Give an emulator socket the largest buffers the OS grants, each way.
+///
+/// **The instrument must not drop what the link would carry.** With the OS default (786 KB receive
+/// on macOS), the emulator's own sockets overflowed during WAN bursts: the kernel counted tens of
+/// thousands of datagrams "dropped due to full socket buffers" in one R41 run on the macOS runner,
+/// which the tunnel paid for as loss and the gate reported as the tunnel's throughput. The link it
+/// emulates drops only at its queue (`bdp + 4 MB`, counted in `TAIL_DROPS`). Largest first, halving
+/// until the OS accepts: macOS caps a socket at `kern.ipc.maxsockbuf` (6 MiB on the runner).
+fn big_buffers(sock: &std::net::UdpSocket) {
+    let s = socket2::SockRef::from(sock);
+    let mut n = 64 << 20;
+    while n >= 1 << 20 && s.set_recv_buffer_size(n).is_err() {
+        n /= 2;
+    }
+    let mut n = 64 << 20;
+    while n >= 1 << 20 && s.set_send_buffer_size(n).is_err() {
+        n /= 2;
+    }
+}
+
 fn udp_shaper(
     upstream: SocketAddr,
     link: Shared,
 ) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
     let front = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the shaper");
     let back = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the shaper's upstream side");
+    big_buffers(&front);
+    big_buffers(&back);
     back.connect(upstream).expect("connect the shaper upstream");
     let addr = front.local_addr().unwrap();
     let carried = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -290,12 +312,14 @@ fn calibrate_once(link: Option<Link>) -> f64 {
     let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     sink.set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
+    big_buffers(&sink);
     let (front, _) = udp_shaper(sink.local_addr().unwrap(), Arc::new(Mutex::new(link)));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sender = {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            big_buffers(&s);
             let pkt = [0x5au8; 1350];
             // 1,350 bytes plus the 28 the emulator charges per datagram, at 1.05x the link's rate,
             // sent as one batch per millisecond and then **asleep**: a sender that spins to pace

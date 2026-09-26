@@ -54,5 +54,8 @@ rustix.workspace = true
 # ADR-021 §6: a minted operation id is 128 bits of OS randomness.
 getrandom.workspace = true
 
-# No `[dev-dependencies]`: `tempfile` is a normal dependency above and is in scope for the
-# integration proofs too.
+# `tempfile` is a normal dependency above and is in scope for the integration proofs too.
+[dev-dependencies]
+# The R41 link emulator sizes its own UDP sockets' buffers (std cannot): a link does not drop
+# packets at a 786 KB socket, and the emulator must not either.
+socket2.workspace = true
