@@ -8,6 +8,13 @@
 //! parent then asserts the child died, died by `SIGABRT` (so the OS recorded its stacks), died
 //! inside its budget, and said why. A unit test over the timing arithmetic would prove none of
 //! that: the thing that can break is whether the process actually ends.
+//!
+//! **The child runs the way `cargo test` runs a gate: with libtest's output capture on.** An
+//! earlier version passed `--nocapture`, and so proved a message that no real run ever showed:
+//! with capture on, the watchdog's `eprintln!` went into the hung test's capture buffer, which
+//! an aborted process never prints. CI's two watchdog aborts on 2026-09-25 logged nothing but
+//! `SIGABRT`. The parent also asserts the log names the hung test and carries the spinning
+//! frame, because a CI runner keeps no crash report: what the log holds is all there is.
 
 #[path = "support/watchdog.rs"]
 mod watchdog;
@@ -44,12 +51,8 @@ fn watchdog_kills_a_hung_test() {
     let me = std::env::current_exe().expect("this test binary's own path");
     let started = Instant::now();
     let mut child = Command::new(&me)
-        .args([
-            "--exact",
-            "selftest_hangs_forever",
-            "--ignored",
-            "--nocapture",
-        ])
+        // No `--nocapture`: libtest captures the test's output, exactly as under `cargo test`.
+        .args(["--exact", "selftest_hangs_forever", "--ignored"])
         .env("VOX_TEST_WATCHDOG_SELFTEST", "1")
         .env("VOX_TEST_WATCHDOG_SECS", SELFTEST_BUDGET_SECS.to_string())
         .stdout(std::process::Stdio::piped())
@@ -110,13 +113,56 @@ fn watchdog_kills_a_hung_test() {
         "hung, not slow",
         "DiagnosticReports",
         "VOX_TEST_WATCHDOG_SECS=0",
+        "end of thread dump",
     ] {
         assert!(
             said.contains(expected),
             "the watchdog's message does not mention {expected:?}; it said: {said}"
         );
     }
-    println!("watchdog killed a hung test in {elapsed:?} with SIGABRT, and explained why");
+    // It names the test that hung, from its list of tests still running.
+    let running = said
+        .split("Tests still running:")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .unwrap_or("");
+    assert!(
+        running.contains("selftest_hangs_forever"),
+        "the watchdog did not name the hung test among those still running; it listed {running:?}"
+    );
+    // And it puts the spinning thread's stack in the log itself.
+    let spinning = spinning_thread_evidence(&said);
+    assert!(
+        spinning > 0,
+        "the thread dump does not show the spinning thread (see spinning_thread_evidence); \
+         it said: {said}"
+    );
+    println!(
+        "watchdog killed a hung test in {elapsed:?} with SIGABRT, named it, and dumped its \
+         stack ({spinning} lines of evidence for the spinning thread, {} bytes of log)",
+        said.len()
+    );
+}
+
+/// How many lines of the dump show the spinning thread spinning.
+///
+/// macOS: `sample`'s call graph carries the spinning frame itself, `watchdog_proof::selftest_hangs_forever`,
+/// which only a stack can show (the thread's *name* is the bare test name, without the path).
+/// Linux: the `/proc` census row of the test's thread (its name truncated by the kernel to 15
+/// bytes) in state `R`, running.
+fn spinning_thread_evidence(said: &str) -> usize {
+    if cfg!(target_os = "macos") {
+        said.lines()
+            .filter(|l| l.contains("watchdog_proof::selftest_hangs_forever"))
+            .count()
+    } else {
+        said.lines()
+            .filter(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() >= 4 && f[1] == "R" && f[3].starts_with("selftest_hangs")
+            })
+            .count()
+    }
 }
 
 /// `SIGABRT` is 6 on every platform vox targets; vox-core takes no libc dependency for tests.

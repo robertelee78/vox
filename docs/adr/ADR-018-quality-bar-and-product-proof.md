@@ -3,7 +3,7 @@
 **Status**: accepted (2026-09-21) — the policy is in force from this change; the harness lands with it
 and grows per capability
 **Date**: 2026-09-21
-**Updated**: 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
+**Updated**: 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
 work, and the two obligations they cannot yet meet are recorded in §3's accepted-gaps table rather
 than skipped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -199,11 +199,62 @@ forever on purpose and requires the child to die, by `SIGABRT`, inside its budge
 Mutation-checked: disabling `arm()` makes it fail with "the watchdog did not kill a deliberately
 hung test within 60s".
 
-**The underlying hang was not reproduced** — 12 sequential and 12 concurrent runs of that exact
-binary, none hung — and no sample or crash report from the original window was retained. It MUST
-therefore be recorded as **still latent**, not fixed. What this change buys is that the next
-occurrence is a loud failure with thread stacks rather than a silent process burning a core until
-someone happens to run `ps`.
+The original record said: *the underlying hang was not reproduced* — 12 sequential and 12 concurrent
+runs of that exact binary, none hung — and no sample or crash report from the original window was
+retained, so it was recorded as **still latent**. That is superseded below (2026-09-26).
+
+#### 6a. The hang, found (2026-09-26, v0.2.10 V210-17)
+
+**It was `connect_direct`'s hot spin, the one M15.1 (`3037525`) fixed the same morning.** The RCA
+above ruled that out on the strength of a binary hash: rebuilding `92a79f8` reproduced the hung
+binary's `7d73f935…`, so they "were that milestone's code". That inference measured nothing. The
+suffix cargo gives a test binary is its `-C metadata` hash — package, profile, features, toolchain,
+dependency graph — and **not the source**: `3037525` built as it stands and `3037525` with the
+pre-fix `connect_direct` restored produce the same file, `node_m15_anchor_gate-e3c08375ea6ccd61`. So
+the hash could not tell the fixed code from the broken one, and the processes started seven minutes
+before the fix was committed.
+
+**Reproduced.** `3037525` with only `connect_direct` restored to its parent's version, gate run in
+release: still running at 3 min 38 s against a 23–48 s pass, 3 min 9 s of CPU. Sampled twice for
+3 s: two tokio workers in **every one** of 2,162 and 1,818 samples inside `connect_direct` — one under
+bob's `Node::dial` (the join), one under alice's `Node::answer_punch` — creating a `Sleep`, polling an
+empty `JoinSet`, dropping the `Sleep`, round again; no worker in `kevent`, so nothing drove the timer
+and the gate's own 120 s `tokio::time::timeout`s never fired. Two spinning workers is the incident's
+~1.5 cores a process. The same gate on `3037525` unmodified: 3 of 3 passed (48 s, 23 s, 23 s).
+
+**Why it spun.** The loop raced "launch the next candidate after 250 ms" against "an attempt
+finished". When the only attempt in flight failed faster than 250 ms, the set was empty; waiting on
+an empty `JoinSet` returns at once, so the loop went round, armed a fresh timer, and found the set
+empty again — without once returning `Pending`. A task that never yields cannot be cancelled, and a
+runtime cannot shut down under it, so the process could not even exit. M15.1's trigger was an IPv6
+candidate on an IPv4 socket, refused instantly; that candidate is now filtered before the loop, and
+the loop launches the next candidate at once when nothing is in flight.
+
+**Pinned by a proof of the product, which it never had.** `a_wrong_peer_cannot_wedge_a_dial_proof`
+(vox-tui) uses the other way an attempt fails in milliseconds, and an ordinary one: the address is
+live and a **different node** answers there — a peer's old address now held by somebody else. A host
+`vox serve` advertises a decoy `vox node`'s address first and its own second; the decoy sits behind a
+counting UDP relay, so the proof asserts the guest's `vox connect` really exchanged datagrams with it
+before it asserts the join. Fixed tree: 3 of 3 joined. The pre-M15.1 loop restored (one line —
+`if set.is_empty()` → `if set.is_empty() && next == 0`): 3 of 3 red, `vox connect` not finished in
+120 s having used ~116 CPU-seconds of them. Control, the same mutant with the decoy not advertised:
+green in 5 s, so the decoy's fast refusal is what the proof exercises.
+
+**The watchdog could not have told us, and now can.** CI's only two watchdog aborts (R41 on macOS,
+2026-09-25) logged `signal: 6, SIGABRT` and nothing else. The banner went through `eprintln!` from a
+thread spawned inside a test, and such a thread **inherits libtest's output capture**, so it went into
+a buffer an aborted process never prints; `watchdog_proof` did not see this because it ran its child
+with `--nocapture`, which no real run does. And the crash report the abort exists for is written on
+the runner and discarded with it. The watchdog therefore MUST write to file descriptor 2 directly, MUST
+name the tests still running (each arming is struck off when its test's thread ends), and MUST put
+every thread's stack into the log before it aborts: `/usr/bin/sample` on macOS, and on Linux a `/proc`
+census of every thread with its state and the CPU it used in the last second, plus `gdb`'s backtraces
+where `gdb` is installed and permitted to attach. `watchdog_proof` now runs its child with capture on
+and asserts the banner, the hung test's name, and the spinning frame (macOS) or a running `R` thread
+of that test (Linux). Red on the old watchdog: its child's stderr was empty.
+
+The watchdog stays, as the backstop the acceptance requires: this finds a hang, it does not prevent
+one.
 
 ### 7. A green gate is not evidence: a gate can assert the bug
 
