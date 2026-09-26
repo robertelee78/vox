@@ -197,21 +197,25 @@ const UPGRADE_RETRY: Duration = Duration::from_secs(60);
 /// ordinary work never reports, and short enough that a stall a person would notice always does.
 const STALL_BUDGET: Duration = Duration::from_secs(5);
 
-/// **The actor decides; slots do the waiting.** Everything about reconciling a room with a peer that
-/// touches the wire — reading that peer's board, opening the stream, the session itself — runs in a
-/// slot (`ports::OUTBOUND_SLOTS`), so the one task allowed to write channel state never waits on a
-/// network round trip. It used to: `fetch_channel` and `open_sync` were awaited inline, bounded only
-/// by `SYNC_FRAME_TIMEOUT`, so a peer that went quiet mid-setup stopped the node for twenty seconds:
-///
-/// ```text
-/// vox node: took 1 entry for room 4yxukqstptuq
-/// vox node: BUSY 20033ms — filing a sync that finished — nobody could be answered
-/// ```
-///
-/// Past the cap a sync used to be **skipped**, on the argument that a queue of sessions for rooms
-/// whose state has since moved on is worse than none. ADR-025 D6 queues the *port* instead, and a
-/// queued port re-checks whether it still needs a session when its turn comes, which answers that.
-const _SLOTS_NOTE: () = ();
+// **The actor decides; slots do the waiting.** Everything about reconciling a room with a peer that
+// touches the wire — reading that peer's board, opening the stream, the session itself — runs in a
+// slot (`ports::OUTBOUND_SLOTS`), so the one task allowed to write channel state never waits on a
+// network round trip. It used to: `fetch_channel` and `open_sync` were awaited inline, bounded only
+// by `SYNC_FRAME_TIMEOUT`, so a peer that went quiet mid-setup stopped the node for twenty seconds:
+//
+// ```text
+// vox node: took 1 entry for room 4yxukqstptuq
+// vox node: BUSY 20033ms — filing a sync that finished — nobody could be answered
+// ```
+//
+// Past the cap a sync used to be **skipped**, on the argument that a queue of sessions for rooms
+// whose state has since moved on is worse than none. ADR-025 D6 queues the *port* instead, and a
+// queued port re-checks whether it still needs a session when its turn comes, which answers that.
+
+/// How long an outbound session's setup — reading the peer's board and offering it the records it
+/// lacks — may take before the session goes on without it. Both are best-effort, and a live peer
+/// answers them in milliseconds, as a board answers a publish (`ANCHOR_PUBLISH_PATIENCE`).
+const SETUP_PATIENCE: Duration = Duration::from_secs(5);
 
 /// How many inbound joins this node answers at once.
 ///
@@ -5469,59 +5473,68 @@ impl Node {
             let epoch = match &target {
                 SessionTarget::Channel(shared) => {
                     let known = shared.lock().await.epoch();
-                    if let Some(pstore) = admit_store {
-                        if let Ok(set) = net.fetch_channel(&conn, &cid, known).await {
-                            {
-                                let mut ch = shared.lock().await;
-                                let before = ch.author_keys().len();
-                                let _ = admit_board_records(
-                                    &mut ch,
-                                    &pstore,
-                                    &set.bundles,
-                                    ChannelState::MAX_ADMISSIONS_PER_SWEEP,
-                                    now,
-                                )
-                                .await;
-                                admitted_authors = ch.author_keys().len().saturating_sub(before);
-                            }
-                            // What the peer's board holds is filed on this node's own, so its board
-                            // carries the whole membership it knows. Bundles go first: they carry
-                            // the key an address record is verified with (M15.2a). Mirroring to the
-                            // anchors follows on the actor when `SyncDone` lands, because that needs
-                            // channel state.
-                            for wire in set
-                                .bundles
-                                .iter()
-                                .map(MemberBundleRecord::to_wire)
-                                .chain(set.members.iter().map(RendezvousRecord::to_wire))
-                            {
-                                let _ = net.publish_local(&wire);
-                            }
-                            // **And the other way: what this node's board holds that the peer's
-                            // lacks.** A member who joined through this node is on this node's
-                            // board and no other, and the peer learned of it only when *it* next
-                            // read this board, on its own periodic sync: 24–28 s for a third
-                            // member to see a new one, measured. Offered here, a push that follows
-                            // a join carries the newcomer to every connected member at once.
-                            // Best-effort: a refusal (a record the peer's board already holds
-                            // newer) costs nothing, and the peer's own sync still reads this board.
-                            let missing = net.board_records_missing_from(&cid, known, &set);
-                            if !missing.is_empty() {
-                                if let Ok(mut client) =
-                                    crate::nat::service::RendezvousClient::open(&conn).await
+                    // **Bounded** (ADR-025 D6): the board read and the offer are best-effort, and a
+                    // live peer answers them in milliseconds. Unbounded, a peer that stopped
+                    // answering held this slot and the port's one outbound attempt until the
+                    // connection was filed dead, past the limit D6 states (a frame timeout plus
+                    // the budgets).
+                    let setup = async {
+                        if let Some(pstore) = admit_store {
+                            if let Ok(set) = net.fetch_channel(&conn, &cid, known).await {
                                 {
-                                    for wire in &missing {
-                                        if let Err(e) = client.put(wire).await {
-                                            if !matches!(e, Error::RendezvousRejected(_)) {
-                                                break;
+                                    let mut ch = shared.lock().await;
+                                    let before = ch.author_keys().len();
+                                    let _ = admit_board_records(
+                                        &mut ch,
+                                        &pstore,
+                                        &set.bundles,
+                                        ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+                                        now,
+                                    )
+                                    .await;
+                                    admitted_authors =
+                                        ch.author_keys().len().saturating_sub(before);
+                                }
+                                // What the peer's board holds is filed on this node's own, so its board
+                                // carries the whole membership it knows. Bundles go first: they carry
+                                // the key an address record is verified with (M15.2a). Mirroring to the
+                                // anchors follows on the actor when `SyncDone` lands, because that needs
+                                // channel state.
+                                for wire in set
+                                    .bundles
+                                    .iter()
+                                    .map(MemberBundleRecord::to_wire)
+                                    .chain(set.members.iter().map(RendezvousRecord::to_wire))
+                                {
+                                    let _ = net.publish_local(&wire);
+                                }
+                                // **And the other way: what this node's board holds that the peer's
+                                // lacks.** A member who joined through this node is on this node's
+                                // board and no other, and the peer learned of it only when *it* next
+                                // read this board, on its own periodic sync: 24–28 s for a third
+                                // member to see a new one, measured. Offered here, a push that follows
+                                // a join carries the newcomer to every connected member at once.
+                                // Best-effort: a refusal (a record the peer's board already holds
+                                // newer) costs nothing, and the peer's own sync still reads this board.
+                                let missing = net.board_records_missing_from(&cid, known, &set);
+                                if !missing.is_empty() {
+                                    if let Ok(mut client) =
+                                        crate::nat::service::RendezvousClient::open(&conn).await
+                                    {
+                                        for wire in &missing {
+                                            if let Err(e) = client.put(wire).await {
+                                                if !matches!(e, Error::RendezvousRejected(_)) {
+                                                    break;
+                                                }
                                             }
                                         }
+                                        client.finish();
                                     }
-                                    client.finish();
                                 }
                             }
                         }
-                    }
+                    };
+                    let _ = tokio::time::timeout(SETUP_PATIENCE, setup).await;
                     shared.lock().await.epoch()
                 }
                 SessionTarget::Anchored(state) => state.lock().await.epoch(),
