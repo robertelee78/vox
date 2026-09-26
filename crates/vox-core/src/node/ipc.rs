@@ -1427,10 +1427,12 @@ async fn verify_operator(
 /// [`PAGE_ENTRIES`] of them and at most [`ROWS_BUDGET`] bytes, and at least one while any
 /// remain.
 ///
-/// **Every collection reply is paged** (V210-16). `Rooms` and `Trusted` used to be the
-/// whole list in one frame, and the client refuses a frame over `MAX_FRAME`: about 1,500
-/// rooms at the longest local name, or 2,600 trusted identities, and `vox room list`,
-/// every command that resolves a room by name, and `vox trust list` stopped working.
+/// **Every collection reply is paged** (V210-16). `Rooms` used to be the whole list in one
+/// frame, and the client refuses a frame over `MAX_FRAME`: past about 1,540 rooms at the
+/// longest local name, `vox room list` and every command that resolves a room by name
+/// stopped working, and rooms are unbounded. `Trusted` is bounded — the keyring holds at
+/// most `MAX_TRUSTED` (1,024) entries, about 100 KiB — and is paged the same way so that
+/// no collection reply depends on a cap elsewhere staying small.
 /// Ordering by id rather than by position means a page boundary survives a room being
 /// added or removed between pages: the next page starts at the first id past the cursor.
 fn page<T>(
@@ -1897,6 +1899,11 @@ impl IpcClient {
                     let Some(last) = rows.last() else {
                         return Ok(Frame::Rows { rows: all });
                     };
+                    // A page that ends where the last one did would be asked for again
+                    // forever; a node that ignored the cursor is an error, not a hang.
+                    if cursor == Some(last.entry_hash) {
+                        return Err(Error::MalformedBundle("ipc rows page did not advance"));
+                    }
                     cursor = Some(last.entry_hash);
                     all.extend(rows);
                 }
@@ -1919,6 +1926,9 @@ impl IpcClient {
                     let Some(last) = rooms.last() else {
                         return Ok(Frame::Rooms { rooms: all });
                     };
+                    if after.is_some_and(|a| last.0 <= a) {
+                        return Err(Error::MalformedBundle("ipc rooms page did not advance"));
+                    }
                     after = Some(last.0);
                     all.extend(rooms);
                 }
@@ -1947,6 +1957,9 @@ impl IpcClient {
                     let Some(last) = entries.last() else {
                         return Ok(Frame::Trusted { entries: all });
                     };
+                    if after.is_some_and(|a| last.0 <= a) {
+                        return Err(Error::MalformedBundle("ipc trusted page did not advance"));
+                    }
                     after = Some(last.0);
                     all.extend(entries);
                 }
