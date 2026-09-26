@@ -283,6 +283,7 @@ epoch, so the same prefix is not re-served.
 |---|---|---|---|
 | `Unreachable` | transport failure, stream-open failure (`202:transport/quic.rs` 764–781) | from 200 ms, doubling | 8 s |
 | `Busy` | `SessionBusy` (only past `INBOUND_PER_PORT`) | from 200 ms, doubling | 8 s |
+| `Busy` (also) | `NotYetMember` (0x0C, #217: an anchor that has not yet admitted a just-joined member; claimed by vox-0e) | from 200 ms, doubling | 8 s: a new member's first sync must not wait on the 30 s `Policy` pacing |
 | `NoProgress` | D3's no-progress rows, `ProtocolViolation` | from 1 s, doubling | 30 s |
 | `Policy` | `EpochMismatch`, not a member, room not held | 30 s flat | 30 s: an anchor that keeps no log is asked once per interval, as today, not every 8 s (kimi-k3) |
 
