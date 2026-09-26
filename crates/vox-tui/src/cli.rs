@@ -483,6 +483,16 @@ pub struct GetFileArgs {
     pub out: Option<PathBuf>,
 }
 
+/// `vox status`
+#[derive(Args, Debug, Clone)]
+pub struct StatusArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// Print the node's report as JSON, for machines.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// `vox daemon`
 #[derive(Args, Debug, Clone)]
 pub struct DaemonArgs {
@@ -1050,6 +1060,9 @@ enum Cmd {
     /// Unlike the TUI it does not lock on SIGHUP, which is the point. SIGINT and
     /// SIGTERM stop it.
     Daemon(DaemonArgs),
+    /// What the running node's sync is doing, per room and peer (ADR-025): sessions opened,
+    /// admitted, refused, completed, partial and failed, and any backoff.
+    Status(StatusArgs),
     /// Offer a local TCP port as a room-bound service, in one command (ADR-017).
     ///
     /// Creates a room, offers the port in it, and prints the address, the
@@ -1413,6 +1426,39 @@ pub fn run() -> ExitCode {
             ));
             // Always success: a hook that fails must not break the turn.
             ExitCode::SUCCESS
+        }
+        Cmd::Status(args) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(vox_core::node::status::request(&paths.socket_file())) {
+                Ok(json) => {
+                    if args.json {
+                        println!("{json}");
+                    } else {
+                        print!("{}", crate::status_cli::render(&json));
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("vox: no running node answered: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Cmd::Daemon(args) => {
             let paths = match args.profile.paths() {

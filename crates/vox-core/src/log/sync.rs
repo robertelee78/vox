@@ -885,13 +885,16 @@ pub const MAX_STAGED: usize = 256;
 ///
 /// # Errors
 /// The coded [`WireError`] of a hard fail; the transport is closed with it.
-pub fn frontier_session_room<T, S>(t: &mut T, room: &S) -> std::result::Result<usize, WireError>
+pub fn frontier_session_room<T, S>(
+    t: &mut T,
+    room: &S,
+) -> std::result::Result<RoomSession, WireError>
 where
     T: Transport,
     S: SessionRoom + ?Sized,
 {
     match frontier_session_room_inner(t, room) {
-        Ok(applied) => Ok(applied),
+        Ok(done) => Ok(done),
         Err(code) => {
             t.close(code);
             Err(code)
@@ -899,7 +902,20 @@ where
     }
 }
 
-fn frontier_session_room_inner<T, S>(t: &mut T, room: &S) -> std::result::Result<usize, WireError>
+/// What one [`frontier_session_room`] did, as this side saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RoomSession {
+    /// Entries newly stored.
+    pub applied: usize,
+    /// Whether every position this side asked for arrived. A serve bounded by count, bytes or
+    /// time ends cleanly but leaves the rest unsent, which only the receiver can see.
+    pub complete: bool,
+}
+
+fn frontier_session_room_inner<T, S>(
+    t: &mut T,
+    room: &S,
+) -> std::result::Result<RoomSession, WireError>
 where
     T: Transport,
     S: SessionRoom + ?Sized,
@@ -913,7 +929,13 @@ where
     send(t, encode_have(&room.frontiers()?))?;
     let remote_have = expect_have(t.recv())?;
 
-    send(t, encode_want(&room.wants(&remote_have)?))?;
+    let my_wants = room.wants(&remote_have)?;
+    let wanted: u128 = my_wants
+        .iter()
+        .filter(|w| w.from_seq <= w.to_seq)
+        .map(|w| u128::from(w.to_seq - w.from_seq) + 1)
+        .sum();
+    send(t, encode_want(&my_wants))?;
     let their_wants = expect_want(t.recv())?;
 
     // Served while the peer's entries are drained (V210-39): see `Transport::start_serving`.
@@ -930,12 +952,14 @@ where
     let deadline = std::time::Instant::now() + DRAIN_BUDGET;
     let mut staged: Vec<Vec<u8>> = Vec::new();
     let mut applied = 0;
+    let mut received: u128 = 0;
     while let Some(frame) = t.recv().map_err(|e| wire_of(&e))? {
         if std::time::Instant::now() >= deadline {
             return Err(WireError::SyncModeUnsupported);
         }
         match decode_frame(&frame) {
             Ok(SyncFrame::Entry(wire)) => {
+                received += 1;
                 staged.push(wire);
                 if staged.len() >= MAX_STAGED {
                     applied += room.apply(std::mem::take(&mut staged))?;
@@ -948,7 +972,10 @@ where
         applied += room.apply(staged)?;
     }
     t.finish_serving().map_err(|e| wire_of(&e))?;
-    Ok(applied)
+    Ok(RoomSession {
+        applied,
+        complete: received >= wanted,
+    })
 }
 
 /// Apply staged entries into `dag`, returning how many were newly stored — the apply half of
