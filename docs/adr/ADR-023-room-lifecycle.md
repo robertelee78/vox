@@ -319,6 +319,18 @@ covers only the approver's own messages, as consent always has.
       (6 of 12); never-late gives "exactly the late post is marked late", left `[]`.
   - **`vox room read --since` is arrival-based:** a late row lands above the cursor, and a
     positional read would skip it forever.
+  - **Paged reads keep the two apart.** Since v0.2.9 (#183) a `Read` reply is bounded by bytes, and
+    the client asks for the next page from the last row it got. A read from a cursor continues
+    with that row as its cursor, still by arrival. A read of the whole room continues with it as
+    a **page mark** (`Request::Read.after`, in the room's order). Continued as a cursor, page 2
+    would become the arrival feed and repeat a late row already on page 1.
+    - Proved by `causal_order_proof.rs`
+      `a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place`, shipped binary: a frozen
+      bob's post lands above alice's 8 × 32 KiB rows (262,265 bytes of text). alice's whole-room
+      read shows 19 rows, 19 distinct, the late post once (at 10, above big 1 at 11) and in the
+      `--hashes` order; `read --since` carries it and all 8 big rows once each.
+    - **Mutation, red:** every page continued as a cursor gives 16 rows, 15 distinct, and "the
+      late post must be shown exactly once", left 2.
   - **`vox room read --hashes` (hidden):** prints `<hash> <clock-ms>` for every held entry, in
     order.
   - **For claims:** `Dag::happened_before(a, b)` and `ChannelState::happened_before` are the

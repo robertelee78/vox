@@ -284,6 +284,7 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
         match rt.block_on(reader.request(&Request::Read {
             channel_id,
             since: None,
+            after: None,
             limit: 0,
         })) {
             Ok(Frame::Rows { rows }) => rows.iter().any(|r| r.text == text),

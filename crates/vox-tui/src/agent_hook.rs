@@ -499,14 +499,7 @@ async fn drain(
 
     let since = load_cursor(paths, &room_key, &input.session_id);
     let mut notice = None;
-    let rows = match client
-        .request(&Request::Read {
-            channel_id,
-            since,
-            limit: 0,
-        })
-        .await
-    {
+    let rows = match client.read_rows(channel_id, since).await {
         Ok(Frame::Rows { rows }) => rows,
         // A cursor the node no longer holds — the room was re-opened, or the log
         // was pruned. Start from the beginning rather than failing: the agent
@@ -519,14 +512,7 @@ async fn drain(
                 "(Your read position in this room was not found — {reason} — so this \
                  starts again from the room's first message.)"
             ));
-            match client
-                .request(&Request::Read {
-                    channel_id,
-                    since: None,
-                    limit: 0,
-                })
-                .await
-            {
+            match client.read_rows(channel_id, None).await {
                 Ok(Frame::Rows { rows }) => rows,
                 Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
                 Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),

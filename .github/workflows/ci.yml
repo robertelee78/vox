@@ -76,7 +76,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # 120, not 45: both platforms were cancelled at 45 minutes on v0.2.9's merge with nothing red;
+    # the suite now includes the R41/R42 transport proofs.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
@@ -104,7 +106,7 @@ jobs:
       - name: Clippy (default, pure-Rust)
         run: cargo clippy --all-targets -- -D warnings
       - name: Test (default, pure-Rust)
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
         env:
           # `update_proof` asks GitHub which releases exist, to find one to update *from*.
           GH_TOKEN: ${{ github.token }}
@@ -118,4 +120,4 @@ jobs:
       - name: Real-parameter gates (release)
         # `three_members_one_offline_for_a_while_show_one_order` is skipped for the cause stated in
         # release.yml (the v0.2.9 second-joiner connectivity defect, not the order).
-        run: cargo test --release --workspace -- --ignored --skip three_members_one_offline_for_a_while_show_one_order --skip a_late_arrival_after_a_restart_is_marked
+        run: cargo test --release --workspace --no-fail-fast -- --ignored --skip three_members_one_offline_for_a_while_show_one_order --skip a_late_arrival_after_a_restart_is_marked

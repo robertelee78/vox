@@ -70,6 +70,17 @@ pub const PROTOCOL_VERSION: u64 = 7;
 /// [`crate::node::content::MAX_TEXT_LEN`] (64 KiB).
 pub const MAX_FRAME: usize = 256 * 1024;
 
+/// What one `Rows` reply may carry, counted as text plus [`ROW_OVERHEAD`] per row.
+/// Half a frame, so an estimate that ran short would still fit.
+pub const ROWS_BUDGET: usize = MAX_FRAME / 2;
+
+/// Everything a row carries besides its text — two 32-byte hashes, a timestamp and the
+/// CBOR around them — rounded up.
+pub const ROW_OVERHEAD: usize = 128;
+
+// A reply always carries at least one row, so the largest row must fit a frame by itself.
+const _: () = assert!(crate::node::content::MAX_TEXT_LEN + ROW_OVERHEAD <= ROWS_BUDGET);
+
 // ---- frame tags ------------------------------------------------------------
 // Node → client.
 const T_HELLO: u64 = 1;
@@ -200,6 +211,11 @@ pub enum Request {
         channel_id: Digest32,
         /// Return only entries **after** this one. Absent reads from the start.
         since: Option<Digest32>,
+        /// Continue a read that has no cursor after this row, in the room's order: the page
+        /// mark of a read that came in pages. It is not `since`, which is a feed by arrival
+        /// (see the server): paging the room by `since` would skip every late arrival that
+        /// landed above the page boundary. Only with no `since`.
+        after: Option<Digest32>,
         /// Cap on rows returned; 0 means no cap.
         limit: u64,
     },
@@ -342,14 +358,16 @@ impl Request {
             Request::Read {
                 channel_id,
                 since,
+                after,
                 limit,
             } => {
-                e.array(4)
+                e.array(5)
                     .uint(T_READ)
                     .bytes(channel_id)
                     // An absent cursor is the empty byte string, so the arity is
                     // fixed — ADR-008's canonical encoding has no optionals.
                     .bytes(since.as_ref().map_or(&[][..], |d| &d[..]))
+                    .bytes(after.as_ref().map_or(&[][..], |d| &d[..]))
                     .uint(*limit);
             }
             Request::Roster { channel_id } => {
@@ -497,25 +515,26 @@ impl Request {
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Post { channel_id, text })
             }
-            (T_READ, 4) => {
+            (T_READ, 5) => {
                 let channel_id = digest(&mut d)?;
-                let cursor = d
-                    .bytes()
-                    .map_err(|_| Error::MalformedBundle("ipc cursor"))?;
-                let since = if cursor.is_empty() {
-                    None
-                } else {
-                    Some(
-                        Digest32::try_from(cursor)
-                            .map_err(|_| Error::MalformedBundle("ipc cursor length"))?,
-                    )
+                let mut hash = |what: &'static str| -> Result<Option<Digest32>> {
+                    let b = d.bytes().map_err(|_| Error::MalformedBundle(what))?;
+                    if b.is_empty() {
+                        return Ok(None);
+                    }
+                    Digest32::try_from(b)
+                        .map(Some)
+                        .map_err(|_| Error::MalformedBundle(what))
                 };
+                let since = hash("ipc cursor")?;
+                let after = hash("ipc page mark")?;
                 let limit = d.uint().map_err(|_| Error::MalformedBundle("ipc limit"))?;
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Read {
                     channel_id,
                     since,
+                    after,
                     limit,
                 })
             }
@@ -1670,6 +1689,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::Read {
             channel_id,
             since,
+            after,
             limit,
         } => {
             let view = handle.view();
@@ -1692,10 +1712,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             // "everything below the cursor" would skip it for good. So a read from a
             // cursor is a feed: what this node rendered after the cursor, in the order it
             // rendered them, which makes the last line always the right next cursor. A
-            // read with no cursor is the room, in the room's order.
-            let mut rows: Vec<MessageRow> = match since {
-                None => detail.timeline.clone(),
-                Some(cursor) => {
+            // read with no cursor is the room, in the room's order, and `after` is where
+            // its next page starts in that order.
+            let candidates: Vec<&MessageRow> = match (since, after) {
+                (Some(_), Some(_)) => {
+                    return Frame::Error {
+                        reason: "a read takes a cursor or a page mark, not both".into(),
+                    }
+                }
+                (Some(cursor), None) => {
                     let Some(mark) = detail
                         .timeline
                         .iter()
@@ -1706,18 +1731,43 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                             reason: "cursor not in this room's timeline".into(),
                         };
                     };
-                    let mut newer: Vec<MessageRow> = detail
+                    let mut newer: Vec<&MessageRow> = detail
                         .timeline
                         .iter()
                         .filter(|r| r.arrival > mark)
-                        .cloned()
                         .collect();
                     newer.sort_by_key(|r| r.arrival);
                     newer
                 }
+                (None, None) => detail.timeline.iter().collect(),
+                (None, Some(mark)) => {
+                    let Some(i) = detail.timeline.iter().position(|r| r.entry_hash == mark) else {
+                        return Frame::Error {
+                            reason: "page mark not in this room's timeline".into(),
+                        };
+                    };
+                    detail.timeline[i + 1..].iter().collect()
+                }
             };
-            if limit > 0 {
-                rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            // **One reply is bounded by bytes, never the whole room.** A reply was every row
+            // after `since`, in one frame, and the client refuses a frame over `MAX_FRAME`:
+            // so a room past 256 KiB of history could not be read, tailed, posted to with
+            // `--op` or board'ed at all ("declared size exceeds hard limit: ipc frame
+            // length"). A reply now stops at `ROWS_BUDGET`, always carrying at least one
+            // row, and `IpcClient::read_rows` asks again from the last row it got.
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            let mut rows: Vec<MessageRow> = Vec::new();
+            let mut bytes = 0usize;
+            for r in candidates {
+                if limit > 0 && rows.len() >= limit {
+                    break;
+                }
+                let cost = r.text.len() + ROW_OVERHEAD;
+                if !rows.is_empty() && bytes + cost > ROWS_BUDGET {
+                    break;
+                }
+                bytes += cost;
+                rows.push(r.clone());
             }
             Frame::Rows { rows }
         }
@@ -2020,6 +2070,51 @@ impl IpcClient {
             return Err(Error::MalformedBundle("ipc closed before reply"));
         };
         Frame::from_bytes(&body)
+    }
+
+    /// Every row after `since`, however many replies that takes — as one
+    /// [`Frame::Rows`], or the first reply that was not rows (an error).
+    ///
+    /// A reply is bounded by bytes (see [`ROWS_BUDGET`]), so a room's history comes in
+    /// pages; this asks again from the last row until a reply is empty.
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn read_rows(
+        &mut self,
+        channel_id: Digest32,
+        since: Option<Digest32>,
+    ) -> Result<Frame> {
+        // A read from a cursor is a feed by arrival, so its next page follows the last row
+        // as a cursor. A read of the whole room is in the room's order, so its next page
+        // follows the last row as a page mark: as a cursor it would become that feed, and
+        // lose every late arrival above the page boundary.
+        let mut all = Vec::new();
+        let (mut cursor, mut mark) = (since, None);
+        loop {
+            match self
+                .request(&Request::Read {
+                    channel_id,
+                    since: cursor,
+                    after: mark,
+                    limit: 0,
+                })
+                .await?
+            {
+                Frame::Rows { rows } => {
+                    let Some(last) = rows.last() else {
+                        return Ok(Frame::Rows { rows: all });
+                    };
+                    if since.is_some() {
+                        cursor = Some(last.entry_hash);
+                    } else {
+                        mark = Some(last.entry_hash);
+                    }
+                    all.extend(rows);
+                }
+                other => return Ok(other),
+            }
+        }
     }
 
     /// Turn this connection into an event stream. Terminal: no further request

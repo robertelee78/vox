@@ -850,6 +850,157 @@ fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
     stop_all(vec![alice_d, bob_d]);
 }
 
+/// **A room read in pages keeps a late arrival where it belongs, once.** A `Read` reply is
+/// bounded by bytes (v0.2.9, #183), so a room's history comes back in pages, and the client
+/// asks for the next page from the last row it got. A read *from a cursor* is a feed by
+/// arrival, and a read of the *whole room* is in the room's order (ADR-023 decision 1). The
+/// two meet here: continuing the whole-room read with its last row as a cursor turns page 2
+/// into the arrival feed, which repeats a late arrival already shown on page 1 and drops any
+/// row that arrived before the page boundary but sits below it.
+///
+/// Bob posts and his daemon is frozen, and alice posts eight 32 KiB rows (256 KiB, past the
+/// 128 KiB page budget). Thawed, bob's post lands above them, on page 1. alice's
+/// `vox room read`, of the whole room, must show every row exactly once, in the room's order.
+/// The same rows by arrival, `read --since`, must also come back whole.
+///
+/// Mutation: `read_rows` continues every read from its last row as a cursor (the naive merge
+/// of #183 onto the arrival cursor) — red: the late post is shown twice.
+#[test]
+#[ignore = "two real vox daemons (about a minute); CI runs it in release"]
+fn a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = members(tmp.path(), &["alice", "bob"]);
+    let (alice, bob) = (&dirs[0], &dirs[1]);
+    let alice_d = daemon(
+        alice,
+        "alice",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n"),
+        None,
+    );
+    attached(alice, "alice");
+    let bob_d = daemon(bob, "bob", "127.0.0.1:0", &format!("{IDENTITY}\n"), None);
+    attached(bob, "bob");
+    let room = room(alice, &[bob]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        post(bob, &room, "bob probe");
+        std::thread::sleep(Duration::from_millis(500));
+        if texts(&read(alice, &room)).contains(&"bob probe") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "alice never read bob");
+    }
+    let cursor = read(alice, &room).last().unwrap().0.clone();
+
+    // Bob's post does not get out before his node freezes (retried if the push won the race).
+    let mut attempt = 0;
+    let away = loop {
+        attempt += 1;
+        assert!(
+            attempt <= 5,
+            "bob's post got out before his node froze, 5 times"
+        );
+        let text = format!("while away {attempt}");
+        post(bob, &room, &text);
+        bob_d.signal("-STOP");
+        std::thread::sleep(Duration::from_secs(2));
+        if !texts(&read(alice, &room)).contains(&text.as_str()) {
+            break text;
+        }
+        bob_d.signal("-CONT");
+    };
+    // 8 × 32 KiB: twice the page budget (`ROWS_BUDGET`, 128 KiB), so the read takes pages.
+    let big: Vec<String> = (1..=8)
+        .map(|i| format!("big {i} {}", "x".repeat(32 * 1024)))
+        .collect();
+    for b in &big {
+        post(alice, &room, b);
+    }
+    bob_d.signal("-CONT");
+    // Waited for by the room's order (`--hashes`), which is not paged, so the wait does not
+    // depend on what is being proved.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let held_before = order(alice, &room).len();
+    while order(alice, &room).len() <= held_before {
+        assert!(
+            Instant::now() < deadline,
+            "alice never received {away:?}\n{}",
+            daemon_logs(&[(alice.as_path(), "alice"), (bob.as_path(), "bob")])
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // And rendered: the whole-room read is what is under test, so look for the row by arrival.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (ok, out, _) = vox(alice, &["room", "read", &room, "--since", &cursor], None);
+        if ok && out.contains(&away) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "alice never rendered {away:?}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ---- the whole room, in pages ---------------------------------------------------------
+    let rows = read(alice, &room);
+    let bytes: usize = rows.iter().map(|(_, t)| t.len()).sum();
+    let shown = |t: &str| rows.iter().filter(|(_, x)| x == t).count();
+    let mut hashes: Vec<&String> = rows.iter().map(|(h, _)| h).collect();
+    hashes.sort();
+    hashes.dedup();
+    let away_at = rows.iter().position(|(_, t)| *t == away);
+    let big1_at = rows.iter().position(|(_, t)| *t == big[0]);
+    println!(
+        "alice's whole-room read: {} rows ({} distinct), {bytes} bytes of text; {away:?} shown {} \
+         time(s) at {away_at:?}, big 1 at {big1_at:?}; big rows shown {}/8 (after {attempt} \
+         attempt(s))",
+        rows.len(),
+        hashes.len(),
+        shown(&away),
+        big.iter().filter(|b| shown(b) == 1).count()
+    );
+    assert!(
+        bytes > 2 * 128 * 1024,
+        "the room's text ({bytes} bytes) does not span pages, so this run proved nothing"
+    );
+    assert_eq!(shown(&away), 1, "the late post must be shown exactly once");
+    assert_eq!(hashes.len(), rows.len(), "every row is shown exactly once");
+    for (i, b) in big.iter().enumerate() {
+        assert_eq!(shown(b), 1, "big {} must be shown exactly once", i + 1);
+    }
+    assert!(
+        away_at < big1_at,
+        "the late post is not in its place, above what alice posted while it was away"
+    );
+    let checked = is_ordered_subsequence("alice", &rows, &order(alice, &room));
+    println!("alice's whole-room read is in the room's order: {checked} rows checked");
+
+    // ---- the same rows by arrival ---------------------------------------------------------
+    let (ok, out, err) = vox(alice, &["room", "read", &room, "--since", &cursor], None);
+    assert!(ok, "vox room read --since: {err}");
+    let feed: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.splitn(3, ' ').nth(2))
+        .collect();
+    let fed = |t: &str| feed.iter().filter(|x| **x == t).count();
+    println!(
+        "alice's read --since the probe: {} rows; {away:?} {} time(s); big rows {}/8",
+        feed.len(),
+        fed(&away),
+        big.iter().filter(|b| fed(b) == 1).count()
+    );
+    assert_eq!(
+        fed(&away),
+        1,
+        "the feed must carry the late post exactly once"
+    );
+    for (i, b) in big.iter().enumerate() {
+        assert_eq!(fed(b), 1, "the feed must carry big {} exactly once", i + 1);
+    }
+    stop_all(vec![alice_d, bob_d]);
+}
+
 /// The other way a member goes offline: its node **restarts**. Bob posts and his daemon is killed
 /// before its push; alice goes on; bob's daemon starts again (on a new port, as a restarted node
 /// does) and delivers the post, which lands above what alice was already shown and is marked
