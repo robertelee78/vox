@@ -202,6 +202,41 @@ pub struct Room {
     pub id: String,
     pub cid: [u8; 32],
     _anchor: Proc,
+    anchor_spec: String,
+    tmp: std::path::PathBuf,
+}
+
+impl Room {
+    /// Restart worker `i`'s daemon: killed by its own PID, then started again unlocked
+    /// with the identity and the room passphrase, as an operator restarting it would.
+    /// Returns once the room reads again on that node.
+    pub fn restart(&mut self, i: usize) {
+        let w = &mut self.workers[i];
+        w.daemon = None; // killed and reaped by PID
+        let deadline = Instant::now() + TIMEOUT;
+        while w.vox(None, &["room", "list"]).ok {
+            assert!(
+                Instant::now() < deadline,
+                "{}'s daemon never stopped",
+                w.name
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let identity = std::fs::read_to_string(&w.pass).unwrap();
+        let both = self.tmp.join(format!("{}.restart.pass", w.name));
+        std::fs::write(&both, format!("{}\n{ROOM_PASS}\n", identity.trim_end())).unwrap();
+        let err = self.tmp.join(format!("{}.daemon.restart.err", w.name));
+        start_daemon_with(w, &self.anchor_spec, &err, &both);
+        while !w.vox(None, &["room", "read", &self.id]).ok {
+            assert!(
+                Instant::now() < deadline + TIMEOUT,
+                "{}'s room never reopened after the restart: {}",
+                w.name,
+                std::fs::read_to_string(&err).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
@@ -264,6 +299,14 @@ fn worker(tmp: &std::path::Path, name: &str) -> Worker {
 }
 
 fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
+    let pass = w.pass.clone();
+    start_daemon_with(w, anchor, err, &pass);
+}
+
+/// Start `w`'s daemon unlocked by the passphrase file `pass`: the identity passphrase on
+/// its first line, and after a restart the room passphrase on the next (`vox daemon`
+/// tries a bare line against every closed room).
+fn start_daemon_with(w: &mut Worker, anchor: &str, err: &std::path::Path, pass: &std::path::Path) {
     let child = Command::new(VOX)
         .args([
             "daemon",
@@ -273,7 +316,7 @@ fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
             anchor,
             "--passphrase-file",
         ])
-        .arg(&w.pass)
+        .arg(pass)
         .env("VOX_DATA_DIR", &w.data)
         .env("VOX_CONFIG_DIR", &w.cfg)
         .stdin(Stdio::null())
@@ -421,6 +464,8 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         cid,
         workers,
         _anchor: anchor,
+        anchor_spec: spec,
+        tmp: tmp.to_path_buf(),
     }
 }
 
