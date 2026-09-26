@@ -157,7 +157,7 @@ fn lost_claims(
             .max_by_key(|p| (p.created_millis, p.entry_hash))
             .map(|p| p.envelope.kind.clone())
     };
-    let who = |fp: &[u8; 32], session: &str| format!("{}/{session}", &claim::b32(fp)[..12]);
+    let who = |fp: &[u8; 32], session: &str| format!("{}/{session}", crate::ident::author_id(fp));
     prev.difference(now)
         .filter(|r| {
             !matches!(
@@ -259,7 +259,7 @@ fn render_row(out: &mut String, r: &vox_core::node::api::MessageRow) {
         out,
         "[{} from {}] ",
         &b32_encode(&r.entry_hash)[..8],
-        &b32_encode(&r.author)[..8],
+        crate::ident::author_id(&r.author),
     );
     let mut pending_break = false;
     for c in shown.chars() {

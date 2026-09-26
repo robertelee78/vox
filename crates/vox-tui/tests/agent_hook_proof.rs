@@ -357,10 +357,11 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
         .expect("bind");
     let room_key = vox_core::node::link::b32_encode(&cid);
     let label: String = room_key.chars().take(12).collect();
-    let me: String = vox_core::node::link::b32_encode(&node.view().identity.unwrap().fingerprint)
-        .chars()
-        .take(8)
-        .collect();
+    // A member is named by 26 base32 characters (130 bits) of its fingerprint, not a prefix short
+    // enough to grind a lookalike for (#198: the drain showed 8, 40 bits). Written as a literal,
+    // not the product's constant, so shrinking the constant is caught here.
+    let fingerprint = vox_core::node::link::b32_encode(&node.view().identity.unwrap().fingerprint);
+    let me: String = fingerprint.chars().take(26).collect();
     let turn = |session: &str| -> String {
         let (ok, out, err) = hook(
             &data,
@@ -408,13 +409,20 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
         assert!(ok, "room read: {err}");
         // `room read` prints the text raw, so the message's own line is the one that
         // carries its first line of text, not the last line of the output.
-        out.lines()
+        let line = out
+            .lines()
             .find(|l| l.ends_with(" all good"))
-            .and_then(|l| l.split_whitespace().next())
-            .expect("a row")
-            .chars()
-            .take(8)
-            .collect::<String>()
+            .expect("a row");
+        let mut fields = line.split_whitespace();
+        let hash: String = fields.next().expect("a hash").chars().take(8).collect();
+        // `room read` names the author the same way: 26 characters of its fingerprint.
+        let author = fields.next().expect("an author");
+        assert!(
+            author.len() >= 26 && fingerprint.starts_with(author),
+            "room read must name the author by at least 26 characters of its fingerprint, got {author:?}"
+        );
+        eprintln!("room read: author named by {} characters", author.len());
+        hash
     };
     let got = turn("forgery-session");
     let want = format!(

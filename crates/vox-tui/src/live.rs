@@ -66,6 +66,12 @@ pub fn short_id(id: &Digest32) -> String {
 }
 
 impl LiveCore {
+    /// A member as the TUI names it: its keyring petname, else its fingerprint marked as not in
+    /// the keyring (`crate::ident`, #198).
+    fn member_name(&self, fp: &Digest32) -> String {
+        crate::ident::member_name(&self.node.view().trusted, fp)
+    }
+
     /// Bind to `node`, which runs on the runtime `rt`.
     #[must_use]
     pub fn new(node: NodeHandle, rt: tokio::runtime::Handle) -> Self {
@@ -121,16 +127,16 @@ impl LiveCore {
                     self.notice = Some(format!("invite link: {url}"));
                 }
                 NodeEvent::Joined { responder, .. } => {
-                    self.notice = Some(format!("joined via {}", short_id(&responder)));
+                    self.notice = Some(format!("joined via {}", self.member_name(&responder)));
                 }
                 NodeEvent::PeerJoined { peer, .. } => {
                     self.notice = Some(format!(
                         "{} joined — they read nothing until you consent",
-                        short_id(&peer)
+                        self.member_name(&peer)
                     ));
                 }
                 NodeEvent::Consented { target, .. } => {
-                    self.notice = Some(format!("consented to {}", short_id(&target)));
+                    self.notice = Some(format!("consented to {}", self.member_name(&target)));
                 }
                 NodeEvent::SenderKeyReceived {
                     peer, backfilled, ..
@@ -138,10 +144,10 @@ impl LiveCore {
                     self.notice = Some(if backfilled > 0 {
                         format!(
                             "{} consented to you — {backfilled} earlier message(s) now readable",
-                            short_id(&peer)
+                            self.member_name(&peer)
                         )
                     } else {
-                        format!("{} consented to you", short_id(&peer))
+                        format!("{} consented to you", self.member_name(&peer))
                     });
                 }
                 NodeEvent::Synced {
@@ -190,7 +196,11 @@ impl LiveCore {
                             let is_me = me == Some(*m);
                             MemberView {
                                 id: *m,
-                                nickname: if is_me { "you".to_owned() } else { short_id(m) },
+                                nickname: if is_me {
+                                    "you".to_owned()
+                                } else {
+                                    crate::ident::member_name(&nv.trusted, m)
+                                },
                                 verification: if is_me || self.verified.contains(&(cid, *m)) {
                                     Verification::Verified
                                 } else {
@@ -213,7 +223,7 @@ impl LiveCore {
                             author_nick: if me == Some(r.author) {
                                 "you".to_owned()
                             } else {
-                                short_id(&r.author)
+                                crate::ident::member_name(&nv.trusted, &r.author)
                             },
                             // Displayed as a time of day, so seconds; the full precision is kept for ordering.
                             timestamp: r.created_millis / 1_000,

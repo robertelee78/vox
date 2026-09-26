@@ -417,7 +417,7 @@ pub fn run_node(
                                 vox_core::node::api::NodeEvent::PeerUnreachable { peer, why } => {
                                     eprintln!(
                                         "vox node: could not reach {} — {why}",
-                                        crate::tunnel_cli::short_id_of(&peer)
+                                        crate::ident::author_id(&peer)
                                     );
                                 }
                                 vox_core::node::api::NodeEvent::JoinFailed { reason } => {
@@ -446,14 +446,14 @@ pub fn run_node(
                                 } => {
                                     eprintln!(
                                         "vox node: {} did not take our key for room {} — {why}; it is sent again",
-                                        crate::tunnel_cli::short_id_of(&peer),
+                                        crate::ident::author_id(&peer),
                                         crate::tunnel_cli::short_id_of(&channel_id)
                                     );
                                 }
                                 vox_core::node::api::NodeEvent::StillRelayed { peer, reason } => {
                                     eprintln!(
                                         "vox node: still relayed to {} — {reason}",
-                                        crate::tunnel_cli::short_id_of(&peer)
+                                        crate::ident::author_id(&peer)
                                     );
                                 }
                                 vox_core::node::api::NodeEvent::Synced {

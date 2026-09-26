@@ -370,7 +370,7 @@ pub async fn forward(
         if !said {
             eprintln!(
                 "vox: {} is not reachable yet — waiting for a path (up to {:?})",
-                short(&host),
+                crate::ident::author_id(&host),
                 vox_core::node::up::HOST_PATIENCE
             );
             said = true;
@@ -389,7 +389,7 @@ pub async fn forward(
              right now, or they have not run `vox trust add` on you.\n       Reach is \
              the HOST's decision (ADR-017 decision 3) — there is nothing you can grant \
              yourself.",
-            short(&host)
+            crate::ident::author_id(&host)
         )));
     }
     // The bound port comes back as an event, since port 0 is resolved by the OS.
@@ -400,7 +400,10 @@ pub async fn forward(
             None => return Err(AppError::Usage("the node stopped".into())),
         }
     };
-    println!("vox: {bound} → {tag:?} on {}", short(&host));
+    println!(
+        "vox: {bound} → {tag:?} on {}",
+        crate::ident::author_id(&host)
+    );
     println!("     e.g.  ssh -p {} user@{}", bound.port(), bound.ip());
     println!("     Ctrl-C to stop");
     // Keep reading events while forwarding, so a connection the host refused or cut says
@@ -524,10 +527,10 @@ pub async fn serve(
             _ = tokio::signal::ctrl_c() => break,
             event = node.next_event() => match event {
                 Some(NodeEvent::TunnelServed { client, service_tag, .. }) => {
-                    println!("vox: {} reached {service_tag:?}", short(&client));
+                    println!("vox: {} reached {service_tag:?}", crate::ident::author_id(&client));
                 }
                 Some(NodeEvent::PeerJoined { peer, .. }) => {
-                    println!("vox: {} joined", short(&peer));
+                    println!("vox: {} joined", crate::ident::author_id(&peer));
                 }
                 Some(ref other) => say_if_it_explains_a_failure(other),
                 None => return Err(AppError::Usage("the node stopped".into())),
@@ -640,7 +643,10 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
 pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
     match ev {
         NodeEvent::PeerUnreachable { peer, why } => {
-            eprintln!("vox: could not reach {} — {why}", short(peer));
+            eprintln!(
+                "vox: could not reach {} — {why}",
+                crate::ident::author_id(peer)
+            );
         }
         NodeEvent::JoinFailed { reason } => {
             eprintln!("vox: a join did not complete — {reason}");
@@ -668,12 +674,15 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         } => {
             eprintln!(
                 "vox: {} did not take our key for room {} — {why}; it is sent again",
-                short(peer),
+                crate::ident::author_id(peer),
                 short(channel_id)
             );
         }
         NodeEvent::StillRelayed { peer, reason } => {
-            eprintln!("vox: still relayed to {} — {reason}", short(peer));
+            eprintln!(
+                "vox: still relayed to {} — {reason}",
+                crate::ident::author_id(peer)
+            );
         }
         NodeEvent::ProxyRefused { reason } => {
             eprintln!("vox: tunnel refused or cut — {reason}");
@@ -712,7 +721,10 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
                 break;
             }
             NodeEvent::PeerUnreachable { peer, why } => {
-                said.push(format!("could not reach {} — {why}", short(&peer)));
+                said.push(format!(
+                    "could not reach {} — {why}",
+                    crate::ident::author_id(&peer)
+                ));
             }
             ref other => say_if_it_explains_a_failure(other),
         }
