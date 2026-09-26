@@ -220,6 +220,23 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `Sek` posture: one owner, one wipe point. *(2026-09-19 secret-hygiene sweep.)* Both are pinned as
   non-`Clone` by an autoref-specialization check (`test_support::is_clone!`) with a positive control —
   replacing a test that compiled for any type and proved nothing.
+- **A daemon reopens the rooms it held open (#208, V210-35, decided 2026-09-26).** `vox daemon`
+  unlocks with the identity passphrase alone, so under the double-lock above a restarted daemon came
+  back holding no open room. The decider chose: **the daemon reopens every room it held open**. Each
+  open room's SEK and passphrase (the room keeps the passphrase to answer joins, ADR-005) are kept in
+  store meta under `open-rooms`, AES-256-GCM-sealed under `HKDF-SHA-256(self_seed,
+  info = "vox/open-rooms-sek/v1")` (`node::open_rooms`). A room enters that set when it is created,
+  joined or opened, and leaves it only when it is closed on purpose; a stop, crash or reboot keeps it.
+  **This weakens the double-lock for those rooms, deliberately:** whoever holds the disk *and* the
+  identity passphrase now opens every room in the set without its room passphrase. The seal is taken
+  over `self_seed`, a random secret held only inside the identity vault, and **not** over the Ed25519
+  `id_proof` the trust keyring uses: that one is classical (see above), and sealing under it would
+  have left remembered rooms openable by a quantum adversary from the disk with no passphrase at all.
+  Sealed this way, the set is exactly as strong as the identity vault (Argon2id at the floor,
+  post-quantum included). A room closed on purpose keeps the full double-lock. Proven through the
+  shipped binary by `a_daemon_reopens_its_rooms_proof` (crash and clean restart, a created and a
+  joined room); a room closed on purpose staying closed is **not** proven there, since only `vox tui`
+  closes a room.
 - **Known gaps (recorded 2026-09-19).** There is no persistence layer: no file I/O, segment map, or
   database — `SekWrap`, `IdentityVault`, `SealedSegment` are codecs and mechanisms the node runtime
   will drive. Only the SEK is `mlock`ed; derived factors, the KEK, the vault key and opened plaintext
