@@ -14,10 +14,10 @@
 //! anchor, in one room. Alice offers a file (`vox room send`); once bob can see the offer, alice's
 //! node is killed (`SIGKILL`, so nothing tells bob), and bob waits out the 30 s the node takes to
 //! recognise a silent connection as dead — so the fetch dials afresh, as it would after any real
-//! absence. Then bob runs `vox room get`, and **while it dials**, `vox room list` is asked of the
-//! same daemon. What it asserts:
+//! absence. Then bob runs `vox room get`, and **while it dials**, bob posts to the room through
+//! the same daemon — a request its actor must answer. What it asserts:
 //! 1. the fetch fails (alice is gone) — the dial really ran;
-//! 2. every `vox room list` asked during it answers within [`ANSWER_WITHIN`];
+//! 2. every post made during it is taken within [`ANSWER_WITHIN`];
 //! 3. bob's daemon reports no stall of a second or more while opening the forward.
 //!
 //! Mutation: the dial back on the actor (the parent of this change) — (2) and (3) go red.
@@ -240,7 +240,7 @@ fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> S
     panic!("timed out waiting for {what}; last saw {last}");
 }
 
-/// How long the daemon may take to answer a `vox room list` while a fetch dials.
+/// How long the daemon may take to take a post while a fetch dials.
 const ANSWER_WITHIN: Duration = Duration::from_secs(2);
 
 /// The node treats a connection that has heard nothing for this long as dead
@@ -334,11 +334,15 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
             )
         })
     };
+    // A post, not `vox room list`: a list is answered from the view the daemon publishes, and
+    // measured it answered in 3-18 ms even while the actor was held for ten seconds. A post is
+    // the actor's to append, so it waits for whatever holds the actor — as another agent's post
+    // would.
     let mut answers = Vec::new();
-    for _ in 0..3 {
+    for n in 0..3 {
         std::thread::sleep(Duration::from_millis(700));
         let asked = Instant::now();
-        let (ok, _, err) = bob.vox(&["room", "list"]);
+        let (ok, _, err) = bob.vox(&["room", "post", &room, &format!("still here {n}")]);
         answers.push((asked.elapsed(), ok, err));
     }
     let (got, took, said) = fetch.join().unwrap();
@@ -352,7 +356,7 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
         .map(str::to_owned)
         .collect();
     eprintln!(
-        "[proof] the fetch took {took:?} (ok={got}); `vox room list` during it answered after {:?}; \
+        "[proof] the fetch took {took:?} (ok={got}); `vox room post` during it answered after {:?}; \
          bob's daemon reported {} forward stall(s): {stalls:?}",
         answers.iter().map(|(t, ..)| *t).collect::<Vec<_>>(),
         stalls.len()
@@ -362,10 +366,10 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
         "CANNOT PROVE: the fetch from a member who is gone succeeded, so nothing was dialled: {said}"
     );
     for (t, ok, err) in &answers {
-        assert!(*ok, "`vox room list` failed during the fetch: {err}");
+        assert!(*ok, "`vox room post` failed during the fetch: {err}");
         assert!(
             *t < ANSWER_WITHIN,
-            "bob's daemon took {t:?} to answer `vox room list` while a fetch dialled — the dial \
+            "bob's daemon took {t:?} to take a post while a fetch dialled — the dial \
              held its actor (#215); all answers: {:?}",
             answers.iter().map(|(t, ..)| *t).collect::<Vec<_>>()
         );
