@@ -164,6 +164,12 @@ async fn by<T>(
 /// How long one publish round to one board may take before it is given up until the next round: a
 /// live board answers each put in milliseconds. See `publish_channel_to_anchor`.
 const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
+
+/// How long a join's board search keeps preferring the room's own anchors once some other route
+/// has answered: the connection-attempt delay RFC 8305 recommends, long enough for a route that
+/// is merely a moment slower to win, short enough that one that will never answer costs nothing a
+/// person notices. See `Joiner::reach_a_board`.
+const BOARD_PREFERENCE_GRACE: Duration = Duration::from_millis(250);
 /// How long a delivered sender key may go unanswered before it is counted as not taken and sent
 /// again. See `pairwise_stream::refused`.
 const KEY_DELIVERY_PATIENCE: Duration = Duration::from_secs(30);
@@ -1172,9 +1178,19 @@ impl Joiner {
         endpoints: &crate::nat::multiaddr::EndpointList,
         board: bool,
     ) -> crate::error::Result<Arc<VoxConnection>> {
-        let conn = self.net.reach(peer, endpoints).await?;
-        let _ = self
-            .tx
+        Self::dial_with(&self.net, &self.tx, peer, endpoints, board).await
+    }
+
+    /// [`Self::dial`] with what it needs passed in, so several can run on tasks of their own.
+    async fn dial_with(
+        net: &Arc<NodeNet>,
+        tx: &mpsc::Sender<NetEvent>,
+        peer: Digest32,
+        endpoints: &crate::nat::multiaddr::EndpointList,
+        board: bool,
+    ) -> crate::error::Result<Arc<VoxConnection>> {
+        let conn = net.reach(peer, endpoints).await?;
+        let _ = tx
             .send(NetEvent::Dialed {
                 conn: Arc::clone(&conn),
                 endpoints: endpoints.clone(),
@@ -1184,12 +1200,68 @@ impl Joiner {
         Ok(conn)
     }
 
+    /// A board for this join: every route dialled at once, the room's own anchors preferred for a
+    /// short grace, then whichever has answered (Happy Eyeballs, RFC 8305).
+    ///
+    /// **Not one after another.** The routes were dialled in turn, so a route this node cannot
+    /// use held up every route after it for its full timeout: an IPv6-only member whose address
+    /// advertised the room's anchor and host on IPv4 reached its own IPv6 anchor — reachable the
+    /// whole time — after `board 20.76s`, measured through the real binaries (#197; PRD-001 R42
+    /// asks for under 2s).
+    ///
+    /// **Preferred, not waited for.** The order still matters: the link's own anchors come first
+    /// because they are the boards that hold the room, and a joiner's own anchor may not. But
+    /// waiting for every earlier route to *fail* would only halve a 20s wait, since a route that
+    /// cannot be reached fails by timing out. So once any route has answered, an earlier one gets
+    /// [`BOARD_PREFERENCE_GRACE`] to answer too; after that, the earliest route that **has**
+    /// answered is taken and the slower ones are dropped.
     async fn reach_a_board(&self) -> Option<Arc<VoxConnection>> {
         let deadline = tokio::time::Instant::now() + Node::BOARD_PATIENCE;
         loop {
-            for (id, endpoints) in &self.routes {
-                if let Ok(conn) = self.dial(*id, endpoints, true).await {
-                    return Some(conn);
+            let mut dials = tokio::task::JoinSet::new();
+            for (at, (id, endpoints)) in self.routes.iter().enumerate() {
+                let (net, tx, id, endpoints) = (
+                    Arc::clone(&self.net),
+                    self.tx.clone(),
+                    *id,
+                    endpoints.clone(),
+                );
+                dials.spawn(async move {
+                    (
+                        at,
+                        Self::dial_with(&net, &tx, id, &endpoints, true).await.ok(),
+                    )
+                });
+            }
+            // Per route: `None` while it is still dialling, `Some(answer)` once it has settled.
+            let mut settled: Vec<Option<Option<Arc<VoxConnection>>>> =
+                vec![None; self.routes.len()];
+            let mut grace_ends: Option<tokio::time::Instant> = None;
+            loop {
+                // The earliest route that answered, and whether any route before it is still
+                // dialling (and so might yet be preferred).
+                let best = settled.iter().position(|o| matches!(o, Some(Some(_))));
+                if let Some(best) = best {
+                    let earlier_pending = settled[..best].iter().any(Option::is_none);
+                    let grace_over = grace_ends.is_some_and(|t| tokio::time::Instant::now() >= t);
+                    if !earlier_pending || grace_over {
+                        if let Some(Some(conn)) = &settled[best] {
+                            return Some(Arc::clone(conn));
+                        }
+                    }
+                    grace_ends.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + BOARD_PREFERENCE_GRACE
+                    });
+                }
+                let next = match grace_ends {
+                    Some(t) => tokio::time::timeout_at(t, dials.join_next()).await,
+                    None => Ok(dials.join_next().await),
+                };
+                match next {
+                    Ok(Some(Ok((at, conn)))) => settled[at] = Some(conn),
+                    Ok(Some(Err(_))) => {} // a dial task that panicked: nothing to take
+                    Ok(None) => break,     // every route settled, none answered
+                    Err(_) => {}           // the grace is up: the loop takes the best answer
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -4011,15 +4083,36 @@ impl Node {
         let me = net.local_id();
         // The boards to try, in the order `reach_a_board` tried them: the link's anchors, this
         // node's own, then any anchor it already holds a live connection to.
+        //
+        // **One route per board, with every address known for it.** The link and this node can
+        // name the same anchor by different addresses — the host that minted the link reached it on
+        // IPv4, this node reaches it on IPv6 — and keeping only the first entry for an identity
+        // dropped this node's own addresses for it: an IPv6-only member was left dialling the
+        // link's IPv4 address for its own anchor, and reached it only by a fallback after that
+        // dial ran out. This node's own addresses go first — they are what it resolved for itself
+        // — then the link's, and the dial races them (`connect_direct` is Happy Eyeballs).
         let mut routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
         let mut seen: std::collections::BTreeSet<Digest32> = [me].into_iter().collect();
-        for a in parsed
-            .anchors
-            .iter()
-            .chain(self.anchors.nodes())
-            .filter(|a| seen.insert(a.id))
-        {
-            routes.push((a.id, a.endpoints.clone()));
+        for a in parsed.anchors.iter() {
+            if seen.insert(a.id) {
+                routes.push((a.id, a.endpoints.clone()));
+            }
+        }
+        for a in self.anchors.nodes() {
+            if seen.insert(a.id) {
+                routes.push((a.id, a.endpoints.clone()));
+            } else if let Some((_, known)) = routes.iter_mut().find(|(id, _)| *id == a.id) {
+                let mut all: Vec<crate::nat::multiaddr::Multiaddr> = a.endpoints.addrs().to_vec();
+                for m in known.addrs() {
+                    if !all.contains(m) {
+                        all.push(*m);
+                    }
+                }
+                all.truncate(crate::nat::multiaddr::MAX_ENDPOINTS);
+                if let Ok(merged) = crate::nat::multiaddr::EndpointList::new(all) {
+                    *known = merged;
+                }
+            }
         }
         let live: std::collections::BTreeSet<Digest32> =
             net.manager().peers().into_iter().collect();
