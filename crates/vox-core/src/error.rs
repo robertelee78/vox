@@ -382,6 +382,17 @@ pub enum Error {
     #[error("sync failed: {0}")]
     SyncFailed(crate::wire::WireError),
 
+    /// A sync session did not complete because **the peer refused** it, with this coded reason.
+    /// Kept apart from [`Self::SyncFailed`] and [`Self::SyncRejected`] so that a report can say
+    /// which end stopped the session (#202's follow-up: all three used to read the same).
+    #[error("sync failed: the peer refused: {0}")]
+    SyncRefused(crate::wire::WireError),
+
+    /// A sync session did not complete because **this node** refused what the peer sent, with
+    /// this coded reason: an entry the log would not accept, or a frame out of protocol.
+    #[error("sync failed: this node refused what the peer sent: {0}")]
+    SyncRejected(crate::wire::WireError),
+
     /// The peer reset or stopped the stream with a coded reason (an ADR-008 [`WireError`]):
     /// it refused, deliberately, and said why. Distinct from [`Self::Unreachable`], which is a
     /// stream or connection that went away with nothing said.

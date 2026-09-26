@@ -14,13 +14,17 @@
 //! 1. at least one failed sync is reported **as a collision**: "the peer was busy syncing this
 //!    room";
 //! 2. no failed sync between the two members is reported as a governance or malformed-data
-//!    error, or as an invalid authenticator.
+//!    error, or as an invalid authenticator;
+//! 3. **every collision is reported as the peer's refusal**, "the peer refused: the peer was busy
+//!    …", because it is the peer that stopped the session. Before #202's follow-up, a peer's
+//!    refusal and this node's own rejection of an entry both read "sync failed: <reason>", so a
+//!    report could not say which end stopped the session.
 //!
 //! If no collision happened in all the rounds, the run proves nothing, and it fails as CANNOT
 //! MEASURE rather than passing.
 //!
 //! Mutations: the old governance wrapper in `sync_failure` breaks (2); a collision refused with the
-//! uninformative code breaks (1) and (2).
+//! uninformative code breaks (1) and (2); `sync_failure` ignoring who refused breaks (3).
 
 #![cfg(unix)]
 
@@ -43,6 +47,8 @@ const ROUNDS: usize = 40;
 const TIMEOUT: Duration = Duration::from_secs(90);
 /// What a collision reads as, from the coded reason `SessionBusy`.
 const COLLISION: &str = "the peer was busy syncing this room";
+/// A collision, said as the peer's refusal.
+const REFUSED_COLLISION: &str = "the peer refused: the peer was busy syncing this room";
 
 fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     let mut child = Command::new(VOX)
@@ -220,6 +226,10 @@ fn a_sync_that_did_not_complete_says_why() {
         )
         .collect();
     let collisions = reports.iter().filter(|l| l.contains(COLLISION)).count();
+    let unattributed: Vec<&String> = reports
+        .iter()
+        .filter(|l| l.contains(COLLISION) && !l.contains(REFUSED_COLLISION))
+        .collect();
     let misnamed: Vec<&String> = reports
         .iter()
         .filter(|l| {
@@ -228,13 +238,19 @@ fn a_sync_that_did_not_complete_says_why() {
         .collect();
     println!(
         "[proof] {} failed-sync report(s) over {ROUNDS} simultaneous rounds: {collisions} named as a \
-         collision, {} misnamed",
+         collision ({} not said as the peer's refusal), {} misnamed",
         reports.len(),
+        unattributed.len(),
         misnamed.len()
     );
     for l in reports.iter().take(12) {
         println!("[report] {l}");
     }
+    assert!(
+        unattributed.is_empty(),
+        "a collision was not reported as the peer's refusal, so the report cannot say which end \
+         stopped the session: {unattributed:?}"
+    );
     assert!(
         misnamed.is_empty(),
         "a failed sync between two members was reported as a governance, malformed-data or \

@@ -130,6 +130,13 @@ pub trait Transport {
     /// nothing here. A real ordered byte transport (the QUIC mapping, M9) overrides
     /// this to FIN its send stream so the peer's blocking read terminates.
     fn finish(&mut self) {}
+
+    /// The code the **peer** reset or stopped the stream with, if it did (#202's follow-up): a
+    /// session that fails with this code failed because the peer refused, not because this node
+    /// rejected what it was sent. A transport that cannot tell says `None`.
+    fn peer_refused(&self) -> Option<WireError> {
+        None
+    }
 }
 
 /// An in-memory duplex transport pairing two endpoints by shared queues, for

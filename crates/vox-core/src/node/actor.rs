@@ -7090,7 +7090,10 @@ fn fault_of(e: &Error) -> Fault {
         ) => Fault::NotConsented,
         // A sync that did not complete, or a peer that refused: the peer did not serve this, which
         // is reachability, not an internal fault (#202).
-        Error::SyncFailed(_) | Error::PeerRefused(_) => Fault::Unreachable,
+        Error::SyncFailed(_)
+        | Error::SyncRefused(_)
+        | Error::SyncRejected(_)
+        | Error::PeerRefused(_) => Fault::Unreachable,
         _ => Fault::Internal,
     }
 }
