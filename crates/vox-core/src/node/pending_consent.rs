@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::atrest::sek::Sek;
 use crate::atrest::sek::NONCE_LEN;
 use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
 use crate::cbor::{Decoder, Encoder};
@@ -23,7 +24,6 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
 use crate::node::store::Store;
-use crate::atrest::sek::Sek;
 use crate::node::trust::MAX_TRUSTED;
 
 /// HKDF label for the map's sealing key, taken over `self_seed` ([`crate::atrest::seal`]).

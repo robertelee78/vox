@@ -58,9 +58,11 @@ pub fn migrate_to_vault_seals(store: &Store, signer: &dyn RootSigner) -> Result<
 
     // The prekey ring: one segment in its pseudo-channel.
     let ring_channel = prekeys::ring_channel();
-    if let Some(sealed) =
-        store.get_segment(&ring_channel, SegmentKind::PrekeyRing, prekeys::SEG_PREKEY_RING)?
-    {
+    if let Some(sealed) = store.get_segment(
+        &ring_channel,
+        SegmentKind::PrekeyRing,
+        prekeys::SEG_PREKEY_RING,
+    )? {
         if let Some(fresh) = reseal(
             SegmentKind::PrekeyRing,
             prekeys::SEG_PREKEY_RING,

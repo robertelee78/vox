@@ -51,7 +51,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-
 use crate::atrest::sek::{Sek, NONCE_LEN};
 use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
 use crate::cbor::{Decoder, Encoder};
