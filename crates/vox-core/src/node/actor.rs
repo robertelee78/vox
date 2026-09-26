@@ -254,6 +254,16 @@ const SYNCS_IN_FLIGHT: usize = 16;
 /// passed a hardcoded `0`, so it had never once adapted.
 const JOINS_IN_FLIGHT: usize = 16;
 
+/// How many identity-passphrase checks may run at once.
+///
+/// A check is production Argon2id at ≥256 MiB (`sek::ADR_MIN_M_COST_KIB`). It runs off the
+/// actor (V210-26), and unbounded that let any client of the control socket — an agent
+/// session running model-authored code, by ADR-020 §7's own threat model — start one per
+/// request: 32 concurrent `vox trust list`s with any passphrase is ~8 GiB. A wrong
+/// passphrase costs as much as a right one, so nothing can refuse early. Checks beyond this
+/// many wait for a slot in a task of their own, off the actor, so the node keeps serving.
+const VERIFIES_IN_FLIGHT: usize = 2;
+
 /// A short name for what a command was, for the stall report.
 fn command_name(c: &NodeCommand) -> &'static str {
     match c {
@@ -1691,6 +1701,8 @@ pub struct Node {
     publish_refusal_first_seen: BTreeMap<(Digest32, String), u64>,
     /// Slots for answering inbound joins; see [`JOINS_IN_FLIGHT`].
     join_slots: Arc<tokio::sync::Semaphore>,
+    /// Slots for identity-passphrase checks; see [`VERIFIES_IN_FLIGHT`].
+    verify_slots: Arc<tokio::sync::Semaphore>,
     /// The join exchanges running right now.
     ///
     /// Tracked rather than detached for one reason: each holds an `Arc<VaultRootSigner>`, and
@@ -1924,6 +1936,7 @@ impl Node {
             last_publish_refusal: BTreeMap::new(),
             publish_refusal_first_seen: BTreeMap::new(),
             join_slots: Arc::new(tokio::sync::Semaphore::new(JOINS_IN_FLIGHT)),
+            verify_slots: Arc::new(tokio::sync::Semaphore::new(VERIFIES_IN_FLIGHT)),
             join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
             joining: std::collections::BTreeSet::new(),
@@ -5909,11 +5922,23 @@ impl Node {
             return;
         };
         let verifier = profile.passphrase_verifier();
-        tokio::task::spawn_blocking(move || {
-            let outcome = match verifier.verify(&passphrase) {
-                Ok(()) => Outcome::Done,
-                Err(_) => Outcome::Failed(Fault::WrongPassphrase),
+        let slots = Arc::clone(&self.verify_slots);
+        // Waiting for a slot happens here, off the actor; the check itself on a blocking
+        // thread, holding the slot until it is done.
+        tokio::spawn(async move {
+            let Ok(slot) = slots.acquire_owned().await else {
+                let _ = reply.send(Outcome::Failed(Fault::ShuttingDown));
+                return;
             };
+            let outcome = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                match verifier.verify(&passphrase) {
+                    Ok(()) => Outcome::Done,
+                    Err(_) => Outcome::Failed(Fault::WrongPassphrase),
+                }
+            })
+            .await
+            .unwrap_or(Outcome::Failed(Fault::Internal));
             let _ = reply.send(outcome);
         });
     }

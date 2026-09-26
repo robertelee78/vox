@@ -92,6 +92,12 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// The pid of this worker's `vox daemon`, while it runs.
+    #[allow(dead_code)] // not every proof that includes this support module measures it
+    pub fn daemon_pid(&self) -> Option<u32> {
+        self.daemon.as_ref().map(|p| p.0.id())
+    }
+
     /// Run `vox …` as `session` of this worker (or with no session at all).
     pub fn vox(&self, session: Option<&str>, args: &[&str]) -> Out {
         self.vox_in(session, args, None)
