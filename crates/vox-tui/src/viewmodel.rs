@@ -227,6 +227,8 @@ pub enum UiError {
     ChannelNotOpen,
     /// An input exceeded its bound (name or message length).
     TooLong,
+    /// The trust keyring holds its maximum number of identities.
+    KeyringFull,
     /// Persisting to the store failed; reopen the channel.
     Storage,
     /// This action needs the network milestone (M14) — not available yet.
@@ -239,6 +241,10 @@ pub enum UiError {
     NotConsented,
     /// This client is not networked, or is locked, so it cannot reach anyone.
     NotNetworked,
+    /// A local address the node needs (its listen port) is already in use.
+    AddressInUse,
+    /// A join named a room this profile already holds.
+    AlreadyMember,
     /// An unexpected internal error (never carries detail).
     Internal,
 }
@@ -273,11 +279,14 @@ impl UiError {
             UiError::Locked => "locked — :unlock",
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",
+            UiError::KeyringFull => "your trust keyring is full (1,024) — remove one first",
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",
+            UiError::AddressInUse => "a local port it needs is in use — pick another --listen",
+            UiError::AlreadyMember => "you already hold that room — it is in your list",
             UiError::Internal => "internal error",
         }
     }

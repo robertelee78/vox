@@ -306,18 +306,32 @@ where
     // Read **after** the request, from the live set, so a stream parked open across a
     // withdrawal of trust is judged by the decision that holds now, not by one taken when
     // the stream opened (M17.11).
-    let host = resolve(&req.channel_id, &req.service_tag)
-        .filter(|h| h.reachers.borrow().contains(client_id));
-    let Some(HostService {
-        endpoint: target,
-        reachers,
-        offered,
-    }) = host
+    let host = resolve(&req.channel_id, &req.service_tag);
+    // The two refusals stay one on the wire — the dialer learns only "denied" (dark services)
+    // — but not in the host's own log, where "service unauthorized or unknown" left the person
+    // who runs the service guessing which of two opposite fixes applied (PRD-001 R36).
+    let why = match &host {
+        None => Some("no such service is offered in that room"),
+        Some(h) if !h.reachers.borrow().contains(client_id) => {
+            Some("they are not in your trust keyring (`vox trust add` them to let them reach it)")
+        }
+        Some(_) => None,
+    };
+    let (
+        Some(HostService {
+            endpoint: target,
+            reachers,
+            offered,
+        }),
+        None,
+    ) = (host, why)
     else {
         // Finish the stream so the status reaches the dialer before we drop it.
         write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
         let _ = send.finish();
-        return Err(Error::TunnelDenied("service unauthorized or unknown"));
+        return Err(Error::TunnelDenied(
+            why.unwrap_or("no such service is offered in that room"),
+        ));
     };
     // Authorized, and not before: the host learns who reached what, and learns nothing
     // about a refusal it did not grant.
@@ -328,7 +342,9 @@ where
         Err(_) => {
             write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
             let _ = send.finish();
-            return Err(Error::TunnelDenied("local service connect failed"));
+            return Err(Error::TunnelDenied(
+                "the local service did not accept the connection (is it running?)",
+            ));
         }
     };
     write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;

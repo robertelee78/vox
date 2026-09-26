@@ -255,6 +255,7 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::WrongPassphrase => UiError::WrongPassphrase,
         Fault::UnknownChannel | Fault::ChannelNotOpen => UiError::ChannelNotOpen,
         Fault::TooLong => UiError::TooLong,
+        Fault::KeyringFull => UiError::KeyringFull,
         Fault::Storage => UiError::Storage,
         Fault::ShuttingDown | Fault::Internal => UiError::Internal,
         // A link that will not parse is malformed input, not a network failure.
@@ -264,6 +265,8 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::Refused => UiError::Refused,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
+        Fault::AddressInUse => UiError::AddressInUse,
+        Fault::AlreadyMember => UiError::AlreadyMember,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
     }

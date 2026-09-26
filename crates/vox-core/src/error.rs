@@ -251,6 +251,22 @@ pub enum Error {
     #[error("peer unreachable — {0}")]
     LadderExhausted(String),
 
+    /// This node could not listen on a local address it was told to use.
+    ///
+    /// Carried whole rather than as a `&'static str`: "quic endpoint bind" was the only thing
+    /// the daemon could say when its `--listen` port was taken, and it reached the person as
+    /// `Failed(Internal)` — a bug report for what is an occupied port (PRD-001 R36).
+    #[error("cannot listen on {addr}: {reason}")]
+    LocalBind {
+        /// The address that could not be bound.
+        addr: std::net::SocketAddr,
+        /// Whether something else already holds it (the common case, and the one with an
+        /// obvious fix).
+        in_use: bool,
+        /// What the operating system said.
+        reason: String,
+    },
+
     /// A tunnel operation was refused by authorization (ADR-013): the requesting
     /// member holds no valid `dial:<service>` capability (or the host no
     /// `bind:<service>`), or the service is dark/unknown. Default-deny: the absence

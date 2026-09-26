@@ -259,6 +259,16 @@ const SYNCS_IN_FLIGHT: usize = 16;
 /// passed a hardcoded `0`, so it had never once adapted.
 const JOINS_IN_FLIGHT: usize = 16;
 
+/// How many identity-passphrase checks may run at once.
+///
+/// A check is production Argon2id at ≥256 MiB (`sek::ADR_MIN_M_COST_KIB`). It runs off the
+/// actor (V210-26), and unbounded that let any client of the control socket — an agent
+/// session running model-authored code, by ADR-020 §7's own threat model — start one per
+/// request: 32 concurrent `vox trust list`s with any passphrase is ~8 GiB. A wrong
+/// passphrase costs as much as a right one, so nothing can refuse early. Checks beyond this
+/// many wait for a slot in a task of their own, off the actor, so the node keeps serving.
+const VERIFIES_IN_FLIGHT: usize = 2;
+
 /// A short name for what a command was, for the stall report.
 fn command_name(c: &NodeCommand) -> &'static str {
     match c {
@@ -1472,6 +1482,7 @@ const fn worth_another_responder(fault: Fault) -> bool {
             | Fault::ShuttingDown
             | Fault::NotNetworked
             | Fault::IdentityExists
+            | Fault::AlreadyMember
     )
 }
 
@@ -1708,6 +1719,8 @@ pub struct Node {
     publish_refusal_first_seen: BTreeMap<(Digest32, String), u64>,
     /// Slots for answering inbound joins; see [`JOINS_IN_FLIGHT`].
     join_slots: Arc<tokio::sync::Semaphore>,
+    /// Slots for identity-passphrase checks; see [`VERIFIES_IN_FLIGHT`].
+    verify_slots: Arc<tokio::sync::Semaphore>,
     /// The join exchanges running right now.
     ///
     /// Tracked rather than detached for one reason: each holds an `Arc<VaultRootSigner>`, and
@@ -1941,6 +1954,7 @@ impl Node {
             last_publish_refusal: BTreeMap::new(),
             publish_refusal_first_seen: BTreeMap::new(),
             join_slots: Arc::new(tokio::sync::Semaphore::new(JOINS_IN_FLIGHT)),
+            verify_slots: Arc::new(tokio::sync::Semaphore::new(VERIFIES_IN_FLIGHT)),
             join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
             joining: std::collections::BTreeSet::new(),
@@ -2014,6 +2028,16 @@ impl Node {
                     let shutdown = matches!(command, NodeCommand::Shutdown);
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
+                    // **Answered off the actor.** Checking the identity passphrase is production
+                    // Argon2id, and every `vox trust add/list/remove` asks for it. Inline, it held
+                    // the actor for ~0.3 s per command, and nothing on the node — posts, reads,
+                    // syncs — was served meanwhile (V210-26). It changes no state, so it runs on
+                    // a blocking thread and answers the caller from there.
+                    if let NodeCommand::VerifyPassphrase { passphrase } = command {
+                        self.begin_verify_passphrase(passphrase, reply);
+                        self.note_if_stalled(name, started);
+                        continue;
+                    }
                     // **Answered later, not here.** Creating a room seals its key under the
                     // passphrase with production Argon2id — seconds of CPU — and this task answers
                     // nothing while it runs. So the seal goes to a blocking thread and the reply
@@ -3540,7 +3564,8 @@ impl Node {
                         let carried = Arc::clone(&connection);
                         tokio::spawn(async move {
                             let _carried = carried;
-                            let _ = crate::node::tunnel::serve_reporting(
+                            let refusals = events.clone();
+                            let served = crate::node::tunnel::serve_reporting(
                                 peer,
                                 send,
                                 recv,
@@ -3548,6 +3573,19 @@ impl Node {
                                 Some(events),
                             )
                             .await;
+                            // The result used to be dropped here, so a host refusing a member —
+                            // untrusted, no such service, its own service down — said nothing
+                            // anywhere (PRD-001 R36). Refusals only: a session that ends in an
+                            // error after it was accepted is a disconnect, not a no.
+                            if let Err(e @ crate::error::Error::TunnelDenied(_)) = served {
+                                let who: String = crate::node::link::b32_encode(&peer)
+                                    .chars()
+                                    .take(12)
+                                    .collect();
+                                let _ = refusals.send(NodeEvent::ProxyRefused {
+                                    reason: format!("refused {who} a tunnel: {e}"),
+                                });
+                            }
                         });
                     }
                     Inbound::NotYetSupported { .. }
@@ -4038,7 +4076,7 @@ impl Node {
             return;
         };
         if self.channels.contains_key(&parsed.channel_id) {
-            let _ = reply.send(Outcome::Failed(Fault::IdentityExists));
+            let _ = reply.send(Outcome::Failed(Fault::AlreadyMember));
             return;
         }
         let Some(profile) = self.profile.as_ref() else {
@@ -5919,6 +5957,34 @@ impl Node {
 
     /// Begin creating a room: the genesis here, the Argon2id seal on a blocking thread, and the
     /// reply carried to `NetEvent::ChannelSealed`. Any failure before the seal answers at once.
+    /// Check the identity passphrase on a blocking thread and answer `reply` from there.
+    fn begin_verify_passphrase(&self, passphrase: Secret, reply: oneshot::Sender<Outcome>) {
+        let Some(profile) = self.profile.as_ref() else {
+            let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
+            return;
+        };
+        let verifier = profile.passphrase_verifier();
+        let slots = Arc::clone(&self.verify_slots);
+        // Waiting for a slot happens here, off the actor; the check itself on a blocking
+        // thread, holding the slot until it is done.
+        tokio::spawn(async move {
+            let Ok(slot) = slots.acquire_owned().await else {
+                let _ = reply.send(Outcome::Failed(Fault::ShuttingDown));
+                return;
+            };
+            let outcome = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                match verifier.verify(&passphrase) {
+                    Ok(()) => Outcome::Done,
+                    Err(_) => Outcome::Failed(Fault::WrongPassphrase),
+                }
+            })
+            .await
+            .unwrap_or(Outcome::Failed(Fault::Internal));
+            let _ = reply.send(outcome);
+        });
+    }
+
     async fn begin_create_channel(
         &mut self,
         local_name: String,
@@ -6143,7 +6209,7 @@ impl Node {
             // A room with no genesis service grant has no `.vox` name: its host is not
             // determined by the genesis, so there is nothing to resolve to. Such a room is
             // reached with `vox forward <member>/<tag>` instead (ADR-017 decision 4).
-            return Outcome::Failed(Fault::Refused);
+            return Outcome::Failed(Fault::NotAServiceRoom);
         }
         let hostname = crate::node::link::vox_hostname(channel_id);
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
@@ -6156,9 +6222,11 @@ impl Node {
         // in between, with `serve`'s failure invisible because its task's `Result` is
         // dropped. A bound socket accepts into the kernel's backlog immediately, so
         // handing it over makes the announcement truthful the moment it is made.
+        // A port that cannot be bound is the person's to fix, and it said `Unreachable` — which
+        // sent them to check a host that was never contacted (PRD-001 R36).
         let listener = match tokio::net::TcpListener::bind(bind).await {
             Ok(l) => l,
-            Err(_) => return Outcome::Failed(Fault::Unreachable),
+            Err(_) => return Outcome::Failed(Fault::AddressInUse),
         };
         let bound = match listener.local_addr() {
             Ok(a) => a,
@@ -6226,6 +6294,14 @@ impl Node {
         }
         // The member's advertised endpoints, from this node's board — the same hints
         // any dial uses; the ladder does the rest.
+        // **The local port before the network.** A forward bound its port only after the dial,
+        // so a port already in use was never reported: the dial failed first on a host that
+        // was not up yet, and `vox forward` sat "waiting for a path" for five minutes about a
+        // problem on this machine (PRD-001 R36). Probed and released; `Forward::bind` still
+        // binds for real, and still reports if the port was taken in between.
+        if local.port() != 0 && std::net::TcpListener::bind(local).is_err() {
+            return Outcome::Failed(Fault::AddressInUse);
+        }
         let endpoints = self
             .net
             .as_ref()
@@ -6758,12 +6834,15 @@ fn fault_of(e: &Error) -> Fault {
         // A ladder that tried every rung and got nowhere is unreachable, not an internal
         // fault: falling through to `Internal` made the join walk stop after one responder.
         Error::LadderExhausted(_) => Fault::Unreachable,
+        Error::LocalBind { .. } => Fault::AddressInUse,
         Error::Profile("no identity in this profile") => Fault::NoIdentity,
         Error::Profile("identity already exists in this profile") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such channel in this profile") => Fault::UnknownChannel,
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,
         Error::AtRestLocked => Fault::Locked,
+        // Before the general size arm: a full keyring is not an input that was too long.
+        Error::SizeLimitExceeded("trusted identities") => Fault::KeyringFull,
         Error::SizeLimitExceeded(_) => Fault::TooLong,
         Error::MalformedLink(_) | Error::MalformedAnchor(_) => Fault::BadLink,
         Error::Unreachable(_) => Fault::Unreachable,
