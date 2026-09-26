@@ -43,7 +43,7 @@
 use std::io::Read as _;
 
 use vox_core::hash::Digest32;
-use vox_core::node::ipc::{Frame, IpcClient, Request};
+use vox_core::node::ipc::{Frame, IpcClient};
 use vox_core::node::link::b32_encode;
 use vox_core::node::paths::Paths;
 
@@ -494,7 +494,7 @@ async fn drain(
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
 
-    let rooms = match client.request(&Request::Rooms).await {
+    let rooms = match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => rooms,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),

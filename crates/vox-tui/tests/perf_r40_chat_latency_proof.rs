@@ -272,7 +272,7 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
     let mut reader = rt
         .block_on(IpcClient::open(&bob_paths.socket_file()))
         .expect("attach to bob's node");
-    let channel_id = match rt.block_on(reader.request(&Request::Rooms)) {
+    let channel_id = match rt.block_on(reader.rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms
             .iter()
             .map(|(id, _, _)| *id)

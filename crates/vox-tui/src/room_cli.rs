@@ -79,7 +79,7 @@ async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
 
 /// Ask the node for its rooms, as `(id, local name, open)`.
 async fn rooms_of(client: &mut IpcClient) -> Result<Vec<(Digest32, String, bool)>, AppError> {
-    match client.request(&Request::Rooms).await {
+    match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => Ok(rooms),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
@@ -2311,12 +2311,7 @@ pub async fn trust_remove(
 /// `vox trust list`, asked of the running node.
 pub async fn trust_list(paths: &Paths, identity_passphrase: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client
-        .request(&Request::TrustList {
-            identity_passphrase: identity_passphrase.to_owned(),
-        })
-        .await
-    {
+    match client.trusted(identity_passphrase).await {
         Ok(Frame::Trusted { entries }) => {
             if entries.is_empty() {
                 println!("no trusted identities");
