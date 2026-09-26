@@ -2,7 +2,8 @@
 
 - **Source**: the decider's choice (a) for V29-17, 2026-09-25: a test that does not drive the shipped `vox` is kept only while it backs a product claim, and each such test gets its own item to replace it. *"I don't like clutter I don't like junk. I don't want to pretend that a test is a valuable thing unless it actually is."*
 - **Rule for every item**: the replacement drives the shipped `vox` (and only it) for every node in the claim, is mutation-checked (it goes red when the behaviour it covers is broken), and the in-process test is deleted in the same change. Until then the in-process test is never cited as evidence.
-- **Delivery boundary**: an item is delivered when its replacement is merged to `main`.
+- **Superseded, 2026-09-26 (the decider)**: *"if we have a test at all, it must be in using the product/feature"*. Every in-process test was deleted at once in `86949be` rather than kept until its replacement exists (ADR-018, "Only real use of the product is a test"). So each item's "is deleted" clause is already met, and what remains is the real-use proof. Until it lands, the item's claim is **unmeasured**.
+- **Delivery boundary**: an item is delivered when its replacement is merged to `main`. The items that `docs/release/v0.2.10.md` V210-31 and V210-32 name are required for the v0.2.10 release.
 - **Exempt**: `vox-core/tests/watchdog_proof.rs` proves the test harness's own watchdog (a hung test process is killed), not the product, so it makes no product claim and needs no replacement.
 
 ### RP-01 — The agent-comms envelope and claim rules hold, through the shipped binary
@@ -229,3 +230,8 @@
 **Why.** `crates/vox-core/tests/node_m19_fanout_gate.rs` runs every node in-process, so it is not proof that a person running `vox` gets this.
 **Acceptance.** A proof that drives only the shipped `vox` shows that a wedged client cannot stall a node and is told it lagged, goes red under a mutation that breaks it, and `crates/vox-core/tests/node_m19_fanout_gate.rs` is deleted.
 **Validation.** The new proof is green on `main` and red under its mutation; `crates/vox-core/tests/node_m19_fanout_gate.rs` no longer exists.
+
+### RP-46 — Shutting a node down releases its profile, through the shipped binary
+**Why.** `crates/vox-tui/tests/shutdown_releases_the_profile_proof.rs` drives the shipped `vox` but also runs a participant in-process (ADR-018, "Only real use of the product is a test"), so it is not proof that a person running `vox` gets this.
+**Acceptance.** A proof in which every participant is the shipped `vox` shows that a profile is free the moment shutdown answers done, goes red under a mutation that breaks it, and the in-process participant is gone from `crates/vox-tui/tests/shutdown_releases_the_profile_proof.rs`.
+**Validation.** The new proof is green on `main` and red under its mutation, and no participant in it runs in-process.
