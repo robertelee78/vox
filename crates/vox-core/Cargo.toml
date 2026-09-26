@@ -45,10 +45,6 @@ redb.workspace = true
 # OpenPGP v4 fingerprint of the native root (ADR-002 §GPG).
 sha1.workspace = true
 
-[dev-dependencies]
-hex.workspace = true
-tempfile.workspace = true
-
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

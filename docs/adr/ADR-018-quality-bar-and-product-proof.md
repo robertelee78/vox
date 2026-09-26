@@ -727,6 +727,68 @@ can never fail CI. Every `cargo test` runs `--no-fail-fast`, so one red cannot h
 **Re-running.** If CI on the tagged commit fails and a re-run of that CI run passes, re-run the
 release workflow (its `ci-passed` job reads the run's latest conclusion). Nothing is re-tagged.
 
+## Only real use of the product is a test (2026-09-26)
+
+**Decision (the decider, 2026-09-26).** A test exists only if it drives the **shipped `vox` binary the
+way a person would** and checks what that person would see or depend on. Every other test is deleted,
+**now**, not kept until a replacement exists. This supersedes the V29-17 decision (a) of 2026-09-25,
+which kept claim-backing in-process tests as placeholders. In the decider's words: "if we have a test
+at all, it must be in using the product/feature"; anything else "doesn't measure anything I care
+about", "slow[s] us down", and "we can't ever disambiguate between 'product doesn't work' vs 'test is
+retarded'".
+
+**Why.** A red from real use has one meaning: the product failed a person. A red from anything else
+has three (ADR-018, "A red gate has three meanings"), and the day this was decided spent hours on the
+other two. #42's direct control counted a *retired* circuit at the anchor, a proxy. R41's calibration
+measured its own flooding thread and macOS Spotlight. The adapter-stream proof relied on a slow
+machine. None of these found a defect. Real use found the real ones: rooms past 256 KiB unreadable
+from the CLI (#183), and quinn dropping a tunnel to 1200-byte packets after congestion loss.
+
+**What was deleted** (36 test files, and the support and fixture files only they used: `vnet.rs`,
+`perf_r42.rs`, the v0.1.0 genesis fixture, and vox-core's dev-dependencies). Each ran nodes
+in-process and never ran the binary:
+`agentcomms_gate`, `a_join_is_not_hostage_to_one_member`, `a_live_duplicate_is_decided_alike`,
+`a_restarted_host_is_reached_through_its_anchor`, `a_second_circuit_is_decided_alike`,
+`a_silent_stream_cannot_wedge_the_node`, `a_vox_name_is_not_a_licence_to_wedge`,
+`a_want_cannot_wedge_a_room`, `anchor_hostname_gate`, `atrest_profile_floor`,
+`displaced_relay_is_let_go`, `idle_connection_survives`, `m17_11_parked_stream_proof`,
+`m17_13_v010_compat_proof`, `mux_circuit_addressing`, `nat_holepunch_through_nat`, `node_m13_gate`,
+`node_m15_anchor_gate`, `node_m15_session_from_bundle_gate`, `node_m17_up_gate`,
+`node_m18_revocation_gate`, `node_m19_fanout_gate`, `node_m19_ipc_gate`, `node_m19_trust_gate`,
+`node_m19_untrust_lock_gate`, `perf_r40_relayed_chat_gate`, `perf_r42_first_connect_{open,punch,relay}_gate`,
+`relayed_path_is_retried`, `retire_keeps_carried_paths`, `sec_forward_binds_loopback_only`,
+`sec_no_consent_without_a_ring_entry`, `transport_mtu_and_window_proof`, `watchdog_proof`, and
+vox-tui's in-process `interrupt_proof`.
+
+**Claims already held by real use** (unchanged): relayed chat under a second
+(`perf_r40_relayed_chat_proof`), a restarted relayed host reached again (`a_relayed_host_restart_is_reached_again_proof`),
+tunnel throughput (`perf_r41_tunnel_throughput_proof`), relay circuits on IPv6
+(`a_circuit_carries_an_ipv6_daemon_proof`), and the 56 other binary proofs.
+
+**Claims now unmeasured until a real-use proof is written**, each to be tracked as its own item: first
+connection under 2 s (R42: open, punched, relayed); a relayed pair upgrades to direct (#49); a severed
+circuit or a second circuit is not taken for a direct path (V29-15); a silent stream, a `.vox` name or a
+`want` cannot wedge the node; a join is not hostage to one member; `vox forward` binds loopback only;
+no consent without a keyring entry; revocation (M18); the path MTU follows the granted socket buffer
+(#174); the at-rest profile floor. The unshaped R42 and #174 claims are also exercised whenever R41 runs.
+
+**§5 is stale, not current.** Its in-source suites (`governance/vectors.rs`, `cpace`, `cbor`, the UPnP
+mock, `deniable/tests.rs`, the Argon2id timing spike) no longer exist in the tree: there are no
+`#[test]` or `#[cfg(test)]` items in any crate's `src/` (verified 2026-09-26). They are not restored.
+
+**Still to convert: twelve binary proofs that also run a participant in-process.** They drive the
+shipped `vox`, but start one or more other participants as an in-process `Node` where a person would
+run `vox`: `a_daemon_follows_its_anchor`, `a_long_room_reopens_proof`, `agent_hook_proof`,
+`agent_rehearsal_proof`, `daemon_proof`, `file_exchange_proof`, `it_just_works_with_a_daemon_running`,
+`opencode_plugin_proof`, `remote_interrupt_proof`, `room_verbs_proof`,
+`shutdown_releases_the_profile_proof`, `work_board_proof`. Each is to have every participant run as
+the binary, or be deleted, and is tracked as its own item.
+
+**How this is applied.** No new test may run the node in-process, assert an internal value, or stand
+in a proxy for what a person sees. A proof that needs an instrument (the R41 link emulator) keeps the
+instrument honest in its own output, and a CANNOT MEASURE names its cause. Helpers shared by real
+proofs (`support/watchdog.rs`, `support/raw_sync.rs`) stay.
+
 ## Links
 
 **Depends on**: ADR-007 (the golden evaluator suite this retains), ADR-010 (the Argon2 cost this

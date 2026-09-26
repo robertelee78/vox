@@ -127,27 +127,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
       - name: Docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-      # Real-parameter gates that are too slow unoptimized and therefore
-      # `#[ignore]`d in the debug suite: the (200,9) Equihash solve→verify
-      # (ADR-005, ≈1 s / 245 MB in release) and the production-Argon2id node +
-      # live-client lifecycle tests (ADR-016 M13; ≈0.3 s per derivation in
-      # release). Run here in release.
-      # Excluded here, and run in their own jobs below: the PRD-001 transport gates (`r40_`, `r41_`,
-      # `r42_`, ~20 minutes of the suite — the relay gate alone 11-22), so they run in parallel with
-      # this job instead of after it; and `cross_process_join_proof`, a known flake (ADR-018, "Two
+      # The proofs that drive the shipped `vox` with production parameters (Argon2id, real
+      # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
+      # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
+      # product is a test", 2026-09-26). Run here in release.
+      # Excluded here, and run in their own jobs below: the PRD-001 transport proofs (`r40_`, `r41_`),
+      # the slowest part of the suite, so they run in parallel with this job instead of after it; and `cross_process_join_proof`, a known flake (ADR-018, "Two
       # proofs are excluded from the release gate, by name"), reported but never blocking.
       # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
       - name: Real-parameter gates (release)
         run: |
           cargo test --release --workspace --no-fail-fast -- --ignored \
-            --skip r40_ --skip r41_ --skip r42_ \
+            --skip r40_ --skip r41_ \
             --skip two_agents_on_separate_processes_join_through_an_anchor_and_talk
 
-  # **The PRD-001 transport gates, in parallel with the rest.** They are blocking — a release
+  # **The PRD-001 transport proofs, in parallel with the rest.** They are blocking — a release
   # publishes only a commit whose whole CI run passed (release.yml `ci-passed`) — but they are
-  # the slowest ~20 minutes of the suite, so they get their own runner instead of a place in line.
+  # the slowest part of the suite, so they get their own runner instead of a place in line.
   transport-gates:
-    name: transport gates (R40 · R41 · R42)
+    name: transport proofs (R40 · R41)
     strategy:
       fail-fast: false
       matrix:
@@ -165,7 +163,7 @@ jobs:
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Transport gates (release)
-        run: cargo test --release --workspace --no-fail-fast -- --ignored r40_ r41_ r42_
+        run: cargo test --release --workspace --no-fail-fast -- --ignored r40_ r41_
 
   # **Reporting only, and in its OWN job on purpose**: the proofs excluded from the gate above by
   # name. The command ends in `|| echo "::warning::"`, so it cannot fail CI, and being a separate job
