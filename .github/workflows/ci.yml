@@ -157,7 +157,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y zsh fish
+      # Its one test binary only, not the workspace: the release waits for this whole CI run
+      # (release.yml `ci-passed`), so a reporting job that compiled every test binary would set
+      # the release's pace. Safe to name: `build-test` skips this proof by its full name, so a
+      # rename makes it run there, in the blocking set, where a red is seen.
       - run: |
-          cargo test --release --workspace --no-fail-fast -- --ignored \
+          cargo test --release -p vox-tui --test cross_process_join_proof -- --ignored \
             two_agents_on_separate_processes_join_through_an_anchor_and_talk \
             || echo "::warning::cross_process_join_proof failed — known flake, ADR-018"

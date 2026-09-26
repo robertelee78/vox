@@ -248,11 +248,29 @@ fn udp_shaper(
     (addr, carried)
 }
 
-/// What the emulator itself delivers at `link` (or unshaped): plain 1,350-byte datagrams blasted
+/// What the emulator itself delivers at `link` (or unshaped): plain 1,350-byte datagrams sent
 /// through a fresh UDP shaper for two seconds, counted where they land. A link the emulator cannot
 /// carry is not a link Vox can be measured on, so a gated link below [`EMULATOR_FIDELITY`] of its
 /// rate is reported as CANNOT MEASURE rather than blamed on the tunnel.
+///
+/// **On a link, the sender is paced at 1.05x its rate, and the best of three windows counts.** An
+/// unpaced flood is a busy thread that competes with the emulator's own threads for the CPU, which
+/// measures the emulator under an overload the real transfers never create (they are paced by
+/// congestion control). On GitHub's 3-core macOS runner that competition alone took fidelity to
+/// 91.9% and 88.2% in 5 of 12 windows, where a paced sender got 96.8-98.0%. A window that catches
+/// the VM being preempted by its host loses a few percent more (2 of 18 paced windows there: 92.8%,
+/// 89.7%), and that is interference, not capacity: the capacity of an emulator is its best window.
+/// A genuinely slow emulator is slow in every window: slowed by 12 us per packet it delivered
+/// 34-63% on both runners, far below the bar. Unshaped (`None`) there is no rate to pace at, so it
+/// is one unpaced window, as before; it is reported, not gated.
 fn calibrate(link: Option<Link>) -> f64 {
+    match link {
+        Some(l) => (0..3).map(|_| calibrate_once(Some(l))).fold(0.0, f64::max),
+        None => calibrate_once(None),
+    }
+}
+
+fn calibrate_once(link: Option<Link>) -> f64 {
     let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     sink.set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
@@ -263,7 +281,23 @@ fn calibrate(link: Option<Link>) -> f64 {
         std::thread::spawn(move || {
             let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let pkt = [0x5au8; 1350];
+            // 1,350 bytes plus the 28 the emulator charges per datagram, at 1.05x the link's rate.
+            let gap = link.map(|l| Duration::from_secs_f64(1378.0 * 8.0 / (l.bits_per_sec * 1.05)));
+            let mut next = Instant::now();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(gap) = gap {
+                    let now = Instant::now();
+                    if now < next {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    // Behind by more than a burst (a stall): start again from now, not a flood.
+                    next = if now > next + Duration::from_millis(5) {
+                        now
+                    } else {
+                        next
+                    } + gap;
+                }
                 let _ = s.send_to(&pkt, front);
             }
         })
