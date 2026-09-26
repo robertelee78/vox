@@ -124,13 +124,14 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     );
 
     // ---- stand up a node with a room, as a person does: vox id, vox daemon, vox room create ----
-    let (ok, _, err) = vox(
+    let (ok, me, err) = vox(
         &data,
         &cfg,
         &["id", "--identity-passphrase-file", pass.to_str().unwrap()],
         None,
     );
     assert!(ok, "vox id: {err}");
+    let me = me.trim().to_owned();
     let _daemon = daemon(&data, &cfg, &pass, &tmp.path().join("daemon.err"));
     let (ok, _, err) = vox(
         &data,
@@ -229,12 +230,20 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     // ---- roster ----
     let (ok, out, err) = vox(&data, &cfg, &["room", "roster", &room_prefix], None);
     assert!(ok, "room roster failed: {err}");
-    assert!(!out.trim().is_empty(), "roster printed nothing");
+    // The roster names this node's own member, by its whole fingerprint (agent_comms's review
+    // of acc5dc0: "not empty" let a roster that printed "(roster unavailable)" pass).
+    assert!(
+        out.lines().any(|l| l.trim() == me),
+        "the roster must list this member ({me}), got: {out:?}"
+    );
 
     // ---- the remaining failures say something useful ----
     let (ok, _, err) = vox(&data, &cfg, &["room", "read", "zzzzzzzz"], None);
     assert!(!ok, "an unknown room should fail");
-    assert!(!err.trim().is_empty(), "an unknown room said nothing");
+    assert!(
+        err.contains("nothing here matches") && err.contains("zzzzzzzz"),
+        "an unknown room must say that nothing matches it, naming it, got: {err:?}"
+    );
 
     let (ok, _, err) = vox(
         &data,
