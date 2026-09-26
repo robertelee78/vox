@@ -2040,54 +2040,114 @@ impl ChannelState {
             applied: arrived.len(),
             ..SyncOutcome::default()
         };
-        for (author, entry_hash, payload) in arrived {
-            let key = self
-                .authors
-                .get(&author)
-                .ok_or(Error::MalformedGovernance(
-                    "synced entry from an unadmitted author",
-                ))?
-                .clone();
-            let wire = self
-                .dag
-                .get_by_hash(&entry_hash)
-                .ok_or(Error::MalformedGovernance("synced entry vanished"))?
-                .to_wire();
-            let id = self.next_log_id;
-            let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
-            if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg) {
+        if arrived.is_empty() {
+            return Ok(out);
+        }
+        // **One durable commit for the whole batch** (see `render_content_into`).
+        //
+        // Two kinds of failure, kept apart as they were when each entry committed on its own:
+        // - an entry this node refuses (an unadmitted author, bad governance) stops the pass
+        //   **without** poisoning the room: what came before it is still committed and rendered,
+        //   and the refusal is returned after that;
+        // - a failed write poisons the room, because memory has advanced past what is on disk.
+        let mut rendered_rows: Vec<Rendered> = Vec::new();
+        let mut refused: Option<Error> = None;
+        let mut batch = match store.batch() {
+            Ok(b) => b,
+            Err(e) => {
                 self.poisoned = true;
                 return Err(e);
             }
-            self.next_log_id = id.saturating_add(1);
-            match classify_payload(&payload)? {
-                EntryKind::Governance => {
-                    let entry = self
+        };
+        let mut write_failed: Option<Error> = None;
+        for (author, entry_hash, payload) in arrived {
+            let step =
+                (|| -> Result<std::result::Result<Option<Rendered>, Error>> {
+                    // A refusal, not a write failure: `Ok(Err(..))`.
+                    macro_rules! refuse {
+                        ($e:expr) => {
+                            match $e {
+                                Ok(v) => v,
+                                Err(e) => return Ok(Err(e)),
+                            }
+                        };
+                    }
+                    let key = refuse!(self.authors.get(&author).cloned().ok_or(
+                        Error::MalformedGovernance("synced entry from an unadmitted author")
+                    ));
+                    let wire = refuse!(self
                         .dag
                         .get_by_hash(&entry_hash)
-                        .ok_or(Error::MalformedGovernance("synced entry vanished"))?
-                        .clone();
-                    let gov = GovEntry::from_verified_log_entry(
-                        &entry,
-                        &key,
-                        &self.channel_id,
-                        self.gov_heads(),
-                    )?;
-                    self.gov_entries.push(gov);
-                    self.evaluator = Arc::new(Self::build_evaluator(
-                        &self.genesis,
-                        &self.authors,
-                        &self.gov_entries,
-                        now_secs,
-                    )?);
-                    out.governance += 1;
-                }
-                EntryKind::Content => {
-                    if self.render_content(store, author, entry_hash, &payload, now_secs)? {
-                        out.rendered += 1;
+                        .ok_or(Error::MalformedGovernance("synced entry vanished")))
+                    .to_wire();
+                    // Written before the entry is classified, exactly as each entry was when it
+                    // committed on its own: a refusal below still leaves its log row stored.
+                    let id = self.next_log_id;
+                    let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
+                    batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
+                    self.next_log_id = id.saturating_add(1);
+                    let kind = refuse!(classify_payload(&payload));
+                    let gov = match kind {
+                        EntryKind::Governance => {
+                            let entry = refuse!(self
+                                .dag
+                                .get_by_hash(&entry_hash)
+                                .ok_or(Error::MalformedGovernance("synced entry vanished")))
+                            .clone();
+                            Some(refuse!(GovEntry::from_verified_log_entry(
+                                &entry,
+                                &key,
+                                &self.channel_id,
+                                self.gov_heads(),
+                            )))
+                        }
+                        EntryKind::Content => None,
+                    };
+                    if let Some(gov) = gov {
+                        self.gov_entries.push(gov);
+                        self.evaluator = Arc::new(refuse!(Self::build_evaluator(
+                            &self.genesis,
+                            &self.authors,
+                            &self.gov_entries,
+                            now_secs,
+                        )));
+                        out.governance += 1;
+                        return Ok(Ok(None));
                     }
+                    Ok(Ok(self.render_content_into(
+                        &mut batch, author, entry_hash, &payload,
+                    )?))
+                })();
+            match step {
+                Ok(Ok(Some(r))) => rendered_rows.push(r),
+                Ok(Ok(None)) => {}
+                Ok(Err(refusal)) => {
+                    refused = Some(refusal);
+                    break;
+                }
+                Err(e) => {
+                    write_failed = Some(e);
+                    break;
                 }
             }
+        }
+        let committed = match write_failed {
+            Some(e) => Err(e),
+            None => (|| -> Result<()> {
+                if !rendered_rows.is_empty() {
+                    self.queue_receivers(&mut batch)?;
+                }
+                batch.commit()
+            })(),
+        };
+        if let Err(e) = committed {
+            self.poisoned = true;
+            return Err(e);
+        }
+        out.rendered += rendered_rows.len();
+        self.timeline.extend(rendered_rows);
+        if let Some(refusal) = refused {
+            return Err(refusal);
         }
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
@@ -2216,15 +2276,33 @@ impl ChannelState {
                 })
                 .collect(),
         };
-        let mut rendered = 0usize;
-        for (entry_hash, payload, _seq) in pending {
-            if !matches!(classify_payload(&payload), Ok(EntryKind::Content)) {
-                continue;
+        let _ = now_secs;
+        // One durable commit for the whole backfill (see `render_content_into`).
+        let mut rows: Vec<Rendered> = Vec::new();
+        let result = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            for (entry_hash, payload, _seq) in pending {
+                if !matches!(classify_payload(&payload), Ok(EntryKind::Content)) {
+                    continue;
+                }
+                if let Some(r) =
+                    self.render_content_into(&mut batch, *author, entry_hash, &payload)?
+                {
+                    rows.push(r);
+                }
             }
-            if self.render_content(store, *author, entry_hash, &payload, now_secs)? {
-                rendered += 1;
+            if rows.is_empty() {
+                return Ok(());
             }
+            self.queue_receivers(&mut batch)?;
+            batch.commit()
+        })();
+        if let Err(e) = result {
+            self.poisoned = true;
+            return Err(e);
         }
+        let rendered = rows.len();
+        self.timeline.extend(rows);
         Ok(rendered)
     }
 
@@ -2243,21 +2321,66 @@ impl ChannelState {
         payload: &[u8],
         now_secs: u64,
     ) -> Result<bool> {
+        let _ = now_secs;
+        let persisted = (|| -> Result<Option<Rendered>> {
+            let mut batch = store.batch()?;
+            let Some(rendered) =
+                self.render_content_into(&mut batch, author, entry_hash, payload)?
+            else {
+                return Ok(None);
+            };
+            self.queue_receivers(&mut batch)?;
+            batch.commit()?;
+            Ok(Some(rendered))
+        })();
+        match persisted {
+            Ok(Some(rendered)) => {
+                self.timeline.push(rendered);
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(e) => {
+                // The chain advanced in memory but the advance was not persisted: a
+                // reopen would re-derive a consumed key. Poison instead.
+                self.poisoned = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Decrypt one content payload and queue its sealed plaintext-cache row into `batch`,
+    /// returning the rendered row for the caller to add to the timeline **once the batch has
+    /// committed** — or `None` when this node may not, or cannot, read it (see
+    /// [`Self::render_content`]).
+    ///
+    /// **One transaction per pass, not two per entry.** Each entry used to commit its own cache
+    /// row and its own copy of the receiver chains — two durable commits, about 17 ms apiece on
+    /// macOS, taken while holding the room's lock. A sync delivering 133 of another member's
+    /// messages held the room for 2.3 s, and every post made in that room waited behind it
+    /// (V210-08, #179: `vox room post` p95 of seconds while a peer posts). The caller queues the
+    /// receiver chains once, after its loop, and commits once.
+    fn render_content_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        author: Digest32,
+        entry_hash: Digest32,
+        payload: &[u8],
+    ) -> Result<Option<Rendered>> {
         let me = self.me();
         if author != me && !self.may_read(&author, &me) {
-            return Ok(false);
+            return Ok(None);
         }
         let msg = match GroupMessage::from_wire(payload) {
             Ok(m) => m,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(None),
         };
         let slot = (author, msg.header.chain_id);
         let Some(chain) = self.receivers.get_mut(&slot) else {
-            return Ok(false);
+            return Ok(None);
         };
         let plaintext = match chain.decrypt(&msg) {
             Ok(p) => Zeroizing::new(p),
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(None),
         };
         // **Skipped, not propagated** — matching the three `Ok(false)` paths above it.
         //
@@ -2274,7 +2397,7 @@ impl ChannelState {
         // change degrades to "that one message did not render" instead of "the room stopped
         // rendering". Found in review by the other session, not by me, and not by a test.
         let Ok(content) = Content::from_canonical_slice(&plaintext) else {
-            return Ok(false);
+            return Ok(None);
         };
         let rendered = Rendered {
             entry_hash,
@@ -2291,38 +2414,30 @@ impl ChannelState {
             id,
             &cache_bytes(&rendered),
         )?;
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::PlaintextCache,
+            id,
+            &cache_seg,
+        )?;
+        self.next_log_id = id.saturating_add(1);
+        Ok(Some(rendered))
+    }
+
+    /// Queue the receiver chains, as they stand now, into `batch`.
+    fn queue_receivers(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
         let receivers_seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_RECEIVERS,
             &receivers_bytes(&self.receivers),
         )?;
-        let persisted = (|| -> Result<()> {
-            let mut batch = store.batch()?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::PlaintextCache,
-                id,
-                &cache_seg,
-            )?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_RECEIVERS,
-                &receivers_seg,
-            )?;
-            batch.commit()
-        })();
-        if let Err(e) = persisted {
-            // The chain advanced in memory but the advance was not persisted: a
-            // reopen would re-derive a consumed key. Poison instead.
-            self.poisoned = true;
-            return Err(e);
-        }
-        self.next_log_id = id.saturating_add(1);
-        self.timeline.push(rendered);
-        let _ = now_secs;
-        Ok(true)
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_RECEIVERS,
+            &receivers_seg,
+        )
     }
 
     /// Accept an entry authored by **another** member (M14.5; the bytes arrive from
