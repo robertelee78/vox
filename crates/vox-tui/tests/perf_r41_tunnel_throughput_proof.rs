@@ -443,8 +443,12 @@ impl Proc {
         .flatten()
         {
             let sink = Arc::clone(&lines);
+            let who = name.to_string();
             std::thread::spawn(move || {
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    if line.contains("vox: PATH") {
+                        eprintln!("[{who}] {line}");
+                    }
                     sink.lock().unwrap().push(line);
                 }
             });
