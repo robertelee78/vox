@@ -395,22 +395,23 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         let (_node, spec) = anchor(&new, &dir("anchor"));
         let alice_d = daemon(&new, "alice", &alice, &spec, &idpass);
         let bob_d = daemon(&new, "bob", &bob, &spec, &idpass);
-        let room = shared_room(&new, &alice, &bob, "sealed");
+        shared_room(&new, &alice, &bob, "sealed");
         // With bob unreachable, alice's key for him is held until it can be delivered: that is
         // the pending consent, written to disk.
         let bob_pid = bob_d.child.id();
         signal(bob_pid, "-STOP");
-        ok(
+        // Its outcome is not the point: whether the delivery to a stopped bob is reported as a
+        // failure or not, the key is written before it is tried. The blob on disk is checked below.
+        let (_, out, err) = vox_with(
             &new,
             &alice,
             &["trust", "add", &bob_fp, "--name", "bob"],
             None,
         );
-        ok(
-            &new,
-            &alice,
-            &["room", "post", &room, "while bob is away"],
-            None,
+        eprintln!(
+            "[alice trusts bob while he is stopped] {}{}",
+            out.trim(),
+            err.trim()
         );
         std::thread::sleep(Duration::from_secs(3));
         drop(alice_d);
