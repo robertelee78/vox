@@ -46,14 +46,101 @@
 mod watchdog;
 
 use std::io::Write;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
-use vox_core::node::actor::{Clock, Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, Secret};
 use vox_core::node::paths::Paths;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
+
+/// A real `vox daemon` holding a profile with one room, set up as a person would: `vox id`,
+/// `vox daemon`, `vox room create`. Every participant in these proofs is the shipped binary.
+struct Daemon {
+    child: Child,
+    data: PathBuf,
+    cfg: PathBuf,
+    /// The room's full base32 key, from its invite link.
+    room_key: String,
+    /// This identity's fingerprint, as `vox id` prints it.
+    fingerprint: String,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Daemon {
+    fn start(root: &Path) -> Self {
+        let (data, cfg) = (root.join("data"), root.join("cfg"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        let pass = root.join("identity.pass");
+        std::fs::write(&pass, "identity passphrase").unwrap();
+        let (ok, out, err) = hook(
+            &data,
+            &cfg,
+            &["id", "--identity-passphrase-file", pass.to_str().unwrap()],
+            "",
+        );
+        assert!(ok, "vox id: {err}");
+        let fingerprint = out.trim().to_owned();
+        let child = Command::new(VOX)
+            .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+            .arg(&pass)
+            .env("VOX_DATA_DIR", &data)
+            .env("VOX_CONFIG_DIR", &cfg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(root.join("daemon.err")).unwrap(),
+            ))
+            .spawn()
+            .expect("spawn vox daemon");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !hook(&data, &cfg, &["room", "list"], "").0 {
+            assert!(Instant::now() < deadline, "the daemon never answered");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let (ok, _, err) = hook(
+            &data,
+            &cfg,
+            &["room", "create", "--name", "agents"],
+            "channel passphrase",
+        );
+        assert!(ok, "vox room create: {err}");
+        let label = hook(&data, &cfg, &["room", "list"], "")
+            .1
+            .split_whitespace()
+            .next()
+            .expect("a room")
+            .to_owned();
+        let (ok, link, err) = hook(&data, &cfg, &["room", "invite", &label], "");
+        assert!(ok, "vox room invite: {err}");
+        let room_key = link
+            .trim()
+            .strip_prefix("vox://")
+            .and_then(|l| l.split('?').next())
+            .expect("an invite link naming the room")
+            .to_owned();
+        Self {
+            child,
+            data,
+            cfg,
+            room_key,
+            fingerprint,
+        }
+    }
+
+    /// Post `text` to the room exactly as given, through `vox room post … -` (stdin).
+    fn post(&self, text: &str) {
+        let label: String = self.room_key.chars().take(12).collect();
+        let (ok, _, err) = hook(&self.data, &self.cfg, &["room", "post", &label, "-"], text);
+        assert!(ok, "vox room post: {err}");
+    }
+}
 
 /// A Claude Code `UserPromptSubmit` payload, in the shape the spike measured.
 fn claude_input(session: &str) -> String {
@@ -66,10 +153,6 @@ fn claude_input(session: &str) -> String {
 /// which is exactly what `auto` keys off.
 fn codex_input(session: &str) -> String {
     format!(r#"{{"session_id":"{session}","cwd":"/tmp"}}"#)
-}
-
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
 }
 
 fn hook(
@@ -109,7 +192,6 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
 
     // (6) with nothing running at all, the hook still exits 0.
     let (ok, out, _) = hook(
@@ -121,52 +203,10 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     assert!(ok, "a hook must exit 0 even with no node running");
     assert!(out.is_empty(), "it must inject nothing when it cannot read");
 
-    // ---- a node, a room, and one message waiting ----
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let clock: Clock = Arc::new(|| 1_800_000_000);
-    let node: NodeHandle = rt
-        .block_on(async {
-            Node::spawn_with(
-                paths.clone(),
-                clock,
-                vox_core::atrest::sek::Argon2Profile::default(),
-            )
-        })
-        .unwrap();
-    let cid = rt.block_on(async {
-        assert!(node
-            .apply(NodeCommand::CreateIdentity {
-                passphrase: secret("identity passphrase"),
-            })
-            .await
-            .is_done());
-        assert!(node
-            .apply(NodeCommand::CreateChannel {
-                local_name: "agents".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-        assert!(node
-            .apply(NodeCommand::SendText {
-                channel_id: node.view().channels[0].channel_id,
-                text: "PLAN: port the wire codec".into(),
-            })
-            .await
-            .is_done());
-        node.view().channels[0].channel_id
-    });
-    let _server = rt
-        .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
-        .expect("bind");
-    let room: String = vox_core::node::link::b32_encode(&cid)
-        .chars()
-        .take(8)
-        .collect();
+    // ---- a daemon, a room, and one message waiting ----
+    let daemon = Daemon::start(tmp.path());
+    daemon.post("PLAN: port the wire codec");
+    let room: String = daemon.room_key.chars().take(8).collect();
 
     // (1) Claude Code's shape.
     let (ok, out, err) = hook(
@@ -307,60 +347,16 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
     const MAX: usize = vox_tui::agent_hook::MAX_INJECTED_MESSAGES;
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
-    let data = tmp.path().join("data");
-    let cfg = tmp.path().join("cfg");
+    let daemon = Daemon::start(tmp.path());
+    let (data, cfg) = (daemon.data.clone(), daemon.cfg.clone());
     let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let clock: Clock = Arc::new(|| 1_800_000_000);
-    let node: NodeHandle = rt
-        .block_on(async {
-            Node::spawn_with(
-                paths.clone(),
-                clock,
-                vox_core::atrest::sek::Argon2Profile::default(),
-            )
-        })
-        .unwrap();
-    let cid = rt.block_on(async {
-        assert!(node
-            .apply(NodeCommand::CreateIdentity {
-                passphrase: secret("identity passphrase"),
-            })
-            .await
-            .is_done());
-        assert!(node
-            .apply(NodeCommand::CreateChannel {
-                local_name: "agents".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-        node.view().channels[0].channel_id
-    });
-    let send = |text: &str| {
-        rt.block_on(async {
-            assert!(node
-                .apply(NodeCommand::SendText {
-                    channel_id: cid,
-                    text: text.into(),
-                })
-                .await
-                .is_done());
-        });
-    };
-    let _server = rt
-        .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
-        .expect("bind");
-    let room_key = vox_core::node::link::b32_encode(&cid);
+    let send = |text: &str| daemon.post(text);
+    let room_key = daemon.room_key.clone();
     let label: String = room_key.chars().take(12).collect();
     // A member is named by 26 base32 characters (130 bits) of its fingerprint, not a prefix short
     // enough to grind a lookalike for (#198: the drain showed 8, 40 bits). Written as a literal,
     // not the product's constant, so shrinking the constant is caught here.
-    let fingerprint = vox_core::node::link::b32_encode(&node.view().identity.unwrap().fingerprint);
+    let fingerprint = daemon.fingerprint.clone();
     let me: String = fingerprint.chars().take(26).collect();
     let turn = |session: &str| -> String {
         let (ok, out, err) = hook(
