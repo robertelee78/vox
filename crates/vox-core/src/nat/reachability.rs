@@ -389,7 +389,20 @@ pub async fn connect_direct_within(
                 None => true,
             }
     };
-    let candidates: Vec<SocketAddr> = candidates.iter().copied().filter(reachable).collect();
+    // **An IPv4-mapped IPv6 address is an IPv4 address.** A peer on a dual-stack socket (`[::]`)
+    // sees an IPv4 sender as `::ffff:a.b.c.d`, and that is what it reports back as the sender's
+    // observed address — the reflexive address a hole punch trades. Filtered by family as it
+    // stands, an IPv4-bound node dropped the only address its peer can be punched at, and fired
+    // nothing: measured through the shipped binary behind two userspace NATs (RP-23), the
+    // responder sent not one datagram while the initiator's went unanswered at 1, 2, 4 and 7 s.
+    let candidates: Vec<SocketAddr> = candidates
+        .iter()
+        .map(|c| match (local, c.ip().to_canonical()) {
+            (Some(SocketAddr::V4(_)), ip @ std::net::IpAddr::V4(_)) => SocketAddr::new(ip, c.port()),
+            _ => *c,
+        })
+        .filter(reachable)
+        .collect();
     if candidates.is_empty() {
         return Err(Error::Unreachable("no direct candidates"));
     }
