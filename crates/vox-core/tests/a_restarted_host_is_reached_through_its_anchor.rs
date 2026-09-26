@@ -1,5 +1,7 @@
-//! v0.2.9 #6 — **a host that restarts is reachable through its anchor again within one
-//! `SILENCE_IS_DEATH`**, not after QUIC's 60s idle timeout.
+//! #6 / #40 — **a host that restarts is reachable through its anchor again within seconds**, not
+//! after one `SILENCE_IS_DEATH` (30s) and not after QUIC's 60s idle timeout.
+//!
+//! *Tightened for the active probe (#40): the bound was 45s, which only silence had to meet.*
 //!
 //! When a host crashes and comes back, every node that held a connection to the old process
 //! keeps holding it: the old process's close never left the box, and nothing else says it is
@@ -9,8 +11,10 @@
 //! it on the dead connection, and the service is unreachable for up to a minute. The client is
 //! stuck the same way on its own side: its relayed connection to the old process looks live too.
 //!
-//! The rule under test (`node::net::SILENCE_IS_DEATH`): a connection that has received nothing
-//! for 1.5 keep-alive intervals is dead, and a live one to the same peer takes over. Nothing here
+//! The rules under test: when a newcomer arrives for a peer, the connection held for it is
+//! **probed** (`ConnectionManager::probe_held`) and closed if nothing answers within a few round
+//! trips; and a connection that has received nothing for 1.5 keep-alive intervals is dead
+//! (`node::net::SILENCE_IS_DEATH`), which is what remains when no newcomer arrives. Nothing here
 //! looks at addresses, and the two restarts staged are the two an address rule gets wrong or
 //! cannot tell apart:
 //!
@@ -62,10 +66,13 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// coin rescues) makes it rarer still.
 const RESTARTS: usize = 3;
 
-/// The bound on "reachable again", from the crash: `SILENCE_IS_DEATH` (30s), plus the node's 1s
-/// tick, plus a circuit being set up afresh through the ladder. Well under the 60s idle timeout
-/// the old behaviour waited out, so the two cannot be confused.
-const REACHABLE_AGAIN_WITHIN: Duration = Duration::from_secs(45);
+/// The bound on "reachable again", from the moment the restarted host (and the client) are back
+/// up. The restarted host's new connection reaches the anchor at once; the anchor's probe of the
+/// dead ones it held goes unanswered within its patience (at most 2s), and the anchor files the
+/// new one. 10s leaves room for a circuit set up afresh. Without the probe it is about
+/// `SILENCE_IS_DEATH` (30s) less the restart time whenever a dead connection won the tie-break,
+/// and without liveness at all the 60s idle timeout, so neither can pass by being merely slow.
+const REACHABLE_AGAIN_WITHIN: Duration = Duration::from_secs(10);
 
 fn secret(s: &str) -> Secret {
     Secret::new(s.as_bytes().to_vec())
@@ -435,6 +442,14 @@ fn restarts_are_recognised_by_silence(comeback: Comeback) {
             net.sever(&a_sock);
             let _ = alice.apply(NodeCommand::Shutdown).await;
             let crashed = Instant::now();
+            eprintln!(
+                "{:.3} [dbg] crash round {round}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64()
+                    % 1000.0
+            );
             a_sock = match comeback {
                 Comeback::SameAddress => net.replug(a_inner),
                 Comeback::NewAddress => {
@@ -480,7 +495,7 @@ fn restarts_are_recognised_by_silence(comeback: Comeback) {
                 &hostname,
                 port,
                 crashed,
-                REACHABLE_AGAIN_WITHIN + Duration::from_secs(30),
+                back_up + REACHABLE_AGAIN_WITHIN + Duration::from_secs(50),
             )
             .await;
             // Either end's view will do, and each is only as fresh as its last publish; with both
@@ -504,7 +519,11 @@ fn restarts_are_recognised_by_silence(comeback: Comeback) {
                 back_up.as_secs_f64(),
                 round_started.elapsed().as_secs_f64()
             );
-            elapsed.push(took);
+            // Measured from when both nodes were back, not from the crash: how long a restart
+            // takes (an Argon2id unlock, a store opened) is not what is under test, and on a
+            // loaded box it alone was 20-46s. What is under test is how long a host that is back
+            // stays unreachable through its anchor.
+            elapsed.push(took.map(|t| t.saturating_sub(back_up)));
             if took.is_some() {
                 assert!(
                     relayed,
@@ -532,15 +551,17 @@ fn restarts_are_recognised_by_silence(comeback: Comeback) {
             })
             .collect();
         eprintln!(
-            "[test] {} of {} restarts reachable again within {}s",
+            "[test] {} of {} restarts reachable again within {}s of both nodes being back",
             elapsed.len() - over.len(),
             elapsed.len(),
             REACHABLE_AGAIN_WITHIN.as_secs()
         );
         assert!(
             over.is_empty(),
-            "a restarted host stayed unreachable through its anchor past {}s — the anchor (or the \
-             client) kept the dead process's connection until QUIC's idle timeout: {over:?}",
+            "a restarted host stayed unreachable through its anchor for more than {}s after it was \
+             back — the anchor (or the \
+             client) kept the dead process's connection instead of asking whether anyone was \
+             there (~30s: silence caught it; ~60s: nothing did): {over:?}",
             REACHABLE_AGAIN_WITHIN.as_secs()
         );
 

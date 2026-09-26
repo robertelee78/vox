@@ -390,7 +390,20 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   `a_live_duplicate_is_decided_alike` (a member whose NAT rebinds dials the anchor twice: 0 of 24
   trials disagree; with the address rule, 12 of 24). Residual: the datagram count is taken before
   authentication, so an on-path attacker that knows a connection ID can keep a dead connection looking
-  alive — which returns the node to the 60 s idle timeout, no worse than before.)* Both ends apply the same rule, so the upgrade lands with no
+  alive — which returns the node to the 60 s idle timeout, no worse than before.)* *(Amended again for #40,
+  the active probe: silence alone left a restarted peer unreachable for up to 30 s, because its new
+  connection arrives seconds after the crash and loses the tie-break to the dead one half the time. So
+  before a newcomer is filed, **every** connection held for that peer — the primary and any retired one —
+  is probed: one unframed byte as a QUIC datagram, ack-eliciting, dropped unread by the far end's
+  `recv_datagram`. Anything arriving within 3 × RTT (clamped to 250 ms–2 s) is an answer; a connection
+  with none is closed. Retired connections are probed too because a dead one within its 30 s of allowed
+  silence was promoted when a primary closed, which cost 28 s in about one restart in twenty. Two live
+  duplicates are probed from both ends and each end's probe is traffic the other hears — the dialling
+  side's probe even migrates the old connection onto a rebound NAT port — so both still go to `tie_key`.
+  Proved by `a_restarted_host_is_reached_through_its_anchor` with its bound tightened to 10 s after both
+  nodes are back: 36 of 36 restarts reachable within 0.1 s of being back; probe disabled, 5 of 12 took
+  28.0–28.6 s. And by `a_live_duplicate_is_decided_alike`: 0 of 24 disagree; probing on one side only,
+  15 of 24.)* Both ends apply the same rule, so the upgrade lands with no
   protocol: the side that punched files the direct connection as an improvement, and the side that
   accepted it does too. A circuit attempt abandoned because another rung won tears itself down on drop
   (its driver is aborted, the port detaches, the stream closes, and the relay and the far side let go).

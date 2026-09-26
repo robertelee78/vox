@@ -597,9 +597,11 @@ impl NodeNet {
                 //
                 // `ask_observed` returns a `Result` and its callers tolerate failure,
                 // falling back to local endpoints.
+                //
+                // Asked of the connection, not the mux table: a circuit the table has since
+                // detached still left a synthetic address here (V29-15).
                 let remote = conn.quinn().remote_address();
-                let observed =
-                    (!self.manager.endpoint().is_circuit(remote)).then(|| Multiaddr::from(remote));
+                let observed = (!conn.via_circuit()).then(|| Multiaddr::from(remote));
                 let manager = Arc::clone(&self.manager);
                 match coordstream::serve_coord(
                     peer,
@@ -773,7 +775,7 @@ impl NodeNet {
         let mut why: Vec<String> = Vec::with_capacity(set.len());
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok((_, Ok(conn))) => return Ok(self.manager.adopt(conn)),
+                Ok((_, Ok(conn))) => return Ok(self.manager.adopt(conn).await),
                 Ok((rung, Err(e))) => why.push(format!("{rung}: {e}")),
                 Err(_) => why.push("a rung was cancelled".to_owned()),
             }
@@ -851,7 +853,7 @@ impl NodeNet {
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok(Ok(conn)) => {
-                    let filed = self.manager.adopt(conn);
+                    let filed = self.manager.adopt(conn).await;
                     // `adopt` keeps the better of the two; only a real replacement is an
                     // upgrade.
                     if !std::ptr::eq(Arc::as_ptr(&filed), current.as_ptr()) {
@@ -901,7 +903,7 @@ impl NodeNet {
         let conn =
             coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
                 .await?;
-        Ok(self.manager.adopt(conn))
+        Ok(self.manager.adopt(conn).await)
     }
 
     /// Rung 4 on its own: ask `relay` to carry a circuit to `peer` and dial `peer`
@@ -914,7 +916,7 @@ impl NodeNet {
     ) -> Result<Arc<VoxConnection>> {
         let conn = circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now())
             .await?;
-        Ok(self.manager.adopt(conn))
+        Ok(self.manager.adopt(conn).await)
     }
 
     /// The responder's side of rung 3, on a session a coordinator relayed here: run the
@@ -932,7 +934,7 @@ impl NodeNet {
         let conn =
             coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
                 .await?;
-        Ok(self.manager.adopt(conn))
+        Ok(self.manager.adopt(conn).await)
     }
 
     /// What this node's board anchors: every channel it holds a genesis for, with

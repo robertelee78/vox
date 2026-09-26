@@ -19,6 +19,14 @@
 //! anchor saw the two connections from different addresses — otherwise it would not be staging
 //! the case at all.
 //!
+//! **Since the active probe (#40)** this is also the gate for "a probe never kills a live
+//! duplicate". Each trial files two live connections for one peer, concurrently, at both ends, and
+//! each end probes the other's held connection before filing. Two things must hold, and a
+//! disagreement here is how either shows: the dialling end's probe is traffic the anchor hears
+//! (with the anchor's probe alone, a rebound NAT hides the old connection and 15/24 trials
+//! disagreed); and a verdict is re-checked under the lock when it is acted on, so a connection that
+//! answered late, or was filed while the probes were awaited, is not closed.
+//!
 //! Real QUIC, real handshakes, the real `ConnectionManager` on both ends, over the in-process
 //! NAT network. `#[ignore]`d in the debug suite; CI runs it in the release step.
 
@@ -125,6 +133,12 @@ async fn trial(n: usize) -> ([u8; 8], [u8; 8], [u8; 8], [u8; 8], bool, [u8; 8]) 
     // new port at the anchor, and then both connections come from one address and the case is
     // not staged; after the tail the first connection is quiet until its next keep-alive, 20s on.
     tokio::time::sleep(Duration::from_millis(500)).await;
+    // Where the anchor places the first connection before the NAT rebinds. The second dial must
+    // arrive from somewhere else, or this is not the rebinding case. (Measured here, not at
+    // the second filing: since the active probe, the member's probe on the first connection
+    // migrates it to the new port at the anchor before the anchor files the second one — the
+    // very traffic that tells the anchor the first connection is live.)
+    let first_seen_from = first_filed.kept.quinn().remote_address();
 
     // The NAT rebinds under the live process, and the process dials again.
     let dropped = net.rebind(m_inner);
@@ -135,7 +149,7 @@ async fn trial(n: usize) -> ([u8; 8], [u8; 8], [u8; 8], [u8; 8], bool, [u8; 8]) 
         .await
         .expect("second dial");
     let second_tag = tag(&second);
-    let member_kept = member.adopt(second);
+    let member_kept = member.adopt(second).await;
     let second_filed = recv_filed(&mut filed_rx).await;
     let second_seen_from = if tag(&second_filed.kept) == second_tag {
         second_filed.kept.quinn().remote_address()
@@ -147,9 +161,6 @@ async fn trial(n: usize) -> ([u8; 8], [u8; 8], [u8; 8], [u8; 8], bool, [u8; 8]) 
             .quinn()
             .remote_address()
     };
-    // Where the anchor places the first connection **now**, as the second is filed: that is the
-    // comparison an address rule makes, so it is the one that says whether this was staged.
-    let first_seen_from = first_filed.kept.quinn().remote_address();
     let staged = first_seen_from != second_seen_from;
 
     // Settled: both ends' current connection, after any close has crossed.

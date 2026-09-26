@@ -288,6 +288,15 @@ pub enum WireError {
     /// diagnosed as speaking the wrong version (ADR-008, ADR-016 M15.2c).
     #[error("transport failed")]
     TransportFailed = 0x09,
+    /// `0x0A` — this end closed the connection because the peer **stopped answering**: a
+    /// liveness probe went unanswered, or nothing arrived for `SILENCE_IS_DEATH` (ADR-012,
+    /// #40). The connection is presumed to lead to a process that no longer exists — a peer
+    /// that crashed and restarted — so the close is bookkeeping, and nothing about the peer's
+    /// identity or its frames was wrong. Before this code existed these closes carried
+    /// `0x05` (authenticator invalid), which any log or live peer would read as an
+    /// authentication failure.
+    #[error("no answer to a liveness probe")]
+    Unresponsive = 0x0A,
 }
 
 impl WireError {
@@ -308,6 +317,7 @@ impl WireError {
             0x07 => Some(WireError::SyncModeUnsupported),
             0x08 => Some(WireError::EpochMismatch),
             0x09 => Some(WireError::TransportFailed),
+            0x0A => Some(WireError::Unresponsive),
             _ => None,
         }
     }
