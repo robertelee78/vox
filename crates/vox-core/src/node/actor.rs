@@ -4304,16 +4304,29 @@ impl Node {
         ) else {
             return Outcome::Failed(Fault::UnknownChannel);
         };
+        // **The held key leaves the store before the consent is recorded, never after.** Removed
+        // after, a failed save left a delivered key on disk, and after a revocation and a new
+        // consent that stale pre-rotation key would have been the one delivered (found in
+        // verification of #203). Removed first, a key on disk means no consent was recorded for
+        // it. So a failed removal is refused, loudly, with nothing recorded: the key stays held,
+        // and the next attempt delivers the same key again. A failure between the removal and the
+        // record can only lose the held key, so that consent is taken again from a later position:
+        // narrower, never wider.
+        if self.consent_keys.get(channel_id, &target).is_some() {
+            let mut next = self.consent_keys.clone();
+            next.remove(channel_id, &target);
+            let saved = profile
+                .signer()
+                .and_then(|signer| next.save(profile.store(), signer));
+            if let Err(e) = saved {
+                return Outcome::Failed(fault_of(&e));
+            }
+            self.consent_keys = next;
+        }
         {
             let mut channel = shared.lock().await;
             if let Err(e) = channel.issue_consent(profile, target, &skdm, now) {
                 return Outcome::Failed(fault_of(&e));
-            }
-        }
-        // Recorded: nothing is pending for this consent any more.
-        if self.consent_keys.remove(channel_id, &target) {
-            if let Ok(signer) = profile.signer() {
-                let _ = self.consent_keys.save(profile.store(), signer);
             }
         }
         // The generation delivered is the key's own: a key taken before a rotation is the older
