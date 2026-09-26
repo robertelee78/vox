@@ -1015,7 +1015,9 @@ pub async fn accept_authorized(
 }
 
 /// Refuse a stream `class` may not open as `kind`: uninformatively, except that a **pending joiner
-/// asking to sync** is told it is not a member here yet ([`WireError::NotYetMember`], #217).
+/// asking to sync** is told it is not a member here yet ([`WireError::NotYetMember`], #217), and a
+/// **join responder asking to sync** that the room is not held here yet
+/// ([`WireError::EpochMismatch`]).
 ///
 /// A pending joiner holds the room's invitation, so "not a member yet" tells it nothing it did not
 /// know; told `0x05`, a member that had just joined reported an integrity failure for a record
@@ -1026,10 +1028,19 @@ pub fn refuse_disallowed(
     send: &mut SendStream,
     recv: &mut RecvStream,
 ) {
-    if class == PeerClass::PendingJoiner && kind == StreamKind::Sync {
-        refuse_stream_because(send, recv, WireError::NotYetMember);
-    } else {
-        refuse_stream(send, recv);
+    match (class, kind) {
+        (PeerClass::PendingJoiner, StreamKind::Sync) => {
+            refuse_stream_because(send, recv, WireError::NotYetMember);
+        }
+        // **The member letting this node in, asking to sync before the room is held here**: this
+        // node is still sealing the room's key, and that member pushes the moment it has admitted
+        // us. Measured: alice reported seven syncs with a joiner as "authenticator invalid", every
+        // one refused at the joiner's gate with alice classed `JoinResponder`. She answered the
+        // join, so "not held here yet" (`EpochMismatch`, as the actor says it) tells her nothing.
+        (PeerClass::JoinResponder, StreamKind::Sync) => {
+            refuse_stream_because(send, recv, WireError::EpochMismatch);
+        }
+        _ => refuse_stream(send, recv),
     }
 }
 
