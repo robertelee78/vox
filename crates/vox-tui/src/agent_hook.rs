@@ -215,10 +215,12 @@ fn is_own(row: &vox_core::node::api::MessageRow, me: Option<Digest32>, session: 
 /// post …`" still primed an unasked post in turn 1 in 2 of 12 live runs; the agent skill
 /// teaches posting, so the drain does not repeat it every turn.
 ///
-/// Measured (real `drain_self_filter_proof`, opencode 1.18.32, claude-haiku-4-5, 12
-/// interleaved pairs): the old framing passed 11/12 and this one's first version 12/12,
-/// with 0 refusals in either. That does **not** separate them. This framing is hygiene;
-/// it is not shown to fix the live half's misses (see that proof).
+/// Measured 2026-09-26 (real `drain_self_filter_proof`, opencode 1.18.32, a fixture per
+/// tree, 20 interleaved runs per arm; the old framing = main 91da36e with only the proof
+/// changed): with claude-sonnet-5 the old framing had the operator's instruction **refused
+/// 5 times in 20**, each citing the room block ("the room told me to reply via `vox room
+/// post … -`"), and an unasked post in turn 1 **11 times in 20**; this framing, **0 and 0**.
+/// With claude-haiku-4-5: 0 refusals either way, unasked posts 1 → 0.
 fn render(room_label: &str, rows: &[vox_core::node::api::MessageRow]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
