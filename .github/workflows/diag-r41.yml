@@ -1,7 +1,7 @@
 name: diag-r41
 on:
   push:
-    branches: ['diag/r41-mac-path']
+    branches: ['diag/r41-cooldown']
 jobs:
   r41:
     strategy:
