@@ -112,6 +112,16 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/pyte"
           "$RUNNER_TEMP/pyte/bin/pip" install --quiet pyte==0.8.2
           echo "VOX_PYTE_PATH=$("$RUNNER_TEMP/pyte/bin/python" -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
+      # The test watchdog dumps a hung proof's threads with gdb before it aborts. Ubuntu's Yama
+      # default (`ptrace_scope` 1) lets only an ancestor attach, and gdb is the test's child — no
+      # ancestor of the test or of any `vox` it started — so every Linux dump had a census and no
+      # stack frames (#213). The runner is a throwaway VM.
+      - name: Let the test watchdog attach gdb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y gdb
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          gdb --version | head -1
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Format check
@@ -162,6 +172,16 @@ jobs:
         run: sudo mdutil -a -i off
       - name: Show toolchain
         run: rustc --version && cargo --version
+      # The test watchdog dumps a hung proof's threads with gdb before it aborts. Ubuntu's Yama
+      # default (`ptrace_scope` 1) lets only an ancestor attach, and gdb is the test's child — no
+      # ancestor of the test or of any `vox` it started — so every Linux dump had a census and no
+      # stack frames (#213). The runner is a throwaway VM.
+      - name: Let the test watchdog attach gdb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y gdb
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          gdb --version | head -1
       - name: Transport gates (release)
         run: cargo test --release --workspace --no-fail-fast -- --ignored r40_ r41_
 
@@ -175,6 +195,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y zsh fish
+      # The test watchdog dumps a hung proof's threads with gdb before it aborts. Ubuntu's Yama
+      # default (`ptrace_scope` 1) lets only an ancestor attach, and gdb is the test's child — no
+      # ancestor of the test or of any `vox` it started — so every Linux dump had a census and no
+      # stack frames (#213). The runner is a throwaway VM.
+      - name: Let the test watchdog attach gdb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y gdb
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          gdb --version | head -1
       # Its one test binary only, not the workspace: the release waits for this whole CI run
       # (release.yml `ci-passed`), so a reporting job that compiled every test binary would set
       # the release's pace. Safe to name: `build-test` skips this proof by its full name, so a

@@ -37,7 +37,9 @@
 //!   thread, so a spinning frame stands out by its count, not a single snapshot); on Linux, a
 //!   census of every thread from `/proc` with its state and the CPU it burned in the last second
 //!   (a spinning thread is the `R` one with ~100 ticks), plus `gdb`'s backtraces where it is
-//!   installed and allowed to attach.
+//!   installed and allowed to attach — which Yama's default `ptrace_scope` of 1 forbids, since
+//!   gdb is no ancestor of the process it dumps. CI sets the scope to 0; elsewhere the dump says
+//!   why it holds no frames.
 //!
 //! It also names the tests still running: every test arms the watchdog, and each arming is
 //! struck off when that test's thread ends, so what is left is the test that hung.
@@ -298,8 +300,24 @@ fn dump_threads(pid: u32) {
         ));
     }
     say(&out);
+    // **Said, not left as a gap.** Yama's default (`ptrace_scope` 1) lets a process be traced only
+    // by an ancestor, and gdb is none: it is this test's child, so it can attach neither to the
+    // test (its parent) nor to a `vox` the test started (its sibling). gdb then prints an error
+    // among the census lines and no stacks, which reads as a dump that found nothing. CI sets the
+    // scope to 0 before the tests (ci.yml, "Let the test watchdog attach gdb"); anywhere it is
+    // not, the dump says why it has no frames.
+    let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default();
+    if !scope.is_empty() && scope != "0" {
+        say(&format!(
+            "(no stack frames for process {pid}: kernel.yama.ptrace_scope is {scope}, so gdb may \
+             attach only to its own descendants and this process is not one. \
+             `sysctl kernel.yama.ptrace_scope=0` lets the watchdog show them; CI sets it.)\n"
+        ));
+        return;
+    }
     let pid = pid.to_string();
-    // Where gdb is installed and the kernel's ptrace policy lets a child attach to its parent.
     run_bounded(Command::new("gdb").args([
         "-p",
         &pid,
