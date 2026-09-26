@@ -1807,6 +1807,9 @@ pub struct Node {
     /// The ADR-020 §3 trust keyring, loaded on unlock and empty while locked
     /// (it is sealed under the identity, so there is nothing to hold locked).
     trust: crate::node::trust::Keyring,
+    /// Consents decided but not yet delivered, each with the key it releases, taken at the
+    /// decision (V210-30). Kept beside the keyring, sealed the same way.
+    consent_keys: crate::node::pending_consent::PendingConsents,
     /// When each peer was last tried for a better path, so a relayed connection is retried
     /// on a schedule rather than only at the moment it was made.
     last_upgrade: std::collections::BTreeMap<Digest32, u64>,
@@ -1950,6 +1953,7 @@ impl Node {
             view_tx: watch::Sender::new(NodeView::default()),
             event_tx,
             trust: crate::node::trust::Keyring::new(),
+            consent_keys: crate::node::pending_consent::PendingConsents::default(),
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
             offered: std::collections::BTreeMap::new(),
@@ -4244,9 +4248,30 @@ impl Node {
                 // it and cannot know we are releasing to the right party.
                 return Outcome::Failed(Fault::UnknownChannel);
             }
-            match channel.skdm_for_consent(profile) {
-                Ok(s) => s,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
+            // **The key is taken once, when the consent is decided** (V210-30). A member that
+            // cannot be reached now gets, whenever it is reached, the key from this moment —
+            // not one built then, from a later position, which would leave every post made in
+            // between sealed before it and unreadable to that member for good. A key taken for
+            // an earlier epoch (the passphrase was rotated since) is no key for this one.
+            let held = self
+                .consent_keys
+                .get(channel_id, &target)
+                .and_then(|w| crate::group::skdm::Skdm::from_wire(w).ok())
+                .filter(|s| s.body.epoch == channel.epoch());
+            match held {
+                Some(s) => s,
+                None => match channel.skdm_for_consent(profile) {
+                    Ok(s) => {
+                        self.consent_keys.insert(*channel_id, target, s.to_wire());
+                        if let Ok(signer) = profile.signer() {
+                            if let Err(e) = self.consent_keys.save(profile.store(), signer) {
+                                return Outcome::Failed(fault_of(&e));
+                            }
+                        }
+                        s
+                    }
+                    Err(e) => return Outcome::Failed(fault_of(&e)),
+                },
             }
         };
         // No session need exist yet: one is opened from this member's bundle record
@@ -4279,13 +4304,21 @@ impl Node {
         ) else {
             return Outcome::Failed(Fault::UnknownChannel);
         };
-        let chain_id = {
+        {
             let mut channel = shared.lock().await;
             if let Err(e) = channel.issue_consent(profile, target, &skdm, now) {
                 return Outcome::Failed(fault_of(&e));
             }
-            channel.sender_generation()
-        };
+        }
+        // Recorded: nothing is pending for this consent any more.
+        if self.consent_keys.remove(channel_id, &target) {
+            if let Ok(signer) = profile.signer() {
+                let _ = self.consent_keys.save(profile.store(), signer);
+            }
+        }
+        // The generation delivered is the key's own: a key taken before a rotation is the older
+        // one, and a refusal must re-owe exactly that (V210-30).
+        let chain_id = skdm.body.chain_id;
         // The consent is a fact once decided; whether the key landed is learnt off the actor.
         self.watch_delivery(sent, *channel_id, target, chain_id);
         Outcome::Done
@@ -4436,6 +4469,16 @@ impl Node {
         let mut next = self.trust.clone();
         if !next.untrust(fingerprint) {
             return Outcome::Failed(Fault::NotConsented);
+        }
+        // A consent decided for this identity and not yet delivered is withdrawn with the trust
+        // it came from, in every room, open or not: a later re-trust takes a key of its own
+        // moment, never this one's (V210-30).
+        let mut pending = self.consent_keys.clone();
+        if pending.forget(fingerprint) {
+            if let Err(e) = pending.save(profile.store(), signer) {
+                return Outcome::Failed(fault_of(&e));
+            }
+            self.consent_keys = pending;
         }
         // The ring is written FIRST and unconditionally, exactly as a revocation's
         // log fact lands before its re-keys: if the rotations below cannot all be
@@ -5808,6 +5851,8 @@ impl Node {
         // (ADR-020 §3). Without this the node would hold an empty keyring and
         // silently trust nobody after every restart.
         self.trust = crate::node::trust::Keyring::load(profile.store(), signer)?;
+        self.consent_keys =
+            crate::node::pending_consent::PendingConsents::load(profile.store(), signer)?;
         Ok(())
     }
 

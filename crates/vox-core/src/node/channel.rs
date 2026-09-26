@@ -1587,9 +1587,12 @@ impl ChannelState {
             self.genesis.body.policy.history_mode,
         )?;
         self.append_governance(profile, &grant.to_wire(), now_secs)?;
-        // The grant is the record that `target` holds this generation; the ledger is
-        // how a later rotation knows it has not yet been given the next one.
-        self.delivered.insert(target, self.sender.chain_id());
+        // The grant is the record that `target` holds the generation it was given; the ledger
+        // is how a later rotation knows it has not yet been given the next one. The generation
+        // is the delivered key's own, not the current one: a key taken when consent was decided
+        // and delivered after a rotation is the older generation, and the rotation still owes
+        // this member the new one (V210-30).
+        self.delivered.insert(target, delivered_skdm.body.chain_id);
         self.persist_delivered(profile.store())?;
         Ok(grant)
     }
@@ -2073,6 +2076,7 @@ impl ChannelState {
                         &self.channel_id,
                         self.gov_heads(),
                     )?;
+                    let could_read = self.readable_authors();
                     self.gov_entries.push(gov);
                     self.evaluator = Arc::new(Self::build_evaluator(
                         &self.genesis,
@@ -2081,6 +2085,7 @@ impl ChannelState {
                         now_secs,
                     )?);
                     out.governance += 1;
+                    out.rendered += self.backfill_newly_readable(store, &could_read, now_secs)?;
                 }
                 EntryKind::Content => {
                     if self.render_content(store, author, entry_hash, &payload, now_secs)? {
@@ -2201,6 +2206,43 @@ impl ChannelState {
 
     /// Retry every stored content entry from `author` against the sender keys now
     /// held, rendering those that open. Called when a key arrives.
+    /// The authors whose messages this node may read now (see [`Self::may_read`]).
+    fn readable_authors(&self) -> BTreeSet<Digest32> {
+        let me = self.me();
+        self.authors
+            .keys()
+            .copied()
+            .filter(|a| *a != me && self.may_read(a, &me))
+            .collect()
+    }
+
+    /// Render what a governance entry has just made readable (V210-30).
+    ///
+    /// Reading an author needs two things, its sender key and its consent on the log, and they
+    /// arrive separately: the key over the pairwise session, the consent by sync. Rendering was
+    /// attempted when the **key** arrived (`accept_skdm`'s backfill) and when an entry arrived,
+    /// never when the consent did. So when the key came first, every message already held from
+    /// that author stayed unrendered for good, and only messages arriving afterwards showed. The
+    /// commonest way to get that order is a consent delivered late, whose key lands before its
+    /// grant has synced. Now an author who has just become readable is backfilled.
+    fn backfill_newly_readable(
+        &mut self,
+        store: &Store,
+        could_read: &BTreeSet<Digest32>,
+        now_secs: u64,
+    ) -> Result<usize> {
+        let newly: Vec<Digest32> = self
+            .readable_authors()
+            .into_iter()
+            .filter(|a| !could_read.contains(a))
+            .collect();
+        let mut rendered = 0;
+        for author in newly {
+            rendered += self.backfill(store, &author, now_secs)?;
+        }
+        Ok(rendered)
+    }
+
     fn backfill(&mut self, store: &Store, author: &Digest32, now_secs: u64) -> Result<usize> {
         let already: std::collections::BTreeSet<Digest32> =
             self.timeline.iter().map(|r| r.entry_hash).collect();
@@ -2383,6 +2425,7 @@ impl ChannelState {
         self.next_log_id = id.saturating_add(1);
         match gov {
             Some(g) => {
+                let could_read = self.readable_authors();
                 self.gov_entries.push(g);
                 self.evaluator = Arc::new(Self::build_evaluator(
                     &self.genesis,
@@ -2390,6 +2433,7 @@ impl ChannelState {
                     &self.gov_entries,
                     now_secs,
                 )?);
+                self.backfill_newly_readable(store, &could_read, now_secs)?;
                 Ok(Accepted::Governance)
             }
             // Content: render it if we hold the author's sender key and the author
