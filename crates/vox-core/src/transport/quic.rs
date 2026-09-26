@@ -271,7 +271,7 @@ fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
     ))));
     let mut mtu = quinn::MtuDiscoveryConfig::default();
     mtu.upper_bound(mtu_ceiling);
-    mtu.black_hole_cooldown(Duration::from_secs(2)); // DIAG
+    mtu.black_hole_cooldown(std::time::Duration::from_secs(2)); // DIAG
     cfg.mtu_discovery_config(Some(mtu));
     // Enough flow-control credit to fill a long, fast path (PRD-001 R41). quinn's default
     // stream window is 1.25 MB, sized for 100 Mbit/s at 100 ms; at 1 Gbit/s and 20 ms RTT that
