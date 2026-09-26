@@ -1021,3 +1021,11 @@ pub fn refuse_stream(send: &mut SendStream, recv: &mut RecvStream) {
     let _ = send.reset(code);
     let _ = recv.stop(code);
 }
+
+/// Reset both halves of a stream with a **specific** coded reason, for a peer that is owed one
+/// (#202). Use [`refuse_stream`] for anyone who must learn nothing from the refusal.
+pub fn refuse_stream_because(send: &mut SendStream, recv: &mut RecvStream, why: WireError) {
+    let code = close_code(why);
+    let _ = send.reset(code);
+    let _ = recv.stop(code);
+}

@@ -677,8 +677,8 @@ where
     R: AuthorResolver,
     P: FnMut(&mut TA, &mut TB) -> usize,
 {
-    let send_a = |t: &mut TA, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
-    let send_b = |t: &mut TB, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
+    let send_a = |t: &mut TA, f: Vec<u8>| t.send(&f).map_err(|e| wire_of(&e));
+    let send_b = |t: &mut TB, f: Vec<u8>| t.send(&f).map_err(|e| wire_of(&e));
 
     // 1. HELLO exchange + mode negotiation.
     send_a(ta, encode_hello(SYNC_MODE_FRONTIER))?;
@@ -769,7 +769,7 @@ where
     T: Transport,
     R: AuthorResolver,
 {
-    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
+    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|e| wire_of(&e));
 
     // 1. HELLO exchange + mode negotiation.
     send(t, encode_hello(SYNC_MODE_FRONTIER))?;
@@ -871,7 +871,7 @@ where
     T: Transport,
     S: SessionRoom + ?Sized,
 {
-    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
+    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|e| wire_of(&e));
 
     send(t, encode_hello(SYNC_MODE_FRONTIER))?;
     let remote_hello = expect_hello(t.recv())?;
@@ -896,7 +896,7 @@ where
     let deadline = std::time::Instant::now() + DRAIN_BUDGET;
     let mut staged: Vec<Vec<u8>> = Vec::new();
     let mut applied = 0;
-    while let Some(frame) = t.recv().map_err(|_| WireError::TransportFailed)? {
+    while let Some(frame) = t.recv().map_err(|e| wire_of(&e))? {
         if std::time::Instant::now() >= deadline {
             return Err(WireError::SyncModeUnsupported);
         }
@@ -964,7 +964,7 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
     // circuit on total idle. A per-frame bound alone only defends against a peer that stops, never
     // against one that drips.
     let deadline = std::time::Instant::now() + DRAIN_BUDGET;
-    while let Some(frame) = t.recv().map_err(|_| WireError::TransportFailed)? {
+    while let Some(frame) = t.recv().map_err(|e| wire_of(&e))? {
         if std::time::Instant::now() >= deadline {
             return Err(WireError::SyncModeUnsupported);
         }
@@ -988,8 +988,17 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
     Ok(applied)
 }
 
+/// The coded reason a transport error carries: the peer's own reason when it refused the stream
+/// with one ([`Error::PeerRefused`]), and [`WireError::TransportFailed`] for everything else
+/// (#202). Reporting every refusal as `TransportFailed` hid a collision behind a dead path.
+fn wire_of(e: &Error) -> WireError {
+    match e {
+        Error::PeerRefused(code) => *code,
+        _ => WireError::TransportFailed,
+    }
+}
 fn expect_hello(r: Result<Option<Vec<u8>>>) -> std::result::Result<u8, WireError> {
-    match r.map_err(|_| WireError::TransportFailed)? {
+    match r.map_err(|e| wire_of(&e))? {
         Some(frame) => match decode_frame(&frame) {
             Ok(SyncFrame::Hello(bitmap)) => Ok(bitmap),
             _ => Err(WireError::SyncModeUnsupported),
@@ -1000,7 +1009,7 @@ fn expect_hello(r: Result<Option<Vec<u8>>>) -> std::result::Result<u8, WireError
 }
 
 fn expect_have(r: Result<Option<Vec<u8>>>) -> std::result::Result<Vec<FeedFrontier>, WireError> {
-    match r.map_err(|_| WireError::TransportFailed)? {
+    match r.map_err(|e| wire_of(&e))? {
         Some(frame) => match decode_frame(&frame) {
             Ok(SyncFrame::Have(v)) => Ok(v),
             _ => Err(WireError::SyncModeUnsupported),
@@ -1010,7 +1019,7 @@ fn expect_have(r: Result<Option<Vec<u8>>>) -> std::result::Result<Vec<FeedFronti
 }
 
 fn expect_want(r: Result<Option<Vec<u8>>>) -> std::result::Result<Vec<WantRange>, WireError> {
-    match r.map_err(|_| WireError::TransportFailed)? {
+    match r.map_err(|e| wire_of(&e))? {
         Some(frame) => match decode_frame(&frame) {
             Ok(SyncFrame::Want(v)) => Ok(v),
             _ => Err(WireError::SyncModeUnsupported),

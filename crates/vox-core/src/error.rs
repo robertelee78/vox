@@ -372,6 +372,23 @@ pub enum Error {
     /// remedy and they used to share one sentence (#191).
     #[error("{0}")]
     Ipc(IpcHandshake),
+
+    /// A sync session did not complete, carrying the ADR-008 coded reason (#202).
+    ///
+    /// **Not [`Self::MalformedGovernance`].** Every sync failure used to be wrapped in it, so a
+    /// peer's ordinary refusal of a colliding session read "malformed governance struct: sync
+    /// failed: transport", which points at data corruption and cannot be told apart from a path
+    /// that died.
+    #[error("sync failed: {0}")]
+    SyncFailed(crate::wire::WireError),
+
+    /// The peer reset or stopped the stream with a coded reason (an ADR-008 [`WireError`]):
+    /// it refused, deliberately, and said why. Distinct from [`Self::Unreachable`], which is a
+    /// stream or connection that went away with nothing said.
+    ///
+    /// [`WireError`]: crate::wire::WireError
+    #[error("the peer refused: {0}")]
+    PeerRefused(crate::wire::WireError),
 }
 
 /// How an attach to a node's control socket failed ([`Error::Ipc`]).

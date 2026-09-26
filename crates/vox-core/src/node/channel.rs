@@ -168,17 +168,8 @@ pub fn join_context_from_genesis(
 /// Map an ADR-008 coded sync failure onto the error taxonomy, keeping the reason
 /// (the ADR's rule is that a failure is never silently downgraded).
 pub(crate) fn sync_failure(code: crate::wire::WireError) -> Error {
-    Error::MalformedGovernance(match code {
-        crate::wire::WireError::ProtocolVersionUnsupported => "sync failed: protocol version",
-        crate::wire::WireError::SuiteBelowFloor => "sync failed: suite below floor",
-        crate::wire::WireError::UnknownStructTag => "sync failed: unknown struct tag",
-        crate::wire::WireError::UnknownAlgoId => "sync failed: unknown algo id",
-        crate::wire::WireError::AuthenticatorInvalid => "sync failed: authenticator invalid",
-        crate::wire::WireError::SyncModeUnsupported => "sync failed: sync mode unsupported",
-        crate::wire::WireError::EpochMismatch => "sync failed: epoch mismatch",
-        crate::wire::WireError::TransportFailed => "sync failed: transport",
-        crate::wire::WireError::Unresponsive => "sync failed: the peer stopped answering",
-    })
+    // Its own variant, carrying the coded reason, never `MalformedGovernance` (#202).
+    Error::SyncFailed(code)
 }
 
 /// The channel's [`AuthorResolver`] for ADR-008 sync: the admitted authors' keys,
