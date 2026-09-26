@@ -1,30 +1,27 @@
-//! V210-29 (#202) — **a sync that did not complete says why**, through the shipped binary.
+//! V210-29 (#202) — **a sync that did not complete says why**, through the shipped binary; and,
+//! since ADR-025, **two members posting at once no longer collide at all**.
 //!
 //! Alice and Bob are real `vox daemon`s in one room, behind a real `vox node` anchor. They post
-//! at the same moment, [`ROUNDS`] times, so their pushes collide: each end's session for the room
-//! is running when the other's arrives, and each refuses the other. That collision is the
-//! commonest failure between two live members, and the push retry resolves it.
+//! at the same moment, [`ROUNDS`] times. Before ADR-025 their pushes collided: each end's session
+//! for the room was running when the other's arrived, and each refused the other (#202 made that
+//! refusal say "the peer was busy syncing this room" instead of a governance error, and #216 said
+//! it as the peer's refusal). ADR-025 option C (the decider, 2026-09-26) admits the inbound
+//! session beside the outbound one — full duplex — so a collision report cannot occur between two
+//! correct members.
 //!
-//! Before #202 the daemon said nothing about a failed sync. Inside, every one was wrapped as
-//! "malformed governance struct: sync failed: transport": the refusal was sent with the code for
-//! an invalid authenticator, and the initiator never read the code at all. So a collision could
-//! not be told from a dead path, and whatever reported it pointed at corrupt data.
-//!
-//! What this asserts, on both daemons' stderr:
-//! 1. at least one failed sync is reported **as a collision**: "the peer was busy syncing this
-//!    room";
+//! What this asserts, on both daemons' stderr, over the lines printed during the rounds:
+//! 1. **no** failed sync is reported as a collision ("the peer was busy syncing this room");
 //! 2. no failed sync between the two members is reported as a governance or malformed-data
 //!    error, or as an invalid authenticator;
-//! 3. **every collision is reported as the peer's refusal**, "the peer refused: the peer was busy
-//!    …", because it is the peer that stopped the session. Before #202's follow-up, a peer's
-//!    refusal and this node's own rejection of an entry both read "sync failed: <reason>", so a
-//!    report could not say which end stopped the session.
+//! 3. any collision that is reported is said as the peer's refusal (#216) — vacuous while (1)
+//!    holds, kept so the mutant below shows both.
 //!
-//! If no collision happened in all the rounds, the run proves nothing, and it fails as CANNOT
-//! MEASURE rather than passing.
+//! Precondition (else CANNOT MEASURE): both daemons opened at least three sessions to each other
+//! over the rounds (`vox status --json`). Not one per round: posts made while a session runs are
+//! carried by it (measured on the change: 14 and 10 over 40 rounds).
 //!
-//! Mutations: the old governance wrapper in `sync_failure` breaks (2); a collision refused with the
-//! uninformative code breaks (1) and (2); `sync_failure` ignoring who refused breaks (3).
+//! Mutations: restoring the busy refusal at the inbound check breaks (1); the old governance
+//! wrapper in `sync_failure` breaks (2) wherever a failure is reported.
 
 #![cfg(unix)]
 
@@ -244,9 +241,25 @@ fn a_sync_that_did_not_complete_says_why() {
             l.contains("governance") || l.contains("malformed") || l.contains("authenticator")
         })
         .collect();
+    let opened = |d: &Path, other: &str| -> u64 {
+        let (ok, out, err) = vox_once(d, &args(&["status", "--json"]));
+        assert!(ok, "vox status --json: {err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("status JSON");
+        v["sync"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| r["peer"].as_str().is_some_and(|p| other.starts_with(p)))
+                    .map(|r| r["opened"].as_u64().unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+    let (a_opened, b_opened) = (opened(&alice_dir, &bob_fp), opened(&bob_dir, &alice_fp));
     println!(
         "[proof] {} failed-sync report(s) over {ROUNDS} simultaneous rounds: {collisions} named as a \
-         collision ({} not said as the peer's refusal), {} misnamed",
+         collision ({} not said as the peer's refusal), {} misnamed; sessions opened alice->bob \
+         {a_opened}, bob->alice {b_opened}",
         reports.len(),
         unattributed.len(),
         misnamed.len()
@@ -255,9 +268,13 @@ fn a_sync_that_did_not_complete_says_why() {
         println!("[report] {l}");
     }
     assert!(
-        unattributed.is_empty(),
-        "a collision was not reported as the peer's refusal, so the report cannot say which end \
-         stopped the session: {unattributed:?}"
+        a_opened >= 3 && b_opened >= 3,
+        "CANNOT MEASURE: the members opened {a_opened} and {b_opened} sessions to each other over \
+         {ROUNDS} rounds"
+    );
+    assert_eq!(
+        collisions, 0,
+        "two members posting at once refused each other as busy {collisions} time(s): {reports:?}"
     );
     assert!(
         misnamed.is_empty(),
@@ -265,10 +282,8 @@ fn a_sync_that_did_not_complete_says_why() {
          authenticator failure: {misnamed:?}"
     );
     assert!(
-        collisions > 0,
-        "no failed sync was reported as a collision over {ROUNDS} simultaneous rounds (reports: \
-         {reports:?}). If there are no reports at all, the node reported nothing, or no collision \
-         happened: CANNOT MEASURE either way"
+        unattributed.is_empty(),
+        "a collision was not reported as the peer's refusal: {unattributed:?}"
     );
     drop(anchor);
 }
