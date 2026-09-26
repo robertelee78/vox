@@ -22,7 +22,7 @@
 //! Dropping the last [`NodeHandle`] closes the command channel; the actor then
 //! locks (wiping every SEK and the signer) and exits.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -3505,10 +3505,20 @@ impl Node {
                 ) else {
                     return;
                 };
-                let _ = shared
-                    .lock()
-                    .await
-                    .note_undelivered(profile.store(), peer, chain_id);
+                {
+                    let mut channel = shared.lock().await;
+                    let _ = channel.note_undelivered(profile.store(), peer, chain_id);
+                    // A refused generation the member is entitled to whole is owed again from
+                    // there (V210-45). Entitlement is re-derived from the trust decision and the
+                    // log, never from what was sent, so a key taken at an author's position is
+                    // never re-owed from its origin.
+                    if channel
+                        .history_floor(&peer, self.trust.trusted_since(&peer))
+                        .is_some_and(|f| f <= chain_id)
+                    {
+                        let _ = channel.owe_history(profile.store(), peer, chain_id);
+                    }
+                }
                 // 2, 4, 8 … 64s: a refusal that cures (a session that converges, a member learnt
                 // from the board) is retried promptly, and one that does not stops costing a
                 // stream every second.
@@ -4515,6 +4525,8 @@ impl Node {
             return Outcome::Failed(Fault::NotNetworked);
         }
         let now = self.now();
+        let trusted_since = self.trust.trusted_since(&target);
+        let floor: Option<u64>;
         let skdm = {
             let (Some(profile), Some(shared)) = (
                 self.profile.as_ref(),
@@ -4528,30 +4540,46 @@ impl Node {
                 // it and cannot know we are releasing to the right party.
                 return Outcome::Failed(Fault::UnknownChannel);
             }
-            // **The key is taken once, when the consent is decided** (V210-30). A member that
-            // cannot be reached now gets, whenever it is reached, the key from this moment —
-            // not one built then, from a later position, which would leave every post made in
-            // between sealed before it and unreadable to that member for good. A key taken for
-            // an earlier epoch (the passphrase was rotated since) is no key for this one.
-            let held = self
-                .consent_keys
-                .get(channel_id, &target)
-                .and_then(|w| crate::group::skdm::Skdm::from_wire(w).ok())
-                .filter(|s| s.body.epoch == channel.epoch());
-            match held {
-                Some(s) => s,
-                None => match channel.skdm_for_consent(profile) {
-                    Ok(s) => {
-                        self.consent_keys.insert(*channel_id, target, s.to_wire());
-                        if let Ok(signer) = profile.signer() {
-                            if let Err(e) = self.consent_keys.save(profile.store(), signer) {
-                                return Outcome::Failed(fault_of(&e));
-                            }
-                        }
-                        s
-                    }
+            // **Consent is dated by the decision, not the delivery** (V210-45). A member
+            // trusted before this identity minted a generation is entitled to it whole: it
+            // holds only posts sealed after the decision. So the live generation goes at its
+            // origin, and every older one it is entitled to is owed below and delivered by
+            // the re-key round, which retries until each is taken. Without this a member
+            // trusted before a room existed, joining after 1,500 posts, read only the 500 of
+            // the generation live at its join — or none, had that key been taken at the
+            // author's position.
+            floor = channel.history_floor(&target, trusted_since);
+            if floor.is_some() {
+                match channel.rekey_skdm(profile) {
+                    Ok(s) => s,
                     Err(e) => return Outcome::Failed(fault_of(&e)),
-                },
+                }
+            } else {
+                // **The key is taken once, when the consent is decided** (V210-30). A member that
+                // cannot be reached now gets, whenever it is reached, the key from this moment —
+                // not one built then, from a later position, which would leave every post made in
+                // between sealed before it and unreadable to that member for good. A key taken for
+                // an earlier epoch (the passphrase was rotated since) is no key for this one.
+                let held = self
+                    .consent_keys
+                    .get(channel_id, &target)
+                    .and_then(|w| crate::group::skdm::Skdm::from_wire(w).ok())
+                    .filter(|s| s.body.epoch == channel.epoch());
+                match held {
+                    Some(s) => s,
+                    None => match channel.skdm_for_consent(profile) {
+                        Ok(s) => {
+                            self.consent_keys.insert(*channel_id, target, s.to_wire());
+                            if let Ok(signer) = profile.signer() {
+                                if let Err(e) = self.consent_keys.save(profile.store(), signer) {
+                                    return Outcome::Failed(fault_of(&e));
+                                }
+                            }
+                            s
+                        }
+                        Err(e) => return Outcome::Failed(fault_of(&e)),
+                    },
+                }
             }
         };
         // No session need exist yet: one is opened from this member's bundle record
@@ -4603,17 +4631,31 @@ impl Node {
             }
             self.consent_keys = next;
         }
-        {
+        let history_owed = {
             let mut channel = shared.lock().await;
             if let Err(e) = channel.issue_consent(profile, target, &skdm, now) {
                 return Outcome::Failed(fault_of(&e));
             }
-        }
+            // The generations before the live one that the decision covers (V210-45).
+            match floor {
+                Some(f) if f < skdm.body.chain_id => {
+                    if let Err(e) = channel.owe_history(profile.store(), target, f) {
+                        return Outcome::Failed(fault_of(&e));
+                    }
+                    true
+                }
+                _ => false,
+            }
+        };
         // The generation delivered is the key's own: a key taken before a rotation is the older
         // one, and a refusal must re-owe exactly that (V210-30).
         let chain_id = skdm.body.chain_id;
         // The consent is a fact once decided; whether the key landed is learnt off the actor.
         self.watch_delivery(sent, *channel_id, target, chain_id);
+        if history_owed {
+            // At once rather than on the tick: the connection and session are live now.
+            let _ = self.deliver_rekeys_for(channel_id, asked).await;
+        }
         Outcome::Done
     }
 
@@ -4730,7 +4772,7 @@ impl Node {
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
         let mut next = self.trust.clone();
-        if let Err(e) = next.trust(fingerprint, petname) {
+        if let Err(e) = next.trust(fingerprint, petname, self.now()) {
             return Outcome::Failed(fault_of(&e));
         }
         // Persist BEFORE adopting it: a keyring that consented but did not survive
@@ -4920,23 +4962,34 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return 0;
         };
-        let (owed, generation, skdm) = {
+        let (owed, generation, skdm, mut history) = {
             let channel = shared.lock().await;
             let owed = channel.owed_rekeys();
-            if owed.is_empty() {
+            let history_owed = channel.owed_history();
+            if owed.is_empty() && history_owed.is_empty() {
                 return 0;
             }
             let Some(profile) = self.profile.as_ref() else {
                 return 0;
             };
+            // A member owed history gets every generation from its floor to the live one, each
+            // at its origin, oldest first (V210-45). At most `MAX_RETAINED_ORIGINS` keys: the
+            // work is bounded by the history this identity holds, not by a constant.
+            let mut history: BTreeMap<Digest32, Vec<crate::group::skdm::Skdm>> = BTreeMap::new();
+            for (target, floor) in history_owed {
+                if let Ok(batch) = channel.history_skdms(profile, floor) {
+                    history.insert(target, batch);
+                }
+            }
             match channel.rekey_skdm(profile) {
-                Ok(s) => (owed, channel.sender_generation(), s),
+                Ok(s) => (owed, channel.sender_generation(), s, history),
                 Err(_) => return 0,
             }
         };
         let mut delivered = 0u64;
         let now_secs = self.now();
-        for target in owed {
+        let targets: BTreeSet<Digest32> = owed.into_iter().chain(history.keys().copied()).collect();
+        for target in targets {
             // A member whose last keys were not taken waits out its backoff, unless a person asked.
             if !asked
                 && self
@@ -4955,33 +5008,54 @@ impl Node {
             let Some(conn) = self.reach_member(channel_id, target, asked).await else {
                 continue;
             };
-            let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
-                continue;
+            let batch = history.remove(&target);
+            let owes_history = batch.is_some();
+            let keys: Vec<&crate::group::skdm::Skdm> = match batch.as_ref() {
+                Some(b) => b.iter().collect(),
+                None => vec![&skdm],
             };
-            let Ok(sent) = crate::node::pairwise_stream::deliver_skdm(
-                &conn,
-                channel_id,
-                session,
-                &skdm,
-                hello.as_ref(),
-            )
-            .await
-            else {
-                continue;
-            };
-            if hello.is_some() {
-                self.hello_delivered(channel_id, target);
+            let mut all_sent = true;
+            let mut hello_left = hello.as_ref();
+            for key in keys {
+                let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
+                    all_sent = false;
+                    break;
+                };
+                // The hello rides the first key only: the peer holds the session after it.
+                let Ok(sent) = crate::node::pairwise_stream::deliver_skdm(
+                    &conn,
+                    channel_id,
+                    session,
+                    key,
+                    hello_left.take(),
+                )
+                .await
+                else {
+                    all_sent = false;
+                    break;
+                };
+                if hello.is_some() {
+                    self.hello_delivered(channel_id, target);
+                }
+                // Each key's own generation: a refusal re-owes exactly what was refused.
+                self.watch_delivery(sent, *channel_id, target, key.body.chain_id);
             }
-            self.watch_delivery(sent, *channel_id, target, generation);
+            if !all_sent {
+                continue;
+            }
             // Recorded only after the bytes went out, so a failed delivery stays owed.
             let noted = {
                 let Some(profile) = self.profile.as_ref() else {
                     return delivered;
                 };
-                shared
-                    .lock()
-                    .await
-                    .note_delivered(profile.store(), target, generation)
+                let mut channel = shared.lock().await;
+                let history_noted = if owes_history {
+                    channel.note_history_delivered(profile.store(), &target)
+                } else {
+                    Ok(())
+                };
+                history_noted
+                    .and_then(|()| channel.note_delivered(profile.store(), target, generation))
             };
             if noted.is_ok() {
                 delivered += 1;
@@ -5837,7 +5911,12 @@ impl Node {
         ) else {
             return;
         };
-        let _ = shared.lock().await.forget_delivery(profile.store(), peer);
+        let mut channel = shared.lock().await;
+        let _ = channel.forget_delivery(profile.store(), peer);
+        // The history keys went under the dropped session too (V210-45).
+        if let Some(f) = channel.history_floor(peer, self.trust.trusted_since(peer)) {
+            let _ = channel.owe_history(profile.store(), *peer, f);
+        }
     }
 
     /// File the session a join just established — `mine` when this node was the joiner,

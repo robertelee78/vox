@@ -239,6 +239,26 @@ impl OriginKeyStore {
         self.records.contains_key(&(*channel_id, epoch, chain_id))
     }
 
+    /// The retained generations `author` minted for `(channel_id, epoch)`, as
+    /// `(chain_id, created_at)` in ascending `chain_id` order — what a history release
+    /// can cover, and all it can (V210-45). At most [`MAX_RETAINED_ORIGINS`].
+    #[must_use]
+    pub fn generations(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+        author: &Digest32,
+    ) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = self
+            .records
+            .iter()
+            .filter(|((c, e, _), r)| c == channel_id && *e == epoch && &r.author_id == author)
+            .map(|((_, _, chain_id), r)| (*chain_id, r.created_at))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Derive the chain key at `iteration` for a retained generation by ratcheting
     /// the origin forward (one-way; cannot go backward). Bounded by
     /// [`MAX_SKIP`] iterations of derivation to avoid an unbounded loop on a

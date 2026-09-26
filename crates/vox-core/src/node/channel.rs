@@ -117,6 +117,13 @@ const SEG_DELIVERED: u64 = 7;
 /// exists.
 const SEG_ADMISSION: u64 = 8;
 
+/// The history ledger segment id within [`SegmentKind::KeyMaterial`] (V210-45):
+/// target → the oldest of this identity's generations it is still owed **whole**.
+/// Same encoding as [`SEG_DELIVERED`]. A row exists only while some of that history is
+/// undelivered; it is never the authority on what the target may read — that is
+/// re-derived from the trust decision and the log every time ([`ChannelState::history_floor`]).
+const SEG_HISTORY: u64 = 9;
+
 /// At-rest version of the delivery-ledger segment.
 const DELIVERED_VERSION: u64 = 1;
 /// Services encoding version.
@@ -295,6 +302,9 @@ pub struct ChannelState {
     /// [`ChannelState::owed_rekeys`]; it is never itself the authority on who may
     /// read (the log is).
     delivered: BTreeMap<Digest32, u64>,
+    /// Target → the oldest generation it is still owed whole (V210-45), persisted in
+    /// `SEG_HISTORY`. See [`ChannelState::owe_history`].
+    history: BTreeMap<Digest32, u64>,
     /// The channel passphrase, retained **in memory only** for as long as the
     /// channel is open (M14.7c).
     ///
@@ -818,6 +828,7 @@ impl ChannelState {
             own_admission: Some(Admission::Creator),
             origins,
             delivered: BTreeMap::new(),
+            history: BTreeMap::new(),
             poisoned: false,
         })
     }
@@ -993,6 +1004,13 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
+        let history = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_HISTORY)? {
+            Some(seg) => {
+                let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_HISTORY, &seg)?;
+                parse_delivered(&bytes)?
+            }
+            None => BTreeMap::new(),
+        };
 
         let evaluator = Arc::new(Self::build_evaluator(
             &genesis,
@@ -1022,6 +1040,7 @@ impl ChannelState {
             own_admission,
             origins,
             delivered,
+            history,
             poisoned: false,
         })
     }
@@ -1237,6 +1256,7 @@ impl ChannelState {
             own_admission: None,
             origins,
             delivered: BTreeMap::new(),
+            history: BTreeMap::new(),
             poisoned: false,
         })
     }
@@ -1852,6 +1872,11 @@ impl ChannelState {
         if self.delivered.remove(&target).is_some() {
             self.persist_delivered(profile.store())?;
         }
+        // Nor any history: and none is owed again, because `history_floor` refuses a
+        // member this identity has ever revoked here.
+        if self.history.remove(&target).is_some() {
+            self.persist_history(profile.store())?;
+        }
         Ok(revocation)
     }
 
@@ -1866,6 +1891,168 @@ impl ChannelState {
     pub fn forget_delivery(&mut self, store: &Store, target: &Digest32) -> Result<()> {
         if self.delivered.remove(target).is_some() {
             self.persist_delivered(store)?;
+        }
+        Ok(())
+    }
+
+    /// The oldest of this identity's generations here that `target` is entitled to read
+    /// **whole**, given that it was trusted at `trusted_since` (V210-45), or `None` when
+    /// it is entitled to none from its origin.
+    ///
+    /// Trust is the consent decision (ADR-020 §3). It is *delivered* per room once the
+    /// identity is a member, which may be long after — a newcomer trusted before a room
+    /// existed joins it after a thousand posts. Forward-only consent (ADR-006) is
+    /// measured from the decision, not the delivery: every generation minted after the
+    /// decision contains, by construction, only messages sealed after it, so releasing
+    /// those generations at their origin reveals nothing the decision did not cover.
+    /// That is the same argument M18.1's re-key at iteration 0 rests on. Releasing only
+    /// the generation current at delivery — what this did before — left a newcomer
+    /// reading the last partial generation (posts 1,001–1,500 of 1,500) and nothing
+    /// sealed under the generations before it, which the author retains precisely so
+    /// they can be released.
+    ///
+    /// What makes it never wider than the decision:
+    /// - the floor is taken from the **newest** generation down, stopping at the first
+    ///   one not minted strictly after the decision, so a clock step backwards cannot
+    ///   pull an older generation in behind a newer one;
+    /// - strictly after, in whole seconds: a generation minted in the same second as the
+    ///   decision may predate it, and is left out (narrower, never wider);
+    /// - an identity with no recorded moment (a keyring from before the moment was kept)
+    ///   gets `None`;
+    /// - an identity this identity has **ever** revoked here gets `None`: a re-consent
+    ///   after a revocation is a new decision the keyring's moment does not date, and the
+    ///   generations minted while it was excluded must stay closed to it (ADR-007).
+    ///
+    /// The work is bounded by what is held: at most [`MAX_RETAINED_ORIGINS`] generations,
+    /// each at most `ROTATE_AFTER_MESSAGES` iterations long, because the node rotates at
+    /// that bound on every append. So a receiver deriving a released generation from its
+    /// origin never needs more than `MAX_SKIP` steps of it, and nothing here asks for
+    /// more derivation than this identity's own retained history contains.
+    ///
+    /// [`MAX_RETAINED_ORIGINS`]: crate::group::history::MAX_RETAINED_ORIGINS
+    #[must_use]
+    pub fn history_floor(&self, target: &Digest32, trusted_since: Option<u64>) -> Option<u64> {
+        let since = trusted_since?;
+        let me = self.me();
+        let revoked_here = self.gov_entries.iter().any(|g| {
+            matches!(
+                &g.body,
+                crate::governance::entry::GovBody::ConsentRevocation(r)
+                    if r.body.author_id == me && r.body.target_id == *target
+            )
+        });
+        if revoked_here {
+            return None;
+        }
+        let current = self.sender.chain_id();
+        let mut floor = None;
+        for (chain_id, created_at) in self
+            .origins
+            .generations(&self.channel_id, self.epoch, &me)
+            .into_iter()
+            .rev()
+        {
+            if chain_id > current {
+                continue;
+            }
+            // Contiguous from the top: a hole (an evicted origin) ends what can be released.
+            if created_at <= since || floor.is_some_and(|f: u64| chain_id + 1 != f) {
+                break;
+            }
+            if floor.is_none() && chain_id != current {
+                // The live generation's origin is not retained: nothing above can anchor.
+                break;
+            }
+            floor = Some(chain_id);
+        }
+        floor
+    }
+
+    /// Record that `target` is owed this identity's generations from `floor` up to the
+    /// current one **whole**, so the re-key round delivers them ([`Self::owed_history`],
+    /// [`Self::history_skdms`]) and retries them until they are taken (V210-45).
+    ///
+    /// Only ever lowers an existing row: owing more of what the target is entitled to is
+    /// harmless — a generation already held is ignored by [`Self::accept_skdm`] — and
+    /// owing less could strand it. What it is entitled to is the caller's
+    /// [`Self::history_floor`], never this ledger.
+    ///
+    /// # Errors
+    /// If the ledger cannot be persisted.
+    pub fn owe_history(&mut self, store: &Store, target: Digest32, floor: u64) -> Result<()> {
+        if floor >= self.sender.chain_id() {
+            // Only the live generation: the ordinary re-key covers it.
+            return Ok(());
+        }
+        let entry = self.history.entry(target).or_insert(floor);
+        if *entry < floor {
+            return Ok(());
+        }
+        *entry = floor;
+        self.persist_history(store)
+    }
+
+    /// The consenters still owed history, with the oldest generation each is owed.
+    /// Filtered by the consent set on the log, so a revoked member is never owed any.
+    #[must_use]
+    pub fn owed_history(&self) -> BTreeMap<Digest32, u64> {
+        let me = self.me();
+        let readers = MembershipView::new(&self.evaluator).readers_of(&me);
+        self.history
+            .iter()
+            .filter(|(t, _)| **t != me && readers.contains(*t))
+            .map(|(t, f)| (*t, *f))
+            .collect()
+    }
+
+    /// The SKDMs releasing each of this identity's retained generations from `floor` to
+    /// the current one at its origin, oldest first. A generation whose origin is no
+    /// longer retained is skipped: it cannot be released by anybody.
+    pub fn history_skdms(&self, profile: &Profile, floor: u64) -> Result<Vec<Skdm>> {
+        let signer = profile.signer()?;
+        let current = self.sender.chain_id();
+        let mut out = Vec::new();
+        for chain_id in floor..=current {
+            if self.origins.has(&self.channel_id, self.epoch, chain_id) {
+                out.push(self.origins.release_at(
+                    signer,
+                    &self.channel_id,
+                    self.epoch,
+                    chain_id,
+                    0,
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record that every generation `target` was owed from its history floor has gone
+    /// out; a refusal of any of them owes it again ([`Self::owe_history`]).
+    ///
+    /// # Errors
+    /// If the ledger cannot be persisted.
+    pub fn note_history_delivered(&mut self, store: &Store, target: &Digest32) -> Result<()> {
+        if self.history.remove(target).is_some() {
+            self.persist_history(store)?;
+        }
+        Ok(())
+    }
+
+    fn persist_history(&mut self, store: &Store) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_HISTORY,
+            &delivered_bytes(&self.history),
+        )?;
+        if let Err(e) = store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_HISTORY,
+            &seg,
+        ) {
+            self.poisoned = true;
+            return Err(e);
         }
         Ok(())
     }

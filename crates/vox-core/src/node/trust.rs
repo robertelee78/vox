@@ -74,8 +74,11 @@ pub const TRUST_META_KEY: &str = "trust";
 /// Only slot; the keyring is a single blob.
 const TRUST_SEGMENT_ID: u64 = 0;
 
-/// Encoding version of the keyring body.
-const KEYRING_VERSION: u64 = 1;
+/// Encoding version of the keyring body. Version 2 adds, per row, the moment the
+/// identity was trusted; a version-1 body still reads, with that moment unknown.
+const KEYRING_VERSION: u64 = 2;
+/// The first keyring encoding: `[1, [[fingerprint, petname], ..]]`.
+const KEYRING_VERSION_1: u64 = 1;
 
 /// Most identities one node will ever trust. A bound, not a target: it keeps a
 /// corrupt or hostile blob from forcing an unbounded allocation on load.
@@ -102,6 +105,17 @@ pub fn trust_sek(signer: &dyn RootSigner) -> Result<Sek> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Keyring {
     entries: BTreeMap<Digest32, String>,
+    /// When each identity was trusted (Unix seconds), where that is known (V210-45).
+    ///
+    /// Trusting is the consent **decision** (ADR-020 §3); a room delivers it later,
+    /// once the identity is a member there. What the decision entitles the identity to
+    /// read is fixed by when it was taken, not by when it was delivered: a sender-key
+    /// generation minted after this moment holds only messages sealed after it, so
+    /// releasing that generation whole reveals nothing the decision did not already
+    /// cover (ADR-006 §History, the same argument M18.1's re-key at iteration 0 rests
+    /// on). An entry read from a version-1 keyring has no moment, and entitles to no
+    /// history: narrower, never wider.
+    since: BTreeMap<Digest32, u64>,
 }
 
 impl Keyring {
@@ -118,7 +132,10 @@ impl Keyring {
     /// The petname must be non-empty, at most [`MAX_PETNAME`] bytes, and free of
     /// control characters — it is displayed in a terminal and used to address
     /// members by name.
-    pub fn trust(&mut self, fingerprint: Digest32, petname: &str) -> Result<()> {
+    ///
+    /// `now_secs` is recorded as the moment of the decision for a newly trusted
+    /// identity. A rename keeps the original moment: it is the same decision.
+    pub fn trust(&mut self, fingerprint: Digest32, petname: &str, now_secs: u64) -> Result<()> {
         let name = petname.trim();
         if name.is_empty() || name.len() > MAX_PETNAME {
             return Err(Error::SizeLimitExceeded("petname length"));
@@ -129,7 +146,9 @@ impl Keyring {
         if !self.entries.contains_key(&fingerprint) && self.entries.len() >= MAX_TRUSTED {
             return Err(Error::SizeLimitExceeded("trusted identities"));
         }
-        self.entries.insert(fingerprint, name.to_owned());
+        if self.entries.insert(fingerprint, name.to_owned()).is_none() {
+            self.since.insert(fingerprint, now_secs);
+        }
         Ok(())
     }
 
@@ -147,7 +166,20 @@ impl Keyring {
     /// has. It stops them reading what comes *next*. ADR-007's enforcement honesty
     /// applies and nothing here can say otherwise.
     pub fn untrust(&mut self, fingerprint: &Digest32) -> bool {
+        // The moment goes with the entry: a later re-trust is a new decision, and what it
+        // entitles is measured from then, never from this one (V210-30).
+        self.since.remove(fingerprint);
         self.entries.remove(fingerprint).is_some()
+    }
+
+    /// When `fingerprint` was trusted (Unix seconds), if it is trusted and the moment is
+    /// known. See the `since` field for what the moment is used for.
+    #[must_use]
+    pub fn trusted_since(&self, fingerprint: &Digest32) -> Option<u64> {
+        self.entries
+            .contains_key(fingerprint)
+            .then(|| self.since.get(fingerprint).copied())
+            .flatten()
     }
 
     /// Whether `fingerprint` is trusted.
@@ -185,13 +217,17 @@ impl Keyring {
         self.entries.is_empty()
     }
 
-    /// Canonical CBOR body: `[version, [[fingerprint, petname], ..]]`.
+    /// Canonical CBOR body: `[2, [row, ..]]`, each row `[fingerprint, petname,
+    /// trusted_since]`, or `[fingerprint, petname]` where the moment is unknown.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(2).uint(KEYRING_VERSION).array(self.entries.len());
         for (fp, name) in &self.entries {
-            e.array(2).bytes(fp).text(name);
+            match self.since.get(fp) {
+                Some(t) => e.array(3).bytes(fp).text(name).uint(*t),
+                None => e.array(2).bytes(fp).text(name),
+            };
         }
         e.finish()
     }
@@ -206,7 +242,7 @@ impl Keyring {
         let version = d
             .uint()
             .map_err(|_| Error::MalformedAtRest("keyring version"))?;
-        if version != KEYRING_VERSION {
+        if version != KEYRING_VERSION && version != KEYRING_VERSION_1 {
             return Err(Error::MalformedAtRest("keyring version"));
         }
         let n = d
@@ -216,11 +252,14 @@ impl Keyring {
             return Err(Error::SizeLimitExceeded("trusted identities"));
         }
         let mut entries = BTreeMap::new();
+        let mut since = BTreeMap::new();
         for _ in 0..n {
             let pair = d
                 .array()
                 .map_err(|_| Error::MalformedAtRest("keyring row"))?;
-            if pair != 2 {
+            // A version-1 row is always `[fp, name]`; a version-2 row carries the moment
+            // when it is known.
+            if !(pair == 2 || (pair == 3 && version == KEYRING_VERSION)) {
                 return Err(Error::MalformedAtRest("keyring row arity"));
             }
             let fp = Digest32::try_from(
@@ -235,11 +274,17 @@ impl Keyring {
             if name.is_empty() || name.len() > MAX_PETNAME {
                 return Err(Error::MalformedAtRest("keyring petname length"));
             }
+            if pair == 3 {
+                let t = d
+                    .uint()
+                    .map_err(|_| Error::MalformedAtRest("keyring trusted_since"))?;
+                since.insert(fp, t);
+            }
             entries.insert(fp, name);
         }
         d.finish()
             .map_err(|_| Error::MalformedAtRest("keyring trailing"))?;
-        Ok(Self { entries })
+        Ok(Self { entries, since })
     }
 
     /// Seal and write the keyring. Requires an unlocked identity.
