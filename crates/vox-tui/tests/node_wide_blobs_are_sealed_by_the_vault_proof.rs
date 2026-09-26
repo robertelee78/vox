@@ -486,7 +486,11 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     let version_after = disk.vault().version;
     let reads = {
         let (_node, spec) = anchor(&new, &dir("new-anchor"));
-        let _carol_d = daemon(&new, "carol", &carol, &spec, &idpass);
+        // v0.2.9 kept no set of open rooms (that is v0.2.10's, #208), so its room is reopened
+        // the way a person running `vox daemon` does: a line with the room's passphrase.
+        let with_room = tmp.path().join("idpass-with-room");
+        std::fs::write(&with_room, format!("{IDENTITY}\n{room} room pass\n")).unwrap();
+        let _carol_d = daemon(&new, "carol", &carol, &spec, &with_room);
         ok(&new, &carol, &["room", "read", &room], None)
     };
     println!(
