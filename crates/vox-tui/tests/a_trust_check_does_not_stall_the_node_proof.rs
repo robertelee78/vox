@@ -11,6 +11,14 @@
 //! four `vox trust list`s run back to back against the same daemon. With the check on the
 //! actor, each post waits behind whatever checks are queued ahead of it.
 //!
+//! **Then a flood:** 32 `vox trust list`s at once with a wrong passphrase — a wrong one costs
+//! the same Argon2id as a right one, so nothing can refuse it early. A check off the actor
+//! and unbounded is one 256 MiB derivation per request, which is how an agent session running
+//! model-authored code could take the node, or the machine, down. So checks share
+//! `VERIFIES_IN_FLIGHT` (2) slots: the daemon's resident memory must stay within its level
+//! before the flood plus [`FLOOD_HEADROOM`], it must answer afterwards, and a post must still
+//! be readable within [`LOCAL_BOUND`] throughout.
+//!
 //! **The bound** is from what the product promises a person at the keyboard, not from a
 //! quiet run: a post they make is readable on their own node well inside PRD-001 R40's
 //! one second for a message to a peer. So every loaded sample must be under
@@ -30,11 +38,28 @@ use std::time::{Duration, Instant};
 
 use support::Worker;
 
+/// Resident memory of `pid`, in bytes.
+fn rss(pid: u32) -> u64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .map_or(0, |kib| kib * 1024)
+}
+
 /// A post a person makes, readable on their own node, end to end.
 const LOCAL_BOUND: Duration = Duration::from_millis(1_000);
 /// How much a concurrent trust check may add to the median.
 const MEDIAN_SLACK: Duration = Duration::from_millis(150);
 const SAMPLES: usize = 20;
+/// Concurrent wrong-passphrase checks in the flood.
+const FLOOD: usize = 32;
+/// What the flood may add to the daemon's resident memory: two 256 MiB Argon2id derivations
+/// in flight (`VERIFIES_IN_FLIGHT`), and one more for slack. Unbounded, 32 would want 8 GiB.
+const FLOOD_HEADROOM: u64 = 3 * 256 * 1024 * 1024;
 const CHECKERS: usize = 4;
 
 fn post_then_read(w: &Worker, r: &str, tag: &str) -> Duration {
@@ -132,6 +157,73 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
         "[proof] {} trust checks ran during the loaded phase",
         checks.load(Ordering::SeqCst)
     );
+    // ---- the flood: 32 wrong-passphrase checks at once ----
+    let daemon = alice.daemon_pid().expect("alice's daemon");
+    let wrong = tmp.path().join("wrong.pass");
+    std::fs::write(&wrong, "not the identity passphrase\n").unwrap();
+    let base_rss = rss(daemon);
+    let done = Arc::new(AtomicUsize::new(0));
+    let (peak, flood_posts) = std::thread::scope(|scope| {
+        for _ in 0..FLOOD {
+            let (done, wrong) = (done.clone(), wrong.clone());
+            scope.spawn(move || {
+                let o = alice.vox(
+                    None,
+                    &[
+                        "trust",
+                        "list",
+                        "--identity-passphrase-file",
+                        wrong.to_str().unwrap(),
+                    ],
+                );
+                assert!(!o.ok, "a wrong passphrase must be refused: {o:?}");
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        let mut peak = base_rss;
+        let mut posts = Vec::new();
+        let started = Instant::now();
+        while done.load(Ordering::SeqCst) < FLOOD {
+            assert!(
+                started.elapsed() < Duration::from_secs(300),
+                "the flood never drained: {} of {FLOOD} checks answered",
+                done.load(Ordering::SeqCst)
+            );
+            peak = peak.max(rss(daemon));
+            posts.push(post_then_read(
+                alice,
+                r,
+                &format!("FLOOD-{:03}", posts.len()),
+            ));
+        }
+        (peak, posts)
+    });
+    let after = alice.vox(None, &["room", "list"]);
+    assert!(
+        after.ok,
+        "the daemon must still answer after the flood: {after:?}"
+    );
+    eprintln!(
+        "[proof] flood: {FLOOD} wrong-passphrase checks; daemon RSS {} MiB before, peak {} MiB \
+         (+{} MiB; headroom {} MiB)",
+        base_rss >> 20,
+        peak >> 20,
+        peak.saturating_sub(base_rss) >> 20,
+        FLOOD_HEADROOM >> 20
+    );
+    let (_, flood_max) = stats("flood  post → readable", &flood_posts);
+    assert!(
+        peak.saturating_sub(base_rss) <= FLOOD_HEADROOM,
+        "the flood raised the daemon's resident memory by {} MiB, past {} MiB: checks are \
+         not bounded",
+        peak.saturating_sub(base_rss) >> 20,
+        FLOOD_HEADROOM >> 20
+    );
+    assert!(
+        flood_max < LOCAL_BOUND,
+        "a post waited {flood_max:?} during the flood (bound {LOCAL_BOUND:?})"
+    );
+
     let (quiet_median, _) = stats("quiet  post → readable", &quiet);
     let (loaded_median, loaded_max) = stats("loaded post → readable", &loaded);
     assert!(
