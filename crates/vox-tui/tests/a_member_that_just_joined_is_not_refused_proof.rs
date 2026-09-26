@@ -172,16 +172,26 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         out.trim().to_owned()
     };
     let alice_fp = fp(&alice_dir);
+    // Who is who, so a failure names the peer it failed with, not only its fingerprint.
+    let anchor_fp = anchor
+        .transcript()
+        .lines()
+        .find_map(|l| l.split("identity ").nth(1))
+        .map(|f| f.trim().to_owned())
+        .expect("the anchor names its identity");
+    let mut names: Vec<(String, &str)> =
+        vec![(anchor_fp, "the anchor"), (alice_fp.clone(), "alice")];
     let joiners: Vec<(&str, std::path::PathBuf)> = JOINERS.iter().map(|n| (*n, dir(n))).collect();
     for (name, d) in &joiners {
         let their = fp(d);
+        names.push((their.clone(), name));
         let (ok, out, err) = vox_once(&alice_dir, &args(&["trust", "add", &their, "--name", name]));
         assert!(ok, "alice trusts {name}: {out}{err}");
         let (ok, out, err) = vox_once(d, &args(&["trust", "add", &alice_fp, "--name", "alice"]));
         assert!(ok, "{name} trusts alice: {out}{err}");
     }
 
-    let _alice = daemon("alice", &alice_dir, &spec, &idpass);
+    let mut alice = daemon("alice", &alice_dir, &spec, &idpass);
     let (ok, out, err) = vox_in(
         &alice_dir,
         &["room", "create", "--name", "family"],
@@ -244,7 +254,11 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
     // ---- what each joiner reported --------------------------------------------------------
     let mut misnamed = Vec::new();
     let mut not_yet = 0usize;
-    for (name, _, p) in &mut procs {
+    // Alice's reports count too: the member that let a joiner in pushes to it at once, and was
+    // refused as "authenticator invalid" while the joiner was still sealing its key.
+    let mut everyone: Vec<(&str, &mut VoxProc)> = vec![("alice", &mut alice)];
+    everyone.extend(procs.iter_mut().map(|(name, _, p)| (*name, p)));
+    for (name, p) in everyone {
         for l in p
             .transcript()
             .lines()
@@ -265,6 +279,18 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         read_after,
         misnamed.len()
     );
+    let who = |l: &str| -> String {
+        names
+            .iter()
+            .filter(|(fp, _)| l.contains(&fp[..12]))
+            .map(|(_, n)| (*n).to_owned())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let misnamed: Vec<String> = misnamed
+        .into_iter()
+        .map(|l| format!("{l}   [peer: {}]", who(&l)))
+        .collect();
     assert!(
         misnamed.is_empty(),
         "a member that had just joined reported a failed sync as a governance, malformed-data or \

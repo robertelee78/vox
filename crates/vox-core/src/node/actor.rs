@@ -5604,12 +5604,20 @@ impl Node {
     /// has a member record for the room on the board. Decided without the room's lock, because
     /// the refusals that ask run before it. Anyone else is refused with the uninformative code,
     /// so a stranger who names a room learns nothing about whether this node holds it.
+    ///
+    /// **And the member that is letting this node in** (#217). A joiner holds the room only once it
+    /// has sealed its key — seconds of Argon2id — and the member that admitted it pushes to it the
+    /// moment it has: measured, a host reported five syncs with its new member as "authenticator
+    /// invalid", all refused while the joiner was still sealing. That member knows the room exists
+    /// (it answered the join), so telling it "not held here yet" (`EpochMismatch`) tells it nothing.
     fn owed_a_reason(&self, channel_id: &Digest32, peer: &Digest32, epoch: u64) -> bool {
         self.syncing.contains(&(*channel_id, *peer))
             || self.net.as_ref().is_some_and(|net| {
                 net.board_bundles(channel_id, epoch)
                     .iter()
                     .any(|b| b.author_id == *peer)
+                    || (self.joining.contains(channel_id)
+                        && net.policy().snapshot().join_responders().contains(peer))
             })
     }
 
