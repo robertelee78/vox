@@ -20,7 +20,8 @@
 //! so is unshaped loopback, as a raw-efficiency figure, not the bar. The emulator is userspace, so
 //! its own ceiling bounds the 10 Gbit/s figure; that is reported with it, not hidden.
 //!
-//! Mutation knob (test-side only): `VOX_PERF_MIN_RATIO` replaces the target ratio.
+//! Mutation knob (test-side only): `VOX_PERF_MIN_RATIO` replaces the target ratio. Diagnostic knob:
+//! `VOX_PERF_ONLY=<text>` runs only the links whose name contains it.
 
 #![cfg(unix)]
 
@@ -263,11 +264,26 @@ fn udp_shaper(
 /// A genuinely slow emulator is slow in every window: slowed by 12 us per packet it delivered
 /// 34-63% on both runners, far below the bar. Unshaped (`None`) there is no rate to pace at, so it
 /// is one unpaced window, as before; it is reported, not gated.
-fn calibrate(link: Option<Link>) -> f64 {
-    match link {
-        Some(l) => (0..3).map(|_| calibrate_once(Some(l))).fold(0.0, f64::max),
-        None => calibrate_once(None),
-    }
+///
+/// Returns each window's rate, in bytes per second: three on a link, one unshaped.
+fn calibrate_windows(link: Option<Link>) -> Vec<f64> {
+    let n = if link.is_some() { 3 } else { 1 };
+    (0..n).map(|_| calibrate_once(link)).collect()
+}
+
+/// What competed for the CPU when the emulator could not carry a link: the busiest processes.
+fn busiest() -> String {
+    Command::new("ps")
+        .args(["-Ao", "pcpu,comm", "-r"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .take(7)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 fn calibrate_once(link: Option<Link>) -> f64 {
@@ -281,24 +297,28 @@ fn calibrate_once(link: Option<Link>) -> f64 {
         std::thread::spawn(move || {
             let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let pkt = [0x5au8; 1350];
-            // 1,350 bytes plus the 28 the emulator charges per datagram, at 1.05x the link's rate.
-            let gap = link.map(|l| Duration::from_secs_f64(1378.0 * 8.0 / (l.bits_per_sec * 1.05)));
-            let mut next = Instant::now();
+            // 1,350 bytes plus the 28 the emulator charges per datagram, at 1.05x the link's rate,
+            // sent as one batch per millisecond and then **asleep**: a sender that spins to pace
+            // itself holds a whole core, which on GitHub's 3-core macOS runner was the emulator's.
+            let per_ms = link.map(|l| l.bits_per_sec * 1.05 / 8.0 / 1378.0 / 1000.0);
+            let start = Instant::now();
+            let mut sent = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(gap) = gap {
-                    let now = Instant::now();
-                    if now < next {
-                        std::hint::spin_loop();
-                        continue;
-                    }
-                    // Behind by more than a burst (a stall): start again from now, not a flood.
-                    next = if now > next + Duration::from_millis(5) {
-                        now
-                    } else {
-                        next
-                    } + gap;
+                let Some(per_ms) = per_ms else {
+                    let _ = s.send_to(&pkt, front);
+                    continue;
+                };
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                // A sleep that overshoots is made up in the next batch, never forgiven: the offered
+                // load must stay at 1.05x the link or this measures the sender, not the emulator. On
+                // a loaded runner VM, forgiving any backlog past 5 ms dropped fidelity to 60-70%. The
+                // emulator's queue (bdp + 4 MB) absorbs the burst, as it absorbed the old flood.
+                let due = (elapsed_ms * per_ms) as u64;
+                while sent < due {
+                    let _ = s.send_to(&pkt, front);
+                    sent += 1;
                 }
-                let _ = s.send_to(&pkt, front);
+                std::thread::sleep(Duration::from_millis(1));
             }
         })
     };
@@ -711,14 +731,26 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     ));
 
     let mut failed = Vec::new();
+    // Diagnostic knob (test-side only): `VOX_PERF_ONLY` runs just the links whose name contains it.
+    let only = std::env::var("VOX_PERF_ONLY").ok();
     for l in LINKS {
-        let fidelity = calibrate(Some(l)) * 8.0 / l.bits_per_sec;
+        if only.as_deref().is_some_and(|o| !l.name.contains(o)) {
+            continue;
+        }
+        let windows = calibrate_windows(Some(l));
+        let fidelity = windows.iter().copied().fold(0.0, f64::max) * 8.0 / l.bits_per_sec;
+        let pct: Vec<String> = windows
+            .iter()
+            .map(|w| format!("{:.1}%", w * 8.0 / l.bits_per_sec * 100.0))
+            .collect();
         assert!(
             !l.gated || fidelity >= EMULATOR_FIDELITY,
-            "CANNOT MEASURE {}: the emulator itself delivers only {:.1}% of the link's rate (load: {})",
+            "CANNOT MEASURE {}: the emulator itself delivers only {:.1}% of the link's rate \
+             (windows {pct:?}; load: {})\nbusiest processes:\n{}",
             l.name,
             fidelity * 100.0,
-            uptime()
+            uptime(),
+            busiest()
         );
         *link.lock().unwrap() = Some(l);
         std::thread::sleep(Duration::from_millis(500));
