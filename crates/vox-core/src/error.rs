@@ -325,6 +325,13 @@ pub enum Error {
     #[error("join refused: {0}")]
     JoinRefused(&'static str),
 
+    /// A join the responder **answered and then did not finish**: it stopped waiting for this
+    /// node, or the exchange's stream broke, after its challenge arrived. Not a refusal, and not
+    /// "unreachable" — the responder was reached — and no verdict on the passphrase, which is
+    /// judged only at the end of the exchange (#160).
+    #[error("join cut short: {0}")]
+    JoinCutShort(&'static str),
+
     /// A peer opened a stream kind its class is not authorized to open (ADR-016
     /// §"Connections": an anchor has no channel authority, a pending joiner may
     /// open only the join stream, an unknown peer only the rendezvous service).

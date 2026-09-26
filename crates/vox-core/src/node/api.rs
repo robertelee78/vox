@@ -402,6 +402,10 @@ pub enum Fault {
     Unreachable,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
+    /// A join the responder answered and then did not finish: it stopped waiting for this node,
+    /// or the exchange broke off. The responder was reached, and the passphrase was not judged
+    /// (#160).
+    CutShort,
     /// There is no consent to withdraw: the target was never consented to, or the
     /// consent has already been revoked (ADR-007 — consent is single-writer, so this
     /// is a settled fact, not a race).

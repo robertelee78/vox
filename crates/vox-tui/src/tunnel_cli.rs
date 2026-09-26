@@ -766,6 +766,13 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::Refused) => {
             "a member answered and refused the join\n       usually the room passphrase is wrong — it is checked by them, not by you,\n       so a typo arrives here rather than as a passphrase error\n       if you are sure of it, they may have revoked you, or be on a different room"
         }
+        // **Neither a refusal nor nobody.** A member answered, then the exchange stopped before the
+        // passphrase was judged — most often because it stopped waiting for this machine. Told
+        // "usually the passphrase is wrong", a person with the right passphrase changed it (#160);
+        // told "every member is offline", they went looking for a member that was online.
+        Some(Fault::CutShort) => {
+            "a member answered, then the exchange was cut short before your passphrase was judged\n       this is not a verdict on it — the member stopped waiting for this machine, or the\n       connection broke; try again, and if this machine is very busy, try when it is not"
+        }
         Some(Fault::NotNetworked) => {
             "this node is not networked, or its identity is locked\n       nothing about the room is in question"
         }
@@ -785,6 +792,7 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
         "BadLink" => Fault::BadLink,
         "Unreachable" => Fault::Unreachable,
         "Refused" => Fault::Refused,
+        "CutShort" => Fault::CutShort,
         "NotNetworked" => Fault::NotNetworked,
         "Locked" => Fault::Locked,
         "NoIdentity" => Fault::NoIdentity,

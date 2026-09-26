@@ -251,6 +251,8 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::BadLink => UiError::Malformed,
         Fault::Unreachable => UiError::Unreachable,
         Fault::Refused => UiError::Refused,
+        // Reached, then broken off: a connection problem, not a refusal and not "nobody" (#160).
+        Fault::CutShort => UiError::Transport,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
         #[allow(unreachable_patterns)]

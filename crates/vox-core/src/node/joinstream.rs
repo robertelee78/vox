@@ -110,6 +110,12 @@ pub enum JoinReject {
     /// Refused after the work gate: wrong passphrase, identity mismatch, an
     /// unresolvable prekey, or a policy refusal. One value, so it is no oracle.
     Refused = 3,
+    /// The responder stopped waiting: the joiner's next frame did not arrive within the
+    /// responder's patience. **Not folded into `Refused`**, because the joiner turns `Refused`
+    /// into "usually the passphrase is wrong", and a correct passphrase from a joiner too busy to
+    /// answer in time got exactly that (#160). It is no oracle: whether a frame arrived in time
+    /// says nothing about the passphrase, which is judged only once the proofs are in.
+    TimedOut = 4,
 }
 
 impl JoinReject {
@@ -118,6 +124,7 @@ impl JoinReject {
             1 => Some(Self::PowInvalid),
             2 => Some(Self::Malformed),
             3 => Some(Self::Refused),
+            4 => Some(Self::TimedOut),
             _ => None,
         }
     }
@@ -129,7 +136,29 @@ impl JoinReject {
             Self::PowInvalid => "responder refused: proof-of-work invalid",
             Self::Malformed => "responder refused: malformed frame",
             Self::Refused => "responder refused",
+            Self::TimedOut => "responder stopped waiting for this node",
         }
+    }
+}
+
+/// The error a joiner reports for a responder's `Rejected(r)`.
+///
+/// A responder that stopped waiting cut the exchange short; it did not refuse it (#160).
+fn rejected(r: JoinReject) -> Error {
+    match r {
+        JoinReject::TimedOut => Error::JoinCutShort(r.as_str()),
+        _ => Error::JoinRefused(r.as_str()),
+    }
+}
+
+/// A joiner's error from the steps after the responder's challenge arrived. The responder was
+/// reached by then, so a stream that breaks is an exchange cut short, not an unreachable peer —
+/// and reporting it as unreachable told a person every member was offline about a responder that
+/// had answered and was online (#160).
+fn cut_short(e: Error) -> Error {
+    match e {
+        Error::Unreachable(why) => Error::JoinCutShort(why),
+        e => e,
     }
 }
 
@@ -487,105 +516,109 @@ pub async fn run_initiator(
     };
     let challenge_sig = CompositeSignature::from_bytes(&challenge_sig)?;
 
-    // 2. SOLVE — `join_initiate` verifies the signature, the binding and the
-    //    difficulty cap before grinding, then solves and starts CPace.
-    //
-    //    **Ground off the runtime's worker.** The solve is Equihash — seconds of CPU — and this is
-    //    an async function, so it ran on one of the daemon's two runtime workers and took it away
-    //    from everything else scheduled there: measured through the real binary, a `vox room list`
-    //    issued during a join waited 0.8–17.5s, tracking the join's own length, although it needs
-    //    nothing but the published view. `block_in_place` moves this worker's other tasks elsewhere
-    //    for the duration. It panics on a current-thread runtime, which grinds inline as before.
-    let grind = || {
-        join_initiate(
-            ctx,
-            passphrase,
-            &sid,
-            &challenge,
-            &responder_pub,
-            &challenge_sig,
-            root,
-            ik,
+    // Everything from here runs after the responder answered: see `cut_short`.
+    let answered = async {
+        // 2. SOLVE — `join_initiate` verifies the signature, the binding and the
+        //    difficulty cap before grinding, then solves and starts CPace.
+        //
+        //    **Ground off the runtime's worker.** The solve is Equihash — seconds of CPU — and this is
+        //    an async function, so it ran on one of the daemon's two runtime workers and took it away
+        //    from everything else scheduled there: measured through the real binary, a `vox room list`
+        //    issued during a join waited 0.8–17.5s, tracking the join's own length, although it needs
+        //    nothing but the published view. `block_in_place` moves this worker's other tasks elsewhere
+        //    for the duration. It panics on a current-thread runtime, which grinds inline as before.
+        let grind = || {
+            join_initiate(
+                ctx,
+                passphrase,
+                &sid,
+                &challenge,
+                &responder_pub,
+                &challenge_sig,
+                root,
+                ik,
+            )
+        };
+        let (initiator, token, share) = if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(grind)?
+        } else {
+            grind()?
+        };
+        send_frame(
+            &mut send,
+            &JoinFrame::Solve {
+                equihash_nonce: token.equihash_nonce.clone(),
+                solution: token.solution.clone(),
+                share,
+            },
         )
-    };
-    let (initiator, token, share) = if tokio::runtime::Handle::current().runtime_flavor()
-        == tokio::runtime::RuntimeFlavor::MultiThread
-    {
-        tokio::task::block_in_place(grind)?
-    } else {
-        grind()?
-    };
-    send_frame(
-        &mut send,
-        &JoinFrame::Solve {
-            equihash_nonce: token.equihash_nonce.clone(),
-            solution: token.solution.clone(),
-            share,
-        },
-    )
-    .await?;
+        .await?;
 
-    // 3. SHARE.
-    let peer_share = match recv_frame(&mut recv).await? {
-        JoinFrame::Share { share } => share,
-        JoinFrame::Rejected(r) => return Err(Error::JoinRefused(r.as_str())),
-        _ => return Err(Error::MalformedJoin("expected share")),
+        // 3. SHARE.
+        let peer_share = match recv_frame(&mut recv).await? {
+            JoinFrame::Share { share } => share,
+            JoinFrame::Rejected(r) => return Err(rejected(r)),
+            _ => return Err(Error::MalformedJoin("expected share")),
+        };
+        let (pending, bootstrap) = initiator.complete_cpace(&peer_share)?;
+
+        // 4/5. PROOF both ways. A wrong passphrase fails here, locally.
+        send_frame(
+            &mut send,
+            &JoinFrame::Proof {
+                sealed: pending.own_proof_sealed()?,
+            },
+        )
+        .await?;
+        let sealed_peer = match recv_frame(&mut recv).await? {
+            JoinFrame::Proof { sealed } => sealed,
+            JoinFrame::Rejected(r) => return Err(rejected(r)),
+            _ => return Err(Error::MalformedJoin("expected proof")),
+        };
+        let peer = pending.verify_peer_sealed(&sealed_peer, &responder_fp)?;
+
+        // 6. INIT — PQXDH against the responder's verified bundle.
+        let (session, init_msg) = bootstrap.bootstrap(&bundle)?;
+        send_frame(
+            &mut send,
+            &JoinFrame::Init {
+                message: init_msg.to_wire(),
+            },
+        )
+        .await?;
+
+        // 7. ACCEPTED, carrying the responder's witness to this join (M17.6).
+        let witness = match recv_frame(&mut recv).await? {
+            JoinFrame::Accepted { witness } => JoinWitness::from_body(&witness)?,
+            JoinFrame::Rejected(r) => return Err(rejected(r)),
+            _ => return Err(Error::MalformedJoin("expected accepted")),
+        };
+        // Checked here, against the identity the handshake pinned, so a responder cannot
+        // hand back a witness for some other key or some other room and have it kept.
+        witness.verify(
+            &responder_pub,
+            &ctx.channel_id,
+            ctx.epoch,
+            &root.fingerprint(),
+        )?;
+
+        // 8. OPEN — one ratchet message, empty plaintext, so the responder can send at all.
+        //    On this stream rather than a later one, so it is processed before the join
+        //    returns (see `JoinFrame::Open`).
+        let mut session = session;
+        let sealed = session.encrypt(&[])?.to_wire();
+        send_frame(&mut send, &JoinFrame::Open { sealed }).await?;
+        let _ = send.finish();
+        Ok(JoinOutcome {
+            session,
+            peer,
+            witness,
+            last_resort_grade: false,
+        })
     };
-    let (pending, bootstrap) = initiator.complete_cpace(&peer_share)?;
-
-    // 4/5. PROOF both ways. A wrong passphrase fails here, locally.
-    send_frame(
-        &mut send,
-        &JoinFrame::Proof {
-            sealed: pending.own_proof_sealed()?,
-        },
-    )
-    .await?;
-    let sealed_peer = match recv_frame(&mut recv).await? {
-        JoinFrame::Proof { sealed } => sealed,
-        JoinFrame::Rejected(r) => return Err(Error::JoinRefused(r.as_str())),
-        _ => return Err(Error::MalformedJoin("expected proof")),
-    };
-    let peer = pending.verify_peer_sealed(&sealed_peer, &responder_fp)?;
-
-    // 6. INIT — PQXDH against the responder's verified bundle.
-    let (session, init_msg) = bootstrap.bootstrap(&bundle)?;
-    send_frame(
-        &mut send,
-        &JoinFrame::Init {
-            message: init_msg.to_wire(),
-        },
-    )
-    .await?;
-
-    // 7. ACCEPTED, carrying the responder's witness to this join (M17.6).
-    let witness = match recv_frame(&mut recv).await? {
-        JoinFrame::Accepted { witness } => JoinWitness::from_body(&witness)?,
-        JoinFrame::Rejected(r) => return Err(Error::JoinRefused(r.as_str())),
-        _ => return Err(Error::MalformedJoin("expected accepted")),
-    };
-    // Checked here, against the identity the handshake pinned, so a responder cannot
-    // hand back a witness for some other key or some other room and have it kept.
-    witness.verify(
-        &responder_pub,
-        &ctx.channel_id,
-        ctx.epoch,
-        &root.fingerprint(),
-    )?;
-
-    // 8. OPEN — one ratchet message, empty plaintext, so the responder can send at all.
-    //    On this stream rather than a later one, so it is processed before the join
-    //    returns (see `JoinFrame::Open`).
-    let mut session = session;
-    let sealed = session.encrypt(&[])?.to_wire();
-    send_frame(&mut send, &JoinFrame::Open { sealed }).await?;
-    let _ = send.finish();
-    Ok(JoinOutcome {
-        session,
-        peer,
-        witness,
-        last_resort_grade: false,
-    })
+    answered.await.map_err(cut_short)
 }
 
 /// The responder's side inputs that are not on the wire.
@@ -705,6 +738,7 @@ where
             let reason = match e {
                 Error::JoinPowInvalid => JoinReject::PowInvalid,
                 Error::MalformedJoin(_) | Error::Cbor(_) => JoinReject::Malformed,
+                e if crate::transport::framing::is_patience_exceeded(e) => JoinReject::TimedOut,
                 _ => JoinReject::Refused,
             };
             let _ = send_frame(&mut send, &JoinFrame::Rejected(reason)).await;

@@ -38,6 +38,21 @@ pub async fn write_frame(send: &mut SendStream, frame: &[u8]) -> Result<()> {
 /// that stops answering.
 pub const FRAME_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What a read says when the peer sent nothing within its patience.
+pub const NO_FRAME_IN_TIME: &str = "quic stream: peer sent no frame in time";
+
+/// What a read says when the peer began a frame and stopped sending partway through it.
+pub const STOPPED_MID_FRAME: &str = "quic stream: peer stopped partway through a frame";
+
+/// Whether `e` is a read that ran out of patience — the peer was too slow, as opposed to gone.
+///
+/// A join responder uses this to tell a joiner "I stopped waiting for you" rather than the coarse
+/// refusal a wrong passphrase gets: the two call for opposite things from the person (#160).
+#[must_use]
+pub fn is_patience_exceeded(e: &Error) -> bool {
+    matches!(e, Error::Unreachable(s) if *s == NO_FRAME_IN_TIME || *s == STOPPED_MID_FRAME)
+}
+
 /// Read one length-prefixed frame of at most `max_len` bytes, waiting at most
 /// [`FRAME_PATIENCE`]. A clean FIN *exactly at* a frame boundary is the peer's success
 /// half-close → `Ok(None)`; a FIN partway through a frame, a reset, an announced length above
@@ -57,11 +72,7 @@ pub async fn read_frame_within(
         Ok(Ok(())) => {}
         Ok(Err(quinn::ReadExactError::FinishedEarly(0))) => return Ok(None),
         Ok(Err(_)) => return Err(Error::Unreachable("quic stream: closed by the peer")),
-        Err(_) => {
-            return Err(Error::Unreachable(
-                "quic stream: peer sent no frame in time",
-            ))
-        }
+        Err(_) => return Err(Error::Unreachable(NO_FRAME_IN_TIME)),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > max_len {
@@ -71,11 +82,7 @@ pub async fn read_frame_within(
     match tokio::time::timeout(patience, recv.read_exact(&mut body)).await {
         Ok(Ok(())) => {}
         Ok(Err(_)) => return Err(Error::Unreachable("quic stream: closed by the peer")),
-        Err(_) => {
-            return Err(Error::Unreachable(
-                "quic stream: peer stopped partway through a frame",
-            ))
-        }
+        Err(_) => return Err(Error::Unreachable(STOPPED_MID_FRAME)),
     }
     Ok(Some(body))
 }

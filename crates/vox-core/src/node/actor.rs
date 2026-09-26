@@ -6726,6 +6726,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::MalformedLink(_) | Error::MalformedAnchor(_) => Fault::BadLink,
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
+        Error::JoinCutShort(_) => Fault::CutShort,
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,
         // A join refused before the challenge (the responder does not hold that
         // channel open) reaches the joiner as a malformed exchange; report it as the
