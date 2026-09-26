@@ -241,6 +241,50 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
         "CANNOT MEASURE: bob reads carol before carol trusts him"
     );
 
+    // **Which arrived first at bob, carol's key or her consent**, from bob's own events: a key
+    // that renders what bob held (`backfilled` ≥ 1) came after the consent; one that renders
+    // nothing came before it, and then only a render on the consent's arrival shows the post
+    // (#210). Printed per run, so a red can be tied to the order that produced it.
+    let key_events = Arc::new(Mutex::new(Vec::<(Duration, u64)>::new()));
+    {
+        let sock = vox_core::node::paths::Paths::resolve(
+            "default",
+            Some(bob_dir),
+            Some(&bob_dir.join("cfg")),
+        )
+        .unwrap()
+        .socket_file();
+        let carol = vox_core::node::link::b32_decode(&fps[2], "carol").unwrap();
+        let sink = Arc::clone(&key_events);
+        let t0 = Instant::now();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let Ok(mut c) = vox_core::node::ipc::IpcClient::open(&sock).await else {
+                    return;
+                };
+                if c.subscribe().await.is_err() {
+                    return;
+                }
+                while let Ok(Some(frame)) = c.next().await {
+                    if let vox_core::node::ipc::Frame::Event(
+                        vox_core::node::api::NodeEvent::SenderKeyReceived {
+                            peer, backfilled, ..
+                        },
+                    ) = frame
+                    {
+                        if peer == carol {
+                            sink.lock().unwrap().push((t0.elapsed(), backfilled));
+                        }
+                    }
+                }
+            });
+        });
+    }
+
     // ---- with bob unreachable, carol trusts him and posts ----
     let anchor_pid = anchor.proc.child.id();
     signal(anchor_pid, "-STOP");
@@ -264,6 +308,16 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
     let read = until("bob reads CAROL-WHILE-UNREACHABLE", 90, || {
         reads(bob_dir, &room, "CAROL-WHILE-UNREACHABLE")
     });
+    for (at, backfilled) in key_events.lock().unwrap().iter() {
+        eprintln!(
+            "[order] carol's key reached bob at +{at:.1?}, rendering {backfilled} held post(s): {}",
+            if *backfilled == 0 {
+                "the key came before the consent (the post can render only when the consent arrives)"
+            } else {
+                "the consent was already there"
+            }
+        );
+    }
     let (ok, _, _) = vox(carol_dir, &["room", "post", &room, "CAROL-AFTER"], None);
     assert!(ok);
     let later = until("bob reads CAROL-AFTER", 60, || {
