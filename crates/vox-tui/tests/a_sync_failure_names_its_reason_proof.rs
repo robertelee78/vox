@@ -100,13 +100,22 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
     panic!("{name}'s daemon never answered `vox room list`");
 }
 
-/// The daemon's reports of syncs that did not complete.
-fn sync_failures(p: &mut VoxProc) -> Vec<String> {
+/// The daemon's reports of syncs that did not complete, among the lines it printed after the
+/// first `since` (a count from [`lines_so_far`]).
+fn sync_failures(p: &mut VoxProc, since: usize) -> Vec<String> {
     p.transcript()
         .lines()
+        .skip(since)
         .filter(|l| l.contains("did not complete"))
         .map(str::to_owned)
         .collect()
+}
+
+/// How many lines the daemon has printed so far. The transcript keeps every line, so what came
+/// before the rounds is excluded by position, not by draining it (the drain this replaced was inert:
+/// `transcript` never forgets, so join-time failures were counted as round failures).
+fn lines_so_far(p: &mut VoxProc) -> usize {
+    p.transcript().lines().count()
 }
 
 #[test]
@@ -192,8 +201,7 @@ fn a_sync_that_did_not_complete_says_why() {
         std::thread::sleep(Duration::from_millis(200));
     }
     // What was reported before the rounds is not what this measures.
-    let _ = sync_failures(&mut alice);
-    let _ = sync_failures(&mut bob);
+    let (alice_from, bob_from) = (lines_so_far(&mut alice), lines_so_far(&mut bob));
 
     // ---- both post at the same moment, ROUNDS times ----------------------------------------
     let barrier = Arc::new(Barrier::new(2));
@@ -216,11 +224,11 @@ fn a_sync_that_did_not_complete_says_why() {
     // Let the retries of the last collisions finish and be reported.
     std::thread::sleep(Duration::from_secs(5));
 
-    let reports: Vec<String> = sync_failures(&mut alice)
+    let reports: Vec<String> = sync_failures(&mut alice, alice_from)
         .into_iter()
         .map(|l| format!("alice {l}"))
         .chain(
-            sync_failures(&mut bob)
+            sync_failures(&mut bob, bob_from)
                 .into_iter()
                 .map(|l| format!("bob {l}")),
         )
