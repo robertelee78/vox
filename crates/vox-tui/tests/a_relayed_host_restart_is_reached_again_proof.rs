@@ -41,7 +41,7 @@ mod relay;
 use std::time::Duration;
 
 use relay::{RelayWorld, Split};
-use world::round_trip;
+use world::{round_trip, VoxProc};
 
 /// Trials; each is a fresh anchor, host and guest.
 const RESTARTS: usize = 5;
@@ -62,10 +62,17 @@ const GIVE_UP: Duration = Duration::from_secs(90);
 fn trial(n: usize) -> Duration {
     let mut w = RelayWorld::new(Split::Families);
     let (ok, took, out, err) = w.join_guest();
-    assert!(
-        ok,
-        "CANNOT PROVE (trial {n}): the guest could not join over the relay ({took:?}).\n{out}\n{err}"
-    );
+    eprintln!("[join] trial {n}: joined = {ok} in {took:.1?}");
+    if !ok {
+        // #182: a join that found the anchor's board without the room. What the host said about
+        // its publish rounds, and what the anchor's board held, name the cause.
+        let host = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();
+        let anchor = w.anchor.proc.transcript();
+        panic!(
+            "CANNOT PROVE (trial {n}): the guest could not join over the relay ({took:?}).\n{out}\n\
+             {err}\n--- host:\n{host}\n--- anchor:\n{anchor}"
+        );
+    }
     let at = w.forward();
     let before =
         round_trip(at, b"before the crash", Duration::from_secs(120)).unwrap_or_else(|e| {
