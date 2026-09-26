@@ -374,11 +374,20 @@ pub async fn connect_direct_within(
     // IPv4-bound node anything, and a peer's IPv4 entries from costing an IPv6-only node a full
     // per-attempt timeout each: measured, an IPv6-only joiner spent `board 20.76s` dialling two
     // IPv4 addresses it could never reach before the one it could (#197).
+    //
+    // **A circuit is not on the socket.** A relay circuit stands at a synthetic IPv4 address in
+    // the range the mux reserves (`transport::mux::in_circuit_range`); its packets travel over
+    // the relay's connection, whatever this socket's family. Filtered by family, an IPv6-only
+    // node refused every circuit it dialled — "circuit via …: no direct candidates" — and could
+    // reach an IPv4 host no way at all (#173's proof, red once #197 merged).
     let local = endpoint.local_addr().ok();
-    let reachable = |c: &SocketAddr| match local {
-        Some(SocketAddr::V4(_)) => c.is_ipv4(),
-        Some(SocketAddr::V6(l)) => c.is_ipv6() || l.ip().is_unspecified(),
-        None => true,
+    let reachable = |c: &SocketAddr| {
+        crate::transport::mux::in_circuit_range(*c)
+            || match local {
+                Some(SocketAddr::V4(_)) => c.is_ipv4(),
+                Some(SocketAddr::V6(l)) => c.is_ipv6() || l.ip().is_unspecified(),
+                None => true,
+            }
     };
     let candidates: Vec<SocketAddr> = candidates.iter().copied().filter(reachable).collect();
     if candidates.is_empty() {
