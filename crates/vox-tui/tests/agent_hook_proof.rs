@@ -344,7 +344,12 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
 #[test]
 #[ignore = "production Argon2id at setup + drives the real binary; CI runs it in release"]
 fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
-    const MAX: usize = vox_tui::agent_hook::MAX_INJECTED_MESSAGES;
+    // The bounds are written here as numbers, not read from the product's constants, so a constant
+    // raised past them turns this red (agent_comms's review of RP-34): 50 messages a turn, 2 KiB a
+    // message, 16 KiB an injection.
+    const MAX: usize = 50;
+    const MESSAGE_BYTES: usize = 2 * 1024;
+    const INJECTED_BYTES: usize = 16 * 1024;
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(tmp.path());
@@ -472,13 +477,13 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
     assert!(turn("forgery-session").is_empty(), "then the room is quiet");
 
     // ---- (3) oversized messages: cut per message and in total, still counted ----
-    let big = "y".repeat(3 * vox_tui::agent_hook::MAX_MESSAGE_BYTES);
+    let big = "y".repeat(3 * MESSAGE_BYTES);
     for _ in 0..10 {
         send(&big);
     }
     let out = turn("forgery-session");
     assert!(
-        out.len() <= vox_tui::agent_hook::MAX_INJECTED_BYTES + 1024,
+        out.len() <= INJECTED_BYTES + 1024,
         "an injection must stay within its byte bound: {} bytes",
         out.len()
     );
