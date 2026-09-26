@@ -26,6 +26,13 @@
 //! difficulty is that there is nothing to look at; this leaves something to look at. A clean
 //! `exit` would discard exactly the evidence the next person needs.
 //!
+//! ## Why it kills the test's children first
+//! `abort` runs no destructors, so every `vox node` and `vox daemon` a gate had started — each
+//! normally killed by its handle's `Drop` — kept running, reparented to init, after the gate
+//! was aborted. Aborted runs on 2026-09-26 left three at a time behind (V210-28), and a leak
+//! like that is how the 21-hour processes above began. So before it aborts, the watchdog
+//! kills every descendant of this process, found by parent pid, deepest first.
+//!
 //! The budget is deliberately generous: it is not a performance assertion, it is the line past
 //! which "slow" is no longer a credible explanation. Override with `VOX_TEST_WATCHDOG_SECS`,
 //! and `VOX_TEST_WATCHDOG_SECS=0` disables it — for attaching a debugger, which is the one
@@ -77,8 +84,53 @@ pub fn arm() {
                     started.elapsed(),
                     budget,
                 );
+                let killed = kill_descendants();
+                eprintln!(
+                    "vox test watchdog: killed {killed} descendant process(es) before aborting"
+                );
                 std::process::abort();
             })
             .ok();
     });
+}
+
+/// Kill every descendant of this process, deepest first, and say how many. Found with `ps`,
+/// which macOS and Linux both have, so the support code needs no platform crate.
+fn kill_descendants() -> usize {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+    else {
+        return 0;
+    };
+    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect();
+    // Breadth first from this process, so the list runs parents before children.
+    let mut found = vec![std::process::id()];
+    let mut i = 0;
+    while i < found.len() {
+        let parent = found[i];
+        found.extend(
+            pairs
+                .iter()
+                .filter(|(_, pp)| *pp == parent)
+                .map(|(p, _)| *p),
+        );
+        i += 1;
+    }
+    let mine = std::process::id();
+    let mut killed = 0;
+    for pid in found.iter().rev().filter(|p| **p != mine) {
+        let ok = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        killed += usize::from(ok);
+    }
+    killed
 }
