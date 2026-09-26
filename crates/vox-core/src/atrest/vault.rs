@@ -49,11 +49,30 @@ use crate::identity::rng::random_array;
 /// distinct from the SEK wrap's `info` so the two domains never collide.
 const VAULT_KEK_HKDF_INFO: &[u8] = b"vox/identity-vault-wrap/v1";
 
-/// AEAD associated data for a vault bundle.
-const VAULT_AAD: &[u8] = b"vox/identity-vault-aead/v1";
+/// AEAD associated data for a version-1 vault bundle.
+const VAULT_AAD_V1: &[u8] = b"vox/identity-vault-aead/v1";
 
-/// Format version of the [`IdentityVault`] serialization.
-const VAULT_VERSION: u64 = 1;
+/// AEAD associated data for a version-2 vault bundle. **The version is bound here** because the
+/// serialized version field sits outside the AEAD: without this, a v2 vault relabelled as v1 would
+/// still open, and v1 is what tells an unlock to migrate the at-rest seals, the one moment a
+/// legacy-sealed blob is read (V210-40, #214).
+const VAULT_AAD_V2: &[u8] = b"vox/identity-vault-aead/v2";
+
+/// Format version of the [`IdentityVault`] serialization this build writes.
+///
+/// - 1: node-wide blobs (trust keyring, pending consents, prekey ring, anchor pages) sealed
+///   from the identity factor, `HKDF(id_proof)`;
+/// - 2: sealed from `self_seed` ([`crate::atrest::seal`]). Unlocking a v1 vault migrates them,
+///   then rewrites the vault as v2.
+pub const VAULT_VERSION: u64 = 2;
+
+fn vault_aad(version: u64) -> Result<&'static [u8]> {
+    match version {
+        1 => Ok(VAULT_AAD_V1),
+        2 => Ok(VAULT_AAD_V2),
+        _ => Err(Error::MalformedAtRest("vault version")),
+    }
+}
 
 /// Length of the vault key (256 bits).
 const VAULT_KEY_LEN: usize = 32;
@@ -82,6 +101,8 @@ fn derive_vault_key(
 /// `[version, profile_id, salt(16), nonce(12), ciphertext(bundle + tag)]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityVault {
+    /// Format version (see [`VAULT_VERSION`]); authenticated as the AEAD's associated data.
+    pub version: u64,
     /// Argon2id profile id used to derive the identity factor.
     pub profile_id: u8,
     /// Per-vault 128-bit Argon2id salt.
@@ -121,12 +142,13 @@ impl IdentityVault {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: plaintext.as_ref(),
-                    aad: VAULT_AAD,
+                    aad: VAULT_AAD_V2,
                 },
             )
             .map_err(|_| Error::AtRestUnlockFailed)?;
         plaintext.zeroize();
         Ok(Self {
+            version: VAULT_VERSION,
             profile_id: profile.id(),
             salt: *salt,
             nonce,
@@ -150,7 +172,7 @@ impl IdentityVault {
                 Nonce::from_slice(&self.nonce),
                 Payload {
                     msg: &self.ciphertext,
-                    aad: VAULT_AAD,
+                    aad: vault_aad(self.version).map_err(|_| Error::AtRestUnlockFailed)?,
                 },
             )
             .map_err(|_| Error::AtRestUnlockFailed)?;
@@ -171,7 +193,7 @@ impl IdentityVault {
     pub fn to_canonical_vec(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(5)
-            .uint(VAULT_VERSION)
+            .uint(self.version)
             .uint(u64::from(self.profile_id))
             .bytes(&self.salt)
             .bytes(&self.nonce)
@@ -186,9 +208,7 @@ impl IdentityVault {
             return Err(Error::MalformedAtRest("vault arity"));
         }
         let version = d.uint().map_err(Error::from)?;
-        if version != VAULT_VERSION {
-            return Err(Error::MalformedAtRest("vault version"));
-        }
+        vault_aad(version)?;
         let profile_id = u8::try_from(d.uint().map_err(Error::from)?)
             .map_err(|_| Error::MalformedAtRest("vault profile id range"))?;
         let salt: [u8; SALT_LEN] = d
@@ -204,6 +224,7 @@ impl IdentityVault {
         let ciphertext = d.bytes().map_err(Error::from)?.to_vec();
         d.finish().map_err(Error::from)?;
         Ok(Self {
+            version,
             profile_id,
             salt,
             nonce,
@@ -254,6 +275,10 @@ impl RootSigner for VaultRootSigner {
 
     fn sign(&self, msg: &[u8]) -> Result<CompositeSignature> {
         self.signer.sign(msg)
+    }
+
+    fn at_rest_seed(&self) -> Option<&[u8; 32]> {
+        Some(&self.self_seed)
     }
 }
 

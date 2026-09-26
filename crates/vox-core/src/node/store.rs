@@ -485,6 +485,13 @@ impl Batch<'_> {
         Ok(existed)
     }
 
+    /// Queue a public metadata write (see [`Store::put_meta`]).
+    pub fn put_meta(&mut self, name: &str, value: &[u8]) -> Result<()> {
+        let mut meta = self.txn.open_table(META).map_err(storage("open meta"))?;
+        meta.insert(name, value).map_err(storage("write meta"))?;
+        Ok(())
+    }
+
     /// Queue a SEK wrap write.
     pub fn put_sek_wrap(&mut self, channel: &Digest32, wrap: &SekWrap) -> Result<()> {
         let mut t = self

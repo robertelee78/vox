@@ -41,6 +41,7 @@ pub mod pairwise_stream;
 pub mod passphrase;
 pub mod paths;
 pub mod pending_consent;
+pub mod seal_migration;
 pub mod prekeys;
 pub mod profile;
 pub mod resolver;
