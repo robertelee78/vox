@@ -106,9 +106,8 @@ const EVENT_QUEUE: usize = 256;
 type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 
 /// How often the actor's timers run. Sync is not paced by it: a port is evaluated at the end of
-/// every event that can change what it needs (ADR-025 D6a), and this tick is a safety net that
-/// also evaluates every port, retires attempts whose connection died, and raises the periodic
-/// request (D7).
+/// every event that can change what it needs (ADR-025 D6a); the tick retires attempts whose
+/// connection died and raises the periodic request (D7).
 const TICK: Duration = Duration::from_secs(1);
 
 /// How often automatic work (a rotation's rekeys, a trusted member's consent) may start a background
@@ -2264,8 +2263,7 @@ impl Node {
                     // events kept showing them: an anchor with no rooms reported a circuit it
                     // no longer carried for as long as nothing else happened to it.
                     // ADR-025: the tick is a safety net for sync. It retires attempts whose
-                    // connection died (D1a), raises the periodic request (D7), and evaluates every
-                    // port, which no proof depends on.
+                    // connection died (D1a) and raises the periodic request (D7).
                     self.sync_tick().await;
                     let ran = self.schedule().await;
                     if ran || self.paths_moved() {
@@ -5332,8 +5330,11 @@ impl Node {
                 .is_some_and(|n| n.manager().existing(&key.1).is_some())
     }
 
-    /// The tick's part in sync (ADR-025 D1a, D7): retire attempts whose connection died, raise
-    /// the periodic request on every port and rediscover every room, and evaluate every port.
+    /// The tick's part in sync (ADR-025 D1a, D7): retire attempts whose connection died, and every
+    /// [`SYNC_INTERVAL_SECS`](crate::node::syncstream::SYNC_INTERVAL_SECS) raise the periodic
+    /// request on every port, rediscover every room and evaluate every port. Nothing else waits
+    /// for the tick: every event that changes what a port needs evaluates it when it ends (D6a),
+    /// and no proof passes because of the tick (D7).
     async fn sync_tick(&mut self) {
         let dead: Vec<((Digest32, Digest32), crate::node::ports::Token)> = self
             .ports
@@ -5360,8 +5361,8 @@ impl Node {
             }
             self.discover_rooms
                 .extend(self.channels.keys().chain(self.anchored.keys()).copied());
+            self.sched_all = true;
         }
-        self.sched_all = true;
     }
 
     /// Put a port in backoff after a failed session (ADR-025 D5), and arm its wakeup.
