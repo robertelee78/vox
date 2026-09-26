@@ -44,6 +44,7 @@ pub mod pending_consent;
 pub mod prekeys;
 pub mod profile;
 pub mod resolver;
+pub mod status;
 pub mod store;
 pub mod syncstream;
 pub mod trust;

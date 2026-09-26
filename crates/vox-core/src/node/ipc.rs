@@ -1398,6 +1398,11 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         let Some(body) = read_frame(&mut stream).await? else {
             return Ok(());
         };
+        // ADR-025 S0b: `vox status --json`. Answered, and the connection serves on.
+        if crate::node::status::is_request(&body) {
+            crate::node::status::serve(&mut stream, handle.sync_book()).await?;
+            continue;
+        }
         let request = match Request::from_bytes(&body) {
             Ok(r) => r,
             Err(e) => {

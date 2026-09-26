@@ -1614,9 +1614,17 @@ pub struct NodeHandle {
     /// The handle's own stream, backing [`NodeHandle::next_event`] — the
     /// single-consumer convenience the TUI and the gates use.
     events: Arc<Mutex<broadcast::Receiver<NodeEvent>>>,
+    /// The sync counters `vox status --json` reports (ADR-025 S0b).
+    sync_book: crate::node::status::SharedSyncBook,
 }
 
 impl NodeHandle {
+    /// The sync counters `vox status --json` reports (ADR-025 S0b).
+    #[must_use]
+    pub fn sync_book(&self) -> &crate::node::status::SharedSyncBook {
+        &self.sync_book
+    }
+
     /// The latest view (cheap clone of the watch value).
     #[must_use]
     pub fn view(&self) -> NodeView {
@@ -1867,6 +1875,8 @@ pub struct Node {
     /// side: each takes the room's lock inside one protocol step at a time, never across the
     /// network (`ChannelState::sync_over_room`).
     syncing: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// The sync counters `vox status --json` reports (ADR-025 S0b).
+    sync_book: crate::node::status::SharedSyncBook,
     /// Rooms this node is joining right now (their join is on a `Joiner` task).
     joining: std::collections::BTreeSet<Digest32>,
     /// Rooms being reopened off the actor at unlock (#208). A room leaves this set when it is
@@ -2125,8 +2135,10 @@ impl Node {
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
             offered: std::collections::BTreeMap::new(),
+            sync_book: crate::node::status::SyncBook::shared(),
         };
         let view_rx = node.view_tx.subscribe();
+        let sync_book = Arc::clone(&node.sync_book);
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
         if node.headless.is_some() {
@@ -2145,6 +2157,7 @@ impl Node {
             view_rx,
             event_tx: handle_event_tx,
             events: Arc::new(Mutex::new(event_rx)),
+            sync_book,
         })
     }
 
@@ -3617,6 +3630,16 @@ impl Node {
                 outcome,
             } => {
                 self.syncing.remove(&(channel_id, peer));
+                crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
+                    match &outcome {
+                        Ok(o) if o.complete => c.completed += 1,
+                        Ok(_) => c.partial += 1,
+                        Err(e) => {
+                            c.failed += 1;
+                            c.last_failure = Some(e.to_string());
+                        }
+                    }
+                });
                 if let Err(e) = &outcome {
                     // Said, with its reason (PRD-001 R36). A collision is the commonest failure
                     // between two live members and the retry resolves it; it is reported so that
@@ -5341,9 +5364,13 @@ impl Node {
             return false; // a session with this peer already has this room
         }
         let Ok(slot) = Arc::clone(&self.sync_slots).try_acquire_owned() else {
+            crate::node::status::SyncBook::with(&self.sync_book, *channel_id, peer, |c| {
+                c.skipped_at_cap += 1;
+            });
             return false; // past the cap: skipped, not queued. The schedule comes round again.
         };
         self.syncing.insert((*channel_id, peer));
+        crate::node::status::SyncBook::with(&self.sync_book, *channel_id, peer, |c| c.opened += 1);
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
         let cid = *channel_id;
         let now = self.now();
@@ -5485,6 +5512,7 @@ impl Node {
         // Marked here, past both early returns above, so a session that never starts never
         // leaves the room marked. Its caller used to mark it first.
         self.syncing.insert((channel_id, peer));
+        crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| c.admitted += 1);
         let now = self.now();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
@@ -5578,6 +5606,9 @@ impl Node {
         // run, and this is the actor: awaiting that lock to read the epoch parked the whole node
         // behind the very session this check exists to detect.
         if self.in_session_with(&channel_id, &peer) {
+            crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
+                c.busy_refused += 1;
+            });
             let (mut send, mut recv) = (send, recv);
             if self.owed_a_reason(&channel_id, &peer, epoch) {
                 // Busy: our own session for this room is running (with this peer, a collision, or

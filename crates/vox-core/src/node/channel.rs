@@ -228,6 +228,9 @@ pub struct SyncOutcome {
     pub governance: usize,
     /// How many of those were decrypted and rendered into the timeline.
     pub rendered: usize,
+    /// Whether every entry this side asked for arrived (ADR-025): `false` for a serve the peer
+    /// bounded, which ends cleanly but leaves the rest owed.
+    pub complete: bool,
 }
 
 /// What [`ChannelState::accept_entry`] did with a peer's entry.
@@ -2153,8 +2156,9 @@ impl ChannelState {
         }
         let mut out = room.out.into_inner();
         match session {
-            Ok(n) => {
-                out.applied = n;
+            Ok(done) => {
+                out.applied = done.applied;
+                out.complete = done.complete;
                 Ok(out)
             }
             Err(code) => Err(sync_failure(code, transport.peer_refused())),

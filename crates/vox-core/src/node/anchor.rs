@@ -352,8 +352,9 @@ impl AnchorState {
         }
         let mut out = room.out.into_inner();
         match session {
-            Ok(n) => {
-                out.applied = n;
+            Ok(done) => {
+                out.applied = done.applied;
+                out.complete = done.complete;
                 Ok(out)
             }
             Err(code) => Err(sync_failure(code, transport.peer_refused())),
