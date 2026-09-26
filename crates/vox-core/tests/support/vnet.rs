@@ -9,8 +9,9 @@
 //! [`VoxEndpoint::bind_abstract`](vox_core::transport::quic::VoxEndpoint::bind_abstract)),
 //! where each host may sit behind a NAT that maps and filters per RFC 4787.
 //!
-//! No packet is ever lost, reordered or delayed, so a failure is a real behavioural
-//! failure rather than a flake.
+//! No packet is ever lost, so a failure is a real behavioural failure rather than a
+//! flake. Nothing is delayed, or reordered, unless a test asks for a delay with
+//! [`VirtualNet::set_delay`].
 
 // Shared by several test binaries, each of which uses a different part of it.
 #![allow(dead_code)]
@@ -72,6 +73,8 @@ struct Inner {
     filtered: u64,
     /// Datagrams dropped because nothing is bound at the destination.
     unroutable: u64,
+    /// How long every datagram takes to arrive; see [`VirtualNet::set_delay`].
+    delay: std::time::Duration,
 }
 
 struct Nat {
@@ -188,6 +191,15 @@ impl VirtualNet {
         dropped.len()
     }
 
+    /// Make every datagram take `one_way` to arrive, as a distant peer's would. On a network with
+    /// no distance a sync session is over in a millisecond, so nothing that depends on sessions
+    /// *lasting* — a room held in overlapping sessions, say — can be staged at all. Delivery order
+    /// is kept to the timer's resolution (every datagram waits the same time, on the sender's runtime),
+    /// and QUIC tolerates the rest.
+    pub fn set_delay(&self, one_way: std::time::Duration) {
+        self.lock().delay = one_way;
+    }
+
     /// How many datagrams a NAT has dropped for want of a mapping or filter. A
     /// hole-punch test asserts this is non-zero for the unsolicited case: without it,
     /// the "NAT" would be letting everything through and proving nothing.
@@ -223,24 +235,39 @@ impl VirtualNet {
     /// Carry one datagram from `from` to `to`, translating and filtering as the hosts'
     /// NATs require.
     fn send(&self, from: SocketAddr, to: SocketAddr, payload: &[u8]) {
-        let delivery = {
+        let (delivery, delay) = {
             let mut g = self.lock();
             let src = g.translate_out(from, to);
-            g.route_in(from, src, to)
+            (g.route_in(from, src, to), g.delay)
         };
-        // The waker runs outside the network lock: a woken task may send immediately.
         if let Some((socket, src)) = delivery {
-            if socket.severed.load(Ordering::SeqCst) {
-                return; // a crashed process receives nothing
+            if delay.is_zero() {
+                socket.deliver(src, payload.to_vec());
+            } else {
+                let payload = payload.to_vec();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    socket.deliver(src, payload);
+                });
             }
-            let waker = {
-                let mut inbox = socket.inbox.lock().expect("inbox mutex");
-                inbox.queue.push_back((src, payload.to_vec()));
-                inbox.waker.take()
-            };
-            if let Some(w) = waker {
-                w.wake();
-            }
+        }
+    }
+}
+
+impl VirtualSocket {
+    /// Queue one datagram for this socket and wake its reader.
+    fn deliver(&self, src: SocketAddr, payload: Vec<u8>) {
+        if self.severed.load(Ordering::SeqCst) {
+            return; // a crashed process receives nothing
+        }
+        // The waker runs outside the network lock: a woken task may send immediately.
+        let waker = {
+            let mut inbox = self.inbox.lock().expect("inbox mutex");
+            inbox.queue.push_back((src, payload));
+            inbox.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
         }
     }
 }
