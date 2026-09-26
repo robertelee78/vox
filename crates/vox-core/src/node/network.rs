@@ -535,8 +535,14 @@ impl NodeNet {
     }
 
     /// Whether the board knows `peer` as a member of some channel it anchors: the
-    /// creator named by a genesis it holds, or the author of a live member record
-    /// (which the board only admitted from an authenticated member).
+    /// creator named by a genesis it holds, or the author of a live member record or
+    /// member bundle (each of which the board only admitted from an authenticated member).
+    ///
+    /// **The bundle counts too** (#217). A member's bundle and its address record pass the same
+    /// membership check on the way in (`accept_bundle`, `accept_member`), and the bundle is what
+    /// lands first — it is published first, and mirrored by the member that admitted it. Counting
+    /// only address records refused a member whose bundle this board already held: measured, a
+    /// member that had just joined was classed a pending joiner with `bundle[… ep0]` on the board.
     #[must_use]
     pub fn peer_is_member_on_board(&self, peer: &Digest32) -> bool {
         let now = self.now();
@@ -548,6 +554,10 @@ impl NodeNet {
                 .is_some_and(|g| g.body.creator_pubkey.fingerprint() == *peer)
                 || guard
                     .current_members(cid, 0, now)
+                    .iter()
+                    .any(|r| r.author_id == *peer)
+                || guard
+                    .current_bundles(cid, 0, now)
                     .iter()
                     .any(|r| r.author_id == *peer)
         })

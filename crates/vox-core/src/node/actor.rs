@@ -1848,6 +1848,9 @@ pub struct Node {
     board_authors: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// `(room, board)` publish rounds in flight on their own tasks; see `publish_channel_to_anchor`.
     publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// `(room, board)` pairs with at least one completed publish round, refused or not: a session
+    /// with one of our anchors for a room waits for the first (#217, see `sync_one`).
+    board_rounds_done: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// Publishes asked for while that `(room, board)` round was in flight: run when it ends.
     publish_again: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// Creates and joins answered once their room's publish rounds have ended: see
@@ -2053,6 +2056,7 @@ impl Node {
             held_pairwise: Vec::new(),
             board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
+            board_rounds_done: std::collections::BTreeSet::new(),
             publish_again: std::collections::BTreeSet::new(),
             publish_waiters: Vec::new(),
             push_now: false,
@@ -3452,6 +3456,7 @@ impl Node {
                 outcomes,
             } => {
                 self.publishing.remove(&(channel_id, board));
+                self.board_rounds_done.insert((channel_id, board));
                 self.report_publish(&channel_id, board, outcomes);
                 if !self.publishing.iter().any(|(room, _)| *room == channel_id) {
                     let (ready, waiting): (Vec<_>, Vec<_>) =
@@ -5263,6 +5268,24 @@ impl Node {
         }
         if self.in_session_with(channel_id, &peer) {
             return false; // a session with this peer already has this room
+        }
+        // **Our records on a board before our first session with it** (#217). A board that has not
+        // yet heard from us for this room knows us only by our pre-join record, and refuses a sync
+        // from a pending joiner: measured, a member that had just joined synced with its anchor ~2 s
+        // into the join, before any round of ours had landed there, and reported the refusal as
+        // "authenticator invalid". So a session with one of our anchors for a room waits for one
+        // completed publish round to it (started here if none is in flight); `PublishDone` then
+        // sets `push_now`, and the session follows at once. One completed round, **refused or not**,
+        // is enough: a board that will not take our records must not stop us syncing with it for
+        // good — its refusal then says why (`WireError::NotYetMember`).
+        if matches!(target, SessionTarget::Channel(_))
+            && self.anchor_ids.contains(&peer)
+            && !self.board_rounds_done.contains(&(*channel_id, peer))
+        {
+            if !self.publishing.contains(&(*channel_id, peer)) {
+                self.publish_channel_to_anchor(channel_id, &conn).await;
+            }
+            return false;
         }
         let Ok(slot) = Arc::clone(&self.sync_slots).try_acquire_owned() else {
             return false; // past the cap: skipped, not queued. The schedule comes round again.
