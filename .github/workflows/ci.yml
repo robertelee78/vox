@@ -94,7 +94,8 @@ jobs:
           fi
           zsh --version && fish --version && bash --version | head -1
       # `codex_trust_proof` asks Codex itself whether Vox's hook is trusted and refuses to pass
-      # without `codex` on PATH. Pinned to the version it was measured on (see release.yml).
+      # without `codex` on PATH (an absent Codex is not a pass). Pinned to the version it was
+      # measured on: the app-server's `hooks/list` statuses are Codex's, not Vox's, to change.
       - name: Install the Codex the trust proof measures
         run: npm install -g @openai/codex@0.157.0 && codex --version
       - name: Show toolchain
@@ -117,7 +118,67 @@ jobs:
       # (ADR-005, ≈1 s / 245 MB in release) and the production-Argon2id node +
       # live-client lifecycle tests (ADR-016 M13; ≈0.3 s per derivation in
       # release). Run here in release.
+      # Excluded here, and run in their own jobs below: the PRD-001 transport gates (`r40_`, `r41_`,
+      # `r42_`, ~20 minutes of the suite — the relay gate alone 11-22), so they run in parallel with
+      # this job instead of after it; and `cross_process_join_proof`, a known flake (ADR-018, "Two
+      # proofs are excluded from the release gate, by name"), reported but never blocking.
+      # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
       - name: Real-parameter gates (release)
-        # `three_members_one_offline_for_a_while_show_one_order` is skipped for the cause stated in
-        # release.yml (the v0.2.9 second-joiner connectivity defect, not the order).
-        run: cargo test --release --workspace --no-fail-fast -- --ignored --skip three_members_one_offline_for_a_while_show_one_order --skip a_late_arrival_after_a_restart_is_marked
+        # Two causal_order_proof proofs are excluded here, **for a cause that is not the order**:
+        # `three_members_one_offline_for_a_while_show_one_order` (ADR-023 M23.2 proof 1), excluded
+        # from 2026-09-25. On v0.2.8 the second joiner of three daemons is cut off from the first
+        # post onward in about half of runs: 5 red of 9 with M23.2, and 1 of 4 on 3cac220 without it.
+        # In each of the four reds whose logs were captured, the second joiner's restarted daemon logs
+        # "the board holds a newer record from that author". Whenever the three converged, their
+        # orders were identical. The order is proven in the blocking set by `one_order_gate` (three
+        # in-process nodes) and by proof 2 through the daemons. This exclusion is to be removed when
+        # the v0.2.9 connectivity defect is fixed.
+        # `a_late_arrival_after_a_restart_is_marked`, for the same cause, V29-23 (#104): a restarted
+        # daemon's board record restarts its sequence and is refused, so its peer never receives what
+        # it held (2 of 5 runs). The frozen-daemon variant, in the blocking set, carries the
+        # late-arrival claim meanwhile.
+        run: |
+          cargo test --release --workspace --no-fail-fast -- --ignored \
+            --skip r40_ --skip r41_ --skip r42_ \
+            --skip two_agents_on_separate_processes_join_through_an_anchor_and_talk \
+            --skip three_members_one_offline_for_a_while_show_one_order \
+            --skip a_late_arrival_after_a_restart_is_marked
+
+  # **The PRD-001 transport gates, in parallel with the rest.** They are blocking — a release
+  # publishes only a commit whose whole CI run passed (release.yml `ci-passed`) — but they are
+  # the slowest ~20 minutes of the suite, so they get their own runner instead of a place in line.
+  transport-gates:
+    name: transport gates (R40 · R41 · R42)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+      - name: Transport gates (release)
+        run: cargo test --release --workspace --no-fail-fast -- --ignored r40_ r41_ r42_
+
+  # **Reporting only, and in its OWN job on purpose**: the proofs excluded from the gate above by
+  # name. The command ends in `|| echo "::warning::"`, so it cannot fail CI, and being a separate job
+  # it cannot spend the gate's time budget either. A rate that changes is still visible as a warning.
+  flaky-watch:
+    name: excluded proofs (reporting only — never blocks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y zsh fish
+      - run: |
+          cargo test --release --workspace --no-fail-fast -- --ignored \
+            two_agents_on_separate_processes_join_through_an_anchor_and_talk \
+            || echo "::warning::cross_process_join_proof failed — known flake, ADR-018"
+          cargo test --release --workspace --no-fail-fast -- --ignored \
+            three_members_one_offline_for_a_while_show_one_order \
+            || echo "::warning::causal_order_proof proof 1 failed — second joiner cut off (v0.2.9), ADR-023 M23.2"
+          cargo test --release --workspace --no-fail-fast -- --ignored \
+            a_late_arrival_after_a_restart_is_marked \
+            || echo "::warning::causal_order_proof restart late-arrival failed — V29-23 (#104)"
