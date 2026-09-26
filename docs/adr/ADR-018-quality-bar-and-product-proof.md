@@ -89,6 +89,12 @@ or blocked obligation MUST be recorded as failing or blocked, never as waived-gr
 |---|---|---|
 | `install.apple_gate_refuses_unsigned_bytes` in `install_sh_proof` | the installer's Developer ID and notarization gate is macOS-only, so on Linux there is nothing to measure. On macOS it is proved, by forcing the gate on against an unsigned fixture. | nothing closes it on Linux; it is a property that does not exist there |
 
+**Closed 2026-09-26 (V210-20, #193): the Apple gate, and the update journey on CI.** A property a
+platform does not have is not a gap on that platform: `install_sh_proof` no longer makes the
+`install.apple_gate_refuses_unsigned_bytes` claim off macOS at all, and CI's macOS job proves it for
+real. `journey.update_replaces_an_older_install` had stayed on CI's list after it cleared (see
+below), and is removed. CI's list is now `opencode,cross-process-join,cross-process-tunnel`.
+
 **Closed by `v0.2.0`, 2026-09-22: the two `update_proof` gaps — and what the second one found.**
 Both were accepted because there was no earlier release to update *from*. `v0.2.0` supplied one, and
 `journey.update_replaces_an_older_install` began passing with no code change, exactly as its remedy
