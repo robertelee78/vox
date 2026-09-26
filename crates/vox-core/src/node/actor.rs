@@ -167,10 +167,15 @@ const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
 /// How long a delivered sender key may go unanswered before it is counted as not taken and sent
 /// again. See `pairwise_stream::refused`.
 const KEY_DELIVERY_PATIENCE: Duration = Duration::from_secs(30);
-/// How many failed sessions in a row a `(room, peer)` push is retried on the next tick before it is
-/// left to the periodic interval. Enough to ride out a collision (both sides pushing at once); few
-/// enough that a peer whose sessions always fail cannot hold the room.
-const MAX_PUSH_RETRIES: u32 = 3;
+/// The longest a failed `(room, peer)` push waits before its next try; see the `SyncDone` handler.
+/// Long enough that a peer whose sessions always fail (an anchor keeping no log for the room) costs
+/// one session every few seconds, not a stream; far shorter than the 30s interval it used to fall
+/// back to.
+const MAX_PUSH_RETRY_WAIT: Duration = Duration::from_secs(8);
+/// How many failed sessions in a row a `(room, peer)` push retries after a short random 20–100ms
+/// wait, before it backs off (see the `SyncDone` handler). Enough to ride out a collision (both
+/// sides pushing at once).
+const QUICK_PUSH_RETRIES: u32 = 3;
 
 /// How often a peer reached over a relay is retried for a direct path.
 ///
@@ -1744,7 +1749,7 @@ pub struct Node {
     /// far, so one that cannot succeed is answered rather than kept. The person gets the real
     /// outcome and the node keeps answering meanwhile.
     pending_consents: Vec<(Digest32, Digest32, oneshot::Sender<Outcome>, u8)>,
-    /// Consecutive failed sessions per `(room, peer)`; see `MAX_PUSH_RETRIES`.
+    /// Consecutive failed sessions per `(room, peer)`; see the `SyncDone` handler.
     push_failures: BTreeMap<(Digest32, Digest32), u32>,
     /// Each room's view summary and detail as this node's own latest write left them, taken under the room's lock
     /// by the write itself. `view_of` uses it when a session holds the room, so a person always sees
@@ -3373,26 +3378,50 @@ impl Node {
                 // every tick, sorted ahead of the member it shared the room with, took the room each
                 // pass, and the member's owed push lost every round: the independent verdict
                 // measured 2–3 relayed runs in 10 losing a message for 120s (vox-bc, #41). Now the
-                // retry goes to the peer that failed, at most `MAX_PUSH_RETRIES` times running; past
-                // that the pair waits for the periodic interval like any other.
+                // retry goes to the peer that failed, with a wait that grows each time (below), so a
+                // peer that always fails costs a session every few seconds and never holds the room.
                 //
                 // **After a short random wait, not the next tick.** The commonest failure is a
                 // collision: both ends push on the same event, each refuses the other because its
                 // own session for the room is running, and both fail. Retried on the tick, the two
                 // retries landed together again and a message took up to a second (median 364–531ms
                 // in 3 of 10 relayed runs, measured). A random 20–100ms wait desynchronises them.
+                // **Backed off, desynchronised, and never handed to the 30s tick.** A retry capped at
+                // three and then left to the periodic interval lost messages for up to 30s whenever
+                // both ends kept colliding: the V29-06 verdict caught alice and bob refusing each
+                // other six times in ~200ms, because their 20–100ms random waits kept landing within
+                // 0–8ms of each other, and then a message sat 29.7s. Now the first
+                // `QUICK_PUSH_RETRIES` keep the 20–100ms random wait, and past them the push is
+                // never left to the tick: it backs off with the two ends drawing from disjoint ranges
+                // by fingerprint order. (Doubling from 25ms on the first failure instead was
+                // measured worse: 3 of 60 both-ends relayed runs had a message over 1s, against 0 of
+                // 60 with the quick retries kept.)
                 if outcome.is_err() {
                     let failures = self.push_failures.entry((channel_id, peer)).or_insert(0);
                     *failures = failures.saturating_add(1);
-                    if *failures <= MAX_PUSH_RETRIES {
-                        let jitter = crate::identity::rng::random_array::<1>().map_or(0, |b| b[0]);
-                        let wait = Duration::from_millis(20 + u64::from(jitter) * 80 / 255);
-                        let tx = self.net_tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(wait).await;
-                            let _ = tx.send(NetEvent::PushRetry { channel_id, peer }).await;
-                        });
-                    }
+                    let jitter = crate::identity::rng::random_array::<2>()
+                        .map_or(0, |b| u64::from(u16::from_le_bytes(b)));
+                    let wait = if *failures <= QUICK_PUSH_RETRIES {
+                        // A collision almost always clears in one of these: measured 0 of 1,500
+                        // relayed rounds with both ends posting at once over 1 s.
+                        Duration::from_millis(20 + jitter % 81)
+                    } else {
+                        // Past them, never the 30 s interval: back off from 200 ms to
+                        // `MAX_PUSH_RETRY_WAIT`, the two ends drawing from disjoint halves by
+                        // fingerprint order (the lower [w/2, w), the higher [w, 2w)) so two nodes
+                        // that keep colliding cannot keep doing it in lockstep.
+                        let w = (200u64 << (*failures - QUICK_PUSH_RETRIES - 1).min(6)).min(
+                            u64::try_from(MAX_PUSH_RETRY_WAIT.as_millis()).unwrap_or(8_000) / 2,
+                        );
+                        let lower = self.net.as_ref().is_some_and(|n| n.local_id() < peer);
+                        let (from, span) = if lower { (w / 2, w / 2) } else { (w, w) };
+                        Duration::from_millis(from + jitter % span.max(1))
+                    };
+                    let tx = self.net_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(wait).await;
+                        let _ = tx.send(NetEvent::PushRetry { channel_id, peer }).await;
+                    });
                 } else {
                     self.push_failures.remove(&(channel_id, peer));
                 }

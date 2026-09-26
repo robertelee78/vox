@@ -7,8 +7,10 @@
 //! is a real `Node` with production Argon2id, joined and trusted through the product's own
 //! commands; the relay is asserted, not assumed, before and after the samples.
 //!
-//! [`SAMPLES`] times, alice sends and the clock stops when bob's node renders the text,
-//! polled every [`POLL`]. Printed as min / median / p95 / max; the PRD target is asserted
+//! [`SAMPLES`] times, alice and bob each send, one straight after the other, and the clock
+//! stops when both messages have been rendered on the other node, polled every [`POLL`]. Both
+//! ends pushing at once is the collision behind #41 (a message left to the 30 s interval), which
+//! a one-way sample never makes. Printed as min / median / p95 / max; the PRD target is asserted
 //! on every sample.
 //!
 //! The simulator delivers every datagram at once, with no loss, so this measures what the
@@ -278,8 +280,18 @@ fn r40_a_message_arrives_in_under_a_second_over_a_forced_relay() {
                 })
                 .await
                 .is_done());
+            // **Both ends post at once** (#41): each push-on-append races the other's, which is the
+            // collision a one-way sample never makes. A sample ends when both messages have crossed.
+            let back = format!("r40 relayed reply {i:02}");
+            assert!(bob
+                .apply(NodeCommand::SendText {
+                    channel_id: cid,
+                    text: back.clone(),
+                })
+                .await
+                .is_done());
             let arrived = tokio::time::timeout(Duration::from_secs(60), async {
-                while !renders(&bob, &text) {
+                while !renders(&bob, &text) || !renders(&alice, &back) {
                     tokio::time::sleep(POLL).await;
                 }
             })
