@@ -1,347 +1,389 @@
 # ADR-025: Sync Is Scheduled Like a Switch, Not a Hub
 
-**Status**: **Proposed — 2026-09-26.** Not decided and not built. For review by three models, then the decider.
+**Status**: **Proposed, revision 2 — 2026-09-26.** Not decided and not built.
+- Revision 1 (8c4e347) was reviewed by gpt-6-astra (**BLOCK**), glm-5.3 (**REVISE**) and kimi-k3
+  (**REVISE**); the transcripts are in [`ADR-025-reviews/`](ADR-025-reviews/).
+- Revision 2 answers every finding (see "What the review changed") and replaces revision 1's collision
+  rule with a designated opener.
 **Date**: 2026-09-26
 **Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: sync, scheduling, node-runtime, latency
-**Builds on**: #180 (sessions guarded per room and peer, `fix/180-no-defer`), #202 (`WireError::SessionBusy`,
-`fix/202-sync-failure-reason`). Neither is on `integrate/v0.2.10` yet; this ADR assumes both.
-**Relates to**: #41 (V29-06; its backoff is what D5 deletes), #200 (V210-27), #180, #202.
+**Tags**: sync, scheduling, node-runtime, latency, wire
+**Builds on**: #180 (sessions guarded per room and peer, `fix/180-no-defer` 33da864 + 58fde36) and #202
+(`WireError::SessionBusy`, 8436100, accepted). This ADR assumes both are integrated. Code is cited
+**from the #180 tree (58fde36)** unless it says otherwise.
+**Relates to**: #41 (V29-06; its backoff is what D5 deletes), #200 (V210-27).
 
 ## Context
 
 The decider, on the collisions #202 made visible: *"it kind of reminds me of a networking hub vs. a
 switch — is there something that we can do that's more intelligent to make it more like a switch
-instead of a hub, with slots and queues"*.
+instead of a hub, with slots and queues"*, and *"it's cute that it kind of sort of works but we can do
+better"*.
 
 ### What a sync session is
 
-A sync session reconciles one room's log between two nodes over one QUIC bi-stream. **It is already
-full duplex.** Both ends run the same steps (`log/sync.rs`, `frontier_session_room_inner`): each sends
-`HELLO`, then `HAVE` (its frontiers), then `WANT` (what it lacks of the other's `HAVE`), serves the
-other's `WANT`, finishes its send side and drains what it is sent. One session, opened by either end,
-moves entries **both ways**. The room's lock is taken one protocol step at a time, never across the
-network (`SessionRoom`, `ChannelState::sync_over_room`).
+A sync session reconciles one room's log between two nodes over one QUIC bi-stream, and **either end
+may open it**. Both ends run the same steps (`log/sync.rs` `frontier_session_room_inner`, 869–922):
+1. each sends `HELLO`, then `HAVE` (its frontiers), then `WANT` (what it lacks of the other's `HAVE`);
+2. each serves the other's `WANT` and finishes its send side (`t.finish()`, 893);
+3. each drains and applies what it is sent (896–916).
 
-So the only thing a session opened by Alice cannot carry from Bob is **an entry Bob stored after Bob
-computed his `HAVE` for that session**.
+So one session moves entries **both ways**. The room's lock is taken one step at a time, never across
+the network (`SessionRoom`, `ChannelState::sync_over_room`).
 
-### How sessions are scheduled today, and where it behaves like a hub
+Two limits matter below:
+- **Serving stops silently at a bound.** `entries_for_wants` stops at `MAX_SERVE_ENTRIES` (1,024) or
+  `MAX_SERVE_BYTES` (64 MiB) (501–506), and the serve loop stops at `SERVE_BUDGET` (30 s) (888–890).
+  In both cases the session still ends `Ok`, and `SyncOutcome` (`node/channel.rs` 211–219) says
+  nothing about it. The rule so far has been "applied something ⇒ sync again at once" (sync.rs 43–48,
+  riding `o.applied > 0`).
+- **A side's success says nothing about the other's apply.** Each side finishes sending *before* it
+  applies what it received. So Alice can finish cleanly while Bob is still applying what she sent, and
+  Bob may then refuse an entry (an author he hasn't admitted yet: `AuthenticatorInvalid`, sync.rs 611)
+  or fail to persist. Alice never learns of it; only Bob knows.
 
-Every place below is cited from `fix/202-sync-failure-reason` at 8436100 (`crates/vox-core/src/node/actor.rs`).
+### Where scheduling behaves like a hub
 
-1. **Glare, then random backoff (CSMA/CD).** A local append marks every peer due
-   (`note_local_append`, `run_due_syncs`), and the push goes out at once. When Alice and Bob post
-   within a round trip of each other, each opens a session to the other. Each end's responder finds
-   its own session with that peer running (`run_sync_session`, the `syncing` check, ~5226) and
-   refuses with `SessionBusy`. **Both sessions fail; neither carried anything.** The `SyncDone` handler
-   (~3377–3460) then re-owes the push after a random 20–100 ms (`QUICK_PUSH_RETRIES = 3`), and past
-   three failures backs off from 200 ms to `MAX_PUSH_RETRY_WAIT` (8 s) with the two ends drawing from
-   disjoint halves by fingerprint order (#41, b6545e5). That is Ethernet on a hub: transmit, collide,
-   back off at random, transmit again.
-   - Measured by `a_sync_failure_names_its_reason_proof` (#202): **35–47 collisions in 40 rounds** of
-     both members posting at once, every one resolved by retry.
-   - Measured by the V29-06 verdict before #41: six mutual refusals in ~200 ms with the random waits
-     landing 0–8 ms apart, then a message waited **29.7 s** for the periodic tick.
-   - Measured by vox-0e on main (instrumented, 2026-09-26), 3 members plus an anchor: **1,397
-     refusals in 40 rounds**, with streaks of 5–7 failed sessions past `QUICK_PUSH_RETRIES`. No post was
-     late only because the third member and the anchor carried what the colliding pair failed to
-     exchange. With two members and the anchor stopped, the same gate is red in round 1 at 30–31 s on
-     main; that stall is #180's (a room-keyed guard behind a dead peer), so #41's backoff cannot be
-     judged without #180 underneath.
-   - **With #180 underneath, the tail is gone but the collisions are not** (vox-0e, same gate, 5
-     interleaved runs per arm, 300 rounds each): #180 alone, 0 late, slowest 0.30 s, **703 refusals**,
-     longest failed streak 3; #180 plus #41's backoff, 0 late, slowest 0.25 s, **702 refusals**, longest
-     streak 3. So on the trees v0.2.10 will ship, collide-and-retry *works*: about 2.3 refusals per round,
-     each a stream opened, refused and retried after a random wait, and a delivery time set by that
-     random wait (hundreds of milliseconds) rather than by one session (tens). That is the honest size
-     of item 1: waste and randomness, not lost or 30 s-late messages.
-   - The retry is redundant even when it succeeds: whichever session had run would already have
-     carried both ends' entries.
-2. **Skipped, not queued.** `sync_one` takes one of `SYNCS_IN_FLIGHT = 16` slots with `try_acquire`;
-   past the cap the push is *"skipped, not queued. The schedule comes round again."* (~5010). A node
-   with more than 16 room–peer pairs to push at once drops the excess to the next pass, and the
-   `pushed_to`/`pending_push` bookkeeping decides whether that pass comes at once or on the tick.
-3. **"Pushed" means started, not delivered.** `run_due_syncs` records a push as done when the
-   session *starts* (~4960, the comment says so: *"Known and not fixed here: `pushed` means a
-   session started, not that it delivered"*). The failure path re-owes it (`PushRetry`); nothing
-   re-owes an entry stored after the session's `HAVE`, except the separate `pending_push` path when
-   the room is busy at the next append.
-4. **Six maps for one question.** Whether room *R* is owed to peer *P* is spread across `schedules`,
-   `pending_push`, `pushed_to`, `owed_first`, `push_failures` and `syncing`, updated at different
-   points in `run_due_syncs`, `PushRetry` and `SyncDone`. Several of the comments in those places record
-   defects that came from those maps disagreeing (a skipped peer marked synced, an owed room removed
-   by the `retain` that follows it, a failed peer re-owed to every peer).
-5. **Room-wide busy.** Before #180, one session made the whole room refuse every other peer. #180 fixes
-   this by keying the guard by (room, peer); this ADR keeps that.
-
-### What a switch does differently
-
-A switch gives each port its own full-duplex link and its own queue, so frames are **queued, never
-collided**; contention is resolved by the switch's scheduler, deterministically, not by random
-backoff. The equivalents here:
-
-| Switch | Vox |
-|---|---|
-| Port | a **(room, peer) pair**: the one place a session between those two can run |
-| Full-duplex link | a session already carries both directions; a second concurrent one is waste |
-| Per-port queue | a pair is **dirty** (owes the peer something) or clean; triggers set the flag, they never open a second session |
-| Store-and-forward, no collision domain | a node that wants a pair already in session **waits for that session to end**, then runs again only if it is still dirty |
-| Scheduler | a fair queue over dirty pairs for the 16 slots, instead of `try_acquire`-or-skip |
+1. **Glare, then random backoff (CSMA/CD).**
+   - **How it happens.** A local append makes every peer due (`note_local_append`, `run_due_syncs`),
+     and the push goes out at once. When Alice and Bob post within a round trip, each opens a session
+     to the other. Each end's responder finds its own session with that peer running
+     (`run_sync_session`, `in_session_with`) and refuses it (`SessionBusy` after #202).
+   - **What it costs.** Both sessions fail. The `SyncDone` handler re-owes the push after a random
+     20–100 ms (`QUICK_PUSH_RETRIES = 3`), and past three failures it backs off to
+     `MAX_PUSH_RETRY_WAIT` (8 s) with the ends drawing from disjoint halves by fingerprint (#41,
+     b6545e5).
+   - **Measured** (harness outputs from vox-0e's instrumented runs and #202's proof, not reproducible
+     from the trees alone):
+     - #202's proof: 35–47 collisions in 40 simultaneous rounds.
+     - Before #180, on main, with 3 members and an anchor: 1,397 refusals in 40 rounds, with streaks of
+       5–7.
+     - **With #180 underneath** (5 interleaved runs per arm, 300 rounds each): #180 alone had 0 late
+       posts, slowest 0.30 s, 703 refusals, longest streak 3. #180 plus b6545e5 had 0 late, 0.25 s,
+       702 refusals, streak 3.
+   - **So on the trees v0.2.10 ships, this is waste and randomness, not lost messages:** about 2.3
+     refused streams per simultaneous round, and a delivery time set by a random wait rather than by
+     one session.
+2. **Skipped, not queued: a real 30 s defect.** `sync_one` takes one of `SYNCS_IN_FLIGHT = 16` slots
+   with `try_acquire`, and past the cap returns `false` (5010–5011).
+   - **Why it's lost.** The skipped pair is not added to `owed`, and the peer's schedule is marked
+     synced anyway (`note_synced`, 4920–4921). `due()` then gates every later pass
+     (`syncstream.rs` 102–113).
+   - **What doesn't rescue it.** The `SyncDone` re-arm only sets `push_now`, which still hits `due()`.
+     Unless a new append or a `PushRetry` happens to re-mark that peer, **the skipped push waits for
+     the 30 s interval**. All three reviewers confirmed this.
+   - **What the code argues.** It defends the skip: *"a queue of sessions for rooms whose state has
+     since moved on is worse than none"* (actor.rs 237–239). That is true of a queue of *sessions*.
+     D6 queues *ports*: a port that has become clean by the time a slot frees never opens.
+3. **"Pushed" means started.** `run_due_syncs` counts a push as done when its session starts
+   (actor.rs 4970–4971: *"Known and not fixed here"*).
+   - **Today, the paths that rescue it:** a failed session re-owes it (`PushRetry`), and an append
+     during a session is caught by the in-session check and re-armed at `SyncDone`.
+   - **What's left** is the accounting window between a session's start and its failure, and
+     truncated serves (above), which count as done.
+4. **Seven maps for one question.** Whether room *R* is owed to peer *P* is spread across
+   `schedules`, `pending_push`, `pushed_to`, `owed_first`, `push_failures`, `syncing` and #202's
+   `syncing_with`, plus the `push_now` flag. Several comments at those sites record defects that came
+   from the maps disagreeing (4922–4935, 4963–4968, 3406–3413).
 
 ## Prior art
 
-Researched 2026-09-26. Links are to primary sources; the items marked *(unverified)* were not
-line-read.
+Researched 2026-09-26; primary sources linked, and items marked *(unverified)* were not line-read.
 
-**Collide and retry at random: what we do now.** SIP glare (RFC 3261 §14, `491 Request Pending`)
-retries after a randomized window, with no bound on the number of rounds; re-glare happens in real
-deployments *(unverified against the RFC text)*. libp2p's simultaneous-open extension
-([simopen.md](https://github.com/libp2p/specs/blob/master/connections/simopen.md)) tosses a random
-64-bit coin and fails outright on a tie. Wi-Fi RTS/CTS reduces collisions without removing them. All
-three are the hub end of the spectrum.
+**Collide, then retry at random: today's behaviour.**
+- SIP glare (RFC 3261 §14, `491 Request Pending`) *(unverified against the RFC text)*.
+- libp2p simultaneous open's random coin toss
+  ([simopen.md](https://github.com/libp2p/specs/blob/master/connections/simopen.md)).
+- Wi-Fi RTS/CTS.
 
-**A deterministic tie-break, decided before the collision: D4.**
-- BGP, [RFC 4271 §6.8](https://www.rfc-editor.org/rfc/rfc4271.html): *"retain only the connection
-  initiated by the BGP speaker with the higher-valued BGP Identifier"*. There's no randomness and no
-  retry, and it's computed from values both ends hold beforehand. FRR shipped a bug in it over IPv6
-  ([FRR#1219](https://github.com/FRRouting/frr/issues/1219)): deterministic on paper still has to be
-  wired correctly.
-- WebRTC *perfect negotiation* ([Mozilla](https://blog.mozilla.org/webrtc/perfect-negotiation-in-webrtc/)):
-  a pre-agreed polite peer rolls back and accepts, while the impolite one keeps its own offer. That's
-  the shape of D4. Its load-bearing detail is that both ends compute the role identically.
-- `iroh-persistent` ([ppetr/iroh-persistent](https://github.com/ppetr/iroh-persistent)), on Rust and
-  QUIC like us, documents our exact collision: *"a deterministic rule from the ordering of the two
-  EndpointIds makes both sides keep the same [connection] and drop the other"*.
-- Vox already does this for pairwise sessions (`incoming_session_wins`, ADR-021 F12).
-- **The pitfall to design against:** go-libp2p's dial dedup cancelled an outbound when an inbound
-  succeeded. That's a timing heuristic, not an identity rule, and it closed connections that should
-  have survived ([go-libp2p-swarm#79](https://github.com/libp2p/go-libp2p-swarm/issues/79)). D4 must
-  never depend on two ends agreeing about *timing*, only about fingerprints. See the interleavings
-  under D4.
+**A deterministic rule, decided before any collision.**
+- BGP ([RFC 4271 §6.8](https://www.rfc-editor.org/rfc/rfc4271.html)) keeps the connection opened by
+  the higher identifier. FRR mis-wired it over IPv6 ([FRR#1219](https://github.com/FRRouting/frr/issues/1219)).
+- WebRTC *perfect negotiation* ([Mozilla](https://blog.mozilla.org/webrtc/perfect-negotiation-in-webrtc/))
+  uses a pre-agreed polite and impolite peer. It holds only if both compute the roles identically.
+- `iroh-persistent` ([ppetr/iroh-persistent](https://github.com/ppetr/iroh-persistent)) is Rust over
+  QUIC, like Vox, and solves our exact collision by EndpointId ordering.
+- Vox already keeps the pairwise session opened by the lower fingerprint (`incoming_session_wins`,
+  ADR-021 F12).
+- **The pitfall:** go-libp2p decided dial dedup by *timing*, and closed connections that should have
+  survived ([go-libp2p-swarm#79](https://github.com/libp2p/go-libp2p-swarm/issues/79)).
 
-**A dirty flag, re-queued once when processing ends: D2 and D3.** Kubernetes client-go's workqueue
-([queue.go](https://github.com/kubernetes/client-go/blob/master/util/workqueue/queue.go)) keeps
-`dirty` and `processing` sets. An `Add` while a key is processing marks it dirty without enqueueing it
-twice, and `Done` re-queues it exactly once if it's still dirty. So N posts during one session become
-exactly one follow-up. Go's `singleflight` looks similar but isn't: it forgets a key the moment its
-call ends, with no rerun-once rule. Automerge keeps an `in_flight` flag per peer
-([sync::State](https://automerge.org/automerge/automerge/sync/struct.State.html)) to suppress
-duplicate messages within one exchange.
+**A dirty flag, re-queued once.** Kubernetes client-go's workqueue
+([queue.go](https://github.com/kubernetes/client-go/blob/master/util/workqueue/queue.go)): an `Add`
+while a key is processing marks it dirty, and `Done` re-queues it exactly once. Go's `singleflight`
+forgets the key when the call ends, so it has no rerun-once rule.
 
-**Persistent streams instead of per-event sessions: the full switch, deferred.**
-- Scuttlebutt EBT ([epidemic-broadcast-trees](https://github.com/ssbc/epidemic-broadcast-trees)) keeps
-  one duplex exchange per connection and announces appends via `onAppend`.
-- Hypercore multiplexes `Want/Have/Request/Data` channels over one stream
-  ([DEP-0010](https://www.datprotocol.com/deps/0010-wire-protocol/)).
-- Yjs sends `SyncStep1` from *both* ends on connect, so initiation is symmetric and idempotent, then
-  streams `Update`s ([y-protocols sync.js](https://github.com/yjs/y-protocols/blob/master/sync.js)).
-- Willow's WGPS ([spec](https://willowprotocol.org/specs/sync/index.html)) runs range reconciliation
-  forever over one connection, with credit-based logical channels. It explicitly leaves how that
-  connection came to exist, which is our collision, to the transport.
-- **Their lessons are costs:**
-  - EBT has shipped replication stalls between two connected peers
-    ([ssb-ebt#77](https://github.com/ssbc/ssb-ebt/issues/77), [#61](https://github.com/ssbc/ssb-ebt/issues/61)):
-    a long-lived stream still needs a reliable "there is news" signal.
-  - automerge-repo has shipped a family of stale per-peer sync-state bugs on reconnect
-    ([#742](https://github.com/automerge/automerge-repo/pull/742),
-    [#763](https://github.com/automerge/automerge-repo/pull/763),
-    [#343](https://github.com/automerge/automerge-repo/issues/343)).
-  - Syncthing has let a dead connection block its replacement for minutes
-    ([syncthing#9337](https://github.com/syncthing/syncthing/issues/9337)).
-- Each of these is a defect class that Vox's per-event sessions do not have today. That's why the
-  persistent stream is left for v0.3.0 and not for a defect release.
+**Persistent streams: the full switch, deferred.**
+- Scuttlebutt EBT, Hypercore ([DEP-0010](https://www.datprotocol.com/deps/0010-wire-protocol/)), Yjs
+  (a symmetric `SyncStep1` from both ends) and Willow WGPS
+  ([spec](https://willowprotocol.org/specs/sync/index.html)) all keep one long-lived stream.
+- Their bugs are the costs: EBT replication stalls ([ssb-ebt#77](https://github.com/ssbc/ssb-ebt/issues/77),
+  [#61](https://github.com/ssbc/ssb-ebt/issues/61)); stale per-peer state in automerge-repo
+  ([#742](https://github.com/automerge/automerge-repo/pull/742),
+  [#763](https://github.com/automerge/automerge-repo/pull/763)); a dead connection blocking its
+  replacement in Syncthing ([#9337](https://github.com/syncthing/syncthing/issues/9337)).
+- Short-lived sessions are not immune to their own versions of these. The code records a
+  permanent running-marker wedge (actor.rs 5060–5063), and dead connections blocking replacements
+  (`node/net.rs` 727–744). The persistent stream is deferred because it is a new protocol and a
+  feature, not because per-event sessions are free of these bug classes.
 
 **Where prior art does not transfer.**
-- TCP's simultaneous open ([RFC 9293 §3.5](https://www.rfc-editor.org/rfc/rfc9293.html)) merges both
-  SYNs into one connection, because a connection *is* its 4-tuple. A Vox session is a payload-bearing
-  reconciliation, and there's no free merge point.
-- WireGuard tolerates two handshakes because a handshake is cheap. Two Vox sessions are two full
-  reconciliations.
-- Credit-based flow control (QUIC RFC 9000 §4, WGPS guarantees) governs data already flowing. It does
-  not stop two ends from opening at the same instant.
-- **Stacking layers:** Cheshire's Nagle/delayed-ACK paper
-  ([link](https://www.stuartcheshire.org/papers/NagleDelayedAck/)) shows two reasonable coalescing
-  mechanisms, stacked without a precedence rule, producing a circular wait broken only by a timer.
-  That's the argument for D5 *deleting* the jitter rather than layering D4 over it, and for D2 making
-  the port the one authoritative trigger path.
+- TCP's simultaneous open ([RFC 9293 §3.5](https://www.rfc-editor.org/rfc/rfc9293.html)) merges for
+  free because a connection *is* its 4-tuple; a Vox session carries a reconciliation.
+- WireGuard tolerates double handshakes because they're cheap.
+- Credit-based flow control doesn't stop two ends opening at once.
+- **Stacked coalescing mechanisms produce circular waits** (Cheshire's Nagle/delayed-ACK paper,
+  [link](https://www.stuartcheshire.org/papers/NagleDelayedAck/)). That is why D5 deletes the jitter
+  rather than layering a new rule over it.
+
+## Options for the collision (the decider's choice)
+
+| | **A. Designated opener** (recommended) | B. Glare rule (revision 1's D4) | C. Accept both |
+|---|---|---|---|
+| Who opens a session for (room, pair) | only the **lower** fingerprint; the higher sends `SYNC_NOTIFY` | either; on glare the lower's is kept, the higher's is refused | either; neither refuses |
+| Collisions | **impossible by construction** | one refused stream per glare | none refused; two sessions run |
+| Sessions per pair at once | **exactly one** | up to two briefly (the refused outbound and the accepted inbound) | two on glare |
+| State the port needs | `Idle / Queued / Running` (lower); `Idle / Serving` (higher) | inbound and outbound held together, session tokens, `Awaiting` with a deadline, stale-refusal rows (all three reviews) | a session count, and attribution for two `SyncDone`s per pair |
+| Timers | **none** except the 30 s tick | `AWAIT_KEEPER` (measured from arrival, not completion) | none |
+| Wire change | **one new stream kind** (`SYNC_NOTIFY`; no compatibility is needed) | none | none |
+| Latency cost | a higher-fingerprint member's post waits one extra one-way trip (the notify), e.g. ~20 ms relayed | none | none |
+| Bytes cost | a 40-byte notify | a refused stream per glare | a duplicate reconciliation per glare |
+
+**Recommended: A.** It is the only option in which a collision cannot happen at all. That is the
+switch: one port owner, one session at a time, no collision domain.
+- **The cost is real but small.** Posts from the higher-fingerprint member take one extra one-way
+  trip, tens of milliseconds even relayed, against PRD-001 R40's 1 s.
+- **It deletes the hardest part of B**, where all three reviews found holes: two streams for one pair,
+  `SyncDone` attribution, stale refusals, and a deadline whose meaning (arrival or completion) was
+  wrong.
+- **C** is the smallest code change, but it keeps the duplicate work, and it still needs attribution
+  of two `SyncDone`s per pair.
+
+The rest of this Decision assumes A. D1–D3 and D5–D7 hold under B or C as well.
 
 ## Decision (proposed)
 
-**Each (room, peer) pair gets one port: a small state machine that the actor owns. Triggers mark a
-port dirty; a scheduler runs dirty ports into slots; a collision is resolved by a fixed rule, never by
-random backoff.** No wire change: the frames, the stream kind and `SessionBusy` (0x0B) stay as they
-are.
-
-### D1. One port per (room, peer), with one owner of its state
+### D1. One port per (room, peer), owned by the actor
 
 ```text
 struct Port {
-    state:     Idle | Queued | Running { dir: Out | In, gen_at_have: u64 } | Awaiting { until } | Backoff { until, failures },
-    dirty_gen: u64,   // the room's content generation this peer is owed up to
-    done_gen:  u64,   // the generation the last completed session delivered
+    role:       Opener | Notifier,        // lower fingerprint (network identity) opens
+    state:      Idle | Queued { since } | Running { token, gen_at_have: Option<u64> } | Backoff { until, failures },
+    owed:       bool,                     // the explicit request flag (D2)
+    done_gen:   u64,                      // room generation this peer is known to be current with
+    epoch:      u64,
 }
 ```
 
-`ports: BTreeMap<(room, peer), Port>` replaces `pushed_to`, `pending_push`, `owed_first` and
-`push_failures`. `syncing` becomes `Running`. `schedules` stays for the periodic tick and connect
-triggers, which now only mark ports dirty.
+- **`ports: BTreeMap<(room, peer), Port>`** replaces `pushed_to`, `pending_push`, `owed_first`,
+  `push_failures`, `syncing`, `syncing_with` and `push_now`.
+- **`schedules` stays** only to raise the periodic tick and connect triggers, and those only mark
+  ports owed.
+- **Roles use the authenticated network identity** (the comparison #41 already makes, actor.rs 3447),
+  never a profile lookup.
 
-Each room gains a **content generation**: a counter the room bumps whenever it stores an entry, from
-any source (a local post, a session, a backfill). A port is **dirty** while `room.gen > port.done_gen`.
+A room gets a **content generation**, a `u64` that increases whenever the room stores an entry from
+any source.
+- It is read in **the same lock acquisition** as the frontiers the session sends in `HAVE`
+  (`SessionRoom::frontiers` returns both), so it never credits an append that the `HAVE` did not
+  contain.
+- A new epoch resets every port for the room to owed.
 
-### D2. Triggers mark ports dirty; they never open a session themselves
+A port **needs a session** when any of these holds:
+- `room.gen > done_gen`: this node has something the peer may lack;
+- `owed`: someone asked (connect, the tick, a notify, a person's `vox room sync`, new board members,
+  a failed or incomplete session). The flag exists because an unchanged generation can still need
+  reconciliation, which revision 1 missed.
 
-A local append, a session that applied entries (anchor forwarding, `o.applied > 0`), a connect, a new
-member, the periodic tick and a person's `vox room sync` all do the same thing: bump or read the
-generation and mark the affected ports dirty. The scheduler opens sessions. This is the Kubernetes
-controller workqueue rule (dedup while queued; a key marked dirty while it is processing is re-queued
-once when processing ends), and it is what makes a burst of posts one session per peer instead of N.
+### D2. Triggers mark ports; only the scheduler opens sessions
 
-### D3. A session delivers up to the generation of its `HAVE`, and only if it completed
+A local post, a stored entry from any session (including a session that then **fails**), a connect,
+the tick, new members, and `vox room sync` each only bump the generation or set `owed`.
 
-When a session computes this node's `HAVE`, it records the room's generation `gen_at_have`. On
-`SyncDone`:
-- **completed** (both directions drained, serve not cut short by `SERVE_BUDGET`/`MAX_SERVE_*`):
-  `done_gen = gen_at_have`. If `room.gen > done_gen` (something was stored after the `HAVE`), the port
-  is dirty and is queued again **at once**, not on the tick;
-- **failed or cut short**: `done_gen` is unchanged, so the port is still dirty; see D5 for when it runs.
+Then, for a port that needs a session:
+- **as `Opener`:** the port is queued, and the scheduler (D6) opens it;
+- **as `Notifier`:** the node sends `SYNC_NOTIFY { room, epoch }` on a unidirectional stream, **once
+  per change of need**. It sends no second notify while one is outstanding and no session has started
+  since.
 
-This applies to sessions **in either direction**. A session Bob opened to Alice clears Alice's port
-for Bob exactly as one Alice opened would, because Alice's `HAVE` went into it. That is the point:
-whichever end's session runs, it serves both, and the other end does not open a second one.
+A port that is `Running` just records the need; the need is re-evaluated at that session's `SyncDone`.
+This is the workqueue rule: any number of triggers during a session become exactly one follow-up.
 
-### D4. A collision is resolved by a fixed rule: the lower fingerprint's session is kept
+**Entries applied from peer P don't re-owe P** (glm-5.3's answer to revision 1's open question 2).
+After a session with P that applied *n* entries, P's `done_gen` advances by the generation those
+applies produced, provided nothing else bumped the room meanwhile. If something did, P is simply owed:
+one idempotent session.
 
-Glare (both ends opened a session for the same room to each other before either saw the other's) is
-resolved the way BGP resolves a connection collision (RFC 4271 §6.8: the higher identifier's
-connection is kept) and the way Vox already resolves two pairwise sessions opened at once
-(`incoming_session_wins`, ADR-021 F12: the lower fingerprint's is kept). **The same side wins here
-as there: the session opened by the lower fingerprint.**
+### D3. What a port may conclude from a session, **on its own side only**
 
-- **The lower end** (its own session is the keeper) refuses the inbound one with `SessionBusy`, as
-  today.
-- **The higher end** accepts the inbound session even though its own outbound is running, so for a
-  moment that pair has two streams on the higher end. Its own outbound is refused by the lower end with
-  `SessionBusy`. That refusal is **not a failure**: the port moves to `Awaiting` and nothing is retried,
-  because the inbound session it is serving carries its `HAVE`, and D3 decides on that session's
-  `SyncDone` whether anything is still owed.
-- `Awaiting` has a deadline, `AWAIT_KEEPER` (proposed 2 s; see the open questions). If no session from
-  that peer for that room completes by then (its session died before it reached us), the port is queued
-  and runs as an ordinary outbound. So a lost keeper costs one bounded wait, never the 30 s tick.
+No side ever concludes that the peer *applied* anything: it cannot see that (see Context). Each side
+decides only what it can observe, and **the side that sees a problem is the side that asks again**.
+Under A, asking again means opening (lower) or notifying (higher), so nothing waits on the other end.
 
-**The interleavings.** Alice is lower (L) and Bob is higher (H). Each end decides from **its own
-port state and the two fingerprints only**, never from a belief about what the other end is doing.
-That is the libp2p #79 lesson.
+At `SyncDone`, on this node's side:
 
-| At the moment the other's stream arrives | L's action | H's action | Sessions that run |
-|---|---|---|---|
-| L idle or queued, H's arrives | accept → `Running{In}`; L's queued outbound waits on it (D2) | — | 1 (H's) |
-| H idle or queued, L's arrives | — | accept → `Running{In}` | 1 (L's) |
-| both `Running{Out}` (glare) | refuse H's with `SessionBusy` | accept L's; H's own is refused → `Awaiting` | 1 (L's) |
-| L `Running{In}` from H, and H opens again | impossible: H's port is `Running{Out}` for that session, and H opens one session per port | — | 1 |
-| L `Running{Out}` completes, then H's arrives | ordinary inbound, accept | — | 2, in sequence, and the second runs only if H was dirty past its `HAVE` in the first (D3) |
+| This side observed | Port afterwards |
+|---|---|
+| session ended `Ok`, **and** every entry this side `WANT`ed arrived (the count received equals the count its `WANT` ranges named, clamped to the peer's `HAVE`), **and** its applies all succeeded | `done_gen = gen_at_have`; still needs a session if `room.gen > done_gen` (something was stored after this side's `HAVE`), and then queues or notifies **at once** |
+| fewer entries arrived than it `WANT`ed (the peer's serve hit `MAX_SERVE_*` or `SERVE_BUDGET`) | `owed`: the rest is fetched at once. This is the truncation flag revision 1 lacked. It is observable on the receiving side, with no wire change |
+| an apply failed, or refused an entry, or the session failed | `owed`, with D5's backoff if it is a real failure; `done_gen` unchanged |
+| the session stored some entries and then failed | as above, **and** the stored entries bumped the generation, so every *other* port for the room needs a session (astra's partial-apply finding) |
 
-- **The two ends can never refuse each other**, because H never refuses on glare.
-- **Two sessions can't run to completion at once.** A stream only arrives from an end that opened
-  it, so "both streams in flight" is exactly the glare row, and there L's survives and H's is refused.
-- **A port can't stay `Awaiting` forever.** `AWAIT_KEEPER` bounds it, and the tick (D7) stands behind
-  that.
-- The reviewers are asked to break this table (open question 3).
+Entries refused because they can never be accepted (an author revoked in this epoch) count as
+received, so a permanent refusal is not retried forever. An author that is merely **not admitted yet**
+is `owed` with backoff, and `learn_members` runs first on the retry.
 
-A `SessionBusy` refusal is no longer reported as `SyncFailed`: it is an expected outcome. #202's
-reporting stays for real failures.
+**Why this closes the case revision 1 had open.** Alice (opener) serves Bob entries from an author Bob
+hasn't admitted.
+1. Bob refuses them, and Alice ends `Ok`.
+2. Bob's port for Alice is now `owed`. Bob is the notifier, so he sends `SYNC_NOTIFY`.
+3. Alice runs another session, and Bob runs `learn_members` before applying.
 
-**What this does to the numbers:** in steady state, one session per collision instead of two
-refusals plus 1–3 retries, and **no random wait on the delivery path at all**. The worst case for a
-message posted during a collision is the length of the keeper's session plus, if the post landed after
-the keeper's `HAVE`, one more session queued at once.
+The retry is driven by the side that saw the failure, within milliseconds; nobody waits for the 30 s
+tick.
+
+### D4. The designated opener (option A)
+
+For each (room, peer), **only the lower network identity opens sync streams.**
+
+**The higher end:**
+- **never opens a sync stream** for that room to that peer. It sends `SYNC_NOTIFY`, a new stream kind:
+  one unidirectional stream carrying `{channel_id, epoch}`, and nothing comes back;
+- **serves the inbound session** as today.
+
+**The lower end, on a `SYNC_NOTIFY`:**
+- checks `may_sync` (the same membership rule as an inbound session);
+- if that passes, sets the port `owed`;
+- if not, **silently drops it**. There is no reply, so a notify is no oracle for whether this node
+  holds a room (#202's probe concern).
+
+Notifies coalesce into the one flag, so a member that floods notifies costs at most one session per
+port at a time.
+
+**Reliability, without a timer.**
+- A notify rides a QUIC reliable stream. On a live connection it arrives or the connection dies.
+- If the connection dies, reconnecting marks every shared port `owed` (the connect trigger), and the
+  sessions start from there.
+- The remaining gap is a bug that swallows a notify. The 30 s tick (D7) covers it, and it is the reason
+  the tick stays.
+- EBT's lesson (a long-lived channel still needs a reliable "there is news") is met by construction.
+  The "news" is a fresh stream every time, so no stale per-peer state carries across a reconnect.
+
+**Inbound sync streams from a peer that should not open them** (a higher fingerprint opening to a
+lower one) are refused with `SessionBusy`'s neighbour, a new code `WrongOpener` (0x0C), and reported
+as a defect. A correct node never sends one.
+
+**A person's `vox room sync`, or a consent's retry, on the higher end.**
+- It sends the notify.
+- It is answered from the `SyncDone` of the inbound session that follows, which `start_session`
+  already reports.
+- If no session arrives within the command's own patience (today's `Sync` reply bound), it answers
+  `Unreachable`, as a failed open does today.
+
+**Restart under the same identity.** The restarted node has no port state. The connect trigger marks
+all of its ports owed. Its old session on the other end dies when the dead connection is filed
+(restart-probe, 582f18a), and that end's `SyncDone` for the old token is ignored (D1 tokens: a
+`SyncDone` whose token is not the port's current one changes nothing).
 
 ### D5. Backoff is only for real failures
 
-`Backoff` is entered only by a failure that is not a collision: `Unreachable`, a transport failure,
-`EpochMismatch`, a policy refusal. It keeps #41's growth to `MAX_PUSH_RETRY_WAIT` (8 s), so a peer
-whose sessions always fail (an anchor that keeps no log for the room) costs one session every few
-seconds. **The jittered quick retries, `QUICK_PUSH_RETRIES` and the disjoint-halves rule are deleted:
-nothing collides any more, so there is nothing to desynchronise.**
+`Backoff` is entered only by a real failure:
+- `Unreachable` or a transport failure;
+- `EpochMismatch` or a policy refusal;
+- an author not yet admitted.
 
-### D6. Queued, not skipped: a fair scheduler over the 16 slots
+It keeps #41's growth to `MAX_PUSH_RETRY_WAIT` (8 s). **Deleted:** the jittered quick retries,
+`QUICK_PUSH_RETRIES`, the disjoint-halves rule and the `PushRetry` event. Under A nothing collides, so
+there is nothing to desynchronise. A trigger never bypasses an active backoff; a person's
+`vox room sync` does.
 
-`sync_one`'s `try_acquire`-or-skip becomes a queue. Dirty ports wait in `Queued`; whenever a slot
-frees (on every `SyncDone`), the scheduler starts the queued port that has waited longest (FIFO by the
-time it became dirty, so one busy room cannot starve another and one peer that always goes first
-cannot starve the rest; this is what `owed_first` approximated). `SYNCS_IN_FLIGHT` stays 16. The
-anchor publish, `note_new_members` and a consent's retry keep `room_in_session` from #180 unchanged.
+### D6. Queued ports, not skipped sessions: a fair scheduler
+
+- **The 16 slots stay, for outbound sessions only.** Inbound sessions take no slot (as today:
+  `start_session` never acquires one), so two nodes cannot fill each other's slots and deadlock
+  (astra).
+- **A queued port waits in FIFO order** of when it became queued. **After each session, a port that
+  still needs one goes to the tail**, not back to its original place, so a perpetually dirty port
+  cannot starve later ones.
+- **A queued port re-checks its need when its turn comes** and does not open if it has become clean.
+  That answers the code's own objection to a queue.
 
 ### D7. The periodic tick is a safety net, not a delivery path
 
-`SYNC_INTERVAL_SECS` (30 s) stays as anti-entropy: every tick marks every shared port dirty, which
-catches anything a bug in D1–D6 misses. No proof may pass *because of* the tick: every delivery proof
-below bounds latency well under 30 s.
+`SYNC_INTERVAL_SECS` (30 s) stays. Each tick sets `owed` on every shared port. No proof may pass
+*because of* the tick: every delivery bound below is far under 30 s.
 
-### Not decided here, and why
+### Reporting
 
-- **A persistent replication stream per peer** (one long-lived stream per peer that carries every room's
-  changes as they happen, like Scuttlebutt EBT or Hypercore) is the fullest form of a switch. It changes
-  the protocol, the stream lifecycle and the anchor, and is a feature, not a defect fix: a **v0.3.0**
-  candidate. D1–D7 do not block it; the port state machine is what it would drive.
-- **Accept-both** (never refuse; let both sessions run). Correct now that the lock is per step, and
-  simpler than D4, but every collision still costs two full sessions, and it keeps the redundant session
-  as the normal case. Rejected in favour of D4.
+`vox status --json` gains, per room and peer:
+- sessions opened, served, completed, truncated and failed;
+- notifies sent and received;
+- `WrongOpener` refusals.
+
+`SyncFailed` (#202) stays for real failures. A `WrongOpener` refusal is reported as a defect.
 
 ## Scope and release
 
-**Proposed: v0.2.10, and the decider decides.** The parts are not equally defects:
-- **D3 and D6 are defects** in shipped code by the code's own account (*"`pushed` means a session
-  started, not that it delivered"*; *"skipped, not queued"*). Under the rule that every known defect is
-  fixed in the current release, they belong in v0.2.10 however D4 is decided.
-- **D4/D5 replace a mechanism that, with #180, works**: vox-0e measured 0 late posts in 600 rounds
-  across both arms. What they remove is ~2.3 wasted refusals per simultaneous round and a random wait
-  on the delivery path. The decider's words were *"it kind of sort of works but we can do better"*.
-  That is an improvement to shipped behaviour rather than a defect with a failing proof, so the
-  release it goes in is the decider's call. The case for v0.2.10 is that D1–D3 build the port that D4
-  needs, and building D1–D3 without D4 means keeping the jitter code alive inside the new structure.
-- The persistent stream stays for v0.3.0.
+**Proposed: v0.2.10; the decider decides.**
+- **Defects in shipped code, which belong in v0.2.10 under the every-known-defect rule:**
+  - item 2's 30 s skip (D6);
+  - a truncated serve that is counted as done (D3's receive-side completeness);
+  - a partial apply that fails and doesn't wake the other ports (D3).
+- **The collision behaviour (D4, D5) is an improvement to something that works with #180**: 0 late
+  posts in 600 rounds. It removes ~2.3 wasted streams per simultaneous round and the random wait. That
+  is the decider's *"we can do better"*, and whether it goes in v0.2.10 is the decider's call.
+- **Why together.** The port (D1–D3) is what the defect fixes need. Building it while keeping the
+  jitter and `PushRetry` alive inside it would be the stacked-mechanism trap the prior art warns
+  about.
+- The persistent stream stays a v0.3.0 candidate.
 
-## Proof (real binaries only, ADR-018; each red-first on the base and mutation-checked)
+## Proof (real binaries only; each prints its counts; timing runs take the timing lock)
 
-| # | Proof (new unless noted) | Asserts | Mutant that must turn it red |
-|---|---|---|---|
-| P1 | `a_collision_costs_one_session_proof` — the #202 harness: a real `vox node`, two `vox daemon`s, 40 barrier-synchronised rounds of simultaneous posts | every post readable by the other member within 250 ms (p100, not p95); **zero** `did not complete` reports; zero random-wait retries | D4 inverted so both ends refuse (today's behaviour); and D4 with *both* ends accepting |
-| P2 | same harness, 3 members | as P1 for every pair | D3 with `done_gen` set at session start (the old "pushed = started") |
-| P3 | `a_burst_past_the_slot_cap_is_queued_proof` — 24 rooms shared by two members; both post in all 24 at once | every post arrives within 2 s; none waits for the tick | D6 reverted to `try_acquire`-or-skip |
-| P4 | `a_lost_keeper_costs_a_bounded_wait_proof` — the lower end's daemon is `SIGSTOP`ped right after the higher end posts into a collision, then continued after `AWAIT_KEEPER` | the higher end's post reaches a third member (or the anchor) within `AWAIT_KEEPER` + 1 s | `Awaiting` with no deadline |
-| P5 | a post stored after the keeper's `HAVE` | it arrives in the queued follow-up session, within 250 ms of the keeper's `SyncDone` | D3 without the re-queue (`done_gen` = the generation at `SyncDone`) |
-| P6 | vox-0e's #41 gate (`test/41-collision-gate`): 2 members, the anchor stopped after warm-up, both posting at once, 60 rounds | every post read by the other within its bound; and, instrumented, **zero** refusals between the pair in steady state (today: streaks of 5–7) | today's collide-and-backoff restored |
-| — | existing: #180's `a_dead_member_does_not_stall_the_room_proof`, #41's gate, R40 (relayed and direct), `node_m15_anchor_gate`, #202's proof (its collision assertion is replaced by P1's zero-report assertion) | unchanged bounds | — |
+"Red on the base" means red on the #180+#202 tree without this ADR. S0b lands first, so each proof's
+counters exist on the base too.
 
-Every timing proof runs inside the shared timing lock. P1–P5 each print their counts (rounds run,
-reports seen, sessions started), never just `ok`, so a run that measured nothing cannot read as green.
+| # | Proof | Asserts (all through the shipped binary's output) | Red on the base? | Mutant that must turn it red |
+|---|---|---|---|---|
+| P1 | `a_collision_is_impossible_proof`: 2 daemons + anchor, 40 barrier-synchronised rounds of simultaneous posts | every post read by the other within 250 ms of `vox room post` returning (p100, loopback, one host); per pair, **sessions opened ≤ rounds + 2** and **refused-busy = 0**; opened = completed + failed at the end (quiescence) | yes: refusals > 0 | today's both-ends-open (refusals > 0); **accept-both** (sessions ≈ 2× rounds, over the bound) |
+| P2 | `a_skipped_push_is_queued_proof`: 24 rooms shared by 2 members; **only Alice posts**, once in each room at once, in both fingerprint orientations | every post read by Bob within 2 s; no port waits for the tick | **yes: ~30 s** (single-direction posting removes the `PushRetry` rescue kimi-k3 found) | `try_acquire`-or-skip restored |
+| P3 | `a_long_backlog_catches_up_proof`: Bob offline while Alice posts 3,000 entries (> 2 × `MAX_SERVE_ENTRIES`), then Bob starts | Bob holds all 3,000 within 10 s of starting; `truncated` ≥ 2 | to be measured; the base may pass via `applied > 0` | D3's receive-side completeness **and** the `applied > 0` re-owe both removed |
+| P4 | `a_refused_entry_is_asked_for_again_proof`: Carol joins through Alice; Alice immediately serves Bob a post of Carol's before Bob admits Carol | Bob reads Carol's post within 2 s, the tick excluded | to be measured | the refusing side's `owed` removed (D3 row 3) |
+| P5 | `a_post_after_have_follows_proof`: many posts during one session | every post arrives within 250 ms of its `vox room post` | **no**: the base passes via `pending_push`. It is **a mutant guard only**, and says so | `done_gen` set at `SyncDone` instead of at `HAVE` |
+| P6 | vox-0e's gate (`test/two-member-collisions` 3bb6ca1): 2 members, anchor stopped, 60 rounds | every post within its bound; **refused-busy = 0** | yes (702–703 refusals per 300 rounds) | both-ends-open restored |
+| P7 | `a_restarted_peer_resumes_its_ports_proof`: Bob killed by PID mid-session, restarted under the same identity | posts in both directions within 2 s of Bob's restart; no stale-token change (the counters stay consistent) | to be measured | tokens ignored (a stale `SyncDone` clears the current port) |
+| — | existing: `a_dead_member_does_not_stall_the_room`, R40 relayed and direct, `a_new_member_is_seen_promptly`, #202's proof **rewritten** (with no collisions left, it forces a real failure, an anchor that keeps no log, and asserts the reason) | unchanged bounds | — | — |
+
+**Not provable by real use, and said so:** a notify swallowed by a bug on a live connection. The tick
+covers it; no proof pretends to force it.
 
 ## Plan
 
 | Step | Work | Depends on |
 |---|---|---|
-| S0 | Integrate #180 and #202 into `integrate/v0.2.10` (both awaiting their independent verdicts) | — |
-| S0b | **Make the counts observable in the product**: `vox status --json` reports, per room and peer, sessions started, completed, refused as busy, and failed. vox-0e's refusal logging (`dbg/180-sessions` dddd316, `VOX_DEBUG_SYNC`) is debug-only, and a proof counts only what the shipped binary shows. Lands first, so P1/P6 can be run red on the base | S0 |
-| S1 | Room content generation; `gen_at_have` recorded by both session directions and returned in `SyncOutcome` | S0 |
-| S2 | `Port` state machine and `ports` map; migrate `pushed_to`, `pending_push`, `owed_first`, `push_failures`, `syncing` into it; triggers only mark dirty (D1, D2, D3) | S1 |
-| S3 | Glare rule and `Awaiting` with its deadline; `SessionBusy` no longer reported (D4); delete the jitter and quick retries (D5) | S2 |
-| S4 | FIFO scheduler over slots (D6) | S2 |
-| S5 | P1–P5 red-first on the base, green on the change, each mutant red; the existing proofs above re-run | S3, S4 |
-| S6 | Independent verifier; ADR-016's sync-scheduling section updated to point here | S5 |
+| S0 | #180 and #202 integrated into `integrate/v0.2.10` | — |
+| S0b | `vox status --json` per-(room, peer) counters (Reporting above); vox-0e offered to own this and P6 | S0 |
+| S1 | Room generation read with the frontiers; `SyncOutcome` gains `gen_at_have`, the received-vs-`WANT`ed count and the applied count; partial applies are reported | S0 |
+| S2 | `Port` and `ports`, with tokens; the seven maps and `push_now` migrated into it; triggers only mark (D1–D3) | S1 |
+| S3 | `SYNC_NOTIFY` stream kind and the opener rule; `WrongOpener` (0x0C); jitter, `QUICK_PUSH_RETRIES` and `PushRetry` deleted (D4, D5) | S2 |
+| S4 | FIFO scheduler with requeue-at-tail (D6) | S2 |
+| S5 | P1–P7 red-first where the table says so; each mutant red; existing proofs re-run | S3, S4 |
+| S6 | Independent verifier; ADR-016's sync-scheduling section points here | S5 |
 
 One branch, `fix/adr025-sync-ports`, off `integrate/v0.2.10` after S0. Tracked as one v0.2.10 item
-(V210-31) with S1–S6 as its checklist.
+(V210-34) with S0b–S6 as its checklist; P2's defect alone could land first if the decider wants it
+split.
 
-## Open questions for review
+## What the review changed (revision 1 → 2)
 
-1. `AWAIT_KEEPER = 2 s`: long enough for a relayed session's first frame on a slow link, short enough
-   to stay inside PRD-001 R40's 1 s budget only when the keeper is alive. Is a deadline measured from
-   the refusal right, or should it be measured from the last frame the higher end saw on the keeper's
-   session?
-2. The room generation bumps on entries *this peer just sent us*, so after a session that applied
-   entries from P, P's own port is dirty and runs one more (idempotent, empty) session. Is it worth
-   tracking the entries each session applied so that session's peer is not re-owed them?
-3. The higher end briefly runs two streams for one pair (its refused outbound and the accepted
-   inbound). Is there any path where both complete and both apply, and does anything assume one?
+| Finding | Reviewers | Change |
+|---|---|---|
+| D4's port couldn't represent two streams per pair; `SyncDone` had no attribution; stale refusals | astra, glm, kimi | Option A removes the second stream; tokens on every session; B kept as an option with the table's costs |
+| D3 claimed delivery it couldn't observe (truncation, the peer's apply after FIN, partial applies) | all three | D3 now decides only on this side's observations; receive-side completeness; the refusing side asks again; partial applies wake the other ports |
+| The generation alone couldn't encode connect, tick and new-member triggers | astra | explicit `owed` flag |
+| `AWAIT_KEEPER` measured completion; 2 s unsupported | astra, glm, kimi | gone: no deadline exists under A |
+| Slots: inbound-plus-outbound deadlock risk; FIFO starvation | astra | outbound-only slots; requeue at the tail; re-check need at the turn |
+| P1 green on accept-both; P3 green on the base; P4 tested the wrong pair; P5 not red on the base; P6 contradicted D4 | all three | table rebuilt: session-count bound, single-direction P2, P4 replaced, P5 labelled a mutant guard, P6 consistent with A; truncation, refused-entry and restart proofs added |
+| False claim: #180 keeps `room_in_session` | all three | removed. 58fde36 deleted it, and D6 no longer mentions it |
+| Claim 1 cited the room-keyed tree; claim 3 overstated; "never refuse each other" overstated | glm, kimi | citations now from 58fde36; claim 3 restated; refusals for epoch and membership remain and go to backoff |
+| Designated opener and accept-both weren't argued | astra, glm, kimi | Options table |
+| The code's own defence of skipping was quoted selectively | glm | quoted in full and answered |
