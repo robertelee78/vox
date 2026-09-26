@@ -49,7 +49,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::cbor::{Decoder, Encoder};
-use crate::error::{Error, Result};
+use crate::error::{Error, IpcHandshake, Result};
 use crate::hash::Digest32;
 use crate::node::actor::{EventStream, EventStreamItem, NodeHandle};
 use crate::node::api::{MessageRow, NodeEvent};
@@ -1757,17 +1757,23 @@ impl IpcClient {
     /// the connection into an event stream, after which no further request can be
     /// sent on it.
     pub async fn open(path: &Path) -> Result<Self> {
-        let mut stream = UnixStream::connect(path).await.map_err(|e| Error::Path {
-            op: "connect control socket",
-            detail: format!("{}: {e}", path.display()),
+        let mut stream = UnixStream::connect(path).await.map_err(|e| {
+            Error::Ipc(IpcHandshake::Unreachable {
+                reason: e.to_string(),
+            })
         })?;
         let Some(hello) = read_frame(&mut stream).await? else {
-            return Err(Error::MalformedBundle("ipc closed before hello"));
+            return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         let me = match Frame::from_bytes(&hello)? {
             Frame::Hello { protocol, me } if protocol == PROTOCOL_VERSION => me,
-            Frame::Hello { .. } => return Err(Error::MalformedBundle("ipc protocol version")),
-            _ => return Err(Error::MalformedBundle("ipc expected hello")),
+            Frame::Hello { protocol, .. } => {
+                return Err(Error::Ipc(IpcHandshake::Protocol {
+                    mine: PROTOCOL_VERSION,
+                    theirs: protocol,
+                }))
+            }
+            _ => return Err(Error::Ipc(IpcHandshake::NotHello)),
         };
         Ok(Self { stream, me })
     }

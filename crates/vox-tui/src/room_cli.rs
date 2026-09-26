@@ -22,6 +22,7 @@ use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 
+use vox_core::error::{Error, IpcHandshake};
 use vox_core::hash::Digest32;
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::{b32_decode, b32_encode, B32_DIGEST_LEN};
@@ -53,12 +54,26 @@ async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
             paths.socket_file().display()
         )));
     }
-    IpcClient::open(&sock).await.map_err(|_| {
-        AppError::Usage(format!(
-            "a control socket exists at {} but nothing answered — the node may have \
-             stopped without cleaning up. Starting a node again replaces it.",
-            sock.display()
-        ))
+    // Each way an attach fails needs a different remedy, so each gets its own sentence
+    // (#191): they were one, "nothing answered — the node may have stopped", which is true
+    // only of a stale socket, and the actual error was thrown away.
+    IpcClient::open(&sock).await.map_err(|e| {
+        let at = sock.display();
+        AppError::Usage(match e {
+            Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
+                "a control socket exists at {at} but nothing is listening on it ({reason}) — \
+                 the node may have stopped without cleaning up. Starting a node again replaces it."
+            ),
+            Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => format!(
+                "a control socket exists at {at}, but {h}: it may be shutting down. Try again, \
+                 or start one with `vox daemon`."
+            ),
+            Error::Ipc(h) => format!("{h}. Socket: {at}"),
+            other => format!(
+                "a control socket exists at {at} but nothing answered ({other}) — the node may \
+                 have stopped without cleaning up. Starting a node again replaces it."
+            ),
+        })
     })
 }
 
