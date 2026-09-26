@@ -19,7 +19,9 @@ use vox_core::node::link::b32_encode;
 pub const AUTHOR_CHARS: usize = 26;
 
 /// What marks a member that is not in this node's trust keyring, where the keyring is known.
-pub const NOT_IN_KEYRING: &str = "(not in your keyring)";
+/// Short enough that 26 characters, a space and this fit the TUI's members pane (46 columns):
+/// the longer "(not in your keyring)" was cut off there, which the proof caught.
+pub const NOT_IN_KEYRING: &str = "(not in keyring)";
 
 /// A member's fingerprint as shown on screen: its first [`AUTHOR_CHARS`] base32 characters.
 #[must_use]
