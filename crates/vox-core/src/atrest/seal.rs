@@ -1,13 +1,15 @@
 //! The key a node-wide blob is sealed under at rest (V210-40, #214).
 //!
-//! Four blobs belong to the identity rather than to any channel: the trust keyring, the pending
-//! consents, the prekey ring, and the pages of a log this node anchors. Each used to be sealed
-//! under `HKDF(id_proof)`, the ADR-010 identity factor. The `id_proof` is an Ed25519 signature,
-//! and Ed25519 falls to a quantum adversary who holds only the public key: such an adversary
-//! with the disk could open all four without the identity passphrase. For the prekey ring that
+//! Three blobs belong to the identity rather than to any channel: the trust keyring, the pending
+//! consents and the prekey ring. Each used to be sealed under `HKDF(id_proof)`, the ADR-010
+//! identity factor. The `id_proof` is an Ed25519 signature, and Ed25519 falls to a quantum
+//! adversary who holds only the public key: such an adversary with the disk could open all three
+//! without the identity passphrase. For the prekey ring that
 //! means the ML-KEM prekey secrets, which defeats the post-quantum half of every recorded
 //! handshake. A per-channel SEK is not affected, because its second factor is the room
-//! passphrase through Argon2id.
+//! passphrase through Argon2id. Nor are anchor pages: only a headless `vox node` keeps them, and
+//! its identity is a plaintext file by design (ADR-016), so a key from its identity factor is
+//! exactly as strong as the identity it has.
 //!
 //! Each is now sealed under `HKDF(self_seed, info = <its own label>)`. `self_seed` lives inside
 //! the identity vault, so only the identity passphrase releases it, the same as the open-room

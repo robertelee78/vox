@@ -23,10 +23,13 @@ use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKin
 use crate::error::Result;
 use crate::identity::composite::RootSigner;
 use crate::node::store::{Batch, Store};
-use crate::node::{anchor, pending_consent, prekeys, trust};
+use crate::node::{pending_consent, prekeys, trust};
 
 /// Re-seal every node-wide blob in `store` that still opens only under its legacy key, in one
-/// transaction. Returns how many blobs (anchor pages counted one by one) were re-sealed.
+/// transaction. Returns how many blobs were re-sealed.
+///
+/// Anchor pages are not among them: only a headless `vox node` keeps them, and it has no vault
+/// (see [`crate::node::anchor::anchor_sek`]).
 ///
 /// # Errors
 /// A key cannot be derived, or the store cannot be read or written.
@@ -72,30 +75,6 @@ pub fn migrate_to_vault_seals(store: &Store, signer: &dyn RootSigner) -> Result<
                 &fresh,
             )?;
             moved += 1;
-        }
-    }
-
-    // Anchored logs: the meta segment decides; if it moved, every page moves with it.
-    for channel in store.anchored_channels()? {
-        let (new, old) = (
-            anchor::anchor_sek(signer, &channel)?,
-            anchor::legacy_anchor_sek(signer, &channel)?,
-        );
-        let Some(meta) = store.get_segment(&channel, SegmentKind::AnchorMeta, anchor::SEG_META)?
-        else {
-            continue;
-        };
-        let Some(fresh) = reseal(SegmentKind::AnchorMeta, anchor::SEG_META, &meta, &new, &old)?
-        else {
-            continue;
-        };
-        batch.put_segment(&channel, SegmentKind::AnchorMeta, anchor::SEG_META, &fresh)?;
-        moved += 1;
-        for (id, page) in store.segments(&channel, SegmentKind::AnchorLog)? {
-            if let Some(fresh) = reseal(SegmentKind::AnchorLog, id, &page, &new, &old)? {
-                batch.put_segment(&channel, SegmentKind::AnchorLog, id, &fresh)?;
-                moved += 1;
-            }
         }
     }
 

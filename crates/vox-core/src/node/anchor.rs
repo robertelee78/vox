@@ -42,37 +42,15 @@ use crate::node::store::Store;
 pub const ANCHOR_SEK_INFO: &[u8] = b"vox/anchor-log-sek/v1";
 
 /// The metadata segment's id within [`SegmentKind::AnchorMeta`].
-pub const SEG_META: u64 = 0;
+const SEG_META: u64 = 0;
 
 /// Metadata encoding version.
 const META_VERSION: u64 = 1;
 
-/// HKDF `info` prefix for a profile node's anchored pages, taken over `self_seed` and followed
-/// by the channelID.
-pub const ANCHOR_VAULT_SEK_INFO: &[u8] = b"vox/anchor-log-sek/v2";
-
-/// Derive the sealing key for the anchor's copy of `channel_id`. Deterministic, so a restart
-/// reopens its own pages.
-///
-/// - A **profile** node seals from the vault's `self_seed` (V210-40, #214), which only the
-///   identity passphrase releases. The identity factor it used before is an Ed25519
-///   signature, which a quantum adversary can compute from the public key.
-/// - A **headless** `vox node` has no vault: its identity is a plaintext file by design
-///   (ADR-016), so whoever can read its pages can read that file too, and a key from its
-///   identity factor is exactly as strong as its identity. It keeps [`legacy_anchor_sek`].
+/// Derive the sealing key for the anchor's copy of `channel_id` from the anchor's
+/// identity: the identity factor for that channel (ADR-010's `factor_id`), expanded
+/// under [`ANCHOR_SEK_INFO`]. Deterministic, so a restart reopens its own pages.
 pub fn anchor_sek(signer: &dyn RootSigner, channel_id: &Digest32) -> Result<Sek> {
-    if signer.at_rest_seed().is_some() {
-        let mut info = Vec::with_capacity(ANCHOR_VAULT_SEK_INFO.len() + channel_id.len());
-        info.extend_from_slice(ANCHOR_VAULT_SEK_INFO);
-        info.extend_from_slice(channel_id.as_ref());
-        return crate::atrest::seal::sek(signer, &info);
-    }
-    legacy_anchor_sek(signer, channel_id)
-}
-
-/// The identity factor for `channel_id` (ADR-010's `factor_id`), expanded under
-/// [`ANCHOR_SEK_INFO`]: a headless node's key, and a version-1 vault's (migration only).
-pub fn legacy_anchor_sek(signer: &dyn RootSigner, channel_id: &Digest32) -> Result<Sek> {
     let factor = SignatureIdentityFactor::new(signer);
     let factor_id = factor.factor_id(channel_id)?;
     let hk = Hkdf::<Sha256>::new(None, factor_id.as_ref());
