@@ -1100,6 +1100,41 @@ impl NodeNet {
         out
     }
 
+    /// This node's board's live records for `(channel, epoch)` whose **author** the given peer
+    /// board holds no record of the same kind for — bundles first, then address records, in the
+    /// order `board_records` explains. Includes this node's own. What a member offers a peer's
+    /// board during a sync, so the peer learns of a member that joined through this node without
+    /// waiting to read this node's board itself.
+    #[must_use]
+    pub fn board_records_missing_from(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+        peer: &crate::nat::service::RecordSet,
+    ) -> Vec<Vec<u8>> {
+        let now = self.now();
+        let has_bundle: std::collections::BTreeSet<Digest32> =
+            peer.bundles.iter().map(|b| b.author_id).collect();
+        let has_address: std::collections::BTreeSet<Digest32> =
+            peer.members.iter().map(|m| m.author_id).collect();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut out: Vec<Vec<u8>> = guard
+            .current_bundles(channel_id, epoch, now)
+            .into_iter()
+            .filter(|r| !has_bundle.contains(&r.author_id))
+            .map(MemberBundleRecord::to_wire)
+            .collect();
+        out.extend(
+            guard
+                .current_members(channel_id, epoch, now)
+                .into_iter()
+                .filter(|r| !has_address.contains(&r.author_id))
+                .map(RendezvousRecord::to_wire),
+        );
+        out
+    }
+
     /// Put a framed record on **this node's own** board, without a network round
     /// trip. A node is its own first anchor, and it would be absurd to dial itself;
     /// the record still goes through the service's full policy, so a local publish

@@ -116,6 +116,11 @@ const TICK: Duration = Duration::from_secs(1);
 /// dial to one member it cannot currently reach. See `reach_member`.
 const MEMBER_REDIAL_SECS: u64 = 30;
 
+/// How long relayed connections' closes get to leave through their circuits before the circuits'
+/// carrier connections are closed too (see `stop_network`). The frame only has to be handed to the
+/// circuit's stream, which happens on the endpoint driver's next turn.
+const RELAYED_CLOSE_LEAD: Duration = Duration::from_millis(50);
+
 /// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
@@ -1814,7 +1819,17 @@ pub struct Node {
     /// by *its* initiated session. Nothing breaks it but `SYNC_FRAME_TIMEOUT`. Measured as a user, a
     /// message posted right after a join crossed in 20s or 40s — one and two frame timeouts — instead
     /// of the 0-1s it takes when the rooms are free.
-    syncing: std::collections::BTreeSet<Digest32>,
+    ///
+    /// **Per room and peer, not per room.** Keyed by room alone, one session made the whole room
+    /// wait: a push to a member whose process had died waited for an answer until the connection
+    /// was declared dead (`SILENCE_IS_DEATH`, 30 s), and for all that time every other member's
+    /// session for the room was refused and every push to them was owed. One dead member stalled a
+    /// room for everyone (measured by log-scale, and in `a_dead_member_does_not_stall_the_room`).
+    /// What this guards against is a *pair* colliding, both ends reconciling the same room with
+    /// each other at once, so that is what it keys on. Sessions with different peers run side by
+    /// side: each takes the room's lock inside one protocol step at a time, never across the
+    /// network (`ChannelState::sync_over_room`).
+    syncing: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// Rooms this node is joining right now (their join is on a `Joiner` task).
     joining: std::collections::BTreeSet<Digest32>,
     /// Pairwise streams for a room still being joined, held until the join reports back: see
@@ -1826,9 +1841,10 @@ pub struct Node {
         quinn::SendStream,
         quinn::RecvStream,
     )>,
-    /// Rooms whose anchor publish found them mid-session: run when that session's `SyncDone`
-    /// lands. See `publish_channel_to_anchors`.
-    publish_owed: std::collections::BTreeSet<Digest32>,
+    /// Per room, the members this node's board has held a bundle record for. A record from an
+    /// author not in it is a member this node has just learned of, which is what
+    /// `note_new_members` passes on at once; a refresh of a known member's record is not.
+    board_authors: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// `(room, board)` publish rounds in flight on their own tasks; see `publish_channel_to_anchor`.
     publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// Publishes asked for while that `(room, board)` round was in flight: run when it ends.
@@ -2031,7 +2047,7 @@ impl Node {
             syncing: std::collections::BTreeSet::new(),
             joining: std::collections::BTreeSet::new(),
             held_pairwise: Vec::new(),
-            publish_owed: std::collections::BTreeSet::new(),
+            board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
             publish_again: std::collections::BTreeSet::new(),
             publish_waiters: Vec::new(),
@@ -2197,7 +2213,7 @@ impl Node {
         }
         // Channel closed or shutdown: lock (wipe every SEK + the signer) and stop.
         let store = self.log_store();
-        self.stop_network();
+        self.stop_network().await;
         self.lock_all().await;
         self.publish().await;
         let _ = self.event_tx.send(NodeEvent::Shutdown);
@@ -2545,8 +2561,19 @@ impl Node {
 
     /// Tear the network down: close every connection and the endpoint, so a locked
     /// node presents no network identity at all.
-    fn stop_network(&mut self) {
+    async fn stop_network(&mut self) {
         if let Some(net) = self.net.take() {
+            // **Relayed connections first**, while the circuits their closes travel in still run,
+            // then everything else. Closing them all at once closed each circuit's carrier in the
+            // same instant, so a relayed peer never received the CONNECTION_CLOSE. It learned this
+            // node was gone only by inference: from `SILENCE_IS_DEATH` (30 s), or, since V29-15,
+            // from reading the severed circuit as not a direct path. Inference is the fallback for
+            // a crash. A node that is stopping **says** it is leaving, which is what a close is for.
+            // Measured on `m15_members_never_online_together`: 33.3 s in 10 of 12 runs without
+            // either, 107–115 ms with this ordering alone.
+            if net.manager().close_relayed() > 0 {
+                tokio::time::sleep(RELAYED_CLOSE_LEAD).await;
+            }
             net.manager().close_all();
             net.manager().endpoint().close();
         }
@@ -3028,20 +3055,13 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        // **Never wait on a room a session holds.** Building the records takes the room's lock, and
-        // a sync session holds that lock for its whole run on a blocking thread — bounded only by
-        // the 20s frame timeout when the peer is slow. Measured through the real binaries with the
-        // wait timed: `publish waited 19.9987s for the ROOM lock`, against `busy 20005ms — passing on
-        // a record that landed on our board`, while every put on the wire took under 22ms. It was
-        // also half of a cycle: this actor waiting on its room, whose session waited on a peer
-        // whose actor was waiting the same way, broken only by the frame timeout.
-        //
-        // Owed instead, and run the moment that session's `SyncDone` lands — still on the actor, so
-        // anything that follows a publish still follows it.
-        if self.syncing.contains(channel_id) {
-            self.publish_owed.insert(*channel_id);
-            return;
-        }
+        // **Not deferred while a session runs.** This used to be owed until the room had no
+        // session at all, because a session held the room's lock for its whole run (measured:
+        // `publish waited 19.9987s for the ROOM lock`). Since 3f95b57 a session takes the lock
+        // per protocol step and never across I/O, so the wait here is one step. Deferring had
+        // become the hazard instead: with sessions guarded per (room, peer) (#180), sessions
+        // with different members overlap, a busy room is never session-free, and the owed
+        // publish could wait indefinitely while joiners read a stale board.
         let anchors: Vec<Arc<VoxConnection>> = self
             .anchor_ids
             .iter()
@@ -3335,6 +3355,7 @@ impl Node {
                 // around a ring of anchors.
                 if self.channels.contains_key(&channel_id) {
                     self.publish_channel_to_anchors(&channel_id).await;
+                    self.note_new_members(&channel_id).await;
                 }
             }
             NetEvent::SyncRequest {
@@ -3468,7 +3489,7 @@ impl Node {
                 peer,
                 outcome,
             } => {
-                self.syncing.remove(&channel_id);
+                self.syncing.remove(&(channel_id, peer));
                 self.answer_pending_consents(|room, _| *room == channel_id, None)
                     .await;
                 // **A session that failed delivered nothing, so its push is owed again.**
@@ -3541,9 +3562,6 @@ impl Node {
                 if !self.pending_push.is_empty() {
                     // A push that found this room mid-session is owed; the room is free now.
                     self.push_now = true;
-                }
-                if self.publish_owed.remove(&channel_id) {
-                    self.publish_channel_to_anchors(&channel_id).await;
                 }
                 self.refresh_network_view().await;
                 if let Ok(o) = outcome {
@@ -4494,10 +4512,12 @@ impl Node {
             .as_ref()
             .is_some_and(|n| n.manager().existing(&target).is_some());
         if connected {
-            // Started or not (the room may be mid-session with somebody else), the retry rides the
-            // room's next `SyncDone`.
+            // Started or not (a session with this same member may already be running), the retry
+            // rides the next `SyncDone` of a session **with the target**. Checking for any session
+            // on the room kept a consent waiting on sessions with other members, which, now that
+            // sessions are guarded per (room, peer), need never all end.
             let _ = self.sync_one(&channel_id, target).await;
-            if !self.syncing.contains(&channel_id) {
+            if !self.in_session_with(&channel_id, &target) {
                 let _ = reply.send(outcome);
                 return;
             }
@@ -4825,6 +4845,59 @@ impl Node {
         delivered
     }
 
+    /// **A member this node has just learned of is passed on at once**, like a local append.
+    ///
+    /// Membership travels on boards: a member who joins through one node puts its records on
+    /// that node's board, and every other member learned of it only by reading that board on
+    /// its own periodic sync (`SYNC_INTERVAL_SECS`, 30 s). Measured with three real nodes: the
+    /// third member saw a new one 24–28 s after the join returned; with the interval forced to
+    /// 5 s, 1.9–2.6 s. So when this node's board gains a bundle record from an author it has
+    /// not seen, it admits what the evidence allows and pushes the room to its connected members.
+    /// That push offers their boards the records they lack (`sync_one`), and each receiving
+    /// member does the same once, when the newcomer is new to it.
+    ///
+    /// **Bounded, not a storm.** Only a *new author* triggers this: a member's periodic refresh of
+    /// its own records does not. Each node therefore pushes at most once per newcomer, which is
+    /// the same fan-out one chat message already has, and in a 500-member room it is one pass per
+    /// member per join, over the connections it already holds, with nothing forwarded twice
+    /// because a board that already holds the record does not grow.
+    async fn note_new_members(&mut self, channel_id: &Digest32) {
+        // Not deferred while a session runs; see `publish_channel_to_anchors`.
+        let (Some(net), Some(shared)) = (
+            self.net.as_ref().map(Arc::clone),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
+            return;
+        };
+        let epoch = shared.lock().await.epoch();
+        let bundles = net.board_bundles(channel_id, epoch);
+        let known = self.board_authors.entry(*channel_id).or_default();
+        let fresh = bundles.iter().filter(|b| known.insert(b.author_id)).count();
+        if fresh == 0 {
+            return;
+        }
+        if let Some(store) = self.profile.as_ref().map(Profile::store_handle) {
+            let now = self.now();
+            let mut channel = shared.lock().await;
+            let _ = admit_board_records(
+                &mut channel,
+                &store,
+                &bundles,
+                ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+                now,
+            )
+            .await;
+        }
+        self.refresh_network_view().await;
+        self.note_local_append(channel_id);
+    }
+
+    /// Whether a sync session with `peer` is running on `channel_id`: the collision a new
+    /// session with that peer for that room must not start into (see `syncing`).
+    fn in_session_with(&self, channel_id: &Digest32, peer: &Digest32) -> bool {
+        self.syncing.contains(&(*channel_id, *peer))
+    }
+
     /// Mark a channel as having a local append to push, and make every peer's
     /// schedule due (ADR-016: "a push immediately after a local append").
     fn note_local_append(&mut self, channel_id: &Digest32) {
@@ -4960,7 +5033,7 @@ impl Node {
                 {
                     continue;
                 }
-                if self.syncing.contains(cid) || self.publishing.contains(&(*cid, peer)) {
+                if self.in_session_with(cid, &peer) || self.publishing.contains(&(*cid, peer)) {
                     owed.push(*cid);
                     continue;
                 }
@@ -5005,7 +5078,7 @@ impl Node {
                 {
                     continue;
                 }
-                if self.syncing.contains(cid) {
+                if self.in_session_with(cid, &peer) {
                     owed.push(*cid);
                     continue;
                 }
@@ -5117,13 +5190,13 @@ impl Node {
         if matches!(target, SessionTarget::Anchored(_)) {
             self.refresh_anchored_authors(channel_id).await;
         }
-        if self.syncing.contains(channel_id) {
-            return false; // a session already has this room; a second would deadlock against it
+        if self.in_session_with(channel_id, &peer) {
+            return false; // a session with this peer already has this room
         }
         let Ok(slot) = Arc::clone(&self.sync_slots).try_acquire_owned() else {
             return false; // past the cap: skipped, not queued. The schedule comes round again.
         };
-        self.syncing.insert(*channel_id);
+        self.syncing.insert((*channel_id, peer));
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
         let cid = *channel_id;
         let now = self.now();
@@ -5160,6 +5233,29 @@ impl Node {
                                 .chain(set.members.iter().map(RendezvousRecord::to_wire))
                             {
                                 let _ = net.publish_local(&wire);
+                            }
+                            // **And the other way: what this node's board holds that the peer's
+                            // lacks.** A member who joined through this node is on this node's
+                            // board and no other, and the peer learned of it only when *it* next
+                            // read this board, on its own periodic sync: 24–28 s for a third
+                            // member to see a new one, measured. Offered here, a push that follows
+                            // a join carries the newcomer to every connected member at once.
+                            // Best-effort: a refusal (a record the peer's board already holds
+                            // newer) costs nothing, and the peer's own sync still reads this board.
+                            let missing = net.board_records_missing_from(&cid, known, &set);
+                            if !missing.is_empty() {
+                                if let Ok(mut client) =
+                                    crate::nat::service::RendezvousClient::open(&conn).await
+                                {
+                                    for wire in &missing {
+                                        if let Err(e) = client.put(wire).await {
+                                            if !matches!(e, Error::RendezvousRejected(_)) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    client.finish();
+                                }
                             }
                         }
                     }
@@ -5241,7 +5337,7 @@ impl Node {
         };
         // Marked here, past both early returns above, so a session that never starts never
         // leaves the room marked. Its caller used to mark it first.
-        self.syncing.insert(channel_id);
+        self.syncing.insert((channel_id, peer));
         let now = self.now();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
@@ -5334,7 +5430,7 @@ impl Node {
         // **Refused before the lock, not after.** A session holds this room's mutex for its whole
         // run, and this is the actor: awaiting that lock to read the epoch parked the whole node
         // behind the very session this check exists to detect.
-        if self.syncing.contains(&channel_id) {
+        if self.in_session_with(&channel_id, &peer) {
             let (mut send, mut recv) = (send, recv);
             crate::node::net::refuse_stream(&mut send, &mut recv);
             return;
@@ -6013,7 +6109,7 @@ impl Node {
         self.reopen.clear();
         // And take the network down: a locked node has no identity to present, so it
         // must not keep serving or holding connections (M14.7d).
-        self.stop_network();
+        self.stop_network().await;
         if let Some(p) = self.profile.as_mut() {
             p.lock();
         }

@@ -950,6 +950,29 @@ impl ConnectionManager {
         }
     }
 
+    /// Close every connection that runs **over a relay circuit**, and hand back how many.
+    ///
+    /// Done before the others at shutdown: a relayed connection's CONNECTION_CLOSE travels inside
+    /// a circuit on another connection (the one to the relay), so closing that carrier at the same
+    /// moment loses the frame, and the far peer learns only from `SILENCE_IS_DEATH`.
+    pub fn close_relayed(&self) -> usize {
+        let relayed = |c: &VoxConnection| path_class(&self.endpoint, c) == PathClass::Relayed;
+        let mut n = 0;
+        for (conn, _) in lock(&self.retiring).iter() {
+            if relayed(conn) {
+                conn.close(WireError::AuthenticatorInvalid);
+                n += 1;
+            }
+        }
+        for conn in lock(&self.conns).values() {
+            if relayed(conn) {
+                conn.close(WireError::AuthenticatorInvalid);
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Close every connection (node shutdown).
     pub fn close_all(&self) {
         for (conn, _) in lock(&self.retiring).drain(..) {

@@ -932,6 +932,68 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   application-deaf for the whole grace. Retiring is now confined to the accept path, where the caller
   serves it; everywhere else the loser is closed as before, and a `debug_assert!` holds the
   invariant. Found independently by two reviewers reading the diff, not by a gate.
+- **A new member reaches the room when it joins, not on the next interval (2026-09-25, v0.2.10).**
+  Membership travels on boards. A member who joins through Alice puts its records on Alice's board,
+  and each other member learned of it only when it next read that board on its own periodic sync
+  (`SYNC_INTERVAL_SECS`, 30 s). Measured before: the third member listed the newcomer 21.7–27.1 s
+  after the join returned. With the interval forced to 5 s, 1.9–2.6 s, which confirmed the carrier.
+  Two changes, both needed (each alone was measured red):
+  - When a node's board gains a bundle record from an author it has not seen, it admits what the
+    evidence allows and pushes the room to its connected members at once (`note_new_members`).
+  - A sync now offers the peer's board the records this node's board holds and the peer's lacks
+    (`board_records_missing_from`, bundles before addresses). A push therefore carries the newcomer.
+
+  Only a *new author* triggers the push; a member refreshing its own records does not. So each node
+  pushes at most once per newcomer, the fan-out one chat message already has, and a board that
+  already holds a record does not grow and forwards nothing. Gate
+  `crates/vox-tui/tests/a_new_member_is_seen_promptly_proof.rs`: a real anchor and three real
+  daemons; Bob lists Carol 107–110 ms after her join returns (bound 3 s, 3 of 3). Mutation, no
+  prompt push: 27.1 s and 21.7 s, red. Mutation, no board offer: 27.6 s and 26.4 s, red. R40 is
+  unaffected: relayed p95 64 ms, direct p95 31 ms.
+
+- **A node that stops tells its relayed peers (2026-09-25, v0.2.10).** Closing every connection at
+  once closed each circuit's carrier in the same instant as the relayed connection riding it, so the
+  relayed peer never received the CONNECTION_CLOSE. It learned the node was gone only by inference:
+  after `SILENCE_IS_DEATH` (30 s), or, with V29-15, by reading the severed circuit as no longer a
+  direct path. `stop_network` now closes relayed connections first, waits `RELAYED_CLOSE_LEAD`
+  (50 ms), then closes the rest.
+  **Both mechanisms stay, for different paths.** V29-15's inference is what a peer has after a crash,
+  when there is no close to receive. The ordered close is what an orderly stop owes its peers.
+  On `m15_members_never_online_together`:
+  - 33.3 s in 10 of 12 runs with neither;
+  - 107–115 ms with this ordering alone (3 of 3);
+  - 2.3–4.9 s with V29-15 alone (5 of 5).
+
+  Its gate now bounds the anchor taking Alice's post at 10 s. Mutation (everything closed at once, no
+  V29-15): 31.0 s and 30.5 s, red.
+- **One dead member no longer stalls a room for everyone (2026-09-25, v0.2.10).** A push reconciles
+  the room with a member and waits for its answer. When that member's process died without closing
+  its connections, nothing answered until the connection was declared dead (`SILENCE_IS_DEATH`,
+  30 s). The session guard (`syncing`) was keyed by room, so for the whole wait every other member's
+  session for the room was refused and every push to them was owed. log-scale measured it with
+  shipped daemons: converged 29.5 s and 21.9 s after a member returned.
+  - The guard is now keyed by **room and peer**. What it prevents is a pair colliding, both ends
+    reconciling the same room with each other at once, and a pair is what it keys on.
+  - Sessions with different peers run side by side. Each takes the room's lock inside one protocol
+    step at a time, never across the network (`ChannelState::sync_over_room`).
+  - The anchor publish and `note_new_members` are **not** deferred while sessions run. They used to
+    be owed until the room had no session at all, which was right while a session held the lock for
+    its whole run. Once sessions lock per step and overlap per peer, a busy room need never be
+    session-free, and the owed publish could wait indefinitely while joiners read a stale board
+    (agent_comms's review of 33da864). The deferral is removed; the actor waits at most one step.
+    An explicit consent's retry rides the next `SyncDone` of a session **with its target**
+    (`in_session_with`), not of any session on the room.
+    - Not gated red-first. On today's tree the anchor learns a joiner from its own copy of the log,
+      so no anchor-visible change depends on a busy member's publish: a busy-room gate stayed green
+      before and after (5 of 5 on 33da864 and 69aaff5). It can bite once anchors store nothing
+      (ADR-023 M23.5). The regression checks are the dead-member and new-member gates.
+
+  Gate `crates/vox-tui/tests/a_dead_member_does_not_stall_the_room_proof.rs` (a real anchor and three
+  real daemons; Carol's daemon killed by PID; five posts from Alice timed to Bob's `vox room read`,
+  bound 1 s, R40): 56–65 ms each, 2 runs. Mutation, guard keyed by room again: posts waited 30.0 s and
+  29.3 s, red. Not covered here: a member that restarts under the **same** identity while the old
+  session still waits is refused as the same pair until that session ends. restart-probe's held-
+  connection probe (582f18a) closes the dead connection when the newcomer is filed.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
