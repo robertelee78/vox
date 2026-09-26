@@ -1,0 +1,21 @@
+name: diag-r41
+on:
+  push:
+    branches: ['diag/r41-mac-path']
+jobs:
+  r41:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+      - uses: actions/checkout@v4
+      - run: sysctl -n hw.ncpu 2>/dev/null || nproc
+      - run: cargo test --release -p vox-tui --test perf_r41_tunnel_throughput_proof -- --ignored --nocapture 2>&1 | grep -E 'R41:|PATH|CANNOT|test result|windows' | tail -150
+        env:
+          VOX_PERF_ONLY: "1 Gbit/s"
+          VOX_TEST_PATH_STATS: "1"

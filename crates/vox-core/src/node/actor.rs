@@ -2073,6 +2073,22 @@ impl Node {
                 }
                 _ = ticker.tick() => {
                     if let Some(net) = self.net.as_ref() {
+                        // DIAG (throwaway branch): VOX_TEST_PATH_STATS prints each connection's
+                        // path every tick.
+                        if std::env::var_os("VOX_TEST_PATH_STATS").is_some() {
+                            for peer in net.manager().peers() {
+                                if let Some(c) = net.manager().existing(&peer) {
+                                    let s = c.quinn().stats();
+                                    let p = s.path;
+                                    eprintln!(
+                                        "vox: PATH {} rtt {:?} cwnd {} lost {} cong {} sent {} mtu {} tx_bytes {}",
+                                        crate::node::network::short_id(peer), p.rtt, p.cwnd,
+                                        p.lost_packets, p.congestion_events, p.sent_packets,
+                                        p.current_mtu, s.udp_tx.bytes
+                                    );
+                                }
+                            }
+                        }
                         // Connections a better path displaced are closed once their
                         // grace is up (M15.1b).
                         net.manager().retire_expired();
