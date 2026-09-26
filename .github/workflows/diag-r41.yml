@@ -1,0 +1,19 @@
+name: diag-r41
+on:
+  push:
+    branches: ['diag/r41-in-test']
+jobs:
+  r41:
+    strategy:
+      fail-fast: false
+      matrix:
+        spotlight: [off, on]
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - if: matrix.spotlight == 'off'
+        run: sudo mdutil -a -i off
+      - uses: actions/checkout@v4
+      - run: cargo test --release -p vox-tui --test perf_r41_tunnel_throughput_proof -- --ignored --nocapture 2>&1 | grep -vE '^\s*$' | tail -60
+        env:
+          VOX_PERF_ONLY: "1 Gbit/s"
