@@ -192,8 +192,13 @@ impl Transport for QuicStreamTransport {
                     let _ = send.reset(code);
                     Ok(())
                 }
-                // The transport was dropped: the stream goes with it.
-                Err(Err(_)) => Ok(()),
+                // The transport was dropped without a close, so the session ended in error part-way.
+                // Reset, never finish: a dropped `SendStream` finishes itself, and the peer would read
+                // a truncated batch as a clean end and report success (adr-020_adr-021's review).
+                Err(Err(_)) => {
+                    let _ = send.reset(close_code(WireError::TransportFailed));
+                    Ok(())
+                }
             }
         });
         self.writer = Some((task, cancel_tx));
