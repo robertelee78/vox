@@ -163,6 +163,11 @@ jobs:
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Transport gates (release)
+        # R41's WAN link is reported, not gated, on the macOS runner only (decider, 2026-09-26): the
+        # 3-core VM stalls its processes and the same build measures 29-106% of raw there. WAN is
+        # gated here on ubuntu and on real Mac hardware by the local macOS gate before a tag.
+        env:
+          VOX_PERF_REPORT_ONLY: ${{ runner.os == 'macOS' && 'WAN' || '' }}
         run: cargo test --release --workspace --no-fail-fast -- --ignored r40_ r41_
 
   # **Reporting only, and in its OWN job on purpose**: the proofs excluded from the gate above by

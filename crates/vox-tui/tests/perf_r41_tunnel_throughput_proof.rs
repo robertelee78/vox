@@ -22,6 +22,13 @@
 //!
 //! Mutation knob (test-side only): `VOX_PERF_MIN_RATIO` replaces the target ratio. Diagnostic knob:
 //! `VOX_PERF_ONLY=<text>` runs only the links whose name contains it.
+//!
+//! `VOX_PERF_REPORT_ONLY=<text>`: the gated links whose name contains it are measured and
+//! reported, not gated. Set only by CI's macOS runner for the WAN link (decider, 2026-09-26):
+//! GitHub's 3-core macOS VM stalls its processes long enough to overflow socket buffers, and the
+//! same build measured 29-106% of raw there from run to run, against 98-103% on a real Mac and ~95%
+//! on ubuntu. WAN is gated on real hardware (the local macOS gate) and on ubuntu. The VM itself is
+//! tracked as its own item: people run agents inside VMs.
 
 #![cfg(unix)]
 
@@ -757,9 +764,13 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     let mut failed = Vec::new();
     // Diagnostic knob (test-side only): `VOX_PERF_ONLY` runs just the links whose name contains it.
     let only = std::env::var("VOX_PERF_ONLY").ok();
-    for l in LINKS {
+    let report_only = std::env::var("VOX_PERF_REPORT_ONLY").ok();
+    for mut l in LINKS {
         if only.as_deref().is_some_and(|o| !l.name.contains(o)) {
             continue;
+        }
+        if report_only.as_deref().is_some_and(|r| l.name.contains(r)) {
+            l.gated = false;
         }
         let windows = calibrate_windows(Some(l));
         let fidelity = windows.iter().copied().fold(0.0, f64::max) * 8.0 / l.bits_per_sec;
