@@ -522,6 +522,17 @@ pub enum NodeEvent {
         /// The port that was being carried, which is the service tag.
         port: u16,
     },
+    /// A sync session with `peer` for `channel_id` did not complete, and why: the peer's coded
+    /// reason when it refused (a collision reads "the peer was busy syncing this room"), or the
+    /// transport's (#202, PRD-001 R36).
+    SyncFailed {
+        /// The room.
+        channel_id: Digest32,
+        /// The peer the session was with.
+        peer: Digest32,
+        /// What went wrong, in words.
+        reason: String,
+    },
     /// This node was unable to answer anybody for a noticeable time, and what it was doing.
     ///
     /// The actor is the only writer of channel state, so whatever it awaits stops the node

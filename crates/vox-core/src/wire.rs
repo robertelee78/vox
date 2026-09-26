@@ -297,6 +297,15 @@ pub enum WireError {
     /// authentication failure.
     #[error("no answer to a liveness probe")]
     Unresponsive = 0x0A,
+    /// `0x0B` — refused because this end's own session for the same room is running: most often
+    /// with the very peer that asked, because both ends pushed on the same event (a
+    /// **collision**, the commonest failure between two live members, which the push retry
+    /// resolves), otherwise with another peer. Nothing about the peer, its frames or the path was
+    /// wrong. Sent only to a room peer. Before this code existed such a refusal carried `0x05`
+    /// (authenticator invalid), and the initiator, which never read the code, reported it as a
+    /// transport failure wrapped in a governance error (#202).
+    #[error("the peer was busy syncing this room")]
+    SessionBusy = 0x0B,
 }
 
 impl WireError {
@@ -318,6 +327,7 @@ impl WireError {
             0x08 => Some(WireError::EpochMismatch),
             0x09 => Some(WireError::TransportFailed),
             0x0A => Some(WireError::Unresponsive),
+            0x0B => Some(WireError::SessionBusy),
             _ => None,
         }
     }

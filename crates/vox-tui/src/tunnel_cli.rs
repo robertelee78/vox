@@ -687,6 +687,17 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         NodeEvent::ProxyRefused { reason } => {
             eprintln!("vox: tunnel refused or cut — {reason}");
         }
+        NodeEvent::SyncFailed {
+            channel_id,
+            peer,
+            reason,
+        } => {
+            eprintln!(
+                "vox: sync of room {} with {} did not complete — {reason}",
+                short(channel_id),
+                crate::ident::author_id(peer)
+            );
+        }
         NodeEvent::Stalled { what, millis } => {
             eprintln!("vox: busy {millis}ms — {what} — nobody could be answered");
         }

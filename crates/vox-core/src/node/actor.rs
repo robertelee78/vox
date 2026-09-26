@@ -1730,6 +1730,12 @@ pub struct Node {
     /// message posted right after a join crossed in 20s or 40s — one and two frame timeouts — instead
     /// of the 0-1s it takes when the rooms are free.
     syncing: std::collections::BTreeSet<Digest32>,
+    /// The peer each running session in [`Self::syncing`] is with. A refusal says **why**
+    /// (`SessionBusy`) only to that peer: it is a room peer this node chose to sync with, so the
+    /// reason tells it nothing new. Anyone else is refused with the uninformative code, because
+    /// the busy check runs before the membership check, and a reason would let a non-member
+    /// probe whether this node holds a room (#202).
+    syncing_with: BTreeMap<Digest32, Digest32>,
     /// Rooms this node is joining right now (their join is on a `Joiner` task).
     joining: std::collections::BTreeSet<Digest32>,
     /// Pairwise streams for a room still being joined, held until the join reports back: see
@@ -1943,6 +1949,7 @@ impl Node {
             join_slots: Arc::new(tokio::sync::Semaphore::new(JOINS_IN_FLIGHT)),
             join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
+            syncing_with: BTreeMap::new(),
             joining: std::collections::BTreeSet::new(),
             held_pairwise: Vec::new(),
             publish_owed: std::collections::BTreeSet::new(),
@@ -3373,6 +3380,17 @@ impl Node {
                 outcome,
             } => {
                 self.syncing.remove(&channel_id);
+                self.syncing_with.remove(&channel_id);
+                if let Err(e) = &outcome {
+                    // Said, with its reason (PRD-001 R36). A collision is the commonest failure
+                    // between two live members and the retry resolves it; it is reported so that
+                    // a failure that does not resolve can be told apart from one that does.
+                    let _ = self.event_tx.send(NodeEvent::SyncFailed {
+                        channel_id,
+                        peer,
+                        reason: e.to_string(),
+                    });
+                }
                 self.answer_pending_consents(|room, _| *room == channel_id, None)
                     .await;
                 // **A session that failed delivered nothing, so its push is owed again.**
@@ -4993,6 +5011,7 @@ impl Node {
             return false; // past the cap: skipped, not queued. The schedule comes round again.
         };
         self.syncing.insert(*channel_id);
+        self.syncing_with.insert(*channel_id, peer);
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
         let cid = *channel_id;
         let now = self.now();
@@ -5111,6 +5130,7 @@ impl Node {
         // Marked here, past both early returns above, so a session that never starts never
         // leaves the room marked. Its caller used to mark it first.
         self.syncing.insert(channel_id);
+        self.syncing_with.insert(channel_id, peer);
         let now = self.now();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
@@ -5205,7 +5225,18 @@ impl Node {
         // behind the very session this check exists to detect.
         if self.syncing.contains(&channel_id) {
             let (mut send, mut recv) = (send, recv);
-            crate::node::net::refuse_stream(&mut send, &mut recv);
+            if self.owed_a_reason(&channel_id, &peer, epoch) {
+                // Busy: our own session for this room is running (with this peer, a collision, or
+                // with another). Said to a room peer, so its session ends as `SessionBusy`, not as
+                // a transport failure (#202).
+                crate::node::net::refuse_stream_because(
+                    &mut send,
+                    &mut recv,
+                    crate::wire::WireError::SessionBusy,
+                );
+            } else {
+                crate::node::net::refuse_stream(&mut send, &mut recv);
+            }
             return;
         }
         // Only a channel we hold open at that epoch — or keep as an anchor — can be
@@ -5233,7 +5264,15 @@ impl Node {
         // losses once blamed on this were the room-wide starvation v0.2.8 fixed.)
         if !matches_epoch {
             let (mut send, mut recv) = (send, recv);
-            crate::node::net::refuse_stream(&mut send, &mut recv);
+            if self.owed_a_reason(&channel_id, &peer, epoch) {
+                crate::node::net::refuse_stream_because(
+                    &mut send,
+                    &mut recv,
+                    crate::wire::WireError::EpochMismatch,
+                );
+            } else {
+                crate::node::net::refuse_stream(&mut send, &mut recv);
+            }
             return;
         }
         if !self.may_sync(&channel_id, &peer, epoch).await {
@@ -5260,6 +5299,19 @@ impl Node {
     ///   room's link is not an anchor of this one.
     ///
     /// For a room this node only anchors, the peer must be an author the board knows.
+    /// Whether a refusal may tell `peer` **why** (#202): it is this room's session partner, or it
+    /// has a member record for the room on the board. Decided without the room's lock, because
+    /// the refusals that ask run before it. Anyone else is refused with the uninformative code,
+    /// so a stranger who names a room learns nothing about whether this node holds it.
+    fn owed_a_reason(&self, channel_id: &Digest32, peer: &Digest32, epoch: u64) -> bool {
+        self.syncing_with.get(channel_id) == Some(peer)
+            || self.net.as_ref().is_some_and(|net| {
+                net.board_bundles(channel_id, epoch)
+                    .iter()
+                    .any(|b| b.author_id == *peer)
+            })
+    }
+
     async fn may_sync(&mut self, channel_id: &Digest32, peer: &Digest32, epoch: u64) -> bool {
         if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
             {
@@ -6778,6 +6830,9 @@ fn fault_of(e: &Error) -> Fault {
         Error::MalformedGovernance(
             "no consent to revoke" | "an identity cannot revoke its own consent",
         ) => Fault::NotConsented,
+        // A sync that did not complete, or a peer that refused: the peer did not serve this, which
+        // is reachability, not an internal fault (#202).
+        Error::SyncFailed(_) | Error::PeerRefused(_) => Fault::Unreachable,
         _ => Fault::Internal,
     }
 }

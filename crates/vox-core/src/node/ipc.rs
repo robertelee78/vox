@@ -119,6 +119,8 @@ const T_PUBLISH_REFUSED: u64 = 1717;
 const T_JOIN_STEPS: u64 = 1718;
 /// `NodeEvent::KeyNotTaken`.
 const T_KEY_NOT_TAKEN: u64 = 1719;
+/// A sync session with a peer did not complete, and why (#202).
+const T_SYNC_FAILED: u64 = 1720;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -820,6 +822,17 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .text(what)
                 .text(why);
         }
+        NodeEvent::SyncFailed {
+            channel_id,
+            peer,
+            reason,
+        } => {
+            e.array(4)
+                .uint(T_SYNC_FAILED)
+                .bytes(channel_id)
+                .bytes(peer)
+                .text(reason);
+        }
         NodeEvent::JoinFailed { reason } => {
             e.array(2).uint(T_JOIN_FAILED).text(reason);
         }
@@ -1085,6 +1098,14 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             millis: d
                 .uint()
                 .map_err(|_| Error::MalformedBundle("ipc stall ms"))?,
+        },
+        (T_SYNC_FAILED, 4) => NodeEvent::SyncFailed {
+            channel_id: digest(d)?,
+            peer: digest(d)?,
+            reason: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc sync failed reason"))?
+                .to_owned(),
         },
         (T_PUBLISH_REFUSED, 4) => NodeEvent::PublishRefused {
             channel_id: digest(d)?,
