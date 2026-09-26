@@ -389,6 +389,10 @@ pub enum Fault {
     ChannelNotOpen,
     /// An input exceeded its bound (name or text length).
     TooLong,
+    /// The trust keyring already holds its maximum number of identities
+    /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too
+    /// long, and "longer than this field allows" sent them looking at the petname.
+    KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
     /// The node is shutting down.
@@ -437,6 +441,9 @@ impl Fault {
     /// What this fault means to a person, and what to do about it, in the house style: one
     /// short line saying what happened, then indented lines saying what to do.
     ///
+    // `Fault::KeyringFull`'s explanation names the cap in words; this holds them together.
+    const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
+
     /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
     /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,
     /// `Failed(NotConsented)`: the name of an enum variant, not a cause. The token stays
@@ -459,6 +466,9 @@ impl Fault {
                 "that room is not open on this node\n       open it with its passphrase: a line `<room> <passphrase>` to `vox daemon`, or in `vox tui`"
             }
             Fault::TooLong => "that is longer than this field allows",
+            Fault::KeyringFull => {
+                "your trust keyring is full (1,024 identities)\n       remove one with `vox trust remove <fingerprint>`, then add again"
+            }
             Fault::Storage => {
                 "the profile's store could not be written\n       check free disk space and that the data directory is writable"
             }

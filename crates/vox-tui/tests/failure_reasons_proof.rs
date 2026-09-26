@@ -22,7 +22,10 @@
 //! 6. `vox trust remove` of someone never trusted → there is nothing to remove;
 //! 7. a forward into a host that has not trusted you → the guest is told the host refused and
 //!    why that usually is, and the **host** logs whom it refused and why;
-//! 8. a room that is not there → "nothing here matches".
+//! 8. a room that is not there → "nothing here matches";
+//! 9. `vox trust add` when the keyring already holds its 1,024 identities → the keyring is
+//!    full, and how to make room. It used to say "that is longer than this field allows"
+//!    (the generic size fault), which sent a person looking at the petname.
 
 #![cfg(unix)]
 
@@ -324,6 +327,40 @@ fn every_common_failure_names_its_cause() {
     let (ok, said, _) = vox(&joiner_dir, &["trust", "remove", &host_fp], "", quick);
     assert!(!ok, "removing a trust that does not exist must fail");
     assert_says("trust remove, never trusted", &said, &["never trusted"]);
+
+    // ---- (9) trust past the keyring's limit ----
+    // Fill it with distinct identities until the first refusal. That refusal must come only
+    // once the keyring is full (whatever it held already), and must say so.
+    let mut added = 0usize;
+    let full = loop {
+        assert!(
+            added <= 1_100,
+            "CANNOT MEASURE (9): {added} identities were trusted and the keyring never filled"
+        );
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(added as u64 + 1).to_be_bytes());
+        id[31] = 0x5A;
+        let fp = vox_core::node::link::b32_encode(&id);
+        let (ok, said, _) = vox(
+            &joiner_dir,
+            &["trust", "add", &fp, "--name", &format!("filler-{added}")],
+            "",
+            quick,
+        );
+        if !ok {
+            break said;
+        }
+        added += 1;
+    };
+    assert!(
+        added >= 1_000,
+        "the keyring refused after only {added} additions, before it could be full: {full}"
+    );
+    assert_says(
+        "trust add, keyring full",
+        &full,
+        &["keyring is full", "vox trust remove"],
+    );
 
     // ---- (8) a room that is not there ----
     let (ok, said, _) = vox(&joiner_dir, &["room", "post", "zzzzzzzz", "hi"], "", quick);

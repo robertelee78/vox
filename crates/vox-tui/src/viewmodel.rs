@@ -227,6 +227,8 @@ pub enum UiError {
     ChannelNotOpen,
     /// An input exceeded its bound (name or message length).
     TooLong,
+    /// The trust keyring holds its maximum number of identities.
+    KeyringFull,
     /// Persisting to the store failed; reopen the channel.
     Storage,
     /// This action needs the network milestone (M14) — not available yet.
@@ -277,6 +279,7 @@ impl UiError {
             UiError::Locked => "locked — :unlock",
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",
+            UiError::KeyringFull => "your trust keyring is full (1,024) — remove one first",
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
