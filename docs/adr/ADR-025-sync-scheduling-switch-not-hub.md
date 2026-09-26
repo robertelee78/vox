@@ -1,24 +1,19 @@
 # ADR-025: Sync Is Scheduled Like a Switch, Not a Hub
 
-**Status**: **Proposed, revision 4 — 2026-09-26.** Not decided and not built.
+**Status**: **Accepted by the decider — 2026-09-26, revision 4 with the decisions below.** Not built.
+
+**The decider's decisions (2026-09-26), as product manager.** The reviewers advised and the decider decided:
+1. **Option C, full duplex.**
+2. **All of it in v0.2.10**, both the defects and the collision redesign.
+3. **Simple counters only in `vox status --json`, not a sync journal.** The reviewers asked for a detailed journal so the proofs could observe causes. The decider judged that to be product surface nobody asked for. Proofs therefore assert what a person sees, plus a few counters.
+4. **The review loop stops after round 4, and building starts**, with #212 and the counters first. The remaining implementation-level findings (listed under "Settled in the code") are resolved in the implementation and checked by the independent verifier. There are no further design rounds.
 
 | Revision | Collision rule | Reviews (transcripts in [`ADR-025-reviews/`](ADR-025-reviews/)) |
 |---|---|---|
 | 1 (8c4e347) | a glare rule | gpt-6-astra BLOCK, glm-5.3 REVISE, kimi-k3 REVISE |
-| 2 (16951fe) | a designated opener | gpt-6-astra BLOCK (glm-5.3 and kimi-k3 were unavailable, out of funds) |
-| 3 (141dc11) | full duplex | gpt-6-astra BLOCK, glm-5.3 BLOCK, kimi-k3 BLOCK |
-| **4 (this)** | full duplex, with the resource lifecycle, receive semantics, scheduler and observability specified | not yet reviewed |
-
-**Round 3's reviewers could not break full duplex itself.** They found no corruption, no double-apply
-and no room-lock deadlock with two sessions on one pair. Their blocks were on what was missing:
-- retiring stale attempts and releasing their resources;
-- bounds on retries;
-- the inherited transport deadlock (#212);
-- entry classes that the code can actually compute;
-- the points at which the scheduler evaluates ports;
-- an observability schema that the proofs can use.
-
-Revision 4 specifies each; see the table at the end.
+| 2 (16951fe) | a designated opener | gpt-6-astra BLOCK (glm-5.3 and kimi-k3 were unavailable) |
+| 3 (141dc11) | full duplex | all three BLOCK |
+| 4 (5846720) | full duplex, specified | gpt-6-astra BLOCK, glm-5.3 **REVISE**, kimi-k3 **REVISE**: *"the architecture survives attack … revisable without touching the design"* |
 
 **Date**: 2026-09-26
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -337,41 +332,15 @@ It raises a request on every shared port every 30 s. No proof passes because of 
 - **A new epoch** retires every attempt, sets `done_gen = 0`, clears backoff and the frozen-skip set,
   and raises a request.
 
-### Observability (S0b) — derived from what the proofs must observe
+### Observability (S0b): simple counters (the decider's decision 3)
 
-`vox status --json`, per (room, peer), carries three kinds of data.
+`vox status --json` gains, per (room, peer):
+- **counters:** sessions opened, admitted, busy-refused, completed, partial, failed (with the last failure's reason), stale, skipped at the slot cap (on the base) and queued;
+- **the current backoff**, if any, with its kind.
 
-**1. Counters:**
-- opened, admitted, busy-refused, completed-clean, completed-partial, failed (by reason), retired,
-  stale;
-- queued and dequeued;
-- backoff entered and expired, by kind;
-- on the base, **skipped-at-cap**.
-
-**2. A session journal with sequence numbers.** It is monotonic per node, so a reader detects a gap
-(kimi-k3, glm-5.3), and it keeps the last 256 sessions, with an overflow counter. Each record holds:
-
-| Field | What it records |
-|---|---|
-| identity | `seq`, `token`, `dir`, `conn`, `epoch` |
-| timing | `t_start`, `t_have` (unix ms), `t_end` |
-| at admission | `req_gen`, `req_done`, `done_gen` |
-| at `HAVE` | `gen_at_have` |
-| at completion | `req_done`, `done_gen` |
-| received | the requested entry count (from the intervals), and received by class |
-| served | the stored entry ids (up to 32, plus a count), and the served entry ids (up to 32, plus a count) |
-| result | the outcome, and the reason |
-
-**3. An event journal**, same sequencing and overflow rules:
-- queued and dequeued, with the peer's and the global slot occupancy;
-- skipped-at-cap (base);
-- backoff entered and expired, with the kind;
-- retirement, with its cause;
-- generation bumps, with the entry ids that caused them.
-
-It's a diagnostic view ("why is this room slow?") that also makes every proof's precondition
-observable through the shipped binary. On the base it reports the fields that exist there: sessions,
-refusals, skips, generations.
+There is no session journal. Proofs assert what a person sees, above all how long a post takes to be
+readable, and use these counters for what a person cannot see directly: that nothing was refused or
+skipped.
 
 ## Scope and release
 
@@ -392,9 +361,14 @@ refusals, skips, generations.
 **How to read the table:**
 - **"Base"** is #180+#202 with S0b.
 - **Nothing is claimed red on the base until S0c has measured it.**
-- **A proof that doesn't observe its precondition** in the journals fails as **CANNOT MEASURE**, never
-  green.
-- **A journal gap or overflow** during a proof is also CANNOT MEASURE.
+- **A proof whose precondition isn't shown by the counters, or by the proof's own setup, fails as
+  CANNOT MEASURE**, never green.
+- **Rows written against the withdrawn journal are to be restated against counters and timing when
+  their proof is written.** Each restated row keeps its mutant, and the verifier checks that the
+  mutant is still red. The round-4 reviewers' corrections to P4, P7 and P8 apply at that point:
+  - **P8** backs off with the connection held up, so a reconnect cannot rescue its mutant.
+  - **P4's** mutant removes the retry itself.
+  - **P7** retires by the newcomer probe, not by `SILENCE_IS_DEATH`.
 
 | # | Proof | Precondition (from the journals) | Asserts | Mutant that must turn it red |
 |---|---|---|---|---|
@@ -413,6 +387,27 @@ refusals, skips, generations.
 
 P9 and P10 need a *mutant sender*, a deliberately misbehaving build of the shipped binary. That is how
 the product's defence against a faulty peer is proved through real use.
+
+## Settled in the code (round-4 findings, not further design rounds)
+
+Each is resolved in the implementation and stated in its commit. The independent verifier checks it.
+- **D1a's mechanism** (all three reviewers).
+  - An abort stops the outer task, not a started `spawn_blocking` worker. The worker stops at its next
+    room step or transport operation, fenced by epoch, poison, or its stream being reset.
+  - A retired worker's stores stay, and report themselves through a generation-bump event independent
+    of `SyncDone`.
+  - The slot permit is held until the worker exits, so slots bound running workers.
+- **D5 is exhaustive.** Every hard-fail path (authentication, feed link, malformed frame, unsupported
+  mode, local failure) maps to a kind. `ProtocolViolation` is local-only (no wire code), and the
+  refusal is a reset. The rule for concurrent completions: progress wins over failure for `failures`
+  and credit, and a failure's backoff never cancels a newer attempt.
+- **`stored` means persisted.** Credit and the generation count only entries the persist step
+  committed. A failure returns its committed prefix in a structured partial outcome.
+- **`fork-handled` already continues today** (`180:log/sync.rs` 613–619). The table's "today" column
+  is corrected in the code's comments. The new behaviour is classifying the rejections that follow.
+- **`schedule()` scans** every queued port, plus the ports of the room whose event it is.
+- **#212's acceptance includes a bilateral, concurrent-session, shared-connection backlog proof**
+  before S5.
 
 ## Plan
 
