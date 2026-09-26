@@ -282,9 +282,7 @@ fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
     cfg.receive_window(quinn::VarInt::from_u32(CONNECTION_WINDOW));
     // Cubic, restarted after the connection idles: a tunnel's transfer must not inherit the
     // congestion history of an older one on the same long-lived connection (PRD-001 R41).
-    cfg.congestion_controller_factory(Arc::new(
-        crate::transport::congestion::IdleRestartConfig::default(),
-    ));
+    cfg.congestion_controller_factory(Arc::new(crate::transport::congestion::IdleRestartConfig));
     Arc::new(cfg)
 }
 
