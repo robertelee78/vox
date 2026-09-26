@@ -130,6 +130,38 @@ pub trait Transport {
     /// nothing here. A real ordered byte transport (the QUIC mapping, M9) overrides
     /// this to FIN its send stream so the peer's blocking read terminates.
     fn finish(&mut self) {}
+
+    /// Start sending `frames`, then a clean end-of-stream, **while the caller goes on to drain
+    /// what the peer sends** (V210-39). A session used to serve its whole batch before reading
+    /// anything; when both ends had more to send than a stream's flow-control window, each blocked
+    /// writing into a window the other was not reading, and both failed having applied nothing.
+    ///
+    /// Stops early, still with a clean end, once `deadline` passes (a bounded serve is not a
+    /// failure: see [`SERVE_BUDGET`]). The outcome is collected by [`Transport::finish_serving`].
+    ///
+    /// The default sends everything first, which is correct for a transport whose sends never
+    /// wait on the peer (the in-memory [`DuplexTransport`]).
+    ///
+    /// # Errors
+    /// A send failed.
+    fn start_serving(&mut self, frames: Vec<Vec<u8>>, deadline: std::time::Instant) -> Result<()> {
+        for f in frames {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            self.send(&f)?;
+        }
+        self.finish();
+        Ok(())
+    }
+
+    /// Wait for what [`Transport::start_serving`] started, and return how it went.
+    ///
+    /// # Errors
+    /// Serving failed.
+    fn finish_serving(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// An in-memory duplex transport pairing two endpoints by shared queues, for
@@ -792,20 +824,21 @@ where
     //    in-memory duplex relies on the drain loop observing an empty inbox.
     //    Bounded in count, bytes and time (see the module docs); stopping at the
     //    time bound is a clean end, not a failure — the peer keeps what it got.
+    //    Served **while** the peer's entries are drained (V210-39): see
+    //    `Transport::start_serving`.
     let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
-    for wire in entries_for_wants(dag, &their_wants) {
-        if std::time::Instant::now() >= serve_deadline {
-            break;
-        }
-        send(t, encode_entry(&wire))?;
-    }
-    // Signal a clean end-of-stream on our send side (success terminator, not a
-    // hard close), so the peer's drain loop terminates at FIN.
-    t.finish();
+    let frames: Vec<Vec<u8>> = entries_for_wants(dag, &their_wants)
+        .iter()
+        .map(|w| encode_entry(w))
+        .collect();
+    t.start_serving(frames, serve_deadline)
+        .map_err(|e| wire_of(&e))?;
 
     // 5. Drain and apply the entries the peer serves us, until the peer's clean
-    //    half-close (recv → Ok(None)).
-    drain_entries(t, dag, resolver, admission)
+    //    half-close (recv → Ok(None)), then collect how our own serving went.
+    let applied = drain_entries(t, dag, resolver, admission)?;
+    t.finish_serving().map_err(|e| wire_of(&e))?;
+    Ok(applied)
 }
 
 /// What a frontier session may do to a room, **one step at a time**. Each method takes the room's
@@ -883,14 +916,15 @@ where
     send(t, encode_want(&room.wants(&remote_have)?))?;
     let their_wants = expect_want(t.recv())?;
 
+    // Served while the peer's entries are drained (V210-39): see `Transport::start_serving`.
     let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
-    for wire in room.entries(&their_wants)? {
-        if std::time::Instant::now() >= serve_deadline {
-            break;
-        }
-        send(t, encode_entry(&wire))?;
-    }
-    t.finish();
+    let frames: Vec<Vec<u8>> = room
+        .entries(&their_wants)?
+        .iter()
+        .map(|w| encode_entry(w))
+        .collect();
+    t.start_serving(frames, serve_deadline)
+        .map_err(|e| wire_of(&e))?;
 
     // Drained with no lock held; applied a batch at a time under a fresh one.
     let deadline = std::time::Instant::now() + DRAIN_BUDGET;
@@ -913,6 +947,7 @@ where
     if !staged.is_empty() {
         applied += room.apply(staged)?;
     }
+    t.finish_serving().map_err(|e| wire_of(&e))?;
     Ok(applied)
 }
 
