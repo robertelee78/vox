@@ -634,6 +634,18 @@ pub enum NodeEvent {
         /// What went wrong, in words.
         reason: String,
     },
+    /// A room is open, but it could not be added to the rooms this node reopens by itself
+    /// (#208), so it will be closed after a restart until it is opened again.
+    ///
+    /// Not a failure of the command that opened it: the room exists and is open, and saying
+    /// the command failed would leave a room in the store that its creator was told does not
+    /// exist.
+    RoomNotRemembered {
+        /// The room.
+        channel_id: Digest32,
+        /// Why it could not be remembered, in words.
+        why: String,
+    },
     /// This node was unable to answer anybody for a noticeable time, and what it was doing.
     ///
     /// The actor is the only writer of channel state, so whatever it awaits stops the node

@@ -656,6 +656,12 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         NodeEvent::JoinFailed { reason } => {
             eprintln!("vox: a join did not complete — {reason}");
         }
+        NodeEvent::RoomNotRemembered { channel_id, why } => {
+            eprintln!(
+                "vox: room {} is open, but will not reopen by itself after a restart — {why}",
+                short(channel_id)
+            );
+        }
         NodeEvent::JoinSteps { joined, steps } => {
             eprintln!(
                 "vox: join {} — {steps}",

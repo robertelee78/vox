@@ -136,6 +136,9 @@ const T_JOIN_STEPS: u64 = 1718;
 const T_KEY_NOT_TAKEN: u64 = 1719;
 /// A sync session with a peer did not complete, and why (#202).
 const T_SYNC_FAILED: u64 = 1720;
+/// [`NodeEvent::RoomNotRemembered`] (#208). Additive, and far from the other additive tags so a
+/// concurrently-developed branch that takes 1721 does not collide with it.
+const T_ROOM_NOT_REMEMBERED: u64 = 2081;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -898,6 +901,12 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::JoinFailed { reason } => {
             e.array(2).uint(T_JOIN_FAILED).text(reason);
         }
+        NodeEvent::RoomNotRemembered { channel_id, why } => {
+            e.array(3)
+                .uint(T_ROOM_NOT_REMEMBERED)
+                .bytes(channel_id)
+                .text(why);
+        }
         NodeEvent::JoinSteps { joined, steps } => {
             e.array(3)
                 .uint(T_JOIN_STEPS)
@@ -1167,6 +1176,13 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             reason: d
                 .text()
                 .map_err(|_| Error::MalformedBundle("ipc sync failed reason"))?
+                .to_owned(),
+        },
+        (T_ROOM_NOT_REMEMBERED, 3) => NodeEvent::RoomNotRemembered {
+            channel_id: digest(d)?,
+            why: d
+                .text()
+                .map_err(|_| Error::MalformedBundle("ipc room not remembered why"))?
                 .to_owned(),
         },
         (T_PUBLISH_REFUSED, 4) => NodeEvent::PublishRefused {

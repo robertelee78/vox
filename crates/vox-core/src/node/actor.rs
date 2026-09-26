@@ -321,6 +321,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
         NetEvent::Dialed { .. } => "adopting a connection a join dialled",
         NetEvent::JoinerDone { .. } => "finishing a join",
+        NetEvent::Reopened { .. } => "holding a room that reopened",
+        NetEvent::ReopenGone { .. } => "forgetting a room that no longer exists",
+        NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped => "shutting the network down",
     }
@@ -697,6 +700,22 @@ enum NetEvent {
         /// Whether it is the board the join reads from (and so an anchor of ours).
         board: bool,
     },
+    /// A room this node held open before it stopped has been reopened off the actor (#208):
+    /// hold it, unless it was closed or the identity locked while it was opening.
+    Reopened {
+        /// The room.
+        channel_id: Digest32,
+        /// Its state, opened from the SEK kept sealed under the identity.
+        channel: Box<ChannelState>,
+    },
+    /// A room in the reopen set no longer exists in the store: forget it (#208).
+    ReopenGone {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// The reopening has tried every room (#208). A room still marked as reopening would not
+    /// open: it stays remembered, and closed. The unlock is answered now.
+    ReopenFinished,
     /// A joiner's task finished: make the room, or say why not, and answer the command.
     JoinerDone {
         /// The `JoinChannel` command's reply.
@@ -1833,6 +1852,14 @@ pub struct Node {
     syncing: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// Rooms this node is joining right now (their join is on a `Joiner` task).
     joining: std::collections::BTreeSet<Digest32>,
+    /// Rooms being reopened off the actor at unlock (#208). A room leaves this set when it is
+    /// held, closed, or the identity locks; a reopened room not in it is dropped, not held.
+    reopening: std::collections::BTreeSet<Digest32>,
+    /// The reopening task, aborted at lock: it holds room keys, and a locked node holds none
+    /// (ADR-015).
+    reopen_task: Option<tokio::task::AbortHandle>,
+    /// Unlock replies held until the reopening has finished (#208).
+    unlock_waiters: Vec<oneshot::Sender<Outcome>>,
     /// Pairwise streams for a room still being joined, held until the join reports back: see
     /// `take_inbound_skdm`.
     held_pairwise: Vec<(
@@ -2050,6 +2077,9 @@ impl Node {
             join_tasks: tokio::task::JoinSet::new(),
             syncing: std::collections::BTreeSet::new(),
             joining: std::collections::BTreeSet::new(),
+            reopening: std::collections::BTreeSet::new(),
+            reopen_task: None,
+            unlock_waiters: Vec::new(),
             held_pairwise: Vec::new(),
             board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
@@ -2167,6 +2197,21 @@ impl Node {
                         self.note_if_stalled(name, started);
                         self.publish().await;
                         self.push_if_owed().await;
+                        continue;
+                    }
+                    // **Unlock is answered once the rooms it held are held again** (#208). They
+                    // reopen off the actor so the node answers everyone meanwhile, but a caller
+                    // told `Done` — `vox daemon`, which then opens its control socket — must not
+                    // find a room it held still closed.
+                    if let NodeCommand::Unlock { passphrase } = command {
+                        let outcome = self.unlock(&passphrase).await;
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
+                        if outcome.is_done() && self.reopen_task.is_some() {
+                            self.unlock_waiters.push(reply);
+                        } else {
+                            let _ = reply.send(outcome);
+                        }
                         continue;
                     }
                     let outcome = self.handle(command).await;
@@ -3185,6 +3230,37 @@ impl Node {
     /// Handle one piece of network work.
     async fn handle_net(&mut self, event: NetEvent) {
         match event {
+            NetEvent::Reopened {
+                channel_id,
+                channel,
+            } => {
+                // Held only if it is still wanted: closed while it was opening, the identity
+                // locked meanwhile, or opened by hand in between — each drops it, and its keys
+                // zeroize with it.
+                let wanted = self.reopening.remove(&channel_id)
+                    && !self.channels.contains_key(&channel_id)
+                    && self.profile.as_ref().is_some_and(Profile::is_unlocked);
+                if wanted {
+                    self.channels
+                        .insert(channel_id, Arc::new(tokio::sync::Mutex::new(*channel)));
+                    self.adopt_channel_anchors(&channel_id, None).await;
+                    self.refresh_network_view().await;
+                    self.publish_channel_locally(&channel_id).await;
+                    self.publish_channel_to_anchors(&channel_id).await;
+                    let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
+                }
+            }
+            NetEvent::ReopenGone { channel_id } => {
+                self.reopening.remove(&channel_id);
+                let _ = self.forget_open(&channel_id);
+            }
+            NetEvent::ReopenFinished => {
+                self.reopening.clear();
+                self.reopen_task = None;
+                for reply in std::mem::take(&mut self.unlock_waiters) {
+                    let _ = reply.send(Outcome::Done);
+                }
+            }
             NetEvent::Stopped => {
                 self.net = None;
             }
@@ -4312,9 +4388,7 @@ impl Node {
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
-        if let Err(e) = self.remember_open(&channel) {
-            return Outcome::Failed(fault_of(&e));
-        }
+        self.remember_or_say(&channel);
         self.channels.insert(
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
@@ -6196,6 +6270,15 @@ impl Node {
         // drops both at the task's next await point, which is what makes ADR-015's
         // lock/zeroize still true now that the exchange runs off the actor.
         self.join_tasks.abort_all();
+        // The reopening holds room keys too: stopped, and nothing it opened is held (#208).
+        if let Some(task) = self.reopen_task.take() {
+            task.abort();
+        }
+        self.reopening.clear();
+        // The unlock they wait on did happen; what it reopened is locked again with the rest.
+        for reply in std::mem::take(&mut self.unlock_waiters) {
+            let _ = reply.send(Outcome::Done);
+        }
         // Awaited, not polled: `try_join_next` collects only tasks that have already finished, and
         // an aborted one drops its handles — the signer, the ring, the store — at its next await.
         while self.join_tasks.join_next().await.is_some() {}
@@ -6237,9 +6320,7 @@ impl Node {
     /// Everything after a room exists: hold it, give it anchors, publish it, say so.
     async fn finish_create_channel(&mut self, ch: ChannelState) -> Outcome {
         let id = ch.channel_id();
-        if let Err(e) = self.remember_open(&ch) {
-            return Outcome::Failed(fault_of(&e));
-        }
+        self.remember_or_say(&ch);
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
         self.adopt_channel_anchors(&id, None).await;
@@ -6375,9 +6456,7 @@ impl Node {
             // published, so forgetting it here is the whole of the rollback.
             return Outcome::Failed(fault_of(&e));
         }
-        if let Err(e) = self.remember_open(&channel) {
-            return Outcome::Failed(fault_of(&e));
-        }
+        self.remember_or_say(&channel);
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(channel)));
         self.adopt_channel_anchors(&id, None).await;
@@ -6403,6 +6482,21 @@ impl Node {
             set.save(profile.store(), signer)?;
         }
         Ok(())
+    }
+
+    /// [`Self::remember_open`], and if it cannot, **say so and keep going**.
+    ///
+    /// Every caller has already made or opened the room — it is in the store, and a created
+    /// room's SEK wrap is written — so failing the command here told its caller that a room did
+    /// not exist which did. What failed is narrower: the room will not reopen by itself after a
+    /// restart. That is what is reported ([`NodeEvent::RoomNotRemembered`]); the room is held.
+    fn remember_or_say(&self, ch: &ChannelState) {
+        if let Err(e) = self.remember_open(ch) {
+            let _ = self.event_tx.send(NodeEvent::RoomNotRemembered {
+                channel_id: ch.channel_id(),
+                why: e.to_string(),
+            });
+        }
     }
 
     /// Take `channel_id` out of the rooms this node reopens by itself.
@@ -6432,9 +6526,11 @@ impl Node {
     /// identity and every other room with it.
     async fn reopen_remembered(&mut self) {
         let now = self.now();
-        let mut opened = Vec::new();
-        let mut gone = Vec::new();
-        {
+        // Only the sealed set is read here — one small decrypt. Opening each room reads and
+        // re-verifies its whole log, and that runs **off the actor**, one room at a time, each
+        // held as soon as it is open: with many rooms, a reopen on the actor answered nobody until
+        // the last one was open.
+        let (store, rooms) = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
@@ -6444,39 +6540,50 @@ impl Node {
             let Ok(set) = OpenRooms::load(profile.store(), signer) else {
                 return;
             };
-            for (id, keys) in set.rooms() {
-                if self.channels.contains_key(id) {
-                    continue;
-                }
-                match profile.store().get_sek_wrap(id) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        gone.push(*id);
-                        continue;
+            let rooms: Vec<_> = set
+                .rooms()
+                .filter(|(id, _)| !self.channels.contains_key(*id))
+                .map(|(id, keys)| (*id, keys.sek.clone(), keys.passphrase.clone()))
+                .collect();
+            (profile.store_handle(), rooms)
+        };
+        if rooms.is_empty() {
+            return;
+        }
+        self.reopening.extend(rooms.iter().map(|(id, _, _)| *id));
+        let tx = self.net_tx.clone();
+        let task = tokio::spawn(async move {
+            for (id, sek, passphrase) in rooms {
+                let store = Arc::clone(&store);
+                let opened = tokio::task::spawn_blocking(move || {
+                    match store.get_sek_wrap(&id) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => return Some(Err(())),
+                        // Unreadable now: left in the set for the next unlock, and closed.
+                        Err(_) => return None,
                     }
-                    Err(_) => continue,
-                }
-                let sek = crate::atrest::sek::Sek::from_bytes(keys.sek.clone());
-                if let Ok(ch) = ChannelState::open_with_sek(profile, id, sek, &keys.passphrase, now)
-                {
-                    opened.push((*id, ch));
+                    let sek = crate::atrest::sek::Sek::from_bytes(sek);
+                    ChannelState::open_with_sek(&store, &id, sek, &passphrase, now)
+                        .ok()
+                        .map(Ok)
+                })
+                .await;
+                let event = match opened {
+                    Ok(Some(Ok(channel))) => NetEvent::Reopened {
+                        channel_id: id,
+                        channel: Box::new(channel),
+                    },
+                    Ok(Some(Err(()))) => NetEvent::ReopenGone { channel_id: id },
+                    // A room that exists but will not open stays remembered and closed.
+                    Ok(None) | Err(_) => continue,
+                };
+                if tx.send(event).await.is_err() {
+                    return;
                 }
             }
-        }
-        for id in &gone {
-            let _ = self.forget_open(id);
-        }
-        for (id, ch) in opened {
-            self.channels
-                .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
-            self.adopt_channel_anchors(&id, None).await;
-            self.refresh_network_view().await;
-            self.publish_channel_locally(&id).await;
-            self.publish_channel_to_anchors(&id).await;
-            let _ = self
-                .event_tx
-                .send(NodeEvent::ChannelOpened { channel_id: id });
-        }
+            let _ = tx.send(NetEvent::ReopenFinished).await;
+        });
+        self.reopen_task = Some(task.abort_handle());
     }
 
     async fn open_channel(&mut self, channel_id: &Digest32, passphrase: &Secret) -> Outcome {
@@ -6489,9 +6596,7 @@ impl Node {
         };
         match ChannelState::open(profile, channel_id, passphrase, now) {
             Ok(ch) => {
-                if let Err(e) = self.remember_open(&ch) {
-                    return Outcome::Failed(fault_of(&e));
-                }
+                self.remember_or_say(&ch);
                 self.channels
                     .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
                 self.adopt_channel_anchors(channel_id, None).await;
@@ -6510,7 +6615,10 @@ impl Node {
     async fn close_channel(&mut self, channel_id: &Digest32) -> Outcome {
         // Closed on purpose, so not reopened at the next unlock (#208). Forgotten first: a room
         // that stayed in the set would come back by itself, which is not what closing it meant.
-        if self.channels.contains_key(channel_id) {
+        // A room still reopening is closed too: it leaves `reopening`, so its state is dropped
+        // when it arrives rather than held.
+        let reopening = self.reopening.remove(channel_id);
+        if self.channels.contains_key(channel_id) || reopening {
             if let Err(e) = self.forget_open(channel_id) {
                 return Outcome::Failed(fault_of(&e));
             }
