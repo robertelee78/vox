@@ -216,9 +216,101 @@ pub struct SyncOutcome {
     pub governance: usize,
     /// How many of those were decrypted and rendered into the timeline.
     pub rendered: usize,
-    /// Whether every entry this side asked for arrived (ADR-025): `false` for a serve the peer
-    /// bounded, which ends cleanly but leaves the rest owed.
+    /// Whether every position this side asked for was filled (ADR-025 D3): `false` for a serve the
+    /// peer bounded, which ends cleanly but leaves the rest owed.
     pub complete: bool,
+    /// Whether any requested position was newly filled (ADR-025 D3's progress).
+    pub filled_any: bool,
+    /// Entries refused because their author is not admitted here (yet).
+    pub unadmitted: usize,
+    /// Entries refused because their author is frozen.
+    pub frozen: usize,
+    /// Authors the session's setup admitted from the peer's board (ADR-025 D3's progress).
+    pub admitted_authors: usize,
+    /// The room's generation read with this side's `HAVE` (ADR-025 D2).
+    pub gen_have: Option<u64>,
+    /// The room's generation when the session ended.
+    pub gen_end: Option<u64>,
+}
+
+impl SyncOutcome {
+    /// Whether the session made progress (ADR-025 D3): stored an entry, admitted an author, or
+    /// filled a requested position.
+    #[must_use]
+    pub fn progress(&self) -> bool {
+        self.applied > 0 || self.admitted_authors > 0 || self.filled_any
+    }
+}
+
+/// Why a sync session did not complete (ADR-025 D5 maps each to a backoff kind).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncFailure {
+    /// The session protocol failed: locally, by the peer's coded refusal, or by a protocol
+    /// violation.
+    Session(crate::log::sync::SessionError),
+    /// The stream could not be opened, or the peer could not be reached.
+    Unreachable(String),
+    /// The room's persist failed: the room is poisoned until it is reopened.
+    Poisoned(String),
+    /// The session's worker panicked.
+    Panicked,
+}
+
+impl std::fmt::Display for SyncFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::log::sync::SessionError;
+        match self {
+            Self::Session(SessionError::Local(c) | SessionError::Peer(c)) => {
+                write!(f, "{}", Error::SyncFailed(*c))
+            }
+            Self::Session(SessionError::ProtocolViolation) => {
+                f.write_str("sync failed: the peer served an entry that was not asked for")
+            }
+            Self::Unreachable(why) | Self::Poisoned(why) => f.write_str(why),
+            Self::Panicked => f.write_str("sync failed: the session panicked"),
+        }
+    }
+}
+
+/// What one sync session did, and why it stopped if it did not complete. The outcome is filled in
+/// either way: a failure keeps what was persisted before it (ADR-025).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionReport {
+    /// What the session did.
+    pub out: SyncOutcome,
+    /// Why it did not complete.
+    pub fail: Option<SyncFailure>,
+}
+
+impl SessionReport {
+    /// A session that failed before it did anything.
+    #[must_use]
+    pub fn failed(fail: SyncFailure) -> Self {
+        Self {
+            out: SyncOutcome::default(),
+            fail: Some(fail),
+        }
+    }
+
+    /// Fill in the room session's part of the outcome.
+    pub(crate) fn from_room(
+        mut out: SyncOutcome,
+        s: crate::log::sync::RoomSession,
+        fatal: Option<Error>,
+    ) -> Self {
+        out.applied = s.applied;
+        out.complete = s.complete;
+        out.filled_any = s.filled_any;
+        out.unadmitted = s.unadmitted;
+        out.frozen = s.frozen;
+        out.gen_have = s.gen_have;
+        out.gen_end = s.gen_end;
+        let fail = match fatal {
+            Some(e) => Some(SyncFailure::Poisoned(e.to_string())),
+            None => s.fail.map(SyncFailure::Session),
+        };
+        Self { out, fail }
+    }
 }
 
 /// What [`ChannelState::accept_entry`] did with a peer's entry.
@@ -313,6 +405,10 @@ pub struct ChannelState {
     /// `Debug` output carries it).
     passphrase: Zeroizing<Vec<u8>>,
     poisoned: bool,
+    /// The room's **generation** (ADR-025 D1): bumped by every entry persisted, from any source.
+    /// In memory; a restart resets it together with every sync port. Shared with the actor, which
+    /// reads it without the room's lock; it only changes under the lock.
+    gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for ChannelState {
@@ -822,6 +918,7 @@ impl ChannelState {
             origins,
             delivered: BTreeMap::new(),
             poisoned: false,
+            gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -1026,6 +1123,7 @@ impl ChannelState {
             origins,
             delivered,
             poisoned: false,
+            gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -1241,6 +1339,7 @@ impl ChannelState {
             origins,
             delivered: BTreeMap::new(),
             poisoned: false,
+            gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -1938,6 +2037,7 @@ impl ChannelState {
             return Err(e);
         }
         self.next_log_id = id.saturating_add(1);
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.gov_entries.push(gov);
         self.evaluator = Arc::new(Self::build_evaluator(
             &self.genesis,
@@ -2074,6 +2174,7 @@ impl ChannelState {
                 return Err(e);
             }
             self.next_log_id = id.saturating_add(1);
+            self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match classify_payload(&payload)? {
                 EntryKind::Governance => {
                     let entry = self
@@ -2112,20 +2213,23 @@ impl ChannelState {
 
     /// Reconcile the room with a peer over `transport`, holding `shared`'s lock only inside each
     /// protocol step — never across a send or a receive. See [`crate::log::sync::SessionRoom`].
+    /// Every step fails once `fence` is retired (ADR-025 D1a).
     ///
-    /// # Errors
-    /// The room is poisoned, a persist fails, or the session hard-fails.
+    /// Never fails as a whole: the report says what was persisted and why the session stopped, if
+    /// it did — the room poisoned, a persist that failed, or the session's own failure.
     pub fn sync_over_room<T: Transport>(
         shared: &tokio::sync::Mutex<Self>,
         store: &Store,
         transport: &mut T,
         now_secs: u64,
-    ) -> Result<SyncOutcome> {
+        fence: &crate::transport::stream_transport::Fence,
+        on_stored: &dyn Fn(),
+    ) -> SessionReport {
         let epoch = {
             let ch = shared.blocking_lock();
             if ch.poisoned {
-                return Err(Error::Profile(
-                    "channel is poisoned after a failed persist; reopen it",
+                return SessionReport::failed(SyncFailure::Poisoned(
+                    "channel is poisoned after a failed persist; reopen it".to_owned(),
                 ));
             }
             ch.epoch
@@ -2135,22 +2239,14 @@ impl ChannelState {
             store,
             now_secs,
             epoch,
+            fence,
+            on_stored,
             out: std::cell::RefCell::new(SyncOutcome::default()),
             fatal: std::cell::RefCell::new(None),
         };
         let session = crate::log::sync::frontier_session_room(transport, &room);
-        if let Some(e) = room.fatal.take() {
-            return Err(e);
-        }
-        let mut out = room.out.into_inner();
-        match session {
-            Ok(done) => {
-                out.applied = done.applied;
-                out.complete = done.complete;
-                Ok(out)
-            }
-            Err(code) => Err(sync_failure(code)),
-        }
+        let fatal = room.fatal.take();
+        SessionReport::from_room(room.out.into_inner(), session, fatal)
     }
 
     /// Accept a **sender-key distribution message** from `author` (ADR-006/ADR-007
@@ -2373,6 +2469,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        // A cache row, not an entry: the generation counts entries only (ADR-025 D1).
         self.next_log_id = id.saturating_add(1);
         self.timeline.push(rendered);
         let _ = now_secs;
@@ -2435,6 +2532,7 @@ impl ChannelState {
             return Err(e);
         }
         self.next_log_id = id.saturating_add(1);
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match gov {
             Some(g) => {
                 let could_read = self.readable_authors();
@@ -2557,6 +2655,7 @@ impl ChannelState {
             return Err(e);
         }
         self.next_log_id = id.saturating_add(1);
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.timeline.push(rendered);
         self.timeline
             .last()
@@ -2650,6 +2749,12 @@ impl ChannelState {
         &self.evaluator
     }
 
+    /// The room's generation counter (ADR-025 D1), shared.
+    #[must_use]
+    pub fn generation(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.gen)
+    }
+
     /// Whether a failed persist has poisoned this channel (reopen to continue).
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
@@ -2716,6 +2821,10 @@ struct ChannelSessionRoom<'a> {
     now_secs: u64,
     /// The epoch the session began at; a room that has moved on refuses what was staged for it.
     epoch: u64,
+    /// Retired sessions stop at their next step (ADR-025 D1a).
+    fence: &'a crate::transport::stream_transport::Fence,
+    /// Called after a batch persisted entries (ADR-025 D1a: stores report themselves).
+    on_stored: &'a dyn Fn(),
     out: std::cell::RefCell<SyncOutcome>,
     /// A local failure (a persist that failed) that must reach the caller as itself, not as a code.
     fatal: std::cell::RefCell<Option<Error>>,
@@ -2726,6 +2835,9 @@ impl ChannelSessionRoom<'_> {
         &self,
     ) -> std::result::Result<tokio::sync::MutexGuard<'_, ChannelState>, crate::wire::WireError>
     {
+        if self.fence.is_retired() {
+            return Err(crate::wire::WireError::TransportFailed);
+        }
         let ch = self.shared.blocking_lock();
         if ch.poisoned {
             return Err(crate::wire::WireError::TransportFailed);
@@ -2740,15 +2852,23 @@ impl ChannelSessionRoom<'_> {
 impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
     fn frontiers(
         &self,
-    ) -> std::result::Result<Vec<crate::log::sync::FeedFrontier>, crate::wire::WireError> {
-        Ok(crate::log::sync::frontiers_of(&self.room()?.dag))
+    ) -> std::result::Result<(Vec<crate::log::sync::FeedFrontier>, u64), crate::wire::WireError>
+    {
+        let ch = self.room()?;
+        Ok((
+            crate::log::sync::frontiers_of(&ch.dag),
+            ch.gen.load(std::sync::atomic::Ordering::Relaxed),
+        ))
     }
 
     fn wants(
         &self,
         remote: &[crate::log::sync::FeedFrontier],
     ) -> std::result::Result<Vec<crate::log::sync::WantRange>, crate::wire::WireError> {
-        Ok(crate::log::sync::wants_for(&self.room()?.dag, remote))
+        Ok(crate::log::sync::wants_for_unfrozen(
+            &self.room()?.dag,
+            remote,
+        ))
     }
 
     fn entries(
@@ -2761,33 +2881,54 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         ))
     }
 
-    fn apply(&self, staged: Vec<Vec<u8>>) -> std::result::Result<usize, crate::wire::WireError> {
-        let mut guard = self.room()?;
+    fn apply(&self, staged: Vec<Vec<u8>>) -> crate::log::sync::ApplyReport {
+        let mut guard = match self.room() {
+            Ok(g) => g,
+            Err(code) => {
+                return crate::log::sync::ApplyReport {
+                    fail: Some(code),
+                    ..crate::log::sync::ApplyReport::default()
+                }
+            }
+        };
         let ch = &mut *guard;
         let before = ch.heads();
+        let gen_before = ch.gen.load(std::sync::atomic::Ordering::Relaxed);
         // The resolver as it is *now*: an author revoked while this batch was on the wire is not
         // an author of this room any more, and its entries are refused.
         let resolver = ch.resolver();
-        // **Absorb what was stored, then report the failure.** `apply_staged` stores entries one
-        // at a time and stops at the first it refuses; those before it are already in the log.
-        // Returning the refusal first skipped persisting and rendering them, yet the log now held
-        // them, so every later session saw nothing to send and they were never shown: one joiner
-        // read nothing from the host in a room, silently, about one run in four (tworooms.sh). The
-        // refusal was the other joiner's entry, from an author this node had not admitted yet.
-        // `sync_over` always did it in this order ("reconciliation done; only now surface a
-        // session failure"); the per-step path lost it.
-        let stored = crate::log::sync::apply_staged(&mut ch.dag, &resolver, &ch.admission, &staged);
+        // **Absorb what was stored, then report the failure.** The DAG takes entries one at a time
+        // and stops at the first hard failure; those before it are already in the log, so they are
+        // persisted, rendered and counted before the failure is reported (one joiner once read
+        // nothing from the host because the order was the other way round: tworooms.sh).
+        let mut report = crate::log::sync::apply_staged_classified(
+            &mut ch.dag,
+            &resolver,
+            &ch.admission,
+            &staged,
+        );
         match ch.absorb_arrived(self.store, &before, self.now_secs) {
             Ok(got) => {
                 let mut out = self.out.borrow_mut();
                 out.rendered += got.rendered;
                 out.governance += got.governance;
-                stored
             }
             Err(e) => {
                 *self.fatal.borrow_mut() = Some(e);
-                Err(crate::wire::WireError::TransportFailed)
+                report.fail = Some(crate::wire::WireError::TransportFailed);
             }
         }
+        // `stored` means persisted: the generation counts each entry the persist step committed.
+        let gen_after = ch.gen.load(std::sync::atomic::Ordering::Relaxed);
+        report.stored = usize::try_from(gen_after.saturating_sub(gen_before)).unwrap_or(usize::MAX);
+        drop(guard);
+        if report.stored > 0 {
+            (self.on_stored)();
+        }
+        report
+    }
+
+    fn generation(&self) -> std::result::Result<u64, crate::wire::WireError> {
+        Ok(self.room()?.gen.load(std::sync::atomic::Ordering::Relaxed))
     }
 }

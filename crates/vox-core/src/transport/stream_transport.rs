@@ -28,6 +28,50 @@ use crate::wire::WireError;
 /// exchange and shorter than anyone waits.
 pub const SYNC_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// A session's **fence** (ADR-025 D1a): once retired, a session stops at its next room step or
+/// transport operation. Aborting the task that started a session does not stop a worker already
+/// running it on a blocking thread, so the worker is told this way instead, and a transport
+/// operation it is blocked in returns at once, resetting the stream.
+#[derive(Debug, Default)]
+pub struct Fence {
+    retired: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Fence {
+    /// A new, unretired fence.
+    #[must_use]
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// Retire the session: every later check fails, and a wait in progress ends.
+    pub fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// Whether the session has been retired.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once the session is retired.
+    pub async fn retired(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_retired() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// A [`sync::Transport`](crate::log::sync::Transport) over one reliable QUIC
 /// bi-stream, bridging the synchronous M5 sync engine onto async quinn via a tokio
 /// runtime [`Handle`].
@@ -51,6 +95,8 @@ pub struct QuicStreamTransport {
     closed: Option<WireError>,
     /// Per-frame bound on both directions; see [`SYNC_FRAME_TIMEOUT`].
     frame_timeout: Duration,
+    /// The session's fence, if it has one (ADR-025 D1a).
+    fence: Option<std::sync::Arc<Fence>>,
 }
 
 impl QuicStreamTransport {
@@ -76,7 +122,24 @@ impl QuicStreamTransport {
             recv,
             closed: None,
             frame_timeout,
+            fence: None,
         }
+    }
+
+    /// Stop every transport operation once `fence` is retired (ADR-025 D1a).
+    #[must_use]
+    pub fn fenced(mut self, fence: std::sync::Arc<Fence>) -> Self {
+        self.fence = Some(fence);
+        self
+    }
+
+    /// Whether the fence is retired; if so the stream is reset, once.
+    fn check_fence(&mut self) -> Result<()> {
+        if self.fence.as_ref().is_some_and(|f| f.is_retired()) {
+            self.close(WireError::TransportFailed);
+            return Err(Error::Unreachable("sync: the session was retired"));
+        }
+        Ok(())
     }
 
     /// Open a new bi-stream on `conn` and wrap it (initiator side).
@@ -94,6 +157,7 @@ impl QuicStreamTransport {
 
 impl Transport for QuicStreamTransport {
     fn send(&mut self, frame: &[u8]) -> Result<()> {
+        self.check_fence()?;
         if self.closed.is_some() {
             return Err(Error::Unreachable("quic transport: send after close"));
         }
@@ -101,27 +165,54 @@ impl Transport for QuicStreamTransport {
             return Err(Error::Unreachable("quic transport: send while serving"));
         };
         let bound = self.frame_timeout;
-        self.handle
+        let fence = self.fence.clone();
+        let r = self
+            .handle
             .block_on(async move {
-                tokio::time::timeout(bound, write_frame(send, frame))
-                    .await
-                    .map_err(|_| Error::Unreachable("sync: peer stopped taking frames"))
+                let work = async {
+                    tokio::time::timeout(bound, write_frame(send, frame))
+                        .await
+                        .map_err(|_| Error::Unreachable("sync: peer stopped taking frames"))
+                };
+                match fence {
+                    Some(f) => tokio::select! {
+                        r = work => r,
+                        () = f.retired() => Err(Error::Unreachable("sync: the session was retired")),
+                    },
+                    None => work.await,
+                }
             })
-            .and_then(|r| r)
+            .and_then(|r| r);
+        self.check_fence()?;
+        r
     }
 
     fn recv(&mut self) -> Result<Option<Vec<u8>>> {
         // A clean FIN exactly at a frame boundary is the peer's success
         // half-close → `Ok(None)`; anything else is a real transport failure.
+        self.check_fence()?;
         let recv = &mut self.recv;
         let bound = self.frame_timeout;
-        self.handle
+        let fence = self.fence.clone();
+        let r = self
+            .handle
             .block_on(async move {
-                tokio::time::timeout(bound, read_frame(recv, MAX_STREAM_FRAME))
-                    .await
-                    .map_err(|_| Error::Unreachable("sync: peer went quiet"))
+                let work = async {
+                    tokio::time::timeout(bound, read_frame(recv, MAX_STREAM_FRAME))
+                        .await
+                        .map_err(|_| Error::Unreachable("sync: peer went quiet"))
+                };
+                match fence {
+                    Some(f) => tokio::select! {
+                        r = work => r,
+                        () = f.retired() => Err(Error::Unreachable("sync: the session was retired")),
+                    },
+                    None => work.await,
+                }
             })
-            .and_then(|r| r)
+            .and_then(|r| r);
+        self.check_fence()?;
+        r
     }
 
     fn close(&mut self, code: WireError) {
@@ -206,11 +297,30 @@ impl Transport for QuicStreamTransport {
     }
 
     fn finish_serving(&mut self) -> Result<()> {
-        let Some((task, _cancel)) = self.writer.take() else {
+        let Some((mut task, cancel)) = self.writer.take() else {
             return Ok(());
         };
-        self.handle.block_on(task).unwrap_or(Err(Error::Unreachable(
-            "sync: the serving task ended abnormally",
-        )))
+        let fence = self.fence.clone();
+        let done = self.handle.block_on(async {
+            match fence {
+                Some(f) => tokio::select! {
+                    r = &mut task => Some(r),
+                    () = f.retired() => None,
+                },
+                None => Some((&mut task).await),
+            }
+        });
+        match done {
+            Some(r) => r.unwrap_or(Err(Error::Unreachable(
+                "sync: the serving task ended abnormally",
+            ))),
+            None => {
+                // Retired while serving: the writer resets the stream and stops.
+                let _ = cancel.send(close_code(WireError::TransportFailed));
+                self.closed = Some(WireError::TransportFailed);
+                let _ = self.recv.stop(close_code(WireError::TransportFailed));
+                Err(Error::Unreachable("sync: the session was retired"))
+            }
+        }
     }
 }
