@@ -131,8 +131,9 @@ developer's machine. The point of the mechanism is that the strict list is the o
 repository.
 
 Removing an entry MUST make the proof fail until that gap is closed — that is the point of it. The
-value is set once in `.github/workflows/ci.yml` and `.github/workflows/release.yml`, so the accepted
-gaps are visible in the gate itself and not only here.
+value is set once, in `.github/workflows/ci.yml`, so the accepted gaps are visible in the gate
+itself and not only here. (`release.yml` carried a copy while it re-ran the gates; since 2026-09-26 it
+runs no proof — see "Publish only what CI proved".)
 
 A whitelist entry matches either a whole claim id or its first segment, so a gap MAY be accepted
 precisely (`verify.digest_mismatch_is_refused`) rather than by area (`verify`). Accepting by area
@@ -699,6 +700,32 @@ Recorded here rather than left to be rediscovered: the `Stalled` line above exis
 node was made to say when it cannot answer, which is the same instrumentation that found the
 board-growth defect. Before that, this was thirty silent seconds and nothing in the product could have
 told anyone why.
+
+## Publish only what CI proved (2026-09-26)
+
+**Decision.** The gates run **once**, in CI, on the commit that is published. `release.yml` runs no
+proof: its first job, `ci-passed`, waits for CI's `push` run on `main` for exactly the tagged SHA and
+passes only if that whole run succeeded. The builds depend on it. A tag on a commit CI never ran on
+`main` is refused within minutes, not built.
+
+**Why.** Until v0.2.9 `release.yml` re-ran the entire suite that CI had just run on the same commit.
+That proved one tree twice, cost roughly 60 minutes per release, and the duplicate was the copy that
+hit its time budget on v0.2.9's second tag: cancelled at 60 minutes with 141 results green and nothing
+red. §6's rule is unchanged: nothing is published from a tree the gates have not passed on. The tree
+CI proved and the tree published are the same SHA.
+
+**What this makes stricter.** CI runs on ubuntu **and** macOS. The old release gate ran on ubuntu
+only, so a macOS-only red could not block a release; now it does. Both are shipped platforms.
+
+**How the suite is laid out in CI.** `build-test` (both OSes) runs fmt, clippy, the debug suite,
+rustdoc and the release `--ignored` suite **without** the PRD-001 transport gates, which run in
+parallel in `transport-gates` (`r40_`, `r41_`, `r42_`; ~20 minutes, the relay gate alone 11-22).
+Both are blocking. The by-name exclusion recorded in "Two proofs are excluded from the release gate,
+by name" now lives in `ci.yml`: `cross_process_join_proof` runs in `flaky-watch`, which reports and
+can never fail CI. Every `cargo test` runs `--no-fail-fast`, so one red cannot hide the rest.
+
+**Re-running.** If CI on the tagged commit fails and a re-run of that CI run passes, re-run the
+release workflow (its `ci-passed` job reads the run's latest conclusion). Nothing is re-tagged.
 
 ## Links
 

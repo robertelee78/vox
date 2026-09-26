@@ -197,15 +197,10 @@ pub async fn read_all(
     channel_id: Digest32,
     since: Option<Digest32>,
 ) -> Result<Vec<MessageRow>, AppError> {
-    match ask(
-        client,
-        &Request::Read {
-            channel_id,
-            since,
-            limit: 0,
-        },
-    )
-    .await?
+    match client
+        .read_rows(channel_id, since)
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?
     {
         Frame::Rows { rows } => Ok(rows),
         other => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),

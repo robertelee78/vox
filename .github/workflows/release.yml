@@ -7,132 +7,65 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The gaps ADR-018 §3 accepts today. Removing one MUST make the proofs fail until it is
-  # closed — that is what makes an accepted gap a decision rather than a silence.
-  #
-  # `opencode` — the M19.7 rehearsal and the OpenCode plugin proof drive a **live model**
-  # through a real harness. A CI runner has neither the harness nor a credential, so they
-  # report unproven here and are proved on a developer machine instead. Removing this name
-  # does not make CI prove them; it makes CI fail.
-  # `cross-process-join` / `cross-process-tunnel` — the open reachability defects recorded
-  # in ADR-012 and ADR-016 with measurements. Named separately so a tunnel regression
-  # cannot hide behind a join defect, or the reverse.
-  # `journey.update_replaces_an_older_install` — this claim drives a **published binary**,
-  # not this tree: it runs v<older>'s own `vox update`. v0.1.0 and v0.2.0 shipped the Linux
-  # ETXTBSY defect (ADR-015), so on Linux they cannot update to anything and no change here
-  # can alter that. The proof reports it blocked with the versions named, and the condition
-  # clears itself once the newest release other than the current one is >= v0.2.1.
-  # `verify.digest_mismatch_is_refused` was REMOVED on 2026-09-22: it had been excused since
-  # v0.1.0, and while it was excused the `proof` channel record was unreadable by every
-  # released binary, so the refusal it names had never once run. It passes now, and an
-  # accepted gap that has closed MUST be removed rather than renewed — otherwise the next
-  # regression is green.
-  # See ci.yml: `fish` is not excused here, the gates job installs it.
-  VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,install.apple_gate_refuses_unsigned_bytes,opencode,cross-process-join,cross-process-tunnel"
+  # No proof runs in this workflow: the gates run in CI on the same commit (see `ci-passed`), so
+  # the accepted gaps (`VOX_PROOF_ALLOW_UNPROVEN`) are set in ci.yml alone.
 
 jobs:
   # ADR-018 §6: nothing is published from a tree the gates have not passed on. The tag is the
   # tree users will run, so it is the tree that gets proved — not merely the branch it came from.
-  gates:
-    name: gates (fmt · clippy · test · docs)
+  #
+  # **The gates run once, in CI, on the tagged commit itself** (ADR-018, "Publish only what CI
+  # proved", 2026-09-26). This job re-ran the whole suite that CI had just run on the same commit:
+  # ~60 minutes per release spent proving a tree twice, and in v0.2.9 it was the second copy that hit
+  # its time budget. Now it waits for CI's `push` run on `main` for exactly `github.sha` and passes
+  # only if that run succeeded. A tag on a commit CI never ran on `main` cannot publish; tag a commit
+  # that is on `main`. The tree proved is still the tree published: the same SHA.
+  ci-passed:
+    name: CI passed on this exact commit
     runs-on: ubuntu-latest
-    # 60, not 45: this job compiles every release target and then runs the whole `--ignored` suite,
-    # which is ~20 minutes of the total on a developer machine and longer on a shared runner. At 45
-    # a green release was a race against the clock — v0.2.5's run reached 32 minutes with the release
-    # suite still going. A gate that fails on its own budget teaches nobody anything.
-    # 120, not 60: v0.2.9's first run was cancelled at 60 minutes inside the R41 perf proof with 141
-    # results green and 0 failed; the release suite alone ran 54 minutes (the R42 relay proof ~11,
-    # a restarted host ~5) and had vox-tui still to go.
-    timeout-minutes: 120
-    # Set once for the whole job so every step shares one flag set and nothing is rebuilt
-    # between them. Deliberately NOT workflow-wide: a release build has no business failing on
-    # a dependency's warning under a cross-compile.
-    env:
-      RUSTFLAGS: "-D warnings"
+    # CI's slowest job has a 120-minute budget; a tag pushed straight after `main` waits for it.
+    timeout-minutes: 150
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
-      # See ci.yml: the proofs measure real shells, so the runner installs them.
-      - run: sudo apt-get update && sudo apt-get install -y zsh fish
-      # `codex_trust_proof` asks Codex itself whether Vox's hook is trusted, and refuses to pass
-      # without `codex` on PATH (an absent Codex is not a pass). Pinned to the version it was
-      # measured on: the app-server's `hooks/list` statuses are Codex's, not Vox's, to change.
-      - run: npm install -g @openai/codex@0.157.0 && codex --version
-      - run: rustc --version && cargo --version
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --workspace --no-fail-fast
+      - name: Wait for CI's run on main for this commit, and require success
         env:
-          # `update_proof` asks GitHub which releases exist, to find one to update *from*.
           GH_TOKEN: ${{ github.token }}
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-      # Two proofs are excluded here **by name, with their measured rates**, because they are
-      # flaky rather than red and retrying a release until luck lets it through is not evidence:
-      #
-      #   cross_process_join_proof      4 ok of 6 measured locally (~1 in 3 fails)
-      #   relayed_path_is_retried       RESTORED to the blocking set for v0.2.9 (V29-14): 48 ok of 48 on
-      #                                 36b5c94 (8 interleaved with v0.2.8, which was 8 of 8, plus 40), where
-      #                                 it had been 4 of 5 on main and failed once in CI.
-      #
-      # Both are tracked as open defects in ADR-018. `cross-process-join` already sits on
-      # VOX_PROOF_ALLOW_UNPROVEN above, which records that its claim is unproven but does not stop
-      # it failing this gate. Excluding them is stated, not hidden: a release built this way has NOT
-      # been shown to carry a log entry between processes, and the release notes must say so.
-      # `work_board_proof` was excluded here on 2026-09-24 and the exclusion is now REMOVED, because
-      # its cause is fixed rather than tolerated: ADR-020 §5's one-second `created_secs` resolution
-      # sent two claims in the same second to an entry-hash tie-break that is deterministic but not
-      # causal. M19.9 gives the timestamp millisecond resolution. Measured: 1 failure in 3 before, on
-      # both `main` and v0.2.5's commit; 6 of 6 after, at loads 4-45 — and high load is the *harder*
-      # condition for this race, since a quiet box is what packs a claim and a release into one second.
-      # It is back in the blocking set, which is where a proof belongs once it can pass for a reason.
-      # `service_rehearsal_proof` was excluded here on 2026-09-23 and the exclusion is now REMOVED,
-      # because its cause is fixed rather than tolerated. It failed at the stranger's join (`:490`):
-      # `spawn_accept_loop` awaited `finish_incoming` inline, so a host that had answered one joiner
-      # answered nobody for up to `HANDSHAKE_TIMEOUT` (30s), and `vox connect` exits the moment it has
-      # joined, which leaves the host mid-handshake. v0.2.8 spawns each handshake on its own bounded
-      # task, which closes ADR-017's "Open proof gap". Back in the blocking set.
-      # `--no-fail-fast`: without it cargo stops at the first red test binary, and v0.2.9's run left
-      # ~120 binaries unrun behind one red, so each run could show only one red per hour.
-      - run: |
-          cargo test --release --workspace --no-fail-fast -- --ignored \
-            --skip two_agents_on_separate_processes_join_through_an_anchor_and_talk
-
-  # **Reporting only, and in its OWN job on purpose.** These are the proofs excluded from the gate
-  # above. Every command here ends in `|| echo "::warning::"`, so none of them can fail a release —
-  # but while they lived as a step inside `gates` they could still *time out* that job, and a timed
-  # out `gates` blocks the release completely. A step forbidden from failing the release could
-  # nonetheless kill it, by spending a budget it shared with the real gate.
-  #
-  # That very nearly happened: adding a third proof here (`service_rehearsal_proof`, since restored to
-  # the gate, whose failing
-  # path burns its whole timeout) lengthened this work inside a 45-minute budget that the blocking
-  # steps had already spent 32 minutes of.
-  #
-  # So it is a separate job that **nothing needs and which needs nothing**. It cannot consume the
-  # gate's time, cannot block publication, and a rate that changes is still visible as a warning —
-  # which is the entire reason these are run at all rather than deleted (ADR-018).
-  flaky-watch:
-    name: excluded proofs (reporting only — never blocks a release)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    # No `VOX_PROOF_ALLOW_UNPROVEN` here: a job inherits the workflow-level `env` above, and the
-    # `env` **context** is not available inside a job-level `env` block — writing
-    # `${{ env.VOX_PROOF_ALLOW_UNPROVEN }}` there made GitHub reject this whole file, so the run
-    # failed in 0s with no jobs and no log. v0.2.6's first two tags died that way.
-    env:
-      RUSTFLAGS: "-D warnings"
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y zsh fish
-      # Run them anyway, reporting only: a rate that changes is information, and a gate that hides
-      # them entirely would let them rot.
-      - run: |
-          cargo test --release --workspace --no-fail-fast -- --ignored \
-            two_agents_on_separate_processes_join_through_an_anchor_and_talk \
-            || echo "::warning::cross_process_join_proof failed — known flake, ADR-018"
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          url="repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=main&per_page=1"
+          seen=""
+          for i in $(seq 1 280); do
+            line=$(gh api "$url" --jq '.workflow_runs[0] | select(. != null) | "\(.id) \(.status) \(.conclusion) \(.html_url)"' || true)
+            if [ -z "$line" ]; then
+              # CI starts within seconds of a push to main; five minutes without one means this
+              # commit was never pushed to main, which is a refusal, not a wait.
+              if [ "$i" -ge 10 ]; then
+                echo "::error::no CI run on main for $SHA — tag a commit that is on main and has been through CI"
+                exit 1
+              fi
+            else
+              set -- $line
+              [ "$seen" != "$1 $2" ] && echo "CI run $1: $2 $3 ($4)" && seen="$1 $2"
+              if [ "$2" = completed ]; then
+                if [ "$3" = success ]; then
+                  echo "CI passed on $SHA: $4"
+                  exit 0
+                fi
+                echo "::error::CI on $SHA concluded '$3': $4 — nothing is published from a tree the gates did not pass"
+                exit 1
+              fi
+            fi
+            sleep 30
+          done
+          echo "::error::CI on $SHA did not finish within this job's budget"
+          exit 1
 
   build-linux-x64:
-    needs: [gates]
+    needs: [ci-passed]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -154,7 +87,7 @@ jobs:
           path: dist/*
 
   build-darwin-arm64:
-    needs: [gates]
+    needs: [ci-passed]
     runs-on: macos-latest
     timeout-minutes: 75  # includes waiting on Apple's notary service
     # Holds the Apple credentials. A fork or a pull request cannot reach them, so it cannot
@@ -209,7 +142,7 @@ jobs:
           path: dist/*
 
   build-darwin-x64:
-    needs: [gates]
+    needs: [ci-passed]
     runs-on: macos-latest
     timeout-minutes: 75  # includes waiting on Apple's notary service
     environment: apple-release
