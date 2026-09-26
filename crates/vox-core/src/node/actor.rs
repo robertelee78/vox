@@ -27,6 +27,26 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+// DEBUG INSTRUMENTATION (dbg/180-sessions, not for merge): VOX_DEBUG_SYNC=1 prints session events.
+static DEBUG_SYNC: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("VOX_DEBUG_SYNC").is_some());
+macro_rules! dbg_sync {
+    ($($a:tt)*) => {
+        if *DEBUG_SYNC {
+            eprintln!(
+                "[vox-dbg {}] {}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis()),
+                format!($($a)*)
+            );
+        }
+    };
+}
+fn s8(d: &[u8; 32]) -> String {
+    crate::node::link::b32_encode(d).chars().take(8).collect()
+}
+
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 
 use crate::atrest::sek::Argon2Profile;
@@ -3359,6 +3379,7 @@ impl Node {
                 self.key_backoff.remove(&(channel_id, peer));
             }
             NetEvent::PushRetry { channel_id, peer } => {
+                dbg_sync!("push RETRY room={} peer={}", s8(&channel_id), s8(&peer));
                 self.pending_push.insert(channel_id);
                 // The failed session carried nothing, so this peer is owed the room again.
                 if let Some(to) = self.pushed_to.get_mut(&channel_id) {
@@ -3375,6 +3396,7 @@ impl Node {
                 peer,
                 outcome,
             } => {
+                dbg_sync!("sync DONE room={} peer={} ok={} {}", s8(&channel_id), s8(&peer), outcome.is_ok(), outcome.as_ref().err().map(|e| e.to_string()).unwrap_or_default());
                 self.syncing.remove(&(channel_id, peer));
                 self.answer_pending_consents(|room, _| *room == channel_id, None)
                     .await;
@@ -4401,6 +4423,7 @@ impl Node {
     /// Consent to `target` reading this identity's messages — ADR-007 step 3, the
     /// human decision, taken per sender.
     async fn consent(&mut self, channel_id: &Digest32, target: Digest32, asked: bool) -> Outcome {
+        dbg_sync!("CONSENT room={} target={} asked={asked}", s8(channel_id), s8(&target));
         let outcome = self.release_key_to(channel_id, target, asked).await;
         if outcome.is_done() {
             let _ = self.event_tx.send(NodeEvent::Consented {
@@ -4861,6 +4884,7 @@ impl Node {
                     continue;
                 }
                 if self.in_session_with(cid, &peer) || self.publishing.contains(&(*cid, peer)) {
+                    dbg_sync!("push OWED room={} peer={} (in session {}, publishing {})", s8(cid), s8(&peer), self.in_session_with(cid, &peer), self.publishing.contains(&(*cid, peer)));
                     owed.push(*cid);
                     continue;
                 }
@@ -5018,11 +5042,14 @@ impl Node {
             self.refresh_anchored_authors(channel_id).await;
         }
         if self.in_session_with(channel_id, &peer) {
+            dbg_sync!("sync SKIP room={} peer={}: already in session with it", s8(channel_id), s8(&peer));
             return false; // a session with this peer already has this room
         }
         let Ok(slot) = Arc::clone(&self.sync_slots).try_acquire_owned() else {
+            dbg_sync!("sync SKIP room={} peer={}: no slot", s8(channel_id), s8(&peer));
             return false; // past the cap: skipped, not queued. The schedule comes round again.
         };
+        dbg_sync!("sync START room={} peer={} (in flight now {})", s8(channel_id), s8(&peer), self.syncing.len() + 1);
         self.syncing.insert((*channel_id, peer));
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
         let cid = *channel_id;
@@ -5258,6 +5285,7 @@ impl Node {
         // run, and this is the actor: awaiting that lock to read the epoch parked the whole node
         // behind the very session this check exists to detect.
         if self.in_session_with(&channel_id, &peer) {
+            dbg_sync!("inbound REFUSED room={} peer={}: in session with it", s8(&channel_id), s8(&peer));
             let (mut send, mut recv) = (send, recv);
             crate::node::net::refuse_stream(&mut send, &mut recv);
             return;
@@ -5286,11 +5314,13 @@ impl Node {
         // stream already ended the initiator's session within milliseconds, measured; the long
         // losses once blamed on this were the room-wide starvation v0.2.8 fixed.)
         if !matches_epoch {
+            dbg_sync!("inbound REFUSED room={} peer={}: epoch", s8(&channel_id), s8(&peer));
             let (mut send, mut recv) = (send, recv);
             crate::node::net::refuse_stream(&mut send, &mut recv);
             return;
         }
         if !self.may_sync(&channel_id, &peer, epoch).await {
+            dbg_sync!("inbound REFUSED room={} peer={}: may_sync", s8(&channel_id), s8(&peer));
             // Refused explicitly, with the same coded reset as a stream kind the peer may not
             // open, rather than left to read for a frame that never comes.
             let (mut send, mut recv) = (send, recv);
@@ -5878,6 +5908,7 @@ impl Node {
         let Some(n) = backfilled else {
             return Some(Err(KeyRefusal::NotAccepted));
         };
+        dbg_sync!("key RECEIVED room={} from={} backfilled={n}", s8(&channel_id), s8(&peer));
         let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
             channel_id,
             peer,

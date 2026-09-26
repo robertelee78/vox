@@ -120,6 +120,7 @@ impl Member {
             .arg(&self.pass)
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
+            .env("VOX_DEBUG_SYNC", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(err).unwrap()))
@@ -147,8 +148,9 @@ fn spawn_anchor(root: &Path) -> (Proc, String) {
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &a_data)
             .env("VOX_CONFIG_DIR", &a_cfg)
+            .env("VOX_DEBUG_SYNC", "1")
             .stdout(Stdio::from(std::fs::File::create(&anchor_out).unwrap()))
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(root.join("anchor.err")).unwrap()))
             .spawn()
             .expect("spawn vox node"),
     );
@@ -178,8 +180,13 @@ const POSTS: usize = 5;
 #[ignore = "a real anchor and three real daemons with production Argon2id; CI runs it in release"]
 fn a_dead_member_does_not_stall_the_room() {
     watchdog::arm();
+    // DEBUG (dbg/180-sessions): keep every file under VOX_PROOF_ROOT when set.
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
+    let kept = std::env::var_os("VOX_PROOF_ROOT").map(std::path::PathBuf::from);
+    if let Some(k) = &kept {
+        std::fs::create_dir_all(k).unwrap();
+    }
+    let root: &Path = kept.as_deref().unwrap_or(tmp.path());
     let (_anchor, spec) = spawn_anchor(root);
     let members = [
         Member::new(root, "alice"),
@@ -293,6 +300,7 @@ fn a_dead_member_does_not_stall_the_room() {
         let (ok, _, err) = alice.vox(&["room", "post", &room, &text], None);
         assert!(ok, "alice posts: {err}");
         let posted = Instant::now();
+        eprintln!("[dbg-proof {}] post {i} returned", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         let seen = loop {
             let (_, out, _) = bob.vox(&["room", "read", &room], None);
             if out.contains(&text) {
