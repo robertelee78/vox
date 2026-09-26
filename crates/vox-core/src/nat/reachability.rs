@@ -367,15 +367,20 @@ pub async fn connect_direct_within(
     per_attempt: Duration,
 ) -> Result<VoxConnection> {
     // A candidate the socket cannot even address is not a candidate: quinn refuses
-    // an IPv6 destination on an IPv4 socket outright (and maps IPv4 onto an IPv6
-    // one, so the reverse is fine). Dropping them here is what keeps a dual-stack
-    // peer's IPv6 entries from costing an IPv4-bound node anything.
-    let local_v6 = endpoint.local_addr().is_ok_and(|a| a.is_ipv6());
-    let candidates: Vec<SocketAddr> = candidates
-        .iter()
-        .copied()
-        .filter(|c| local_v6 || c.is_ipv4())
-        .collect();
+    // an IPv6 destination on an IPv4 socket outright, and an IPv6 socket carries IPv4 only
+    // as v4-mapped addresses — which works for a socket bound to the IPv6 wildcard (`[::]`,
+    // dual-stack) and **not** for one bound to a particular IPv6 address such as `[::1]`.
+    // Dropping them here is what keeps a dual-stack peer's IPv6 entries from costing an
+    // IPv4-bound node anything, and a peer's IPv4 entries from costing an IPv6-only node a full
+    // per-attempt timeout each: measured, an IPv6-only joiner spent `board 20.76s` dialling two
+    // IPv4 addresses it could never reach before the one it could (#197).
+    let local = endpoint.local_addr().ok();
+    let reachable = |c: &SocketAddr| match local {
+        Some(SocketAddr::V4(_)) => c.is_ipv4(),
+        Some(SocketAddr::V6(l)) => c.is_ipv6() || l.ip().is_unspecified(),
+        None => true,
+    };
+    let candidates: Vec<SocketAddr> = candidates.iter().copied().filter(reachable).collect();
     if candidates.is_empty() {
         return Err(Error::Unreachable("no direct candidates"));
     }
