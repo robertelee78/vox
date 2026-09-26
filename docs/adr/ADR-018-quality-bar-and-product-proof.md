@@ -828,10 +828,10 @@ no consent without a keyring entry; revocation (M18); the path MTU follows the g
 mock, `deniable/tests.rs`, the Argon2id timing spike) no longer exist in the tree: there are no
 `#[test]` or `#[cfg(test)]` items in any crate's `src/` (verified 2026-09-26). They are not restored.
 
-**Still to convert: eleven binary proofs that also run a participant in-process.** They drive the
+**Still to convert: ten binary proofs that also run a participant in-process.** They drive the
 shipped `vox`, but start one or more other participants as an in-process `Node` where a person would
 run `vox`: `a_daemon_follows_its_anchor`, `a_long_room_reopens_proof`,
-`agent_rehearsal_proof`, `daemon_proof`, `file_exchange_proof`, `it_just_works_with_a_daemon_running`,
+`agent_rehearsal_proof`, `daemon_proof`, `it_just_works_with_a_daemon_running`,
 `opencode_plugin_proof`, `remote_interrupt_proof`, `room_verbs_proof`,
 `shutdown_releases_the_profile_proof`, `work_board_proof`. Each is to have every participant run as
 the binary, or be deleted, and is tracked as its own item.
