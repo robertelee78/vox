@@ -237,20 +237,23 @@ fn two_backlogs_that_meet_both_cross() {
         assert!(ok, "{name} posts: {err}");
     }
     let deadline = Instant::now() + SETUP;
+    let mut missing: Vec<String> = Vec::new();
     'warm: loop {
-        let mut all = true;
-        for (_, d) in members {
+        missing.clear();
+        for (reader, d) in members {
             let (_, r, _) = vox_once(d, &args(&["room", "read", &room]));
-            all &= members
-                .iter()
-                .all(|(n, _)| r.contains(&format!("hello from {n}")));
+            for (n, _) in members {
+                if !r.contains(&format!("hello from {n}")) {
+                    missing.push(format!("{reader} cannot read {n}"));
+                }
+            }
         }
-        if all {
+        if missing.is_empty() {
             break 'warm;
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: the three members never read each other"
+            "CANNOT MEASURE: after {SETUP:?} the members still do not all read each other: {missing:?}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
