@@ -491,6 +491,15 @@ impl Request {
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
             }
+            // The unpaged form (no `after`), as any release before #189 sends it: read as the first
+            // page. Refused, a worker on an older release died at its first room lookup with
+            // "ipc request unknown tag" and never reached the version check that exists to refuse it
+            // by name (ADR-021 M21.1, work_version_proof).
+            (T_ROOMS_REQ, 1) => {
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Rooms { after: None })
+            }
             (T_ROOMS_REQ, 2) => {
                 let after = optional_digest(&mut d)?;
                 d.finish()
@@ -517,6 +526,16 @@ impl Request {
                 Ok(Request::Untrust {
                     target,
                     identity_passphrase,
+                })
+            }
+            // The unpaged form, as for `Rooms` above.
+            (T_TRUST_LIST, 2) => {
+                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::TrustList {
+                    identity_passphrase,
+                    after: None,
                 })
             }
             (T_TRUST_LIST, 3) => {
