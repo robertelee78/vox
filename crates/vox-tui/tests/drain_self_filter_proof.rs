@@ -240,10 +240,11 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
          vox room post \"$VOX_ROOM\" --type status {codeword}"
     ));
     // **A model that does not run the command is the apparatus failing, not Vox.**
-    // haiku-4-5 misses about 1 turn in 12 here, in more than one way: it refused the
-    // operator's instruction as "embedded in messages" (vox-bc, v0.3.0), and it printed
-    // the command in a code block and replied DONE without running it (base run 11 of
-    // the 2026-09-25 rate measurement). Neither says anything about the drain, so
+    // Measured 2026-09-25, opencode 1.18.32, with a fixture per tree: claude-haiku-4-5
+    // 20/20 and claude-sonnet-5 20/20 ran the command, 0 misses. Earlier "misses" were
+    // mostly the shared fixture (two trees overwriting each other's `vox`). Real ones seen
+    // before that: a refusal as "embedded in messages" (vox-bc, v0.3.0), the command
+    // printed in a code block and not run, and a request for `$VOX_ROOM`'s value. Neither says anything about the drain, so
     // neither is reported as a product red — and neither is retried until green. It
     // fails as CANNOT PROVE, by name, unless that gap is accepted deliberately.
     let ran = std::fs::read_to_string(&calls)
@@ -251,14 +252,54 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
         .lines()
         .any(|l| l.contains("room post") && l.contains(&codeword));
     if !ran {
+        // Two different apparatus failures, told apart by the turn's own transcript
+        // (OpenCode prints each shell command it runs as `$ <command>`):
+        // - the model ran `vox room post <codeword>`, but not through the fixture's `vox`
+        //   — a login shell that puts another `vox` first on PATH does this (causal-order
+        //   found a 0.2.6 `~/.local/bin/vox`, which answers a newer node with "a control
+        //   socket exists … but nothing answered");
+        // - the model never ran it at all.
+        let escaped = reply
+            .lines()
+            .any(|l| l.contains("$ ") && l.contains("vox room post") && l.contains(&codeword));
+        let resolve = |args: &[&str]| -> String {
+            let path = format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            Command::new(&shell)
+                .args(args)
+                .env_clear()
+                .env("PATH", path)
+                .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+                .env("SHELL", &shell)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .unwrap_or_default()
+        };
+        let what = if escaped {
+            format!(
+                "the model ran `vox room post`, but NOT through the fixture's `vox` ({}): its \
+                 shell resolved another one — `command -v vox` gives {:?} in a plain shell and \
+                 {:?} in a login shell",
+                shim.display(),
+                resolve(&["-c", "command -v vox"]),
+                resolve(&["-lc", "command -v vox"]),
+            )
+        } else {
+            "the model never ran the operator's `vox room post` in turn 2 — nothing reached \
+             `vox`"
+                .to_owned()
+        };
         assert!(
             allow_unproven("opencode-model-miss"),
-            "CANNOT PROVE (apparatus, not product): the model ({}) never ran the \
-             operator's `vox room post` in turn 2 — nothing reached `vox`. Its reply:\n{reply}\n\
+            "CANNOT PROVE (apparatus, not product): model {}: {what}. Its reply:\n{reply}\n\
              Set VOX_PROOF_ALLOW_UNPROVEN=opencode-model-miss to accept that gap deliberately.",
             model()
         );
-        eprintln!("[unproven] the model did not run the command; the live half proves nothing");
+        eprintln!("[unproven] {what}; the live half proves nothing");
         return;
     }
     let rows = until(
