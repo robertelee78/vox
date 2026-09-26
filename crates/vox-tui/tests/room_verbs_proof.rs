@@ -32,17 +32,41 @@
 mod watchdog;
 
 use std::io::Write;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-
-use vox_core::node::actor::{Clock, Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, Secret};
-use vox_core::node::paths::Paths;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
+/// A real `vox daemon`, killed however the test ends.
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Start `vox daemon` on the profile and wait until its control socket answers.
+fn daemon(data: &Path, cfg: &Path, pass: &Path, err: &Path) -> Daemon {
+    let child = Command::new(VOX)
+        .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+        .arg(pass)
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", cfg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(err).unwrap()))
+        .spawn()
+        .expect("spawn vox daemon");
+    let d = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !vox(data, cfg, &["room", "list"], None).0 {
+        assert!(Instant::now() < deadline, "the daemon never answered");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    d
 }
 
 /// Run `vox room …` against the profile rooted at `data`/`cfg`.
@@ -80,14 +104,6 @@ fn vox(
     )
 }
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap()
-}
-
 #[test]
 #[ignore = "production Argon2id at setup + drives the real binary; CI runs it in release"]
 fn vox_room_speaks_to_a_node_it_did_not_start() {
@@ -95,7 +111,9 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
+    std::fs::create_dir_all(&cfg).unwrap();
+    let pass = tmp.path().join("identity.pass");
+    std::fs::write(&pass, "identity passphrase").unwrap();
 
     // ---- the failure an operator hits first, before anything is running ----
     let (ok, _, err) = vox(&data, &cfg, &["room", "list"], None);
@@ -105,40 +123,29 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         "the no-node error must say so plainly, got: {err}"
     );
 
-    // ---- stand up a node with a room, and bind the socket ----
-    let rt = runtime();
-    let clock: Clock = Arc::new(|| 1_800_000_000);
-    let node: NodeHandle = rt
-        .block_on(async {
-            Node::spawn_with(
-                paths.clone(),
-                clock,
-                vox_core::atrest::sek::Argon2Profile::default(),
-            )
-        })
-        .unwrap();
-    let cid = rt.block_on(async {
-        assert!(node
-            .apply(NodeCommand::CreateIdentity {
-                passphrase: secret("identity passphrase"),
-            })
-            .await
-            .is_done());
-        assert!(node
-            .apply(NodeCommand::CreateChannel {
-                local_name: "agents".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-        node.view().channels[0].channel_id
-    });
-    let _server = rt
-        .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
-        .expect("bind control socket");
+    // ---- stand up a node with a room, as a person does: vox id, vox daemon, vox room create ----
+    let (ok, _, err) = vox(
+        &data,
+        &cfg,
+        &["id", "--identity-passphrase-file", pass.to_str().unwrap()],
+        None,
+    );
+    assert!(ok, "vox id: {err}");
+    let _daemon = daemon(&data, &cfg, &pass, &tmp.path().join("daemon.err"));
+    let (ok, _, err) = vox(
+        &data,
+        &cfg,
+        &["room", "create", "--name", "agents"],
+        Some("channel passphrase"),
+    );
+    assert!(ok, "vox room create: {err}");
     // The CLI identifies a room by its base32 rendering, as every other verb
     // does, so the prefix must be taken from that — not from hex.
-    let room_prefix: String = vox_core::node::link::b32_encode(&cid)
+    let room_prefix: String = vox(&data, &cfg, &["room", "list"], None)
+        .1
+        .split_whitespace()
+        .next()
+        .expect("a room")
         .chars()
         .take(8)
         .collect();
@@ -162,25 +169,17 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     let (ok, _, err) = vox(&data, &cfg, &["room", "post", &room_prefix], Some(envelope));
     assert!(ok, "room post from stdin failed: {err}");
 
-    let in_the_node = node
-        .view()
-        .open_channels
-        .iter()
-        .find(|d| d.channel_id == cid)
-        .map(|d| {
-            d.timeline
-                .iter()
-                .map(|r| r.text.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    // ---- the posts are in the node, not only in the exit code: a separate `vox` process reads
+    // them back from the daemon ----
+    let (ok, stored, err) = vox(&data, &cfg, &["room", "read", &room_prefix], None);
+    assert!(ok, "room read failed: {err}");
     assert!(
-        in_the_node.iter().any(|t| t == "first from the cli"),
-        "the node's own view is missing the posted message: {in_the_node:?}"
+        stored.lines().any(|l| l.ends_with(" first from the cli")),
+        "the node does not have the posted message: {stored}"
     );
     assert!(
-        in_the_node.iter().any(|t| t == envelope),
-        "the stdin-posted envelope did not arrive intact: {in_the_node:?}"
+        stored.lines().any(|l| l.ends_with(envelope)),
+        "the stdin-posted envelope did not arrive intact: {stored}"
     );
 
     // ---- read, and use the printed hash as a cursor ----
@@ -195,7 +194,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     let first_hash = lines[0].split_whitespace().next().expect("hash column");
     assert_eq!(
         first_hash.len(),
-        vox_core::node::link::B32_DIGEST_LEN,
+        52,
         "the first column must be a full entry hash in the CLI's own encoding"
     );
 
