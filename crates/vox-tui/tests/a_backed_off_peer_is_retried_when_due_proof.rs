@@ -17,8 +17,14 @@
 //!
 //! ## Asserted
 //! 1. Bob reads Alice's post within [`BOUND`] of being continued;
-//! 2. it came by **Alice's own outbound session**: between the failure and the read, Alice opened
-//!    a new session to Bob and Bob opened none to Alice (from both daemons' counters).
+//! 2. **Alice's own port retried while Bob was still frozen**, with the connection up: by the time
+//!    Bob is continued Alice has opened two sessions to him since her post — the one that failed
+//!    and the retry her backoff's wakeup started ~200 ms later (her counters, read before Bob is
+//!    continued, so nothing Bob does can count).
+//!
+//! Bob's own periodic request may also fall due while he is frozen (every 30 s), and then his pull
+//! can carry the post too; that is why (2) is read from Alice's side before he is continued and
+//! does not depend on who delivered.
 //!
 //! **Why 3 s and not the ADR row's 9 s.** The row's 9 s is the 8 s backoff cap plus a second, for a
 //! staging where every retry fails fast. Here the only failure is one frame timeout, after which
@@ -30,7 +36,9 @@
 //! Alice's session to Bob failed while Bob was frozen (`failed` rose within 28 s).
 //!
 //! ## Mutation
-//! Remove `BackoffExpired`: the port sits in backoff until the periodic interval and (1) goes red.
+//! Remove `BackoffExpired`: nothing re-evaluates the port until an unrelated trigger, so Alice
+//! opens no retry while Bob is frozen and (2) goes red; (1) too unless Bob's own periodic pull
+//! happens to carry the post.
 
 #![cfg(unix)]
 
@@ -135,15 +143,16 @@ fn a_backed_off_peer_is_retried_when_due() {
     }
     std::thread::sleep(Duration::from_millis(500));
     let (a1, b1) = (alice.status(), bob.status());
-    let a_opened =
-        counter(&a1, "opened", Some(&bob.fp)) - counter(&a_fail, "opened", Some(&bob.fp));
+    let a_retried =
+        counter(&a_mid, "opened", Some(&bob.fp)) - counter(&a0, "opened", Some(&bob.fp));
     let b_opened =
         counter(&b1, "opened", Some(&alice.fp)) - counter(&b_mid, "opened", Some(&alice.fp));
+    let a_after = counter(&a1, "opened", Some(&bob.fp)) - counter(&a_mid, "opened", Some(&bob.fp));
     println!(
         "[proof] P8: bob frozen; alice's session failed {failed_at:?} after the freeze (\"{}\"); \
          backoff then {backoff}; bob continued {:?} after the freeze; read {read_at:?} after \
-         continuing; alice opened {a_opened} to bob since the failure, bob opened {b_opened} to \
-         alice",
+         continuing; alice opened {a_retried} to bob between her post and bob's continuing \
+         (the failed one and the retry), {a_after} after; bob opened {b_opened} to alice after",
         failures(&a_fail).join(" | "),
         resumed - frozen,
     );
@@ -159,8 +168,8 @@ fn a_backed_off_peer_is_retried_when_due() {
          port was not retried when due"
     );
     assert!(
-        a_opened >= 1 && b_opened == 0,
-        "the post did not come by alice's own outbound session (alice opened {a_opened} to bob \
-         after the failure, bob opened {b_opened} to alice)"
+        a_retried >= 2,
+        "alice's port did not retry while bob was frozen: she opened {a_retried} session(s) to him \
+         between her post and his continuing (the failed one, and a retry when the backoff was due)"
     );
 }
