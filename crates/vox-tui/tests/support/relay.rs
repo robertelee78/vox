@@ -113,13 +113,35 @@ impl Anchor {
         );
     }
 
-    /// Assert the anchor carries **no** circuit now — for a control that must be direct.
+    /// Assert the pair is **direct** — for a control that must be. The product reaches a peer
+    /// relay-first and upgrades behind it (M15.1b): a join can win through the anchor and switch to
+    /// the direct path within a round trip, and the circuit it left is *retired*, not closed, for
+    /// `RETIRE_GRACE_SECS` (60 s) so nothing in flight on it is cut. The anchor keeps counting that
+    /// circuit until then. Counting once, 2 s in, read that retired circuit as a relayed pair: 1 red
+    /// in 10 paired runs, on trees with and without #40. A probe of the red showed the circuit gone
+    /// 39 s after the check, within the grace of a join-time upgrade.
+    ///
+    /// So a direct pair is one whose anchor count reaches **0 within the grace plus a margin**. An
+    /// upgrade that only lands on the 60 s retry (`UPGRADE_RETRY`) would keep the circuit for about
+    /// 120 s, and a pair that never upgrades keeps it for good: both are still red.
     pub fn assert_direct(&mut self, when: &str) {
-        let n = self.circuits(Duration::from_secs(2));
+        const WITHIN: Duration = Duration::from_secs(75);
+        let t0 = Instant::now();
+        let mut n = self.circuits(Duration::from_secs(2));
+        while n > 0 && t0.elapsed() < WITHIN {
+            n = self.circuits(Duration::from_secs(1));
+        }
+        if n == 0 && t0.elapsed() > Duration::from_secs(3) {
+            eprintln!(
+                "[relay] {when}: a retired circuit closed after {:?}",
+                t0.elapsed()
+            );
+        }
         assert_eq!(
             n,
             0,
-            "NOT DIRECT {when}: the anchor reports {n} circuit(s) carried.\nanchor:\n{}",
+            "NOT DIRECT {when}: the anchor still reports {n} circuit(s) carried after {WITHIN:?}, \
+             past a retired circuit's grace.\nanchor:\n{}",
             self.proc.transcript()
         );
     }
