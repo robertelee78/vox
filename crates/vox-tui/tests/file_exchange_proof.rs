@@ -38,20 +38,16 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-
 use std::sync::{Arc, Mutex};
-use vox_core::node::actor::{Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
-
-use vox_core::node::paths::Paths;
+use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
-}
+const ID_PASS: &str = "identity passphrase";
+const ROOM_PASS: &str = "channel passphrase";
 
 /// A long-running child, killed however the test ends, with its pipes drained.
 struct Running(Child, Arc<Mutex<String>>);
@@ -99,14 +95,45 @@ fn drain(stream: Option<impl std::io::Read + Send + 'static>, into: &Arc<Mutex<S
     });
 }
 
+/// One member: a profile and, once started, its real `vox daemon`.
 struct Agent {
-    data: std::path::PathBuf,
-    cfg: std::path::PathBuf,
-    paths: Paths,
-    node: NodeHandle,
+    data: PathBuf,
+    cfg: PathBuf,
+    pass: PathBuf,
+    daemon: Option<Running>,
 }
 
 impl Agent {
+    /// `vox` with `stdin` on its standard input.
+    fn vox_with(&self, args: &[&str], stdin: &str) -> (bool, String, String) {
+        let mut child = Command::new(VOX)
+            .args(args)
+            .env("VOX_DATA_DIR", &self.data)
+            .env("VOX_CONFIG_DIR", &self.cfg)
+            .env_remove("VOX_ROOM")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vox");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn id_pass(&self) -> &str {
+        self.pass.to_str().unwrap()
+    }
+
     fn vox(&self, args: &[&str]) -> (bool, String, String) {
         let out = Command::new(VOX)
             .args(args)
@@ -169,40 +196,71 @@ impl Agent {
     }
 }
 
-async fn agent(tmp: &tempfile::TempDir, name: &str) -> Agent {
+/// A member as a person sets one up: `vox id`, then a real `vox daemon` on loopback, reaching
+/// the anchor at `spec`.
+fn agent(tmp: &tempfile::TempDir, name: &str, spec: &str) -> Agent {
     let data = tmp.path().join(name).join("data");
     let cfg = tmp.path().join(name).join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
-    let node = Node::spawn_networked(paths.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
-    assert!(node
-        .apply(NodeCommand::CreateIdentity {
-            passphrase: secret("identity passphrase"),
-        })
-        .await
-        .is_done());
-    Agent {
+    std::fs::create_dir_all(&cfg).unwrap();
+    let pass = tmp.path().join(format!("{name}.pass"));
+    std::fs::write(&pass, ID_PASS).unwrap();
+    let mut a = Agent {
         data,
         cfg,
-        paths,
-        node,
+        pass,
+        daemon: None,
+    };
+    let (ok, _, err) = a.vox(&["id", "--identity-passphrase-file", a.id_pass()]);
+    assert!(ok, "{name}: vox id: {err}");
+    a.daemon = Some(a.spawn(&[
+        "daemon",
+        "--listen",
+        "127.0.0.1:0",
+        "--anchor",
+        spec,
+        "--passphrase-file",
+        a.id_pass(),
+    ]));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !a.vox(&["room", "list"]).0 {
+        assert!(Instant::now() < deadline, "{name}'s daemon never answered");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    a
+}
+
+/// A real `vox node` anchor on loopback, and the `--anchor` spec it prints.
+fn anchor(tmp: &tempfile::TempDir) -> (Running, String) {
+    let dir = tmp.path().join("anchor");
+    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    let a = Agent {
+        data: dir.join("data"),
+        cfg: dir.join("cfg"),
+        pass: PathBuf::new(),
+        daemon: None,
+    };
+    let node = a.spawn(&["node", "--listen", "127.0.0.1:0"]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let said = node.1.lock().unwrap().clone();
+        if let Some(spec) = said
+            .split_whitespace()
+            .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
+        {
+            return (node, spec.to_owned());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the anchor never printed its spec"
+        );
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
-async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) -> T {
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match h.next_event().await {
-                Some(e) => {
-                    if let Some(v) = f(e) {
-                        return v;
-                    }
-                }
-                None => panic!("event stream ended"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for an event")
+fn fingerprint(a: &Agent) -> String {
+    let (ok, out, err) = a.vox(&["id", "--identity-passphrase-file", a.id_pass()]);
+    assert!(ok, "vox id: {err}");
+    out.trim().to_owned()
 }
 
 fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> String {
@@ -223,11 +281,6 @@ fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> S
 #[ignore = "two networked nodes and real child processes; CI runs it in release"]
 fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     watchdog::arm();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
 
     // Big enough to cross several 64 KiB reads, so a truncation is possible at all.
@@ -235,71 +288,65 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     let source = tmp.path().join("artifact.bin");
     std::fs::write(&source, &payload).unwrap();
 
-    let (alice, bob, room, _a_sock, _b_sock) = rt.block_on(async {
-        let alice = agent(&tmp, "alice").await;
-        let bob = agent(&tmp, "bob").await;
-        let alice_fp = alice.node.view().identity.unwrap().fingerprint;
-        let bob_fp = bob.node.view().identity.unwrap().fingerprint;
-
-        assert!(alice
-            .node
-            .apply(NodeCommand::CreateChannel {
-                local_name: "mission".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-        let cid = alice.node.view().channels[0].channel_id;
-        assert!(alice
-            .node
-            .apply(NodeCommand::Invite { channel_id: cid })
-            .await
-            .is_done());
-        let url = wait_for(&alice.node, |e| match e {
-            NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
-            _ => None,
-        })
-        .await;
-        assert!(bob
-            .node
-            .apply(NodeCommand::JoinChannel {
-                link: url,
-                local_name: "mission".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-
-        // Joining grants nothing: each admits the other before either can read what
-        // the other writes, which is also what makes the announcement's audience and
-        // the transfer's audience the same set.
-        for (who, peer, name) in [(&alice, bob_fp, "bob"), (&bob, alice_fp, "alice")] {
-            assert!(who
-                .node
-                .apply(NodeCommand::Trust {
-                    fingerprint: peer,
-                    petname: name.into(),
-                })
-                .await
-                .is_done());
+    let (_anchor, spec) = anchor(&tmp);
+    let alice = agent(&tmp, "alice", &spec);
+    let bob = agent(&tmp, "bob", &spec);
+    // Joining grants nothing: each admits the other before either can read what the other
+    // writes, which is also what makes the announcement's audience and the transfer's audience
+    // the same set.
+    let (alice_fp, bob_fp) = (fingerprint(&alice), fingerprint(&bob));
+    for (who, peer, name) in [(&alice, &bob_fp, "bob"), (&bob, &alice_fp, "alice")] {
+        let (ok, _, err) = who.vox(&[
+            "trust",
+            "add",
+            peer,
+            "--name",
+            name,
+            "--identity-passphrase-file",
+            who.id_pass(),
+        ]);
+        assert!(ok, "trust {name}: {err}");
+    }
+    let (ok, _, err) = alice.vox_with(&["room", "create", "--name", "mission"], ROOM_PASS);
+    assert!(ok, "vox room create: {err}");
+    let label = alice
+        .vox(&["room", "list"])
+        .1
+        .split_whitespace()
+        .next()
+        .expect("a room")
+        .to_owned();
+    let (ok, link, err) = alice.vox(&["room", "invite", &label]);
+    assert!(ok, "vox room invite: {err}");
+    let link = link.trim().to_owned();
+    let room = link
+        .strip_prefix("vox://")
+        .and_then(|l| l.split('?').next())
+        .expect("an invite link naming the room")
+        .to_owned();
+    let mut joined = false;
+    for _ in 0..6 {
+        if bob
+            .vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS)
+            .0
+        {
+            joined = true;
+            break;
         }
-        for (who, peer) in [(&alice, bob_fp), (&bob, alice_fp)] {
-            wait_for(&who.node, |e| match e {
-                NodeEvent::SenderKeyReceived {
-                    channel_id,
-                    peer: p,
-                    ..
-                } if channel_id == cid && p == peer => Some(()),
-                _ => None,
-            })
-            .await;
-        }
-
-        let a_sock = vox_core::node::ipc::bind(alice.node.clone(), &alice.paths).expect("alice");
-        let b_sock = vox_core::node::ipc::bind(bob.node.clone(), &bob.paths).expect("bob");
-        let room = vox_core::node::link::b32_encode(&cid);
-        (alice, bob, room, a_sock, b_sock)
-    });
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    assert!(joined, "bob never joined");
+    // Each reads the other before the transfer: keys have flowed both ways.
+    for (who, other, word) in [(&alice, &bob, "warm-bob"), (&bob, &alice, "warm-alice")] {
+        let (ok, _, err) = other.vox(&["room", "post", &room, word]);
+        assert!(ok, "post: {err}");
+        until(
+            who,
+            "each to read the other",
+            &["room", "read", &room],
+            |o| o.contains(word),
+        );
+    }
 
     // ---- (4) nothing offered yet: asking says so ----
     let (ok, _, err) = bob.vox(&["room", "get", &room, "artifact.bin"]);
