@@ -1996,6 +1996,16 @@ impl Node {
                     let shutdown = matches!(command, NodeCommand::Shutdown);
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
+                    // **Answered off the actor.** Checking the identity passphrase is production
+                    // Argon2id, and every `vox trust add/list/remove` asks for it. Inline, it held
+                    // the actor for ~0.3 s per command, and nothing on the node — posts, reads,
+                    // syncs — was served meanwhile (V210-26). It changes no state, so it runs on
+                    // a blocking thread and answers the caller from there.
+                    if let NodeCommand::VerifyPassphrase { passphrase } = command {
+                        self.begin_verify_passphrase(passphrase, reply);
+                        self.note_if_stalled(name, started);
+                        continue;
+                    }
                     // **Answered later, not here.** Creating a room seals its key under the
                     // passphrase with production Argon2id — seconds of CPU — and this task answers
                     // nothing while it runs. So the seal goes to a blocking thread and the reply
@@ -5877,6 +5887,22 @@ impl Node {
 
     /// Begin creating a room: the genesis here, the Argon2id seal on a blocking thread, and the
     /// reply carried to `NetEvent::ChannelSealed`. Any failure before the seal answers at once.
+    /// Check the identity passphrase on a blocking thread and answer `reply` from there.
+    fn begin_verify_passphrase(&self, passphrase: Secret, reply: oneshot::Sender<Outcome>) {
+        let Some(profile) = self.profile.as_ref() else {
+            let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
+            return;
+        };
+        let verifier = profile.passphrase_verifier();
+        tokio::task::spawn_blocking(move || {
+            let outcome = match verifier.verify(&passphrase) {
+                Ok(()) => Outcome::Done,
+                Err(_) => Outcome::Failed(Fault::WrongPassphrase),
+            };
+            let _ = reply.send(outcome);
+        });
+    }
+
     async fn begin_create_channel(
         &mut self,
         local_name: String,
