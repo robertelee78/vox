@@ -764,7 +764,11 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     let mut failed = Vec::new();
     // Diagnostic knob (test-side only): `VOX_PERF_ONLY` runs just the links whose name contains it.
     let only = std::env::var("VOX_PERF_ONLY").ok();
-    let report_only = std::env::var("VOX_PERF_REPORT_ONLY").ok();
+    // Empty is unset: CI writes an empty value on the runners where nothing is demoted, and every
+    // name contains "", so an empty value read as a filter demoted every gated link.
+    let report_only = std::env::var("VOX_PERF_REPORT_ONLY")
+        .ok()
+        .filter(|r| !r.is_empty());
     for mut l in LINKS {
         if only.as_deref().is_some_and(|o| !l.name.contains(o)) {
             continue;
