@@ -839,7 +839,21 @@ impl ChannelState {
             .ok_or(Error::Profile("no such channel in this profile"))?;
         let factor = SignatureIdentityFactor::new(signer);
         let sek = wrap.unwrap_sek(&factor, channel_id, channel_passphrase)?;
+        Self::open_with_sek(profile, channel_id, sek, channel_passphrase, now_secs)
+    }
 
+    /// Open a channel from the store with its SEK already in hand: the half of [`Self::open`]
+    /// after the double-lock unwrap. A daemon reopening the rooms it held uses it (#208), with the
+    /// SEK and passphrase kept sealed under its identity in [`crate::node::open_rooms`]. The
+    /// passphrase is still needed: the room retains it to answer joins (ADR-005).
+    pub fn open_with_sek(
+        profile: &Profile,
+        channel_id: &Digest32,
+        sek: Sek,
+        channel_passphrase: &[u8],
+        now_secs: u64,
+    ) -> Result<Self> {
+        let store = profile.store();
         let manifest_seg = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_MANIFEST)?
             .ok_or(Error::MalformedAtRest("channel manifest missing"))?;
@@ -2593,6 +2607,12 @@ impl ChannelState {
     }
 
     /// Whether this channel's SEK is `mlock`ed (ADR-010 best-effort; surfaced to
+    /// This channel's SEK, so a daemon can keep it sealed under its identity and reopen the room
+    /// after a restart without the room passphrase (#208).
+    pub fn sek_bytes(&self) -> Result<&[u8]> {
+        self.sek.key_bytes()
+    }
+
     /// the UI as the memory-protection honesty flag).
     #[must_use]
     pub fn mlock_active(&self) -> bool {

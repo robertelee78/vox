@@ -166,10 +166,19 @@ async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Digest32, AppEr
     }
     let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
     let id = resolve_prefix(prefix, &ids)?;
+    // A closed room's name is sealed in its manifest, so a node that has not opened it does
+    // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
+    // Named by the id the operator typed a prefix of, and by its name only when there is one.
     if let Some((_, name, false)) = rooms.iter().find(|(r, _, _)| *r == id) {
+        let which = if name.is_empty() {
+            format!("room {}", b32_encode(&id))
+        } else {
+            format!("room {name:?} ({})", b32_encode(&id))
+        };
         return Err(AppError::Usage(format!(
-            "room {name:?} is not open on this node, so there is nothing to read or \
-             post — open it in `vox tui`, or start the node with it open"
+            "{which} is closed on this node, so there is nothing to read or post. A daemon \
+             reopens every room it held open, so this one was closed in `vox tui` or did not \
+             reopen. Open it in `vox tui`, or give `vox daemon` a line with its passphrase"
         )));
     }
     Ok(id)

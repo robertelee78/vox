@@ -36,6 +36,7 @@ pub mod joinstream;
 pub mod link;
 pub mod net;
 pub mod network;
+pub mod open_rooms;
 pub mod pairwise_stream;
 pub mod passphrase;
 pub mod paths;

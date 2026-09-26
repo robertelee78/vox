@@ -43,6 +43,7 @@ use crate::node::api::{
 use crate::node::channel::{ChannelState, Rendered};
 use crate::node::net::PeerPolicy;
 use crate::node::network::{Inbound, NodeNet};
+use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
@@ -2437,6 +2438,7 @@ impl Node {
                     return Outcome::Failed(fault_of(&e));
                 }
                 let _ = self.event_tx.send(NodeEvent::Unlocked);
+                self.reopen_remembered().await;
                 Outcome::Done
             }
             Err(e) => Outcome::Failed(fault_of(&e)),
@@ -4306,6 +4308,9 @@ impl Node {
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
+        if let Err(e) = self.remember_open(&channel) {
+            return Outcome::Failed(fault_of(&e));
+        }
         self.channels.insert(
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
@@ -6174,6 +6179,9 @@ impl Node {
     /// Everything after a room exists: hold it, give it anchors, publish it, say so.
     async fn finish_create_channel(&mut self, ch: ChannelState) -> Outcome {
         let id = ch.channel_id();
+        if let Err(e) = self.remember_open(&ch) {
+            return Outcome::Failed(fault_of(&e));
+        }
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
         self.adopt_channel_anchors(&id, None).await;
@@ -6309,6 +6317,9 @@ impl Node {
             // published, so forgetting it here is the whole of the rollback.
             return Outcome::Failed(fault_of(&e));
         }
+        if let Err(e) = self.remember_open(&channel) {
+            return Outcome::Failed(fault_of(&e));
+        }
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(channel)));
         self.adopt_channel_anchors(&id, None).await;
@@ -6321,6 +6332,95 @@ impl Node {
         Outcome::Done
     }
 
+    /// Add `ch` to the rooms this node reopens by itself at unlock (#208), with the keys that
+    /// reopen it, sealed under the identity ([`crate::node::open_rooms`]).
+    fn remember_open(&self, ch: &ChannelState) -> crate::error::Result<()> {
+        let profile = self
+            .profile
+            .as_ref()
+            .ok_or(crate::error::Error::AtRestLocked)?;
+        let signer = profile.signer()?;
+        let mut set = OpenRooms::load(profile.store(), signer)?;
+        if set.remember(ch.channel_id(), ch.sek_bytes()?, ch.join_passphrase()?)? {
+            set.save(profile.store(), signer)?;
+        }
+        Ok(())
+    }
+
+    /// Take `channel_id` out of the rooms this node reopens by itself.
+    fn forget_open(&self, channel_id: &Digest32) -> crate::error::Result<()> {
+        let profile = self
+            .profile
+            .as_ref()
+            .ok_or(crate::error::Error::AtRestLocked)?;
+        let signer = profile.signer()?;
+        let mut set = OpenRooms::load(profile.store(), signer)?;
+        if set.forget(channel_id) {
+            set.save(profile.store(), signer)?;
+        }
+        Ok(())
+    }
+
+    /// Reopen every room this node held open, as it was before it stopped (#208).
+    ///
+    /// A `vox daemon` unlocks with the identity passphrase alone, so without this it came back
+    /// from every restart holding no room. Each remembered room opens from the SEK kept sealed
+    /// under the identity, and then goes through exactly what [`Self::open_channel`] does after
+    /// an open.
+    ///
+    /// A room that no longer exists in the store is forgotten. A room that exists but will not
+    /// open stays remembered, so the next unlock tries it again, and stays **closed**, which
+    /// the daemon reports ("N room(s) open, M still closed") — it is not a reason to refuse the
+    /// identity and every other room with it.
+    async fn reopen_remembered(&mut self) {
+        let now = self.now();
+        let mut opened = Vec::new();
+        let mut gone = Vec::new();
+        {
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let Ok(signer) = profile.signer() else {
+                return;
+            };
+            let Ok(set) = OpenRooms::load(profile.store(), signer) else {
+                return;
+            };
+            for (id, keys) in set.rooms() {
+                if self.channels.contains_key(id) {
+                    continue;
+                }
+                match profile.store().get_sek_wrap(id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        gone.push(*id);
+                        continue;
+                    }
+                    Err(_) => continue,
+                }
+                let sek = crate::atrest::sek::Sek::from_bytes(keys.sek.clone());
+                if let Ok(ch) = ChannelState::open_with_sek(profile, id, sek, &keys.passphrase, now)
+                {
+                    opened.push((*id, ch));
+                }
+            }
+        }
+        for id in &gone {
+            let _ = self.forget_open(id);
+        }
+        for (id, ch) in opened {
+            self.channels
+                .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
+            self.adopt_channel_anchors(&id, None).await;
+            self.refresh_network_view().await;
+            self.publish_channel_locally(&id).await;
+            self.publish_channel_to_anchors(&id).await;
+            let _ = self
+                .event_tx
+                .send(NodeEvent::ChannelOpened { channel_id: id });
+        }
+    }
+
     async fn open_channel(&mut self, channel_id: &Digest32, passphrase: &Secret) -> Outcome {
         if self.channels.contains_key(channel_id) {
             return Outcome::Done;
@@ -6331,6 +6431,9 @@ impl Node {
         };
         match ChannelState::open(profile, channel_id, passphrase, now) {
             Ok(ch) => {
+                if let Err(e) = self.remember_open(&ch) {
+                    return Outcome::Failed(fault_of(&e));
+                }
                 self.channels
                     .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
                 self.adopt_channel_anchors(channel_id, None).await;
@@ -6347,6 +6450,13 @@ impl Node {
     }
 
     async fn close_channel(&mut self, channel_id: &Digest32) -> Outcome {
+        // Closed on purpose, so not reopened at the next unlock (#208). Forgotten first: a room
+        // that stayed in the set would come back by itself, which is not what closing it meant.
+        if self.channels.contains_key(channel_id) {
+            if let Err(e) = self.forget_open(channel_id) {
+                return Outcome::Failed(fault_of(&e));
+            }
+        }
         match self.channels.remove(channel_id) {
             Some(shared) => {
                 shared.lock().await.lock_now();
