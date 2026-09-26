@@ -1996,20 +1996,78 @@ async fn collect(bound: &str, dest: &Destination, offer: &Offer) -> Result<(), A
         }
     };
     let placed = place(&part, dest);
-    let _ = std::fs::remove_file(&part);
-    let placed = placed?;
+    // Removed only if it is still ours to remove: a placement by rename has already moved it,
+    // and whatever holds that name now is not this collector's.
+    if !matches!(placed, Ok((_, Consumed::Moved))) {
+        let _ = std::fs::remove_file(&part);
+    }
+    let (placed, _) = placed?;
     println!("vox: {} ({total} bytes) verified", placed.display());
     Ok(())
 }
 
-/// Link a verified `.part` into place without replacing anything.
+/// Whether a placement moved the `.part` (so there is nothing left to remove) or linked it.
+enum Consumed {
+    Moved,
+    Linked,
+}
+
+/// Put a verified `.part` at `target` **only if nothing is there**, in one step.
 ///
-/// A hard link fails if the name is taken, which makes "is it free" and "take it" one step
-/// — a rename would silently replace whatever appeared in between.
-fn place(part: &Path, dest: &Destination) -> Result<std::path::PathBuf, AppError> {
+/// "Is it free" and "take it" must be one operation, or whatever appears in between is
+/// replaced. Three ways, in order, because no one of them works on every volume a download
+/// directory can be on:
+///
+/// 1. a no-replace rename (`renameatx_np(RENAME_EXCL)` on macOS, `renameat2(RENAME_NOREPLACE)`
+///    on Linux);
+/// 2. a hard link, which fails if the name is taken;
+/// 3. **claim, then move**: create the name with `O_CREAT | O_EXCL`, which fails if anything is
+///    there — a symlink included, and it is not followed — then rename the `.part` over our own
+///    claim. A rename replaces the directory entry and never writes through a link, so the only
+///    thing it can replace is the empty file this collector just made.
+///
+/// The third exists for FAT, exFAT and network shares — a USB stick is the common case —
+/// where the first two are refused: measured on a FAT32 image attached with `hdiutil`,
+/// `link()` and `renamex_np(RENAME_EXCL)` both return "Operation not supported", and before
+/// this a download there failed instead of landing.
+fn place_no_replace(part: &Path, target: &Path) -> std::io::Result<Consumed> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android"))]
+    {
+        use rustix::fs::{renameat_with, RenameFlags, CWD};
+        match renameat_with(CWD, part, CWD, target, RenameFlags::NOREPLACE) {
+            Ok(()) => return Ok(Consumed::Moved),
+            Err(e) if e == rustix::io::Errno::EXIST => {
+                return Err(std::io::ErrorKind::AlreadyExists.into())
+            }
+            // Refused by this volume or kernel: try the next way.
+            Err(_) => {}
+        }
+    }
+    match std::fs::hard_link(part, target) {
+        Ok(()) => return Ok(Consumed::Linked),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+        // Not supported here: fall through to claiming the name.
+        Err(_) => {}
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    match std::fs::rename(part, target) {
+        Ok(()) => Ok(Consumed::Moved),
+        Err(e) => {
+            // The claim is ours and empty; take it back rather than leave a hollow file.
+            let _ = std::fs::remove_file(target);
+            Err(e)
+        }
+    }
+}
+
+/// Put a verified `.part` into place without replacing anything ([`place_no_replace`]).
+fn place(part: &Path, dest: &Destination) -> Result<(std::path::PathBuf, Consumed), AppError> {
     match dest {
-        Destination::Exact(p) => std::fs::hard_link(part, p)
-            .map(|()| p.clone())
+        Destination::Exact(p) => place_no_replace(part, p)
+            .map(|how| (p.clone(), how))
             .map_err(|e| {
                 AppError::Usage(format!(
                     "cannot put the file at {}: {e}; nothing was overwritten",
@@ -2019,8 +2077,8 @@ fn place(part: &Path, dest: &Destination) -> Result<std::path::PathBuf, AppError
         Destination::Into(dir, name) => {
             for n in 0..1000 {
                 let candidate = dir.join(numbered(name, n));
-                match std::fs::hard_link(part, &candidate) {
-                    Ok(()) => return Ok(candidate),
+                match place_no_replace(part, &candidate) {
+                    Ok(how) => return Ok((candidate, how)),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(e) => {
                         return Err(AppError::Usage(format!(

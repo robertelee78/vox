@@ -390,9 +390,20 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             .collect::<String>()
     };
     let tag = format!("file-{}", &sha[..16]);
+    // AGENT_COMMS-EXTRA: Windows-style names, and symlinks already in Downloads.
+    let victim = tmp.path().join("victim.bin");
+    let victim_bytes = b"a file the symlink points at, which nobody may touch".to_vec();
+    std::fs::write(&victim, &victim_bytes).unwrap();
+    std::os::unix::fs::symlink(&victim, downloads.join("link.bin")).unwrap();
+    let dangle_target = tmp.path().join("dangle-target.bin");
+    std::os::unix::fs::symlink(&dangle_target, downloads.join("dangle.bin")).unwrap();
     for (hostile, lands_as) in [
         ("../../x", "x"),
         (absolute.to_str().unwrap(), "absolute-target.bin"),
+        ("..\\..\\y", "y"),
+        ("C:\\z", "z"),
+        ("link.bin", "link (1).bin"),
+        ("dangle.bin", "dangle (1).bin"),
     ] {
         let forged = serde_json::json!({
             "v": 1,
@@ -407,7 +418,10 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             &bob,
             "the hostile announcement to reach bob",
             &["room", "read", &room],
-            |o| o.contains(hostile),
+            |o| {
+                let escaped = serde_json::to_string(hostile).unwrap();
+                o.contains(hostile) || o.contains(escaped.trim_matches('"'))
+            },
         );
         let (ok, out, err) = bob.vox_at(&["room", "get", &room, hostile], &home, &cwd);
         assert!(ok, "collecting {hostile:?}: stdout={out:?} stderr={err:?}");
@@ -418,6 +432,16 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             escaped.exists(),
             escaped_from_downloads.exists(),
             absolute.exists()
+        );
+        assert!(
+            std::fs::read(&victim).is_ok_and(|b| b == victim_bytes) && !dangle_target.exists(),
+            "EXTRA: a symlink already in Downloads must not be followed ({hostile:?}): victim intact={}, dangling target created={}",
+            std::fs::read(&victim).is_ok_and(|b| b == victim_bytes),
+            dangle_target.exists()
+        );
+        assert!(
+            !tmp.path().join("y").exists() && !tmp.path().join("work").join("y").exists(),
+            "EXTRA: a Windows-style ..\\ name escaped the download directory"
         );
         assert!(
             std::fs::read(downloads.join(lands_as)).is_ok_and(|b| b == payload),
@@ -439,7 +463,13 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             "absolute-target.bin",
             "artifact (1).bin",
             "artifact.bin",
-            "x"
+            "dangle (1).bin",
+            "dangle.bin",
+            "link (1).bin",
+            "link.bin",
+            "x",
+            "y",
+            "z"
         ],
         "exactly the four files, and no leftover `.part`"
     );
@@ -536,6 +566,111 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
         now.len(),
         theirs.len()
     );
+    // (3d) a sender that serves MORE than it announced — it under-announced — is cut off on the
+    // bytes actually received, not believed: our `.part` is removed, nothing is placed, and the
+    // file already under that name is untouched. The offered file grows on disk after the
+    // announcement, exactly as (3) shrinks it.
+    let extra = 200_000usize;
+    let mut longer = payload.clone();
+    longer.extend(std::iter::repeat_n(0x5a_u8, extra));
+    std::fs::write(&flaky, &longer).unwrap();
+    let before = listed(&downloads);
+    let (ok, out, err) = bob.vox_at(&["room", "get", &room, "flaky.bin"], &home, &cwd);
+    eprintln!(
+        "under-announced: {} bytes announced, {} served — refused={} ({})",
+        payload.len(),
+        longer.len(),
+        !ok,
+        err.trim()
+    );
+    assert!(!ok, "more bytes than announced must be refused: stdout={out:?}");
+    assert!(
+        err.contains("sent more than"),
+        "it must say the sender sent more than it announced: {err:?}"
+    );
+    assert!(
+        std::fs::read(downloads.join("flaky.bin")).is_ok_and(|b| b == theirs),
+        "an over-long transfer must not touch the file already there"
+    );
+    assert_eq!(
+        listed(&downloads),
+        before,
+        "an over-long transfer must leave nothing behind — no partial, no `.part`"
+    );
+    // Back to the announced bytes: this offer and `artifact.bin` carry the same content, so they
+    // share one service tag, and the next case collects through it.
+    std::fs::write(&flaky, &payload).unwrap();
+
+    // (5c) a download directory on a volume with no hard links — FAT, as on a USB stick.
+    // `link()` and the no-replace rename are both refused there, so this is the third way
+    // (claim the name with O_EXCL, then move over the claim), and it must keep the same
+    // guarantee: the file already there is untouched and the new one takes the next name.
+    // macOS attaches a FAT image without privileges; elsewhere this needs root, so it is not
+    // run there, and says so.
+    #[cfg(target_os = "macos")]
+    {
+        struct Detach(String);
+        impl Drop for Detach {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("hdiutil")
+                    .args(["detach", "-force", &self.0])
+                    .output();
+            }
+        }
+        let img = tmp.path().join("fat.dmg");
+        let made = std::process::Command::new("hdiutil")
+            .args(["create", "-size", "20m", "-fs", "MS-DOS", "-volname", "VOXFAT"])
+            .arg(&img)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "CANNOT MEASURE (5c): hdiutil create: {made:?}");
+        let attached = std::process::Command::new("hdiutil")
+            .args(["attach", "-nobrowse", "-mountrandom"])
+            .arg(tmp.path())
+            .arg(&img)
+            .output()
+            .unwrap();
+        assert!(attached.status.success(), "CANNOT MEASURE (5c): hdiutil attach: {attached:?}");
+        let mount = String::from_utf8_lossy(&attached.stdout)
+            .lines()
+            .filter_map(|l| l.split('\t').next_back().map(|m| m.trim().to_owned()))
+            .find(|m| m.starts_with('/'))
+            .expect("the FAT volume's mount point");
+        let _detach = Detach(mount.clone());
+        let fat = std::path::PathBuf::from(&mount);
+        // The precondition, measured: a hard link of a real file must be refused here, or this
+        // arm would pass through the second way and prove nothing about the third.
+        std::fs::write(fat.join("probe"), b"p").unwrap();
+        let linked = std::fs::hard_link(fat.join("probe"), fat.join("probe-link"));
+        eprintln!("FAT volume at {mount}: hard link of a file -> {linked:?}");
+        assert!(linked.is_err(), "CANNOT MEASURE (5c): this volume allows hard links");
+        std::fs::remove_file(fat.join("probe")).unwrap();
+        let on_stick = b"bob's own artifact.bin on the stick".to_vec();
+        std::fs::write(fat.join("artifact.bin"), &on_stick).unwrap();
+        let (ok, out, err) = bob.vox_at(
+            &["room", "get", &room, "artifact.bin", "--dir", &mount],
+            &home,
+            &cwd,
+        );
+        let files = listed(&fat);
+        eprintln!("FAT volume: collected ok={ok}; it holds {files:?}");
+        assert!(ok, "collecting onto a FAT volume must work: stdout={out:?} stderr={err:?}");
+        assert!(
+            std::fs::read(fat.join("artifact.bin")).is_ok_and(|b| b == on_stick),
+            "the file already on the FAT volume must be untouched"
+        );
+        assert!(
+            std::fs::read(fat.join("artifact (1).bin")).is_ok_and(|b| b == payload),
+            "the collected file must land beside it under the next free name: {out:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.ends_with(".part")),
+            "no `.part` may be left on the FAT volume: {files:?}"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    eprintln!("FAT volume (5c): not run — attaching a FAT image needs root on this OS");
+
     eprintln!(
         "downloads after every case: {} files, {:?}",
         listed(&downloads).len(),
