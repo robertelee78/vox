@@ -112,6 +112,8 @@ fn raw(conn: &VoxConnection, flow: u64, context: u64, body: &[u8]) {
     let mut d = Vec::new();
     put_varint(&mut d, flow);
     put_varint(&mut d, context);
+    // The send time every frame carries (ADR-022 decision 5).
+    put_varint(&mut d, vox_core::transport::datagram::now_us());
     d.extend_from_slice(body);
     conn.quinn().send_datagram(d.into()).unwrap();
 }

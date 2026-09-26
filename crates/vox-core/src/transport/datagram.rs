@@ -7,11 +7,19 @@
 //!
 //! ## Frame layout
 //! ```text
-//! datagram   := varint flow_id ‖ varint context ‖ body
+//! datagram   := varint flow_id ‖ varint context ‖ varint sent_us ‖ body
 //! context 0  := body is one whole packet
 //! context 1  := body is a fragment: varint packet_id ‖ u8 index ‖ u8 count ‖ bytes
 //! context ≥2 := reserved; dropped and counted
 //! ```
+//! `sent_us` is when the sender framed it, in microseconds on the **sender's own**
+//! monotonic clock ([`now_us`]). The receiver never compares it with its own clock
+//! directly, only with the other send times of the same flow: arrival minus send time is
+//! the one-way delay plus a constant clock offset, and its running minimum over a few
+//! seconds is the path's base delay plus that offset. How far a datagram is above that
+//! minimum is how late it is, which is how a receiver drops a datagram too late to be
+//! worth delivering (ADR-022 decision 5, R27) with no clock synchronisation. A relay
+//! forwards the field untouched.
 //! Varints are QUIC's (RFC 9000 §16): the two high bits of the first byte give the
 //! length, 1, 2, 4 or 8 bytes.
 //!
@@ -34,7 +42,17 @@
 //! That is why fragmenting is the exception, not the norm.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// Microseconds on this process's monotonic clock: the `sent_us` a datagram carries, and
+/// what a receiver compares arrivals against. Only differences within one process mean
+/// anything.
+#[must_use]
+pub fn now_us() -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_micros()).unwrap_or(u64::MAX)
+}
 
 /// Context 0: the body is one whole packet.
 pub const CONTEXT_PACKET: u64 = 0;
@@ -99,12 +117,13 @@ pub fn take_varint(buf: &[u8]) -> Option<(u64, &[u8])> {
     Some((v, &buf[len..]))
 }
 
-/// A whole packet framed for `flow`.
+/// A whole packet framed for `flow`, sent at `sent_us` ([`now_us`]).
 #[must_use]
-pub fn frame_packet(flow: u64, packet: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(varint_len(flow) + 1 + packet.len());
+pub fn frame_packet(flow: u64, sent_us: u64, packet: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(varint_len(flow) + 1 + varint_len(sent_us) + packet.len());
     put_varint(&mut out, flow);
     put_varint(&mut out, CONTEXT_PACKET);
+    put_varint(&mut out, sent_us);
     out.extend_from_slice(packet);
     out
 }
@@ -127,11 +146,17 @@ pub fn reframe(flow: u64, rest: &[u8]) -> Vec<u8> {
 /// than [`MAX_FRAGMENTS`] fragments, or a limit too small to carry the fragment header
 /// and one byte.
 #[must_use]
-pub fn fragment(flow: u64, packet_id: u64, packet: &[u8], max: usize) -> Option<Vec<Vec<u8>>> {
+pub fn fragment(
+    flow: u64,
+    sent_us: u64,
+    packet_id: u64,
+    packet: &[u8],
+    max: usize,
+) -> Option<Vec<Vec<u8>>> {
     if packet.len() > MAX_PACKET {
         return None;
     }
-    let header = varint_len(flow) + 1 + varint_len(packet_id) + 2;
+    let header = varint_len(flow) + 1 + varint_len(sent_us) + varint_len(packet_id) + 2;
     let chunk = max.checked_sub(header).filter(|c| *c > 0)?;
     let count = packet.len().div_ceil(chunk).max(1);
     let count = u8::try_from(count).ok()?;
@@ -143,6 +168,7 @@ pub fn fragment(flow: u64, packet_id: u64, packet: &[u8], max: usize) -> Option<
                 let mut out = Vec::with_capacity(header + bytes.len());
                 put_varint(&mut out, flow);
                 put_varint(&mut out, CONTEXT_FRAGMENT);
+                put_varint(&mut out, sent_us);
                 put_varint(&mut out, packet_id);
                 // `index < count <= 255`, so the cast cannot truncate.
                 out.push(index as u8);
@@ -185,27 +211,32 @@ pub enum Unparsable {
     UnknownContext,
 }
 
-/// Parse the part of a datagram after its flow ID: `context ‖ body`.
-pub fn parse_body(rest: &[u8]) -> std::result::Result<Parsed<'_>, Unparsable> {
+/// Parse the part of a datagram after its flow ID: `context ‖ sent_us ‖ body`. Returns the
+/// sender's `sent_us` with what the body is.
+pub fn parse_body(rest: &[u8]) -> std::result::Result<(u64, Parsed<'_>), Unparsable> {
     let (context, body) = take_varint(rest).ok_or(Unparsable::Malformed)?;
-    match context {
-        CONTEXT_PACKET => Ok(Parsed::Packet(body)),
-        CONTEXT_FRAGMENT => {
+    if context > CONTEXT_FRAGMENT {
+        return Err(Unparsable::UnknownContext);
+    }
+    let (sent_us, body) = take_varint(body).ok_or(Unparsable::Malformed)?;
+    let parsed = match context {
+        CONTEXT_PACKET => Parsed::Packet(body),
+        _ => {
             let (packet_id, body) = take_varint(body).ok_or(Unparsable::Malformed)?;
             let (&index, body) = body.split_first().ok_or(Unparsable::Malformed)?;
             let (&count, bytes) = body.split_first().ok_or(Unparsable::Malformed)?;
             if count == 0 || index >= count {
                 return Err(Unparsable::Malformed);
             }
-            Ok(Parsed::Fragment(Fragment {
+            Parsed::Fragment(Fragment {
                 packet_id,
                 index,
                 count,
                 bytes,
-            }))
+            })
         }
-        _ => Err(Unparsable::UnknownContext),
-    }
+    };
+    Ok((sent_us, parsed))
 }
 
 /// What handing one fragment to the [`Reassembler`] produced.

@@ -137,30 +137,38 @@ behind it.
 
 What does not change: the relay is still ciphertext-only by construction.
 
-**A datagram that cannot go now is dropped, never sent late (2026-09-25, `transport::router`).**
+**A late datagram is dropped, never delivered late (2026-09-25, `transport::router`).**
 The problem, found by M22.6: quinn's congestion controller counts datagrams against the window. When
 a path's acknowledgements are lost, the window fills and every datagram waits in quinn's queue. When
 the path returns they all arrive together, late: 27–368 ms in the direction opposite a black relay
-leg. The rule:
+leg.
 
-- **The router keeps the send queue.** quinn's own datagram buffer is 900 bytes
-  (`QUIC_DATAGRAM_BUFFER`). Every datagram records when it was queued. One pump per connection hands
-  datagrams to quinn only while quinn has room, and drops (and counts) any whose time is up.
-- **Max age is per flow**, default 100 ms (`DEFAULT_MAX_AGE`), about a voice call's mouth-to-ear
-  budget less the network's share.
-  - A flow sets its own with `DatagramFlow::set_max_age`; an app with `AppStream::set_datagram_max_age`,
-    or over IPC with splice frame kind 3 (`MaxAge`, `u32` ms).
-  - A relay forwards at the default: it cannot see the ends' settings.
-- **What quinn already holds cannot be taken back through its API.** When quinn sends nothing for
-  `STALL_FLUSH` (50 ms), the pump pushes two padding datagrams on `PAD_FLOW`. Each is larger than
-  quinn's buffer, so quinn discards everything older to take each one. The peer's router discards the
-  padding and counts it.
-- **50 ms, because a healthy path pauses up to 25 ms.** That is QUIC's delayed acknowledgement, while
-  a keyframe burst waits on the window. At 20 ms, healthy keyframes were flushed.
-- **The age budget accounts for the flush.** A datagram is handed to quinn only while it is younger
-  than its max age less `STALL_FLUSH`, so nothing can then wait long enough to arrive late.
-- **Counted in `vox status`:** `aged_out` and `stall_flushes` in JSON, and
-  `vox_datagrams_aged_out_total` and `vox_datagram_stall_flushes_total` in the metrics.
+quinn is used unpatched (the decider: no patched dependency to carry across upgrades). The rule is
+enforced on both sides of it:
+
+- **Before quinn.**
+  - The router queues what it sends and hands a datagram to quinn only while quinn's buffer has room.
+  - One still waiting past its flow's **max age** is dropped and counted (`aged_out`).
+  - The max age defaults to 100 ms (`DEFAULT_MAX_AGE`), about a voice call's mouth-to-ear budget less
+    the network's share. A flow sets its own with `DatagramFlow::set_max_age`, an app with
+    `AppStream::set_datagram_max_age`, or IPC with splice frame kind 3 (`MaxAge`, `u32` ms).
+- **After quinn.** Every frame carries the sender's send time, in µs on the sender's own monotonic
+  clock (decision 2's frame gains `varint sent_us` after the context).
+  - The receiving router keeps, per flow, the running minimum of `arrival − sent` over `DELAY_WINDOW`
+    (10 s). That minimum is the path's base delay plus a constant clock offset, the idea RTP's jitter
+    and LEDBAT use, and it needs no clock synchronisation.
+  - A datagram arriving more than the flow's max age above that minimum is dropped and counted
+    (`late_dropped`). A late burst still crosses the wire once, and never reaches the application.
+  - A faster path lowers the minimum at once. A slower one (direct replaced by relay) is forgotten
+    after the window, which bounds how long it can make on-time datagrams look late.
+- **A relay does neither.** It forwards the field untouched, and the ends decide. Its own aged-out
+  datagrams are counted and `vox node` prints them on change.
+- **Counted in `vox status`:** `aged_out` and `late_dropped` in JSON, and
+  `vox_datagrams_aged_out_total` and `vox_datagrams_late_dropped_total` in the metrics.
+- **Tried and rejected, measured:** keeping quinn's own buffer small (900 B, with padding to displace
+  what it held), and a one-datagram buffer. Relayed inner packets of about 1100 B could then not
+  pipeline under a congestion window at its floor. `relay_drops_not_stalls` went red 3 of 4 (70–90 ms
+  late against its 40 ms bound), and 3/3 green with quinn's default buffer.
 
 ### 6. UDP tunnels (R25)
 

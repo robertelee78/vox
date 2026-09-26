@@ -964,9 +964,9 @@ fn call(
         let d = &v["datagrams"];
         let (aged, flushes) = (
             d["aged_out"].as_u64().unwrap_or(0),
-            d["displaced"].as_u64().unwrap_or(0),
+            d["late_dropped"].as_u64().unwrap_or(0),
         );
-        eprintln!("[drops] {}: aged out {aged}, displaced {flushes}", m.name);
+        eprintln!("[drops] {}: aged out {aged}, late on arrival {flushes}", m.name);
         drops.insert(m.name.clone(), (aged, flushes));
     }
     // The anchor has no status verb; it says its drops on change. Its relay legs stall like
@@ -977,11 +977,11 @@ fn call(
         .filter_map(|l| l.strip_prefix("vox node: datagrams dropped for age "))
         .next_back()
         .and_then(|rest| {
-            let (aged, flushes) = rest.split_once(", displaced ")?;
+            let (aged, flushes) = rest.split_once(", late on arrival ")?;
             Some((aged.parse().ok()?, flushes.trim().parse().ok()?))
         })
         .unwrap_or((0, 0));
-    eprintln!("[drops] anchor: aged out {}, displaced {}", last.0, last.1);
+    eprintln!("[drops] anchor: aged out {}, late on arrival {}", last.0, last.1);
     drops.insert("anchor".into(), last);
     drop(drops);
     // Every warning a daemon printed during the call: a flow that dies is explained here
@@ -1181,7 +1181,7 @@ fn a_dead_peer_does_not_hold_up_a_live_one(
     );
 }
 
-/// Each member's `(aged_out, displaced)` after the last call.
+/// Each member's `(aged_out, late_dropped)` after the last call.
 static DROPS: Mutex<BTreeMap<String, (u64, u64)>> = Mutex::new(BTreeMap::new());
 
 /// The room passphrase of the current world, for the daemons' passphrase files.
@@ -1392,7 +1392,7 @@ fn blackout_held_nothing(ds: &[Direction]) {
         .unwrap()
         .values()
         .fold((0, 0), |(a, f), (x, y)| (a + x, f + y));
-    eprintln!("[blackout] counted by the members' routers: {aged} aged out, {flushes} displaced");
+    eprintln!("[blackout] counted by the members' routers: {aged} aged out, {flushes} dropped late on arrival");
     for arm in ["voice", "video"] {
         let hit = ds
             .iter()
@@ -1465,9 +1465,10 @@ fn blackout_held_nothing(ds: &[Direction]) {
             n_o > 0,
             "{arm} host->guest: nothing sent during the blackout"
         );
-        // A frame the opposite direction did not deliver was dropped on purpose — aged out, or
-        // displaced from a stalled quinn — by the host's router or by the anchor's (whose leg
-        // to the guest stalls too while the guest's acknowledgements are lost), and counted.
+        // A frame the opposite direction did not deliver was dropped on purpose and counted:
+        // aged out before quinn took it (the host's router, or the anchor's, whose leg to the
+        // guest stalls too while the guest's acknowledgements are lost), or dropped as late on
+        // arrival (the guest's router).
         assert!(
             other.excluded == n_black || aged + flushes > 0,
             "{arm} host->guest: {} of {} frames sent into the blackout never arrived, and no \

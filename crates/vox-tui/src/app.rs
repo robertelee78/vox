@@ -402,10 +402,10 @@ pub fn run_node(
                     // no status verb to ask. On change.
                     if let Ok(report) = node.status().await {
                         let d = report.datagrams;
-                        let drops = (d.aged_out, d.displaced);
+                        let drops = (d.aged_out, d.late_dropped);
                         if drops != last_drops {
                             println!(
-                                "vox node: datagrams dropped for age {}, displaced {}",
+                                "vox node: datagrams dropped for age {}, late on arrival {}",
                                 drops.0, drops.1
                             );
                             last_drops = drops;

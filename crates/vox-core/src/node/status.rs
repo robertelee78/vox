@@ -523,7 +523,8 @@ impl StatusReport {
                 + d.reassembly_evicted
                 + d.reassembly_rejected
                 + d.send_dropped
-                + d.aged_out,
+                + d.aged_out
+                + d.late_dropped,
         );
         counter(
             "vox_datagrams_aged_out_total",
@@ -531,9 +532,9 @@ impl StatusReport {
             d.aged_out,
         );
         counter(
-            "vox_datagrams_displaced_total",
-            "Datagrams a stalled path held too long, replaced by a younger one rather than sent late.",
-            d.displaced,
+            "vox_datagrams_late_dropped_total",
+            "Datagrams that arrived later than their flow's max age, dropped rather than delivered.",
+            d.late_dropped,
         );
         let a = &self.app;
         counter(
@@ -594,7 +595,7 @@ fn list(items: impl Iterator<Item = String>) -> String {
 
 fn dgram_json(d: &DatagramStats) -> String {
     format!(
-        "{{\"sent\":{},\"delivered\":{},\"fragmented\":{},\"unknown_flow\":{},\"inbox_full\":{},\"malformed\":{},\"send_dropped\":{},\"aged_out\":{},\"displaced\":{}}}",
+        "{{\"sent\":{},\"delivered\":{},\"fragmented\":{},\"unknown_flow\":{},\"inbox_full\":{},\"malformed\":{},\"send_dropped\":{},\"aged_out\":{},\"late_dropped\":{}}}",
         d.sent,
         d.delivered,
         d.fragmented,
@@ -603,7 +604,7 @@ fn dgram_json(d: &DatagramStats) -> String {
         d.malformed + d.unknown_context,
         d.send_dropped,
         d.aged_out,
-        d.displaced
+        d.late_dropped
     )
 }
 
@@ -621,8 +622,7 @@ pub fn add_stats(a: &mut DatagramStats, b: &DatagramStats) {
     a.fragmented += b.fragmented;
     a.send_dropped += b.send_dropped;
     a.aged_out += b.aged_out;
-    a.displaced += b.displaced;
-    a.padding += b.padding;
+    a.late_dropped += b.late_dropped;
 }
 
 // ---- IPC -------------------------------------------------------------------

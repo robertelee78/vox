@@ -228,9 +228,6 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut mtu = quinn::MtuDiscoveryConfig::default();
     mtu.upper_bound(MAX_UDP_PAYLOAD);
     cfg.mtu_discovery_config(Some(mtu));
-    // quinn holds only a few datagrams; the router's own queue holds the rest, where each can
-    // be dropped once it is too old to be worth sending (ADR-022 decision 5, R27).
-    cfg.datagram_send_buffer_size(crate::transport::router::QUIC_DATAGRAM_BUFFER);
     // Enough flow-control credit to fill a long, fast path (PRD-001 R41). quinn's default
     // stream window is 1.25 MB, sized for 100 Mbit/s at 100 ms; at 1 Gbit/s and 20 ms RTT that
     // caps a tunnel at ~500 Mbit/s whatever the link does. Measured over a shaped 1 Gbit/s,
