@@ -81,6 +81,12 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      # macOS's Spotlight indexes the checkout and gigabytes of build output while the timing
+      # proofs run: on a fresh runner it took R41's emulator to 74-90% of the link, and to a clean
+      # 98% with indexing off (diag run 36228035025). The runner is a throwaway VM.
+      - name: Stop Spotlight indexing (macOS)
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
       # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
       # `shell_setup_proof` measures real shells. A shell that is absent is reported unproven and
       # FAILS (ADR-018 §3), so the runners install the ones it proves against rather than the
@@ -142,6 +148,12 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      # macOS's Spotlight indexes the checkout and gigabytes of build output while the timing
+      # proofs run: on a fresh runner it took R41's emulator to 74-90% of the link, and to a clean
+      # 98% with indexing off (diag run 36228035025). The runner is a throwaway VM.
+      - name: Stop Spotlight indexing (macOS)
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Transport gates (release)
