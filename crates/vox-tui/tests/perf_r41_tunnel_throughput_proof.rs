@@ -309,12 +309,11 @@ fn calibrate_once(link: Option<Link>) -> f64 {
                     continue;
                 };
                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                // After a stall, forgive all but 5 ms of the backlog: resume, do not flood.
+                // A sleep that overshoots is made up in the next batch, never forgiven: the offered
+                // load must stay at 1.05x the link or this measures the sender, not the emulator. On
+                // a loaded runner VM, forgiving any backlog past 5 ms dropped fidelity to 60-70%. The
+                // emulator's queue (bdp + 4 MB) absorbs the burst, as it absorbed the old flood.
                 let due = (elapsed_ms * per_ms) as u64;
-                let cap = (per_ms * 5.0) as u64;
-                if due > sent + cap {
-                    sent = due - cap;
-                }
                 while sent < due {
                     let _ = s.send_to(&pkt, front);
                     sent += 1;
