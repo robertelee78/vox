@@ -1,387 +1,470 @@
 # ADR-025: Sync Is Scheduled Like a Switch, Not a Hub
 
-**Status**: **Proposed, revision 3 — 2026-09-26.** Not decided and not built.
+**Status**: **Proposed, revision 4 — 2026-09-26.** Not decided and not built.
 
 | Revision | Collision rule | Reviews (transcripts in [`ADR-025-reviews/`](ADR-025-reviews/)) |
 |---|---|---|
-| 1 (8c4e347) | a glare rule | gpt-6-astra **BLOCK**, glm-5.3 **REVISE**, kimi-k3 **REVISE** |
-| 2 (16951fe) | a designated opener | gpt-6-astra **BLOCK**. glm-5.3 and kimi-k3 could not run: the OpenCode Zen account is out of funds |
-| 3 (this) | **full duplex** | not yet reviewed |
+| 1 (8c4e347) | a glare rule | gpt-6-astra BLOCK, glm-5.3 REVISE, kimi-k3 REVISE |
+| 2 (16951fe) | a designated opener | gpt-6-astra BLOCK (glm-5.3 and kimi-k3 were unavailable, out of funds) |
+| 3 (141dc11) | full duplex | gpt-6-astra BLOCK, glm-5.3 BLOCK, kimi-k3 BLOCK |
+| **4 (this)** | full duplex, with the resource lifecycle, receive semantics, scheduler and observability specified | not yet reviewed |
 
-- Revision 3 recommends full duplex and specifies the port's whole lifecycle.
-- See "What each review changed" at the end.
+**Round 3's reviewers could not break full duplex itself.** They found no corruption, no double-apply
+and no room-lock deadlock with two sessions on one pair. Their blocks were on what was missing:
+- retiring stale attempts and releasing their resources;
+- bounds on retries;
+- the inherited transport deadlock (#212);
+- entry classes that the code can actually compute;
+- the points at which the scheduler evaluates ports;
+- an observability schema that the proofs can use.
+
+Revision 4 specifies each; see the table at the end.
+
 **Date**: 2026-09-26
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: sync, scheduling, node-runtime, latency
-**Builds on**: #180 (`fix/180-no-defer`, 33da864 + 58fde36) and #202 (8436100, accepted). It assumes
-both are integrated. Line numbers are prefixed with their tree: **`180:`** is 58fde36 and **`202:`** is
-8436100.
+**Builds on**: #180 (33da864 + 58fde36) and #202 (8436100, accepted), both assumed integrated.
+**Depends on**: V210-39 (#212), the bilateral backlog deadlock, fixed separately and before S5 (see
+"The inherited transport deadlock").
+**Lines** are prefixed with their tree: `180:` = 58fde36, `202:` = 8436100.
 **Relates to**: #41 (V29-06; its backoff is deleted by D5), #200 (V210-27).
 
 ## Context
 
-The decider, on the collisions #202 made visible: *"it kind of reminds me of a networking hub vs. a
-switch — is there something that we can do that's more intelligent to make it more like a switch
-instead of a hub, with slots and queues"*, and *"it's cute that it kind of sort of works but we can do
-better"*.
+The decider: *"it kind of reminds me of a networking hub vs. a switch — is there something that we can
+do that's more intelligent to make it more like a switch instead of a hub, with slots and queues"*;
+*"it's cute that it kind of sort of works but we can do better"*.
 
 ### What a sync session is
 
-A sync session reconciles one room's log between two nodes over one QUIC bi-stream, and **either end
-may open it**. Both ends run the same steps (`180:log/sync.rs` 869–922):
-1. each sends `HELLO`, then `HAVE`, then `WANT` (what it lacks of the other's `HAVE`);
-2. each serves the other's `WANT` and sends FIN (893);
-3. each drains and applies what it is sent (896–916).
+A sync session reconciles one room's log between two nodes over one QUIC bi-stream, and either end may
+open it. Both ends run the same steps (`180:log/sync.rs` 869–917):
+1. each sends `HELLO`, then `HAVE`, then `WANT`;
+2. each serves the other's `WANT` and sends FIN;
+3. each drains and applies.
 
-So one session moves entries **both ways**. The room's lock is taken one step at a time
-(`SessionRoom`, `ChannelState::sync_over_room`), so two sessions on one room interleave safely step by
-step. A duplicate entry is refused idempotently (`202:log/dag.rs` 317–320).
+The room's lock is held one step at a time (`SessionRoom`), so two sessions on one room interleave
+safely. Duplicates are refused idempotently (`202:log/dag.rs` 317–320), and a partial batch is absorbed
+before its error is reported (`202:node/channel.rs` 2701–2721). All three round-3 reviewers checked
+this.
 
-Three limits shape the design:
-- **Serving stops silently at a bound.** It stops at `MAX_SERVE_ENTRIES` (1,024), `MAX_SERVE_BYTES`
-  (64 MiB) or `SERVE_BUDGET` (30 s) (`180:log/sync.rs` 501–506, 888–890). The session still ends
-  `Ok`, and `SyncOutcome` (`180:node/channel.rs` 218–227) doesn't say so.
-- **A side's success says nothing about the other side's apply.** Each side sends FIN before it
-  applies what it received. Only the receiver knows whether its applies succeeded.
-- **The receiver doesn't check what it receives against what it asked for.** It checks neither `WANT`
-  membership nor uniqueness (`180:log/sync.rs` 899–914).
+Facts the design must respect:
+- **Serving stops silently at a bound:** 1,024 entries, 64 MiB or 30 s (`180:log/sync.rs` 501–506,
+  888–890). The session still ends `Ok`, and `SyncOutcome` (`180:node/channel.rs` 218–227) doesn't say
+  so.
+- **Each side sends FIN before applying.** Only the receiver knows its apply outcome.
+- **The receiver doesn't check what it gets against its `WANT`** (`180:log/sync.rs` 899–914).
+- **Rejections today:**
+  - A frozen author and an unadmitted author both return `Rejected::NotAdmitted`
+    (`202:log/dag.rs` 312–324), which maps to the wire code `EpochMismatch` and **fails the session**
+    (`180:log/sync.rs` 564–566).
+  - An author with no resolver key fails as `AuthenticatorInvalid` (`180:log/sync.rs` 609–611).
+  - A persist failure **poisons** the room until it is reopened (`202:node/channel.rs` 2050–2052,
+    2100–2106).
+  - **Consent revocation does not evict an author**: their entries stay valid
+    (`202:node/channel.rs` 1806–1836, 1936–1943).
 
 ### Where scheduling behaves like a hub
 
 1. **Glare, then random backoff (CSMA/CD).**
-   - **How it happens.** A local append pushes to every peer at once. When two members post within a
-     round trip, each opens a session to the other, and each end's responder refuses the other's
-     because its own session with that peer is running (`180:node/actor.rs` 5260–5263; `SessionBusy`
-     after #202).
-   - **What it costs.** Both sessions fail. Retries follow after a random 20–100 ms, then a
-     disjoint-window backoff to 8 s (#41, b6545e5).
-   - **Measured** (vox-0e's instrumented harness outputs and #202's proof):
-     - 35–47 collisions per 40 simultaneous rounds.
-     - Room-keyed guard, on main: 1,397 refusals in 40 rounds.
-     - **With #180 underneath:** 0 late posts in 600 rounds (slowest 0.30 s), but 702–703 refusals per
-       300 rounds.
-   - **So on the trees v0.2.10 ships, this is waste and randomness, not lost messages.**
-2. **Skipped, not queued.** Past 16 slots, `sync_one` returns `false`: *"skipped, not queued"*
-   (`180:node/actor.rs` 5023–5024).
-   - **Why it can be lost.** The pair is not added to `owed`, and the peer's schedule is then marked
-     synced (4933–4934). `due()` gates every later pass (`node/syncstream.rs` 93–113).
-   - **What doesn't rescue it.** The `SyncDone` re-arm only sets `push_now`, which still hits `due()`.
-     Unless another trigger happens to re-mark that peer, the push waits for the 30 s interval.
-     astra and kimi-k3 traced this path. glm-5.3 argued the base recovers promptly, and astra showed
-     that `due()` still gates it.
-   - **Not yet measured on a real harness.** P2 measures it first.
-   - **What the code argues.** It defends the skip: *"a queue of sessions for rooms whose state has
-     since moved on is worse than none"* (180:237–239). D6 queues *ports*, which re-check whether they
-     still need a session when their turn comes.
-3. **"Pushed" means started** (`180:node/actor.rs` 4983–4984: *"Known and not fixed here"*).
-   - **What rescues it today:** failures are re-owed (`PushRetry`), and an append during a session is
-     re-armed at `SyncDone`.
-   - **What's left:** a truncated serve counts as done, and a partial apply that then fails doesn't
-     wake the room's other peers.
-4. **Seven maps and a flag for one question**: `schedules`, `pending_push`, `pushed_to`, `owed_first`,
-   `push_failures`, `syncing`, #202's `syncing_with`, and `push_now`. Their disagreements are recorded
-   as past defects at the sites themselves.
+   - **What happens.** Two members posting within a round trip each open a session to the other, and
+     each refuses the other's (`180:node/actor.rs` 5260–5263; `SessionBusy` after #202). Both retry
+     after a random 20–100 ms, then a disjoint-window backoff (#41).
+   - **Measured** (vox-0e's harness and #202's proof): 35–47 collisions per 40 simultaneous rounds.
+     With #180, 0 late posts in 600 rounds but 702–703 refusals per 300 rounds.
+   - **So it's waste and randomness, not loss.**
+2. **Skipped, not queued.**
+   - **What happens.** Past 16 slots, `sync_one` returns `false` (`180:node/actor.rs` 5023–5024). The
+     peer's schedule is then marked synced (4933–4934), and `due()` gates later passes
+     (`180:node/syncstream.rs` 93–113).
+   - **What doesn't rescue it.** The `SyncDone` re-arm sets only `push_now`. Unless another trigger
+     re-marks the peer, the push waits for the 30 s interval.
+   - **What's measured.** astra and kimi-k3 traced this path. It is not measured on a harness yet (S0c).
+   - **What the code argues.** It defends skipping: *"a queue of sessions for rooms whose state has
+     since moved on is worse than none"* (180:237–239). D6 queues ports that re-check whether they
+     still need a session.
+3. **"Pushed" means started** (`180:node/actor.rs` 4983–4984). Failures and mid-session appends are
+   rescued today. A truncated serve counted as done, and a failed partial apply that doesn't wake the
+   room's other peers, are not.
+4. **Seven maps and a flag** for one question. Past defects at those sites came from the maps
+   disagreeing.
+
+### The inherited transport deadlock (V210-39, #212)
+
+Found by all three round-3 reviews.
+- **Why it happens.** Both ends serve their whole batch before draining. A batch can approach 64 MiB,
+  but the stream receive window is 16 MiB and the connection windows are 32 MiB
+  (`202:transport/quic.rs` 191–203, 280–282).
+- **What follows.** With a large backlog in both directions, both ends block in `write_all`, fail at
+  the 20 s write timeout, and apply nothing. Retries repeat the same state.
+- **It exists today** in a single session: a session already carries both directions. glm-5.3 argued
+  the glare serialises it, but one session is enough to deadlock.
+- **Not yet reproduced.**
+- **The fix is #212's, not this ADR's**: serve and drain run concurrently (the send and receive halves
+  on their own threads). Merely lowering `MAX_SERVE_BYTES` below the stream window does not suffice,
+  because many rooms' sessions share one connection window.
+- **ADR-025 depends on it.** Full duplex makes simultaneous sessions normal, so #212 must land before
+  S5.
 
 ## Prior art
 
 Researched 2026-09-26; primary sources linked, and items marked *(unverified)* were not line-read.
 
-- **Collide, then retry at random: today's behaviour.**
-  - SIP glare (RFC 3261 §14, `491`) *(unverified against the RFC text)*.
-  - libp2p simultaneous open's coin toss
-    ([simopen.md](https://github.com/libp2p/specs/blob/master/connections/simopen.md)).
-  - Wi-Fi RTS/CTS.
-- **Deterministic tie-breaks.** BGP ([RFC 4271 §6.8](https://www.rfc-editor.org/rfc/rfc4271.html)),
+- **Collide, then retry at random** (today): SIP glare (RFC 3261 §14) *(unverified)*, libp2p
+  simultaneous open ([simopen.md](https://github.com/libp2p/specs/blob/master/connections/simopen.md)),
+  Wi-Fi RTS/CTS.
+- **Deterministic tie-breaks:** BGP ([RFC 4271 §6.8](https://www.rfc-editor.org/rfc/rfc4271.html)),
   WebRTC perfect negotiation ([Mozilla](https://blog.mozilla.org/webrtc/perfect-negotiation-in-webrtc/)),
-  `iroh-persistent` ([ppetr/iroh-persistent](https://github.com/ppetr/iroh-persistent)), and Vox's own
-  `incoming_session_wins`.
-  - The pitfall is deciding by timing, not identity
-    ([go-libp2p-swarm#79](https://github.com/libp2p/go-libp2p-swarm/issues/79)).
-  - Revisions 1 and 2 built on these. Revision 3 doesn't need a tie-break at all.
-- **Full duplex: both directions at once, no collision detection.** This is switched Ethernet
-  (IEEE 802.3x): a full-duplex port has no CSMA/CD because both ends may transmit simultaneously.
-  - **TCP simultaneous open** ([RFC 9293 §3.5](https://www.rfc-editor.org/rfc/rfc9293.html)) accepts
-    both SYNs rather than refusing either.
-  - **Yjs** sends `SyncStep1` from **both** ends and treats the redundancy as harmless
-    ([y-protocols sync.js](https://github.com/yjs/y-protocols/blob/master/sync.js)).
-  - **WireGuard** lets two simultaneous handshakes both complete.
-  - Each accepts duplicate work in exchange for having no collision state. That trade is revision 3's.
-- **A dirty flag, re-queued once.** Kubernetes client-go's workqueue
+  `iroh-persistent` ([ppetr/iroh-persistent](https://github.com/ppetr/iroh-persistent)), and Vox's
+  `incoming_session_wins`. The pitfall is deciding by timing
+  ([go-libp2p-swarm#79](https://github.com/libp2p/go-libp2p-swarm/issues/79)). Revisions 1–2 used a
+  tie-break; revision 4 needs none.
+- **Full duplex** (switched Ethernet, IEEE 802.3x: no CSMA/CD because both ends transmit at once):
+  - TCP simultaneous open accepts both SYNs ([RFC 9293 §3.5](https://www.rfc-editor.org/rfc/rfc9293.html)).
+  - Yjs sends `SyncStep1` from both ends ([y-protocols](https://github.com/yjs/y-protocols/blob/master/sync.js)).
+  - WireGuard lets simultaneous handshakes complete.
+  - Each trades duplicate work for having no collision state.
+- **A dirty flag, re-queued once:** Kubernetes client-go's workqueue
   ([queue.go](https://github.com/kubernetes/client-go/blob/master/util/workqueue/queue.go)).
-- **Persistent streams: deferred to v0.3.0.** Scuttlebutt EBT, Hypercore
-  ([DEP-0010](https://www.datprotocol.com/deps/0010-wire-protocol/)) and Willow WGPS
+- **Persistent streams, deferred to v0.3.0:** EBT, Hypercore
+  ([DEP-0010](https://www.datprotocol.com/deps/0010-wire-protocol/)), Willow WGPS
   ([spec](https://willowprotocol.org/specs/sync/index.html)).
-  - Their shipped bugs: EBT stalls ([ssb-ebt#77](https://github.com/ssbc/ssb-ebt/issues/77)), stale
-    per-peer state ([automerge-repo#742](https://github.com/automerge/automerge-repo/pull/742)), a dead
-    connection blocking its replacement ([syncthing#9337](https://github.com/syncthing/syncthing/issues/9337)).
-  - Short-lived sessions have their own versions of these (a running-marker wedge, `180:node/actor.rs`
-    5095–5098). The deferral is because the persistent stream is a new protocol, not because
-    per-event sessions are immune.
-- **Stacked coalescing mechanisms produce circular waits** (Cheshire,
+  - Their stalls ([ssb-ebt#77](https://github.com/ssbc/ssb-ebt/issues/77)), stale state
+    ([automerge-repo#742](https://github.com/automerge/automerge-repo/pull/742)) and dead-connection
+    blocking ([syncthing#9337](https://github.com/syncthing/syncthing/issues/9337)) have equivalents in
+    short-lived sessions too (`180:node/actor.rs` 5095–5098).
+  - They're deferred because they are a new protocol.
+- **Stacked coalescing produces circular waits** (Cheshire,
   [Nagle/delayed-ACK](https://www.stuartcheshire.org/papers/NagleDelayedAck/)). That's why D5 deletes
-  the jitter instead of layering a new rule on it.
+  the jitter.
 
 ## Options for the collision (the decider's choice)
 
-| | **C. Full duplex** (recommended) | A. Designated opener (revision 2) | B. Glare rule (revision 1) |
+| | **C. Full duplex** (recommended) | A. Designated opener | B. Glare rule |
 |---|---|---|---|
-| Who opens | either end, whenever its port needs a session | only the lower fingerprint; the higher sends `SYNC_NOTIFY` | either; on glare the lower's is kept |
-| Busy refusals | **none**: an inbound session is always admitted, queued if the port is at its inbound limit | still possible: the opener's next session can arrive while the other end is still applying the last (astra round 2, finding 1) | one per glare |
-| Sessions per pair at once | at most one outbound from each end, so at most two when both need one | at most one outbound, plus turnover overlap | up to two |
-| New machinery | tokens and an inbound limit | a new stream kind and its accept path, a notify lifecycle (outstanding, failed, dropped, re-sent), a manual-sync override flag, member learning on the higher end, anchor adoption on notify, amplification bounds | tokens, `Awaiting`, deadline, stale-refusal rows |
-| Wire change | **none** | yes | none |
-| Cost | when both ends need a session at once, both run: a duplicate `HAVE`/`WANT` exchange, and possibly entries sent twice (refused idempotently) | an extra one-way trip for the higher end's posts | a refused stream per glare |
+| Who opens | either end, when its port needs a session | only the lower fingerprint, which the higher prompts with `SYNC_NOTIFY` | either; on glare the lower's is kept |
+| Busy refusals between correct peers | **none**: up to `INBOUND_PER_PORT = 3` inbound sessions per port are admitted | possible at turnover (astra, round 2) | one per glare |
+| Unfinished sessions per pair, per end | at most 1 outbound + 3 inbound | 1 + turnover | 2 |
+| Wire change | none | a new stream kind | none |
+| Cost | a duplicate reconciliation when both ends need a session at once (~1 extra session per simultaneous round) | an extra one-way trip for the higher end's posts, plus the notify lifecycle | a refused stream per glare |
 
-**Recommended: C.** It is the switch's full-duplex port.
-- Neither end ever waits on, refuses, or backs off from the other for being busy, so there's no
-  collision to detect, no random wait, and no tie-break.
-- The price is duplicate work when both ends need a session at the same instant: about one extra
-  session per simultaneous round, which is cheap at family scale.
-- A spent its complexity preventing a harmless duplicate, and two review rounds kept finding new
-  states it needed. C needs no new state beyond tokens.
+**Recommended: C.** It is the full-duplex switch port: neither end refuses, waits on or backs off from
+the other for being busy.
 
 ## Decision (proposed, option C)
 
-### D1. One port per (room, peer), owned by the actor
+### D1. One port per (room, peer)
 
 ```text
 struct Port {
-    out:       Option<Attempt>,            // at most one outbound session at a time
-    inbound:   BTreeMap<Token, Attempt>,   // admitted inbound sessions (≤ INBOUND_PER_PORT)
-    held:      VecDeque<HeldStream>,       // inbound streams waiting for admission (D4)
-    queued:    Option<Instant>,            // waiting for an outbound slot (D6)
-    backoff:   Option<Backoff>,            // { until, failures, token }  (D5)
-    req_gen:   u64,                        // requests raised (D2)
-    req_done:  u64,                        // requests satisfied
-    done_gen:  u64,                        // room generation this peer is known current with (D3)
+    out:       Option<Attempt>,           // at most one outbound
+    inbound:   BTreeMap<Token, Attempt>,  // ≤ INBOUND_PER_PORT (3)
+    queued:    Option<QueuedSince>,       // waiting for an outbound slot (D6)
+    backoff:   Option<Backoff>,           // { until, failures, kind, timer_token }  (D5)
+    poisoned:  bool,                      // the room is poisoned (D3)
+    req_gen:   u64,  req_done: u64,       // requests (D2)
+    done_gen:  u64,                       // monotonic within an epoch (D2)
     epoch:     u64,
-    conn:      ConnIncarnation,            // the connection this port's attempts ride
 }
-struct Attempt { token: Token, dir: Out|In, conn: ConnIncarnation, epoch: u64, req_at_start: u64 }
+struct Attempt { token: Token, dir: Out|In, conn: ConnId, epoch: u64, req_at_start: u64,
+                 abort: AbortHandle, permit: Option<OwnedSemaphorePermit> }
 ```
 
-- **`ports: BTreeMap<(room, peer), Port>` replaces** `pushed_to`, `pending_push`, `owed_first`,
-  `push_failures`, `syncing`, `syncing_with` and `push_now`.
-- **`schedules` remains** only to raise the connect and periodic triggers.
-- **Every session has a `Token`** carried to its `SyncDone`. A `SyncDone` whose token is not in `out`
-  or `inbound`, or whose `conn` or `epoch` is stale, **changes nothing** except a `stale` counter.
-- **Room content generation.** A room gains a monotonic `u64` generation, bumped by every stored
-  entry from any source. It is read **in the same lock acquisition as the frontiers sent in `HAVE`**
-  (`SessionRoom::frontiers` returns both), so it never credits an append the `HAVE` did not contain.
+- **`ports` replaces** `pushed_to`, `pending_push`, `owed_first`, `push_failures`, `syncing`,
+  `syncing_with` and `push_now`. `schedules` only raises the connect and tick requests.
+- **The room generation** is a `u64` on the room's `ChannelState` (or `AnchorState`), bumped by every
+  stored entry from any source. It is read in the same lock acquisition as the `HAVE` frontiers. It is
+  in memory, and a restart resets it together with every port.
 
-A port **needs a session** iff `room.gen > done_gen` or `req_gen > req_done`.
+A port **needs a session** iff it is not poisoned, and `room.gen > done_gen` or `req_gen > req_done`.
 
-### D2. Requests: raised, captured at start, consumed at completion
+**Unfinished sessions per pair, per end:** at most 1 outbound plus `INBOUND_PER_PORT` inbound (kimi-k3
+and glm-5.3 corrected revision 3's "two").
 
-Every trigger other than a stored entry **raises a request** (`req_gen += 1`):
-- connect and reconnect (a new `conn` incarnation);
-- the periodic tick;
-- new board members;
-- a person's `vox room sync`;
-- a failure, truncation or temporary refusal seen by this side (D3).
+### D1a. Retirement is separate from ignoring a result
 
-A stored entry bumps the room generation instead.
+Every attempt carries its task's `AbortHandle` and, if outbound, its slot permit.
+
+**A port retires an attempt** when:
+- **its connection dies** (the connection manager files it closed). A *displaced but still carried*
+  connection is **not** a death (`202:node/net.rs` 827–855, 874–898): streams on it stay attributed to
+  the port;
+- **the room changes epoch**;
+- **the room is poisoned**;
+- **the node shuts down**.
+
+Retiring an attempt:
+1. removes it from `out` or `inbound`;
+2. aborts its task;
+3. drops its permit. That happens exactly once, because the permit lives in the attempt and the
+   attempt is removed once.
+
+Stores the old worker made before the abort stay: they are durable and idempotent, and D2's generation
+bump covers them.
+
+**A `SyncDone` for a retired or unknown token changes nothing but the `stale` counter.** Its resources
+were already released at retirement. This is the distinction all three round-3 reviews asked for:
+revision 3 only filtered results, and a stale attempt left in `out` would have silenced the port for
+good.
+
+### D2. Requests and credit
+
+**Raising a request** (`req_gen += 1`): a new connection, the tick, new board members, a person's
+`vox room sync`, and a D3 or D5 outcome.
 
 **Capture and consumption:**
-- An attempt captures `req_at_start = req_gen` **when it is admitted** (outbound, when it opens;
-  inbound, when it leaves `held`).
-- A **clean completion** of an attempt in **either direction** sets
-  `req_done = max(req_done, req_at_start)`.
-- **A request raised after an attempt started is never consumed by it.** So a request is never lost,
-  and never loops: the workqueue rule, with its transition made exact.
+- An attempt captures `req_at_start` when it is admitted.
+- A completion that D3 counts as **clean** sets `req_done = max(req_done, req_at_start)`.
+- A request raised after an attempt started is never consumed by it.
 
-**Entries applied from peer P don't re-owe P** (astra's exact condition). Let `gH` be the generation
-captured with this side's `HAVE`, and `nP` the entries newly stored from P in that attempt:
-- if, **at completion and in the same epoch**, `room.gen == gH + nP`, then `done_gen = gH + nP`;
-- otherwise `done_gen = gH`, which re-owes P at most one idempotent session.
+**Credit is monotonic within an epoch** (all three reviews): `done_gen = max(done_gen, credit)`.
+- Normally `credit = gH`, the generation captured with this side's `HAVE`.
+- It is `gH + nP` when that attempt stored `nP` entries newly from P and, at completion, in the same
+  epoch, `room.gen == gH + nP` (astra's exact condition).
+- Duplicates and fork heads are not "newly stored".
 
-Duplicates and fork heads are not "newly stored".
+### D3. Receive coverage, entry classes, and what each side concludes
 
-### D3. What a side may conclude, from its own observations only
+**Coverage is interval arithmetic, never per-position sets.** glm-5.3 and astra pointed out that a
+`HAVE` can claim `max_seq = u64::MAX`.
+- The receiver keeps its `WANT` as per-author inclusive intervals, clamped to the peer's `HAVE`, plus
+  the advertised head hash for an equal-sequence fork request `(N, N)`.
+- Each received entry must fall in an unfilled interval position of its author, which is tracked as a
+  filled-interval set. A fork request's entry must carry the advertised head hash.
+- **Anything else is a protocol violation.** The session fails with reason `ProtocolViolation`, the
+  entry is not stored, and D5 backs off with the peer reported.
 
-No side concludes anything about the other side's applies. **The side that sees a problem raises the
-request, and under C it opens its own outbound**, whose existing setup already fetches the peer's board
-and admits new authors (`180:node/actor.rs` 5033–5089). So the preparation revision 2 was missing on
-one role comes free.
+**Classes, computed from predicates the code has.** Two are new apply semantics and are marked:
 
-**Receive coverage.** The receiver keeps its `WANT` (today it is computed and discarded,
-`180:log/sync.rs` 880–884) as a set of requested positions: `(author, seq)` over each range, clamped to
-the peer's `HAVE`, and for an equal-sequence fork request `(N, N)` the advertised head hash.
-- **Each received entry must match an unfilled requested position.** Anything else is a protocol
-  violation, which fails the session and is reported. It closes astra's duplicate-substitution hole.
-- **Each received entry is classified:** `stored`, `duplicate`, `fork-handled`, `excluded`
-  (permanent: an author revoked or frozen in this epoch), `unadmitted` (temporary: an author not yet
-  admitted here), or `persist-failed`.
+| Class | Predicate | Today |
+|---|---|---|
+| `stored` | `Dag::accept` → stored | same |
+| `duplicate` | `Rejected::Duplicate` | same (idempotent) |
+| `fork-handled` | `Rejected::Fork` (the author is frozen) | fails the session; **new**: classified, session continues |
+| `frozen` | the author is in `Dag::frozen` (`202:log/dag.rs` 216–220). **Needs `NotAdmitted` split into `Frozen` and `NotAdmitted`** in `dag.rs`, which is a code change | fails as `EpochMismatch` |
+| `unadmitted` | `Rejected::NotAdmitted` after the split, or no resolver key | fails the session; **new**: classified, session continues |
+| `poisoning` | the room's persist failed | poisons the room (unchanged) |
 
-At `SyncDone` (`Ok`, token current), this side:
+- **"Revoked" is not a class.** Consent revocation doesn't evict an author; its entries are stored as
+  normal (glm-5.3, kimi-k3).
+- **Filled positions:** `stored`, `duplicate`, `fork-handled` and `frozen` fill the position.
+  `unadmitted` does not.
+
+At `SyncDone` (token current), this side:
 
 | This side observed | Port afterwards |
 |---|---|
-| every requested position filled with `stored`, `duplicate`, `fork-handled` or `excluded` | `req_done = max(req_done, req_at_start)`; `done_gen` per D2; needs another session only if something newer arrived |
-| some positions unfilled (the peer's serve hit a bound) | raises a request: the rest is fetched at once. `truncated` counter +1 |
-| any `unadmitted` | raises a request **with `learn_members` first**; if the retry makes no progress (nothing stored, nobody admitted), D5 backoff |
-| any `persist-failed`, or the session failed | raises a request; D5 backoff for a real failure |
-| any `stored`, whatever the outcome | the generation bump makes every **other** port of the room need a session (astra's partial-apply finding) |
+| every requested position filled | **clean**: `req_done` and `done_gen` per D2 |
+| some unfilled, and **progress** (≥1 `stored`, or a newly admitted author, or a position newly filled) | raises a request; the rest is fetched at once |
+| some unfilled, and **no progress** | raises a request **and enters backoff** (D5, kind `NoProgress`). A peer that advertises what it never serves costs one session per backoff step, never a tight loop |
+| any `unadmitted` | raises a request with `learn_members` first (the outbound setup, `180:node/actor.rs` 5033–5089, which under C this side runs itself); no progress → backoff |
+| the room was poisoned | the room's ports retire their attempts and are marked `poisoned`, reported once. **No retry** until the room is reopened (by a person, or by #208's reopen at unlock), which re-creates its ports |
+| any `stored`, whatever the outcome | the generation bumped, so every port of the room is evaluated (D6a) |
 
-**Progress past permanent refusals.** An `excluded` author is recorded for the epoch, and later
-`WANT`s skip that author's ranges. So a served prefix of 1,024 excluded entries can't be re-served
-forever (astra round 2, finding 3).
+**Progress past frozen authors:** a `frozen` author's ranges are skipped in later `WANT`s for the
+epoch, so the same prefix is not re-served.
 
-### D4. Full duplex: inbound sessions are always admitted, in order
+### D4. Full duplex admission
 
-- **An inbound session for a port is never refused for being busy.** It is admitted as long as the
-  port holds fewer than `INBOUND_PER_PORT = 2` inbound attempts. A correct peer has at most one
-  outbound per port, and the second covers turnover: the peer's next session arriving while this side
-  is still applying its last one (astra round 2, finding 1).
-- **Past the limit, the stream is held**, not refused, and admitted when an inbound attempt of that
-  port ends. A held stream is bounded by the peer's own frame timeout (20 s,
-  `202:transport/stream_transport.rs` 20–29), which ends the peer's attempt as a transport failure if
-  this side never admits it. It is queueing, not collision.
-- **The outbound decision ignores inbound sessions.** A port opens an outbound when it needs a session,
-  has no `out`, is not in backoff, and gets a slot. An inbound session running at the same moment is
-  the "both directions at once" case, and both complete.
-- **Policy refusals stay as they are:** a non-member, an epoch mismatch, or a room not held
-  (`180:node/actor.rs` 5265–5313, with #202's reasons). An anchor still adopts a just-published room
-  and refreshes its authors before the membership check (5265–5293), unchanged.
-- **Sender-key sessions are untouched**, and so is their tie-break (`incoming_session_wins`, pairwise
-  sessions).
+- **An inbound session is admitted if the port holds fewer than `INBOUND_PER_PORT = 3` inbound
+  attempts.** A correct peer has one outbound per port. The spare two cover this side still applying
+  the peer's previous sessions at turnover (astra, round 2).
+- **Past the limit it is refused at once with `SessionBusy`.** It is never held. The tree's own
+  argument for joins applies: *"a queue of half-finished exchanges is exactly the resource a flood
+  wants to fill"* (180:252–255). The refused peer treats `SessionBusy` as D5 kind `Busy`.
+  - For a correct peer this only happens when this side's applies are slower than three of the peer's
+    sessions.
+  - P1 and P6 assert that it doesn't happen under simultaneous posting.
+  - Revision 3's held queue is removed: all three reviews found it unbounded.
+- **The outbound decision ignores inbound attempts** (both directions at once). glm-5.3 traced an
+  honest pair converging with at most one extra session. The unbounded case was zero-progress retries,
+  which D3 now paces.
+- Policy refusals, and an anchor's adoption and author refresh before the membership check
+  (`180:node/actor.rs` 5265–5313), are unchanged.
 
-### D5. Backoff is only for real failures, and it wakes itself
+### D5. Backoff, by kind, with its own wakeup
 
-`Backoff { until, failures, token }` is entered on:
-- `Unreachable` or a transport failure;
-- `EpochMismatch` or a policy refusal;
-- a stream-open failure (the existing bounded opener, `202:transport/quic.rs` 764–781);
-- a retry that made no progress on `unadmitted` entries.
+| Kind | Entered on | Growth | Cap |
+|---|---|---|---|
+| `Unreachable` | transport failure, stream-open failure (`202:transport/quic.rs` 764–781) | from 200 ms, doubling | 8 s |
+| `Busy` | `SessionBusy` (only past `INBOUND_PER_PORT`) | from 200 ms, doubling | 8 s |
+| `NoProgress` | D3's no-progress rows, `ProtocolViolation` | from 1 s, doubling | 30 s |
+| `Policy` | `EpochMismatch`, not a member, room not held | 30 s flat | 30 s: an anchor that keeps no log is asked once per interval, as today, not every 8 s (kimi-k3) |
 
-It keeps #41's growth to 8 s.
-- **At `until`, a timer event `BackoffExpired { room, peer, token }` re-evaluates the port.** A stale
-  token is ignored. It's the one timer besides the tick.
-- **A person's `vox room sync` clears the backoff and raises a request.** Ordinary triggers wait it out.
+- **Wakeup:** entering backoff arms `BackoffExpired { room, peer, timer_token }`. The port re-evaluates
+  when it fires, and a stale `timer_token` is ignored.
+- **Reset:** `failures` returns to 0 on any completion that made progress.
+- **Cleared by:** a new epoch, a new connection, or a person's `vox room sync`. Ordinary triggers wait
+  it out.
 - **Deleted:** the 20–100 ms jitter, `QUICK_PUSH_RETRIES`, the disjoint halves and `PushRetry`.
-  Nothing collides, so nothing needs desynchronising.
 
-### D6. Queued ports, fair across peers
+### D6. Slots: queued, fair, bounded per peer
 
-- **16 outbound slots.** Inbound sessions take none, as today (`start_session`, `180:node/actor.rs`
-  5148–5197), so two nodes cannot deadlock on each other's slots.
-- **New: at most 4 outbound slots per peer**, so a stalled peer cannot hold all 16 while a live peer
-  waits (astra round 2, finding 4). A stalled session still holds its slot until its frame timeout.
-- **Queued ports are served round-robin across peers**, and FIFO within a peer.
-- **After each session, a port that still needs one goes to the tail.**
-- **A queued port re-checks its need when its turn comes**, and does not open if it has become clean.
+- **16 outbound slots, and at most 4 per peer.** Inbound sessions take none.
+- **Queued ports** are served round-robin across peers and FIFO within a peer. A port that still needs
+  a session after its turn goes to the tail. A queued port re-checks its need when its turn comes.
+- **Stated limit** (glm-5.3, kimi-k3): four stalled peers can occupy all 16 slots until their sessions
+  time out (a frame timeout of 20 s, plus the budgets). A live peer then waits up to that long.
+  Round-robin decides admission; it doesn't pre-empt. This is **not fixed here**, and no proof claims a
+  bound for it.
 
-### D7. The periodic tick is a safety net, not a delivery path
+### D6a. When ports are evaluated
 
-`SYNC_INTERVAL_SECS` (30 s) stays, and each tick raises a request on every shared port. No proof may
-pass *because of* the tick: every delivery bound below is well under 30 s.
+A single `schedule()` pass runs at the end of every actor event that can change a port's need or a
+slot:
+- a room generation bump (every port of that room);
+- a request raised;
+- a `SyncDone`;
+- slot release;
+- `BackoffExpired`;
+- a connection opened or closed;
+- an epoch change;
+- a room opened or poisoned.
 
-### Epochs, reconnects and restarts
+The pass is deduplicated per event. This replaces today's explicit wakes (`180:node/actor.rs`
+3450–3453, 4730–4740, 4788–4801), so a partial apply's forwarding is prompt, never left to the tick
+(kimi-k3).
 
-- **A new epoch:** every attempt of the old epoch becomes stale, each port resets
-  `done_gen = 0` and raises a request, and the `excluded` set is cleared. The room generation is not
-  reset, because it is monotonic per room.
-- **A new connection incarnation** (reconnect, or a peer restarted under the same identity): attempts
-  on the old one become stale, and every shared port raises a request. The old session's eventual
-  `SyncDone` is counted stale and changes nothing.
-- **A consent's retry keys on (room, target) and the token**, not on the room alone
-  (`180:node/actor.rs` 3373–3380, 4362–4393).
-- **`vox room sync` keeps today's reply semantics**: `Done` once at least one session started
-  (5202–5223). It isn't made to wait on a completion.
+### D7. The periodic tick is a safety net
 
-### Observability (S0b; lands first, so the proofs can run on the base)
+It raises a request on every shared port every 30 s. No proof passes because of it.
 
-`vox status --json` gains, per (room, peer):
-- **counters:** sessions opened, admitted, held, completed, truncated, failed, busy-refused, stale;
-- **a bounded log of the last 64 sessions:** token, direction, connection incarnation, start and end
-  in unix ms, `gen_at_have`, requested positions, and received by class;
-- **the room's current generation.**
+### Consents, commands, epochs
 
-It's a person's diagnostic view ("why is this room slow?"), and it makes each causal boundary a proof
-needs observable through the shipped binary. On the base (#180+#202), the same fields report what exists
-there: sessions, refusals and generations. The fields that exist only after the change read absent.
+- **Planned change:** a consent's retry will key on (room, target, token). **Today it keys on the room
+  alone** (`180:node/actor.rs` 1762, 3373–3380, 4356–4393).
+- `vox room sync` keeps today's reply: `Done` once a session starts (5202–5223).
+- **A new epoch** retires every attempt, sets `done_gen = 0`, clears backoff and the frozen-skip set,
+  and raises a request.
+
+### Observability (S0b) — derived from what the proofs must observe
+
+`vox status --json`, per (room, peer), carries three kinds of data.
+
+**1. Counters:**
+- opened, admitted, busy-refused, completed-clean, completed-partial, failed (by reason), retired,
+  stale;
+- queued and dequeued;
+- backoff entered and expired, by kind;
+- on the base, **skipped-at-cap**.
+
+**2. A session journal with sequence numbers.** It is monotonic per node, so a reader detects a gap
+(kimi-k3, glm-5.3), and it keeps the last 256 sessions, with an overflow counter. Each record holds:
+
+| Field | What it records |
+|---|---|
+| identity | `seq`, `token`, `dir`, `conn`, `epoch` |
+| timing | `t_start`, `t_have` (unix ms), `t_end` |
+| at admission | `req_gen`, `req_done`, `done_gen` |
+| at `HAVE` | `gen_at_have` |
+| at completion | `req_done`, `done_gen` |
+| received | the requested entry count (from the intervals), and received by class |
+| served | the stored entry ids (up to 32, plus a count), and the served entry ids (up to 32, plus a count) |
+| result | the outcome, and the reason |
+
+**3. An event journal**, same sequencing and overflow rules:
+- queued and dequeued, with the peer's and the global slot occupancy;
+- skipped-at-cap (base);
+- backoff entered and expired, with the kind;
+- retirement, with its cause;
+- generation bumps, with the entry ids that caused them.
+
+It's a diagnostic view ("why is this room slow?") that also makes every proof's precondition
+observable through the shipped binary. On the base it reports the fields that exist there: sessions,
+refusals, skips, generations.
 
 ## Scope and release
 
 **Proposed: v0.2.10; the decider decides.**
-- **Defects in shipped code**, which belong in v0.2.10 under the every-known-defect rule:
-  - the slot-cap skip (D6), once P2 measures it on the base;
-  - a truncated serve counted as done (D3);
-  - a partial apply that fails and doesn't wake the other peers (D3);
-  - a receiver that accepts entries it didn't ask for (D3's coverage). That last one is a
-    **security-relevant** gap found by the review.
-- **The collision change (D4, D5) is an improvement to a mechanism that works** with #180. It removes
-  ~2.3 refused streams per simultaneous round and the random wait. That is the decider's *"we can do
-  better"*.
-- The port (D1–D3) is what the defect fixes need, and keeping the jitter alive inside it would be the
-  stacked-mechanism trap.
-- The persistent stream stays a v0.3.0 candidate.
+- **Defects:**
+  - the slot-cap skip, once S0c measures it;
+  - a truncated serve counted as done;
+  - a failed partial apply not waking the room's other peers;
+  - the receiver storing entries it didn't ask for, which is **security-relevant**;
+  - an honest pair retrying zero-progress sessions without pacing, once C removes the refusal that
+    hides it;
+  - separately, **#212**.
+- **Improvement:** the collision change (D4, D5), which removes ~2.3 refused streams per simultaneous
+  round and the random wait.
 
-## Proof (real binaries only; timing runs take the timing lock; each prints its counts)
+## Proof (real binaries; the timing lock; counts printed)
 
-"The base" is #180+#202 with S0b. **No proof claims base-red until it has been run on the base**: the
-column says what the analysis predicts, and S5 replaces each prediction with the measurement. A proof
-whose precondition (a saturation, a refusal, a boundary) is not observed in its own log fails as
-**CANNOT MEASURE**, never as green.
+**How to read the table:**
+- **"Base"** is #180+#202 with S0b.
+- **Nothing is claimed red on the base until S0c has measured it.**
+- **A proof that doesn't observe its precondition** in the journals fails as **CANNOT MEASURE**, never
+  green.
+- **A journal gap or overflow** during a proof is also CANNOT MEASURE.
 
-| # | Proof | Precondition it must observe | Asserts | Base (predicted) | Mutant that must turn it red |
-|---|---|---|---|---|---|
-| P1 | `simultaneous_posts_never_collide`: 2 daemons + anchor, 40 barrier-synchronised rounds | at least 20 rounds in which both members' sessions for the pair overlap in time, from the session log | `busy-refused = 0`; every post read by the other within 250 ms of `vox room post` returning (p100, loopback, one host); **every session in the log is justified** (it started while its port needed one: a generation or request newer than the port's last completion) | red: refusals > 0 | busy refusal restored at the inbound check |
-| P2 | `a_burst_past_the_slot_cap_is_queued`: 2 daemons, **no anchor**, 40 rooms; only Alice posts, once in each room at once; both fingerprint orientations | at least one port recorded as queued while 4 of that peer's slots were in use | every post read by Bob within 2 s | predicted red at ~30 s by the traced path; to be measured | `try_acquire`-or-skip restored |
-| P3 | `a_long_backlog_catches_up`: Bob offline while Alice posts 3,000 small entries, and separately 70 entries of 1 MiB (past `MAX_SERVE_BYTES`); both orientations | at least 2 truncated sessions in Bob's log | Bob holds every entry within 20 s of starting | to be measured (`applied > 0` may rescue it) | receive coverage **and** the `applied > 0` re-owe both removed |
-| P4 | `a_refused_entry_is_asked_again`: Carol joins through Alice and posts at once | Bob's log shows an `unadmitted` class for Carol's post | Bob reads it within 2 s of that session's end | to be measured | the `unadmitted` request removed (D3 row 3) |
-| P5 | `a_post_after_have_follows`: Alice posts repeatedly while sessions run | a session whose `gen_at_have` is below a post's generation and that did not carry that post | that post arrives within 250 ms | **green**: `pending_push` rescues it. **It is a mutant guard only** | `done_gen` taken at `SyncDone` instead of at `HAVE` |
-| P6 | vox-0e's gate (`test/two-member-collisions` 3bb6ca1): 2 members, anchor stopped, 60 rounds | as P1 | `busy-refused = 0`, every post within its bound | red: 702–703 refusals per 300 rounds measured | as P1 |
-| P7 | `a_stale_session_changes_nothing`: Bob is `SIGSTOP`ped mid-session, a new Bob starts under the same identity on another data dir clone, Alice syncs with the new Bob, then the old Bob is killed | Alice's log: an attempt on the old incarnation ending **after** an attempt on the new one started | `stale ≥ 1`; never two concurrent outbound attempts on one port; posts flow both ways throughout | to be measured | tokens ignored at `SyncDone` |
-| P8 | `a_backed_off_peer_is_retried_when_due`: Bob down for 5 s, then back | Alice's log shows backoff entered | Alice's post reaches Bob within 9 s of his return; the tick excluded (bound < 30 s) | to be measured | `BackoffExpired` removed (only the tick wakes it) |
-| P9 | `an_entry_that_was_not_asked_for_is_refused`: a mutant **sender** binary serves one extra entry outside the `WANT` | the extra entry is visible in the sender's own log | the receiver fails that session as a protocol violation and does not store the entry | red: the base stores it | coverage check removed |
-| — | existing: `a_dead_member_does_not_stall_the_room`, R40 relayed and direct, `a_new_member_is_seen_promptly` | — | unchanged bounds | — | — |
-| — | #202's proof, **rewritten**: with no busy refusals left, it forces a real failure (an anchor that keeps no log for the room) and asserts the named reason (`EpochMismatch`'s text) on that pair | the refusal in the log | reason named; no governance/malformed text | red on the #202 base's own mutants | the governance wrapper restored; the uninformative code for a room peer restored |
+| # | Proof | Precondition (from the journals) | Asserts | Mutant that must turn it red |
+|---|---|---|---|---|
+| P1 | `simultaneous_posts_never_collide`: 2 daemons + anchor, 40 barrier-synchronised rounds | ≥ 20 rounds in which the pair's opposite-direction sessions overlap in time | `busy-refused = 0`; each post read by the other ≤ 250 ms after `vox room post` returns (p100, loopback); **every outbound session is justified by the opener's own journal** (at admission, `req_gen > req_done` or a generation bump since `done_gen`) and every inbound session is matched to a justified outbound in the peer's journal (direction-aware, glm-5.3) | busy refusal at the inbound check restored |
+| P2 | `a_burst_past_the_slot_cap_is_queued`: 2 daemons, no anchor, 40 rooms, only Alice posts, once in each room at once | base: a skipped-at-cap event; change: a queued event with the peer's occupancy = 4 | each post read by Bob ≤ 2 s | `try_acquire`-or-skip restored |
+| P3 | `a_long_backlog_catches_up`: Bob offline; Alice posts (a) 3,000 small entries, (b) 140 × 1 MiB; then Bob starts | (a) ≥ 2 partial completions; (b) ≥ 2 partial completions (140 MiB > 2 × 64 MiB) | Bob holds every entry ≤ 20 s after starting; ≥ 1 of Alice's `stored` ids per partial session in Bob's journal | receive coverage **and** the `applied > 0` re-owe removed |
+| P4 | `a_refused_entry_is_asked_again`: Carol joins through Alice and posts at once | Bob's journal: a session with an `unadmitted` class; **no other outbound from Bob between it and the retry** except the one it raised | Bob reads Carol's post ≤ 2 s after that session ends | the `unadmitted` request removed |
+| P5 | `a_post_after_have_follows`: Alice posts while sessions run | a session with `t_have` before the post's generation bump (from the event journal's entry id) and without that id in its served ids | the post arrives ≤ 250 ms after `vox room post` | `done_gen` taken at `SyncDone` instead of `HAVE` (a **mutant guard**: the base passes via `pending_push`) |
+| P6 | vox-0e's gate (3bb6ca1): 2 members, anchor stopped, 60 rounds | as P1 | `busy-refused = 0`; every post within its bound | as P1 |
+| P7 | `a_retired_attempt_frees_its_port`: Bob `SIGSTOP`ped mid-session; Bob's connection is then filed dead (Alice's `SILENCE_IS_DEATH`); a new Bob starts; the old Bob is killed | Alice's journal: an attempt retired by connection death, then a new outbound on the new connection | the new outbound opens within 2 s of the new connection; **never two unfinished outbound attempts on one port** (journal overlap check); the slot occupancy returns to its prior value | retirement removed (a stale attempt stays in `out`: no new outbound, red); **and** the stale-result guard removed entirely (the old `SyncDone` clears the new attempt, so two outbound overlap, red) |
+| P8 | `a_backed_off_peer_is_retried_when_due`: Bob down 5 s, then back | Alice's journal: backoff `Unreachable` entered, then expired | **Alice's own outbound** (direction checked, kimi-k3 and glm-5.3) completes clean ≤ 9 s after Bob returns | `BackoffExpired` removed |
+| P9 | `an_entry_that_was_not_asked_for_is_refused`: a mutant sender binary serves one entry outside the `WANT` | that id in the sender's served ids | the receiver's session fails with `ProtocolViolation`; the id is absent from its stored ids and from `vox room read` | the coverage check removed |
+| P10 | `a_peer_that_serves_nothing_is_paced`: a mutant sender binary advertises a tail and serves nothing | the receiver's partial, no-progress completions | ≤ 6 sessions to that peer in 30 s; backoff `NoProgress` entered | the no-progress backoff removed (dozens of sessions, red) |
+| — | #202's proof, **rewritten**: a real failure named on its pair. The setup makes `owed_a_reason` hold: the refusing anchor has the member's record on its board and keeps no log for the room (glm-5.3, kimi-k3). The refusal's reason is observed in the journal | the refusal | the named reason, with no governance or malformed text | the governance wrapper; the uninformative code for a room peer |
+| — | existing: `a_dead_member_does_not_stall_the_room`, R40, `a_new_member_is_seen_promptly` | | unchanged | |
 
-**Not covered, and said so:** a stalled peer holds its slots until its frame timeout. D6's per-peer cap
-bounds the harm, and no proof asserts a delivery bound for the seventeenth *stalled* peer.
+P9 and P10 need a *mutant sender*, a deliberately misbehaving build of the shipped binary. That is how
+the product's defence against a faulty peer is proved through real use.
 
 ## Plan
 
 | Step | Work | Depends on |
 |---|---|---|
-| S0 | #180 and #202 integrated into `integrate/v0.2.10` | — |
-| S0b | Observability: counters, session log, generation in `vox status --json` (vox-0e offered to own it and P6) | S0 |
-| S0c | **Measure the base**: P1, P2, P3, P4, P7 and P8 run on the base, and the table's predictions are replaced with the numbers | S0b |
-| S1 | Generation with `HAVE`; kept `WANT`; receive coverage and classes; `SyncOutcome` extended | S0 |
-| S2 | `Port` with tokens, requests and incarnations; the maps migrated; triggers only raise (D1–D3) | S1 |
-| S3 | Inbound admission and holding (D4); `BackoffExpired`; jitter, `QUICK_PUSH_RETRIES` and `PushRetry` deleted (D5) | S2 |
-| S4 | Per-peer slot cap, round-robin and tail requeue (D6) | S2 |
-| S5 | P1–P9 on the change: red where the base measured red, each mutant red; the existing proofs re-run | S3, S4, S0c |
-| S6 | Independent verifier; ADR-016's sync section points here | S5 |
+| S0 | #180, #202 integrated | — |
+| S0b | observability (counters, both journals) on the base | S0 |
+| S0c | the base measured: P1–P4 and P6–P8 run, predictions replaced with numbers | S0b |
+| S1 | generation with `HAVE`; interval coverage and classes (including the `NotAdmitted` split); `SyncOutcome` extended | S0 |
+| S2 | `Port`, tokens, requests, retirement (D1, D1a, D2); the maps migrated | S1 |
+| S3 | admission (D4), backoff kinds and wakeup (D5), `schedule()` points (D6a); jitter and `PushRetry` deleted | S2 |
+| S4 | per-peer slot cap, round-robin, tail requeue (D6) | S2 |
+| S5 | P1–P10 on the change; each mutant red; existing proofs re-run | S3, S4, S0c, **#212** |
+| S6 | independent verifier; ADR-016's sync section points here | S5 |
 
-One branch, `fix/adr025-sync-ports`, off `integrate/v0.2.10` after S0. Tracked as one v0.2.10 item
-(V210-34) with S0b–S6 as its checklist. D3's coverage check (P9) could land first on its own if the
-decider wants the security gap closed before the rest.
+One branch, `fix/adr025-sync-ports`, tracked as V210-34 (#209).
 
 ## What each review changed
 
-**Round 1 → revision 2** (astra BLOCK, glm REVISE, kimi REVISE):
-- tokens added;
-- D3 limited to what the local side observes;
-- an explicit request flag added;
+**Round 1 → 2:**
+- tokens;
+- local-only conclusions;
+- request flags;
 - `AWAIT_KEEPER` removed;
-- outbound-only slots and tail requeue;
-- the proof table rebuilt;
+- outbound-only slots;
+- the proofs rebuilt;
 - the false `room_in_session` claim removed;
-- options compared;
-- the code's defence of skipping quoted in full.
+- options compared.
 
-**Round 2 → revision 3** (astra BLOCK; glm and kimi unavailable):
+**Round 2 → 3:**
+- option C;
+- request capture and consumption;
+- position-matched coverage;
+- per-peer slot cap;
+- the session log;
+- citations prefixed by tree.
 
-| Finding (astra round 2) | Change |
-|---|---|
-| 1. The designated opener's next session can meet the other end still applying, so busy refusals return | option C: inbound is never refused, `INBOUND_PER_PORT = 2` covers turnover, past it the stream is held |
-| 2. `owed` and notify lifecycle incomplete (Running, Backoff, failed or dropped notify, manual override, epoch, reconnect) | no notify exists under C; requests are captured at admission and consumed at completion (D2); `BackoffExpired`; the manual sync clears backoff; epoch and incarnation rules |
-| 3. Count ≠ coverage (duplicate substitution); permanent refusals can re-serve the same prefix forever | position-matched coverage, entry classes, a per-epoch excluded set that later `WANT`s skip |
-| 4. Anchors as opener; the higher end's member learning; command waiters; the uni accept path; slot saturation | C keeps anchors' and members' paths as they are, and the retry opens an outbound, whose setup already learns members; `vox room sync` keeps its semantics; no uni stream; per-peer slot cap |
-| 5. Notify amplification | no notify; an inbound flood is bounded by the per-port admission limit, and holding |
-| 6. Proofs lacked observed preconditions and measured base results | S0b session log; every proof must observe its precondition or report CANNOT MEASURE; S0c measures the base before any base-red claim; P7–P9 added |
-| 7. D2's condition must be exact and atomic | stated with `gH + nP` checked at completion in the same epoch |
-| 8. Citations from the wrong tree | every line prefixed `180:` or `202:` and re-checked |
-| Nit: "exactly one" | "at most one outbound from each end" |
+**Round 3 → 4** (astra, glm-5.3 and kimi-k3, all BLOCK):
+
+| Finding | Reviewers | Change |
+|---|---|---|
+| A stale result was filtered but never retired, so the port wedged for good | all | D1a: retirement aborts the task and drops the permit exactly once; displaced connections are not deaths |
+| The bilateral serve-before-drain deadlock | all | own item V210-39 (#212): concurrent serve and drain; S5 depends on it |
+| The held queue was unbounded, could time out correct peers, and was a flood target | all | held queue removed; `INBOUND_PER_PORT = 3`, then an immediate `SessionBusy` with D5 kind `Busy` |
+| Zero-progress retries looped forever | all | D3 progress rule; D5 kind `NoProgress`; P10 |
+| Coverage as per-position sets was unbounded | astra, glm | interval arithmetic |
+| Classes weren't computable: frozen vs unadmitted, "revoked", poison, `NotAdmitted` failing the session | glm, kimi | classes table from real predicates; the `NotAdmitted` split and the continue-instead-of-fail semantics marked as code changes; "revoked" dropped; poison → the port is `poisoned` with no retry |
+| Scheduler evaluation points | kimi | D6a |
+| `done_gen` not monotonic; `failures` reset; backoff across an epoch; a permanent refuser every 8 s | all | D2 max-credit; D5 reset and clearing; kind `Policy` at 30 s |
+| "At most two" understated | glm, kimi | stated per end: 1 out + 3 in |
+| S0b couldn't observe the preconditions; a 64-entry log could evict silently | all | S0b derived from the proofs: two sequenced journals with overflow counters and the listed fields |
+| P1's justification was not direction-aware; P3's byte leg made only one truncation; P7's and P8's mutants stayed green; the #202 rewrite missed `owed_a_reason` | glm, kimi | each row fixed as described |
+| P2's "orientations" was left over from option A | kimi | removed |
+| The consent bullet read as today's behaviour | glm, kimi | marked as a planned change against today's room-only keying |
+| D6's limit named the wrong case | glm | stated: stalled peers can starve a live one until timeout, and it's not fixed here |
