@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use world::{args, lossy_proxy, vox_once, PathKind, Setup, World};
+use world::{args, lossy_proxy, vox_once, PathKind, Setup, VoxProc, World};
 
 /// What the test DNS responder answers every `A` query with.
 const ANSWER: [u8; 4] = [10, 53, 0, 1];
@@ -433,9 +433,19 @@ fn denied(path: PathKind) {
         seen, 0,
         "the host's service must see zero packets from an untrusted joiner"
     );
-    let why = fwd.expect_within(Duration::from_secs(10), "the refusal, on stderr", |l| {
+    // A missing refusal has two sides; the forward's alone cannot say which one went quiet,
+    // so a failure prints what the host and the anchor said too.
+    let Some(why) = fwd.wait_for(Duration::from_secs(10), |l| {
         l.starts_with("! ") && l.contains("the host refused")
-    });
+    }) else {
+        let host = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();
+        panic!(
+            "proof 2 ({path:?}): no refusal on the forward's stderr within 10s.\nThe forward \
+             said:\n{}\nThe host said:\n{host}\nThe anchor said:\n{}",
+            fwd.transcript(),
+            w.anchor.transcript()
+        );
+    };
     eprintln!("[test] proof 2 ({path:?}): the forward said: {why}");
     check_path(&mut w);
 }
@@ -558,6 +568,10 @@ fn untrusting_the_dialer_stops_its_udp_within_a_second_relayed() {
 const BLAST_EVERY: Duration = Duration::from_millis(10);
 const BLAST_COUNT: u32 = 400;
 const BLAST_WARMUP: u32 = 100;
+/// How many bytes over the commonest size a packet may be and still be counted as carrying one
+/// numbered datagram: an acknowledgement frame riding with it adds 6–9 (measured 268–271 against
+/// 262).
+const CARRIER_SLACK: usize = 16;
 
 /// Proof 5: a relay leg that loses every 10th datagram, 20 ms each way; a numbered stream
 /// through a UDP forward; the sink reports loss and the longest gap between arrivals.
@@ -581,7 +595,8 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
             }
         });
     }
-    type Knobs = Option<(Arc<AtomicU64>, Arc<AtomicU64>)>;
+    type Sizes = Arc<Mutex<Vec<(usize, bool)>>>;
+    type Knobs = Option<(Arc<AtomicU64>, Arc<AtomicU64>, Sizes)>;
     let lossy: Arc<Mutex<Knobs>> = Arc::default();
     let lossy_in = Arc::clone(&lossy);
     let mut w = World::build(&Setup {
@@ -589,8 +604,8 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
         trusted: true,
         path: PathKind::Relayed,
         guest_leg: Some(Box::new(move |anchor| {
-            let (addr, count, knob) = lossy_proxy(anchor, Duration::from_millis(20));
-            *lossy_in.lock().unwrap() = Some((count, knob));
+            let (addr, count, knob, sizes) = lossy_proxy(anchor, Duration::from_millis(20));
+            *lossy_in.lock().unwrap() = Some((count, knob, sizes));
             Some(addr)
         })),
     });
@@ -612,7 +627,7 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
     // The loss starts now, not during setup: joining over a lossy leg is its own open
     // defect (ADR-018, a joining node holding its actor for 30 s), and this proof is about
     // what the relay does to traffic, not about joining.
-    let (dropped, knob) = lossy.lock().unwrap().clone().unwrap();
+    let (dropped, knob, sizes) = lossy.lock().unwrap().clone().unwrap();
     knob.store(10, Ordering::Relaxed);
     // And congestion control is given the loss to settle on before anything is measured:
     // both connections' windows fall to their floor within the first second or so of a new
@@ -632,6 +647,7 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
     std::thread::sleep(Duration::from_millis(500));
     arrivals.lock().unwrap().clear();
     let proxy_drops_before = dropped.load(Ordering::Relaxed);
+    let sizes_before = sizes.lock().unwrap().len();
 
     let start = Instant::now();
     for seq in 1..=BLAST_COUNT {
@@ -646,6 +662,37 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
     std::thread::sleep(Duration::from_secs(2));
     let got = arrivals.lock().unwrap().clone();
     let proxy_drops = dropped.load(Ordering::Relaxed) - proxy_drops_before;
+    let window: Vec<(usize, bool)> = sizes.lock().unwrap()[sizes_before..].to_vec();
+    // Every numbered datagram is the same 200 bytes, so every packet that carries one on
+    // the leg is the same size: the commonest size the leg passed in the window.
+    let mut passed: std::collections::BTreeMap<usize, usize> = Default::default();
+    let mut lost_sizes: std::collections::BTreeMap<usize, usize> = Default::default();
+    for (n, lose) in &window {
+        *(if *lose { &mut lost_sizes } else { &mut passed })
+            .entry(*n)
+            .or_default() += 1;
+    }
+    let carrier = passed
+        .iter()
+        .max_by_key(|(_, c)| **c)
+        .map(|(n, _)| *n)
+        .unwrap_or_default();
+    // A packet that carries a numbered datagram is that size, or a few bytes more when an
+    // acknowledgement frame rides with it (measured: 262 bytes, and 268–271). Nothing smaller
+    // can hold one — the rest are the outer and inner connections' own acknowledgements, 30–66
+    // bytes — and a much larger packet is something else, or several datagrams coalesced.
+    let band = carrier..=carrier + CARRIER_SLACK;
+    let carrying_drops: u64 = lost_sizes
+        .iter()
+        .filter(|(n, _)| band.contains(n))
+        .map(|(_, c)| *c as u64)
+        .sum();
+    eprintln!(
+        "[test] proof 5: the leg's datagrams by size in the window — passed {passed:?}, \
+         dropped {lost_sizes:?}; a numbered datagram rides in {carrier} bytes, and \
+         {carrying_drops} of the {proxy_drops} drops were {carrier}–{} bytes",
+        carrier + CARRIER_SLACK
+    );
     let received = got.len();
     let measured: Vec<&(u32, Instant)> = got.iter().filter(|(s, _)| *s > BLAST_WARMUP).collect();
     let max_gap = measured
@@ -691,12 +738,23 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
         proxy_drops > 0,
         "the lossy leg must actually have dropped something, or this measured nothing"
     );
+    assert!(
+        carrier >= 200,
+        "CANNOT MEASURE: the commonest packet on the leg was {carrier} bytes, too small to hold \
+         a 200-byte numbered datagram — the window carried something other than the stream"
+    );
     // **Every dropped datagram stays dropped**, which is the whole claim: nothing
     // retransmits it, so nothing can be held behind its retransmission. With the stream
     // carriage restored as a mutation, the outer stream retransmits every loss — 400 of 400
-    // arrive — and later datagrams wait behind each one. The proxy also drops the outer
-    // connection's own packets (acknowledgements, the inner handshake's), so not every one
-    // of its drops costs a numbered datagram; at least half must.
+    // arrive — and later datagrams wait behind each one.
+    //
+    // **Counted per packet that carried one, not per drop** (#161). The proxy drops every
+    // tenth packet on the leg, acknowledgements included, and which packets that lands on
+    // depends on how the ten lines up with the traffic: one run lost 17 datagrams for 50
+    // drops, and the old bound ("at least half the drops") failed it, while its 50 drops were
+    // 36 acknowledgements and 14 datagram-sized packets — 14 lost for 14 carried, nothing
+    // recovered. Measured over five runs: lost 14/40/30/49/48 for 14/40/30/49/44 datagram-sized
+    // drops. So a drop of a packet that carried a datagram must cost one, every time.
     //
     // The gaps and latencies are printed, not bounded: congestion control on the outer and
     // inner connections, reacting to a 10% loss rate, holds and releases datagrams on its
@@ -704,8 +762,12 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
     // ~100 ms with no stream anywhere in the path.
     let lost = BLAST_COUNT as usize - received.min(BLAST_COUNT as usize);
     assert!(
-        lost as u64 * 2 >= proxy_drops,
+        carrying_drops > 0,
+        "CANNOT MEASURE: none of the {proxy_drops} drops was a packet that carried a datagram"
+    );
+    assert!(
+        lost as u64 >= carrying_drops,
         "a relay must lose what the lossy leg drops, not recover it: {lost} lost for \
-         {proxy_drops} dropped on the leg"
+         {carrying_drops} datagram-carrying packets dropped on the leg"
     );
 }

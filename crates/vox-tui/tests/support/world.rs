@@ -310,9 +310,12 @@ pub fn respec(spec: &str, addr: SocketAddr) -> String {
 
 /// A UDP proxy on IPv4 loopback in front of `upstream`: every datagram crosses it after
 /// `delay`, and while `drop_every` is non-zero every `drop_every`-th one from the client
-/// side is lost. Returns its address, the count of datagrams it dropped, and the knob —
-/// so a proof can let setup through clean and switch the loss on for the measurement. One
-/// upstream socket per client address, as a NAT would.
+/// side is lost. Returns its address, the count of datagrams it dropped, the knob — so a
+/// proof can let setup through clean and switch the loss on for the measurement — and, for
+/// every datagram from the client side while the knob is on, its size and whether it was
+/// dropped: the drops are every Nth *packet*, acknowledgements included, so only the sizes
+/// say how many of them carried what a proof counts. One upstream socket per client
+/// address, as a NAT would.
 #[must_use]
 pub fn lossy_proxy(
     upstream: SocketAddr,
@@ -321,6 +324,7 @@ pub fn lossy_proxy(
     SocketAddr,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
+    std::sync::Arc<std::sync::Mutex<Vec<(usize, bool)>>>,
 ) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -331,6 +335,8 @@ pub fn lossy_proxy(
     let counted = Arc::clone(&dropped);
     let knob = Arc::new(AtomicU64::new(0));
     let every = Arc::clone(&knob);
+    let sizes: Arc<std::sync::Mutex<Vec<(usize, bool)>>> = Arc::default();
+    let sized = Arc::clone(&sizes);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -369,7 +375,14 @@ pub fn lossy_proxy(
                 };
                 seen += 1;
                 let drop_every = every.load(Ordering::Relaxed);
-                if drop_every > 0 && seen.is_multiple_of(drop_every) {
+                let lose = drop_every > 0 && seen.is_multiple_of(drop_every);
+                if drop_every > 0 {
+                    sized
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((n, lose));
+                }
+                if lose {
                     counted.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -381,7 +394,7 @@ pub fn lossy_proxy(
             }
         });
     });
-    (addr, dropped, knob)
+    (addr, dropped, knob, sizes)
 }
 
 /// The host's handshake bound (`HANDSHAKE_TIMEOUT`, 30 s) with a margin. See [`World::new`].
@@ -556,7 +569,14 @@ impl World {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(0),
         };
-        let (ok, _, out, err) = w.join(&w.guest_dir);
+        let (ok, took, out, err) = w.join(&w.guest_dir);
+        // Printed pass or fail: V210-04 (#161) is judged on every run's setup time, not only on
+        // the runs where it went wrong.
+        eprintln!(
+            "[setup] vox connect {} after {took:?} ({:?})",
+            if ok { "joined" } else { "FAILED" },
+            setup.path
+        );
         assert!(ok, "vox connect failed.\nstdout:\n{out}\nstderr:\n{err}");
         w
     }
