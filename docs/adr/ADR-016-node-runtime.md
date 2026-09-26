@@ -976,8 +976,17 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     reconciling the same room with each other at once, and a pair is what it keys on.
   - Sessions with different peers run side by side. Each takes the room's lock inside one protocol
     step at a time, never across the network (`ChannelState::sync_over_room`).
-  - Work that must not wait on a room held by any session (the anchor publish, `note_new_members`)
-    asks `room_in_session`.
+  - The anchor publish and `note_new_members` are **not** deferred while sessions run. They used to
+    be owed until the room had no session at all, which was right while a session held the lock for
+    its whole run. Once sessions lock per step and overlap per peer, a busy room need never be
+    session-free, and the owed publish could wait indefinitely while joiners read a stale board
+    (agent_comms's review of 33da864). The deferral is removed; the actor waits at most one step.
+    An explicit consent's retry rides the next `SyncDone` of a session **with its target**
+    (`in_session_with`), not of any session on the room.
+    - Not gated red-first. On today's tree the anchor learns a joiner from its own copy of the log,
+      so no anchor-visible change depends on a busy member's publish: a busy-room gate stayed green
+      before and after (5 of 5 on 33da864 and 69aaff5). It can bite once anchors store nothing
+      (ADR-023 M23.5). The regression checks are the dead-member and new-member gates.
 
   Gate `crates/vox-tui/tests/a_dead_member_does_not_stall_the_room_proof.rs` (a real anchor and three
   real daemons; Carol's daemon killed by PID; five posts from Alice timed to Bob's `vox room read`,

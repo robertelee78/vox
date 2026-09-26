@@ -1738,16 +1738,10 @@ pub struct Node {
         quinn::SendStream,
         quinn::RecvStream,
     )>,
-    /// Rooms whose anchor publish found them mid-session: run when that session's `SyncDone`
-    /// lands. See `publish_channel_to_anchors`.
-    publish_owed: std::collections::BTreeSet<Digest32>,
     /// Per room, the members this node's board has held a bundle record for. A record from an
     /// author not in it is a member this node has just learned of, which is what
     /// `note_new_members` passes on at once; a refresh of a known member's record is not.
     board_authors: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
-    /// Rooms whose board grew while a session held them: `note_new_members` runs when that
-    /// session's `SyncDone` lands, like `publish_owed`.
-    growth_owed: std::collections::BTreeSet<Digest32>,
     /// `(room, board)` publish rounds in flight on their own tasks; see `publish_channel_to_anchor`.
     publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// Publishes asked for while that `(room, board)` round was in flight: run when it ends.
@@ -1949,9 +1943,7 @@ impl Node {
             syncing: std::collections::BTreeSet::new(),
             joining: std::collections::BTreeSet::new(),
             held_pairwise: Vec::new(),
-            publish_owed: std::collections::BTreeSet::new(),
             board_authors: BTreeMap::new(),
-            growth_owed: std::collections::BTreeSet::new(),
             publishing: std::collections::BTreeSet::new(),
             publish_again: std::collections::BTreeSet::new(),
             publish_waiters: Vec::new(),
@@ -2949,20 +2941,13 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        // **Never wait on a room a session holds.** Building the records takes the room's lock, and
-        // a sync session holds that lock for its whole run on a blocking thread — bounded only by
-        // the 20s frame timeout when the peer is slow. Measured through the real binaries with the
-        // wait timed: `publish waited 19.9987s for the ROOM lock`, against `busy 20005ms — passing on
-        // a record that landed on our board`, while every put on the wire took under 22ms. It was
-        // also half of a cycle: this actor waiting on its room, whose session waited on a peer
-        // whose actor was waiting the same way, broken only by the frame timeout.
-        //
-        // Owed instead, and run the moment that session's `SyncDone` lands — still on the actor, so
-        // anything that follows a publish still follows it.
-        if self.room_in_session(channel_id) {
-            self.publish_owed.insert(*channel_id);
-            return;
-        }
+        // **Not deferred while a session runs.** This used to be owed until the room had no
+        // session at all, because a session held the room's lock for its whole run (measured:
+        // `publish waited 19.9987s for the ROOM lock`). Since 3f95b57 a session takes the lock
+        // per protocol step and never across I/O, so the wait here is one step. Deferring had
+        // become the hazard instead: with sessions guarded per (room, peer) (#180), sessions
+        // with different members overlap, a busy room is never session-free, and the owed
+        // publish could wait indefinitely while joiners read a stale board.
         let anchors: Vec<Arc<VoxConnection>> = self
             .anchor_ids
             .iter()
@@ -3439,12 +3424,6 @@ impl Node {
                 if !self.pending_push.is_empty() {
                     // A push that found this room mid-session is owed; the room is free now.
                     self.push_now = true;
-                }
-                if self.publish_owed.remove(&channel_id) {
-                    self.publish_channel_to_anchors(&channel_id).await;
-                }
-                if self.growth_owed.remove(&channel_id) {
-                    self.note_new_members(&channel_id).await;
                 }
                 self.refresh_network_view().await;
                 if let Ok(o) = outcome {
@@ -4360,10 +4339,12 @@ impl Node {
             .as_ref()
             .is_some_and(|n| n.manager().existing(&target).is_some());
         if connected {
-            // Started or not (the room may be mid-session with somebody else), the retry rides the
-            // room's next `SyncDone`.
+            // Started or not (a session with this same member may already be running), the retry
+            // rides the next `SyncDone` of a session **with the target**. Checking for any session
+            // on the room kept a consent waiting on sessions with other members, which, now that
+            // sessions are guarded per (room, peer), need never all end.
             let _ = self.sync_one(&channel_id, target).await;
-            if !self.room_in_session(&channel_id) {
+            if !self.in_session_with(&channel_id, &target) {
                 let _ = reply.send(outcome);
                 return;
             }
@@ -4708,11 +4689,7 @@ impl Node {
     /// member per join, over the connections it already holds, with nothing forwarded twice
     /// because a board that already holds the record does not grow.
     async fn note_new_members(&mut self, channel_id: &Digest32) {
-        // Never wait on a room a session holds; see `publish_channel_to_anchors`.
-        if self.room_in_session(channel_id) {
-            self.growth_owed.insert(*channel_id);
-            return;
-        }
+        // Not deferred while a session runs; see `publish_channel_to_anchors`.
         let (Some(net), Some(shared)) = (
             self.net.as_ref().map(Arc::clone),
             self.channels.get(channel_id).map(Arc::clone),
@@ -4746,14 +4723,6 @@ impl Node {
     /// session with that peer for that room must not start into (see `syncing`).
     fn in_session_with(&self, channel_id: &Digest32, peer: &Digest32) -> bool {
         self.syncing.contains(&(*channel_id, *peer))
-    }
-
-    /// Whether any sync session, with any peer, is running on `channel_id` (see `syncing`).
-    fn room_in_session(&self, channel_id: &Digest32) -> bool {
-        self.syncing
-            .range((*channel_id, [0u8; 32])..=(*channel_id, [0xFFu8; 32]))
-            .next()
-            .is_some()
     }
 
     /// Mark a channel as having a local append to push, and make every peer's
