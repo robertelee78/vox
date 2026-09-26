@@ -543,6 +543,29 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   UPnP-IGD was built the same day, M15.1c — its validation against real router hardware is pending,
   the network it was built on having no UPnP device to answer.)
 
+- **A failed publish round retries on its own (2026-09-25 gap; fix built 2026-09-26, #182).** A round
+  of a room's records to a board ends without them when the stream will not open, a put dies on the
+  transport, or the board answers nothing within `ANCHOR_PUBLISH_PATIENCE`. Before the fix, nothing then
+  scheduled another round. The next came only from a trigger (the board growing, a sync that applied
+  entries, a join, the room reopening, `AnchorConnected`, address discovery), and a host with a new room
+  and nobody in it has none. Now a failed round schedules a retry per (room, board) at 1, 2, 4 … 30 s,
+  each shortened by up to a quarter at random, until a round finishes. A finished round, even a refused
+  one, clears the count, and the retry is dropped if the room or the board's connection has gone. A
+  stream that will not open now says so ("no stream: …") instead of reporting nothing.
+
+  **Evidence is code review, not a red gate, and that is stated rather than hidden.** No staging a person
+  can produce makes the old code lose a room:
+  - a round that times out on a stalled but surviving connection still lands when QUIC delivers the
+    finished stream (12.0 s and 12.4 s after a stalled anchor resumed, both logging the failed round);
+  - a replaced connection republishes through `AnchorConnected`.
+  A lost round needs a surviving connection, nothing in flight and no trigger. In practice that means a
+  stream that never opens because the connection's stream credit is exhausted, which nothing outside
+  the product can force. The fix is additive (it can only add rounds) and bounded (one pending retry per
+  pair, capped at 30 s), the same footing as #203's follow-up and #208's seal. One unexplained join in
+  the relayed-restart gate found its anchor's board without the room (1 in 12 runs, none in 60 focused
+  publish-landing trials). It is tracked as a lost event (#182), measured separately, and not attributed
+  to this gap.
+
 - **A dial that failed reported nothing (2026-09-23).** Connecting runs the ladder with all of its
   timeouts and the actor may not await that, so every dial is spawned and its result returned through
   a channel. Three of those spawns kept the connection on success and dropped the `Err`: the startup
