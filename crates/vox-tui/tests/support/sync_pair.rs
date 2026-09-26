@@ -181,13 +181,19 @@ impl Member {
 
     /// Start this member's daemon, optionally behind `anchor`, and wait until it answers.
     pub fn daemon(&self, anchor: Option<&str>) -> Proc {
+        self.daemon_bin(VOX, anchor)
+    }
+
+    /// [`Member::daemon`], running the daemon from another build of `vox` (a mutant sender that
+    /// plays a faulty peer, for the proofs that need one).
+    pub fn daemon_bin(&self, bin: &str, anchor: Option<&str>) -> Proc {
         let mut argv = vec!["daemon", "--listen", "127.0.0.1:0"];
         if let Some(a) = anchor {
             argv.extend(["--anchor", a]);
         }
         let pass = self.pass.to_str().unwrap().to_owned();
         argv.extend(["--passphrase-file", &pass]);
-        let mut child = Command::new(VOX)
+        let mut child = Command::new(bin)
             .args(&argv)
             .env("VOX_DATA_DIR", &self.dir)
             .env("VOX_CONFIG_DIR", self.dir.join("cfg"))
