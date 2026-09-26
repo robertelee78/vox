@@ -641,7 +641,12 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
             c => text.push(c),
         }
     }
-    format!("{} {} {}", id(&r.entry_hash), short(&r.author), text)
+    format!(
+        "{} {} {}",
+        id(&r.entry_hash),
+        crate::ident::author_id(&r.author),
+        text
+    )
 }
 
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
@@ -1100,7 +1105,7 @@ fn report(
 }
 
 fn who(o: &Owner) -> String {
-    format!("{}/{}", &claim::b32(&o.author)[..12], o.session)
+    format!("{}/{}", crate::ident::author_id(&o.author), o.session)
 }
 
 fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, AppError> {
@@ -1179,7 +1184,7 @@ pub async fn claim_resource(
             false,
             format!(
                 "{resource} is reserved by a handoff for {}{} — you did not get it",
-                &claim::b32(to_fp)[..12],
+                &crate::ident::author_id(to_fp),
                 to_session
                     .as_ref()
                     .map(|s| format!("/{s}"))
@@ -1316,7 +1321,7 @@ pub async fn handoff_resource(
         opts,
         claim::HANDOFF,
         data,
-        format!("handing {resource} to {}", &claim::b32(&to_fp)[..12]),
+        format!("handing {resource} to {}", crate::ident::author_id(&to_fp)),
     )
     .await?;
     let (ok, said) = match (&done.outcome, done.posting.after.fold.resources.get(resource)) {
@@ -1324,7 +1329,7 @@ pub async fn handoff_resource(
             true,
             format!(
                 "{resource} is reserved for {}{} until {}; it completes when that session claims it",
-                &claim::b32(&to_fp)[..12],
+                &crate::ident::author_id(&to_fp),
                 to_session.map(|s| format!("/{s}")).unwrap_or_default(),
                 millis_as_time(*deadline_millis)
             ),
@@ -1557,7 +1562,7 @@ pub async fn board(
             } => format!(
                 "{resource}\tpending handoff from {} to {}{}{} (lapses in {}s)",
                 who(from),
-                &claim::b32(to_fp)[..12],
+                &crate::ident::author_id(to_fp),
                 to_session
                     .as_ref()
                     .map(|s| format!("/{s}"))
@@ -2260,7 +2265,10 @@ pub async fn trust_add(
         .await
     {
         Ok(Frame::Ok) => {
-            println!("vox: trusting {} as {petname:?}", short(&target));
+            println!(
+                "vox: trusting {} as {petname:?}",
+                crate::ident::author_id(&target)
+            );
             println!("     it may now read what you write in every room you share — now and later");
             println!("     and reach every service you bind to a room you are both in");
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
@@ -2287,7 +2295,10 @@ pub async fn trust_remove(
         .await
     {
         Ok(Frame::Ok) => {
-            println!("vox: no longer trusting {}", short(&target));
+            println!(
+                "vox: no longer trusting {}",
+                crate::ident::author_id(&target)
+            );
             println!("     your sender key is rotated and everyone still trusted is re-keyed");
             Ok(())
         }

@@ -24,6 +24,7 @@ pub mod app;
 pub mod cli;
 pub mod codex_trust;
 pub mod coord;
+pub mod ident;
 pub mod live;
 pub mod qr;
 pub mod room_cli;

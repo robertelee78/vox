@@ -104,6 +104,14 @@ jobs:
       # measured on: the app-server's `hooks/list` statuses are Codex's, not Vox's, to change.
       - name: Install the Codex the trust proof measures
         run: npm install -g @openai/codex@0.157.0 && codex --version
+      # `tui_member_names_proof` reads the real `vox tui`'s screen through the `pyte` terminal
+      # emulator, and fails as CANNOT MEASURE without it (#198). Pinned to the version it was
+      # measured on, in a venv of its own: the runners' Python is externally managed (PEP 668).
+      - name: Install the terminal emulator the TUI proof reads the screen with
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyte"
+          "$RUNNER_TEMP/pyte/bin/pip" install --quiet pyte==0.8.2
+          echo "VOX_PYTE_PATH=$("$RUNNER_TEMP/pyte/bin/python" -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Format check
