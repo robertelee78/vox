@@ -481,8 +481,9 @@ impl NodeNet {
         peer: Digest32,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
         let (kind, mut send, mut recv) = accept_typed_on(conn).await?;
-        if !PeerPolicy::allows(self.classify(&peer), kind) {
-            crate::node::net::refuse_stream(&mut send, &mut recv);
+        let class = self.classify(&peer);
+        if !PeerPolicy::allows(class, kind) {
+            crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
             return Err(crate::error::Error::StreamRefused(
                 "peer may not open this stream kind",
             ));

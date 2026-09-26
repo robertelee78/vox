@@ -1008,10 +1008,29 @@ pub async fn accept_authorized(
     let (kind, mut send, mut recv) = accept_typed(conn).await?;
     let class = policy.classify(&conn.peer_id());
     if !PeerPolicy::allows(class, kind) {
-        refuse_stream(&mut send, &mut recv);
+        refuse_disallowed(class, kind, &mut send, &mut recv);
         return Err(Error::StreamRefused("peer may not open this stream kind"));
     }
     Ok((kind, send, recv))
+}
+
+/// Refuse a stream `class` may not open as `kind`: uninformatively, except that a **pending joiner
+/// asking to sync** is told it is not a member here yet ([`WireError::NotYetMember`], #217).
+///
+/// A pending joiner holds the room's invitation, so "not a member yet" tells it nothing it did not
+/// know; told `0x05`, a member that had just joined reported an integrity failure for a record
+/// still on its way to this board. Anyone else learns nothing from the refusal.
+pub fn refuse_disallowed(
+    class: PeerClass,
+    kind: StreamKind,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+) {
+    if class == PeerClass::PendingJoiner && kind == StreamKind::Sync {
+        refuse_stream_because(send, recv, WireError::NotYetMember);
+    } else {
+        refuse_stream(send, recv);
+    }
 }
 
 /// Reset both halves of a stream with the coded rejection — the same code an
