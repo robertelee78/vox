@@ -97,6 +97,17 @@ pub enum Error {
     #[error("malformed identity bundle: {0}")]
     MalformedBundle(&'static str),
 
+    /// A message on a node's control socket could not be decoded (#211). Its own variant, never
+    /// [`Self::MalformedBundle`]: a bad or unknown IPC frame said "malformed identity bundle", which
+    /// points at identity corruption.
+    #[error("malformed control-socket message: {0}")]
+    MalformedIpc(&'static str),
+
+    /// A client sent the node a request it does not know: most often a client from another vox
+    /// version (#211).
+    #[error("the node does not know this request (the client may be a different vox version)")]
+    UnknownIpcRequest,
+
     /// A received CPace public share or the derived shared point `K` was the
     /// group identity (ADR-005 CPace `scalar_mult_vfy` MUST-abort). The session
     /// is aborted: the peer either sent a degenerate share or no agreement
