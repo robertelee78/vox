@@ -10,9 +10,16 @@
 //! would have waited a minute, and most would have escalated to SIGKILL.
 //!
 //! What it asserts: with the anchor and the host killed without warning, SIGTERM stops the
-//! daemon within [`STOP_WITHIN`], it says why it did not stop cleanly, and no process is left.
+//! daemon within [`STOP_WITHIN`], it says why it did not stop cleanly, **the profile is free
+//! the moment it has exited** — `vox trust list`, a verb that opens the profile with its own
+//! node and does not retry a busy one, run immediately, succeeds — and no process is left.
+//! That third assertion is the user-visible half of "shutting a node down releases its
+//! profile" (RP-46); the in-process `Shutdown`→`Done` contract is not something a shipped
+//! process exposes.
 //!
-//! Mutation: the unbounded `node.apply(Shutdown)` this replaced turns it red at ~60 s.
+//! Mutations: the unbounded `node.apply(Shutdown)` this replaced turns it red at ~60 s; a
+//! daemon that leaves something holding its store's lock past its own exit turns it red at
+//! the `vox trust list`, which is refused with "another vox already has this profile open".
 
 #![cfg(unix)]
 
@@ -226,6 +233,16 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     assert!(
         daemon.stdout().iter().any(|l| l.contains("shutting down")),
         "it must say it is shutting down"
+    );
+
+    // The profile is free the moment the daemon has exited: a one-shot verb that opens it
+    // with its own node, and does not retry a busy profile, run with nothing in between.
+    let (opened, said_after) = vox(&joiner_dir, &["trust", "list"], "");
+    eprintln!("[shutdown] `vox trust list` right after the exit: opened={opened}");
+    assert!(
+        opened,
+        "the profile must be free the moment the daemon has exited; `vox trust list` said: \
+         {said_after}"
     );
 
     // Nothing left behind: every process this test started is gone.

@@ -61,12 +61,15 @@ getrandom.workspace = true
 nix = { version = "0.31", default-features = false, features = ["socket", "net", "ioctl", "user", "fs"] }
 
 # `tempfile` is a normal dependency above and is in scope for the integration proofs too.
-
 [dev-dependencies]
-# The status proof forces a relayed path on vox-core's simulated NAT network
-# (`tests/support/vnet.rs`), which is written against quinn's socket traits. Same
-# workspace pin as vox-core, so it is the same quinn.
-quinn.workspace = true
+# The at-rest floor proof re-derives the vault key the binary wrote, independently of
+# vox-core, with the ADR-010 floor parameters hard-coded in the test.
+argon2.workspace = true
+hkdf.workspace = true
+aes-gcm.workspace = true
+# The R41 link emulator sizes its own UDP sockets' buffers (std cannot): a link does not drop
+# packets at a 786 KB socket, and the emulator must not either.
+socket2.workspace = true
 # Driving the TUI on a real terminal (the unread-badge proof): a pty, and a screen grid to
 # replay its output into. The workspace manifest says why each version.
 portable-pty.workspace = true

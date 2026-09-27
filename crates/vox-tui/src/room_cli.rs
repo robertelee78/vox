@@ -22,6 +22,7 @@ use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 
+use vox_core::error::{Error, IpcHandshake};
 use vox_core::hash::Digest32;
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::{b32_decode, b32_encode, B32_DIGEST_LEN};
@@ -53,21 +54,32 @@ pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
             paths.socket_file().display()
         )));
     }
-    // The cause is carried, not replaced: a refused connect, a hello that never came and a
-    // protocol mismatch all read as "nothing answered" otherwise, and one of them (a live node,
-    // answering the harness before and after) was reported as a stale socket.
+    // Each way an attach fails needs a different remedy, so each gets its own sentence
+    // (#191): they were one, "nothing answered — the node may have stopped", which is true
+    // only of a stale socket, and the actual error was thrown away.
     IpcClient::open(&sock).await.map_err(|e| {
-        AppError::Usage(format!(
-            "a control socket exists at {} but nothing answered ({e}) — the node may have \
-             stopped without cleaning up. Starting a node again replaces it.",
-            sock.display()
-        ))
+        let at = sock.display();
+        AppError::Usage(match e {
+            Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
+                "a control socket exists at {at} but nothing is listening on it ({reason}) — \
+                 the node may have stopped without cleaning up. Starting a node again replaces it."
+            ),
+            Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => format!(
+                "a control socket exists at {at}, but {h}: it may be shutting down. Try again, \
+                 or start one with `vox daemon`."
+            ),
+            Error::Ipc(h) => format!("{h}. Socket: {at}"),
+            other => format!(
+                "a control socket exists at {at} but nothing answered ({other}) — the node may \
+                 have stopped without cleaning up. Starting a node again replaces it."
+            ),
+        })
     })
 }
 
 /// Ask the node for its rooms, as `(id, local name, open)`.
 async fn rooms_of(client: &mut IpcClient) -> Result<Vec<(Digest32, String, bool)>, AppError> {
-    match client.request(&Request::Rooms).await {
+    match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => Ok(rooms),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
@@ -154,10 +166,19 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
     }
     let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
     let id = resolve_prefix(prefix, &ids)?;
+    // A closed room's name is sealed in its manifest, so a node that has not opened it does
+    // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
+    // Named by the id the operator typed a prefix of, and by its name only when there is one.
     if let Some((_, name, false)) = rooms.iter().find(|(r, _, _)| *r == id) {
+        let which = if name.is_empty() {
+            format!("room {}", b32_encode(&id))
+        } else {
+            format!("room {name:?} ({})", b32_encode(&id))
+        };
         return Err(AppError::Usage(format!(
-            "room {name:?} is not open on this node, so there is nothing to read or \
-             post — open it in `vox tui`, or start the node with it open"
+            "{which} is closed on this node, so there is nothing to read or post. A daemon \
+             reopens every room it held open, so this one was closed in `vox tui` or did not \
+             reopen. Open it in `vox tui`, or give `vox daemon` a line with its passphrase"
         )));
     }
     Ok(id)
@@ -640,7 +661,12 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
             c => text.push(c),
         }
     }
-    format!("{} {} {}", id(&r.entry_hash), short(&r.author), text)
+    format!(
+        "{} {} {}",
+        id(&r.entry_hash),
+        crate::ident::author_id(&r.author),
+        text
+    )
 }
 
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
@@ -1136,7 +1162,7 @@ fn report(
 }
 
 fn who(o: &Owner) -> String {
-    format!("{}/{}", &claim::b32(&o.author)[..12], o.session)
+    format!("{}/{}", crate::ident::author_id(&o.author), o.session)
 }
 
 fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, AppError> {
@@ -1215,7 +1241,7 @@ pub async fn claim_resource(
             false,
             format!(
                 "{resource} is reserved by a handoff for {}{} — you did not get it",
-                &claim::b32(to_fp)[..12],
+                &crate::ident::author_id(to_fp),
                 to_session
                     .as_ref()
                     .map(|s| format!("/{s}"))
@@ -1352,7 +1378,7 @@ pub async fn handoff_resource(
         opts,
         claim::HANDOFF,
         data,
-        format!("handing {resource} to {}", &claim::b32(&to_fp)[..12]),
+        format!("handing {resource} to {}", crate::ident::author_id(&to_fp)),
     )
     .await?;
     let (ok, said) = match (&done.outcome, done.posting.after.fold.resources.get(resource)) {
@@ -1360,7 +1386,7 @@ pub async fn handoff_resource(
             true,
             format!(
                 "{resource} is reserved for {}{} until {}; it completes when that session claims it",
-                &claim::b32(&to_fp)[..12],
+                &crate::ident::author_id(&to_fp),
                 to_session.map(|s| format!("/{s}")).unwrap_or_default(),
                 millis_as_time(*deadline_millis)
             ),
@@ -1593,7 +1619,7 @@ pub async fn board(
             } => format!(
                 "{resource}\tpending handoff from {} to {}{}{} (lapses in {}s)",
                 who(from),
-                &claim::b32(to_fp)[..12],
+                &crate::ident::author_id(to_fp),
                 to_session
                     .as_ref()
                     .map(|s| format!("/{s}"))
@@ -2414,7 +2440,10 @@ pub async fn trust_add(
         .await
     {
         Ok(Frame::Ok) => {
-            println!("vox: trusting {} as {petname:?}", short(&target));
+            println!(
+                "vox: trusting {} as {petname:?}",
+                crate::ident::author_id(&target)
+            );
             if full_history {
                 println!("     with full history: it may also read what you wrote before now");
             }
@@ -2437,12 +2466,7 @@ pub async fn trust_rename(
     identity_passphrase: &str,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    let entries = match client
-        .request(&Request::TrustList {
-            identity_passphrase: identity_passphrase.to_owned(),
-        })
-        .await
-    {
+    let entries = match client.trusted(identity_passphrase).await {
         Ok(Frame::Trusted { entries }) => entries,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
@@ -2492,7 +2516,10 @@ pub async fn trust_remove(
         .await
     {
         Ok(Frame::Ok) => {
-            println!("vox: no longer trusting {}", short(&target));
+            println!(
+                "vox: no longer trusting {}",
+                crate::ident::author_id(&target)
+            );
             println!("     your sender key is rotated and everyone still trusted is re-keyed");
             Ok(())
         }
@@ -2505,12 +2532,7 @@ pub async fn trust_remove(
 /// `vox trust list`, asked of the running node.
 pub async fn trust_list(paths: &Paths, identity_passphrase: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client
-        .request(&Request::TrustList {
-            identity_passphrase: identity_passphrase.to_owned(),
-        })
-        .await
-    {
+    match client.trusted(identity_passphrase).await {
         Ok(Frame::Trusted { entries }) => {
             if entries.is_empty() {
                 println!("no trusted identities");

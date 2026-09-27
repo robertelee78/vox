@@ -177,11 +177,18 @@ impl Profile {
     /// [`Error::AtRestUnlockFailed`] for a wrong passphrase or a tampered vault, and
     /// [`Error::Profile`] if the vault and the store disagree about the identity.
     pub fn verify_passphrase(&self, passphrase: &[u8]) -> Result<()> {
-        let signer = self.vault.unlock_signer(passphrase)?;
-        if signer.fingerprint() != self.fingerprint {
-            return Err(Error::Profile("vault identity does not match the store"));
+        self.passphrase_verifier().verify(passphrase)
+    }
+
+    /// What [`Profile::verify_passphrase`] needs, owned, so the check can run on a
+    /// blocking thread: it is production Argon2id, and on the node's actor it stalled every
+    /// post, read and sync on the node for as long as it took (V210-26).
+    #[must_use]
+    pub fn passphrase_verifier(&self) -> PassphraseVerifier {
+        PassphraseVerifier {
+            vault: self.vault.clone(),
+            fingerprint: self.fingerprint,
         }
-        Ok(())
     }
 
     /// Lock: drop the unlocked identity (its secrets zeroize on drop). Idempotent.
@@ -272,5 +279,27 @@ impl Profile {
     #[must_use]
     pub fn paths(&self) -> &Paths {
         &self.paths
+    }
+}
+
+/// An owned passphrase check (see [`Profile::passphrase_verifier`]).
+#[derive(Clone)]
+pub struct PassphraseVerifier {
+    vault: IdentityVault,
+    fingerprint: Digest32,
+}
+
+impl PassphraseVerifier {
+    /// Whether `passphrase` unlocks this identity's vault, and the vault is this identity.
+    ///
+    /// # Errors
+    /// [`Error::AtRestUnlockFailed`] for a wrong passphrase or a tampered vault, and
+    /// [`Error::Profile`] if the vault and the store disagree about the identity.
+    pub fn verify(&self, passphrase: &[u8]) -> Result<()> {
+        let signer = self.vault.unlock_signer(passphrase)?;
+        if signer.fingerprint() != self.fingerprint {
+            return Err(Error::Profile("vault identity does not match the store"));
+        }
+        Ok(())
     }
 }

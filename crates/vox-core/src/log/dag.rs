@@ -318,8 +318,6 @@ impl Dag {
     /// Accept an entry into the DAG, enforcing the full ADR-008 predicate.
     ///
     /// Steps, in order (any failure leaves the DAG unchanged):
-    /// 0. Governance entries must carry an attributable (composite)
-    ///    authenticator → otherwise [`Rejected::GovernanceNotAttributable`].
     /// 1. If the author is frozen, refuse ([`Rejected::Fork`] with the recorded
     ///    proof is *not* re-raised; later entries from a frozen author are simply
     ///    refused via [`Rejected::NotAdmitted`]).

@@ -615,7 +615,7 @@ is where padding belongs if it is ever wanted.
 > refreshing one, since an anchor that moved is the same identity at a new address. The
 > channel one mattered independently: a channel's stored set is what an invite link
 > carries, so a room made before the move would have handed out an unreachable address in
-> every invite for ever. Gate: `crates/vox-tui/tests/a_daemon_follows_its_anchor.rs`, real
+> every invite for ever. Gate: `crates/vox-tui/tests/a_daemon_follows_its_anchor_proof.rs`, real
 > binaries, mutation-checked on both halves. **Residual:** a name whose A record moves
 > while the file is untouched is the same code path but is not measured — that needs a
 > resolver the proof owns. The account of the gap as it stood follows.

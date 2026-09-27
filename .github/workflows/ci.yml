@@ -8,11 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # The gaps ADR-018 §3 accepts today, named so that accepting them is a visible decision.
-  # Removing one MUST make the proofs fail until it is closed.
-  # The gaps ADR-018 §3 accepts, named so accepting them is a visible decision. `fish` is NOT
-  # here: the runners install it below, which is how that gap gets closed rather than excused.
-  VOX_PROOF_ALLOW_UNPROVEN: "journey.update_replaces_an_older_install,install.apple_gate_refuses_unsigned_bytes,opencode,cross-process-join,cross-process-tunnel"
+  # The one gap ADR-018 §3 accepts, named so that accepting it is a visible decision. `opencode`:
+  # the five live-model proofs need an OpenCode install and a model account, which CI runners do
+  # not have. The decider (2026-09-26) chose that they run on the local macOS release gate, with
+  # the decider's account, and must be green there before every tag; CI keeps this one exception.
+  # Removing it MUST make those proofs fail on CI. `fish` is NOT here: the runners install it.
+  VOX_PROOF_ALLOW_UNPROVEN: "opencode"
 
 jobs:
   # **Every commit must build, not merely the tip.** `git bisect` compiles the commit it
@@ -81,6 +82,12 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      # macOS's Spotlight indexes the checkout and gigabytes of build output while the timing
+      # proofs run: on a fresh runner it took R41's emulator to 74-90% of the link, and to a clean
+      # 98% with indexing off (diag run 36228035025). The runner is a throwaway VM.
+      - name: Stop Spotlight indexing (macOS)
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
       # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
       # `shell_setup_proof` measures real shells. A shell that is absent is reported unproven and
       # FAILS (ADR-018 §3), so the runners install the ones it proves against rather than the
@@ -98,6 +105,14 @@ jobs:
       # measured on: the app-server's `hooks/list` statuses are Codex's, not Vox's, to change.
       - name: Install the Codex the trust proof measures
         run: npm install -g @openai/codex@0.157.0 && codex --version
+      # `tui_member_names_proof` reads the real `vox tui`'s screen through the `pyte` terminal
+      # emulator, and fails as CANNOT MEASURE without it (#198). Pinned to the version it was
+      # measured on, in a venv of its own: the runners' Python is externally managed (PEP 668).
+      - name: Install the terminal emulator the TUI proof reads the screen with
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyte"
+          "$RUNNER_TEMP/pyte/bin/pip" install --quiet pyte==0.8.2
+          echo "VOX_PYTE_PATH=$("$RUNNER_TEMP/pyte/bin/python" -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Format check
@@ -113,15 +128,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
       - name: Docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-      # Real-parameter gates that are too slow unoptimized and therefore
-      # `#[ignore]`d in the debug suite: the (200,9) Equihash solve→verify
-      # (ADR-005, ≈1 s / 245 MB in release) and the production-Argon2id node +
-      # live-client lifecycle tests (ADR-016 M13; ≈0.3 s per derivation in
-      # release). Run here in release.
-      # Excluded here, and run in their own jobs below: the PRD-001 transport gates (`r40_`, `r41_`,
-      # `r42_`, ~20 minutes of the suite — the relay gate alone 11-22), so they run in parallel with
-      # this job instead of after it; and `cross_process_join_proof`, a known flake (ADR-018, "Two
-      # proofs are excluded from the release gate, by name"), reported but never blocking.
+      # The proofs that drive the shipped `vox` with production parameters (Argon2id, real
+      # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
+      # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
+      # product is a test", 2026-09-26). Run here in release.
+      # Excluded here, and run in their own job below: the PRD-001 transport proofs (`r40_`, `r41_`),
+      # the slowest part of the suite, so they run in parallel with this job instead of after it.
+      # No proof is excluded by name any more (V210-19, #192): `cross_process_join_proof`, excused
+      # as a flake since v0.2.2, passed 20 of 20 on integrate/v0.2.10 and is back in this gate.
       # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
       - name: Real-parameter gates (release)
         # Two causal_order_proof proofs are excluded here, **for a cause that is not the order**:
@@ -139,16 +153,13 @@ jobs:
         # late-arrival claim meanwhile.
         run: |
           cargo test --release --workspace --no-fail-fast -- --ignored \
-            --skip r40_ --skip r41_ --skip r42_ \
-            --skip two_agents_on_separate_processes_join_through_an_anchor_and_talk \
-            --skip three_members_one_offline_for_a_while_show_one_order \
-            --skip a_late_arrival_after_a_restart_is_marked
+            --skip r40_ --skip r41_
 
-  # **The PRD-001 transport gates, in parallel with the rest.** They are blocking — a release
+  # **The PRD-001 transport proofs, in parallel with the rest.** They are blocking — a release
   # publishes only a commit whose whole CI run passed (release.yml `ci-passed`) — but they are
-  # the slowest ~20 minutes of the suite, so they get their own runner instead of a place in line.
+  # the slowest part of the suite, so they get their own runner instead of a place in line.
   transport-gates:
-    name: transport gates (R40 · R41 · R42)
+    name: transport proofs (R40 · R41)
     strategy:
       fail-fast: false
       matrix:
@@ -157,28 +168,18 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      # macOS's Spotlight indexes the checkout and gigabytes of build output while the timing
+      # proofs run: on a fresh runner it took R41's emulator to 74-90% of the link, and to a clean
+      # 98% with indexing off (diag run 36228035025). The runner is a throwaway VM.
+      - name: Stop Spotlight indexing (macOS)
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Transport gates (release)
-        run: cargo test --release --workspace --no-fail-fast -- --ignored r40_ r41_ r42_
-
-  # **Reporting only, and in its OWN job on purpose**: the proofs excluded from the gate above by
-  # name. The command ends in `|| echo "::warning::"`, so it cannot fail CI, and being a separate job
-  # it cannot spend the gate's time budget either. A rate that changes is still visible as a warning.
-  flaky-watch:
-    name: excluded proofs (reporting only — never blocks)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y zsh fish
-      - run: |
-          cargo test --release --workspace --no-fail-fast -- --ignored \
-            two_agents_on_separate_processes_join_through_an_anchor_and_talk \
-            || echo "::warning::cross_process_join_proof failed — known flake, ADR-018"
-          cargo test --release --workspace --no-fail-fast -- --ignored \
-            three_members_one_offline_for_a_while_show_one_order \
-            || echo "::warning::causal_order_proof proof 1 failed — second joiner cut off (v0.2.9), ADR-023 M23.2"
-          cargo test --release --workspace --no-fail-fast -- --ignored \
-            a_late_arrival_after_a_restart_is_marked \
-            || echo "::warning::causal_order_proof restart late-arrival failed — V29-23 (#104)"
+        # R41's WAN link is reported, not gated, on the macOS runner only (decider, 2026-09-26): the
+        # 3-core VM stalls its processes and the same build measures 29-106% of raw there. WAN is
+        # gated here on ubuntu and on real Mac hardware by the local macOS gate before a tag.
+        env:
+          VOX_PERF_REPORT_ONLY: ${{ runner.os == 'macOS' && 'WAN' || '' }}
+        run: cargo test --release --workspace --no-fail-fast -- --ignored r40_ r41_

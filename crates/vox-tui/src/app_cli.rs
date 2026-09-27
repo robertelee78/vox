@@ -41,7 +41,7 @@ async fn client(paths: &Paths) -> Result<IpcClient, AppError> {
 
 /// Resolve a room prefix against the rooms the node holds.
 async fn room(c: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
-    match c.request(&Request::Rooms).await {
+    match c.rooms().await {
         Ok(Frame::Rooms { rooms }) => {
             let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
             resolve_prefix(prefix, &ids)

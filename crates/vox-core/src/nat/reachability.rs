@@ -367,14 +367,43 @@ pub async fn connect_direct_within(
     per_attempt: Duration,
 ) -> Result<VoxConnection> {
     // A candidate the socket cannot even address is not a candidate: quinn refuses
-    // an IPv6 destination on an IPv4 socket outright (and maps IPv4 onto an IPv6
-    // one, so the reverse is fine). Dropping them here is what keeps a dual-stack
-    // peer's IPv6 entries from costing an IPv4-bound node anything.
-    let local_v6 = endpoint.local_addr().is_ok_and(|a| a.is_ipv6());
+    // an IPv6 destination on an IPv4 socket outright, and an IPv6 socket carries IPv4 only
+    // as v4-mapped addresses — which works for a socket bound to the IPv6 wildcard (`[::]`,
+    // dual-stack) and **not** for one bound to a particular IPv6 address such as `[::1]`.
+    // Dropping them here is what keeps a dual-stack peer's IPv6 entries from costing an
+    // IPv4-bound node anything, and a peer's IPv4 entries from costing an IPv6-only node a full
+    // per-attempt timeout each: measured, an IPv6-only joiner spent `board 20.76s` dialling two
+    // IPv4 addresses it could never reach before the one it could (#197).
+    //
+    // **A circuit is not on the socket.** A relay circuit stands at a synthetic IPv4 address in
+    // the range the mux reserves (`transport::mux::in_circuit_range`); its packets travel over
+    // the relay's connection, whatever this socket's family. Filtered by family, an IPv6-only
+    // node refused every circuit it dialled — "circuit via …: no direct candidates" — and could
+    // reach an IPv4 host no way at all (#173's proof, red once #197 merged).
+    let local = endpoint.local_addr().ok();
+    let reachable = |c: &SocketAddr| {
+        crate::transport::mux::in_circuit_range(*c)
+            || match local {
+                Some(SocketAddr::V4(_)) => c.is_ipv4(),
+                Some(SocketAddr::V6(l)) => c.is_ipv6() || l.ip().is_unspecified(),
+                None => true,
+            }
+    };
+    // **An IPv4-mapped IPv6 address is an IPv4 address.** A peer on a dual-stack socket (`[::]`)
+    // sees an IPv4 sender as `::ffff:a.b.c.d`, and that is what it reports back as the sender's
+    // observed address — the reflexive address a hole punch trades. Filtered by family as it
+    // stands, an IPv4-bound node dropped the only address its peer can be punched at, and fired
+    // nothing: measured through the shipped binary behind two userspace NATs (RP-23), the
+    // responder sent not one datagram while the initiator's went unanswered at 1, 2, 4 and 7 s.
     let candidates: Vec<SocketAddr> = candidates
         .iter()
-        .copied()
-        .filter(|c| local_v6 || c.is_ipv4())
+        .map(|c| match (local, c.ip().to_canonical()) {
+            (Some(SocketAddr::V4(_)), ip @ std::net::IpAddr::V4(_)) => {
+                SocketAddr::new(ip, c.port())
+            }
+            _ => *c,
+        })
+        .filter(reachable)
         .collect();
     if candidates.is_empty() {
         return Err(Error::Unreachable("no direct candidates"));

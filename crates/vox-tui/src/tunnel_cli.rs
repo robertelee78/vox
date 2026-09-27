@@ -356,7 +356,15 @@ pub async fn forward(
     // never blocked for more than one attempt.
     let deadline = Instant::now() + vox_core::node::up::HOST_PATIENCE;
     let mut said = false;
+    // **How long reaching the host took, said** (PRD-001 R42, #167). Counted from the first
+    // attempt — after this node has unlocked and opened the room, the two Argon2id steps a person
+    // waits for at the prompt — to the attempt that got through, every retry included: that is
+    // the wait R42 bounds ("a first connection to a peer, including NAT traversal, under 2 s"),
+    // and without it a slow first connection was indistinguishable from a slow unlock.
+    let first_attempt = Instant::now();
+    let mut attempts = 0u32;
     let out = loop {
+        attempts += 1;
         let out = node
             .apply(NodeCommand::Forward {
                 channel_id,
@@ -384,7 +392,7 @@ pub async fn forward(
         if !said {
             eprintln!(
                 "vox: {} is not reachable yet — waiting for a path (up to {:?})",
-                short(&host),
+                crate::ident::author_id(&host),
                 vox_core::node::up::HOST_PATIENCE
             );
             said = true;
@@ -406,9 +414,15 @@ pub async fn forward(
              right now, or they have not run `vox trust add` on you.\n       Reach is \
              the HOST's decision (ADR-017 decision 3) — there is nothing you can grant \
              yourself.",
-            short(&host)
+            crate::ident::author_id(&host)
         )));
     }
+    eprintln!(
+        "vox: reached {} in {} ms ({attempts} attempt{})",
+        crate::ident::author_id(&host),
+        first_attempt.elapsed().as_millis(),
+        if attempts == 1 { "" } else { "s" }
+    );
     // The bound port comes back as an event, since port 0 is resolved by the OS.
     let bound = loop {
         match node.next_event().await {
@@ -417,7 +431,10 @@ pub async fn forward(
             None => return Err(AppError::Usage("the node stopped".into())),
         }
     };
-    println!("vox: {bound} → {tag:?} on {}", short(&host));
+    println!(
+        "vox: {bound} → {tag:?} on {}",
+        crate::ident::author_id(&host)
+    );
     println!("     e.g.  ssh -p {} user@{}", bound.port(), bound.ip());
     println!("     Ctrl-C to stop");
     // Keep reading events while forwarding, so a connection the host refused or cut says
@@ -581,10 +598,10 @@ pub async fn serve(
             _ = tokio::signal::ctrl_c() => break,
             event = node.next_event() => match event {
                 Some(NodeEvent::TunnelServed { client, service_tag, .. }) => {
-                    println!("vox: {} reached {service_tag:?}", short(&client));
+                    println!("vox: {} reached {service_tag:?}", crate::ident::author_id(&client));
                 }
                 Some(NodeEvent::PeerJoined { peer, .. }) => {
-                    println!("vox: {} joined", short(&peer));
+                    println!("vox: {} joined", crate::ident::author_id(&peer));
                 }
                 Some(ref other) => say_if_it_explains_a_failure(other),
                 None => return Err(AppError::Usage("the node stopped".into())),
@@ -697,10 +714,19 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
 pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
     match ev {
         NodeEvent::PeerUnreachable { peer, why } => {
-            eprintln!("vox: could not reach {} — {why}", short(peer));
+            eprintln!(
+                "vox: could not reach {} — {why}",
+                crate::ident::author_id(peer)
+            );
         }
         NodeEvent::JoinFailed { reason } => {
             eprintln!("vox: a join did not complete — {reason}");
+        }
+        NodeEvent::RoomNotRemembered { channel_id, why } => {
+            eprintln!(
+                "vox: room {} is open, but will not reopen by itself after a restart — {why}",
+                short(channel_id)
+            );
         }
         NodeEvent::JoinSteps { joined, steps } => {
             eprintln!(
@@ -725,15 +751,29 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         } => {
             eprintln!(
                 "vox: {} did not take our key for room {} — {why}; it is sent again",
-                short(peer),
+                crate::ident::author_id(peer),
                 short(channel_id)
             );
         }
         NodeEvent::StillRelayed { peer, reason } => {
-            eprintln!("vox: still relayed to {} — {reason}", short(peer));
+            eprintln!(
+                "vox: still relayed to {} — {reason}",
+                crate::ident::author_id(peer)
+            );
         }
         NodeEvent::ProxyRefused { reason } => {
             eprintln!("vox: tunnel refused or cut — {reason}");
+        }
+        NodeEvent::SyncFailed {
+            channel_id,
+            peer,
+            reason,
+        } => {
+            eprintln!(
+                "vox: sync of room {} with {} did not complete — {reason}",
+                short(channel_id),
+                crate::ident::author_id(peer)
+            );
         }
         NodeEvent::Stalled { what, millis } => {
             eprintln!("vox: busy {millis}ms — {what} — nobody could be answered");
@@ -769,7 +809,10 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
                 break;
             }
             NodeEvent::PeerUnreachable { peer, why } => {
-                said.push(format!("could not reach {} — {why}", short(&peer)));
+                said.push(format!(
+                    "could not reach {} — {why}",
+                    crate::ident::author_id(&peer)
+                ));
             }
             ref other => say_if_it_explains_a_failure(other),
         }
@@ -806,6 +849,15 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::BadLink) => {
             "that address will not parse, or names a room this node cannot use\n       this one IS the address — check you copied all of it"
         }
+        // **Do not claim the address is fine here.** A board with nothing for the room cannot tell
+        // "its host has not published it yet" from "that room does not exist": an invite link
+        // carries no checksum, so a room id with one mistyped character still parses, reaches the
+        // board, and finds nothing. The first version of this advice said "the address is fine",
+        // the same false confidence `Unreachable` below refuses about the passphrase. Name both
+        // causes and what settles each.
+        Some(Fault::RoomNotOnBoard) => {
+            "either its host has not published the room there yet (the host must be online; then run this again)\n       or the room part of the address is wrong: check it against the address you were sent"
+        }
         // **Do not claim the passphrase is fine here.** Nobody answered, so nobody
         // checked it — a wrong passphrase against an offline room reaches exactly this
         // branch. The first version of this fix said "NOT the address or the
@@ -829,6 +881,8 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::Locked | Fault::NoIdentity) => {
             "this profile has no unlocked identity, so there is nobody to join as\n       run `vox id` to make one"
         }
+        // Joining a room this node already holds used to say `Failed(IdentityExists)`.
+        Some(Fault::AlreadyMember) => Fault::AlreadyMember.explain(),
         _ => "the node did not say why, which is itself worth reporting",
     }
 }
@@ -840,11 +894,13 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
     Some(match name {
         "WrongPassphrase" => Fault::WrongPassphrase,
         "BadLink" => Fault::BadLink,
+        "RoomNotOnBoard" => Fault::RoomNotOnBoard,
         "Unreachable" => Fault::Unreachable,
         "Refused" => Fault::Refused,
         "NotNetworked" => Fault::NotNetworked,
         "Locked" => Fault::Locked,
         "NoIdentity" => Fault::NoIdentity,
+        "AlreadyMember" => Fault::AlreadyMember,
         _ => return None,
     })
 }

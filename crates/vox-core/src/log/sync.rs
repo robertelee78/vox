@@ -130,6 +130,45 @@ pub trait Transport {
     /// nothing here. A real ordered byte transport (the QUIC mapping, M9) overrides
     /// this to FIN its send stream so the peer's blocking read terminates.
     fn finish(&mut self) {}
+
+    /// Start sending `frames`, then a clean end-of-stream, **while the caller goes on to drain
+    /// what the peer sends** (V210-39). A session used to serve its whole batch before reading
+    /// anything; when both ends had more to send than a stream's flow-control window, each blocked
+    /// writing into a window the other was not reading, and both failed having applied nothing.
+    ///
+    /// Stops early, still with a clean end, once `deadline` passes (a bounded serve is not a
+    /// failure: see [`SERVE_BUDGET`]). The outcome is collected by [`Transport::finish_serving`].
+    ///
+    /// The default sends everything first, which is correct for a transport whose sends never
+    /// wait on the peer (the in-memory [`DuplexTransport`]).
+    ///
+    /// # Errors
+    /// A send failed.
+    fn start_serving(&mut self, frames: Vec<Vec<u8>>, deadline: std::time::Instant) -> Result<()> {
+        for f in frames {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            self.send(&f)?;
+        }
+        self.finish();
+        Ok(())
+    }
+
+    /// Wait for what [`Transport::start_serving`] started, and return how it went.
+    ///
+    /// # Errors
+    /// Serving failed.
+    fn finish_serving(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The code the **peer** reset or stopped the stream with, if it did (#202's follow-up): a
+    /// session that fails with this code failed because the peer refused, not because this node
+    /// rejected what it was sent. A transport that cannot tell says `None`.
+    fn peer_refused(&self) -> Option<WireError> {
+        None
+    }
 }
 
 /// An in-memory duplex transport pairing two endpoints by shared queues, for
@@ -683,8 +722,8 @@ where
     R: AuthorResolver,
     P: FnMut(&mut TA, &mut TB) -> usize,
 {
-    let send_a = |t: &mut TA, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
-    let send_b = |t: &mut TB, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
+    let send_a = |t: &mut TA, f: Vec<u8>| t.send(&f).map_err(|e| wire_of(&e));
+    let send_b = |t: &mut TB, f: Vec<u8>| t.send(&f).map_err(|e| wire_of(&e));
 
     // 1. HELLO exchange + mode negotiation.
     send_a(ta, encode_hello(SYNC_MODE_FRONTIER))?;
@@ -779,7 +818,7 @@ where
     T: Transport,
     R: AuthorResolver,
 {
-    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
+    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|e| wire_of(&e));
 
     // 1. HELLO exchange + mode negotiation.
     send(t, encode_hello(SYNC_MODE_FRONTIER))?;
@@ -802,20 +841,21 @@ where
     //    in-memory duplex relies on the drain loop observing an empty inbox.
     //    Bounded in count, bytes and time (see the module docs); stopping at the
     //    time bound is a clean end, not a failure — the peer keeps what it got.
+    //    Served **while** the peer's entries are drained (V210-39): see
+    //    `Transport::start_serving`.
     let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
-    for wire in entries_for_wants(dag, &their_wants) {
-        if std::time::Instant::now() >= serve_deadline {
-            break;
-        }
-        send(t, encode_entry(&wire))?;
-    }
-    // Signal a clean end-of-stream on our send side (success terminator, not a
-    // hard close), so the peer's drain loop terminates at FIN.
-    t.finish();
+    let frames: Vec<Vec<u8>> = entries_for_wants(dag, &their_wants)
+        .iter()
+        .map(|w| encode_entry(w))
+        .collect();
+    t.start_serving(frames, serve_deadline)
+        .map_err(|e| wire_of(&e))?;
 
     // 5. Drain and apply the entries the peer serves us, until the peer's clean
-    //    half-close (recv → Ok(None)).
-    drain_entries(t, dag, resolver, admission)
+    //    half-close (recv → Ok(None)), then collect how our own serving went.
+    let applied = drain_entries(t, dag, resolver, admission)?;
+    t.finish_serving().map_err(|e| wire_of(&e))?;
+    Ok(applied)
 }
 
 /// What a frontier session may do to a room, **one step at a time**. Each method takes the room's
@@ -881,7 +921,7 @@ where
     T: Transport,
     S: SessionRoom + ?Sized,
 {
-    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|_| WireError::TransportFailed);
+    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|e| wire_of(&e));
 
     send(t, encode_hello(SYNC_MODE_FRONTIER))?;
     let remote_hello = expect_hello(t.recv())?;
@@ -893,20 +933,21 @@ where
     send(t, encode_want(&room.wants(&remote_have)?))?;
     let their_wants = expect_want(t.recv())?;
 
+    // Served while the peer's entries are drained (V210-39): see `Transport::start_serving`.
     let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
-    for wire in room.entries(&their_wants)? {
-        if std::time::Instant::now() >= serve_deadline {
-            break;
-        }
-        send(t, encode_entry(&wire))?;
-    }
-    t.finish();
+    let frames: Vec<Vec<u8>> = room
+        .entries(&their_wants)?
+        .iter()
+        .map(|w| encode_entry(w))
+        .collect();
+    t.start_serving(frames, serve_deadline)
+        .map_err(|e| wire_of(&e))?;
 
     // Drained with no lock held; applied a batch at a time under a fresh one.
     let deadline = std::time::Instant::now() + DRAIN_BUDGET;
     let mut staged: Vec<Vec<u8>> = Vec::new();
     let mut applied = 0;
-    while let Some(frame) = t.recv().map_err(|_| WireError::TransportFailed)? {
+    while let Some(frame) = t.recv().map_err(|e| wire_of(&e))? {
         if std::time::Instant::now() >= deadline {
             return Err(WireError::SyncModeUnsupported);
         }
@@ -923,6 +964,7 @@ where
     if !staged.is_empty() {
         applied += room.apply(staged)?;
     }
+    t.finish_serving().map_err(|e| wire_of(&e))?;
     Ok(applied)
 }
 
@@ -974,7 +1016,7 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
     // circuit on total idle. A per-frame bound alone only defends against a peer that stops, never
     // against one that drips.
     let deadline = std::time::Instant::now() + DRAIN_BUDGET;
-    while let Some(frame) = t.recv().map_err(|_| WireError::TransportFailed)? {
+    while let Some(frame) = t.recv().map_err(|e| wire_of(&e))? {
         if std::time::Instant::now() >= deadline {
             return Err(WireError::SyncModeUnsupported);
         }
@@ -998,8 +1040,17 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
     Ok(applied)
 }
 
+/// The coded reason a transport error carries: the peer's own reason when it refused the stream
+/// with one ([`Error::PeerRefused`]), and [`WireError::TransportFailed`] for everything else
+/// (#202). Reporting every refusal as `TransportFailed` hid a collision behind a dead path.
+fn wire_of(e: &Error) -> WireError {
+    match e {
+        Error::PeerRefused(code) => *code,
+        _ => WireError::TransportFailed,
+    }
+}
 fn expect_hello(r: Result<Option<Vec<u8>>>) -> std::result::Result<u8, WireError> {
-    match r.map_err(|_| WireError::TransportFailed)? {
+    match r.map_err(|e| wire_of(&e))? {
         Some(frame) => match decode_frame(&frame) {
             Ok(SyncFrame::Hello(bitmap)) => Ok(bitmap),
             _ => Err(WireError::SyncModeUnsupported),
@@ -1010,7 +1061,7 @@ fn expect_hello(r: Result<Option<Vec<u8>>>) -> std::result::Result<u8, WireError
 }
 
 fn expect_have(r: Result<Option<Vec<u8>>>) -> std::result::Result<Vec<FeedFrontier>, WireError> {
-    match r.map_err(|_| WireError::TransportFailed)? {
+    match r.map_err(|e| wire_of(&e))? {
         Some(frame) => match decode_frame(&frame) {
             Ok(SyncFrame::Have(v)) => Ok(v),
             _ => Err(WireError::SyncModeUnsupported),
@@ -1020,7 +1071,7 @@ fn expect_have(r: Result<Option<Vec<u8>>>) -> std::result::Result<Vec<FeedFronti
 }
 
 fn expect_want(r: Result<Option<Vec<u8>>>) -> std::result::Result<Vec<WantRange>, WireError> {
-    match r.map_err(|_| WireError::TransportFailed)? {
+    match r.map_err(|e| wire_of(&e))? {
         Some(frame) => match decode_frame(&frame) {
             Ok(SyncFrame::Want(v)) => Ok(v),
             _ => Err(WireError::SyncModeUnsupported),

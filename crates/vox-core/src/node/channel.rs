@@ -188,17 +188,21 @@ pub fn join_context_from_genesis(
 
 /// Map an ADR-008 coded sync failure onto the error taxonomy, keeping the reason
 /// (the ADR's rule is that a failure is never silently downgraded).
-pub(crate) fn sync_failure(code: crate::wire::WireError) -> Error {
-    Error::MalformedGovernance(match code {
-        crate::wire::WireError::ProtocolVersionUnsupported => "sync failed: protocol version",
-        crate::wire::WireError::SuiteBelowFloor => "sync failed: suite below floor",
-        crate::wire::WireError::UnknownStructTag => "sync failed: unknown struct tag",
-        crate::wire::WireError::UnknownAlgoId => "sync failed: unknown algo id",
-        crate::wire::WireError::AuthenticatorInvalid => "sync failed: authenticator invalid",
-        crate::wire::WireError::SyncModeUnsupported => "sync failed: sync mode unsupported",
-        crate::wire::WireError::EpochMismatch => "sync failed: epoch mismatch",
-        crate::wire::WireError::TransportFailed => "sync failed: transport",
-    })
+pub(crate) fn sync_failure(
+    code: crate::wire::WireError,
+    peer_refused: Option<crate::wire::WireError>,
+) -> Error {
+    // Its own variant, carrying the coded reason, never `MalformedGovernance` (#202), and naming
+    // which end stopped the session: the peer's refusal, this node's rejection of what it was
+    // sent, or a path that failed under both.
+    use crate::wire::WireError;
+    if peer_refused == Some(code) {
+        Error::SyncRefused(code)
+    } else if code == WireError::TransportFailed {
+        Error::SyncFailed(code)
+    } else {
+        Error::SyncRejected(code)
+    }
 }
 
 /// The channel's [`AuthorResolver`] for ADR-008 sync: the admitted authors' keys,
@@ -971,7 +975,25 @@ impl ChannelState {
             .ok_or(Error::Profile("no such channel in this profile"))?;
         let factor = SignatureIdentityFactor::new(signer);
         let sek = wrap.unwrap_sek(&factor, channel_id, channel_passphrase)?;
+        let me = signer.fingerprint();
+        Self::open_with_sek(store, channel_id, sek, channel_passphrase, me, now_secs)
+    }
 
+    /// Open a channel from the store with its SEK already in hand: the half of [`Self::open`]
+    /// after the double-lock unwrap. A daemon reopening the rooms it held uses it (#208), with the
+    /// SEK and passphrase kept sealed under its identity in [`crate::node::open_rooms`]. The
+    /// passphrase is still needed: the room retains it to answer joins (ADR-005).
+    ///
+    /// It takes the store and not the profile, so that the reopening can run on a blocking task
+    /// with a [`Profile::store_handle`] rather than on the actor.
+    pub fn open_with_sek(
+        store: &Store,
+        channel_id: &Digest32,
+        sek: Sek,
+        channel_passphrase: &[u8],
+        me: Digest32,
+        now_secs: u64,
+    ) -> Result<Self> {
         let manifest_seg = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_MANIFEST)?
             .ok_or(Error::MalformedAtRest("channel manifest missing"))?;
@@ -1014,7 +1036,6 @@ impl ChannelState {
         // Key-packages for this identity found on reload are offered again: installing one
         // twice is harmless (`accept_skdm` keeps the live chain), and one that arrived just
         // before a crash would otherwise never be installed.
-        let me = signer.fingerprint();
         let mut inbound_packages = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::LogDb)? {
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
@@ -1936,9 +1957,12 @@ impl ChannelState {
             history_mode,
         )?;
         self.append_governance(profile, &grant.to_wire(), now_secs)?;
-        // The grant is the record that `target` holds this generation; the ledger is
-        // how a later rotation knows it has not yet been given the next one.
-        self.delivered.insert(target, self.sender.chain_id());
+        // The grant is the record that `target` holds the generation it was given; the ledger
+        // is how a later rotation knows it has not yet been given the next one. The generation
+        // is the delivered key's own, not the current one: a key taken when consent was decided
+        // and delivered after a rotation is the older generation, and the rotation still owes
+        // this member the new one (V210-30).
+        self.delivered.insert(target, delivered_skdm.body.chain_id);
         self.persist_delivered(profile.store())?;
         Ok(grant)
     }
@@ -2552,6 +2576,33 @@ impl ChannelState {
         Ok(())
     }
 
+    /// [`Self::track_body`] into an open `batch`, for a pass that commits once.
+    fn track_body_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        entry_hash: Digest32,
+        log_id: u64,
+        now_secs: u64,
+    ) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::Index,
+            log_id,
+            &first_seen_bytes(now_secs),
+        )?;
+        batch.put_segment(&self.channel_id, SegmentKind::Index, log_id, &seg)?;
+        self.retention.track(
+            entry_hash,
+            Tracked {
+                log_id,
+                first_seen: now_secs,
+                claimed: None,
+                cache_id: None,
+            },
+        );
+        Ok(())
+    }
+
     /// Append an already-built governance struct as a signed log entry.
     fn append_governance(
         &mut self,
@@ -2673,7 +2724,7 @@ impl ChannelState {
         }
         match session {
             Ok(_) => Ok(out),
-            Err(code) => Err(sync_failure(code)),
+            Err(code) => Err(sync_failure(code, transport.peer_refused())),
         }
     }
 
@@ -2715,82 +2766,154 @@ impl ChannelState {
             applied: arrived.len(),
             ..SyncOutcome::default()
         };
-        for (author, entry_hash, payload) in arrived {
-            let key = self
-                .authors
-                .get(&author)
-                .ok_or(Error::MalformedGovernance(
-                    "synced entry from an unadmitted author",
-                ))?
-                .clone();
-            let wire = self
-                .dag
-                .get_by_hash(&entry_hash)
-                .ok_or(Error::MalformedGovernance("synced entry vanished"))?
-                .to_wire();
-            let id = self.next_log_id;
-            let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
-            if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg) {
+        if arrived.is_empty() {
+            return Ok(out);
+        }
+        // **One durable commit for the whole batch** (see `render_content_into`).
+        //
+        // Two kinds of failure, kept apart as they were when each entry committed on its own:
+        // - an entry this node refuses (an unadmitted author, bad governance) stops the pass
+        //   **without** poisoning the room: what came before it is still committed and rendered,
+        //   and the refusal is returned after that;
+        // - a failed write poisons the room, because memory has advanced past what is on disk.
+        //
+        // Nothing below may write through `store` while `batch` is open: a second write
+        // transaction blocks forever (redb). So a body's first-seen row goes into the batch
+        // (`track_body_into`), and an expired late arrival is pruned only after the commit.
+        let mut rendered_rows: Vec<Rendered> = Vec::new();
+        let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
+        let mut chains_advanced = false;
+        let mut refused: Option<Error> = None;
+        let mut batch = match store.batch() {
+            Ok(b) => b,
+            Err(e) => {
                 self.poisoned = true;
                 return Err(e);
             }
-            self.log_ids.insert(entry_hash, id);
-            self.next_log_id = id.saturating_add(1);
-            let Some(payload) = payload else {
-                continue; // a skeleton: stored, never rendered
-            };
-            match classify_payload(&payload)? {
-                EntryKind::Governance => {
-                    let entry = self
+        };
+        let mut write_failed: Option<Error> = None;
+        for (author, entry_hash, payload) in arrived {
+            let step =
+                (|| -> Result<std::result::Result<Vec<Rendered>, Error>> {
+                    // A refusal, not a write failure: `Ok(Err(..))`.
+                    macro_rules! refuse {
+                        ($e:expr) => {
+                            match $e {
+                                Ok(v) => v,
+                                Err(e) => return Ok(Err(e)),
+                            }
+                        };
+                    }
+                    let key = refuse!(self.authors.get(&author).cloned().ok_or(
+                        Error::MalformedGovernance("synced entry from an unadmitted author")
+                    ));
+                    let wire = refuse!(self
                         .dag
                         .get_by_hash(&entry_hash)
-                        .ok_or(Error::MalformedGovernance("synced entry vanished"))?
-                        .clone();
-                    let gov = GovEntry::from_verified_log_entry(
-                        &entry,
-                        &key,
-                        &self.channel_id,
-                        self.gov_heads(),
-                    )?;
-                    self.gov_entries.push(gov);
-                    self.evaluator = Arc::new(Self::build_evaluator(
-                        &self.genesis,
-                        &self.authors,
-                        &self.gov_entries,
-                        now_secs,
-                    )?);
-                    out.governance += 1;
+                        .ok_or(Error::MalformedGovernance("synced entry vanished")))
+                    .to_wire();
+                    // Written before the entry is classified, exactly as each entry was when it
+                    // committed on its own: a refusal below still leaves its log row stored.
+                    let id = self.next_log_id;
+                    let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
+                    batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
+                    self.log_ids.insert(entry_hash, id);
+                    self.next_log_id = id.saturating_add(1);
+                    let Some(payload) = payload else {
+                        return Ok(Ok(Vec::new())); // a skeleton: stored, never rendered
+                    };
+                    match refuse!(classify_payload(&payload)) {
+                        EntryKind::Governance => {
+                            let entry = refuse!(self
+                                .dag
+                                .get_by_hash(&entry_hash)
+                                .ok_or(Error::MalformedGovernance("synced entry vanished")))
+                            .clone();
+                            let gov = refuse!(GovEntry::from_verified_log_entry(
+                                &entry,
+                                &key,
+                                &self.channel_id,
+                                self.gov_heads(),
+                            ));
+                            let could_read = self.readable_authors();
+                            self.gov_entries.push(gov);
+                            self.evaluator = Arc::new(refuse!(Self::build_evaluator(
+                                &self.genesis,
+                                &self.authors,
+                                &self.gov_entries,
+                                now_secs,
+                            )));
+                            out.governance += 1;
+                            // **A grant that arrives after its key makes stored messages
+                            // readable** (PRD-001 R12): the authors this entry made readable are
+                            // backfilled — into this pass's batch, never a batch of its own.
+                            let skip: BTreeSet<Digest32> =
+                                rendered_rows.iter().map(|r| r.entry_hash).collect();
+                            let rows = self.backfill_newly_readable_into(
+                                &mut batch,
+                                &could_read,
+                                &skip,
+                                now_secs,
+                                &mut expired,
+                            )?;
+                            chains_advanced |= !rows.is_empty();
+                            Ok(Ok(rows))
+                        }
+                        // A checkpoint is stored and read by the DAG; there is nothing to render.
+                        EntryKind::Checkpoint => Ok(Ok(Vec::new())),
+                        EntryKind::Content => {
+                            // A key-package is queued for the actor to install, never rendered or
+                            // aged as a message.
+                            if self.queue_if_key_package(&payload) {
+                                return Ok(Ok(Vec::new()));
+                            }
+                            self.track_body_into(&mut batch, entry_hash, id, now_secs)?;
+                            let before_expired = expired.len();
+                            let row = self.render_content_into(
+                                &mut batch,
+                                author,
+                                entry_hash,
+                                &payload,
+                                now_secs,
+                                &mut expired,
+                            )?;
+                            chains_advanced |= row.is_some() || expired.len() > before_expired;
+                            Ok(Ok(row.into_iter().collect()))
+                        }
+                    }
+                })();
+            match step {
+                Ok(Ok(rows)) => rendered_rows.extend(rows),
+                Ok(Err(refusal)) => {
+                    refused = Some(refusal);
+                    break;
                 }
-                // A checkpoint is stored and read by the DAG; there is nothing to render.
-                EntryKind::Checkpoint => {}
-                EntryKind::Content => {
-                    // A key-package is queued for the actor to install, never rendered or aged
-                    // as a message.
-                    if self.queue_if_key_package(&payload) {
-                        continue;
-                    }
-                    self.track_body(store, entry_hash, id, now_secs)?;
-                    if self.render_content(store, author, entry_hash, &payload, now_secs)? {
-                        out.rendered += 1;
-                    }
+                Err(e) => {
+                    write_failed = Some(e);
+                    break;
                 }
             }
         }
-        // **A grant that arrives after its key makes stored messages readable.** A reader
-        // needs both the sender key and the author's consent on the log (ADR-007); the key
-        // comes over the pairwise stream and the grant by sync, so the key usually lands
-        // first — and its backfill found nothing it was allowed to show. Nothing retried when
-        // the grant followed, so a full-history grant (PRD-001 R12) showed only what was
-        // written after it. Retry every author this node holds a key for; rows already shown
-        // are skipped.
-        if out.governance > 0 {
-            let authors: BTreeSet<Digest32> = self.receivers.keys().map(|(a, _)| *a).collect();
-            for author in authors {
-                out.rendered += self.backfill(store, &author, now_secs)?;
-            }
+        let committed = match write_failed {
+            Some(e) => Err(e),
+            None => (|| -> Result<()> {
+                if chains_advanced {
+                    self.queue_receivers(&mut batch)?;
+                }
+                batch.commit()
+            })(),
+        };
+        if let Err(e) = committed {
+            self.poisoned = true;
+            return Err(e);
         }
+        out.rendered += rendered_rows.len();
+        self.place_committed(store, rendered_rows, &expired)?;
         // An entry that arrived may be a parent others named before it: rows move.
         self.settle_timeline();
+        if let Some(refusal) = refused {
+            return Err(refusal);
+        }
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
         Ok(out)
@@ -2843,7 +2966,7 @@ impl ChannelState {
                 out.applied = n;
                 Ok(out)
             }
-            Err(code) => Err(sync_failure(code)),
+            Err(code) => Err(sync_failure(code, transport.peer_refused())),
         }
     }
 
@@ -2912,31 +3035,134 @@ impl ChannelState {
 
     /// Retry every stored content entry from `author` against the sender keys now
     /// held, rendering those that open. Called when a key arrives.
+    /// The authors whose messages this node may read now (see [`Self::may_read`]).
+    fn readable_authors(&self) -> BTreeSet<Digest32> {
+        let me = self.me();
+        self.authors
+            .keys()
+            .copied()
+            .filter(|a| *a != me && self.may_read(a, &me))
+            .collect()
+    }
+
+    /// Render what a governance entry has just made readable (V210-30).
+    ///
+    /// Reading an author needs two things, its sender key and its consent on the log, and they
+    /// arrive separately: the key over the pairwise session, the consent by sync. Rendering was
+    /// attempted when the **key** arrived (`accept_skdm`'s backfill) and when an entry arrived,
+    /// never when the consent did. So when the key came first, every message already held from
+    /// that author stayed unrendered for good, and only messages arriving afterwards showed. The
+    /// commonest way to get that order is a consent delivered late, whose key lands before its
+    /// grant has synced. Now an author who has just become readable is backfilled.
+    fn backfill_newly_readable(
+        &mut self,
+        store: &Store,
+        could_read: &BTreeSet<Digest32>,
+        now_secs: u64,
+    ) -> Result<usize> {
+        let mut rows: Vec<Rendered> = Vec::new();
+        let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
+        let result = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            rows = self.backfill_newly_readable_into(
+                &mut batch,
+                could_read,
+                &BTreeSet::new(),
+                now_secs,
+                &mut expired,
+            )?;
+            if rows.is_empty() && expired.is_empty() {
+                return Ok(());
+            }
+            self.queue_receivers(&mut batch)?;
+            batch.commit()
+        })();
+        if let Err(e) = result {
+            self.poisoned = true;
+            return Err(e);
+        }
+        let rendered = rows.len();
+        self.place_committed(store, rows, &expired)?;
+        Ok(rendered)
+    }
+
+    /// [`Self::backfill_newly_readable`] into a batch the caller commits, returning the rows for
+    /// the caller to add to the timeline once it has. `skip` names rows already rendered in that
+    /// batch and so not yet in the timeline.
+    fn backfill_newly_readable_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        could_read: &BTreeSet<Digest32>,
+        skip: &BTreeSet<Digest32>,
+        now_secs: u64,
+        expired: &mut Vec<(Digest32, Tracked)>,
+    ) -> Result<Vec<Rendered>> {
+        let newly: Vec<Digest32> = self
+            .readable_authors()
+            .into_iter()
+            .filter(|a| !could_read.contains(a))
+            .collect();
+        let mut rows = Vec::new();
+        for author in newly {
+            rows.extend(self.backfill_into(batch, &author, skip, now_secs, expired)?);
+        }
+        Ok(rows)
+    }
+
     fn backfill(&mut self, store: &Store, author: &Digest32, now_secs: u64) -> Result<usize> {
-        let already: std::collections::BTreeSet<Digest32> =
-            self.timeline.iter().map(|r| r.entry_hash).collect();
-        let pending: Vec<(Digest32, Vec<u8>, u64)> = match self.dag.feed(author) {
+        // One durable commit for the whole backfill (see `render_content_into`).
+        let mut rows: Vec<Rendered> = Vec::new();
+        let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
+        let result = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            rows =
+                self.backfill_into(&mut batch, author, &BTreeSet::new(), now_secs, &mut expired)?;
+            if rows.is_empty() && expired.is_empty() {
+                return Ok(());
+            }
+            self.queue_receivers(&mut batch)?;
+            batch.commit()
+        })();
+        if let Err(e) = result {
+            self.poisoned = true;
+            return Err(e);
+        }
+        let rendered = rows.len();
+        self.place_committed(store, rows, &expired)?;
+        Ok(rendered)
+    }
+
+    /// Render every stored content entry from `author` not yet in the timeline (nor in `skip`)
+    /// into `batch`, without committing it.
+    fn backfill_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        author: &Digest32,
+        skip: &BTreeSet<Digest32>,
+        now_secs: u64,
+        expired: &mut Vec<(Digest32, Tracked)>,
+    ) -> Result<Vec<Rendered>> {
+        let already: BTreeSet<Digest32> = self.timeline.iter().map(|r| r.entry_hash).collect();
+        let pending: Vec<(Digest32, Vec<u8>)> = match self.dag.feed(author) {
             None => Vec::new(),
             Some(feed) => (1..=feed.max_seq())
                 .filter_map(|seq| feed.get(seq))
-                .filter(|e| !already.contains(&e.entry_hash()))
-                .filter_map(|e| {
-                    e.payload
-                        .as_ref()
-                        .map(|p| (e.entry_hash(), p.clone(), e.skeleton.seq))
-                })
+                .filter(|e| !already.contains(&e.entry_hash()) && !skip.contains(&e.entry_hash()))
+                .filter_map(|e| e.payload.as_ref().map(|p| (e.entry_hash(), p.clone())))
                 .collect(),
         };
-        let mut rendered = 0usize;
-        for (entry_hash, payload, _seq) in pending {
+        let mut rows = Vec::new();
+        for (entry_hash, payload) in pending {
             if !matches!(classify_payload(&payload), Ok(EntryKind::Content)) {
                 continue;
             }
-            if self.render_content(store, *author, entry_hash, &payload, now_secs)? {
-                rendered += 1;
+            if let Some(r) =
+                self.render_content_into(batch, *author, entry_hash, &payload, now_secs, expired)?
+            {
+                rows.push(r);
             }
         }
-        Ok(rendered)
+        Ok(rows)
     }
 
     /// Try to decrypt one stored content payload and, on success, render it into the
@@ -2954,23 +3180,81 @@ impl ChannelState {
         payload: &[u8],
         now_secs: u64,
     ) -> Result<bool> {
+        let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
+        let persisted = (|| -> Result<Option<Rendered>> {
+            let mut batch = store.batch()?;
+            let row = self.render_content_into(
+                &mut batch,
+                author,
+                entry_hash,
+                payload,
+                now_secs,
+                &mut expired,
+            )?;
+            if row.is_none() && expired.is_empty() {
+                return Ok(None);
+            }
+            self.queue_receivers(&mut batch)?;
+            batch.commit()?;
+            Ok(row)
+        })();
+        match persisted {
+            Ok(row) => {
+                let shown = row.is_some();
+                self.place_committed(store, row.into_iter().collect(), &expired)?;
+                Ok(shown)
+            }
+            Err(e) => {
+                // The chain advanced in memory but the advance was not persisted: a
+                // reopen would re-derive a consumed key. Poison instead.
+                self.poisoned = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Decrypt one content payload and queue its sealed plaintext-cache row into `batch`,
+    /// returning the rendered row for the caller to place in the timeline **once the batch has
+    /// committed** ([`Self::place_committed`]) — or `None` when this node may not, or cannot,
+    /// read it (see [`Self::render_content`]).
+    ///
+    /// **One transaction per pass, not two per entry.** Each entry used to commit its own cache
+    /// row and its own copy of the receiver chains — two durable commits, about 17 ms apiece on
+    /// macOS, taken while holding the room's lock. A sync delivering 133 of another member's
+    /// messages held the room for 2.3 s, and every post made in that room waited behind it
+    /// (V210-08, #179: `vox room post` p95 of seconds while a peer posts). The caller queues the
+    /// receiver chains once, after its loop, and commits once.
+    ///
+    /// **A late arrival of an expired message never renders** (ADR-023 decision 2): its key has
+    /// been used, so the caller still queues the chains, and the body is pushed onto `expired` to
+    /// be pruned **after** the commit — pruning writes, and a write opened while `batch` is open
+    /// blocks forever (redb).
+    fn render_content_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        author: Digest32,
+        entry_hash: Digest32,
+        payload: &[u8],
+        now_secs: u64,
+        expired: &mut Vec<(Digest32, Tracked)>,
+    ) -> Result<Option<Rendered>> {
         let me = self.me();
         if author != me && !self.may_read(&author, &me) {
-            return Ok(false);
+            return Ok(None);
         }
         let msg = match GroupMessage::from_wire(payload) {
             Ok(m) => m,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(None),
         };
         let slot = (author, msg.header.chain_id);
         let Some(chain) = self.receivers.get_mut(&slot) else {
-            return Ok(false);
+            return Ok(None);
         };
         let plaintext = match chain.decrypt(&msg) {
             Ok(p) => Zeroizing::new(p),
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(None),
         };
-        // **Skipped, not propagated** — matching the three `Ok(false)` paths above it.
+        // **Skipped, not propagated** — matching the three `Ok(None)` paths above it.
         //
         // An entry this node cannot render is one entry it cannot show, and every other reason for
         // that here already degrades: an unreadable group message, a missing receiver chain, a
@@ -2978,79 +3262,78 @@ impl ChannelState {
         // three callers invoke it with `?` **inside a loop over pending entries** — so one
         // undecodable envelope did not hide one message, it aborted the render pass and took every
         // later entry in it along.
-        //
-        // That was unreachable while every envelope in existence was version 1. Bumping the
-        // envelope to version 2 is exactly what makes it reachable, and reachable on nodes already
-        // in the field that this change cannot fix. It cannot help those; it means the next format
-        // change degrades to "that one message did not render" instead of "the room stopped
-        // rendering". Found in review by the other session, not by me, and not by a test.
         let Ok(content) = Content::from_canonical_slice(&plaintext) else {
-            return Ok(false);
+            return Ok(None);
         };
-        // **A late arrival of an expired message never renders** (ADR-023 decision 2). Its key
-        // has been used, so the chain is persisted all the same; the body goes as any other
-        // expired body does.
         if self.already_expired(&entry_hash, content.created_millis / 1_000, now_secs) {
-            let due: Vec<(Digest32, Tracked)> = self
-                .retention
-                .forget(&entry_hash)
-                .map(|t| (entry_hash, t))
-                .into_iter()
-                .collect();
-            self.prune(store, &due, true)?;
-            return Ok(false);
+            expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
+            return Ok(None);
         }
+        // The cache row shares the entry's log id space; use a fresh id so it never
+        // collides with an authored row. It is also the row's arrival (ADR-023 decision 1).
+        let id = self.next_log_id;
         let rendered = Rendered {
             entry_hash,
             author,
             created_millis: content.created_millis,
             text: content.text,
-            arrival: self.next_log_id,
+            arrival: id,
             shown_at_ms: 0,
             late: false,
         };
-        // The cache row shares the entry's log id space; use a fresh id so it never
-        // collides with an authored row.
-        let id = self.next_log_id;
         let cache_seg = seal_segment(
             &self.sek,
             SegmentKind::PlaintextCache,
             id,
             &cache_bytes(&rendered),
         )?;
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::PlaintextCache,
+            id,
+            &cache_seg,
+        )?;
+        self.next_log_id = id.saturating_add(1);
+        Ok(Some(rendered))
+    }
+
+    /// What follows a committed render pass, in memory: each row is recorded for retention and
+    /// placed at its spot in the room's order ([`Self::place_rendered`]), and any expired late
+    /// arrival is pruned — in a transaction of its own, now that the pass's has committed.
+    fn place_committed(
+        &mut self,
+        store: &Store,
+        rows: Vec<Rendered>,
+        expired: &[(Digest32, Tracked)],
+    ) -> Result<()> {
+        for rendered in rows {
+            self.retention.rendered(
+                &rendered.entry_hash,
+                rendered.created_millis / 1_000,
+                rendered.arrival,
+            );
+            self.place_rendered(rendered);
+        }
+        if !expired.is_empty() {
+            self.prune(store, expired, true)?;
+        }
+        Ok(())
+    }
+
+    /// Queue the receiver chains, as they stand now, into `batch`.
+    fn queue_receivers(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
         let receivers_seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_RECEIVERS,
             &receivers_bytes(&self.receivers),
         )?;
-        let persisted = (|| -> Result<()> {
-            let mut batch = store.batch()?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::PlaintextCache,
-                id,
-                &cache_seg,
-            )?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_RECEIVERS,
-                &receivers_seg,
-            )?;
-            batch.commit()
-        })();
-        if let Err(e) = persisted {
-            // The chain advanced in memory but the advance was not persisted: a
-            // reopen would re-derive a consumed key. Poison instead.
-            self.poisoned = true;
-            return Err(e);
-        }
-        self.next_log_id = id.saturating_add(1);
-        self.retention
-            .rendered(&entry_hash, rendered.created_millis / 1_000, id);
-        self.place_rendered(rendered);
-        Ok(true)
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_RECEIVERS,
+            &receivers_seg,
+        )
     }
 
     /// Insert a just-rendered row at its place in the room's order — which is above
@@ -3189,6 +3472,7 @@ impl ChannelState {
         }
         match gov {
             Some(g) => {
+                let could_read = self.readable_authors();
                 self.gov_entries.push(g);
                 self.evaluator = Arc::new(Self::build_evaluator(
                     &self.genesis,
@@ -3196,6 +3480,7 @@ impl ChannelState {
                     &self.gov_entries,
                     now_secs,
                 )?);
+                self.backfill_newly_readable(store, &could_read, now_secs)?;
                 Ok(Accepted::Governance)
             }
             // Content: render it if we hold the author's sender key and the author
@@ -3440,6 +3725,12 @@ impl ChannelState {
     }
 
     /// Whether this channel's SEK is `mlock`ed (ADR-010 best-effort; surfaced to
+    /// This channel's SEK, so a daemon can keep it sealed under its identity and reopen the room
+    /// after a restart without the room passphrase (#208).
+    pub fn sek_bytes(&self) -> Result<&[u8]> {
+        self.sek.key_bytes()
+    }
+
     /// the UI as the memory-protection honesty flag).
     #[must_use]
     pub fn mlock_active(&self) -> bool {

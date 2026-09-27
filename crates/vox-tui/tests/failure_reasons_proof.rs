@@ -22,7 +22,10 @@
 //! 6. `vox trust remove` of someone never trusted → there is nothing to remove;
 //! 7. a forward into a host that has not trusted you → the guest is told the host refused and
 //!    why that usually is, and the **host** logs whom it refused and why;
-//! 8. a room that is not there → "nothing here matches".
+//! 8. a room that is not there → "nothing here matches";
+//! 9. `vox trust add` when the keyring already holds its 1,024 identities → the keyring is
+//!    full, and how to make room. It used to say "that is longer than this field allows"
+//!    (the generic size fault), which sent a person looking at the petname.
 
 #![cfg(unix)]
 
@@ -325,6 +328,65 @@ fn every_common_failure_names_its_cause() {
     assert!(!ok, "removing a trust that does not exist must fail");
     assert_says("trust remove, never trusted", &said, &["never trusted"]);
 
+    // ---- (9) trust past the keyring's limit ----
+    // 1,100 distinct identities, eight at a time: more than the keyring holds, whatever it
+    // held already. Enough must be trusted to fill it, at least one must be refused, and
+    // every refusal must say the keyring is full. Eight at a time is possible because a
+    // passphrase check no longer runs on the node's actor (V210-26); one at a time, it
+    // took longer than the test watchdog allows.
+    let tried = 1_100usize;
+    let refusals: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8usize)
+            .map(|t| {
+                let joiner_dir = &joiner_dir;
+                scope.spawn(move || {
+                    let mut refused = Vec::new();
+                    for n in (t..tried).step_by(8) {
+                        let mut id = [0u8; 32];
+                        id[..8].copy_from_slice(&(n as u64 + 1).to_be_bytes());
+                        id[31] = 0x5A;
+                        let fp = vox_core::node::link::b32_encode(&id);
+                        let (ok, said, _) = vox(
+                            joiner_dir,
+                            &["trust", "add", &fp, "--name", &format!("filler-{n}")],
+                            "",
+                            quick,
+                        );
+                        if !ok {
+                            refused.push(said);
+                        }
+                    }
+                    refused
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    let trusted = tried - refusals.len();
+    eprintln!(
+        "[keyring] {trusted} of {tried} trusted, {} refused",
+        refusals.len()
+    );
+    assert!(
+        trusted >= 1_000,
+        "only {trusted} identities were trusted before the refusals began; the keyring \
+         cannot have been full"
+    );
+    assert!(
+        !refusals.is_empty(),
+        "CANNOT MEASURE (9): {tried} identities were trusted and the keyring never filled"
+    );
+    for said in &refusals {
+        assert_says(
+            "trust add, keyring full",
+            said,
+            &["keyring is full", "vox trust remove"],
+        );
+    }
+
     // ---- (8) a room that is not there ----
     let (ok, said, _) = vox(&joiner_dir, &["room", "post", "zzzzzzzz", "hi"], "", quick);
     assert!(!ok);
@@ -468,18 +530,14 @@ fn every_common_failure_names_its_cause() {
         refused,
         "CANNOT MEASURE (7): an untrusted guest's connection went through"
     );
-    // v0.3.0 integration: the guest's words are v0.2.9's (`up::refusal`, tunnel-honesty-v029),
-    // which say the same thing as this branch's did: the host refused, and trusting you is theirs.
+    // The guest's side: main says this through `up::refusal` (PRD-001 R23), in its own words.
     let guest_said = forward.expect_err("why the connection was refused", 30, |e| {
         e.contains("the host refused")
     });
     assert_says(
         "forward, host has not trusted you (guest)",
         &guest_said,
-        &[
-            "the host refused",
-            "has not trusted this identity (`vox trust add`)",
-        ],
+        &["the host refused", "has not trusted this identity"],
     );
     let host_said = host.expect_err("whom it refused", 30, |e| e.contains("refused"));
     assert_says(

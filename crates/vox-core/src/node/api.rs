@@ -434,6 +434,10 @@ pub enum Fault {
     ChannelNotOpen,
     /// An input exceeded its bound (name or text length).
     TooLong,
+    /// The trust keyring already holds its maximum number of identities
+    /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too
+    /// long, and "longer than this field allows" sent them looking at the petname.
+    KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
     /// The node is shutting down.
@@ -443,6 +447,17 @@ pub enum Fault {
     /// An invite link would not parse, or named a channel/anchor this node cannot
     /// use.
     BadLink,
+    /// A join reached a board, and the board has nothing for the room: either its host has not
+    /// published the room there yet (it is offline, or its publish has not landed), or the room id
+    /// in the address is wrong — a link carries no checksum, so a mistyped room id still parses.
+    /// The board cannot tell the two apart, so neither can this.
+    ///
+    /// **Not [`Fault::BadLink`].** This was reported as one, so a person whose host had simply
+    /// not reached the anchor yet was told the address would not parse and to check they had
+    /// copied all of it — the one thing that was not wrong. Measured on a relayed join: the
+    /// board was reached after 20s, held nothing for the room, and the advice pointed at the
+    /// address.
+    RoomNotOnBoard,
     /// A peer could not be reached (no live endpoint, or the dial failed).
     Unreachable,
     /// The remote refused: a join was refused, or a record was rejected.
@@ -485,6 +500,9 @@ impl Fault {
     /// What this fault means to a person, and what to do about it, in the house style: one
     /// short line saying what happened, then indented lines saying what to do.
     ///
+    // `Fault::KeyringFull`'s explanation names the cap in words; this holds them together.
+    const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
+
     /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
     /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,
     /// `Failed(NotConsented)`: the name of an enum variant, not a cause. The token stays
@@ -507,6 +525,9 @@ impl Fault {
                 "that room is not open on this node\n       open it with its passphrase: a line `<room> <passphrase>` to `vox daemon`, or in `vox tui`"
             }
             Fault::TooLong => "that is longer than this field allows",
+            Fault::KeyringFull => {
+                "your trust keyring is full (1,024 identities)\n       remove one with `vox trust remove <fingerprint>`, then add again"
+            }
             Fault::Storage => {
                 "the profile's store could not be written\n       check free disk space and that the data directory is writable"
             }
@@ -516,6 +537,9 @@ impl Fault {
             }
             Fault::BadLink => {
                 "that address will not parse, or names a room this node cannot use\n       check you copied the whole vox:// address"
+            }
+            Fault::RoomNotOnBoard => {
+                "the board holds nothing for that room\n       either its host has not published it there yet (the host must be online; then try again)\n       or the room part of the address is wrong: check it against the address you were sent"
             }
             Fault::Unreachable => {
                 "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
@@ -545,50 +569,6 @@ impl Fault {
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"
             }
-        }
-    }
-}
-
-impl Fault {
-    /// [`Self::explain`] for a **join**, where the same token means something more specific.
-    ///
-    /// Moved here from `vox connect` so that `vox room join` — which reaches the node over its
-    /// control socket and used to print `cannot join: Failed(Refused)` — says the same thing
-    /// (PRD-001 R36). The house style and every judgement below are `vox connect`'s: one short
-    /// line saying what happened, then an indented line saying what to actually do.
-    #[must_use]
-    pub fn explain_join(self) -> &'static str {
-        match self {
-            Fault::WrongPassphrase => {
-                "the room passphrase is wrong\n       the address is not in question — this is the passphrase alone"
-            }
-            Fault::BadLink => {
-                "that address will not parse, or names a room this node cannot use\n       this one IS the address — check you copied all of it"
-            }
-            // **Do not claim the passphrase is fine here.** Nobody answered, so nobody
-            // checked it — a wrong passphrase against an offline room reaches exactly this
-            // branch. The first version of this fix said "NOT the address or the
-            // passphrase", which is the same false confidence as the sentence it replaced,
-            // pointed the other way. Say what was and was not established.
-            Fault::Unreachable => {
-                "nobody who can answer for this room could be reached\n       so your passphrase was never checked — this is not a verdict on it\n       every member the board knows is offline: ask one to come online, or check\n       `vox node` on the anchor shows more than `1m` for this room"
-            }
-            // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
-            // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
-            // responder, so it is the responder that says no. Leading with "the refusal is
-            // the thing to chase" was true and useless at the one moment a person most
-            // needs a suggestion. Name the likely cause first, without pretending it is the
-            // only one.
-            Fault::Refused => {
-                "a member answered and refused the join\n       usually the room passphrase is wrong — it is checked by them, not by you,\n       so a typo arrives here rather than as a passphrase error\n       if you are sure of it, they may have revoked you, or be on a different room"
-            }
-            Fault::NotNetworked => {
-                "this node is not networked, or its identity is locked\n       nothing about the room is in question"
-            }
-            Fault::Locked | Fault::NoIdentity => {
-                "this profile has no unlocked identity, so there is nobody to join as\n       run `vox id` to make one"
-            }
-            other => other.explain(),
         }
     }
 }
@@ -693,6 +673,29 @@ pub enum NodeEvent {
         channel_id: Digest32,
         /// The port that was being carried, which is the service tag.
         port: u16,
+    },
+    /// A sync session with `peer` for `channel_id` did not complete, and why: the peer's coded
+    /// reason when it refused (a collision reads "the peer was busy syncing this room"), or the
+    /// transport's (#202, PRD-001 R36).
+    SyncFailed {
+        /// The room.
+        channel_id: Digest32,
+        /// The peer the session was with.
+        peer: Digest32,
+        /// What went wrong, in words.
+        reason: String,
+    },
+    /// A room is open, but it could not be added to the rooms this node reopens by itself
+    /// (#208), so it will be closed after a restart until it is opened again.
+    ///
+    /// Not a failure of the command that opened it: the room exists and is open, and saying
+    /// the command failed would leave a room in the store that its creator was told does not
+    /// exist.
+    RoomNotRemembered {
+        /// The room.
+        channel_id: Digest32,
+        /// Why it could not be remembered, in words.
+        why: String,
     },
     /// This node was unable to answer anybody for a noticeable time, and what it was doing.
     ///

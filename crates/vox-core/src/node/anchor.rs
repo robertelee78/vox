@@ -263,7 +263,7 @@ impl AnchorState {
         }
         match session {
             Ok(_) => Ok(out),
-            Err(code) => Err(sync_failure(code)),
+            Err(code) => Err(sync_failure(code, transport.peer_refused())),
         }
     }
 
@@ -357,7 +357,7 @@ impl AnchorState {
                 out.applied = n;
                 Ok(out)
             }
-            Err(code) => Err(sync_failure(code)),
+            Err(code) => Err(sync_failure(code, transport.peer_refused())),
         }
     }
 

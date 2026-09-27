@@ -2,7 +2,7 @@
 //!
 //! Until this existed, agent comms could not work on an unattended host, which
 //! contradicts this ADR's premise that agent sessions may be on "n-count remote
-//! hosts". The TUI was the only caller of `node::ipc::bind`; it needs a tty, and per
+//! hosts". The TUI was the only thing serving the control socket; it needs a tty, and per
 //! ADR-015 it locks the node on SIGHUP. `vox node` is an anchor — no identity
 //! unlocked, no room held, nothing readable.
 //!
@@ -20,6 +20,15 @@
 //!    service managers send on reload, must not disarm the node;
 //! 5. a wrong passphrase **fails loudly** rather than starting an unusable daemon;
 //! 6. an empty passphrase says what to do about it.
+//!
+//! **Every participant is the shipped binary.** The profile is made as a person makes one:
+//! `vox id`, then a `vox daemon` holding it while `vox room create` (room passphrase on
+//! stdin) makes the room, then that daemon is stopped with SIGTERM and reaped. Nothing in
+//! this process runs a node.
+//!
+//! **Mutation.** Remove the daemon's SIGHUP takeover in `run_daemon` (so SIGHUP keeps its
+//! default disposition, which terminates) and this goes red at claim 4: the post after the
+//! signal is refused with "no node is running".
 
 #![cfg(unix)]
 
@@ -30,14 +39,9 @@ use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use vox_core::node::api::{NodeCommand, Secret};
-use vox_core::node::paths::Paths;
-
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
-
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
-}
+const IDENTITY: &str = "daemon passphrase";
+const ROOMPASS: &str = "channel passphrase";
 
 /// A daemon child, killed when the test ends however it ends, with its pipes drained.
 struct Daemon(Child, Arc<Mutex<String>>);
@@ -86,14 +90,39 @@ fn drain(stream: Option<impl std::io::Read + Send + 'static>, into: &Arc<Mutex<S
 }
 
 fn vox(data: &std::path::Path, cfg: &std::path::Path, args: &[&str]) -> (bool, String, String) {
-    let out = Command::new(VOX)
+    vox_in(data, cfg, args, None)
+}
+
+/// `vox`, with `input` piped to its stdin when given (`room create` reads the passphrase
+/// there) and the identity passphrase in the environment, never argv (ADR-015).
+fn vox_in(
+    data: &std::path::Path,
+    cfg: &std::path::Path,
+    args: &[&str],
+    input: Option<&str>,
+) -> (bool, String, String) {
+    let mut child = Command::new(VOX)
         .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM")
-        .stdin(Stdio::null())
-        .output()
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn vox");
+    if let Some(text) = input {
+        let mut pipe = child.stdin.take().expect("vox stdin");
+        pipe.write_all(text.as_bytes()).expect("write stdin");
+        drop(pipe);
+    }
+    let out = child.wait_with_output().expect("vox ran");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -123,50 +152,11 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
 
-    // ---- a profile with an identity and a room, then nothing running ----
-    let cid = {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let node = rt
-            .block_on(async {
-                vox_core::node::actor::Node::spawn_with(
-                    paths.clone(),
-                    std::sync::Arc::new(|| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs())
-                    }),
-                    vox_core::atrest::sek::Argon2Profile::default(),
-                )
-            })
-            .unwrap();
-        let cid = rt.block_on(async {
-            assert!(node
-                .apply(NodeCommand::CreateIdentity {
-                    passphrase: secret("daemon passphrase"),
-                })
-                .await
-                .is_done());
-            assert!(node
-                .apply(NodeCommand::CreateChannel {
-                    local_name: "mission".into(),
-                    passphrase: secret("channel passphrase"),
-                })
-                .await
-                .is_done());
-            let cid = node.view().channels[0].channel_id;
-            let _ = node.apply(NodeCommand::Shutdown).await;
-            cid
-        });
-        drop(rt);
-        cid
-    };
-    let room = vox_core::node::link::b32_encode(&cid);
+    // ---- a profile with an identity and a room, made through the binary, then nothing
+    // running ----
+    let room = make_profile(&data, &cfg);
+    println!("[proof] profile made by `vox id` + `vox room create`: room {room}");
 
     // Nothing is running: the verbs say so rather than hanging.
     let (ok, _, err) = vox(&data, &cfg, &["room", "list"]);
@@ -178,7 +168,7 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
 
     // ---- (5) and (6): the passphrase is checked before anything is served ----
     let out = Command::new(VOX)
-        .args(["daemon"])
+        .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", &data)
         .env("VOX_CONFIG_DIR", &cfg)
         .stdin(Stdio::null())
@@ -192,7 +182,7 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
     );
 
     let mut child = Command::new(VOX)
-        .args(["daemon"])
+        .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", &data)
         .env("VOX_CONFIG_DIR", &cfg)
         .stdin(Stdio::piped())
@@ -211,10 +201,15 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         !out.status.success(),
         "a wrong passphrase must fail, not start an unusable daemon"
     );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("passphrase is wrong"),
+        "a wrong passphrase must be named as the reason: {said:?}"
+    );
 
     // ---- (1) the real thing, with the passphrase piped in ----
     let mut child = Command::new(VOX)
-        .args(["daemon"])
+        .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", &data)
         .env("VOX_CONFIG_DIR", &cfg)
         .stdin(Stdio::piped())
@@ -226,7 +221,7 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(format!("daemon passphrase\n{room} channel passphrase\n").as_bytes())
+        .write_all(format!("{IDENTITY}\n{} {ROOMPASS}\n", &room[..12]).as_bytes())
         .unwrap();
     // Closing stdin is what a pipe does; the daemon must not need it held open.
     drop(child.stdin.take());
@@ -285,5 +280,77 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         "the daemon stopped serving after SIGHUP: {read:?}"
     );
 
+    println!(
+        "[proof] daemon pid {pid}: attached, posted, read back, survived SIGHUP and posted again"
+    );
     drop(daemon);
+}
+
+/// Make the profile a person makes: `vox id`, a `vox daemon` holding it while `vox room
+/// create` makes the room, then that daemon stopped with SIGTERM and reaped. Returns the
+/// room's full id, from its invite link.
+fn make_profile(data: &std::path::Path, cfg: &std::path::Path) -> String {
+    let (ok, fp, err) = vox(data, cfg, &["id"]);
+    assert!(ok, "vox id: {err}");
+    assert_eq!(fp.trim().len(), 52, "`vox id` prints a fingerprint: {fp:?}");
+
+    let mut setup = Command::new(VOX)
+        .args(["daemon", "--listen", "127.0.0.1:0"])
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", cfg)
+        .env_remove("VOX_ROOM")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the setup daemon");
+    let mut pipe = setup.stdin.take().expect("daemon stdin");
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+    drop(pipe);
+    let pid = setup.id();
+    let setup = Daemon(setup, Arc::new(Mutex::new(String::new())));
+    until_attached(data, cfg, "the setup daemon");
+    let (ok, _, err) = vox_in(
+        data,
+        cfg,
+        &["room", "create", "--name", "mission"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "vox room create: {err}");
+    let listed = until_attached(data, cfg, "the setup daemon");
+    let label = listed
+        .split_whitespace()
+        .next()
+        .expect("the new room in `vox room list`")
+        .to_owned();
+    let (ok, link, err) = vox(data, cfg, &["room", "invite", &label]);
+    assert!(ok, "vox room invite: {err}");
+    let room = link
+        .trim()
+        .strip_prefix("vox://")
+        .and_then(|l| l.split('?').next())
+        .expect("an invite link naming the room")
+        .to_owned();
+
+    // Stopped as a service manager stops it, and waited for: the proof proper starts from
+    // a profile nothing holds.
+    let stopped = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(stopped.success(), "could not stop the setup daemon");
+    let mut setup = setup;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if setup.0.try_wait().expect("wait").is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CANNOT MEASURE: the setup daemon (pid {pid}) did not exit within 30s of SIGTERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    drop(setup);
+    room
 }

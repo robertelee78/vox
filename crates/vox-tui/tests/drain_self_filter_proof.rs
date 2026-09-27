@@ -240,11 +240,13 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
          vox room post \"$VOX_ROOM\" --type status {codeword}"
     ));
     // **A model that does not run the command is the apparatus failing, not Vox.**
-    // Measured 2026-09-25, opencode 1.18.32, with a fixture per tree: claude-haiku-4-5
-    // 20/20 and claude-sonnet-5 20/20 ran the command, 0 misses. Earlier "misses" were
-    // mostly the shared fixture (two trees overwriting each other's `vox`). Real ones seen
-    // before that: a refusal as "embedded in messages" (vox-bc, v0.3.0), the command
-    // printed in a code block and not run, and a request for `$VOX_ROOM`'s value. Neither says anything about the drain, so
+    // Measured 2026-09-26, opencode 1.18.32, a fixture per tree, 20 runs per arm: with
+    // this drain framing, claude-haiku-4-5 and claude-sonnet-5 both ran the command 20/20.
+    // With the old framing ("Reply with `vox room post …`" inside the block), sonnet-5
+    // refused 5/20 as an instruction "embedded" in room content; haiku-4-5 0/20. Other real
+    // misses seen: the command printed in a code block and not run, and a request for
+    // `$VOX_ROOM`'s value. A shared fixture used to add false ones (two trees overwriting
+    // each other's `vox`), which the per-tree fixture removed. Neither says anything about the drain, so
     // neither is reported as a product red — and neither is retried until green. It
     // fails as CANNOT PROVE, by name, unless that gap is accepted deliberately.
     let ran = std::fs::read_to_string(&calls)
