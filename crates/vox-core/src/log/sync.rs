@@ -606,9 +606,16 @@ pub fn apply_entry<R: AuthorResolver>(
     entry_wire: &[u8],
 ) -> std::result::Result<ApplyOutcome, WireError> {
     let entry = Entry::from_wire(entry_wire).map_err(|e| wire_error_for(&e))?;
+    // **An author this node has not admitted is `NotAdmitted`, as the DAG says it** (#217) — not an
+    // authenticator failure. Nothing about the entry was shown to be forged: this node simply does
+    // not know the author yet. Measured: members that had just joined received, from their anchor,
+    // the first entry of a member who joined after them, and reported "sync failed: authenticator
+    // invalid" — an integrity failure — for an author their next sync admits. The stream still
+    // closes (ADR-008: an entry that cannot be verified is refused), with the code
+    // `Rejected::NotAdmitted` already maps to.
     let key = resolver
         .key_for(&entry.skeleton.author_id)
-        .ok_or(WireError::AuthenticatorInvalid)?;
+        .ok_or_else(|| wire_error_for_rejected(&Rejected::NotAdmitted))?;
     let kind = resolver.kind_for(&entry);
     match dag.accept(entry, kind, &key, admission) {
         Ok(_) => Ok(ApplyOutcome::Stored),
