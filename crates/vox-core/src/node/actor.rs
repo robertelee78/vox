@@ -3243,6 +3243,7 @@ impl Node {
                 if wanted {
                     self.channels
                         .insert(channel_id, Arc::new(tokio::sync::Mutex::new(*channel)));
+                    self.mark_decisions_on_open(&channel_id).await;
                     self.adopt_channel_anchors(&channel_id, None).await;
                     self.refresh_network_view().await;
                     self.publish_channel_locally(&channel_id).await;
@@ -3508,14 +3509,14 @@ impl Node {
                 {
                     let mut channel = shared.lock().await;
                     let _ = channel.note_undelivered(profile.store(), peer, chain_id);
-                    // A refused generation the member is entitled to whole is owed again from
-                    // there (V210-45). Entitlement is re-derived from the trust decision and the
-                    // log, never from what was sent, so a key taken at an author's position is
-                    // never re-owed from its origin.
-                    if channel
-                        .history_floor(&peer, self.trust.trusted_since(&peer))
-                        .is_some_and(|f| f <= chain_id)
-                    {
+                    // A refused generation older than the live one is owed again as history
+                    // (V210-45), from the member's recorded entitlement and never before it, so
+                    // a key taken at a position is never re-owed from its origin. A refused
+                    // live generation is owed by the ledger above, and its re-key respects the
+                    // same entitlement (`rekey_skdm_for`).
+                    if channel.entitled_from(&peer).is_some_and(|(c, _)| {
+                        c <= chain_id && chain_id < channel.sender_generation()
+                    }) {
                         let _ = channel.owe_history(profile.store(), peer, chain_id);
                     }
                 }
@@ -4525,8 +4526,8 @@ impl Node {
             return Outcome::Failed(Fault::NotNetworked);
         }
         let now = self.now();
-        let trusted_since = self.trust.trusted_since(&target);
-        let floor: Option<u64>;
+        let decision = self.trust_decision(&target);
+        let plan: Option<Vec<(u64, u64)>>;
         let skdm = {
             let (Some(profile), Some(shared)) = (
                 self.profile.as_ref(),
@@ -4540,17 +4541,16 @@ impl Node {
                 // it and cannot know we are releasing to the right party.
                 return Outcome::Failed(Fault::UnknownChannel);
             }
-            // **Consent is dated by the decision, not the delivery** (V210-45). A member
-            // trusted before this identity minted a generation is entitled to it whole: it
-            // holds only posts sealed after the decision. So the live generation goes at its
-            // origin, and every older one it is entitled to is owed below and delivered by
-            // the re-key round, which retries until each is taken. Without this a member
-            // trusted before a room existed, joining after 1,500 posts, read only the 500 of
-            // the generation live at its join — or none, had that key been taken at the
-            // author's position.
-            floor = channel.history_floor(&target, trusted_since);
-            if floor.is_some() {
-                match channel.rekey_skdm(profile) {
+            // **Consent is dated by the decision, not the delivery** (V210-45), in the
+            // profile's logical consent order, never by a clock. Every generation minted after
+            // the decision goes whole; the one live at the decision goes from where it stood
+            // then; nothing older. The live generation's key is delivered here, and the older
+            // ones the plan covers are owed below and delivered by the re-key round, which
+            // retries until each is taken. Without this a member trusted before a room existed,
+            // joining after 1,500 posts, read only the 500 of the generation live at its join.
+            plan = channel.history_plan(&target, decision);
+            if let Some(&(live, from)) = plan.as_ref().and_then(|p| p.last()) {
+                match channel.release_generation(profile, live, from) {
                     Ok(s) => s,
                     Err(e) => return Outcome::Failed(fault_of(&e)),
                 }
@@ -4633,18 +4633,23 @@ impl Node {
         }
         let history_owed = {
             let mut channel = shared.lock().await;
-            if let Err(e) = channel.issue_consent(profile, target, &skdm, now) {
+            // What this consent releases, from its earliest position (V210-45): every later
+            // release to `target` starts there and never before it.
+            let entitled_from = plan
+                .as_ref()
+                .and_then(|p| p.first().copied())
+                .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
+            if let Err(e) = channel.issue_consent(profile, target, &skdm, entitled_from, now) {
                 return Outcome::Failed(fault_of(&e));
             }
             // The generations before the live one that the decision covers (V210-45).
-            match floor {
-                Some(f) if f < skdm.body.chain_id => {
-                    if let Err(e) = channel.owe_history(profile.store(), target, f) {
-                        return Outcome::Failed(fault_of(&e));
-                    }
-                    true
+            if entitled_from.0 < skdm.body.chain_id {
+                if let Err(e) = channel.owe_history(profile.store(), target, entitled_from.0) {
+                    return Outcome::Failed(fault_of(&e));
                 }
-                _ => false,
+                true
+            } else {
+                false
             }
         };
         // The generation delivered is the key's own: a key taken before a rotation is the older
@@ -4761,6 +4766,69 @@ impl Node {
         outcome
     }
 
+    /// The consent-order value of `target`'s current trust decision (V210-45), or `None` if it
+    /// has none — a decision from before the order was kept entitles to no history.
+    fn trust_decision(&self, target: &Digest32) -> Option<u64> {
+        if !self.trust.is_trusted(target) {
+            return None;
+        }
+        let profile = self.profile.as_ref()?;
+        let signer = profile.signer().ok()?;
+        crate::node::consent_order::ConsentOrder::load(profile.store(), signer)
+            .ok()?
+            .trusted_at(target)
+    }
+
+    /// Stamp a new trust decision for `fingerprint` in the consent order and mark where every
+    /// open room's sender key stands at it (V210-45). The stamp is floored by every open room's
+    /// newest generation, so a lost or rolled-back counter cannot make one of them look minted
+    /// after this decision.
+    async fn stamp_trust_decision(&mut self, fingerprint: Digest32) {
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        let Ok(signer) = profile.signer() else {
+            return;
+        };
+        let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
+        let mut floor = 0u64;
+        for ch in &shared {
+            floor = floor.max(ch.lock().await.newest_mint_seq());
+        }
+        let Ok(decision) =
+            crate::node::consent_order::stamp_trust(profile.store(), signer, fingerprint, floor)
+        else {
+            return;
+        };
+        for ch in shared {
+            let _ = ch
+                .lock()
+                .await
+                .mark_trust(profile.store(), fingerprint, decision);
+        }
+    }
+
+    /// Mark, in a room just opened, every trust decision taken while it was closed (V210-45).
+    async fn mark_decisions_on_open(&mut self, channel_id: &Digest32) {
+        let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
+            return;
+        };
+        let Ok(signer) = profile.signer() else {
+            return;
+        };
+        let Ok(order) = crate::node::consent_order::ConsentOrder::load(profile.store(), signer)
+        else {
+            return;
+        };
+        let _ = shared
+            .lock()
+            .await
+            .mark_decisions_on_open(profile.store(), &order);
+    }
+
     /// Trust `fingerprint` node-wide under `petname` (ADR-020 §3), then act on it
     /// at once so the operator does not wait a tick to see the effect.
     async fn trust_identity(&mut self, fingerprint: Digest32, petname: &str) -> Outcome {
@@ -4771,8 +4839,9 @@ impl Node {
             Ok(s) => s,
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
+        let newly = !self.trust.is_trusted(&fingerprint);
         let mut next = self.trust.clone();
-        if let Err(e) = next.trust(fingerprint, petname, self.now()) {
+        if let Err(e) = next.trust(fingerprint, petname) {
             return Outcome::Failed(fault_of(&e));
         }
         // Persist BEFORE adopting it: a keyring that consented but did not survive
@@ -4781,6 +4850,14 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        if newly {
+            // The decision's place in the consent order, and where each open room's sender
+            // key stands at it (V210-45). A rename is the same decision and keeps its place.
+            // Nothing else runs on the actor in between, so no post is sealed between the
+            // stamp and the marks. A failure here narrows what the member will read and
+            // never widens it, so it does not undo the trust.
+            self.stamp_trust_decision(fingerprint).await;
+        }
         // The reacher sets are a join of the ring with each room's author set, so both
         // inputs must push. Immediately, not on the tick: a stream parked open across
         // this instant is judged by the set as it stands when its request lands (M17.11).
@@ -4817,6 +4894,10 @@ impl Node {
             }
             self.consent_keys = pending;
         }
+        // The decision goes with the trust (V210-45). Not load-bearing: a re-trust always draws
+        // a new place in the consent order, and a decision is only read for a trusted identity,
+        // so a failure here leaves nothing that could widen a later release.
+        let _ = crate::node::consent_order::forget_trust(profile.store(), signer, fingerprint);
         // The ring is written FIRST and unconditionally, exactly as a revocation's
         // log fact lands before its re-keys: if the rotations below cannot all be
         // delivered, the decision must still have been taken. A removal that were
@@ -4977,14 +5058,18 @@ impl Node {
             // work is bounded by the history this identity holds, not by a constant.
             let mut history: BTreeMap<Digest32, Vec<crate::group::skdm::Skdm>> = BTreeMap::new();
             for (target, floor) in history_owed {
-                if let Ok(batch) = channel.history_skdms(profile, floor) {
+                if let Ok(batch) = channel.history_skdms(profile, &target, floor) {
                     history.insert(target, batch);
                 }
             }
-            match channel.rekey_skdm(profile) {
-                Ok(s) => (owed, channel.sender_generation(), s, history),
-                Err(_) => return 0,
+            // Each member's re-key from where its entitlement begins (V210-45).
+            let mut skdm: BTreeMap<Digest32, crate::group::skdm::Skdm> = BTreeMap::new();
+            for target in &owed {
+                if let Ok(s) = channel.rekey_skdm_for(profile, target) {
+                    skdm.insert(*target, s);
+                }
             }
+            (owed, channel.sender_generation(), skdm, history)
         };
         let mut delivered = 0u64;
         let now_secs = self.now();
@@ -5012,7 +5097,10 @@ impl Node {
             let owes_history = batch.is_some();
             let keys: Vec<&crate::group::skdm::Skdm> = match batch.as_ref() {
                 Some(b) => b.iter().collect(),
-                None => vec![&skdm],
+                None => match skdm.get(&target) {
+                    Some(k) => vec![k],
+                    None => continue,
+                },
             };
             let mut all_sent = true;
             let mut hello_left = hello.as_ref();
@@ -5914,8 +6002,8 @@ impl Node {
         let mut channel = shared.lock().await;
         let _ = channel.forget_delivery(profile.store(), peer);
         // The history keys went under the dropped session too (V210-45).
-        if let Some(f) = channel.history_floor(peer, self.trust.trusted_since(peer)) {
-            let _ = channel.owe_history(profile.store(), *peer, f);
+        if let Some((from, _)) = channel.entitled_from(peer) {
+            let _ = channel.owe_history(profile.store(), *peer, from);
         }
     }
 
@@ -6678,6 +6766,7 @@ impl Node {
                 self.remember_or_say(&ch);
                 self.channels
                     .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+                self.mark_decisions_on_open(channel_id).await;
                 self.adopt_channel_anchors(channel_id, None).await;
                 self.refresh_network_view().await;
                 self.publish_channel_locally(channel_id).await;
@@ -7064,8 +7153,7 @@ impl Node {
         // A rotation that cannot persist poisons the channel, which the *next*
         // command reports; it does not un-send the message that just went out, so the
         // append is still reported as the success it was.
-        let rotated =
-            ch.should_rotate_sender(now) && ch.rotate_sender(profile.store(), now).is_ok();
+        let rotated = ch.should_rotate_sender(now) && ch.rotate_sender(profile, now).is_ok();
         self.fresh_details
             .insert(*channel_id, (summary_of(&ch), detail_of(&ch)));
         drop(ch);

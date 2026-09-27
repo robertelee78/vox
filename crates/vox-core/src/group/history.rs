@@ -47,8 +47,12 @@ use crate::pairwise::MAX_SKIP;
 /// be releasable (that is what a rotation's re-key needs).
 pub const MAX_RETAINED_ORIGINS: usize = 256;
 
-/// At-rest version of an [`OriginKeyStore`] state blob.
-const ORIGIN_STATE_VERSION: u64 = 1;
+/// At-rest version of an [`OriginKeyStore`] state blob. Version 2 adds each generation's
+/// consent-order value ([`crate::node::consent_order`]); a version-1 blob still reads, its
+/// generations with no value.
+const ORIGIN_STATE_VERSION: u64 = 2;
+/// The first encoding, without consent-order values.
+const ORIGIN_STATE_VERSION_1: u64 = 1;
 
 /// A retained origin record for one `(channel_id, epoch, chain_id)` generation:
 /// the iteration-0 chain key, the composite Sender-Key signing public key, the
@@ -67,6 +71,10 @@ struct OriginRecord {
     signing_pubkey: [u8; crate::group::wire::SENDER_KEY_SIGNING_PUB_LEN],
     /// Wall-clock (Unix seconds) the generation was created — the TTL anchor.
     created_at: u64,
+    /// The generation's place in this profile's consent order (V210-45), drawn when it was
+    /// minted. `None` for a generation minted before the order was kept: it is never released
+    /// as history, because nobody can say whether it predates a decision.
+    mint_seq: Option<u64>,
 }
 
 /// A sender's store of origin chain keys, enabling full-history (and
@@ -117,6 +125,7 @@ impl OriginKeyStore {
         origin_key: ChainKey,
         signing_pubkey: [u8; crate::group::wire::SENDER_KEY_SIGNING_PUB_LEN],
         created_at: u64,
+        mint_seq: Option<u64>,
     ) {
         let key = (*channel_id, epoch, chain_id);
         // Make room before inserting, and only for a genuinely new generation:
@@ -133,6 +142,7 @@ impl OriginKeyStore {
                 origin_key,
                 signing_pubkey,
                 created_at,
+                mint_seq,
             },
         );
     }
@@ -165,7 +175,7 @@ impl OriginKeyStore {
         e.array(2).uint(ORIGIN_STATE_VERSION).array(keys.len());
         for k in keys {
             let r = &self.records[k];
-            e.array(7)
+            e.array(8)
                 .bytes(&r.channel_id)
                 .uint(r.epoch)
                 .uint(k.2)
@@ -173,6 +183,8 @@ impl OriginKeyStore {
                 .bytes(r.origin_key.bytes())
                 .bytes(&r.signing_pubkey)
                 .uint(r.created_at);
+            // 0 is never handed out by the counter, so it stands for "no value".
+            e.uint(r.mint_seq.unwrap_or(0));
         }
         Zeroizing::new(e.finish())
     }
@@ -186,16 +198,22 @@ impl OriginKeyStore {
         if d.array()? != 2 {
             return Err(Error::MalformedBundle("origin store state arity"));
         }
-        if d.uint()? != ORIGIN_STATE_VERSION {
+        let version = d.uint()?;
+        if version != ORIGIN_STATE_VERSION && version != ORIGIN_STATE_VERSION_1 {
             return Err(Error::MalformedBundle("origin store state version"));
         }
+        let arity = if version == ORIGIN_STATE_VERSION {
+            8
+        } else {
+            7
+        };
         let n = d.array()?;
         if n > MAX_RETAINED_ORIGINS {
             return Err(Error::SizeLimitExceeded("retained origin generations"));
         }
         let mut records = HashMap::with_capacity(n);
         for _ in 0..n {
-            if d.array()? != 7 {
+            if d.array()? != arity {
                 return Err(Error::MalformedBundle("origin record arity"));
             }
             let channel_id: Digest32 = d
@@ -217,6 +235,11 @@ impl OriginKeyStore {
                 .try_into()
                 .map_err(|_| Error::MalformedBundle("origin record signing_pubkey"))?;
             let created_at = d.uint()?;
+            let mint_seq = if arity == 8 {
+                Some(d.uint()?).filter(|v| *v != 0)
+            } else {
+                None
+            };
             records.insert(
                 (channel_id, epoch, chain_id),
                 OriginRecord {
@@ -226,6 +249,7 @@ impl OriginKeyStore {
                     origin_key: ChainKey::from_bytes(ck),
                     signing_pubkey,
                     created_at,
+                    mint_seq,
                 },
             );
         }
@@ -240,7 +264,7 @@ impl OriginKeyStore {
     }
 
     /// The retained generations `author` minted for `(channel_id, epoch)`, as
-    /// `(chain_id, created_at)` in ascending `chain_id` order — what a history release
+    /// `(chain_id, mint_seq)` in ascending `chain_id` order — what a history release
     /// can cover, and all it can (V210-45). At most [`MAX_RETAINED_ORIGINS`].
     #[must_use]
     pub fn generations(
@@ -248,12 +272,12 @@ impl OriginKeyStore {
         channel_id: &Digest32,
         epoch: u64,
         author: &Digest32,
-    ) -> Vec<(u64, u64)> {
-        let mut out: Vec<(u64, u64)> = self
+    ) -> Vec<(u64, Option<u64>)> {
+        let mut out: Vec<(u64, Option<u64>)> = self
             .records
             .iter()
             .filter(|((c, e, _), r)| c == channel_id && *e == epoch && &r.author_id == author)
-            .map(|((_, _, chain_id), r)| (*chain_id, r.created_at))
+            .map(|((_, _, chain_id), r)| (*chain_id, r.mint_seq))
             .collect();
         out.sort_unstable();
         out

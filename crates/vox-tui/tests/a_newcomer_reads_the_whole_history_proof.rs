@@ -31,8 +31,17 @@
 //! store or speaks a wire protocol; each step is a `vox` process with its own
 //! `VOX_DATA_DIR`/`VOX_CONFIG_DIR`, killed by its PID when dropped.
 //!
-//! **Mutation:** release a newcomer only the author's current generation (drop the retained
-//! older generations from the consent release) and this goes red with bob at 500 of 1,500.
+//! **Ordering.** Whether a generation was minted after bob was trusted is decided by the
+//! profile's logical consent order (one persisted counter every mint and every trust decision
+//! draws from), never by a clock. The first fix compared whole seconds and went red 1 run in 2
+//! here: alice's `trust add` and her `room create` fall in the same second often enough. This
+//! staging leaves them back to back on purpose, and must be green every run.
+//!
+//! The negative half — nothing sealed before a decision is ever read, and a generation spanning
+//! the decision is read from the decision on — is `a_member_reads_only_what_follows_trust_proof`.
+//!
+//! **Mutation:** make the consent release cover no history (`history_plan` returns nothing) and
+//! this goes red with bob short of 1,500.
 
 #![cfg(unix)]
 
