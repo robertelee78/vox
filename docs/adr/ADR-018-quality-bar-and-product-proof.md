@@ -865,9 +865,9 @@ run `vox`: `a_daemon_follows_its_anchor`, `a_long_room_reopens_proof`,
 `agent_rehearsal_proof`, `daemon_proof`, `it_just_works_with_a_daemon_running`,
 `opencode_plugin_proof`, `remote_interrupt_proof`,
 `shutdown_releases_the_profile_proof`, `work_board_proof`. Each is to have every participant run as
-the binary, or be deleted, and is tracked as its own item. **Updated 2026-09-27:** all but
-`a_daemon_follows_its_anchor` and `agent_rehearsal_proof` are converted (RP-33/34/36/37/38/39/40/41/43)
-or retired into an all-real proof (RP-46).
+the binary, or be deleted, and is tracked as its own item. **Done 2026-09-27:** all twelve are converted
+(RP-32/33/34/35/36/37/38/39/40/41/43) or retired into an all-real proof (RP-46). No test in the tree
+starts a node in-process (checked: no `Node::spawn`, `NodeHandle` or `Node::start` in any test).
 
 **How this is applied.** No new test may run the node in-process, assert an internal value, or stand
 in a proxy for what a person sees. A proof that needs an instrument (the R41 link emulator) keeps the
