@@ -1349,17 +1349,25 @@ impl Joiner {
         let parsed = &self.parsed;
         let net = Arc::clone(&self.net);
         let t = std::time::Instant::now();
+        // **Which side was unreachable is part of the answer (#192).** A board that never answered,
+        // or stopped answering while it was read, is `BoardUnreachable`; `Unreachable` below is
+        // kept for a join whose board answered and whose members did not.
         let Some(board) = self.reach_a_board().await else {
             steps.took("board (unreached)", t);
-            return Err(JoinerLost::of(Fault::Unreachable));
+            return Err(JoinerLost::of(Fault::BoardUnreachable));
         };
         steps.took("board", t);
         let t = std::time::Instant::now();
-        let mut set = net
-            .fetch_channel(&board, &parsed.channel_id, 0)
-            .await
-            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
-        steps.took("fetch", t);
+        let fetched = net.fetch_channel(&board, &parsed.channel_id, 0).await;
+        steps.took(
+            if fetched.is_ok() {
+                "fetch"
+            } else {
+                "fetch (failed)"
+            },
+            t,
+        );
+        let mut set = fetched.map_err(|e| JoinerLost::of(on_the_board(fault_of(&e))))?;
         // **A board that does not hold the room is not a malformed address.** The link parsed and
         // named a room; the board we reached has nothing for it. That is either a room its host has
         // not published there yet, or a room id mistyped into another valid one (a link carries no
@@ -1429,9 +1437,12 @@ impl Joiner {
             .map_err(|e| JoinerLost::of(fault_of(&e)))?
             .to_wire()
         };
-        announce(&board, &prejoin_wire)
-            .await
-            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        let t = std::time::Instant::now();
+        let announced = announce(&board, &prejoin_wire).await;
+        if announced.is_err() {
+            steps.took("announce to the board (failed)", t);
+        }
+        announced.map_err(|e| JoinerLost::of(on_the_board(fault_of(&e))))?;
         let mut why: Vec<String> = Vec::new();
         let mut last_fault = Fault::Unreachable;
         let mut joined_outcome = None;
@@ -1581,6 +1592,15 @@ impl Joiner {
             sealed,
             steps: JoinSteps::default(),
         })
+    }
+}
+
+/// A fault met while talking to the board itself: an `Unreachable` there is the board's, not a
+/// member's, and says so (#192).
+const fn on_the_board(fault: Fault) -> Fault {
+    match fault {
+        Fault::Unreachable => Fault::BoardUnreachable,
+        other => other,
     }
 }
 
@@ -4316,7 +4336,7 @@ impl Node {
             }
         }
         if routes.is_empty() {
-            let _ = reply.send(Outcome::Failed(Fault::Unreachable));
+            let _ = reply.send(Outcome::Failed(Fault::BoardUnreachable));
             return;
         }
         let seq = self.next_record_seq(&parsed.channel_id);
