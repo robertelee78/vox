@@ -631,6 +631,58 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         "the migrated vault is still version {version_after}"
     );
 
+    // ---- 2b. no old seal left in the file ------------------------------------------------------
+    // Whether a replaced page's bytes survive depends on where redb put it: in (2)'s larger
+    // profile the old seals sat in the free region at the file's end, which redb truncates, so a
+    // migration that never rewrote the store still read clean there. This profile is staged as a
+    // v0.2.9 user who trusted someone and started the daemon once, which leaves the old pages
+    // mid-file (as verification of #214 found): here only a rewrite removes them.
+    let (erin, frank) = (dir("erin"), dir("frank"));
+    let frank_fp = ok(&old, &frank, &["id"], None).trim().to_owned();
+    ok(&old, &erin, &["id"], None);
+    ok(
+        &old,
+        &erin,
+        &["trust", "add", &frank_fp, "--name", "frank"],
+        None,
+    );
+    {
+        let (_node, spec) = anchor(&old, &dir("old-anchor-2"));
+        let _erin_d = daemon(&old, "erin (v0.2.9)", &erin, &spec, &idpass);
+    }
+    let small = Disk::of(&erin);
+    let small_before = file_facts(&small);
+    let small_old = fingerprints_of(&blobs(&small));
+    let small_scan_before = occurrences(&small, &small_old);
+    assert!(
+        small_old.len() == 2 && small_scan_before.iter().all(|n| *n >= 1),
+        "CANNOT MEASURE: {PREVIOUS}'s keyring and ring are not both found in the small profile's \
+         raw files: {} blob(s), {small_scan_before:?}",
+        small_old.len()
+    );
+    ok(&new, &erin, &["trust", "list"], None);
+    let small_scan_after = occurrences(&small, &small_old);
+    let small_live = occurrences(&small, &fingerprints_of(&blobs(&small)));
+    println!(
+        "[store] the small profile's store.redb (bytes, inode): {small_before:?} before \
+         migration, {:?} after",
+        file_facts(&small)
+    );
+    println!(
+        "[proof] a v0.2.9 user who trusted and ran the daemon once: old seals in the raw files \
+         {small_scan_before:?} before migration, {small_scan_after:?} after; the new seals \
+         {small_live:?}"
+    );
+    assert!(
+        small_live.iter().all(|n| *n >= 1),
+        "CANNOT MEASURE: the raw scan does not find the small profile's new seals: {small_live:?}"
+    );
+    assert!(
+        small_scan_after.iter().all(|n| *n == 0),
+        "the old seals, openable from the public key, are still on disk after migration: \
+         {small_scan_after:?} copies"
+    );
+
     // ---- 3. no way back to the old keys -------------------------------------------------------
     // (a) A keyring sealed the attacker's way, under the migrated v2 vault: no loader tries an
     // old key, so it does not open.
