@@ -9,8 +9,8 @@
 //! still in flight. Seen as 1 report in 42, and 3 runs in 8 under load, in #202's proof; the
 //! anchor's own dump showed the refusal two seconds after the joiner's pre-join record was written.
 //!
-//! What this drives, as people would: an anchor, alice's `vox daemon` with a room, and [`JOINERS`]
-//! more daemons that each join it and **post straight away**, one after another, while the machine
+//! What this drives, as people would: an anchor, alice's `vox daemon` with a room, and eight
+//! more daemons ([`JOINERS`]) that each join it and **post straight away**, one after another, while the machine
 //! is busy. What it asserts:
 //! 1. no joiner reports a failed sync as a governance, malformed-data or authenticator failure;
 //! 2. alice reads each joiner's first post within [`READ_WITHIN`] of it being posted.
@@ -44,8 +44,12 @@ use std::time::{Duration, Instant};
 
 use world::{args, vox_once, VoxProc, IDENTITY, VOX};
 
-/// Members that join alice's room, one after another. Each is a fresh chance at the window.
-const JOINERS: [&str; 4] = ["bob", "carol", "dave", "erin"];
+/// Members that join alice's room, one after another. Each is a fresh chance at the window — and
+/// each of the four paths this guards is rare on its own, so eight (measured: with four, a mutant
+/// restoring any single path could stay green two runs in a row).
+const JOINERS: [&str; 8] = [
+    "bob", "carol", "dave", "erin", "frank", "grace", "heidi", "ivan",
+];
 /// A joiner's first post must reach alice within this, measured from the moment it was posted.
 const READ_WITHIN: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(120);
