@@ -25,8 +25,12 @@
 //!    migrate. The binary must never show mallory: the version is bound into the vault's AEAD,
 //!    so the relabelled vault does not open at all.
 //!
+//! 3a also requires the refusal to say what happened: the passphrase was right and the keyring
+//! would not open under it, not "the passphrase is wrong".
+//!
 //! Mutations: any one blob sealed with its old key again breaks (1); an unlock that does not
-//! migrate breaks (2); the vault's version left out of its AEAD breaks (3).
+//! migrate breaks (2); the vault's version left out of its AEAD, or a loader that falls back to
+//! the old key, breaks (3); the refusal reported as a wrong passphrase breaks (3a).
 
 #![cfg(unix)]
 
@@ -535,6 +539,17 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     assert!(
         !out.contains("mallory"),
         "a keyring planted with a key computable from the public key was accepted: {out}{err}"
+    );
+    // And it says why, truthfully: the passphrase was right, so "the passphrase is wrong" would
+    // send a person to retype a correct one.
+    println!(
+        "[proof] the refusal says the sealed data will not open = {}, says the passphrase is wrong = {}",
+        err.contains("will not open under it"),
+        err.contains("passphrase is wrong")
+    );
+    assert!(
+        err.contains("will not open under it") && !err.contains("passphrase is wrong"),
+        "a keyring that will not open under a correct passphrase was reported as: {err}"
     );
     // (b) The same, with the vault relabelled v1, which is what makes an unlock migrate.
     {

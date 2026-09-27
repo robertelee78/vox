@@ -2480,7 +2480,12 @@ impl Node {
                     // The identity is usable but the ring is not: lock again rather
                     // than run without key-agreement keys.
                     self.lock_all().await;
-                    return Outcome::Failed(fault_of(&e));
+                    // The passphrase was just proved by the vault, so a blob that will not open
+                    // is not a wrong passphrase (V210-40).
+                    return Outcome::Failed(match e {
+                        crate::error::Error::AtRestUnlockFailed => Fault::SealedUnreadable,
+                        e => fault_of(&e),
+                    });
                 }
                 if let Err(e) = self.start_network() {
                     self.lock_all().await;
