@@ -2684,11 +2684,14 @@ dependencies = [
 name = "vox-tui"
 version = "0.2.9"
 dependencies = [
+ "aes-gcm",
+ "argon2",
  "clap",
  "clap_complete",
  "clap_mangen",
  "crossterm",
  "getrandom 0.3.4",
+ "hkdf",
  "qrcode",
  "ratatui",
  "reqwest",
