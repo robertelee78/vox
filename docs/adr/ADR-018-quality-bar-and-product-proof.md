@@ -79,15 +79,18 @@ A proof whose prover is unavailable — an uninstalled shell, absent hardware, a
 MUST be reported as **unproven** and MUST fail the proof. It MUST NOT be silently skipped.
 
 A gap MAY be accepted deliberately, and when it is, the acceptance MUST be explicit and visible at the
-point of running (for example `VOX_PROOF_ALLOW_UNPROVEN=install.apple_gate_refuses_unsigned_bytes`)
+point of running (for example `VOX_PROOF_ALLOW_UNPROVEN=opencode`)
 and SHOULD be recorded here. A failing
 or blocked obligation MUST be recorded as failing or blocked, never as waived-green.
 
-**Accepted gaps, as of 2026-09-21:**
+**Accepted gaps, as of 2026-09-27** (the one CI still names):
 
-| Gap | Accepted because | What would close it |
+| Gap | Accepted because | Where it is proved instead |
 |---|---|---|
-| `install.apple_gate_refuses_unsigned_bytes` in `install_sh_proof` | the installer's Developer ID and notarization gate is macOS-only, so on Linux there is nothing to measure. On macOS it is proved, by forcing the gate on against an unsigned fixture. | nothing closes it on Linux; it is a property that does not exist there |
+| `opencode`: `agent_rehearsal_proof`, `drain_self_filter_proof`, `opencode_plugin_proof`, `tracker_rehearsal_proof` | they drive a live model through a real OpenCode, and CI runners have neither OpenCode nor a model account. The decider chose (2026-09-26) "Only on this Mac": they run with the decider's account on a real Mac. | `scripts/release-gate.sh`, which runs with **no** gap accepted and refuses a tag unless they are green |
+
+Until 2026-09-26 this table held `install.apple_gate_refuses_unsigned_bytes` (macOS-only, reported
+blocked on Linux). It is closed, as recorded below.
 
 **Closed 2026-09-26 (V210-20, #193): the Apple gate, and the update journey on CI.** A property a
 platform does not have is not a gap on that platform: `install_sh_proof` no longer makes the
@@ -125,11 +128,13 @@ excuse `fish`**. An accepted gap that states its own remedy SHOULD be closed rat
 The whitelist is therefore per-environment, and CI's is the strict one:
 
 ```
-# CI (ubuntu + macOS, both with zsh, bash and fish installed):
-VOX_PROOF_ALLOW_UNPROVEN=journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes
+# CI (ubuntu + macOS, both with zsh, bash and fish installed), as of 2026-09-27:
+VOX_PROOF_ALLOW_UNPROVEN=opencode
+
+# the local release gate (scripts/release-gate.sh): none. It unsets the variable.
 
 # a developer machine that has no fish may additionally name it:
-VOX_PROOF_ALLOW_UNPROVEN=fish,journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes
+VOX_PROOF_ALLOW_UNPROVEN=fish,opencode
 ```
 
 A local list MAY be longer than CI's; it MUST NOT be shorter, and CI's MUST NOT grow to match a
@@ -500,7 +505,14 @@ made the close mechanical.
 
 ## Two proofs are excluded from the release gate, by name (2026-09-23)
 
-**Status: open defects, not accepted gaps.** Both are excluded from `release.yml`'s `--ignored` step
+**Status, 2026-09-27: neither is excluded any more.** `relayed_path_is_retried` was deleted with the
+in-process tests; RP-25 (#132) proves the upgrade through the shipped binary. `cross_process_join_proof`
+is back in the blocking gate (20 of 20 on 39c3884). But its independent verification saw one fast red
+in 3 on 005b801 (a join straight after the invite, "every member the board knows is offline"), and
+that cause is to be named and fixed under #192 before the gate is called honest. The record below is
+the history.
+
+**Status then: open defects, not accepted gaps.** Both are excluded from `release.yml`'s `--ignored` step
 so a release can be built at all, and both still run in the same job as warnings so a change in their
 rate is visible rather than buried.
 
@@ -777,10 +789,12 @@ only, so a macOS-only red could not block a release; now it does. Both are shipp
 
 **How the suite is laid out in CI.** `build-test` (both OSes) runs fmt, clippy, the debug suite,
 rustdoc and the release `--ignored` suite **without** the PRD-001 transport gates, which run in
-parallel in `transport-gates` (`r40_`, `r41_`, `r42_`; ~20 minutes, the relay gate alone 11-22).
-Both are blocking. The by-name exclusion recorded in "Two proofs are excluded from the release gate,
-by name" now lives in `ci.yml`: `cross_process_join_proof` runs in `flaky-watch`, which reports and
-can never fail CI. Every `cargo test` runs `--no-fail-fast`, so one red cannot hide the rest.
+parallel in `transport-gates` (`r40_`, `r41_`; the in-process `r42_` gates were deleted 2026-09-26,
+and R42 is proved by RP-22/23/24 in `build-test`). Both are blocking. No proof is skipped by name
+(2026-09-27): `cross_process_join_proof` runs in `build-test`, and the reporting-only `flaky-watch` job
+that held it is removed. On the macOS runner R41's WAN link is reported rather than gated
+(`VOX_PERF_REPORT_ONLY=WAN`, a decider decision); it is gated on ubuntu and on real hardware by
+`scripts/release-gate.sh`. Every `cargo test` runs `--no-fail-fast`, so one red cannot hide the rest.
 
 **Re-running.** If CI on the tagged commit fails and a re-run of that CI run passes, re-run the
 release workflow (its `ci-passed` job reads the run's latest conclusion). Nothing is re-tagged.
