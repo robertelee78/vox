@@ -1,0 +1,349 @@
+//! **RP-02 — a room is joinable when one of its members is offline**, through the shipped
+//! `vox` binary only: a `vox node` anchor and three `vox daemon`s, every step typed as an
+//! operator types it (`vox id`, `vox trust add`, `vox room create|invite|join|post|read`).
+//!
+//! Replaces `crates/vox-core/tests/a_join_is_not_hostage_to_one_member.rs`, which ran every
+//! node in-process (V29-17).
+//!
+//! ## The claim
+//! A join is not hostage to one member. The joiner reaches the anchor's board, and walks the
+//! room's members — the link's pinned responder first, then the others — until one admits it.
+//! One member being away is not the room being gone.
+//!
+//! ## The staging
+//! 1. Alice creates the room and mints the link with `vox room invite`. A link minted by a
+//!    node **pins that node** (`r=<alice>`), so Alice is, by the product's own rule, the first
+//!    member any joiner reaches for. The proof asserts the pin is there rather than hoping.
+//! 2. Bob joins, and Alice and Bob trust each other; the room is ready when each has rendered
+//!    a post by the other (precondition — `CANNOT MEASURE` if not).
+//! 3. Alice's and Bob's daemons trust Carol (and she them) before she joins.
+//! 4. **Alice's daemon is killed by its PID** and reaped: the member the join tries first is
+//!    offline.
+//! 5. Carol runs `vox room join` with the link Alice minted — **one attempt, no retry**.
+//!
+//! ## What is asserted
+//! - Carol's join succeeds, within [`JOIN_BOUND`] (hard-coded: 60 s; measured ~12 s).
+//! - Carol then renders a post Bob made after her join, within [`READ_BOUND`] (60 s) — she is
+//!   really in the room, through the member that stayed online.
+//!
+//! ## The mutation that must turn it red
+//! `MAX_JOIN_RESPONDERS = 1` in `crates/vox-core/src/node/actor.rs`: the join stops after the
+//! first candidate, which is the pinned, dead Alice, so Carol's single join attempt fails with
+//! `cannot join: …`.
+
+#![cfg(unix)]
+
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+const VOX: &str = env!("CARGO_BIN_EXE_vox");
+const ID_PASS: &str = "identity passphrase";
+const ROOM_PASS: &str = "channel passphrase";
+/// Carol's whole `vox room join`, with the first member tried dead. Hard-coded on purpose.
+const JOIN_BOUND: Duration = Duration::from_secs(60);
+/// From her join to rendering a post Bob made after it.
+const READ_BOUND: Duration = Duration::from_secs(60);
+
+/// A child killed and reaped by its own PID when dropped — never by pattern.
+struct Proc(Child);
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct Member {
+    name: &'static str,
+    data: PathBuf,
+    pass: PathBuf,
+    fp: String,
+    daemon: Option<Proc>,
+}
+
+impl Member {
+    fn vox(&self, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+        let mut child = Command::new(VOX)
+            .args(args)
+            .env("VOX_DATA_DIR", &self.data)
+            .env("VOX_CONFIG_DIR", self.data.join("cfg"))
+            .env_remove("VOX_ROOM")
+            .env_remove("VOX_SESSION")
+            .env_remove("VOX_ROOM_PASSPHRASE")
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vox");
+        if let Some(text) = stdin {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+        }
+        let out = child.wait_with_output().expect("vox ran");
+        let r = (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        );
+        eprintln!(
+            "[receipt] <{}> vox {} -> {}\n  stdout: {}\n  stderr: {}",
+            self.name,
+            args.join(" "),
+            r.0,
+            r.1.trim(),
+            r.2.trim()
+        );
+        r
+    }
+
+    fn reads(&self, room: &str, text: &str) -> bool {
+        self.vox(&["room", "read", room], None).1.contains(text)
+    }
+
+    fn trust(&self, other: &Member) {
+        let (ok, o, e) = self.vox(
+            &[
+                "trust",
+                "add",
+                &other.fp,
+                "--name",
+                other.name,
+                "--identity-passphrase-file",
+                self.pass.to_str().unwrap(),
+            ],
+            None,
+        );
+        assert!(ok, "{} trusts {}: {o}{e}", self.name, other.name);
+    }
+}
+
+fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
+    let data = tmp.join(name);
+    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    let pass = tmp.join(format!("{name}.pass"));
+    std::fs::write(&pass, ID_PASS).unwrap();
+    let mut m = Member {
+        name,
+        data,
+        pass,
+        fp: String::new(),
+        daemon: None,
+    };
+    let (ok, out, err) = m.vox(
+        &["id", "--identity-passphrase-file", m.pass.to_str().unwrap()],
+        None,
+    );
+    assert!(ok, "{name}: vox id: {err}");
+    m.fp = out.trim().to_owned();
+    assert_eq!(m.fp.len(), 52, "{name}: a fingerprint from vox id");
+    let err = std::fs::File::create(tmp.join(format!("{name}.daemon.err"))).unwrap();
+    let child = Command::new(VOX)
+        .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
+        .arg("--passphrase-file")
+        .arg(&m.pass)
+        .env("VOX_DATA_DIR", &m.data)
+        .env("VOX_CONFIG_DIR", m.data.join("cfg"))
+        .env_remove("VOX_ROOM")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err))
+        .spawn()
+        .expect("spawn vox daemon");
+    m.daemon = Some(Proc(child));
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !m.vox(&["room", "list"], None).0 {
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: {name}'s daemon never answered"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    m
+}
+
+fn anchor(tmp: &Path) -> (Proc, String) {
+    let dir = tmp.join("anchor");
+    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    let out = tmp.join("anchor.out");
+    let p = Proc(
+        Command::new(VOX)
+            .args(["node", "--listen", "127.0.0.1:0"])
+            .env("VOX_DATA_DIR", &dir)
+            .env("VOX_CONFIG_DIR", dir.join("cfg"))
+            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vox node"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        if let Some(spec) = text
+            .split_whitespace()
+            .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
+        {
+            return (p, spec.to_owned());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: the anchor never printed its spec"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Keep `author` posting fresh `tag n` lines until `reader` renders one — rooms are
+/// forward-only, so an early post may stay unreadable for good. Returns how many were posted.
+fn posts_until_read(
+    author: &Member,
+    reader: &Member,
+    room: &str,
+    tag: &str,
+    within: Duration,
+) -> Option<u32> {
+    let deadline = Instant::now() + within;
+    let mut n = 0u32;
+    while Instant::now() < deadline {
+        n += 1;
+        let (ok, _, e) = author.vox(&["room", "post", room, &format!("{tag} {n}")], None);
+        assert!(ok, "{} posts: {e}", author.name);
+        std::thread::sleep(Duration::from_secs(1));
+        if reader.reads(room, &format!("{tag} ")) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+#[test]
+#[ignore = "an anchor and three daemons with production Argon2id; CI runs it in release"]
+fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let (_anchor, spec) = anchor(tmp.path());
+    let mut alice = member(tmp.path(), "alice", &spec);
+    let bob = member(tmp.path(), "bob", &spec);
+    let carol = member(tmp.path(), "carol", &spec);
+
+    // ---- alice makes the room; the link she mints pins her ----
+    let (ok, _, e) = alice.vox(
+        &["room", "create", "--name", "team"],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(ok, "room create: {e}");
+    let room = alice
+        .vox(&["room", "list"], None)
+        .1
+        .split_whitespace()
+        .next()
+        .expect("the new room in `vox room list`")
+        .to_owned();
+    let (ok, link, e) = alice.vox(&["room", "invite", &room], None);
+    assert!(ok, "invite: {e}");
+    let link = link.trim().to_owned();
+    let pinned = link
+        .split(['?', '&'])
+        .find_map(|p| p.strip_prefix("r="))
+        .map(str::to_owned);
+    assert_eq!(
+        pinned.as_deref(),
+        Some(alice.fp.as_str()),
+        "CANNOT MEASURE: the link `vox room invite` printed does not pin alice, so alice is not \
+         provably the first member a join reaches for: {link}"
+    );
+
+    // ---- bob joins; alice and bob read each other ----
+    let (ok, o, e) = bob.vox(
+        &["room", "join", &link, "--name", "team"],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(
+        ok,
+        "CANNOT MEASURE: bob's join, with every member up, failed (if this names \
+         `authenticator invalid` it is #217): {o}{e}"
+    );
+    alice.trust(&bob);
+    bob.trust(&alice);
+    let ab = posts_until_read(&alice, &bob, &room, "ALICE-READY", Duration::from_secs(120));
+    let ba = posts_until_read(&bob, &alice, &room, "BOB-READY", Duration::from_secs(120));
+    eprintln!("[proof] ready: alice->bob after {ab:?} posts, bob->alice after {ba:?} posts");
+    assert!(
+        ab.is_some() && ba.is_some(),
+        "CANNOT MEASURE: alice and bob never read each other (alice->bob {ab:?}, bob->alice {ba:?})"
+    );
+
+    // ---- everyone trusts carol before she joins, so what she reads is only the join's doing ----
+    alice.trust(&carol);
+    bob.trust(&carol);
+    carol.trust(&alice);
+    carol.trust(&bob);
+
+    // ---- alice goes away: killed by PID and reaped ----
+    let alice_pid = alice.daemon.as_ref().unwrap().0.id();
+    drop(alice.daemon.take());
+    let still = Command::new("kill")
+        .args(["-0", &alice_pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(
+        !still,
+        "CANNOT MEASURE: alice's daemon (pid {alice_pid}) is still alive"
+    );
+    eprintln!("[proof] alice's daemon pid {alice_pid} killed and reaped");
+
+    // ---- carol joins with alice's own link: one attempt ----
+    let t0 = Instant::now();
+    let (ok, o, e) = carol.vox(
+        &["room", "join", &link, "--name", "team"],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    let took = t0.elapsed();
+    eprintln!(
+        "[proof] carol's join with the pinned member offline: ok={ok} in {:.1}s (bound {}s)",
+        took.as_secs_f64(),
+        JOIN_BOUND.as_secs()
+    );
+    if !ok && format!("{o}{e}").contains("authenticator invalid") {
+        panic!("CANNOT MEASURE: carol's join hit #217 (`authenticator invalid`): {o}{e}");
+    }
+    assert!(
+        ok,
+        "carol could not join a room with a live member in it: alice (the link's pinned \
+         responder) is offline, and the join must fall through to bob. It said: {o}{e}"
+    );
+    assert!(
+        took <= JOIN_BOUND,
+        "carol's join took {:.1}s, over the {}s bound: a join waited on the offline member",
+        took.as_secs_f64(),
+        JOIN_BOUND.as_secs()
+    );
+
+    // ---- and she is really in: she renders what bob says next ----
+    let t1 = Instant::now();
+    let bc = posts_until_read(&bob, &carol, &room, "BOB-TO-CAROL", READ_BOUND);
+    eprintln!(
+        "[proof] carol renders bob after {bc:?} posts, {:.1}s after her join (bound {}s)",
+        t1.elapsed().as_secs_f64(),
+        READ_BOUND.as_secs()
+    );
+    assert!(
+        bc.is_some(),
+        "carol joined but never rendered a post bob made after her join, within {}s",
+        READ_BOUND.as_secs()
+    );
+}
