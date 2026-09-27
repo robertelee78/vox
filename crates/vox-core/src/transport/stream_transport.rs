@@ -51,6 +51,9 @@ pub struct QuicStreamTransport {
     closed: Option<WireError>,
     /// Per-frame bound on both directions; see [`SYNC_FRAME_TIMEOUT`].
     frame_timeout: Duration,
+    /// The code the peer reset or stopped the stream with, once it has (see
+    /// [`Transport::peer_refused`]).
+    peer_refused: Option<WireError>,
 }
 
 impl QuicStreamTransport {
@@ -76,6 +79,7 @@ impl QuicStreamTransport {
             recv,
             closed: None,
             frame_timeout,
+            peer_refused: None,
         }
     }
 
@@ -101,13 +105,16 @@ impl Transport for QuicStreamTransport {
             return Err(Error::Unreachable("quic transport: send while serving"));
         };
         let bound = self.frame_timeout;
-        self.handle
+        let r = self
+            .handle
             .block_on(async move {
                 tokio::time::timeout(bound, write_frame(send, frame))
                     .await
                     .map_err(|_| Error::Unreachable("sync: peer stopped taking frames"))
             })
-            .and_then(|r| r)
+            .and_then(|r| r);
+        self.note_refusal(&r);
+        r
     }
 
     fn recv(&mut self) -> Result<Option<Vec<u8>>> {
@@ -115,13 +122,16 @@ impl Transport for QuicStreamTransport {
         // half-close → `Ok(None)`; anything else is a real transport failure.
         let recv = &mut self.recv;
         let bound = self.frame_timeout;
-        self.handle
+        let r = self
+            .handle
             .block_on(async move {
                 tokio::time::timeout(bound, read_frame(recv, MAX_STREAM_FRAME))
                     .await
                     .map_err(|_| Error::Unreachable("sync: peer went quiet"))
             })
-            .and_then(|r| r)
+            .and_then(|r| r);
+        self.note_refusal(&r);
+        r
     }
 
     fn close(&mut self, code: WireError) {
@@ -212,5 +222,18 @@ impl Transport for QuicStreamTransport {
         self.handle.block_on(task).unwrap_or(Err(Error::Unreachable(
             "sync: the serving task ended abnormally",
         )))
+    }
+
+    fn peer_refused(&self) -> Option<WireError> {
+        self.peer_refused
+    }
+}
+
+impl QuicStreamTransport {
+    /// Remember the peer's refusal, the first time one comes back from the stream.
+    fn note_refusal<T>(&mut self, r: &Result<T>) {
+        if let (None, Err(Error::PeerRefused(code))) = (self.peer_refused, r) {
+            self.peer_refused = Some(*code);
+        }
     }
 }

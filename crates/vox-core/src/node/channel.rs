@@ -167,9 +167,21 @@ pub fn join_context_from_genesis(
 
 /// Map an ADR-008 coded sync failure onto the error taxonomy, keeping the reason
 /// (the ADR's rule is that a failure is never silently downgraded).
-pub(crate) fn sync_failure(code: crate::wire::WireError) -> Error {
-    // Its own variant, carrying the coded reason, never `MalformedGovernance` (#202).
-    Error::SyncFailed(code)
+pub(crate) fn sync_failure(
+    code: crate::wire::WireError,
+    peer_refused: Option<crate::wire::WireError>,
+) -> Error {
+    // Its own variant, carrying the coded reason, never `MalformedGovernance` (#202), and naming
+    // which end stopped the session: the peer's refusal, this node's rejection of what it was
+    // sent, or a path that failed under both.
+    use crate::wire::WireError;
+    if peer_refused == Some(code) {
+        Error::SyncRefused(code)
+    } else if code == WireError::TransportFailed {
+        Error::SyncFailed(code)
+    } else {
+        Error::SyncRejected(code)
+    }
 }
 
 /// The channel's [`AuthorResolver`] for ADR-008 sync: the admitted authors' keys,
@@ -2013,7 +2025,7 @@ impl ChannelState {
         }
         match session {
             Ok(_) => Ok(out),
-            Err(code) => Err(sync_failure(code)),
+            Err(code) => Err(sync_failure(code, transport.peer_refused())),
         }
     }
 
@@ -2145,7 +2157,7 @@ impl ChannelState {
                 out.applied = n;
                 Ok(out)
             }
-            Err(code) => Err(sync_failure(code)),
+            Err(code) => Err(sync_failure(code, transport.peer_refused())),
         }
     }
 
