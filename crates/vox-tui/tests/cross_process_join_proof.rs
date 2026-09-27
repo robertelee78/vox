@@ -356,12 +356,18 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         Some(&format!("{roompass}\n")),
     );
     if !ok {
+        // **A red says why** (#192): what each daemon and the anchor reported up to the join, so
+        // a fast refusal names which member the board offered, what was dialled, and what refused.
+        let said = |p: &Proc| p.err.lock().map(|e| e.clone()).unwrap_or_default();
+        let transcript = format!(
+            "--- alice's daemon ---\n{}\n--- bob's daemon ---\n{}\n--- the anchor ---\n{}",
+            said(&daemons[0]),
+            said(&daemons[1]),
+            said(&anchor)
+        );
         assert!(
             allow_unproven("cross-process-join"),
-            "UNPROVEN: a cross-process join through an anchor failed — {err}\n\
-             This is the open defect in ADR-016/ADR-012, not a regression in agent comms. \
-             Set VOX_PROOF_ALLOW_UNPROVEN=cross-process-join to accept it deliberately; \
-             remove that allowance when the defect closes and this becomes a real gate."
+            "a cross-process join through an anchor failed — {err}\n{transcript}"
         );
         eprintln!("UNPROVEN (allowed): cross-process join failed: {err}");
         return;
