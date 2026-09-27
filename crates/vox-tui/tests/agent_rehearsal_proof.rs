@@ -24,10 +24,19 @@
 //! 2. the **second** agent's model reads the *result* the first one posted — so a
 //!    message written by one session reaches a different session on a different
 //!    identity, which is the whole feature;
-//! 3. **cursors are per session**: the second agent sees the backlog the first has
-//!    already consumed, because it has not read it;
+//! 3. **cursors are per session**, measured on one daemon: two sessions of the *same*
+//!    identity each run the drain the OpenCode plugin runs (`vox agent hook --format text
+//!    --room <room> --session <id>`). After session `s1` has consumed a post carrying a
+//!    per-run nonce, `s1`'s next drain no longer shows it (the cursor moved) and session
+//!    `s2`'s first drain still does (it has not read it). A cursor kept per identity or
+//!    per room would hide the nonce from `s2`;
 //! 4. the operator's plain prose and the agents' typed envelopes coexist in one
-//!    room, which is the shared-room case rather than the pure-agent one.
+//!    room, which is the shared-room case rather than the pure-agent one. The operator's
+//!    question carries a **per-run nonce**, and alice's model must quote that nonce. The
+//!    backlog every fresh `opencode run` session is re-shown also holds the `assign`
+//!    about the codec, so any check that the assignment could satisfy (such as the word
+//!    "codec") measures nothing; only the question's own nonce proves the prose arrived.
+//!    Only the model's stdout is searched, never OpenCode's stderr.
 //!
 //! ## Stated rather than implied
 //!
@@ -37,25 +46,38 @@
 //! of agent sessions, cursors, envelopes and the operator, and that composition is
 //! host-independent. The two-machine claim is not made here and should not be read
 //! into it.
+//!
+//! ## Every participant is the shipped binary
+//!
+//! The nodes are real processes (`support/room.rs`): an anchor (`vox node`), a `vox daemon`
+//! per agent, the room made with `vox room create|invite|join`, each identity admitted with
+//! `vox trust add`, ready once each has rendered a post by the other. Each agent's OpenCode
+//! plugin is what `vox agent plugin opencode` prints, installed where a person puts it, and
+//! that plugin runs `vox agent hook` every turn. Nothing in this process runs a node.
+//!
+//! ## Mutations that must turn it red
+//!
+//! - Make `vox agent hook` inject nothing (the drain returns before printing what is
+//!   unread): red at (1), alice's model cannot name the assignment it was never told.
+//! - Make `vox agent hook` drop plain prose from what it emits (every row that parses as a
+//!   `say` is filtered out of the drain, so only typed envelopes are injected): (1) and (2)
+//!   stay green, and it goes red at (4), alice's answer does not carry the question's nonce.
+//!   (Filtering on `Envelope::parse(..).is_ok()` is not this mutant: prose parses as a
+//!   `say`, so that filter drops nothing.)
+//! - Key the hook's cursor by room alone, ignoring the session: red at (3), `s2` is shown
+//!   nothing because `s1` already read it.
 
 #![cfg(unix)]
 
+#[path = "support/room.rs"]
+mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
 use std::path::Path;
 use std::process::Command;
 
-use vox_core::node::actor::{Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
-use vox_core::node::paths::Paths;
-
-const VOX: &str = env!("CARGO_BIN_EXE_vox");
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
-}
+use support::{until, Worker, VOX};
 
 fn model() -> String {
     std::env::var("VOX_PROOF_OPENCODE_MODEL")
@@ -83,123 +105,74 @@ fn auth_present() -> bool {
         .is_some_and(|b| b.join("opencode/auth.json").is_file())
 }
 
-struct Agent {
-    data: std::path::PathBuf,
-    cfg: std::path::PathBuf,
-    paths: Paths,
-    node: NodeHandle,
-    /// This agent's own project directory, where its OpenCode plugin lives.
-    project: std::path::PathBuf,
-}
-
-impl Agent {
-    fn vox(&self, args: &[&str]) -> (bool, String, String) {
-        let out = Command::new(VOX)
-            .args(args)
-            .env("VOX_DATA_DIR", &self.data)
-            .env("VOX_CONFIG_DIR", &self.cfg)
-            .env_remove("VOX_ROOM")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("spawn vox");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    }
-
-    /// One real model turn for this agent, with its room wired in.
-    fn turn(&self, oc_cfg: &Path, room: &str, prompt: &str) -> String {
-        let mut cmd = Command::new("opencode");
-        // A spawned OpenCode that inherits cargo's environment loads the plugin and
-        // never fires its message hook. Measured; see `opencode_plugin_proof`.
-        cmd.env_clear();
-        for key in ["PATH", "HOME", "SHELL", "LANG", "TMPDIR", "USER"] {
-            if let Some(v) = std::env::var_os(key) {
-                cmd.env(key, v);
-            }
-        }
-        let out = cmd
-            .current_dir(&self.project)
-            .args(["run", "-m", &model(), prompt])
-            .env("XDG_CONFIG_HOME", oc_cfg)
-            .env("VOX_DATA_DIR", &self.data)
-            .env("VOX_CONFIG_DIR", &self.cfg)
-            .env("VOX_ROOM", room)
-            .env("VOX_BIN", VOX)
-            .output()
-            .expect("run opencode");
-        format!(
-            "{}\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        )
-    }
-}
-
-async fn agent(tmp: &tempfile::TempDir, name: &str, fixture: &Path) -> Agent {
-    let data = tmp.path().join(name).join("data");
-    let cfg = tmp.path().join(name).join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
-    let node = Node::spawn_networked(paths.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
-    assert!(node
-        .apply(NodeCommand::CreateIdentity {
-            passphrase: secret("identity passphrase"),
-        })
-        .await
-        .is_done());
-    // Each session gets its own project directory, which is also what gives it its
-    // own OpenCode session and therefore its own cursor.
-    let project = fixture.join(name);
+/// Install this agent's OpenCode plugin the way a person does — `vox agent plugin opencode >
+/// .opencode/plugin/vox.js` — in its own project directory, which is also what gives it its
+/// own OpenCode session and therefore its own cursor. Returns the project directory.
+fn install_plugin(w: &Worker, fixture: &Path) -> std::path::PathBuf {
+    let project = fixture.join(&w.name);
     std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
-    std::fs::write(
-        project.join(".opencode/plugin/vox.js"),
-        vox_tui::agent_hook::OPENCODE_PLUGIN,
-    )
-    .unwrap();
-    Agent {
-        data,
-        cfg,
-        paths,
-        node,
-        project,
-    }
+    let o = w.vox(None, &["agent", "plugin", "opencode"]);
+    assert!(
+        o.ok && o.stdout.contains("vox agent hook"),
+        "vox agent plugin opencode: {o:?}"
+    );
+    std::fs::write(project.join(".opencode/plugin/vox.js"), &o.stdout).unwrap();
+    project
 }
 
-async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) -> T {
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match h.next_event().await {
-                Some(e) => {
-                    if let Some(v) = f(e) {
-                        return v;
-                    }
-                }
-                None => panic!("event stream ended"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for an event")
+/// One real model turn for this agent, with its room wired in.
+fn turn(w: &Worker, project: &Path, oc_cfg: &Path, room: &str, prompt: &str) -> String {
+    turn_split(w, project, oc_cfg, room, prompt).1
 }
 
-fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) {
-    let deadline = std::time::Instant::now() + TIMEOUT;
-    let mut last = String::new();
-    while std::time::Instant::now() < deadline {
-        let (_, out, err) = who.vox(args);
-        last = format!("stdout={out:?} stderr={err:?}");
-        if ok(&out) {
-            return;
+/// As [`turn`], also returning the model's stdout alone (the answer, without OpenCode's
+/// stderr), for a check that must not be satisfied by a log line.
+fn turn_split(
+    w: &Worker,
+    project: &Path,
+    oc_cfg: &Path,
+    room: &str,
+    prompt: &str,
+) -> (String, String) {
+    let mut cmd = Command::new("opencode");
+    // A spawned OpenCode that inherits cargo's environment loads the plugin and never
+    // fires its message hook. Measured; see `opencode_plugin_proof`.
+    cmd.env_clear();
+    for key in ["PATH", "HOME", "SHELL", "LANG", "TMPDIR", "USER"] {
+        if let Some(v) = std::env::var_os(key) {
+            cmd.env(key, v);
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    panic!("timed out waiting for {what}; last saw {last}");
+    let out = cmd
+        .current_dir(project)
+        .args(["run", "-m", &model(), prompt])
+        .env("XDG_CONFIG_HOME", oc_cfg)
+        .env("VOX_DATA_DIR", &w.data)
+        .env("VOX_CONFIG_DIR", &w.cfg)
+        .env("VOX_ROOM", room)
+        .env("VOX_BIN", VOX)
+        .output()
+        .expect("run opencode");
+    let said = format!(
+        "{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprintln!("[turn {}] {prompt:?} -> {said}", w.name);
+    (String::from_utf8_lossy(&out.stdout).into_owned(), said)
+}
+
+/// A per-run token, unguessable by a model and absent from every prompt.
+fn nonce(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{tag}-{}{:06}", std::process::id(), nanos % 1_000_000)
 }
 
 #[test]
-#[ignore = "two nodes, two live model turns; CI runs it in release"]
+#[ignore = "an anchor, two vox daemons, live model turns; CI runs it in release"]
 fn two_agent_sessions_and_an_operator_share_one_room() {
     watchdog::arm();
     if which("opencode").is_none() || !auth_present() {
@@ -218,117 +191,73 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     let oc_cfg = fixture.join("config");
     std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
-
-    let (alice, bob, room, _a, _b) = rt.block_on(async {
-        let alice = agent(&tmp, "alice", &fixture).await;
-        let bob = agent(&tmp, "bob", &fixture).await;
-        let alice_fp = alice.node.view().identity.unwrap().fingerprint;
-        let bob_fp = bob.node.view().identity.unwrap().fingerprint;
-
-        assert!(alice
-            .node
-            .apply(NodeCommand::CreateChannel {
-                local_name: "mission".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-        let cid = alice.node.view().channels[0].channel_id;
-        assert!(alice
-            .node
-            .apply(NodeCommand::Invite { channel_id: cid })
-            .await
-            .is_done());
-        let url = wait_for(&alice.node, |e| match e {
-            NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
-            _ => None,
-        })
-        .await;
-        assert!(bob
-            .node
-            .apply(NodeCommand::JoinChannel {
-                link: url,
-                local_name: "mission".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-        for (who, peer, name) in [(&alice, bob_fp, "bob"), (&bob, alice_fp, "alice")] {
-            assert!(who
-                .node
-                .apply(NodeCommand::Trust {
-                    fingerprint: peer,
-                    petname: name.into(),
-                })
-                .await
-                .is_done());
-        }
-        for (who, peer) in [(&alice, bob_fp), (&bob, alice_fp)] {
-            wait_for(&who.node, |e| match e {
-                NodeEvent::SenderKeyReceived {
-                    channel_id,
-                    peer: p,
-                    ..
-                } if channel_id == cid && p == peer => Some(()),
-                _ => None,
-            })
-            .await;
-        }
-        let a = vox_core::node::ipc::bind(alice.node.clone(), &alice.paths).expect("alice");
-        let b = vox_core::node::ipc::bind(bob.node.clone(), &bob.paths).expect("bob");
-        (alice, bob, vox_core::node::link::b32_encode(&cid), a, b)
-    });
+    let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let (alice, bob) = (&r.workers[0], &r.workers[1]);
+    let room = r.id.clone();
+    let a_proj = install_plugin(alice, &fixture);
+    let b_proj = install_plugin(bob, &fixture);
 
     // Warm both projects: the first turn in a fresh directory installs and does not
-    // fire the hook.
-    for who in [&alice, &bob] {
-        let _ = who.turn(&oc_cfg, &room, "Reply with exactly: READY");
+    // fire the hook. This also consumes the harness's readiness posts from each cursor.
+    for (who, proj) in [(alice, &a_proj), (bob, &b_proj)] {
+        let _ = turn(who, proj, &oc_cfg, &room, "Reply with exactly: READY");
     }
 
     // ---- the operator speaks, as a person, in plain prose ----
     let assignment = r#"{"v":1,"type":"assign","to":["alice"],"body":"port the wire codec to the new envelope format","data":{"resource":"port-the-codec"}}"#;
-    let (ok, _, err) = alice.vox(&["room", "post", &room, assignment]);
-    assert!(ok, "the operator could not post the assignment: {err}");
+    let o = alice.vox(None, &["room", "post", &room, assignment]);
+    assert!(o.ok, "the operator could not post the assignment: {o:?}");
     until(
-        &bob,
+        bob,
+        None,
         "the assignment to reach bob",
         &["room", "read", &room],
-        |o| o.contains("port the wire codec"),
+        |o| o.stdout.contains("port the wire codec"),
     );
 
     // ---- (1) alice's model reads work it was never prompted with ----
-    let answer = alice.turn(
+    let answer = turn(
+        alice,
+        &a_proj,
         &oc_cfg,
         &room,
         "What task have you been assigned? Answer with just the task.",
     );
+    let read_assignment = answer.contains("codec") || answer.contains("wire");
+    println!("[proof] (1) alice's model named its assignment: {read_assignment}");
     assert!(
-        answer.contains("codec") || answer.contains("wire"),
+        read_assignment,
         "alice's model did not read its assignment: {answer:?}"
     );
 
     // ---- alice reports a result, as an agent would ----
     let result = r#"{"v":1,"type":"result","re":"port-the-codec","body":"done: the codec now speaks the envelope format. verification token QUORUM-8812"}"#;
-    let (ok, _, err) = alice.vox(&["room", "post", &room, result]);
-    assert!(ok, "alice could not post her result: {err}");
+    let o = alice.vox(None, &["room", "post", &room, result]);
+    assert!(o.ok, "alice could not post her result: {o:?}");
     until(
-        &bob,
+        bob,
+        None,
         "the result to reach bob",
         &["room", "read", &room],
-        |o| o.contains("QUORUM-8812"),
+        |o| o.stdout.contains("QUORUM-8812"),
     );
 
-    // ---- (2) and (3) bob's model reads what alice wrote, from its own cursor ----
-    let seen = bob.turn(
+    // ---- (2) bob's model reads what alice wrote, from its own session ----
+    let seen = turn(
+        bob,
+        &b_proj,
         &oc_cfg,
         &room,
         "What verification token was reported in your room? Answer with just the token.",
+    );
+    println!(
+        "[proof] (2) bob's model repeated alice's token: {}",
+        seen.contains("QUORUM-8812")
     );
     assert!(
         seen.contains("QUORUM-8812"),
@@ -336,26 +265,97 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     );
 
     // ---- (4) the operator asks a question in prose, and it lands ----
-    let (ok, _, err) = bob.vox(&[
-        "room",
-        "post",
-        &room,
-        "hey, is the codec work finished? the release is waiting on it",
-    ]);
-    assert!(ok, "the operator could not ask a question: {err}");
+    let ask = nonce("ORCHID");
+    let question =
+        format!("hey, is the codec work finished? the release is waiting on it (ref {ask})");
+    let o = bob.vox(None, &["room", "post", &room, &question]);
+    assert!(o.ok, "the operator could not ask a question: {o:?}");
     until(
-        &alice,
+        alice,
+        None,
         "the question to reach alice",
         &["room", "read", &room],
-        |o| o.contains("release is waiting"),
+        |o| o.stdout.contains(&ask),
     );
-    let heard = alice.turn(
+    let (answer4, heard) = turn_split(
+        alice,
+        &a_proj,
         &oc_cfg,
         &room,
-        "Did anyone ask you a question just now? Answer yes or no and quote it.",
+        "Did anyone ask you a question just now? Answer yes or no and quote it exactly, \
+         including any reference code in it.",
+    );
+    let heard_it = answer4.contains(&ask);
+    println!("[proof] (4) alice's model quoted the operator's prose nonce {ask}: {heard_it}");
+    assert!(
+        heard_it,
+        "plain prose from the operator did not reach an agent's context: the answer does \
+         not carry the question's nonce {ask}. The answer: {heard:?}"
+    );
+
+    // ---- (3) cursors are per session: two sessions of one identity, one daemon ----
+    // The drain the OpenCode plugin runs, with two session ids of alice's. A fresh post
+    // by the operator (bob) carries its own nonce.
+    let mark = nonce("LANTERN");
+    let o = bob.vox(
+        None,
+        &["room", "post", &room, &format!("cursor check {mark}")],
+    );
+    assert!(o.ok, "the operator could not post the cursor check: {o:?}");
+    until(
+        alice,
+        None,
+        "the cursor check to reach alice",
+        &["room", "read", &room],
+        |o| o.stdout.contains(&mark),
+    );
+    let (s1, s2) = (nonce("rehearsal-s1"), nonce("rehearsal-s2"));
+    let drain = |session: &str| {
+        let o = alice.vox(
+            None,
+            &[
+                "agent",
+                "hook",
+                "--format",
+                "text",
+                "--room",
+                &room,
+                "--session",
+                session,
+            ],
+        );
+        assert!(o.ok, "vox agent hook --session {session}: {o:?}");
+        o.stdout
+    };
+    let s1_first = drain(&s1);
+    let s1_again = drain(&s1);
+    let s2_first = drain(&s2);
+    let (a, b, c) = (
+        s1_first.contains(&mark),
+        s1_again.contains(&mark),
+        s2_first.contains(&mark),
+    );
+    println!(
+        "[proof] (3) per-session cursors on one daemon: s1 first shows the post: {a}, s1 again: \
+         {b}, s2 first: {c} (drain bytes {} / {} / {})",
+        s1_first.len(),
+        s1_again.len(),
+        s2_first.len()
     );
     assert!(
-        heard.contains("release is waiting") || heard.to_lowercase().contains("codec"),
-        "plain prose from the operator did not reach an agent's context: {heard:?}"
+        a,
+        "CANNOT MEASURE: session s1's first drain did not show the operator's post {mark}: \
+         {s1_first:?}"
+    );
+    assert!(
+        !b,
+        "session s1 was shown the same post twice, so the drain keeps no cursor for it: \
+         {s1_again:?}"
+    );
+    assert!(
+        c,
+        "session s2, on the same identity and daemon, was not shown a post it never read \
+         ({mark}) because session s1 had consumed it: the cursor is not per session. s2's \
+         drain: {s2_first:?}"
     );
 }
