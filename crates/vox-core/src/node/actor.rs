@@ -321,6 +321,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
         NetEvent::Dialed { .. } => "adopting a connection a join dialled",
         NetEvent::JoinerDone { .. } => "finishing a join",
+        NetEvent::ForwardDialed { .. } => "binding a forward whose dial landed",
         NetEvent::Reopened { .. } => "holding a room that reopened",
         NetEvent::ReopenGone { .. } => "forgetting a room that no longer exists",
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
@@ -716,6 +717,22 @@ enum NetEvent {
     /// The reopening has tried every room (#208). A room still marked as reopening would not
     /// open: it stays remembered, and closed. The unlock is answered now.
     ReopenFinished,
+    /// A forward's first dial finished (#215): bind the forward, or say why not, and answer the
+    /// command.
+    ForwardDialed {
+        /// The room.
+        channel_id: Digest32,
+        /// The host.
+        host: Digest32,
+        /// The service asked for.
+        service_tag: String,
+        /// The local address to bind.
+        local: std::net::SocketAddr,
+        /// What the dial came to. Boxed: an error is larger than everything else here.
+        result: Box<crate::error::Result<()>>,
+        /// The `Forward` command's reply.
+        reply: oneshot::Sender<Outcome>,
+    },
     /// A joiner's task finished: make the room, or say why not, and answer the command.
     JoinerDone {
         /// The `JoinChannel` command's reply.
@@ -2175,6 +2192,22 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
+                    // **A forward is answered later too** (#215): its first dial runs the whole
+                    // ladder, and through a relay one rung waits out its 10 s direct-attempt timeout
+                    // — on the actor, so the node answered nobody (`busy 10000ms — opening a
+                    // forward`), and `vox forward` retries every 500 ms. The dial goes to a task;
+                    // `NetEvent::ForwardDialed` binds the forward and answers.
+                    if let NodeCommand::Forward {
+                        channel_id,
+                        host,
+                        service_tag,
+                        local,
+                    } = command
+                    {
+                        self.begin_forward(channel_id, host, service_tag, local, reply);
+                        self.note_if_stalled(name, started);
+                        continue;
+                    }
                     // Joining is answered later for the same reason, and for a longer wait: see
                     // `begin_join_channel`.
                     if let NodeCommand::JoinChannel {
@@ -2393,12 +2426,11 @@ impl Node {
                 channel_id,
                 service_tag,
             } => self.remove_service(&channel_id, &service_tag).await,
-            NodeCommand::Forward {
-                channel_id,
-                host,
-                service_tag,
-                local,
-            } => self.forward(&channel_id, &host, &service_tag, local).await,
+            // Answered by `begin_forward` and `NetEvent::ForwardDialed`: the command loop takes it
+            // before it gets here.
+            NodeCommand::Forward { .. } => {
+                unreachable!("NodeCommand::Forward is answered by begin_forward")
+            }
             NodeCommand::StopForward { local } => {
                 // Dropping the forward aborts its listener; connections already
                 // spliced run to their own end.
@@ -3340,6 +3372,19 @@ impl Node {
                 self.deliver_owed_rekeys().await;
                 self.deliver_owed_consents(None).await;
             }
+            NetEvent::ForwardDialed {
+                channel_id,
+                host,
+                service_tag,
+                local,
+                result,
+                reply,
+            } => {
+                let outcome = self
+                    .finish_forward(&channel_id, &host, &service_tag, local, *result)
+                    .await;
+                let _ = reply.send(outcome);
+            }
             NetEvent::JoinerDone {
                 reply,
                 parsed,
@@ -4019,49 +4064,6 @@ impl Node {
         let _ = self
             .event_tx
             .send(NodeEvent::PeerJoined { channel_id, peer });
-    }
-
-    /// Dial `peer`, reusing a live connection, and make sure a stream loop is serving
-    /// it — a connection we opened must still accept the streams the peer opens back
-    /// (its sender key arrives that way).
-    async fn dial(
-        &mut self,
-        peer: Digest32,
-        endpoints: &crate::nat::multiaddr::EndpointList,
-    ) -> crate::error::Result<Arc<VoxConnection>> {
-        let net = self
-            .net
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or(crate::error::Error::Unreachable("node is not networked"))?;
-        // Whatever rung lands first (M15.1b): through an anchor that is one round
-        // trip, and possibly relayed — in which case a better path is tried behind it
-        // and swapped in underneath by the manager's preference rule.
-        let conn = net.reach(peer, endpoints).await?;
-        self.adopt_connection(Arc::clone(&conn));
-        if crate::node::net::path_class(net.manager().endpoint(), &conn)
-            == crate::node::net::PathClass::Relayed
-        {
-            let tx = self.net_tx.clone();
-            let endpoints = endpoints.clone();
-            self.last_upgrade.insert(peer, self.now());
-            tokio::spawn(async move {
-                match net.upgrade(peer, &endpoints).await {
-                    Ok(better) => {
-                        let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
-                    }
-                    // Only a ladder that tried every rung and got nowhere means "still relayed".
-                    // `upgrade` also returns `Err` for "already direct" and "nothing to upgrade",
-                    // which were a silently-fine `None` before this change; reporting those as
-                    // `StillRelayed` would say something false about a peer that is not relayed.
-                    Err(crate::error::Error::LadderExhausted(reason)) => {
-                        let _ = tx.send(NetEvent::UpgradeFailed { peer, reason }).await;
-                    }
-                    Err(_) => {}
-                }
-            });
-        }
-        Ok(conn)
     }
 
     /// Retry a direct path for every peer still reached over a relay.
@@ -6778,15 +6780,22 @@ impl Node {
         Outcome::Done
     }
 
-    async fn forward(
+    /// Start a forward: the checks that are this machine's business here, and the first dial —
+    /// which runs the whole reachability ladder — on a task of its own (#215). The command is
+    /// answered from [`NetEvent::ForwardDialed`], by [`Self::finish_forward`].
+    fn begin_forward(
         &mut self,
-        channel_id: &Digest32,
-        host: &Digest32,
-        service_tag: &str,
+        channel_id: Digest32,
+        host: Digest32,
+        service_tag: String,
         local: std::net::SocketAddr,
-    ) -> Outcome {
-        if !self.channels.contains_key(channel_id) {
-            return Outcome::Failed(Fault::ChannelNotOpen);
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let refuse = |reply: oneshot::Sender<Outcome>, fault: Fault| {
+            let _ = reply.send(Outcome::Failed(fault));
+        };
+        if !self.channels.contains_key(&channel_id) {
+            return refuse(reply, Fault::ChannelNotOpen);
         }
         // Loopback only, and refused **before anything is dialled**: a forward hands
         // whoever reaches its local port this node's own membership of the room, so a
@@ -6797,7 +6806,7 @@ impl Node {
         // Checked here rather than only at the bind so that a refused request costs no
         // dial, leaks no traffic and tells the caller what is actually wrong.
         if !local.ip().is_loopback() {
-            return Outcome::Failed(Fault::NotLoopback);
+            return refuse(reply, Fault::NotLoopback);
         }
         // The member's advertised endpoints, from this node's board — the same hints
         // any dial uses; the ladder does the rest.
@@ -6807,13 +6816,12 @@ impl Node {
         // problem on this machine (PRD-001 R36). Probed and released; `Forward::bind` still
         // binds for real, and still reports if the port was taken in between.
         if local.port() != 0 && std::net::TcpListener::bind(local).is_err() {
-            return Outcome::Failed(Fault::AddressInUse);
+            return refuse(reply, Fault::AddressInUse);
         }
-        let endpoints = self
-            .net
-            .as_ref()
-            .map(|net| net.board_endpoints(channel_id, host))
-            .unwrap_or_default();
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return refuse(reply, Fault::NotNetworked);
+        };
+        let endpoints = net.board_endpoints(&channel_id, &host);
         // **The ladder's own words, not `Fault::Unreachable`.** `fault_of` collapses
         // `LadderExhausted` to one token, so a forward that could not be carried told the person to
         // check a permission they cannot hold. The common case here is not a refusal at all: a
@@ -6821,21 +6829,64 @@ impl Node {
         // circuit and no board hint to dial directly — `no direct candidates, and no peer is
         // connected to carry a circuit`. That sentence is the whole diagnosis and it was being
         // thrown away.
-        let conn = match self.dial(*host, &endpoints).await {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = self.event_tx.send(NodeEvent::PeerUnreachable {
-                    peer: *host,
-                    why: e.to_string(),
-                });
-                return Outcome::Failed(fault_of(&e));
-            }
-        };
-        // The first dial above is kept for what it tells the caller — a forward to a host that
-        // cannot be reached at all fails here, with the ladder's words — but the forward does
-        // not keep `conn`. It reaches the host afresh for every connection (PRD-001 R24), and
-        // `reach` hands back this same connection for as long as it lives.
-        drop(conn);
+        //
+        // Off the actor: the connection goes back as `NetEvent::Dialed`, which adopts it and tries a
+        // better path behind a relayed one, exactly as the actor's own dial did; then
+        // `ForwardDialed` binds the forward. One sender, so the two arrive in that order.
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let result = match net.reach(host, &endpoints).await {
+                Ok(conn) => {
+                    let _ = tx
+                        .send(NetEvent::Dialed {
+                            conn,
+                            endpoints,
+                            board: false,
+                        })
+                        .await;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            let _ = tx
+                .send(NetEvent::ForwardDialed {
+                    channel_id,
+                    host,
+                    service_tag,
+                    local,
+                    result: Box::new(result),
+                    reply,
+                })
+                .await;
+        });
+    }
+
+    /// Bind a forward whose first dial has landed, or say why it could not, and answer the
+    /// command (#215).
+    ///
+    /// The forward does not keep the dial's connection: it reaches the host afresh for every
+    /// connection (PRD-001 R24), and `reach` hands back that same connection for as long as it
+    /// lives. The dial is kept for what it tells the caller — a forward to a host that cannot be
+    /// reached at all fails, with the ladder's words.
+    async fn finish_forward(
+        &mut self,
+        channel_id: &Digest32,
+        host: &Digest32,
+        service_tag: &str,
+        local: std::net::SocketAddr,
+        result: crate::error::Result<()>,
+    ) -> Outcome {
+        if let Err(e) = result {
+            let _ = self.event_tx.send(NodeEvent::PeerUnreachable {
+                peer: *host,
+                why: e.to_string(),
+            });
+            return Outcome::Failed(fault_of(&e));
+        }
+        // The room may have closed while the dial ran.
+        if !self.channels.contains_key(channel_id) {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        }
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return Outcome::Failed(Fault::NotNetworked);
         };
