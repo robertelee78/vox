@@ -16,8 +16,9 @@
 //! 2. no failed sync between the two members is reported as a governance or malformed-data
 //!    error, or as an invalid authenticator.
 //!
-//! Precondition (else CANNOT MEASURE): both daemons opened sessions to each other over the rounds
-//! (`vox status --json`), so the pair's sessions did run into each other.
+//! Precondition (else CANNOT MEASURE): both daemons opened at least three sessions to each other
+//! over the rounds (`vox status --json`). Not one per round: posts made while a session runs are
+//! carried by it (measured on the change: 14 and 10 over 40 rounds).
 //!
 //! Mutations: restoring the busy refusal at the inbound check breaks (1); the old governance
 //! wrapper in `sync_failure` breaks (2) wherever a failure is reported.
@@ -251,18 +252,18 @@ fn a_sync_that_did_not_complete_says_why() {
         println!("[report] {l}");
     }
     assert!(
-        a_opened >= 20 && b_opened >= 20,
+        a_opened >= 3 && b_opened >= 3,
         "CANNOT MEASURE: the members opened {a_opened} and {b_opened} sessions to each other over \
          {ROUNDS} rounds"
+    );
+    assert_eq!(
+        collisions, 0,
+        "two members posting at once refused each other as busy {collisions} time(s): {reports:?}"
     );
     assert!(
         misnamed.is_empty(),
         "a failed sync between two members was reported as a governance, malformed-data or \
          authenticator failure: {misnamed:?}"
-    );
-    assert_eq!(
-        collisions, 0,
-        "two members posting at once refused each other as busy {collisions} time(s): {reports:?}"
     );
     drop(anchor);
 }
