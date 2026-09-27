@@ -10,9 +10,14 @@
 //! liveness probe (#40); it turns green when a restarted relayed host is reached within
 //! [`REACHED_AGAIN_WITHIN`].
 //!
-//! It also cannot tell V29-15's fix (#50) from its bug yet: that defect only shows once a second
-//! circuit forms, and on this path none does within the 30s. Once #40 makes the host dial back
-//! promptly, re-run it with V29-15's `path_class` reverted.
+//! **It is also V29-15's (#50) gate**, now that #40 makes the restarted host dial back promptly:
+//! the host's new process reaches the guest over a **second** circuit, which detaches the first,
+//! and the guest's connection to the crashed process is left relayed over a circuit it no longer
+//! has. The guest must not take that severed connection for a direct path: kept, it beats the live
+//! newcomer on "better path", the guest's requests go into it, and nothing is reached until
+//! `SILENCE_IS_DEATH`. Measured on integrate/v0.2.10 39c3884 with `path_class` reverted to asking
+//! the mux table alone (the pre-V29-15 rule): 5/5 restarts reached again only after 25.7–32.1s,
+//! red on [`REACHED_AGAIN_WITHIN`], in both of two runs; with the fix, 0.8–1.3s in each of three.
 //!
 //! **How a relay is forced without a switch in the product:** `support/relay.rs` splits host and
 //! guest by address family with their own `--listen`, so the anchor's circuit is the only path
