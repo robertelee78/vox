@@ -28,7 +28,12 @@
 //! 3a also requires the refusal to say what happened: the passphrase was right and the keyring
 //! would not open under it, not "the passphrase is wrong".
 //!
-//! Mutations: any one blob sealed with its old key again breaks (1); an unlock that does not
+//! 2 also reads the profile's files as raw bytes: none of v0.2.9's old seals may survive the
+//! migration anywhere in them. redb is copy-on-write, so a re-sealed blob's old page stays in the
+//! file unless the store is rewritten (found in verification of #214).
+//!
+//! Mutations: any one blob sealed with its old key again, or with a key from anything public,
+//! breaks (1); a migration that does not rewrite the store breaks (2); an unlock that does not
 //! migrate breaks (2); the vault's version left out of its AEAD, or a loader that falls back to
 //! the old key, breaks (3); the refusal reported as a wrong passphrase breaks (3a).
 
@@ -329,14 +334,76 @@ fn blobs(disk: &Disk) -> Vec<Blob> {
     out
 }
 
-/// Every key the attacker can compute for `blob`: the ones v0.2.9 sealed with.
+/// Every key the attacker can compute for `blob`: the ones v0.2.9 sealed with, and the blob's
+/// current label expanded over everything public about the identity. The second set catches a
+/// seal whose seed is not secret at all (a verifier's mutant: the seed replaced by a hash of
+/// the fingerprint), which the first set alone would miss.
 fn attacker_keys(blob: &Blob, attacker: &IdProofOnly<'_>) -> Vec<Sek> {
-    match blob.what {
+    let (legacy, label) = match blob.what {
         // v0.2.9 had no pending consents; builds between sealed them under the keyring's key.
-        "trust keyring" | "pending consents" => vec![trust::legacy_trust_sek(attacker).unwrap()],
-        "prekey ring" => vec![prekeys::legacy_ring_sek(attacker).unwrap()],
+        "trust keyring" => (
+            trust::legacy_trust_sek(attacker).unwrap(),
+            trust::TRUST_SEK_INFO,
+        ),
+        "pending consents" => (
+            trust::legacy_trust_sek(attacker).unwrap(),
+            pending_consent::PENDING_CONSENT_SEK_INFO,
+        ),
+        "prekey ring" => (
+            prekeys::legacy_ring_sek(attacker).unwrap(),
+            prekeys::PREKEY_RING_SEK_INFO,
+        ),
         _ => unreachable!(),
+    };
+    let public = attacker.public_key();
+    let fp = public.fingerprint();
+    let seeds: Vec<Vec<u8>> = vec![
+        fp.to_vec(),
+        Sha256::digest(fp).to_vec(),
+        public.ed25519_bytes().to_vec(),
+        public.ml_dsa_bytes().to_vec(),
+        public.to_bytes().to_vec(),
+        Sha256::digest(public.to_bytes()).to_vec(),
+        vec![0u8; 32],
+    ];
+    let mut keys = vec![legacy];
+    for seed in seeds {
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
+        hkdf::Hkdf::<Sha256>::new(None, &seed)
+            .expand(label, key.as_mut())
+            .unwrap();
+        keys.push(Sek::from_bytes(key));
     }
+    keys
+}
+
+/// How many times each of `needles` occurs anywhere in the files of the profile directory,
+/// read as raw bytes: what an adversary with the disk sees, whatever the database thinks is live.
+fn occurrences(disk: &Disk, needles: &[Vec<u8>]) -> Vec<usize> {
+    let dir = disk.store_file.parent().unwrap();
+    let files: Vec<Vec<u8>> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| std::fs::read(e.path()).unwrap_or_default())
+        .collect();
+    needles
+        .iter()
+        .map(|n| {
+            files
+                .iter()
+                .map(|f| f.windows(n.len()).filter(|w| *w == n.as_slice()).count())
+                .sum()
+        })
+        .collect()
+}
+
+/// A distinctive run of each blob's ciphertext, to look for in the raw files.
+fn fingerprints_of(blobs: &[Blob]) -> Vec<Vec<u8>> {
+    blobs
+        .iter()
+        .map(|b| b.sealed.ciphertext[..48.min(b.sealed.ciphertext.len())].to_vec())
+        .collect()
 }
 
 fn vault_key(blob: &Blob, signer: &VaultRootSigner) -> Sek {
@@ -485,6 +552,13 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         );
     }
 
+    let old_seals = fingerprints_of(&blobs(&disk));
+    let before_scan = occurrences(&disk, &old_seals);
+    assert!(
+        before_scan.iter().all(|n| *n >= 1),
+        "CANNOT MEASURE: the raw scan does not find {PREVIOUS}'s seals in its own store: {before_scan:?}"
+    );
+
     let listed = ok(&new, &carol, &["trust", "list"], None);
     let (theirs_after, ours_after) = who_opens(&disk);
     let version_after = disk.vault().version;
@@ -503,6 +577,23 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
          the room reads the v0.2.9 post = {}",
         listed.contains("dave"),
         reads.contains("written by v0.2.9")
+    );
+    // What an adversary with the disk reads: the old seals must be gone from the files
+    // themselves, not only from what the database considers live (redb is copy-on-write).
+    let after_scan = occurrences(&disk, &old_seals);
+    let live_scan = occurrences(&disk, &fingerprints_of(&blobs(&disk)));
+    println!(
+        "[proof] old seals in the profile's raw files: {before_scan:?} before migration, \
+         {after_scan:?} after; the new seals: {live_scan:?}"
+    );
+    assert!(
+        live_scan.iter().all(|n| *n >= 1),
+        "CANNOT MEASURE: the raw scan does not find the migrated store's own seals: {live_scan:?}"
+    );
+    assert!(
+        after_scan.iter().all(|n| *n == 0),
+        "the old seals, openable from the public key, are still on disk after migration: \
+         {after_scan:?} copies"
     );
     assert!(
         listed.contains("dave"),

@@ -2,9 +2,13 @@
 //! #214; see [`crate::atrest::seal`] for why).
 //!
 //! [`Profile::unlock`](crate::node::profile::Profile::unlock) runs this when it opens a
-//! version-1 vault, then rewrites the vault as version 2. That order makes it safe to repeat: a
-//! crash between the two leaves re-sealed blobs under a v1 vault, and the next unlock finds each
-//! of them already opening under its new key and leaves it alone.
+//! version-1 vault, then rewrites the store into a fresh file
+//! ([`Store::rewrite_fresh`](crate::node::store::Store::rewrite_fresh)), then rewrites the vault as
+//! version 2. The store rewrite is not optional: redb is copy-on-write, so re-sealing a blob leaves
+//! its old seal in a replaced page of the same file, still openable from the public key (found in
+//! verification of #214). That order makes it safe to repeat: a crash before the vault moves leaves
+//! a v1 vault, and the next unlock finds each blob already opening under its new key, leaves it
+//! alone, and rewrites the store again.
 //!
 //! **Only here is a legacy key ever used.** Once the vault is v2, no loader tries one, so a
 //! legacy-sealed blob planted afterwards, by someone who can compute `id_proof` from the public

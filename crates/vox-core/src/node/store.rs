@@ -188,6 +188,87 @@ impl Store {
         }
     }
 
+    /// Rewrite the store into a **new file** holding only its live rows, and put that file in
+    /// place of this one (V210-40, #214).
+    ///
+    /// redb is copy-on-write: a row replaced in a transaction leaves its old page in the file
+    /// until the space is reused, and compaction moves pages without clearing what they leave
+    /// behind. So after the node-wide blobs are re-sealed, the old seals, which a quantum
+    /// adversary can open from the public key, are still in `store.redb`. A fresh database
+    /// written from the live rows never contains them. The new file is written beside the old
+    /// one, made durable, then renamed over it (an atomic replace); a crash before the rename
+    /// leaves the old store whole. redb keeps no journal or WAL beside the file, so there is
+    /// nothing else to replace. What the filesystem keeps of the old file's freed blocks is
+    /// beyond any file-level rewrite; disk encryption covers that.
+    ///
+    /// # Errors
+    /// The store is not writable, or the new file cannot be written or put in place. The old
+    /// store is left open and unchanged in every case but a failed reopen after the rename.
+    pub fn rewrite_fresh(&self) -> Result<()> {
+        let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
+        let Backing::Writable(old) = &*backing else {
+            return Err(Error::Storage {
+                op: "rewrite store",
+                detail: "the store is not open for writing".to_owned(),
+            });
+        };
+        let mut fresh_path = self.path.clone().into_os_string();
+        fresh_path.push(".rewrite");
+        let fresh_path = PathBuf::from(fresh_path);
+        let _ = std::fs::remove_file(&fresh_path);
+        let copied = (|| -> Result<()> {
+            let fresh = Database::create(&fresh_path).map_err(open_error)?;
+            super::paths::set_private_file_mode(&fresh_path)?;
+            let r = old.begin_read().map_err(storage("begin read"))?;
+            let w = fresh.begin_write().map_err(storage("begin write"))?;
+            {
+                if let Ok(from) = r.open_table(SEGMENTS) {
+                    let mut to = w.open_table(SEGMENTS).map_err(storage("open segments"))?;
+                    for item in from.iter().map_err(storage("iterate segments"))? {
+                        let (k, v) = item.map_err(storage("iterate segments"))?;
+                        to.insert(k.value(), v.value()).map_err(storage("write segment"))?;
+                    }
+                }
+                if let Ok(from) = r.open_table(SEK_WRAPS) {
+                    let mut to = w.open_table(SEK_WRAPS).map_err(storage("open sek_wraps"))?;
+                    for item in from.iter().map_err(storage("iterate sek_wraps"))? {
+                        let (k, v) = item.map_err(storage("iterate sek_wraps"))?;
+                        to.insert(k.value(), v.value()).map_err(storage("write sek wrap"))?;
+                    }
+                }
+                if let Ok(from) = r.open_table(META) {
+                    let mut to = w.open_table(META).map_err(storage("open meta"))?;
+                    for item in from.iter().map_err(storage("iterate meta"))? {
+                        let (k, v) = item.map_err(storage("iterate meta"))?;
+                        to.insert(k.value(), v.value()).map_err(storage("write meta"))?;
+                    }
+                }
+            }
+            w.commit().map_err(storage("commit"))
+        })();
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&fresh_path);
+            return Err(e);
+        }
+        // Release the old file, then replace it.
+        drop(std::mem::replace(&mut *backing, Backing::Closed));
+        if let Err(e) = std::fs::rename(&fresh_path, &self.path) {
+            let _ = std::fs::remove_file(&fresh_path);
+            *backing = Backing::Writable(Database::create(&self.path).map_err(open_error)?);
+            return Err(Error::Path {
+                op: "replace store",
+                detail: format!("{}: {e}", self.path.display()),
+            });
+        }
+        if let Some(dir) = self.path.parent() {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        *backing = Backing::Writable(Database::create(&self.path).map_err(open_error)?);
+        Ok(())
+    }
+
     /// Begin a read transaction on whichever handle is open.
     fn begin_read(&self) -> Result<redb::ReadTransaction> {
         self.db

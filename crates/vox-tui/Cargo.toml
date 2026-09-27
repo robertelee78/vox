@@ -59,3 +59,5 @@ getrandom.workspace = true
 # The R41 link emulator sizes its own UDP sockets' buffers (std cannot): a link does not drop
 # packets at a 786 KB socket, and the emulator must not either.
 socket2.workspace = true
+# V210-40's proof derives the keys an attacker can compute from a public key, itself.
+hkdf.workspace = true
