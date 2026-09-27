@@ -24,10 +24,19 @@
 //! 2. the **second** agent's model reads the *result* the first one posted — so a
 //!    message written by one session reaches a different session on a different
 //!    identity, which is the whole feature;
-//! 3. **cursors are per session**: the second agent sees the backlog the first has
-//!    already consumed, because it has not read it;
+//! 3. **cursors are per session**, measured on one daemon: two sessions of the *same*
+//!    identity each run the drain the OpenCode plugin runs (`vox agent hook --format text
+//!    --room <room> --session <id>`). After session `s1` has consumed a post carrying a
+//!    per-run nonce, `s1`'s next drain no longer shows it (the cursor moved) and session
+//!    `s2`'s first drain still does (it has not read it). A cursor kept per identity or
+//!    per room would hide the nonce from `s2`;
 //! 4. the operator's plain prose and the agents' typed envelopes coexist in one
-//!    room, which is the shared-room case rather than the pure-agent one.
+//!    room, which is the shared-room case rather than the pure-agent one. The operator's
+//!    question carries a **per-run nonce**, and alice's model must quote that nonce. The
+//!    backlog every fresh `opencode run` session is re-shown also holds the `assign`
+//!    about the codec, so any check that the assignment could satisfy (such as the word
+//!    "codec") measures nothing; only the question's own nonce proves the prose arrived.
+//!    Only the model's stdout is searched, never OpenCode's stderr.
 //!
 //! ## Stated rather than implied
 //!
@@ -46,10 +55,17 @@
 //! plugin is what `vox agent plugin opencode` prints, installed where a person puts it, and
 //! that plugin runs `vox agent hook` every turn. Nothing in this process runs a node.
 //!
-//! ## Mutation
+//! ## Mutations that must turn it red
 //!
-//! Make `vox agent hook` inject nothing (the drain returns before printing what is unread)
-//! and this goes red at (1): alice's model cannot name the assignment it was never told.
+//! - Make `vox agent hook` inject nothing (the drain returns before printing what is
+//!   unread): red at (1), alice's model cannot name the assignment it was never told.
+//! - Make `vox agent hook` drop plain prose from what it emits (every row that parses as a
+//!   `say` is filtered out of the drain, so only typed envelopes are injected): (1) and (2)
+//!   stay green, and it goes red at (4), alice's answer does not carry the question's nonce.
+//!   (Filtering on `Envelope::parse(..).is_ok()` is not this mutant: prose parses as a
+//!   `say`, so that filter drops nothing.)
+//! - Key the hook's cursor by room alone, ignoring the session: red at (3), `s2` is shown
+//!   nothing because `s1` already read it.
 
 #![cfg(unix)]
 
@@ -106,6 +122,18 @@ fn install_plugin(w: &Worker, fixture: &Path) -> std::path::PathBuf {
 
 /// One real model turn for this agent, with its room wired in.
 fn turn(w: &Worker, project: &Path, oc_cfg: &Path, room: &str, prompt: &str) -> String {
+    turn_split(w, project, oc_cfg, room, prompt).1
+}
+
+/// As [`turn`], also returning the model's stdout alone (the answer, without OpenCode's
+/// stderr), for a check that must not be satisfied by a log line.
+fn turn_split(
+    w: &Worker,
+    project: &Path,
+    oc_cfg: &Path,
+    room: &str,
+    prompt: &str,
+) -> (String, String) {
     let mut cmd = Command::new("opencode");
     // A spawned OpenCode that inherits cargo's environment loads the plugin and never
     // fires its message hook. Measured; see `opencode_plugin_proof`.
@@ -131,7 +159,16 @@ fn turn(w: &Worker, project: &Path, oc_cfg: &Path, room: &str, prompt: &str) -> 
         String::from_utf8_lossy(&out.stderr)
     );
     eprintln!("[turn {}] {prompt:?} -> {said}", w.name);
-    said
+    (String::from_utf8_lossy(&out.stdout).into_owned(), said)
+}
+
+/// A per-run token, unguessable by a model and absent from every prompt.
+fn nonce(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{tag}-{}{:06}", std::process::id(), nanos % 1_000_000)
 }
 
 #[test]
@@ -210,7 +247,7 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
         |o| o.stdout.contains("QUORUM-8812"),
     );
 
-    // ---- (2) and (3) bob's model reads what alice wrote, from its own cursor ----
+    // ---- (2) bob's model reads what alice wrote, from its own session ----
     let seen = turn(
         bob,
         &b_proj,
@@ -228,34 +265,97 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     );
 
     // ---- (4) the operator asks a question in prose, and it lands ----
-    let o = bob.vox(
-        None,
-        &[
-            "room",
-            "post",
-            &room,
-            "hey, is the codec work finished? the release is waiting on it",
-        ],
-    );
+    let ask = nonce("ORCHID");
+    let question =
+        format!("hey, is the codec work finished? the release is waiting on it (ref {ask})");
+    let o = bob.vox(None, &["room", "post", &room, &question]);
     assert!(o.ok, "the operator could not ask a question: {o:?}");
     until(
         alice,
         None,
         "the question to reach alice",
         &["room", "read", &room],
-        |o| o.stdout.contains("release is waiting"),
+        |o| o.stdout.contains(&ask),
     );
-    let heard = turn(
+    let (answer4, heard) = turn_split(
         alice,
         &a_proj,
         &oc_cfg,
         &room,
-        "Did anyone ask you a question just now? Answer yes or no and quote it.",
+        "Did anyone ask you a question just now? Answer yes or no and quote it exactly, \
+         including any reference code in it.",
     );
-    let heard_it = heard.contains("release is waiting") || heard.to_lowercase().contains("codec");
-    println!("[proof] (4) alice's model heard the operator's prose: {heard_it}");
+    let heard_it = answer4.contains(&ask);
+    println!("[proof] (4) alice's model quoted the operator's prose nonce {ask}: {heard_it}");
     assert!(
         heard_it,
-        "plain prose from the operator did not reach an agent's context: {heard:?}"
+        "plain prose from the operator did not reach an agent's context: the answer does \
+         not carry the question's nonce {ask}. The answer: {heard:?}"
+    );
+
+    // ---- (3) cursors are per session: two sessions of one identity, one daemon ----
+    // The drain the OpenCode plugin runs, with two session ids of alice's. A fresh post
+    // by the operator (bob) carries its own nonce.
+    let mark = nonce("LANTERN");
+    let o = bob.vox(
+        None,
+        &["room", "post", &room, &format!("cursor check {mark}")],
+    );
+    assert!(o.ok, "the operator could not post the cursor check: {o:?}");
+    until(
+        alice,
+        None,
+        "the cursor check to reach alice",
+        &["room", "read", &room],
+        |o| o.stdout.contains(&mark),
+    );
+    let (s1, s2) = (nonce("rehearsal-s1"), nonce("rehearsal-s2"));
+    let drain = |session: &str| {
+        let o = alice.vox(
+            None,
+            &[
+                "agent",
+                "hook",
+                "--format",
+                "text",
+                "--room",
+                &room,
+                "--session",
+                session,
+            ],
+        );
+        assert!(o.ok, "vox agent hook --session {session}: {o:?}");
+        o.stdout
+    };
+    let s1_first = drain(&s1);
+    let s1_again = drain(&s1);
+    let s2_first = drain(&s2);
+    let (a, b, c) = (
+        s1_first.contains(&mark),
+        s1_again.contains(&mark),
+        s2_first.contains(&mark),
+    );
+    println!(
+        "[proof] (3) per-session cursors on one daemon: s1 first shows the post: {a}, s1 again: \
+         {b}, s2 first: {c} (drain bytes {} / {} / {})",
+        s1_first.len(),
+        s1_again.len(),
+        s2_first.len()
+    );
+    assert!(
+        a,
+        "CANNOT MEASURE: session s1's first drain did not show the operator's post {mark}: \
+         {s1_first:?}"
+    );
+    assert!(
+        !b,
+        "session s1 was shown the same post twice, so the drain keeps no cursor for it: \
+         {s1_again:?}"
+    );
+    assert!(
+        c,
+        "session s2, on the same identity and daemon, was not shown a post it never read \
+         ({mark}) because session s1 had consumed it: the cursor is not per session. s2's \
+         drain: {s2_first:?}"
     );
 }
