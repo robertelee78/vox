@@ -8,11 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # The gaps ADR-018 §3 accepts today, named so that accepting them is a visible decision.
-  # Removing one MUST make the proofs fail until it is closed.
-  # The gaps ADR-018 §3 accepts, named so accepting them is a visible decision. `fish` is NOT
-  # here: the runners install it below, which is how that gap gets closed rather than excused.
-  VOX_PROOF_ALLOW_UNPROVEN: "opencode,cross-process-join,cross-process-tunnel"
+  # The one gap ADR-018 §3 accepts, named so that accepting it is a visible decision. `opencode`:
+  # the five live-model proofs need an OpenCode install and a model account, which CI runners do
+  # not have. The decider (2026-09-26) chose that they run on the local macOS release gate, with
+  # the decider's account, and must be green there before every tag; CI keeps this one exception.
+  # Removing it MUST make those proofs fail on CI. `fish` is NOT here: the runners install it.
+  VOX_PROOF_ALLOW_UNPROVEN: "opencode"
 
 jobs:
   # **Every commit must build, not merely the tip.** `git bisect` compiles the commit it
@@ -131,15 +132,15 @@ jobs:
       # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
       # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
       # product is a test", 2026-09-26). Run here in release.
-      # Excluded here, and run in their own jobs below: the PRD-001 transport proofs (`r40_`, `r41_`),
-      # the slowest part of the suite, so they run in parallel with this job instead of after it; and `cross_process_join_proof`, a known flake (ADR-018, "Two
-      # proofs are excluded from the release gate, by name"), reported but never blocking.
+      # Excluded here, and run in their own job below: the PRD-001 transport proofs (`r40_`, `r41_`),
+      # the slowest part of the suite, so they run in parallel with this job instead of after it.
+      # No proof is excluded by name any more (V210-19, #192): `cross_process_join_proof`, excused
+      # as a flake since v0.2.2, passed 20 of 20 on integrate/v0.2.10 and is back in this gate.
       # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
       - name: Real-parameter gates (release)
         run: |
           cargo test --release --workspace --no-fail-fast -- --ignored \
-            --skip r40_ --skip r41_ \
-            --skip two_agents_on_separate_processes_join_through_an_anchor_and_talk
+            --skip r40_ --skip r41_
 
   # **The PRD-001 transport proofs, in parallel with the rest.** They are blocking — a release
   # publishes only a commit whose whole CI run passed (release.yml `ci-passed`) — but they are
@@ -169,22 +170,3 @@ jobs:
         env:
           VOX_PERF_REPORT_ONLY: ${{ runner.os == 'macOS' && 'WAN' || '' }}
         run: cargo test --release --workspace --no-fail-fast -- --ignored r40_ r41_
-
-  # **Reporting only, and in its OWN job on purpose**: the proofs excluded from the gate above by
-  # name. The command ends in `|| echo "::warning::"`, so it cannot fail CI, and being a separate job
-  # it cannot spend the gate's time budget either. A rate that changes is still visible as a warning.
-  flaky-watch:
-    name: excluded proofs (reporting only — never blocks)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y zsh fish
-      # Its one test binary only, not the workspace: the release waits for this whole CI run
-      # (release.yml `ci-passed`), so a reporting job that compiled every test binary would set
-      # the release's pace. Safe to name: `build-test` skips this proof by its full name, so a
-      # rename makes it run there, in the blocking set, where a red is seen.
-      - run: |
-          cargo test --release -p vox-tui --test cross_process_join_proof -- --ignored \
-            two_agents_on_separate_processes_join_through_an_anchor_and_talk \
-            || echo "::warning::cross_process_join_proof failed — known flake, ADR-018"

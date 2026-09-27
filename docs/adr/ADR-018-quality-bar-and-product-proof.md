@@ -823,12 +823,23 @@ vox-tui's in-process `interrupt_proof`.
 tunnel throughput (`perf_r41_tunnel_throughput_proof`), relay circuits on IPv6
 (`a_circuit_carries_an_ipv6_daemon_proof`), and the 56 other binary proofs.
 
-**Claims now unmeasured until a real-use proof is written**, each to be tracked as its own item: first
-connection under 2 s (R42: open, punched, relayed); a relayed pair upgrades to direct (#49); a severed
-circuit or a second circuit is not taken for a direct path (V29-15); a silent stream, a `.vox` name or a
-`want` cannot wedge the node; a join is not hostage to one member; `vox forward` binds loopback only;
-no consent without a keyring entry; revocation (M18); the path MTU follows the granted socket buffer
-(#174); the at-rest profile floor. The unshaped R42 and #174 claims are also exercised whenever R41 runs.
+**Claims now unmeasured until a real-use proof is written**, each tracked as its own item. Updated
+2026-09-27: most now have a real-use proof on integrate/v0.2.10, with a verdict on each: first
+connection under 2 s, direct (RP-22), punched (RP-23) and relayed (RP-24); a relayed pair upgrades
+to direct (RP-25, #49); a second circuit is decided alike (V29-15, #50); a silent stream, a `.vox`
+address and a `want` cannot stop a node (RP-03/04/05); a join is not hostage (RP-02); `vox forward`
+binds loopback only (RP-27); the at-rest Argon2id floor (RP-07). **Still unmeasured:** no consent
+without a keyring entry, M18 revocation, and #174's MTU ceiling (whose evidence is #206's path-stats
+runs).
+
+**No proof is excluded by name, and one gap remains (2026-09-27, #192 and #193).**
+`cross_process_join_proof`, excluded from the blocking gate since v0.2.2 as a flake (4 of 6), passed
+20 of 20 on integrate/v0.2.10 (7-12 s each, where it used to be bimodal: about 26 s, or past 60) and
+is back in the gate. Its two gaps (`cross-process-join`, `cross-process-tunnel`) close with it. The
+one accepted gap left is `opencode`. The five live-model proofs need OpenCode and a model account. The
+decider chose (2026-09-26) that they run on the local macOS release gate with the decider's account,
+and that **a tag is not cut unless they are green there**. CI keeps the exception, and says why in
+ci.yml.
 
 **§5 is stale, not current.** Its in-source suites (`governance/vectors.rs`, `cpace`, `cbor`, the UPnP
 mock, `deniable/tests.rs`, the Argon2id timing spike) no longer exist in the tree: there are no
@@ -840,7 +851,9 @@ run `vox`: `a_daemon_follows_its_anchor`, `a_long_room_reopens_proof`,
 `agent_rehearsal_proof`, `daemon_proof`, `it_just_works_with_a_daemon_running`,
 `opencode_plugin_proof`, `remote_interrupt_proof`,
 `shutdown_releases_the_profile_proof`, `work_board_proof`. Each is to have every participant run as
-the binary, or be deleted, and is tracked as its own item.
+the binary, or be deleted, and is tracked as its own item. **Updated 2026-09-27:** all but
+`a_daemon_follows_its_anchor` and `agent_rehearsal_proof` are converted (RP-33/34/36/37/38/39/40/41/43)
+or retired into an all-real proof (RP-46).
 
 **How this is applied.** No new test may run the node in-process, assert an internal value, or stand
 in a proxy for what a person sees. A proof that needs an instrument (the R41 link emulator) keeps the
