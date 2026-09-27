@@ -28,7 +28,7 @@
 //! saw the window reach 42-58 MB and the round trip climb to 110-240 ms, and the transfer then paid
 //! for the burst of losses. R41 WAN on that runner: 61-106% of raw from one run to the next. The
 //! kernels' own TCP (the raw arm) leaves slow start when the round trip rises (HyStart), and so
-//! does this one now: [`VoxCubic`] is quinn 0.11's Cubic, ported unchanged outside slow start, with
+//! does this one now: `VoxCubic` is quinn 0.11's Cubic, ported unchanged outside slow start, with
 //! HyStart++ (RFC 9406) deciding when slow start ends. quinn's `Controller` trait cannot end its
 //! own Cubic's slow start from outside, which is why the Cubic is ours; quinn itself is untouched.
 
@@ -49,7 +49,7 @@ pub const IDLE_RESTART: Duration = Duration::from_secs(1);
 /// restarted between two flights of the same transfer.
 const IDLE_RTTS: u32 = 4;
 
-/// Builds `IdleRestart` controllers around [`VoxCubic`].
+/// Builds `IdleRestart` controllers around `VoxCubic`.
 #[derive(Debug, Default)]
 pub struct IdleRestartConfig;
 
