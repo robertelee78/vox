@@ -3484,12 +3484,19 @@ impl Node {
                     && !self.channels.contains_key(&channel_id)
                     && self.profile.as_ref().is_some_and(Profile::is_unlocked);
                 if wanted {
+                    // Everything `open_channel` does to a room it opens: a room reopened after an
+                    // unlock is the same room, and a restart is exactly when its members have to
+                    // be dialled from where they were last reached (`node::peer_book`).
+                    let mut channel = *channel;
+                    channel.set_node_retention(self.node_retention_for(&channel_id));
                     self.channels
-                        .insert(channel_id, Arc::new(tokio::sync::Mutex::new(*channel)));
+                        .insert(channel_id, Arc::new(tokio::sync::Mutex::new(channel)));
                     self.adopt_channel_anchors(&channel_id, None).await;
                     self.refresh_network_view().await;
                     self.publish_channel_locally(&channel_id).await;
                     self.publish_channel_to_anchors(&channel_id).await;
+                    self.install_key_packages(&channel_id).await;
+                    self.reach_members_of(&channel_id).await;
                     let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
                 }
             }
