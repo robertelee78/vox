@@ -5766,12 +5766,13 @@ impl Node {
                 }
             }
             Some(fail) => {
-                // Nothing credited, so the port still needs a session. A concurrent completion
-                // that made progress while this attempt ran wins over its failure.
+                // **A failure raises a request whether or not it made progress** (ADR-025 D2): what
+                // it did not deliver is still owed. Nothing is credited, and the D5 backoff below
+                // paces the retry, so a peer that always fails costs a session per backoff step,
+                // never a loop. A concurrent completion that made progress while this attempt ran
+                // wins over its failure: then the port is not put back in backoff.
                 let beaten = port.last_progress.is_some_and(|t| t >= attempt.started) && !progress;
-                if progress {
-                    port.raise();
-                }
+                port.raise();
                 if !beaten {
                     if let Some(kind) = crate::node::ports::backoff_kind(fail) {
                         self.enter_backoff(channel_id, peer, kind);

@@ -126,7 +126,8 @@ pub fn backoff_wait(kind: BackoffKind, failures: u32) -> Duration {
 ///
 /// - the peer unreachable, the stream not opening, the transport failing or timing out, the
 ///   peer resetting with `TransportFailed`/`Unresponsive` → `Unreachable`;
-/// - the peer's `SessionBusy` → `Busy`;
+/// - the peer's `SessionBusy`, and its `NotYetMember` (#217: it has not yet admitted this
+///   just-joined member) → `Busy`;
 /// - the peer's `EpochMismatch`, or its uninformative refusal (`AuthenticatorInvalid`: not a
 ///   member, the room not held, or it found our entries unacceptable), and this side's own room
 ///   having moved to another epoch mid-session → `Policy`;
@@ -143,17 +144,31 @@ pub fn backoff_kind(fail: &SyncFailure) -> Option<BackoffKind> {
         SyncFailure::Panicked | SyncFailure::Session(SessionError::ProtocolViolation) => {
             BackoffKind::NoProgress
         }
+        // Every code is named, in both arms, with no catch-all: a code added to `WireError` does not
+        // compile until it is given a kind here.
         SyncFailure::Session(SessionError::Peer(code)) => match code {
             WireError::SessionBusy => BackoffKind::Busy,
+            // The peer does not know this node as a member yet (#217): it clears within seconds,
+            // so it is paced like `Busy`, never by the 30 s `Policy` interval.
+            WireError::NotYetMember => BackoffKind::Busy,
             WireError::TransportFailed | WireError::Unresponsive => BackoffKind::Unreachable,
             WireError::EpochMismatch | WireError::AuthenticatorInvalid => BackoffKind::Policy,
-            _ => BackoffKind::NoProgress,
+            WireError::ProtocolVersionUnsupported
+            | WireError::SuiteBelowFloor
+            | WireError::UnknownStructTag
+            | WireError::UnknownAlgoId
+            | WireError::SyncModeUnsupported => BackoffKind::NoProgress,
         },
         SyncFailure::Session(SessionError::Local(code)) => match code {
             WireError::TransportFailed | WireError::Unresponsive => BackoffKind::Unreachable,
-            WireError::SessionBusy => BackoffKind::Busy,
+            WireError::SessionBusy | WireError::NotYetMember => BackoffKind::Busy,
             WireError::EpochMismatch => BackoffKind::Policy,
-            _ => BackoffKind::NoProgress,
+            WireError::ProtocolVersionUnsupported
+            | WireError::SuiteBelowFloor
+            | WireError::UnknownStructTag
+            | WireError::UnknownAlgoId
+            | WireError::AuthenticatorInvalid
+            | WireError::SyncModeUnsupported => BackoffKind::NoProgress,
         },
     })
 }
