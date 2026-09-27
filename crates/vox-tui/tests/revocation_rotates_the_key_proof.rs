@@ -328,7 +328,11 @@ fn stored_receivers(store: &Store, channel: &[u8; 32], sek: &Sek) -> Vec<Vec<u8>
         .expect("CANNOT MEASURE: the receiver segment does not open under bob's SEK");
     let mut d = Decoder::new(&bytes);
     assert_eq!(d.array().unwrap(), 2, "receiver segment arity");
-    assert_eq!(d.uint().unwrap(), RECEIVERS_VERSION, "receiver segment version");
+    assert_eq!(
+        d.uint().unwrap(),
+        RECEIVERS_VERSION,
+        "receiver segment version"
+    );
     let n = d.array().unwrap();
     (0..n).map(|_| d.bytes().unwrap().to_vec()).collect()
 }
@@ -423,9 +427,11 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
     let (ok, _, e) = alice.vox(&["room", "post", &room, "BEFORE-REMOVAL-CONTROL"], None);
     assert!(ok, "alice posts: {e}");
     assert!(
-        until("bob renders BEFORE-REMOVAL-CONTROL", Duration::from_secs(60), || {
-            bob.reads(&room, "BEFORE-REMOVAL-CONTROL")
-        }),
+        until(
+            "bob renders BEFORE-REMOVAL-CONTROL",
+            Duration::from_secs(60),
+            || { bob.reads(&room, "BEFORE-REMOVAL-CONTROL") }
+        ),
         "CANNOT MEASURE: bob never rendered alice's last pre-removal post, so it is not provably \
          in his log for the attacker to open"
     );
@@ -534,7 +540,9 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
             &channel,
             ROOM_PASS.as_bytes(),
         )
-        .expect("CANNOT MEASURE: unwrap the room's SEK with bob's identity and the room passphrase");
+        .expect(
+            "CANNOT MEASURE: unwrap the room's SEK with bob's identity and the room passphrase",
+        );
     let final_keys = stored_receivers(store, &channel, &sek);
     let snapshot_store =
         Store::open(&snapshot).expect("CANNOT MEASURE: open the snapshot of bob's store");
@@ -551,7 +559,11 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
         let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)
             .expect("CANNOT MEASURE: a log segment does not open under bob's SEK");
         let entry = Entry::from_wire(&wire).expect("a stored log entry decodes");
-        if let Some(msg) = entry.payload.as_deref().and_then(|p| GroupMessage::from_wire(p).ok()) {
+        if let Some(msg) = entry
+            .payload
+            .as_deref()
+            .and_then(|p| GroupMessage::from_wire(p).ok())
+        {
             content.push((entry.skeleton.author_id, entry.skeleton.seq, msg));
         }
     }
