@@ -5,10 +5,18 @@
 //! Replaces `crates/vox-core/tests/node_m18_revocation_gate.rs`, which ran every node
 //! in-process (V29-17).
 //!
+//! **One arm is test code, not a `vox` command: the attacker.** It models a **removed member
+//! running a modified node** — Bob himself, with his own passphrases, reading his own profile
+//! as his `vox` binary wrote it to disk, and ignoring the log's revocation. No `vox` command can
+//! play that node (the shipped one declines to render a revoked author before it decrypts), so
+//! the test opens Bob's store with `vox-core`'s own at-rest, log and sender-key functions used
+//! as a library — exactly what a modified node would do. It starts no in-process `vox` node.
+//!
 //! ## The claim
 //! `vox trust remove <bob>` on Alice's node removes the ring entry **and changes the lock**:
 //! Alice's sender key is rotated and everyone still trusted is re-keyed, in every room shared
-//! with Bob. So Bob, who holds Alice's old key, reads nothing Alice posts afterwards, while
+//! with Bob. So Bob, who holds Alice's old key, reads nothing Alice posts afterwards — not
+//! because his node politely declines, but because **no key he holds opens it** — while
 //! Carol, still trusted, reads all of it — the rotation costs her nothing. What Bob already
 //! read stays read (it cannot be recalled).
 //!
@@ -21,8 +29,12 @@
 //!    other after the joins.
 //! 2. Precondition: Bob and Carol each render a post by Alice, and Bob renders one by Carol
 //!    (`CANNOT MEASURE` otherwise) — Bob really holds Alice's key before she removes him.
-//! 3. Alice runs `vox trust remove <bob>`, then posts [`AFTER`] fresh messages.
-//! 4. Carol must render all of them. Then Carol posts until Bob renders one of hers — a
+//! 3. Bob's daemon is frozen (SIGSTOP) for as long as it takes to copy his `store.redb`, then
+//!    thawed: the attacker's **snapshot** of Bob's own key state. Alice then posts
+//!    `BEFORE-REMOVAL-CONTROL` and Bob renders it (`CANNOT MEASURE` otherwise), so it is in his
+//!    log and his snapshot key sits before it.
+//! 4. Alice runs `vox trust remove <bob>`, then posts [`AFTER`] fresh messages.
+//! 5. Carol must render all of them. Then Carol posts until Bob renders one of hers — a
 //!    **positive control** that Bob's node is still syncing the room (and Carol's post comes
 //!    after she already held Alice's), so Bob's silence below is the lock, not the plumbing.
 //!
@@ -30,11 +42,24 @@
 //! - Carol renders **3 of 3** of Alice's post-removal messages, within 90 s.
 //! - Bob, with the control proved and 10 s more to settle, renders **0 of 3**.
 //! - Bob still renders what Alice said before the removal.
+//! - **The attacker arm.** Bob's daemon is stopped (SIGTERM, by PID). The attacker unlocks Bob's
+//!   profile with his identity passphrase, unwraps the room's SEK with the room passphrase, and
+//!   reads the receiver chains (the sender keys released to Bob) from both his final store and
+//!   the snapshot, and Alice's log entries from his final store. Then:
+//!   - **the escalation works:** the snapshot's key opens `BEFORE-REMOVAL-CONTROL` from Bob's
+//!     log (`CANNOT MEASURE` otherwise — an attacker that opens nothing proves nothing);
+//!   - Bob's log holds **exactly 3** content entries by Alice after that one (`CANNOT MEASURE`
+//!     otherwise);
+//!   - **no key Bob holds, in either store, opens any of the 3** — the key rotated.
 //!
-//! ## The mutation that must turn it red
-//! Drop `self.change_the_lock_against(fingerprint).await;` from `untrust_identity` in
-//! `crates/vox-core/src/node/actor.rs`: the ring entry goes but the key is not rotated, so Bob
-//! keeps opening Alice's new posts with the key he already holds.
+//! ## The mutations that must turn it red
+//! - Drop `self.change_the_lock_against(fingerprint).await;` from `untrust_identity` in
+//!   `crates/vox-core/src/node/actor.rs`: the ring entry goes but the key is not rotated, so Bob
+//!   keeps opening Alice's new posts with the key he already holds.
+//! - **Revoke without rotating**: in `ChannelState::revoke_consent`
+//!   (`crates/vox-core/src/node/channel.rs`), `let new_chain_id = self.rotate_sender(..)?;`
+//!   becomes `let new_chain_id = self.sender.chain_id();`. The revocation is still written, so
+//!   Bob's cooperative node still shows 0/3 — only the attacker arm sees that it opens 3/3.
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -44,6 +69,16 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use vox_core::atrest::store::{open_segment, SegmentKind};
+use vox_core::atrest::{Sek, SignatureIdentityFactor};
+use vox_core::cbor::Decoder;
+use vox_core::group::{GroupMessage, ReceiverChain};
+use vox_core::log::entry::Entry;
+use vox_core::node::content::Content;
+use vox_core::node::paths::Paths;
+use vox_core::node::profile::Profile;
+use vox_core::node::store::Store;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const ID_PASS: &str = "identity passphrase";
@@ -250,6 +285,67 @@ fn join(m: &Member, link: &str) {
     assert!(joined, "CANNOT MEASURE: {} could not join the room", m.name);
 }
 
+/// Send `sig` to `pid` with `kill(1)` — by PID, never by pattern.
+fn signal(pid: u32, sig: &str) {
+    let ok = Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .expect("run kill")
+        .success();
+    assert!(ok, "kill {sig} {pid} failed");
+}
+
+/// Stop a daemon the way a service manager does and wait for it to leave, so its store is
+/// closed and the profile is free to open.
+fn stop(mut daemon: Proc) {
+    signal(daemon.0.id(), "-TERM");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while daemon.0.try_wait().expect("try_wait").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: bob's daemon did not leave within 30s of SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// ---- the attacker: a removed member on a modified node (test code, vox-core as a library) ----
+
+/// The receiver-chain segment's slot in `KeyMaterial`, and its at-rest version — as bob's binary
+/// writes them (`SEG_RECEIVERS`, `RECEIVERS_VERSION` in `node/channel.rs`).
+const SEG_RECEIVERS: u64 = 3;
+const RECEIVERS_VERSION: u64 = 1;
+
+/// Every sender key released to bob, as the state blobs his node sealed into `store`.
+fn stored_receivers(store: &Store, channel: &[u8; 32], sek: &Sek) -> Vec<Vec<u8>> {
+    let Some(seg) = store
+        .get_segment(channel, SegmentKind::KeyMaterial, SEG_RECEIVERS)
+        .expect("read the receiver segment")
+    else {
+        return Vec::new();
+    };
+    let bytes = open_segment(sek, SegmentKind::KeyMaterial, SEG_RECEIVERS, &seg)
+        .expect("CANNOT MEASURE: the receiver segment does not open under bob's SEK");
+    let mut d = Decoder::new(&bytes);
+    assert_eq!(d.array().unwrap(), 2, "receiver segment arity");
+    assert_eq!(d.uint().unwrap(), RECEIVERS_VERSION, "receiver segment version");
+    let n = d.array().unwrap();
+    (0..n).map(|_| d.bytes().unwrap().to_vec()).collect()
+}
+
+/// Try every held key for the message's (author, generation), each from its stored state,
+/// ignoring any consent or revocation. `Some(text)` if one opens it.
+fn attacker_opens(keys: &[Vec<u8>], msg: &GroupMessage) -> Option<String> {
+    keys.iter().find_map(|state| {
+        let mut chain = ReceiverChain::from_state(state).ok()?;
+        if chain.author_id() != msg.header.author_id || chain.chain_id() != msg.header.chain_id {
+            return None;
+        }
+        let plain = chain.decrypt(msg).ok()?;
+        Content::from_canonical_slice(&plain).ok().map(|c| c.text)
+    })
+}
+
 fn until(what: &str, within: Duration, ok: impl Fn() -> bool) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
@@ -316,6 +412,24 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
          carol->bob {cb:?})"
     );
 
+    // ---- the attacker's snapshot of bob's own key state, then a post it must be able to open ----
+    let bob_store = bob.data.join("default").join("store.redb");
+    let snapshot = tmp.path().join("bob-snapshot.redb");
+    let bob_pid = bob.daemon.as_ref().unwrap().0.id();
+    signal(bob_pid, "-STOP");
+    let copied = std::fs::copy(&bob_store, &snapshot);
+    signal(bob_pid, "-CONT");
+    copied.expect("CANNOT MEASURE: copy bob's store.redb");
+    let (ok, _, e) = alice.vox(&["room", "post", &room, "BEFORE-REMOVAL-CONTROL"], None);
+    assert!(ok, "alice posts: {e}");
+    assert!(
+        until("bob renders BEFORE-REMOVAL-CONTROL", Duration::from_secs(60), || {
+            bob.reads(&room, "BEFORE-REMOVAL-CONTROL")
+        }),
+        "CANNOT MEASURE: bob never rendered alice's last pre-removal post, so it is not provably \
+         in his log for the attacker to open"
+    );
+
     // ---- alice removes bob, then keeps talking ----
     let (ok, o, e) = alice.vox(
         &[
@@ -359,7 +473,11 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
         Duration::from_secs(90),
     );
     std::thread::sleep(Duration::from_secs(10));
-    let bob_seen = bob.vox(&["room", "read", &room], None).1;
+    let (bob_read_ok, bob_seen, bob_read_err) = bob.vox(&["room", "read", &room], None);
+    assert!(
+        bob_read_ok,
+        "CANNOT MEASURE: bob's final read failed: {bob_read_err}"
+    );
     let bob_count = (1..=AFTER)
         .filter(|n| bob_seen.contains(&format!("ONLY-CAROL-READS-THIS {n}")))
         .count();
@@ -385,5 +503,107 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
     assert!(
         bob_before,
         "what bob read before the removal is not recalled"
+    );
+
+    // ---- the attacker arm: bob, on a modified node, reads his own disk ----
+    let mut bob = bob;
+    stop(bob.daemon.take().expect("bob's daemon"));
+    let mut profile = Profile::open(Paths {
+        config_dir: bob.data.join("cfg"),
+        profile_dir: bob.data.join("default"),
+    })
+    .expect("CANNOT MEASURE: open bob's profile offline");
+    profile
+        .unlock(ID_PASS.as_bytes())
+        .expect("CANNOT MEASURE: unlock bob's profile with his passphrase");
+    let store = profile.store();
+    let channels = store.channels().expect("list bob's rooms");
+    assert_eq!(
+        channels.len(),
+        1,
+        "CANNOT MEASURE: bob's store holds {} rooms, not the one",
+        channels.len()
+    );
+    let channel = channels[0];
+    let sek = store
+        .get_sek_wrap(&channel)
+        .expect("read the SEK wrap")
+        .expect("CANNOT MEASURE: bob's store has no SEK wrap for the room")
+        .unwrap_sek(
+            &SignatureIdentityFactor::new(profile.signer().unwrap()),
+            &channel,
+            ROOM_PASS.as_bytes(),
+        )
+        .expect("CANNOT MEASURE: unwrap the room's SEK with bob's identity and the room passphrase");
+    let final_keys = stored_receivers(store, &channel, &sek);
+    let snapshot_store =
+        Store::open(&snapshot).expect("CANNOT MEASURE: open the snapshot of bob's store");
+    let snapshot_keys = stored_receivers(&snapshot_store, &channel, &sek);
+    let mut every_key = final_keys.clone();
+    every_key.extend(snapshot_keys.iter().cloned());
+
+    // Every content entry in bob's log, as (author, seq, message), in log order.
+    let mut content = Vec::new();
+    for (id, seg) in store
+        .segments(&channel, SegmentKind::LogDb)
+        .expect("read bob's log")
+    {
+        let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)
+            .expect("CANNOT MEASURE: a log segment does not open under bob's SEK");
+        let entry = Entry::from_wire(&wire).expect("a stored log entry decodes");
+        if let Some(msg) = entry.payload.as_deref().and_then(|p| GroupMessage::from_wire(p).ok()) {
+            content.push((entry.skeleton.author_id, entry.skeleton.seq, msg));
+        }
+    }
+
+    // The escalation works: bob's own earlier key opens alice's last pre-removal post.
+    let control = content.iter().find(|(_, _, msg)| {
+        attacker_opens(&snapshot_keys, msg).as_deref() == Some("BEFORE-REMOVAL-CONTROL")
+    });
+    let Some((alice_id, control_seq, control_msg)) = control else {
+        panic!(
+            "CANNOT MEASURE: the attacker could not open BEFORE-REMOVAL-CONTROL with bob's own \
+             stored key ({} content entries in his log, {} keys in the snapshot, {} in his final \
+             store): its escalation does not work, so its failing below would prove nothing",
+            content.len(),
+            snapshot_keys.len(),
+            final_keys.len()
+        )
+    };
+    let after: Vec<&GroupMessage> = content
+        .iter()
+        .filter(|(author, seq, _)| author == alice_id && seq > control_seq)
+        .map(|(_, _, msg)| msg)
+        .collect();
+    let opened: Vec<String> = after
+        .iter()
+        .filter_map(|msg| attacker_opens(&every_key, msg))
+        .collect();
+    eprintln!(
+        "[proof] attacker: opened the pre-removal control (generation {}); alice's post-removal \
+         entries in bob's log: {} (generations {:?}); bob's keys: {} final + {} snapshot; opened \
+         {}/{}: {opened:?}",
+        control_msg.header.chain_id,
+        after.len(),
+        after.iter().map(|m| m.header.chain_id).collect::<Vec<_>>(),
+        final_keys.len(),
+        snapshot_keys.len(),
+        opened.len(),
+        after.len()
+    );
+    assert_eq!(
+        after.len(),
+        3,
+        "CANNOT MEASURE: bob's log holds {} of alice's post-removal posts, not 3, so what the \
+         attacker fails to open is not what she said",
+        after.len()
+    );
+    assert_eq!(
+        opened.len(),
+        0,
+        "a removed member on a modified node opens {}/3 of alice's post-removal posts with a key \
+         he already held ({opened:?}): `vox trust remove` wrote the revocation but did not rotate \
+         the key",
+        opened.len()
     );
 }
