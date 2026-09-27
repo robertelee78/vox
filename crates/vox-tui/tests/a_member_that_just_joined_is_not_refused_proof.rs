@@ -16,7 +16,7 @@
 //! 2. alice reads each joiner's first post within [`READ_WITHIN`] of it being posted.
 //!
 //! It prints how many syncs a joiner was told "not a member of the room yet" (`NotYetMember`): the
-//! honest name for a window the fix narrows but cannot always close, which the push retry resolves.
+//! honest name for that window, which the push retry resolves.
 //!
 //! **Why it makes load.** The window is a race between the joiner's first session with its anchor
 //! and its first records landing there, and on an idle machine the records nearly always win: #202's
@@ -25,9 +25,12 @@
 //! checked gone — and each joiner is a fresh chance. Run it alone (the timing lock), as every
 //! timing-sensitive proof is.
 //!
-//! Mutations: take the anchor-session hold out of `sync_one`, and take bundles out of
-//! `peer_is_member_on_board` — each widens the window and brings the refusal back; send `0x05`
-//! instead of `NotYetMember` and (1) goes red at the first refusal.
+//! What it guards is four refusals of a member at join, each once sent as `0x05`: the anchor's gate
+//! refusing a pending joiner (now `NotYetMember`), the joiner's gate and actor refusing the member
+//! letting it in (now `EpochMismatch`, "not held here yet"), and a joiner rejecting an entry from a
+//! member who joined after it (now `NotAdmitted`'s code). Its base — all four restored — is red in 3
+//! runs of 5. Each path alone is rare: a mutant restoring one of them was green in 2 runs of 2 with
+//! four joiners, which is why there are eight.
 
 #![cfg(unix)]
 
