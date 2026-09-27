@@ -180,7 +180,11 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         let d = direct_at.map_or(GIVE_UP + a, |at| at.duration_since(t0));
         eprintln!(
             "[proof] sample {i}: answered {a:?} ({}), direct {}",
-            if first_direct { "direct" } else { "over the circuit" },
+            if first_direct {
+                "direct"
+            } else {
+                "over the circuit"
+            },
             direct_at.map_or_else(|| "NEVER".to_owned(), |_| format!("{d:?}"))
         );
         any.push(a);

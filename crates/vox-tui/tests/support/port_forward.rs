@@ -80,7 +80,8 @@ impl PortForward {
                 }
                 let sock = inside.entry(from).or_insert_with(|| {
                     let s = UdpSocket::bind("127.0.0.1:0").expect("bind an inside socket");
-                    s.connect(host).expect("connect the inside socket to the host");
+                    s.connect(host)
+                        .expect("connect the inside socket to the host");
                     s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
                     let s = Arc::new(s);
                     let (back, public, st) =

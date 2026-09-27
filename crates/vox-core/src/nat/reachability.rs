@@ -398,7 +398,9 @@ pub async fn connect_direct_within(
     let candidates: Vec<SocketAddr> = candidates
         .iter()
         .map(|c| match (local, c.ip().to_canonical()) {
-            (Some(SocketAddr::V4(_)), ip @ std::net::IpAddr::V4(_)) => SocketAddr::new(ip, c.port()),
+            (Some(SocketAddr::V4(_)), ip @ std::net::IpAddr::V4(_)) => {
+                SocketAddr::new(ip, c.port())
+            }
             _ => *c,
         })
         .filter(reachable)

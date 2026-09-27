@@ -146,7 +146,10 @@ impl NatWorld {
                 "127.0.0.1:0",
             ]),
         );
-        let room = after_label(&host.expect_line("room", |l| l.starts_with("room ")), "room");
+        let room = after_label(
+            &host.expect_line("room", |l| l.starts_with("room ")),
+            "room",
+        );
         let address = after_label(
             &host.expect_line("address", |l| l.starts_with("address ")),
             "address",
@@ -363,13 +366,26 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         eprintln!(
             "[proof] sample {i}: answered {a:?} ({}), punched {}, {filtered} unsolicited peer \
              datagrams dropped",
-            if first_direct { "punched" } else { "over the circuit" },
+            if first_direct {
+                "punched"
+            } else {
+                "over the circuit"
+            },
             direct_at.map_or_else(|| "NEVER".to_owned(), |_| format!("{d:?}"))
         );
         if direct_at.is_none() {
             // Say which side sent what, so a red names its cause rather than a timeout.
-            let ev: Vec<_> = w.nats.events().into_iter().filter(|e| e.at >= ready).collect();
-            let count = |g: bool, d: bool| ev.iter().filter(|e| e.to_guest == g && e.delivered == d).count();
+            let ev: Vec<_> = w
+                .nats
+                .events()
+                .into_iter()
+                .filter(|e| e.at >= ready)
+                .collect();
+            let count = |g: bool, d: bool| {
+                ev.iter()
+                    .filter(|e| e.to_guest == g && e.delivered == d)
+                    .count()
+            };
             eprintln!(
                 "[proof] sample {i} never punched: host → guest {} delivered / {} dropped; guest → \
                  host {} delivered / {} dropped",
@@ -382,7 +398,11 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
                 eprintln!(
                     "[proof]   +{:?} {} {} → {} {} ({} B)",
                     e.at.duration_since(ready),
-                    if e.to_guest { "host→guest" } else { "guest→host" },
+                    if e.to_guest {
+                        "host→guest"
+                    } else {
+                        "guest→host"
+                    },
                     e.from_inside,
                     e.to_public,
                     if e.delivered { "delivered" } else { "DROPPED" },

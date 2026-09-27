@@ -247,7 +247,13 @@ fn bind_socket(inner: &mut Inner, bind: &str, role: Role, ctx: &Ctx) -> SocketAd
 
 /// The public address `side`'s NAT uses for `inside` talking to `remote`, created on first use;
 /// the filter is opened for `remote` on it. The outbound half of a NAT.
-fn egress(inner: &mut Inner, ctx: &Ctx, side: Side, inside: SocketAddr, remote: SocketAddr) -> SocketAddr {
+fn egress(
+    inner: &mut Inner,
+    ctx: &Ctx,
+    side: Side,
+    inside: SocketAddr,
+    remote: SocketAddr,
+) -> SocketAddr {
     let key = (
         inside,
         match inner.kind {
@@ -283,7 +289,12 @@ fn egress(inner: &mut Inner, ctx: &Ctx, side: Side, inside: SocketAddr, remote: 
 
 /// The inside address a datagram from `remote` at `public` goes to, if the filter holds it. The
 /// inbound half of a NAT.
-fn ingress(inner: &Inner, side: Side, public: SocketAddr, remote: SocketAddr) -> Option<SocketAddr> {
+fn ingress(
+    inner: &Inner,
+    side: Side,
+    public: SocketAddr,
+    remote: SocketAddr,
+) -> Option<SocketAddr> {
     let nat = match side {
         Side::Host => &inner.host_nat,
         Side::Guest => &inner.guest_nat,
@@ -364,8 +375,14 @@ fn route(
                 return None;
             };
             match side {
-                Side::Host => ctx.counters.p2p_to_host.fetch_add(n as u64, Ordering::SeqCst),
-                Side::Guest => ctx.counters.p2p_to_guest.fetch_add(n as u64, Ordering::SeqCst),
+                Side::Host => ctx
+                    .counters
+                    .p2p_to_host
+                    .fetch_add(n as u64, Ordering::SeqCst),
+                Side::Guest => ctx
+                    .counters
+                    .p2p_to_guest
+                    .fetch_add(n as u64, Ordering::SeqCst),
             };
             Some((Arc::clone(&inner.sockets[&from_public]), inside))
         }
