@@ -31,7 +31,9 @@
 //!
 //! ## What is asserted
 //! After the controls and 10 s more to settle, Alice renders **0** of Bob's posts in room one
-//! and **0** in room two.
+//! and **0** in room two. Each final `vox room read` must itself succeed **and** show Alice's
+//! earlier `CAROL-TO-ALICE-IN-{room}` line, otherwise `CANNOT MEASURE`: a dead or wedged daemon
+//! reads as 0 bytes, which must never count as 0 of Bob's posts.
 //!
 //! ## The mutations that must turn it red
 //! - M1: the join releases the joiner's key to its responder — `self.consent(&parsed.channel_id,
@@ -355,7 +357,15 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     std::thread::sleep(Duration::from_secs(10));
     let mut leaked = 0;
     for (name, room, posted) in &alice_read_bob {
-        let seen = alice.vox(&["room", "read", room], None).1;
+        // The same read must succeed and still show what alice rendered in the control:
+        // a daemon that died or wedged reads as 0 bytes, which would count as 0 of bob's.
+        let (ok, seen, e) = alice.vox(&["room", "read", room], None);
+        let control = format!("CAROL-TO-ALICE-IN-{name}");
+        assert!(
+            ok && seen.contains(&control),
+            "CANNOT MEASURE: alice's final read of room {name} did not succeed with her earlier \
+             {control} in it (ok={ok}), so 0 of bob's posts would prove nothing: {e}"
+        );
         let n = count(&seen, "BOB-");
         leaked += n;
         eprintln!("[proof] room {name}: alice renders {n} of bob's {posted} posts");
