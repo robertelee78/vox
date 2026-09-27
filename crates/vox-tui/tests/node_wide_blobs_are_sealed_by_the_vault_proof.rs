@@ -560,6 +560,12 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
 
     let listed = ok(&new, &carol, &["trust", "list"], None);
+    // Scanned **at once**: the moment after the migrating unlock is when an adversary could take
+    // the disk, and later writes (the daemon started below) reuse freed pages and would hide old
+    // seals a rewrite-less migration leaves behind. Measured later, a store that was never
+    // rewritten passed this check.
+    let after_scan = occurrences(&disk, &old_seals);
+    let live_scan = occurrences(&disk, &fingerprints_of(&blobs(&disk)));
     let (theirs_after, ours_after) = who_opens(&disk);
     let version_after = disk.vault().version;
     let reads = {
@@ -580,8 +586,6 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     // What an adversary with the disk reads: the old seals must be gone from the files
     // themselves, not only from what the database considers live (redb is copy-on-write).
-    let after_scan = occurrences(&disk, &old_seals);
-    let live_scan = occurrences(&disk, &fingerprints_of(&blobs(&disk)));
     println!(
         "[proof] old seals in the profile's raw files: {before_scan:?} before migration, \
          {after_scan:?} after; the new seals: {live_scan:?}"
