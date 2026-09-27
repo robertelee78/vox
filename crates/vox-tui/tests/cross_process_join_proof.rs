@@ -25,17 +25,13 @@
 //! vox room post / read       # and they talk
 //! ```
 //!
-//! ## Honest coverage
+//! ## An ordinary gate (#192)
 //!
-//! The join defect in ADR-016 is open: a cross-process join through an anchor fails
-//! a large fraction of the time, measured between 40% and 80% depending on the
-//! tree. While it is open this proof reports **unproven** rather than red, named as
-//! `cross-process-join` — the repo's idiom for a gap that is a deliberate, visible
-//! decision rather than a silence or a false green. When the defect closes, the
-//! allowance comes off and this becomes an ordinary gate.
-//!
-//! It is written now, failing, on purpose: it gives that fix an agent-comms-shaped
-//! acceptance test, the same way the NAT gate became one for the accept-loop split.
+//! It was written failing, when a cross-process join through an anchor failed 40–80% of the time,
+//! and reported **unproven** under the `cross-process-join` and `cross-process-tunnel` allowances
+//! while that defect was open. The defect closed (ADR-018, "No proof is excluded by name"), and the
+//! allowances are gone: a join that fails here, or a tunnel that does not carry, is red, whatever
+//! `VOX_PROOF_ALLOW_UNPROVEN` says.
 
 #![cfg(unix)]
 
@@ -47,13 +43,6 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
-
-fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case(name))
-}
 
 /// A long-running `vox` child, killed however the test ends.
 struct Proc {
@@ -365,12 +354,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
             said(&daemons[1]),
             said(&anchor)
         );
-        assert!(
-            allow_unproven("cross-process-join"),
-            "a cross-process join through an anchor failed — {err}\n{transcript}"
-        );
-        eprintln!("UNPROVEN (allowed): cross-process join failed: {err}");
-        return;
+        panic!("a cross-process join through an anchor failed — {err}\n{transcript}");
     }
 
     // ---- and they talk, over the overlay, as agents ----
@@ -471,19 +455,10 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         None,
     );
     if !ok {
-        assert!(
-            allow_unproven("cross-process-tunnel"),
-            "UNPROVEN: a file transfer across processes failed — {err}\n\
-             `vox room send|get` rides a room-bound service and a `Forward`, which is \
-             the tunnel path ADR-012 records as failing at establishment and mid-stream. \
-             Set VOX_PROOF_ALLOW_UNPROVEN=cross-process-tunnel to accept it deliberately; \
-             remove the allowance when that path is fixed."
+        panic!(
+            "a file transfer across processes failed — {err}\n`vox room send|get` rides a \
+             room-bound service and a `Forward`"
         );
-        eprintln!("UNPROVEN (allowed): cross-process file transfer failed: {err}");
-        drop(offer);
-        drop(daemons);
-        drop(anchor);
-        return;
     }
     assert!(
         out.contains("verified"),
