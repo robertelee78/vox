@@ -4768,7 +4768,7 @@ impl Node {
 
     /// The consent-order value of `target`'s current trust decision (V210-45), or `None` if it
     /// has none — a decision from before the order was kept entitles to no history.
-    fn trust_decision(&self, target: &Digest32) -> Option<u64> {
+    fn trust_decision(&self, target: &Digest32) -> Option<crate::node::consent_order::Stamp> {
         if !self.trust.is_trusted(target) {
             return None;
         }

@@ -68,6 +68,7 @@ use crate::log::feed::lipmaa;
 use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
 use crate::nat::bootstrap::BootstrapSet;
 use crate::nat::record::Admission;
+use crate::node::consent_order::Stamp;
 use crate::node::content::Content;
 use crate::node::profile::Profile;
 use crate::node::store::Store;
@@ -133,12 +134,18 @@ const SEG_ENTITLED: u64 = 10;
 /// The trust-mark segment id within [`SegmentKind::KeyMaterial`] (V210-45): identity →
 /// `(decision, chain_id, iteration)`, the position this identity's sender key stood at
 /// in this room when it decided to trust that identity. `decision` is the decision's
-/// consent-order value ([`crate::node::consent_order`]), so a mark from a withdrawn
-/// decision can never date a later one.
+/// consent-order stamp, value and order id ([`crate::node::consent_order`], V210-49), so a
+/// mark from a withdrawn decision, or from a deleted counter's, can never date a later one.
 const SEG_TRUST_MARKS: u64 = 11;
 
-/// At-rest version of the entitlement and trust-mark segments.
+/// At-rest version of the entitlement segment.
 const POSITIONS_VERSION: u64 = 1;
+/// At-rest version of the trust-mark segment. Version 2 keeps the decision's order id
+/// (V210-49); a version-1 segment is read as holding no marks (narrower, never wider).
+const MARKS_VERSION: u64 = 2;
+
+/// A trust mark: the decision's stamp, and where this identity's sender key stood at it.
+type TrustMark = (Stamp, u64, u64);
 
 /// At-rest version of the delivery-ledger segment.
 const DELIVERED_VERSION: u64 = 1;
@@ -326,7 +333,7 @@ pub struct ChannelState {
     entitled: BTreeMap<Digest32, (u64, u64)>,
     /// Identity → `(decision, chain_id, iteration)` at the trust decision (V210-45),
     /// persisted in `SEG_TRUST_MARKS`. See [`ChannelState::mark_trust`].
-    trust_marks: BTreeMap<Digest32, (u64, u64, u64)>,
+    trust_marks: BTreeMap<Digest32, TrustMark>,
     /// The channel passphrase, retained **in memory only** for as long as the
     /// channel is open (M14.7c).
     ///
@@ -418,7 +425,7 @@ fn retain_generation(
     author: &Digest32,
     sender: &SenderChain,
     created_at: u64,
-    mint_seq: u64,
+    mint_seq: Stamp,
 ) -> Result<()> {
     let (iteration, origin_key) = sender.current_position();
     if iteration != 0 {
@@ -437,25 +444,17 @@ fn retain_generation(
     Ok(())
 }
 
-/// A positions segment: `[version, [[target, chain_id, iteration], …]]`, or with
-/// `decision` first in each row for the trust marks.
-fn positions_bytes(rows: &BTreeMap<Digest32, (u64, u64, u64)>, with_decision: bool) -> Vec<u8> {
+/// The entitlement segment: `[version, [[target, chain_id, iteration], …]]`.
+fn positions_bytes(rows: &BTreeMap<Digest32, (u64, u64)>) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(2).uint(POSITIONS_VERSION).array(rows.len());
-    for (t, (d, c, i)) in rows {
-        if with_decision {
-            e.array(4).bytes(t).uint(*d).uint(*c).uint(*i);
-        } else {
-            e.array(3).bytes(t).uint(*c).uint(*i);
-        }
+    for (t, (c, i)) in rows {
+        e.array(3).bytes(t).uint(*c).uint(*i);
     }
     e.finish()
 }
 
-fn parse_positions(
-    bytes: &[u8],
-    with_decision: bool,
-) -> Result<BTreeMap<Digest32, (u64, u64, u64)>> {
+fn parse_positions(bytes: &[u8]) -> Result<BTreeMap<Digest32, (u64, u64)>> {
     let mut d = Decoder::new(bytes);
     if d.array()? != 2 {
         return Err(Error::MalformedAtRest("positions arity"));
@@ -467,20 +466,73 @@ fn parse_positions(
     if n > MAX_AUTHORS {
         return Err(Error::SizeLimitExceeded("positions rows"));
     }
-    let arity = if with_decision { 4 } else { 3 };
     let mut out = BTreeMap::new();
     for _ in 0..n {
-        if d.array()? != arity {
+        if d.array()? != 3 {
             return Err(Error::MalformedAtRest("positions row arity"));
         }
         let target: Digest32 = d
             .bytes()?
             .try_into()
             .map_err(|_| Error::MalformedAtRest("positions target"))?;
-        let decision = if with_decision { d.uint()? } else { 0 };
         let chain_id = d.uint()?;
         let iteration = d.uint()?;
-        out.insert(target, (decision, chain_id, iteration));
+        out.insert(target, (chain_id, iteration));
+    }
+    d.finish()?;
+    Ok(out)
+}
+
+/// The trust-mark segment: `[version, [[target, decision, order_id, chain_id, iteration], …]]`.
+fn marks_bytes(rows: &BTreeMap<Digest32, TrustMark>) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(MARKS_VERSION).array(rows.len());
+    for (t, (d, c, i)) in rows {
+        e.array(5)
+            .bytes(t)
+            .uint(d.seq)
+            .bytes(&d.order)
+            .uint(*c)
+            .uint(*i);
+    }
+    e.finish()
+}
+
+fn parse_marks(bytes: &[u8]) -> Result<BTreeMap<Digest32, TrustMark>> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 {
+        return Err(Error::MalformedAtRest("trust marks arity"));
+    }
+    let version = d.uint()?;
+    // A version-1 mark carries no order id, so it cannot be matched to any decision: it is
+    // dropped, and a room opened later marks afresh at its position then (narrower).
+    if version == POSITIONS_VERSION {
+        return Ok(BTreeMap::new());
+    }
+    if version != MARKS_VERSION {
+        return Err(Error::MalformedAtRest("trust marks version"));
+    }
+    let n = d.array()?;
+    if n > MAX_AUTHORS {
+        return Err(Error::SizeLimitExceeded("trust marks rows"));
+    }
+    let mut out = BTreeMap::new();
+    for _ in 0..n {
+        if d.array()? != 5 {
+            return Err(Error::MalformedAtRest("trust marks row arity"));
+        }
+        let target: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("trust marks target"))?;
+        let seq = d.uint()?;
+        let order = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("trust marks order id"))?;
+        let chain_id = d.uint()?;
+        let iteration = d.uint()?;
+        out.insert(target, (Stamp { order, seq }, chain_id, iteration));
     }
     d.finish()?;
     Ok(out)
@@ -1099,10 +1151,7 @@ impl ChannelState {
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ENTITLED)? {
                 Some(seg) => {
                     let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_ENTITLED, &seg)?;
-                    parse_positions(&bytes, false)?
-                        .into_iter()
-                        .map(|(t, (_, c, i))| (t, (c, i)))
-                        .collect()
+                    parse_positions(&bytes)?
                 }
                 None => BTreeMap::new(),
             };
@@ -1111,7 +1160,7 @@ impl ChannelState {
                 Some(seg) => {
                     let bytes =
                         open_segment(&sek, SegmentKind::KeyMaterial, SEG_TRUST_MARKS, &seg)?;
-                    parse_positions(&bytes, true)?
+                    parse_marks(&bytes)?
                 }
                 None => BTreeMap::new(),
             };
@@ -2041,18 +2090,19 @@ impl ChannelState {
     }
 
     /// This identity's retained generations here, `(chain_id, mint_seq)` ascending.
-    fn my_generations(&self) -> Vec<(u64, Option<u64>)> {
+    fn my_generations(&self) -> Vec<(u64, Option<Stamp>)> {
         self.origins
             .generations(&self.channel_id, self.epoch, &self.me())
     }
 
     /// The consent-order value of this identity's newest generation here, or 0 when none
-    /// has one. A trust decision is stamped above it ([`crate::node::consent_order`]).
+    /// has one. A trust decision is stamped above it ([`crate::node::consent_order`]). Only a
+    /// floor: a value under another counter's id raises a stamp and never orders anything.
     #[must_use]
     pub fn newest_mint_seq(&self) -> u64 {
         self.my_generations()
             .into_iter()
-            .filter_map(|(_, s)| s)
+            .filter_map(|(_, s)| s.map(|s| s.seq))
             .max()
             .unwrap_or(0)
     }
@@ -2064,7 +2114,7 @@ impl ChannelState {
     ///
     /// # Errors
     /// If the marks cannot be persisted.
-    pub fn mark_trust(&mut self, store: &Store, target: Digest32, decision: u64) -> Result<()> {
+    pub fn mark_trust(&mut self, store: &Store, target: Digest32, decision: Stamp) -> Result<()> {
         if self
             .trust_marks
             .get(&target)
@@ -2084,10 +2134,15 @@ impl ChannelState {
         self.persist_marks(store)
     }
 
-    /// Mark every decision in `order` taken while this room was closed (V210-45): one taken
-    /// after the live generation was minted, with no mark of its own here yet. A decision
-    /// taken before the live generation was minted needs none: that generation, and every
-    /// later one, is released whole.
+    /// Mark every decision in `order` taken while this room was closed (V210-45), with no
+    /// mark of its own here yet: every decision not provably taken **before** the live
+    /// generation was minted. A decision provably before it needs none: that generation, and
+    /// every later one, is released whole.
+    ///
+    /// A live generation stamped by another counter (the blob was deleted and recreated,
+    /// V210-49), or by none, cannot be ordered against any decision, so every decision is
+    /// marked here. That mark is at or after the decision — nothing is sealed in a closed room,
+    /// and a room open at a decision was marked then — so it releases nothing sealed before it.
     ///
     /// # Errors
     /// If the marks cannot be persisted.
@@ -2097,17 +2152,14 @@ impl ChannelState {
         order: &crate::node::consent_order::ConsentOrder,
     ) -> Result<()> {
         let current = self.sender.chain_id();
-        let Some(live) = self
+        let live = self
             .my_generations()
             .into_iter()
             .find(|(c, _)| *c == current)
-            .and_then(|(_, s)| s)
-        else {
-            return Ok(());
-        };
+            .and_then(|(_, s)| s);
         for (target, decision) in order.decisions() {
             // `mark_trust` keeps a mark this decision already has.
-            if decision > live {
+            if !live.is_some_and(|l| l.after(&decision)) {
                 self.mark_trust(store, target, decision)?;
             }
         }
@@ -2133,7 +2185,10 @@ impl ChannelState {
     ///
     /// Narrower, never wider:
     /// - no decision value (a keyring row from before the order was kept) → `None`;
-    /// - a generation with no value (minted before the order was kept) ends the walk;
+    /// - a generation with no value (minted before the order was kept), or one stamped by
+    ///   another counter than the decision's (a deleted and recreated one, V210-49), is not
+    ///   provably after the decision: it is released only from this room's mark of the
+    ///   decision, if the mark lies in it, and it ends the walk;
     /// - a hole in the retained generations ends the walk, and the live generation's origin
     ///   must be retained for anything to be released;
     /// - an identity this identity has **ever** revoked here → `None`: its re-consent is
@@ -2149,7 +2204,7 @@ impl ChannelState {
     pub fn history_plan(
         &self,
         target: &Digest32,
-        decision: Option<u64>,
+        decision: Option<Stamp>,
     ) -> Option<Vec<(u64, u64)>> {
         let decision = decision?;
         let me = self.me();
@@ -2174,18 +2229,18 @@ impl ChannelState {
             if chain_id != expect {
                 break;
             }
-            match mint_seq {
-                Some(m) if m > decision => plan.push((chain_id, 0)),
-                Some(m) if m < decision => {
-                    // Live at the decision: from where it stood then, and nothing before.
-                    if let Some(&(d, c, i)) = self.trust_marks.get(target) {
-                        if d == decision && c == chain_id {
-                            plan.push((chain_id, i));
-                        }
+            if mint_seq.is_some_and(|m| m.after(&decision)) {
+                // Minted after the decision, in the decision's own counter: whole.
+                plan.push((chain_id, 0));
+            } else {
+                // Live at the decision, or not provably after it (no stamp, or another
+                // counter's): only from where this room marked the decision, and nothing before.
+                if let Some(&(d, c, i)) = self.trust_marks.get(target) {
+                    if d == decision && c == chain_id {
+                        plan.push((chain_id, i));
                     }
-                    break;
                 }
-                _ => break,
+                break;
             }
             let Some(below) = chain_id.checked_sub(1) else {
                 break;
@@ -2339,16 +2394,12 @@ impl ChannelState {
     }
 
     fn persist_entitled(&mut self, store: &Store) -> Result<()> {
-        let rows = self
-            .entitled
-            .iter()
-            .map(|(t, (c, i))| (*t, (0, *c, *i)))
-            .collect();
-        self.persist_positions(store, SEG_ENTITLED, &positions_bytes(&rows, false))
+        let bytes = positions_bytes(&self.entitled);
+        self.persist_positions(store, SEG_ENTITLED, &bytes)
     }
 
     fn persist_marks(&mut self, store: &Store) -> Result<()> {
-        let bytes = positions_bytes(&self.trust_marks, true);
+        let bytes = marks_bytes(&self.trust_marks);
         self.persist_positions(store, SEG_TRUST_MARKS, &bytes)
     }
 

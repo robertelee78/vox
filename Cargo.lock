@@ -2691,6 +2691,7 @@ dependencies = [
  "getrandom 0.3.4",
  "qrcode",
  "ratatui",
+ "redb",
  "reqwest",
  "rustix 1.1.4",
  "secrecy",

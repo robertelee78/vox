@@ -31,6 +31,17 @@
 //! therefore also floored by a caller-supplied value: a mint by the room's own newest
 //! generation, a trust by the newest generation of every room open at that moment. A deleted
 //! blob can then never make an open room's existing generation look newer than a new decision.
+//!
+//! **Deletion (V210-49, #224).** The floor covers only the rooms open at the decision. A room
+//! closed then keeps generations stamped by the old counter, and a restarted counter's small
+//! values would make every one of them look minted *after* the new decision, releasing that
+//! room's whole pre-trust history. So each counter carries a random **order id**, drawn when
+//! the blob is first created, and every value it hands out is a [`Stamp`] of `(order id, value)`,
+//! kept with the generation and with the trust mark. Two stamps are ordered only if they carry
+//! the same id ([`Stamp::after`]). A deleted blob is recreated with a new id, so every
+//! generation stamped before the deletion becomes **unordered** against every later decision
+//! and is released to no one it cannot be proved to follow. What remains is replaying an older
+//! copy of the blob itself, which is the general store rollback nothing here defends against.
 
 use std::collections::BTreeMap;
 
@@ -58,8 +69,41 @@ pub const CONSENT_ORDER_SEK_INFO: &[u8] = b"vox/consent-order-sek/v1";
 /// and the pending consents' (1).
 const SEGMENT_ID: u64 = 3;
 
-/// Encoding version of the body.
-const VERSION: u64 = 1;
+/// Encoding version of the body. Version 2 adds the order id (V210-49).
+const VERSION: u64 = 2;
+
+/// Length of a counter's order id, in bytes: 128 bits of OS randomness.
+pub const ORDER_ID_LEN: usize = 16;
+
+/// A counter's order id ([`Stamp`]).
+pub type OrderId = [u8; ORDER_ID_LEN];
+
+/// One value this profile's consent order handed out, with the id of the counter that handed it
+/// out. Values from two counters (a deleted blob and its replacement) say nothing about which
+/// came first, so they are never compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    /// The id of the counter that drew it.
+    pub order: OrderId,
+    /// Its value in that counter.
+    pub seq: u64,
+}
+
+impl Stamp {
+    /// Whether this stamp was provably drawn after `other`: the same counter, and a greater
+    /// value. `false` for stamps of two different counters, whatever their values.
+    #[must_use]
+    pub fn after(&self, other: &Stamp) -> bool {
+        self.order == other.order && self.seq > other.seq
+    }
+}
+
+/// A new counter's id. A deleted blob comes back under an id no earlier stamp carries.
+fn fresh_order_id() -> Result<OrderId> {
+    let mut id = [0u8; ORDER_ID_LEN];
+    getrandom::fill(&mut id).map_err(|_| Error::Rng)?;
+    Ok(id)
+}
 
 fn order_sek(signer: &VaultRootSigner) -> Result<Sek> {
     let hk = Hkdf::<Sha256>::new(None, signer.self_seed());
@@ -70,8 +114,10 @@ fn order_sek(signer: &VaultRootSigner) -> Result<Sek> {
 }
 
 /// The profile's consent-order counter and the value each trusted identity's decision drew.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsentOrder {
+    /// This counter's id, drawn when it was created ([`Stamp`]).
+    id: OrderId,
     /// The last value handed out. Only ever increases.
     last: u64,
     /// Trusted identity → the value its (current) trust decision drew.
@@ -83,29 +129,46 @@ impl ConsentOrder {
     /// was kept. An identity trusted before (a keyring row with no value) has none, and is
     /// entitled to no history: narrower, never wider.
     #[must_use]
-    pub fn trusted_at(&self, fingerprint: &Digest32) -> Option<u64> {
-        self.trusted.get(fingerprint).copied()
+    pub fn trusted_at(&self, fingerprint: &Digest32) -> Option<Stamp> {
+        self.trusted.get(fingerprint).map(|v| self.stamp(*v))
     }
 
-    /// Every recorded decision, `(identity, value)`.
-    pub fn decisions(&self) -> impl Iterator<Item = (Digest32, u64)> + '_ {
-        self.trusted.iter().map(|(fp, v)| (*fp, *v))
+    /// Every recorded decision, `(identity, stamp)`.
+    pub fn decisions(&self) -> impl Iterator<Item = (Digest32, Stamp)> + '_ {
+        self.trusted.iter().map(|(fp, v)| (*fp, self.stamp(*v)))
     }
 
-    fn next(&mut self, at_least: u64) -> Result<u64> {
+    fn stamp(&self, seq: u64) -> Stamp {
+        Stamp {
+            order: self.id,
+            seq,
+        }
+    }
+
+    /// An empty counter under a new id: what a missing blob opens as.
+    fn fresh() -> Result<Self> {
+        Ok(Self {
+            id: fresh_order_id()?,
+            last: 0,
+            trusted: BTreeMap::new(),
+        })
+    }
+
+    fn next(&mut self, at_least: u64) -> Result<Stamp> {
         let v = self
             .last
             .max(at_least)
             .checked_add(1)
             .ok_or(Error::SizeLimitExceeded("consent order counter"))?;
         self.last = v;
-        Ok(v)
+        Ok(self.stamp(v))
     }
 
     fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(3)
+        e.array(4)
             .uint(VERSION)
+            .bytes(&self.id)
             .uint(self.last)
             .array(self.trusted.len());
         for (fp, v) in &self.trusted {
@@ -117,12 +180,14 @@ impl ConsentOrder {
     fn from_bytes(b: &[u8]) -> Result<Self> {
         let bad = |why: &'static str| Error::MalformedAtRest(why);
         let mut d = Decoder::new(b);
-        if d.array().map_err(|_| bad("consent order"))? != 3 {
+        if d.array().map_err(|_| bad("consent order"))? != 4 {
             return Err(bad("consent order arity"));
         }
         if d.uint().map_err(|_| bad("consent order version"))? != VERSION {
             return Err(bad("consent order version"));
         }
+        let id = OrderId::try_from(d.bytes().map_err(|_| bad("consent order id"))?)
+            .map_err(|_| bad("consent order id length"))?;
         let last = d.uint().map_err(|_| bad("consent order counter"))?;
         let n = d.array().map_err(|_| bad("consent order list"))?;
         if n > MAX_TRUSTED {
@@ -143,12 +208,14 @@ impl ConsentOrder {
             trusted.insert(fp, v);
         }
         d.finish().map_err(|_| bad("consent order trailing"))?;
-        Ok(Self { last, trusted })
+        Ok(Self { id, last, trusted })
     }
 
     fn open(blob: Option<&[u8]>, signer: &VaultRootSigner) -> Result<Self> {
+        // A missing blob is a new counter under a new id, never the old one restarted: every
+        // stamp the old one handed out is then unordered against every stamp of this one.
         let Some(blob) = blob else {
-            return Ok(Self::default());
+            return Self::fresh();
         };
         if blob.len() < NONCE_LEN {
             return Err(Error::MalformedAtRest("consent order blob too short"));
@@ -177,8 +244,8 @@ impl ConsentOrder {
         Ok(blob)
     }
 
-    /// Read and open the order, or an empty one if nothing was ever stamped. Requires an
-    /// unlocked identity.
+    /// Read and open the order, or an empty one under a new id if nothing was ever stamped (or
+    /// the blob was deleted). Requires an unlocked identity.
     pub fn load(store: &Store, signer: &VaultRootSigner) -> Result<Self> {
         let blob = store.get_meta(CONSENT_ORDER_META_KEY)?;
         Self::open(blob.as_deref(), signer)
@@ -200,11 +267,12 @@ impl ConsentOrder {
 }
 
 /// Stamp one generation's mint: a value greater than every value this profile ever handed out,
-/// and than `at_least` (the room's own newest generation). Persisted before it is returned.
+/// and than `at_least` (the room's own newest generation), under the counter's id. Persisted
+/// before it is returned.
 ///
 /// # Errors
 /// A store that cannot be written, or a blob that does not open.
-pub fn stamp_mint(store: &Store, signer: &VaultRootSigner, at_least: u64) -> Result<u64> {
+pub fn stamp_mint(store: &Store, signer: &VaultRootSigner, at_least: u64) -> Result<Stamp> {
     ConsentOrder::update(store, signer, |o| o.next(at_least))
 }
 
@@ -219,13 +287,13 @@ pub fn stamp_trust(
     signer: &VaultRootSigner,
     fingerprint: Digest32,
     at_least: u64,
-) -> Result<u64> {
+) -> Result<Stamp> {
     ConsentOrder::update(store, signer, |o| {
         if !o.trusted.contains_key(&fingerprint) && o.trusted.len() >= MAX_TRUSTED {
             return Err(Error::SizeLimitExceeded("consent order entries"));
         }
         let v = o.next(at_least)?;
-        o.trusted.insert(fingerprint, v);
+        o.trusted.insert(fingerprint, v.seq);
         Ok(v)
     })
 }

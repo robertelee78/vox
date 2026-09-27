@@ -59,3 +59,6 @@ getrandom.workspace = true
 # The R41 link emulator sizes its own UDP sockets' buffers (std cannot): a link does not drop
 # packets at a 786 KB socket, and the emulator must not either.
 socket2.workspace = true
+# V210-49's proof plays the attacker who deletes one row of a stopped node's store: no vox command
+# can, so the test opens the file itself (never while a vox process holds it).
+redb.workspace = true

@@ -37,6 +37,7 @@ use crate::group::senderkey::{ChainKey, CHAIN_KEY_LEN};
 use crate::group::skdm::Skdm;
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
+use crate::node::consent_order::Stamp;
 use crate::pairwise::MAX_SKIP;
 
 /// Hard cap on retained generations. A generation spans up to
@@ -47,10 +48,14 @@ use crate::pairwise::MAX_SKIP;
 /// be releasable (that is what a rotation's re-key needs).
 pub const MAX_RETAINED_ORIGINS: usize = 256;
 
-/// At-rest version of an [`OriginKeyStore`] state blob. Version 2 adds each generation's
-/// consent-order value ([`crate::node::consent_order`]); a version-1 blob still reads, its
-/// generations with no value.
-const ORIGIN_STATE_VERSION: u64 = 2;
+/// At-rest version of an [`OriginKeyStore`] state blob. Version 3 keeps each generation's
+/// consent-order stamp — value **and** the counter's order id ([`crate::node::consent_order`],
+/// V210-49). Versions 1 (no value) and 2 (a value with no order id) still read, their
+/// generations with no stamp: nothing can say which decision they precede, so they are never
+/// released as history.
+const ORIGIN_STATE_VERSION: u64 = 3;
+/// The second encoding: a consent-order value without its counter's id.
+const ORIGIN_STATE_VERSION_2: u64 = 2;
 /// The first encoding, without consent-order values.
 const ORIGIN_STATE_VERSION_1: u64 = 1;
 
@@ -72,9 +77,10 @@ struct OriginRecord {
     /// Wall-clock (Unix seconds) the generation was created — the TTL anchor.
     created_at: u64,
     /// The generation's place in this profile's consent order (V210-45), drawn when it was
-    /// minted. `None` for a generation minted before the order was kept: it is never released
-    /// as history, because nobody can say whether it predates a decision.
-    mint_seq: Option<u64>,
+    /// minted, with the id of the counter that drew it (V210-49). `None` for a generation
+    /// minted before the order was kept: it is never released as history, because nobody can
+    /// say whether it predates a decision.
+    mint_seq: Option<Stamp>,
 }
 
 /// A sender's store of origin chain keys, enabling full-history (and
@@ -125,7 +131,7 @@ impl OriginKeyStore {
         origin_key: ChainKey,
         signing_pubkey: [u8; crate::group::wire::SENDER_KEY_SIGNING_PUB_LEN],
         created_at: u64,
-        mint_seq: Option<u64>,
+        mint_seq: Option<Stamp>,
     ) {
         let key = (*channel_id, epoch, chain_id);
         // Make room before inserting, and only for a genuinely new generation:
@@ -175,7 +181,7 @@ impl OriginKeyStore {
         e.array(2).uint(ORIGIN_STATE_VERSION).array(keys.len());
         for k in keys {
             let r = &self.records[k];
-            e.array(8)
+            e.array(9)
                 .bytes(&r.channel_id)
                 .uint(r.epoch)
                 .uint(k.2)
@@ -183,8 +189,11 @@ impl OriginKeyStore {
                 .bytes(r.origin_key.bytes())
                 .bytes(&r.signing_pubkey)
                 .uint(r.created_at);
-            // 0 is never handed out by the counter, so it stands for "no value".
-            e.uint(r.mint_seq.unwrap_or(0));
+            // 0 is never handed out by the counter, so it stands for "no value", with an empty id.
+            match &r.mint_seq {
+                Some(m) => e.uint(m.seq).bytes(&m.order),
+                None => e.uint(0).bytes(&[]),
+            };
         }
         Zeroizing::new(e.finish())
     }
@@ -199,13 +208,11 @@ impl OriginKeyStore {
             return Err(Error::MalformedBundle("origin store state arity"));
         }
         let version = d.uint()?;
-        if version != ORIGIN_STATE_VERSION && version != ORIGIN_STATE_VERSION_1 {
-            return Err(Error::MalformedBundle("origin store state version"));
-        }
-        let arity = if version == ORIGIN_STATE_VERSION {
-            8
-        } else {
-            7
+        let arity = match version {
+            ORIGIN_STATE_VERSION => 9,
+            ORIGIN_STATE_VERSION_2 => 8,
+            ORIGIN_STATE_VERSION_1 => 7,
+            _ => return Err(Error::MalformedBundle("origin store state version")),
         };
         let n = d.array()?;
         if n > MAX_RETAINED_ORIGINS {
@@ -235,10 +242,27 @@ impl OriginKeyStore {
                 .try_into()
                 .map_err(|_| Error::MalformedBundle("origin record signing_pubkey"))?;
             let created_at = d.uint()?;
-            let mint_seq = if arity == 8 {
-                Some(d.uint()?).filter(|v| *v != 0)
-            } else {
-                None
+            let mint_seq = match arity {
+                9 => {
+                    let seq = d.uint()?;
+                    let order = d.bytes()?;
+                    if seq == 0 {
+                        None
+                    } else {
+                        Some(Stamp {
+                            seq,
+                            order: order
+                                .try_into()
+                                .map_err(|_| Error::MalformedBundle("origin record order id"))?,
+                        })
+                    }
+                }
+                // A value with no counter id cannot be ordered against any decision.
+                8 => {
+                    d.uint()?;
+                    None
+                }
+                _ => None,
             };
             records.insert(
                 (channel_id, epoch, chain_id),
@@ -272,14 +296,14 @@ impl OriginKeyStore {
         channel_id: &Digest32,
         epoch: u64,
         author: &Digest32,
-    ) -> Vec<(u64, Option<u64>)> {
-        let mut out: Vec<(u64, Option<u64>)> = self
+    ) -> Vec<(u64, Option<Stamp>)> {
+        let mut out: Vec<(u64, Option<Stamp>)> = self
             .records
             .iter()
             .filter(|((c, e, _), r)| c == channel_id && *e == epoch && &r.author_id == author)
             .map(|((_, _, chain_id), r)| (*chain_id, r.mint_seq))
             .collect();
-        out.sort_unstable();
+        out.sort_unstable_by_key(|(chain_id, _)| *chain_id);
         out
     }
 
