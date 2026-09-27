@@ -346,7 +346,15 @@ pub async fn forward(
     // never blocked for more than one attempt.
     let deadline = Instant::now() + vox_core::node::up::HOST_PATIENCE;
     let mut said = false;
+    // **How long reaching the host took, said** (PRD-001 R42, #167). Counted from the first
+    // attempt — after this node has unlocked and opened the room, the two Argon2id steps a person
+    // waits for at the prompt — to the attempt that got through, every retry included: that is
+    // the wait R42 bounds ("a first connection to a peer, including NAT traversal, under 2 s"),
+    // and without it a slow first connection was indistinguishable from a slow unlock.
+    let first_attempt = Instant::now();
+    let mut attempts = 0u32;
     let out = loop {
+        attempts += 1;
         let out = node
             .apply(NodeCommand::Forward {
                 channel_id,
@@ -399,6 +407,12 @@ pub async fn forward(
             crate::ident::author_id(&host)
         )));
     }
+    eprintln!(
+        "vox: reached {} in {} ms ({attempts} attempt{})",
+        crate::ident::author_id(&host),
+        first_attempt.elapsed().as_millis(),
+        if attempts == 1 { "" } else { "s" }
+    );
     // The bound port comes back as an event, since port 0 is resolved by the OS.
     let bound = loop {
         match node.next_event().await {
