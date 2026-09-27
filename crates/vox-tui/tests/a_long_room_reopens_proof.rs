@@ -17,11 +17,27 @@
 //! vox daemon                       # alice's node, no terminal
 //! vox room create; vox room post   # POSTS posts from one author, every one must succeed
 //! (kill the daemon) vox daemon     # restart: the room must open, and read back every row
-//! vox room invite / vox room join  # bob, cold: his log must hold every entry alice's does
+//! vox room invite / vox room join  # bob, cold
+//! vox room post (alice, after)      # bob must render it: his log holds her whole feed
+//! vox room read --json --limit/--since  # counted page by page, as an agent reads a long room
 //! ```
 //!
-//! Mutation: put the 1,000/hour check back in `Dag::accept` and this goes red at post 1,001;
-//! exempt local appends from it and it goes red at the reopen.
+//! **Every participant is the shipped binary.** What is counted is what `vox room read --json`
+//! prints, paged with `--limit` and `--since` the way an agent walks a long room. Each count is
+//! of the distinct `post <i>` texts, so a duplicated or missing row cannot hide behind a right
+//! total. Nothing in this process runs a node or opens a store.
+//!
+//! **How bob's catch-up is seen from outside.** Alice posts once more after bob has joined, and
+//! bob must render that post. A member's log accepts an author's entry at `seq` only after that
+//! author's entries `1..seq-1` (the feed append checks the sequence is contiguous and the
+//! `prev_hash` and `lipmaa_backlink` chain), so a rendered post 1,501 means bob's log holds
+//! every one of alice's 1,500 posts before it. That is the claim: the newcomer's **log** catches
+//! up with the whole history, of any size.
+//!
+//! **Not asserted, printed:** how many of the 1,500 pre-join posts bob can *read*. Bob was
+//! trusted before any post, so he is entitled to all of them; on `integrate/v0.2.10` before
+//! #220's fix he reads only 500 (posts 1,001–1,500), and #220 (`fix/220-whole-history`) makes it
+//! 1,500. That is #220's own proof to assert; here it is printed so a regression shows.
 
 #![cfg(unix)]
 
@@ -120,16 +136,57 @@ fn attached(dir: &std::path::Path, tag: &str) -> String {
     );
 }
 
-/// How many of the posts `vox room read` returns.
-fn rows(dir: &std::path::Path, room: &str) -> (usize, String) {
-    let (ok, out, err) = vox(dir, &["room", "read", room], None);
-    if !ok {
-        return (0, err);
+/// Rows per page when walking a room, as an agent reading a long room pages it.
+const PAGE: usize = 500;
+
+/// Every `post <i>` this profile's `vox room read --json` shows for `room`, walked a page at a
+/// time with `--limit` and `--since`. Returns the distinct post numbers, how many rows carried
+/// one (a duplicate would make this larger than the set), the pages read, and any refusal.
+fn read_posts(
+    dir: &std::path::Path,
+    room: &str,
+) -> (std::collections::BTreeSet<usize>, usize, usize, String) {
+    let mut seen = std::collections::BTreeSet::new();
+    let (mut rows_with_post, mut pages) = (0usize, 0usize);
+    let mut since: Option<String> = None;
+    loop {
+        let limit = PAGE.to_string();
+        let mut args = vec!["room", "read", room, "--json", "--limit", &limit];
+        if let Some(c) = since.as_deref() {
+            args.extend(["--since", c]);
+        }
+        let (ok, out, err) = vox(dir, &args, None);
+        if !ok {
+            return (seen, rows_with_post, pages, err);
+        }
+        pages += 1;
+        let page: Vec<serde_json::Value> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad row ({e}): {l}")))
+            .collect();
+        for row in &page {
+            if let Some(n) = row["text"]
+                .as_str()
+                .and_then(|t| t.strip_prefix("post "))
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                rows_with_post += 1;
+                seen.insert(n);
+            }
+        }
+        match page.last() {
+            Some(last) if page.len() == PAGE => {
+                since = Some(
+                    last["entry_hash"]
+                        .as_str()
+                        .expect("every row carries its entry hash")
+                        .to_owned(),
+                );
+            }
+            _ => return (seen, rows_with_post, pages, String::new()),
+        }
     }
-    (
-        out.lines().filter(|l| l.contains(" post ")).count(),
-        String::new(),
-    )
 }
 
 #[test]
@@ -181,20 +238,28 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
             i - 1
         );
     }
-    let (before, why) = rows(&alice, &room);
+    let (before, before_rows, pages, why) = read_posts(&alice, &room);
     println!(
-        "alice posted {POSTS} through `vox room post` in {:?}; `vox room read` returns {before} {why}",
-        started.elapsed()
+        "[proof] alice posted {POSTS} through `vox room post` in {:?}; `vox room read --json` \
+         shows {} distinct posts in {before_rows} rows over {pages} pages {why}",
+        started.elapsed(),
+        before.len()
     );
-    assert_eq!(before, POSTS, "every post reads back before the restart");
+    assert_eq!(
+        (before.len(), before_rows),
+        (1_500, 1_500),
+        "every post reads back once before the restart"
+    );
 
     // ---- restart: the room must open, with every row --------------------------------------
     drop(first); // killed by PID
     let second = daemon(&alice, "second", &format!("{IDENTITY}\n{ROOMPASS}\n"));
     let listed = attached(&alice, "alice");
-    let (after, why) = rows(&alice, &room);
+    let (after, after_rows, pages, why) = read_posts(&alice, &room);
     println!(
-        "after the restart: `room list` says {listed:?}; `vox room read` returns {after} {why}"
+        "[proof] after the restart: `room list` says {listed:?}; `vox room read --json` shows {} \
+         distinct posts in {after_rows} rows over {pages} pages {why}",
+        after.len()
     );
     assert!(
         listed.contains("long") && !listed.contains("[closed]"),
@@ -202,7 +267,11 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
          {listed:?} — PRD-001 D1\nalice's daemon said: {}",
         std::fs::read_to_string(alice.join("daemon-second.err")).unwrap_or_default()
     );
-    assert_eq!(after, POSTS, "every post reads back after the restart");
+    assert_eq!(
+        (after.len(), after_rows),
+        (1_500, 1_500),
+        "every post reads back once after the restart"
+    );
 
     // ---- bob joins cold and must read every row ------------------------------------------
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
@@ -216,86 +285,44 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room join: {err}");
-    // Bob's catch-up is measured on his **log**, not on what he can render. Rendering history is
-    // a key question, not a sync one — and on this tree a newcomer given its key at the origin
-    // cannot open a live message more than `MAX_SKIP` (1,000) iterations ahead of it, so "bob
-    // reads the next post" is not a usable signal past a thousand posts (recorded as a separate
-    // finding). So bob's daemon runs for a round, is stopped by PID, and his store is opened by
-    // the same node code the daemon runs, to count what it holds; then it runs again.
-    let held = |dir: &std::path::Path| -> u64 {
-        let paths =
-            vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
-                .unwrap();
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let node = loop {
-                match vox_core::node::actor::Node::spawn(paths.clone()) {
-                    Ok(n) => break n,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
-                }
-            };
-            let secret = |s: &str| vox_core::node::api::Secret::new(s.as_bytes().to_vec());
-            assert!(node
-                .apply(vox_core::node::api::NodeCommand::Unlock {
-                    passphrase: secret(IDENTITY)
-                })
-                .await
-                .is_done());
-            let cid = node.view().channels[0].channel_id;
-            assert!(node
-                .apply(vox_core::node::api::NodeCommand::OpenChannel {
-                    channel_id: cid,
-                    passphrase: secret(ROOMPASS),
-                })
-                .await
-                .is_done());
-            let n = node.view().channels[0].entries;
-            let _ = node.apply(vox_core::node::api::NodeCommand::Shutdown).await;
-            n
-        })
-    };
+    // ---- bob's log catches up: he renders the post alice makes after his join ----------
     let joined = Instant::now();
-    let mut bob_held = 0;
-    let mut last = u64::MAX;
-    let mut bob_daemon = Some(bob_daemon);
-    for round in 1..=8 {
-        std::thread::sleep(Duration::from_secs(15));
-        drop(bob_daemon.take()); // stopped by PID
-        bob_held = held(&bob);
-        println!(
-            "round {round}: bob's log holds {bob_held} entries after {:?}",
-            joined.elapsed()
-        );
-        // Past the posts and unchanged since the last round: the governance entries (the two
-        // consents) travel too, so the count is settled rather than guessed.
-        if bob_held >= POSTS as u64 && bob_held == last {
-            break;
+    let after_join = format!("post {}", POSTS + 1);
+    let (ok, _, err) = vox(&alice, &["room", "post", &room, &after_join], None);
+    assert!(ok, "alice's post after bob joined: {err}");
+    let deadline = joined + Duration::from_secs(300);
+    let caught_up = loop {
+        let (ok, out, _) = vox(&bob, &["room", "read", &room, "--json"], None);
+        let seen = ok
+            && out.lines().any(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .is_ok_and(|r| r["text"].as_str() == Some(after_join.as_str()))
+            });
+        if seen || Instant::now() > deadline {
+            break seen;
         }
-        last = bob_held;
-        bob_daemon = Some(daemon(
-            &bob,
-            &format!("bob-{round}"),
-            &format!("{IDENTITY}\n{ROOMPASS}\n"),
-        ));
-        attached(&bob, "bob");
-    }
-    drop(bob_daemon);
-    drop(second);
-    let alice_held = held(&alice);
-    println!("entries held: alice {alice_held}, bob {bob_held}");
-    assert!(
-        alice_held >= POSTS as u64,
-        "alice's log holds her posts: {alice_held}"
+        std::thread::sleep(Duration::from_secs(2));
+    };
+    let took = joined.elapsed();
+    let (bob_posts, bob_rows, pages, why) = read_posts(&bob, &room);
+    let history: Vec<usize> = bob_posts.iter().copied().filter(|n| *n <= POSTS).collect();
+    println!(
+        "[proof] bob rendered alice's {after_join:?} (made after his join): {caught_up} after \
+         {took:?}; his `vox room read --json` shows {} distinct posts in {bob_rows} rows over \
+         {pages} pages {why}; of the {POSTS} pre-join posts he reads {} (first {:?}, last {:?}) \
+         — printed, not asserted",
+        bob_posts.len(),
+        history.len(),
+        history.first(),
+        history.last()
     );
-    assert_eq!(
-        bob_held,
-        alice_held,
-        "a newcomer's log must reach the whole history, of any size (PRD-001 R1)\nbob's daemon \
-         said: {}",
+    assert!(
+        caught_up,
+        "a newcomer's log must catch up with the whole history, of any size (PRD-001 R1): bob \
+         never rendered {after_join:?}, which his log can accept only after all {POSTS} of \
+         alice's earlier posts, within {took:?}\nbob's daemon said: {}",
         std::fs::read_to_string(bob.join("daemon-bob.err")).unwrap_or_default()
     );
+    drop(bob_daemon);
+    drop(second);
 }
