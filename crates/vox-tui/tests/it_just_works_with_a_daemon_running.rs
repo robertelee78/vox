@@ -35,6 +35,15 @@
 //!    name: you needed the name to unlock, and unlocking is what reveals it. The id works
 //!    and nothing said so, and `room list` needs a running node, so learning the id meant
 //!    starting a daemon bare, listing, stopping it, and starting it again.
+//!
+//! **Every participant is the shipped binary.** The profile is made as a person makes one
+//! — `vox id`, a `vox daemon` holding it while `vox room create` (room passphrase on stdin)
+//! makes the room, that daemon stopped with SIGTERM and reaped — and the stranger to trust
+//! is a second profile's `vox id`. Nothing in this process runs a node.
+//!
+//! **Mutation.** Skip the identity-passphrase check on `Request::Trust` in the control
+//! socket (`serve_request` in `vox-core/src/node/ipc.rs`) and this goes red at claim 3: the
+//! wrong passphrase's `trust add` succeeds.
 
 #![cfg(unix)]
 
@@ -44,16 +53,9 @@ mod watchdog;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
-use vox_core::node::api::{NodeCommand, Secret};
-use vox_core::node::paths::Paths;
-
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "daemon passphrase";
 const ROOMPASS: &str = "channel passphrase";
-
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
-}
 
 struct Daemon(Child);
 
@@ -89,7 +91,17 @@ fn vox_as(
 }
 
 fn vox(data: &std::path::Path, cfg: &std::path::Path, args: &[&str]) -> (bool, String, String) {
-    let out = Command::new(VOX)
+    vox_in(data, cfg, args, None)
+}
+
+/// `vox`, with `input` piped to stdin when given (`room create` reads its passphrase there).
+fn vox_in(
+    data: &std::path::Path,
+    cfg: &std::path::Path,
+    args: &[&str],
+    input: Option<&str>,
+) -> (bool, String, String) {
+    let mut child = Command::new(VOX)
         .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
@@ -97,9 +109,22 @@ fn vox(data: &std::path::Path, cfg: &std::path::Path, args: &[&str]) -> (bool, S
         // world-readable while the process runs, so the flag is refused (ADR-015).
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM")
-        .stdin(Stdio::null())
-        .output()
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn vox");
+    if let Some(text) = input {
+        let mut pipe = child.stdin.take().expect("vox stdin");
+        pipe.write_all(text.as_bytes()).expect("write stdin");
+        drop(pipe);
+    }
+    let out = child.wait_with_output().expect("vox ran");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -164,54 +189,20 @@ fn the_verbs_a_person_cannot_skip_work_while_a_daemon_holds_the_profile() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
 
-    // ---- a profile with an identity and a room, and nothing running ----
-    let (stranger, room_id) = {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let node = rt
-            .block_on(async {
-                vox_core::node::actor::Node::spawn_with(
-                    paths.clone(),
-                    std::sync::Arc::new(|| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs())
-                    }),
-                    vox_core::atrest::sek::Argon2Profile::default(),
-                )
-            })
-            .unwrap();
-        let out = rt.block_on(async {
-            assert!(node
-                .apply(NodeCommand::CreateIdentity {
-                    passphrase: secret(IDENTITY),
-                })
-                .await
-                .is_done());
-            assert!(node
-                .apply(NodeCommand::CreateChannel {
-                    local_name: "mission".into(),
-                    passphrase: secret(ROOMPASS),
-                })
-                .await
-                .is_done());
-            let cid = node.view().channels[0].channel_id;
-            let _ = node.apply(NodeCommand::Shutdown).await;
-            cid
-        });
-        drop(rt);
-        // Somebody to trust who is not us. Any well-formed fingerprint will do: the
-        // keyring records a decision about a key, and the key need not be present.
-        (
-            vox_core::node::link::b32_encode(&[0x5C_u8; 32]),
-            vox_core::node::link::b32_encode(&out),
-        )
-    };
+    // ---- a profile with an identity and a room, made through the binary, and nothing
+    // running ----
+    let room_id = make_profile(&data, &cfg);
+    // Somebody to trust who is not us: a second identity, made the same way. The keyring
+    // records a decision about a key, and the key's owner need not be online.
+    let other = tmp.path().join("stranger");
+    let (ok, stranger, err) = vox(&other.join("data"), &other.join("cfg"), &["id"]);
+    assert!(ok, "vox id (stranger): {err}");
+    let stranger = stranger.trim().to_owned();
+    assert_eq!(stranger.len(), 52, "a fingerprint: {stranger:?}");
+    println!(
+        "[proof] profile made by `vox id` + `vox room create`: room {room_id}; stranger {stranger}"
+    );
 
     // ---- claim 5: a bare passphrase opens the room without naming it ----
     // Deliberately not the room id and not the name — just the passphrase, which is all
@@ -282,4 +273,56 @@ fn the_verbs_a_person_cannot_skip_work_while_a_daemon_holds_the_profile() {
         !out.contains("agent-two"),
         "and the entry must be gone: {out:?}"
     );
+    println!(
+        "[proof] trust add, list, the wrong passphrase's refusal and remove all went through \
+         the running daemon"
+    );
+}
+
+/// Make the profile a person makes: `vox id`, a `vox daemon` holding it while `vox room
+/// create` makes the room, then that daemon stopped with SIGTERM and reaped. Returns the
+/// room's short id as `vox room list` prints it.
+fn make_profile(data: &std::path::Path, cfg: &std::path::Path) -> String {
+    let (ok, fp, err) = vox(data, cfg, &["id"]);
+    assert!(ok, "vox id: {err}");
+    assert_eq!(fp.trim().len(), 52, "`vox id` prints a fingerprint: {fp:?}");
+    let mut setup = daemon(data, cfg, &format!("{IDENTITY}\n"));
+    until_attached(data, cfg);
+    let (ok, _, err) = vox_in(
+        data,
+        cfg,
+        &["room", "create", "--name", "mission"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "vox room create: {err}");
+    let listed = until_attached(data, cfg);
+    assert!(listed.contains("mission"), "the room is listed: {listed:?}");
+    let room = listed
+        .split_whitespace()
+        .next()
+        .expect("the new room in `vox room list`")
+        .to_owned();
+    // Stopped as a service manager stops it, and waited for, so the proof proper starts
+    // from a profile nothing holds and every room closed.
+    let pid = setup.0.id();
+    let stopped = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(stopped.success(), "could not stop the setup daemon");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while setup.0.try_wait().expect("wait").is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CANNOT MEASURE: the setup daemon (pid {pid}) did not exit within 30s of SIGTERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    drop(setup);
+    let (ok, _, err) = vox(data, cfg, &["room", "list"]);
+    assert!(
+        !ok && err.contains("no node is running"),
+        "CANNOT MEASURE: the profile must be held by nothing before the proof starts: {err:?}"
+    );
+    room
 }
