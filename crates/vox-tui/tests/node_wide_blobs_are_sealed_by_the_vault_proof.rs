@@ -552,6 +552,12 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         );
     }
 
+    let file_facts = |d: &Disk| {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata(&d.store_file).unwrap();
+        (m.len(), m.ino())
+    };
+    let facts_before = file_facts(&disk);
     let old_seals = fingerprints_of(&blobs(&disk));
     let before_scan = occurrences(&disk, &old_seals);
     assert!(
@@ -566,6 +572,10 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     // rewritten passed this check.
     let after_scan = occurrences(&disk, &old_seals);
     let live_scan = occurrences(&disk, &fingerprints_of(&blobs(&disk)));
+    println!(
+        "[store] store.redb (bytes, inode): {facts_before:?} before migration, {:?} after",
+        file_facts(&disk)
+    );
     let (theirs_after, ours_after) = who_opens(&disk);
     let version_after = disk.vault().version;
     let reads = {
