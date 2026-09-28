@@ -13,11 +13,17 @@
 //! are started together**. Each asks bob's daemon for a forward to alice, and the daemon's own sync
 //! reaches for her too: three reaches to one peer, none with a connection to reuse.
 //!
-//! What must hold: every fetch succeeds, each within [`FETCH_WITHIN`] — well under the 10 s a lost
-//! circuit handshake costs — and the anchor carried the circuits (the path was relayed).
+//! What must hold, every cycle:
+//! - **one dial**: bob's daemon ran exactly one reachability ladder to alice, read from its own
+//!   `vox status --json` (`reach`, counted where a ladder starts dialling). Timing alone could not
+//!   say it: a verifier's mutant that let a woken reach dial again after the first one finished
+//!   kept every fetch fast and was green (#232);
+//! - every fetch succeeds, each within [`FETCH_WITHIN`] — well under the 10 s a lost circuit
+//!   handshake costs — and the anchor carried the circuits (the path was relayed).
 //!
-//! Mutation: every reach runs its own ladder (the coalescing removed) — red, a fetch over
-//! [`FETCH_WITHIN`].
+//! Mutations: every reach runs its own ladder (the coalescing removed) — red, more than one ladder
+//! and a fetch over [`FETCH_WITHIN`]; a woken reach dials again instead of taking the connection
+//! the first made — red, two ladders.
 
 #![cfg(unix)]
 
@@ -343,6 +349,7 @@ fn two_fetches_at_once_share_one_dial() {
     );
 
     let mut slow: Vec<String> = Vec::new();
+    let mut extra: Vec<String> = Vec::new();
     for cycle in 0..CYCLES {
         // A fresh daemon for bob: no connection to alice to reuse.
         drop(bob.daemon.take());
@@ -361,12 +368,34 @@ fn two_fetches_at_once_share_one_dial() {
                 slow.push(format!("cycle {cycle} fetch {which}: {took:?}"));
             }
         }
+        let (ok, json, err) = bob.vox(&["status", "--json"]);
+        assert!(ok, "vox status --json: {err}");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("status JSON");
+        let ladders = v["reach"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["peer"].as_str() == Some(alice_fp.as_str()))
+            .and_then(|r| r["ladders"].as_u64())
+            .unwrap_or(0);
+        eprintln!("[proof] cycle {cycle}: bob's daemon ran {ladders} ladder(s) to alice");
+        assert!(
+            ladders >= 1,
+            "CANNOT PROVE: cycle {cycle} ran no ladder to alice, so nothing dialled her: {json}"
+        );
+        if ladders != 1 {
+            extra.push(format!("cycle {cycle}: {ladders} ladders"));
+        }
     }
     let carried = circuits(&anchor);
     eprintln!("[proof] the anchor reports {carried} circuit(s) carried");
     assert!(
         carried > 0,
         "CANNOT PROVE: the anchor carried no circuit, so the path was not relayed"
+    );
+    assert!(
+        extra.is_empty(),
+        "reaches to alice started together must share one dial, one ladder a cycle: {extra:?}"
     );
     assert!(
         slow.is_empty(),

@@ -89,6 +89,10 @@ pub struct PortCounters {
 #[derive(Debug, Default)]
 pub struct SyncBook {
     ports: BTreeMap<(Digest32, Digest32), PortCounters>,
+    /// How many reachability ladders this node has run to each peer (`NodeNet::reach`): one per
+    /// dial that found no connection to reuse and no other reach to the same peer under way to
+    /// wait on (V210-53, #232). What no person can see directly — two dials where one would do.
+    ladders: BTreeMap<Digest32, u64>,
 }
 
 /// The book as the actor and the handles share it.
@@ -110,6 +114,12 @@ impl SyncBook {
     ) {
         let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
         f(b.ports.entry((room, peer)).or_default());
+    }
+
+    /// Count one reachability ladder run to `peer`.
+    pub fn note_ladder(book: &SharedSyncBook, peer: Digest32) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        *b.ladders.entry(peer).or_default() += 1;
     }
 
     /// The counters as `vox status --json` prints them.
@@ -145,6 +155,13 @@ impl SyncBook {
                     |(k, n)| format!("{{\"kind\":\"{}\",\"failures\":{n}}}", k.name())
                 ),
             );
+        }
+        s.push_str("],\"reach\":[");
+        for (i, (peer, n)) in b.ladders.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(s, "{{\"peer\":\"{}\",\"ladders\":{n}}}", b32_encode(peer));
         }
         s.push_str("]}");
         s

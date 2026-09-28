@@ -314,6 +314,8 @@ pub struct NodeNet {
     /// merge, where a reopened room dialled its members beside a `vox forward`: cold relayed
     /// connections of 10.8 s instead of about 260 ms (#226).
     reaching: Mutex<HashMap<Digest32, Arc<tokio::sync::Notify>>>,
+    /// Where each ladder run is counted for `vox status --json`, once the node has one.
+    status: Mutex<Option<crate::node::status::SharedSyncBook>>,
     service: RendezvousService,
     membership: SharedMembership,
     policy: SharedPolicy,
@@ -344,6 +346,11 @@ impl std::fmt::Debug for NodeNet {
 }
 
 impl NodeNet {
+    /// Count this node's reachability ladders in `book` (`vox status --json`'s `reach`).
+    pub fn count_ladders_in(&self, book: crate::node::status::SharedSyncBook) {
+        *lock(&self.status) = Some(book);
+    }
+
     /// Build the surface over a bound endpoint. The board it serves is fresh
     /// in-memory state (an anchor that persists a board is M15).
     #[must_use]
@@ -360,6 +367,7 @@ impl NodeNet {
             observed: Mutex::new(BTreeMap::new()),
             circuits: Arc::new(CircuitLedger::default()),
             reaching: Mutex::new(HashMap::new()),
+            status: Mutex::new(None),
             service,
             membership,
             policy: SharedPolicy::new(),
@@ -800,6 +808,9 @@ impl NodeNet {
     ) -> Result<Arc<VoxConnection>> {
         if let Some(conn) = self.manager.existing(&peer) {
             return Ok(conn);
+        }
+        if let Some(book) = lock(&self.status).as_ref() {
+            crate::node::status::SyncBook::note_ladder(book, peer);
         }
         // Each rung is spawned with the label it will be reported under, because a rung
         // that fails is only actionable if the operator knows *which* rung it was: a

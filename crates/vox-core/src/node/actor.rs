@@ -2594,6 +2594,7 @@ impl Node {
             }
         });
         let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
+        net.count_ladders_in(Arc::clone(&self.sync_book));
         // **A record landing on this node's board is an event, not something to notice later.**
         // A newcomer becomes findable to everyone away from the room only because a member that
         // already knows it publishes its bundle onward, and until now nothing told this node one
