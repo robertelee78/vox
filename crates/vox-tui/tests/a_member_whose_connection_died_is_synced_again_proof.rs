@@ -11,19 +11,19 @@
 //! peer (ADR-025 D2), off the actor, one reach per peer, and backs off as Unreachable when that
 //! fails.
 //!
-//! **The scene**, all real `vox` processes:
+//! **The scene** follows CI's red, all real `vox` processes:
 //! 1. An anchor, and two `vox daemon`s, carol and bob, trusting each other in one room. Each
 //!    reads the other's latest hello.
-//! 2. Bob is frozen (`SIGSTOP`) for [`FREEZE`], past QUIC's 60 s idle timeout, so the connection
-//!    between them is **gone at both ends**, whatever either node did meanwhile. Carol posts
-//!    [`POSTS`] rows meanwhile. (A freeze just past the 30 s silence line was not enough to stage it:
-//!    a node drops a silent connection only when it next looks at it, and a port in backoff
-//!    does not look. With the reach removed, bob still read carol's rows over the surviving
-//!    connection, 2 runs of 2. CI's 31.3 s happened to be looked at.)
-//! 3. The anchor is stopped, so no board or relay is left between them. Then bob is continued.
+//! 2. Bob is frozen (`SIGSTOP`) for [`FREEZE`], past the 30 s silence line, and carol posts
+//!    [`POSTS`] rows meanwhile.
+//! 3. The anchor is stopped, so no board or relay is left between them. Carol is frozen and bob
+//!    is continued: he tries her, fails, and posts his own [`POSTS`] rows.
+//! 4. Carol is continued. Each now holds rows the other lacks, with no connection between them.
 //!
-//! **What must hold:** bob reads every one of carol's rows within [`BACK_WITHIN`] of being
-//! continued. Before the fix he never did.
+//! **What must hold:** within [`BACK_WITHIN`] of carol's return, bob reads every one of carol's rows
+//! and carol reads every one of bob's. Without the port's own reach they waited about 20 s in this
+//! scene, for something else to dial (a key to deliver). In CI's red nothing else did, and they
+//! never synced.
 //!
 //! Mutation: the scheduler's reach removed (nothing dials a member for sync) → red.
 
@@ -50,9 +50,11 @@ const FREEZE: Duration = Duration::from_secs(35);
 const CAROL_FROZEN: Duration = Duration::from_secs(10);
 /// Rows carol posts while bob is frozen.
 const POSTS: usize = 20;
-/// How soon after bob is continued he must read all of carol's rows: a periodic request (at most
-/// 30 s) and one dial. The old code never got there.
-const BACK_WITHIN: Duration = Duration::from_secs(60);
+/// How soon after both are back each must read the other's rows. The port's own reach does it
+/// within a second or two. Without it they waited for some other reason to dial each other
+/// (a key to deliver, the periodic request): about 20 s in this scene, and in CI's, where no such
+/// reason came, never.
+const BACK_WITHIN: Duration = Duration::from_secs(10);
 const SETUP: Duration = Duration::from_secs(90);
 
 fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
