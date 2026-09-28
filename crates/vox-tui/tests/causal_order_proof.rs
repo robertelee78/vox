@@ -28,15 +28,16 @@
 //! day-ahead claim back from the author's store.
 //!
 //! Mutations (each run, each red): `seen` ignored when ordering (proof 2); the cap removed
-//! (proof 3). Arrival order is the in-process gate's mutation (`one_order_gate`).
+//! (proof 3). Arrival order has no mutation of its own here: it was `one_order_gate`'s, an
+//! in-process gate deleted with the rest (#227).
 //!
-//! **Proof 1 is intermittently red on v0.2.8, and not for the order.** In about half of runs the
-//! second joiner of three daemons is cut off from the first post onward: 5 red of 9 with M23.2,
-//! and 1 of 4 on 3cac220 without it, with the same signature. In each of the four reds whose logs were captured, the second joiner's
-//! restarted daemon logs "the board holds a newer record from that author". Whenever the three
-//! converged, their orders were identical (e.g. 58/58/58 entries, one SHA-256). CI skips it by name
-//! with this cause (release.yml, ci.yml). The order is proven in the blocking set by
-//! `crates/vox-core/tests/one_order_gate.rs` and by proofs 2 and 3.
+//! **Proof 1 was intermittently red on v0.2.8, and not for the order** (#228). In about half of runs
+//! the second joiner of three daemons was cut off from the first post onward: 5 red of 9. Each red
+//! whose logs were captured had the restarted daemon log "the board holds a newer record from that
+//! author", and CI skipped it by name. Measured on the v0.3.0 merge onto v0.2.10: 7 of 7 green, and
+//! 6 of 6 green with that cause restored (`next_record_seq`'s clock floor zeroed) — the restarted
+//! member reconverges however its record fares. The refusal line itself is #230's defect (a record
+//! signed in its predecessor's second). The proof is in the blocking set, named by nothing.
 
 #![cfg(unix)]
 
@@ -432,8 +433,7 @@ fn is_ordered_subsequence(who: &str, rows: &[(String, String)], seq: &[String]) 
 }
 
 #[test]
-#[ignore = "three real vox daemons (about two minutes); intermittently red on v0.2.8 for a cause \
-            below the log (module docs); CI skips it by name"]
+#[ignore = "three real vox daemons (about two minutes); CI runs it in release"]
 fn three_members_one_offline_for_a_while_show_one_order() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
@@ -1006,13 +1006,12 @@ fn a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place() {
 /// does) and delivers the post, which lands above what alice was already shown and is marked
 /// late.
 ///
-/// Red today for v0.2.9 V29-23 (#104), not for the order: the restarted daemon's board records
-/// restart their sequence at 1, the board holds a newer one from before the restart, and nobody
-/// can reach it at its new address (2 of 5 runs never delivered). It becomes a gate when that fix
-/// lands; the frozen-daemon variant above carries the claim meanwhile.
+/// It was red for v0.2.9 V29-23 (#104): the restarted daemon's board records restarted their
+/// sequence at 1, and nobody could reach it at its new address (2 of 5 runs never delivered).
+/// With v0.2.10's clock floor it is 7 of 7 green on the v0.3.0 merge (#228), 4 of 4 with that floor
+/// zeroed, and a gate.
 #[test]
-#[ignore = "red for v0.2.9 V29-23 (#104, a restarted daemon's board record is refused); CI skips it \
-            by name until that fix lands"]
+#[ignore = "two real vox daemons (about a minute); CI runs it in release"]
 fn a_late_arrival_after_a_restart_is_marked() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
