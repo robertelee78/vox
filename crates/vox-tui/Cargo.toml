@@ -74,3 +74,6 @@ socket2.workspace = true
 # replay its output into. The workspace manifest says why each version.
 portable-pty.workspace = true
 vt100.workspace = true
+# V210-49's proof plays the attacker who deletes one row of a stopped node's store: no vox command
+# can, so the test opens the file itself (never while a vox process holds it).
+redb.workspace = true

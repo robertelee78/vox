@@ -14,6 +14,9 @@
 //!
 //! Prose that merely mentions the word `vox` is not a command and is not checked.
 
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
@@ -160,6 +163,7 @@ fn extract(skill: &str) -> (Vec<Cmd>, Vec<(String, usize)>) {
 
 #[test]
 fn every_verb_and_flag_the_skill_names_exists_in_the_cli() {
+    watchdog::arm();
     let (ok, skill) = vox(&["agent", "skill"]);
     assert!(ok, "vox agent skill must print the skill: {skill}");
     let (cmds, bare) = extract(&skill);

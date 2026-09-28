@@ -1334,7 +1334,9 @@ enum Cmd {
     /// fetches, after `--for`, or on ^C.
     Share(ShareArgs),
     /// What the running node is doing, and what needs attention (PRD-001 R35): rooms and
-    /// their sync, peers and their paths, tunnels, datagram and app counters.
+    /// their sync, peers and their paths, tunnels, datagram and app counters, and the sync
+    /// counters per room and peer (ADR-025): sessions opened, admitted, refused, completed,
+    /// partial and failed, and any backoff.
     Status(StatusArgs),
     /// Wire an agent session into a room (ADR-020) — harness-agnostic.
     #[command(subcommand)]

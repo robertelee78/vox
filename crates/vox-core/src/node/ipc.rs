@@ -138,6 +138,9 @@ const T_STALLED: u64 = 1715;
 const T_PEER_UNREACHABLE: u64 = 1716;
 /// `NodeEvent::PublishRefused`. Additive, and deliberately away from the sequential range.
 const T_PUBLISH_REFUSED: u64 = 1717;
+/// `NodeEvent::PublishCured` (V210-51). Additive, away from both the sequential range and the tags
+/// the v0.3.0 line uses.
+const T_PUBLISH_CURED: u64 = 2091;
 /// [`NodeEvent::JoinSteps`]: where a join's time went.
 const T_JOIN_STEPS: u64 = 1718;
 /// `NodeEvent::KeyNotTaken`.
@@ -1022,6 +1025,12 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .text(what)
                 .text(why);
         }
+        NodeEvent::PublishCured { channel_id, what } => {
+            e.array(3)
+                .uint(T_PUBLISH_CURED)
+                .bytes(channel_id)
+                .text(what);
+        }
         NodeEvent::SyncFailed {
             channel_id,
             peer,
@@ -1339,6 +1348,13 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             why: d
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc room not remembered why"))?
+                .to_owned(),
+        },
+        (T_PUBLISH_CURED, 3) => NodeEvent::PublishCured {
+            channel_id: digest(d)?,
+            what: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc publish cured what"))?
                 .to_owned(),
         },
         (T_PUBLISH_REFUSED, 4) => NodeEvent::PublishRefused {
@@ -1693,6 +1709,11 @@ fn page<T>(
     out
 }
 
+/// `text` on one line, so a detail line in a [`Frame::Error`] stays one line.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Answer one request against the node.
 ///
 /// Every failure comes back as [`Frame::Error`] rather than ending the
@@ -2037,24 +2058,56 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             link,
             local_name,
             passphrase,
-        } => match handle
-            .apply(crate::node::api::NodeCommand::JoinChannel {
-                link,
-                local_name,
-                passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
-            })
-            .await
-        {
-            crate::node::api::Outcome::Done => Frame::Ok,
-            // The outcome is named, not reduced to "it failed". `Unreachable` and a
-            // refused passphrase call for completely different responses from whoever
-            // is holding the link, and this is the only place that knows which it was.
-            // The fault's name, which `vox room join` turns into the same guidance `vox
-            // connect` gives (`tunnel_cli::join_advice`, V29-12).
-            other => Frame::Error {
-                reason: format!("{other:?}"),
-            },
-        },
+        } => {
+            // Subscribe before asking: a failed join's steps and responders' reasons are raised
+            // as events just before the outcome is answered, and one emitted between the command
+            // and the wait would be lost.
+            let mut events = handle.subscribe();
+            match handle
+                .apply(crate::node::api::NodeCommand::JoinChannel {
+                    link,
+                    local_name,
+                    passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                // The outcome is named, not reduced to "it failed". `Unreachable` and a
+                // refused passphrase call for completely different responses from whoever
+                // is holding the link, and this is the only place that knows which it was.
+                // The fault's name, which `vox room join` turns into the same guidance `vox
+                // connect` gives (`tunnel_cli::join_advice`, V29-12).
+                //
+                // **And where it stopped (#192).** The join records each step it took and what
+                // each responder said; `vox room join` printed neither, so a red that happened
+                // once could not be placed. They follow the fault's name, one per line:
+                // `steps: …`, then `said: …`.
+                other => {
+                    let mut reason = format!("{other:?}");
+                    let (mut steps, mut said) = (None, None);
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while steps.is_none() || said.is_none() {
+                        match tokio::time::timeout_at(deadline, events.next()).await {
+                            Ok(Some(EventStreamItem::Event(NodeEvent::JoinSteps {
+                                joined: false,
+                                steps: s,
+                            }))) if steps.is_none() => steps = Some(s),
+                            Ok(Some(EventStreamItem::Event(NodeEvent::JoinFailed {
+                                reason: r,
+                            }))) if said.is_none() => said = Some(r),
+                            Ok(Some(_)) => {}
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                    for (label, text) in [("steps", steps), ("said", said)] {
+                        if let Some(text) = text.filter(|t| !t.is_empty()) {
+                            reason.push_str(&format!("\n{label}: {}", one_line(&text)));
+                        }
+                    }
+                    Frame::Error { reason }
+                }
+            }
+        }
         Request::Create {
             local_name,
             passphrase,

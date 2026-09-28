@@ -25,6 +25,15 @@
 //! it yet, so the report says so and shows when each member was last seen instead.
 //! "Direct" covers both a dialled and a hole-punched path: which rung won is not kept
 //! once the connection is filed.
+//!
+//! ## ADR-025 S0b's sync counters
+//!
+//! Beside the report, `vox status --json` carries v0.2.10's **simple sync counters** (the
+//! decider's decision 3, 2026-09-26): a `"sync"` row per `(room, peer)` — sessions opened,
+//! admitted, refused busy, completed, partial, failed, stale, skipped at the cap, queued, and the
+//! backoff a port is in — and a `"reach"` row per peer, counting reachability ladders and outbound
+//! circuits (V210-53). They are what a person cannot see directly: that nothing was refused,
+//! skipped or left stale. They live in a [`SyncBook`] the actor writes and every handle reads.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -65,6 +74,8 @@ pub struct ServedTunnel {
 pub struct StatusBook {
     /// Room → when a sync this node ran there last completed.
     pub room_synced: BTreeMap<Digest32, u64>,
+    /// Peer → when a sync session with it last completed, in any room.
+    pub member_synced: BTreeMap<Digest32, u64>,
     /// Peer → when this node last saw a live connection to it.
     pub last_seen: BTreeMap<Digest32, u64>,
     /// Tunnels being served, by a local id; entries leave when the tunnel ends.
@@ -620,6 +631,158 @@ pub fn add_stats(a: &mut DatagramStats, b: &DatagramStats) {
     a.send_dropped += b.send_dropped;
 }
 
+// ---- ADR-025 S0b: sync and reach counters ----------------------------------
+
+/// The kinds of backoff a port can be in (ADR-025 D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffKind {
+    /// A transport or stream-open failure.
+    Unreachable,
+    /// The peer refused with `SessionBusy` (only past its inbound limit), or has not yet admitted
+    /// this just-joined member.
+    Busy,
+    /// A session that left requested positions unfilled and made no progress, or a protocol
+    /// violation.
+    NoProgress,
+    /// The peer refuses by policy: another epoch, not a member, the room not held.
+    Policy,
+}
+
+impl BackoffKind {
+    /// The name `vox status --json` prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Busy => "busy",
+            Self::NoProgress => "no_progress",
+            Self::Policy => "policy",
+        }
+    }
+}
+
+/// One `(room, peer)`'s counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PortCounters {
+    /// Outbound sessions this node opened.
+    pub opened: u64,
+    /// Inbound sessions this node admitted.
+    pub admitted: u64,
+    /// Inbound sessions this node refused with `SessionBusy`.
+    pub busy_refused: u64,
+    /// Sessions (either direction) that completed with every requested entry received.
+    pub completed: u64,
+    /// Sessions that ended without error but left requested entries unreceived (a bounded serve).
+    pub partial: u64,
+    /// Sessions that failed.
+    pub failed: u64,
+    /// The last failure's reason.
+    pub last_failure: Option<String>,
+    /// Results that arrived for an attempt already retired (ADR-025 D1a).
+    pub stale: u64,
+    /// Sessions that were due but skipped because every outbound slot was taken.
+    pub skipped_at_cap: u64,
+    /// Times a port waited in the outbound queue for a slot (ADR-025 D6).
+    pub queued: u64,
+    /// The backoff the port is in now, and its consecutive failures.
+    pub backoff: Option<(BackoffKind, u32)>,
+}
+
+/// Every `(room, peer)`'s counters.
+#[derive(Debug, Default)]
+pub struct SyncBook {
+    ports: BTreeMap<(Digest32, Digest32), PortCounters>,
+    /// How many reachability ladders this node has run to each peer (`NodeNet::reach`): one per
+    /// dial that found no connection to reuse and no other reach to the same peer under way to
+    /// wait on (V210-53, #232). What no person can see directly — two dials where one would do.
+    ladders: BTreeMap<Digest32, u64>,
+}
+
+/// The book as the actor and the handles share it.
+pub type SharedSyncBook = Arc<Mutex<SyncBook>>;
+
+impl SyncBook {
+    /// A new shared, empty book.
+    #[must_use]
+    pub fn shared() -> SharedSyncBook {
+        Arc::new(Mutex::new(Self::default()))
+    }
+
+    /// Update one port's counters.
+    pub fn with(
+        book: &SharedSyncBook,
+        room: Digest32,
+        peer: Digest32,
+        f: impl FnOnce(&mut PortCounters),
+    ) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        f(b.ports.entry((room, peer)).or_default());
+    }
+
+    /// Count one reachability ladder run to `peer`.
+    pub fn note_ladder(book: &SharedSyncBook, peer: Digest32) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        *b.ladders.entry(peer).or_default() += 1;
+    }
+
+    /// The counters as `vox status --json` carries them: its `"sync"` and `"reach"` members,
+    /// without the enclosing braces, for [`serve`] to add beside [`StatusReport::to_json`]'s.
+    #[must_use]
+    pub fn sections_json(book: &SharedSyncBook) -> String {
+        let b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut s = String::from("\"sync\":[");
+        for (i, ((room, peer), c)) in b.ports.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(
+                s,
+                "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
+                 \"completed\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\"stale\":{},\
+                 \"skipped_at_cap\":{},\"queued\":{},\"backoff\":{}}}",
+                b32_encode(room),
+                b32_encode(peer),
+                c.opened,
+                c.admitted,
+                c.busy_refused,
+                c.completed,
+                c.partial,
+                c.failed,
+                c.last_failure
+                    .as_deref()
+                    .map_or_else(|| "null".to_owned(), q),
+                c.stale,
+                c.skipped_at_cap,
+                c.queued,
+                c.backoff.map_or_else(
+                    || "null".to_owned(),
+                    |(k, n)| format!("{{\"kind\":\"{}\",\"failures\":{n}}}", k.name())
+                ),
+            );
+        }
+        s.push_str("],\"reach\":[");
+        // Ladders from this book; circuits counted where every outbound circuit is asked for
+        // (`circuitstream::connect_through`). Every peer either names, in one row.
+        let circuits = crate::node::circuitstream::outbound_circuits();
+        let peers: std::collections::BTreeSet<&Digest32> =
+            b.ladders.keys().chain(circuits.keys()).collect();
+        for (i, peer) in peers.into_iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(
+                s,
+                "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{}}}",
+                b32_encode(peer),
+                b.ladders.get(peer).copied().unwrap_or(0),
+                circuits.get(peer).copied().unwrap_or(0)
+            );
+        }
+        s.push(']');
+        s
+    }
+}
+
 // ---- IPC -------------------------------------------------------------------
 // Additive to protocol 6, away from the sequential tags as the other late ones are.
 
@@ -640,8 +803,14 @@ pub fn is_request(body: &[u8]) -> bool {
 pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
     let body = match handle.status().await {
         Ok(report) => {
+            // ADR-025 S0b's counters join the report as its `sync` and `reach` members.
+            let mut json = report.to_json();
+            json.pop();
+            json.push(',');
+            json.push_str(&SyncBook::sections_json(handle.sync_book()));
+            json.push('}');
             let mut e = Encoder::new();
-            e.array(2).uint(T_STATUS_REPORT).text(&report.to_json());
+            e.array(2).uint(T_STATUS_REPORT).text(&json);
             e.finish()
         }
         Err(e) => Frame::Error {

@@ -318,6 +318,18 @@ pub enum WireError {
     /// transport failure wrapped in a governance error (#202).
     #[error("the peer was busy syncing this room")]
     SessionBusy = 0x0B,
+    /// `0x0C` — refused because the peer does not know this node as a member of the room **yet**:
+    /// it holds only this node's pre-join record, because the member records that admit it have
+    /// not reached it (#217). The commonest case is a member that has just joined and syncs with an
+    /// anchor before the member that admitted it has mirrored its bundle there. It clears by itself
+    /// within seconds, and the push retry resolves it.
+    ///
+    /// Sent **only to a pending joiner**, which already holds the room's invitation, so it learns
+    /// nothing it did not know; a stranger is still refused with the uninformative `0x05`. Before
+    /// this code existed this refusal carried `0x05`, and a member that had just joined reported
+    /// "sync failed: authenticator invalid" — an integrity failure — for a record still in flight.
+    #[error("the peer does not know this node as a member of the room yet")]
+    NotYetMember = 0x0C,
 }
 
 impl WireError {
@@ -340,6 +352,7 @@ impl WireError {
             0x09 => Some(WireError::TransportFailed),
             0x0A => Some(WireError::Unresponsive),
             0x0B => Some(WireError::SessionBusy),
+            0x0C => Some(WireError::NotYetMember),
             _ => None,
         }
     }

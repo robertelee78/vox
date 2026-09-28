@@ -165,6 +165,10 @@ pub struct AnchoredChannel {
     /// Entries in the ciphertext copy of the log this node keeps for the channel
     /// (`None` when it keeps none — a client's board, or an anchor not yet caught up).
     pub entries: Option<u64>,
+    /// The address each member's live record on this board names, as the board would hand it to
+    /// any member asking where that member is (V210-51, #230): what `vox node` prints so an
+    /// operator — and a proof — can see which of a member's processes the board points at.
+    pub holding: Vec<(Digest32, Vec<String>)>,
 }
 
 /// A command from a client to the node.
@@ -458,6 +462,15 @@ pub enum Fault {
     /// board was reached after 20s, held nothing for the room, and the advice pointed at the
     /// address.
     RoomNotOnBoard,
+    /// A join could not reach any board: every anchor it knew of (the link's, and this node's
+    /// own) failed to answer within the join's patience, or stopped answering while it read the
+    /// room. No member was asked anything.
+    ///
+    /// **Not [`Fault::Unreachable`].** A join reported both as one, and the CLI's words for it
+    /// said "every member the board knows is offline" — a claim about members, made when the
+    /// board itself was never reached (#192). The two need different fixes: an anchor that is
+    /// down, or a member that is.
+    BoardUnreachable,
     /// A peer could not be reached (no live endpoint, or the dial failed).
     Unreachable,
     /// The remote refused: a join was refused, or a record was rejected.
@@ -540,6 +553,9 @@ impl Fault {
             }
             Fault::RoomNotOnBoard => {
                 "the board holds nothing for that room\n       either its host has not published it there yet (the host must be online; then try again)\n       or the room part of the address is wrong: check it against the address you were sent"
+            }
+            Fault::BoardUnreachable => {
+                "the anchor could not be reached, so no member was asked\n       check that the anchor is running and that this node can reach its address"
             }
             Fault::Unreachable => {
                 "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
@@ -728,6 +744,14 @@ pub enum NodeEvent {
         what: String,
         /// What the board said.
         why: String,
+    },
+    /// A board took one of this node's own records on a republish, after refusing it as stale
+    /// (V210-51, #230): the refusal happened, and was mended. Said once per refusal.
+    PublishCured {
+        /// The room the record was for.
+        channel_id: Digest32,
+        /// Which record it was, and which board (`our address (board …)`).
+        what: String,
     },
     /// A join failed, with what each responder that was tried reported.
     ///

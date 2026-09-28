@@ -4,6 +4,8 @@
 //! It attaches to the node's control socket like `vox room`, asks for the report, and
 //! prints it: for a person by default, as the node's own JSON with `--json`. The JSON is
 //! the contract; the human form is a rendering of it, so the two cannot disagree.
+//!
+//! The report ends with ADR-025 S0b's sync counters: one line per `(room, peer)`.
 
 use serde_json::Value;
 use vox_core::node::paths::Paths;
@@ -189,5 +191,40 @@ fn render(v: &Value) -> String {
         n(a, "refused_locally"),
         n(a, "withdrawn")
     );
+    let _ = writeln!(o, "\nsync, per room and peer");
+    let sync = arr("sync");
+    if sync.is_empty() {
+        let _ = writeln!(o, "  no sync sessions yet");
+    }
+    for r in sync {
+        let _ = write!(
+            o,
+            "  room {} peer {}: opened {} admitted {} completed {} partial {} failed {} busy-refused {} \
+             stale {} skipped {} queued {}",
+            short(s(r, "room")),
+            short(s(r, "peer")),
+            n(r, "opened"),
+            n(r, "admitted"),
+            n(r, "completed"),
+            n(r, "partial"),
+            n(r, "failed"),
+            n(r, "busy_refused"),
+            n(r, "stale"),
+            n(r, "skipped_at_cap"),
+            n(r, "queued"),
+        );
+        if let Some(b) = r.get("backoff").filter(|b| !b.is_null()) {
+            let _ = write!(
+                o,
+                ", backing off ({}, {} failure(s))",
+                s(b, "kind"),
+                n(b, "failures")
+            );
+        }
+        if let Some(f) = r.get("last_failure").and_then(Value::as_str) {
+            let _ = write!(o, "; last failure: {f}");
+        }
+        o.push('\n');
+    }
     o
 }

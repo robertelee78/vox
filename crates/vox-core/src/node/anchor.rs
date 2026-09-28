@@ -16,6 +16,7 @@
 //! node that later *joins* a room it anchored never mistakes these pages for its own.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -33,7 +34,8 @@ use crate::log::dag::{AdmissionPolicy, Dag};
 use crate::log::entry::{Entry, EntryKind};
 use crate::log::sync::{frontier_session_peer, Transport};
 use crate::node::channel::{
-    authors_bytes, classify_payload, parse_authors, sync_failure, ChannelAuthors, SyncOutcome,
+    authors_bytes, classify_payload, parse_authors, sync_failure, ChannelAuthors, SessionReport,
+    SyncFailure, SyncOutcome,
 };
 use crate::node::store::Store;
 
@@ -71,6 +73,8 @@ pub struct AnchorState {
     next_log_id: u64,
     sek: Sek,
     poisoned: bool,
+    /// The copy's generation (ADR-025 D1): bumped by every entry persisted.
+    gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for AnchorState {
@@ -110,6 +114,7 @@ impl AnchorState {
             next_log_id: 1,
             sek,
             poisoned: false,
+            gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         state.rebuild_admission();
         state.persist_meta(store)?;
@@ -139,6 +144,7 @@ impl AnchorState {
             next_log_id: 1,
             sek,
             poisoned: false,
+            gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         state.rebuild_admission();
         for (id, seg) in store.segments(channel_id, SegmentKind::AnchorLog)? {
@@ -180,6 +186,18 @@ impl AnchorState {
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The copy's generation counter (ADR-025 D1), shared.
+    #[must_use]
+    pub fn generation(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.gen)
+    }
+
+    /// Whether a failed persist has poisoned this copy.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// How many entries the anchor holds.
@@ -314,6 +332,7 @@ impl AnchorState {
                 return Err(e);
             }
             self.next_log_id = id.saturating_add(1);
+            self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if is_governance {
                 out.governance += 1;
             }
@@ -322,20 +341,20 @@ impl AnchorState {
     }
 
     /// Reconcile with a peer over `transport`, holding `shared`'s lock only inside each protocol
-    /// step. See [`crate::log::sync::SessionRoom`] and `ChannelState::sync_over_room`.
-    ///
-    /// # Errors
-    /// The copy is poisoned, a persist fails, or the session hard-fails.
+    /// step. See [`crate::log::sync::SessionRoom`] and `ChannelState::sync_over_room`, whose report
+    /// and fence this shares.
     pub fn sync_over_room<T: Transport>(
         shared: &tokio::sync::Mutex<Self>,
         store: &Store,
         transport: &mut T,
-    ) -> Result<SyncOutcome> {
+        fence: &crate::transport::stream_transport::Fence,
+        on_stored: &dyn Fn(),
+    ) -> SessionReport {
         let epoch = {
             let st = shared.blocking_lock();
             if st.poisoned {
-                return Err(Error::Profile(
-                    "anchored channel is poisoned after a failed persist; reopen it",
+                return SessionReport::failed(SyncFailure::Poisoned(
+                    "anchored channel is poisoned after a failed persist; reopen it".to_owned(),
                 ));
             }
             st.epoch
@@ -344,21 +363,14 @@ impl AnchorState {
             shared,
             store,
             epoch,
+            fence,
+            on_stored,
             out: std::cell::RefCell::new(SyncOutcome::default()),
             fatal: std::cell::RefCell::new(None),
         };
         let session = crate::log::sync::frontier_session_room(transport, &room);
-        if let Some(e) = room.fatal.take() {
-            return Err(e);
-        }
-        let mut out = room.out.into_inner();
-        match session {
-            Ok(n) => {
-                out.applied = n;
-                Ok(out)
-            }
-            Err(code) => Err(sync_failure(code, transport.peer_refused())),
-        }
+        let fatal = room.fatal.take();
+        SessionReport::from_room(room.out.into_inner(), session, fatal)
     }
 
     fn rebuild_admission(&mut self) {
@@ -405,6 +417,9 @@ struct AnchorSessionRoom<'a> {
     shared: &'a tokio::sync::Mutex<AnchorState>,
     store: &'a Store,
     epoch: u64,
+    fence: &'a crate::transport::stream_transport::Fence,
+    /// Called after a batch persisted entries (ADR-025 D1a: stores report themselves).
+    on_stored: &'a dyn Fn(),
     out: std::cell::RefCell<SyncOutcome>,
     fatal: std::cell::RefCell<Option<Error>>,
 }
@@ -413,6 +428,9 @@ impl AnchorSessionRoom<'_> {
     fn copy(
         &self,
     ) -> std::result::Result<tokio::sync::MutexGuard<'_, AnchorState>, crate::wire::WireError> {
+        if self.fence.is_retired() {
+            return Err(crate::wire::WireError::TransportFailed);
+        }
         let st = self.shared.blocking_lock();
         if st.poisoned {
             return Err(crate::wire::WireError::TransportFailed);
@@ -427,15 +445,23 @@ impl AnchorSessionRoom<'_> {
 impl crate::log::sync::SessionRoom for AnchorSessionRoom<'_> {
     fn frontiers(
         &self,
-    ) -> std::result::Result<Vec<crate::log::sync::FeedFrontier>, crate::wire::WireError> {
-        Ok(crate::log::sync::frontiers_of(&self.copy()?.dag))
+    ) -> std::result::Result<(Vec<crate::log::sync::FeedFrontier>, u64), crate::wire::WireError>
+    {
+        let st = self.copy()?;
+        Ok((
+            crate::log::sync::frontiers_of(&st.dag),
+            st.gen.load(std::sync::atomic::Ordering::Relaxed),
+        ))
     }
 
     fn wants(
         &self,
         remote: &[crate::log::sync::FeedFrontier],
     ) -> std::result::Result<Vec<crate::log::sync::WantRange>, crate::wire::WireError> {
-        Ok(crate::log::sync::wants_for(&self.copy()?.dag, remote))
+        Ok(crate::log::sync::wants_for_unfrozen(
+            &self.copy()?.dag,
+            remote,
+        ))
     }
 
     fn entries(
@@ -448,22 +474,44 @@ impl crate::log::sync::SessionRoom for AnchorSessionRoom<'_> {
         ))
     }
 
-    fn apply(&self, staged: Vec<Vec<u8>>) -> std::result::Result<usize, crate::wire::WireError> {
-        let mut guard = self.copy()?;
+    fn apply(&self, staged: Vec<Vec<u8>>) -> crate::log::sync::ApplyReport {
+        let mut guard = match self.copy() {
+            Ok(g) => g,
+            Err(code) => {
+                return crate::log::sync::ApplyReport {
+                    fail: Some(code),
+                    ..crate::log::sync::ApplyReport::default()
+                }
+            }
+        };
         let st = &mut *guard;
         let before = st.heads();
+        let gen_before = st.gen.load(std::sync::atomic::Ordering::Relaxed);
         let resolver = ChannelAuthors::new(st.authors.clone());
         // Absorb what was stored, then report the failure: see `ChannelSessionRoom::apply`.
-        let stored = crate::log::sync::apply_staged(&mut st.dag, &resolver, &st.admission, &staged);
+        let mut report = crate::log::sync::apply_staged_classified(
+            &mut st.dag,
+            &resolver,
+            &st.admission,
+            &staged,
+        );
         match st.absorb_arrived(self.store, &before) {
-            Ok(got) => {
-                self.out.borrow_mut().governance += got.governance;
-                stored
-            }
+            Ok(got) => self.out.borrow_mut().governance += got.governance,
             Err(e) => {
                 *self.fatal.borrow_mut() = Some(e);
-                Err(crate::wire::WireError::TransportFailed)
+                report.fail = Some(crate::wire::WireError::TransportFailed);
             }
         }
+        let gen_after = st.gen.load(std::sync::atomic::Ordering::Relaxed);
+        report.stored = usize::try_from(gen_after.saturating_sub(gen_before)).unwrap_or(usize::MAX);
+        drop(guard);
+        if report.stored > 0 {
+            (self.on_stored)();
+        }
+        report
+    }
+
+    fn generation(&self) -> std::result::Result<u64, crate::wire::WireError> {
+        Ok(self.copy()?.gen.load(std::sync::atomic::Ordering::Relaxed))
     }
 }

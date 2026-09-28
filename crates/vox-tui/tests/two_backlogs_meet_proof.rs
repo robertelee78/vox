@@ -12,7 +12,12 @@
 //! not reopen its rooms until V210-35). No freeze lasts as long as the 30 s silence after which a
 //! connection is declared dead, so the pair's connection survives each one.
 //! 1. An anchor, alice, bob and carol (`vox daemon`s, all trusting each other) share a room, and
-//!    each reads the others.
+//!    each reads the others' **latest** hello. The hellos go in rounds, a new one from everyone
+//!    every [`HELLO_ROUND`] until a round is read by all (#231): a member's consent releases its key
+//!    from when its node **learns** the other joined (PRD-001 R12, "from now on", as the decider
+//!    confirmed on #231), so a hello posted in the moment before that is never readable to the one
+//!    who joined, and a proof that waited for the first hello went red in 4 of 20 runs on
+//!    integrate 1de7548 without anything being lost.
 //! 2. Bob is frozen (`SIGSTOP`). Alice posts [`POSTS`] rows of [`ROW`] bytes, and **carol reads
 //!    all of them**. That is the precondition, readable through `vox room read`.
 //! 3. Alice's daemon and the anchor are stopped. Carol is frozen and bob is continued. With nobody
@@ -47,6 +52,8 @@ const ROW: usize = 60_000;
 /// time on loopback, and past two 30 s intervals, so neither the tick nor luck can pass it.
 const CONVERGE: Duration = Duration::from_secs(150);
 const SETUP: Duration = Duration::from_secs(90);
+/// How long one round of hellos is given before everyone posts the next (see step 1).
+const HELLO_ROUND: Duration = Duration::from_secs(10);
 
 fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     let mut child = Command::new(VOX)
@@ -228,44 +235,55 @@ fn two_backlogs_that_meet_both_cross() {
         assert!(ok, "{name} joins: {out}{err}");
     }
 
-    // Everyone reads everyone before anything large moves.
-    for (name, d) in members {
-        let (ok, _, err) = vox_once(
-            d,
-            &args(&["room", "post", &room, &format!("hello from {name}")]),
-        );
-        assert!(ok, "{name} posts: {err}");
-    }
+    // Everyone reads everyone's latest hello before anything large moves (step 1).
     let deadline = Instant::now() + SETUP;
     let mut missing: Vec<String> = Vec::new();
+    let mut round = 0u32;
     'warm: loop {
-        missing.clear();
-        for (reader, d) in members {
-            let (_, r, _) = vox_once(d, &args(&["room", "read", &room]));
-            for (n, _) in members {
-                if !r.contains(&format!("hello from {n}")) {
-                    missing.push(format!("{reader} cannot read {n}"));
+        round += 1;
+        for (name, d) in members {
+            let (ok, _, err) = vox_once(
+                d,
+                &args(&[
+                    "room",
+                    "post",
+                    &room,
+                    &format!("hello from {name} r{round}"),
+                ]),
+            );
+            assert!(ok, "{name} posts: {err}");
+        }
+        let round_ends = Instant::now() + HELLO_ROUND;
+        while Instant::now() < round_ends {
+            missing.clear();
+            for (reader, d) in members {
+                let (_, r, _) = vox_once(d, &args(&["room", "read", &room]));
+                for (n, _) in members {
+                    if !r.contains(&format!("hello from {n} r{round}")) {
+                        missing.push(format!("{reader} cannot read {n}"));
+                    }
                 }
             }
-        }
-        if missing.is_empty() {
-            break 'warm;
-        }
-        if Instant::now() >= deadline {
-            // Each daemon's own report, so a red names its cause.
-            for (name, p) in [
-                ("alice", &mut alice),
-                ("bob", &mut bob),
-                ("carol", &mut carol),
-            ] {
-                eprintln!("---- {name}'s daemon ----\n{}", p.transcript());
+            if missing.is_empty() {
+                eprintln!("[setup] everyone reads everyone's hello of round {round}");
+                break 'warm;
             }
+            if Instant::now() >= deadline {
+                // Each daemon's own report, so a red names its cause.
+                for (name, p) in [
+                    ("alice", &mut alice),
+                    ("bob", &mut bob),
+                    ("carol", &mut carol),
+                ] {
+                    eprintln!("---- {name}'s daemon ----\n{}", p.transcript());
+                }
+                panic!(
+                    "CANNOT MEASURE: after {SETUP:?} ({round} rounds of hellos) the members still \
+                     do not all read each other: {missing:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
-        assert!(
-            Instant::now() < deadline,
-            "CANNOT MEASURE: after {SETUP:?} the members still do not all read each other: {missing:?}"
-        );
-        std::thread::sleep(Duration::from_millis(250));
     }
 
     // ---- 2. bob frozen; alice's backlog reaches carol --------------------------------------

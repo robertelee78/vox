@@ -61,18 +61,18 @@ pub fn system_millis_clock() -> MillisClock {
 pub const TEST_CLOCK_SKEW_ENV: &str = "VOX_TEST_CLOCK_SKEW_MS";
 
 /// [`system_millis_clock`], shifted by a signed number of milliseconds read once from
-/// [`TEST_CLOCK_SKEW_ENV`]. **Test-only: nothing in a real deployment sets it.**
+/// [`TEST_CLOCK_SKEW_ENV`]. **Test-only: for proofs; nothing in a real deployment sets it.**
 ///
-/// It exists so a proof can drive the shipped binary with a node whose clock is wrong
-/// — ADR-023 proof 2 posts a reply from a node an hour behind and asserts the reply is
-/// still ordered after what it answered. A proof that pinned the clock inside the
-/// process would not be the binary a person runs. Only the millisecond clock moves:
-/// that is the one that stamps a message's claimed time. The seconds [`Clock`] feeds
-/// record and session lifetimes, and skewing it would make the node unreachable, which
-/// is a different test.
+/// It lets a proof drive the shipped binary with a node whose millisecond clock is wrong, which
+/// a proof that pinned the clock inside the process could not: that would not be the binary a
+/// person runs. ADR-023 proof 2 posts a reply from a node an hour behind and asserts the reply is
+/// still ordered after what it answered; #230's proof starts a node a moment behind so its first
+/// board record is refused as stale, deterministically. Only the millisecond clock moves — the one
+/// that stamps a message's claimed time and floors a board record's `seq` — never the seconds
+/// [`Clock`], which feeds record and session lifetimes: skewing it would make the node
+/// unreachable, which is a different test.
 ///
-/// Unset, empty or unparsable is no skew: an operator who never heard of it gets the
-/// system clock.
+/// Unset, empty or unparsable is no skew: an operator who never heard of it gets the system clock.
 #[must_use]
 pub fn millis_clock_with_test_skew() -> MillisClock {
     let skew: i64 = std::env::var(TEST_CLOCK_SKEW_ENV)

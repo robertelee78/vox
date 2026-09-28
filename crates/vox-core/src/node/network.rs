@@ -320,9 +320,12 @@ pub struct NodeNet {
     /// The peers a [`NodeNet::reach`] is under way to, each with what its waiters are woken by.
     /// **One ladder per peer at a time.** Two at once each raced a circuit through the same
     /// relay, and the far end keeps one circuit per peer: attaching the second closed the
-    /// first, whose handshake then waited out its full attempt (10 s) — a cold `vox forward`
-    /// took 10.8 s whenever the room it reopened was also dialling that member (#226).
+    /// first, whose handshake then waited out its full attempt (10 s). Measured on the v0.3.0
+    /// merge, where a reopened room dialled its members beside a `vox forward`: cold relayed
+    /// connections of 10.8 s instead of about 260 ms (#226).
     reaching: Mutex<HashMap<Digest32, Arc<tokio::sync::Notify>>>,
+    /// Where each ladder run is counted for `vox status --json`, once the node has one.
+    status: Mutex<Option<crate::node::status::SharedSyncBook>>,
     service: RendezvousService,
     membership: SharedMembership,
     policy: SharedPolicy,
@@ -353,6 +356,11 @@ impl std::fmt::Debug for NodeNet {
 }
 
 impl NodeNet {
+    /// Count this node's reachability ladders in `book` (`vox status --json`'s `reach`).
+    pub fn count_ladders_in(&self, book: crate::node::status::SharedSyncBook) {
+        *lock(&self.status) = Some(book);
+    }
+
     /// Build the surface over a bound endpoint. The board it serves is fresh
     /// in-memory state (an anchor that persists a board is M15).
     #[must_use]
@@ -369,6 +377,7 @@ impl NodeNet {
             observed: Mutex::new(BTreeMap::new()),
             circuits: Arc::new(CircuitLedger::default()),
             reaching: Mutex::new(HashMap::new()),
+            status: Mutex::new(None),
             service,
             membership,
             policy: SharedPolicy::new(),
@@ -512,8 +521,9 @@ impl NodeNet {
         peer: Digest32,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
         let (kind, mut send, mut recv) = accept_typed_on(conn).await?;
-        if !PeerPolicy::allows(self.classify(&peer), kind) {
-            crate::node::net::refuse_stream(&mut send, &mut recv);
+        let class = self.classify(&peer);
+        if !PeerPolicy::allows(class, kind) {
+            crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
             return Err(crate::error::Error::StreamRefused(
                 "peer may not open this stream kind",
             ));
@@ -810,6 +820,9 @@ impl NodeNet {
         if let Some(conn) = self.manager.existing(&peer) {
             return Ok(conn);
         }
+        if let Some(book) = lock(&self.status).as_ref() {
+            crate::node::status::SyncBook::note_ladder(book, peer);
+        }
         // Each rung is spawned with the label it will be reported under, because a rung
         // that fails is only actionable if the operator knows *which* rung it was: a
         // dialable address that never answers and a helper that refuses to relay call for
@@ -1049,6 +1062,14 @@ impl NodeNet {
                     members: members.len(),
                     pending: guard.current_prejoins(&channel_id, now).len(),
                     entries: None,
+                    holding: guard
+                        .current_members(&channel_id, 0, now)
+                        .iter()
+                        .map(|r| {
+                            let addrs = r.endpoints.addrs().iter().map(ToString::to_string);
+                            (r.author_id, addrs.collect())
+                        })
+                        .collect(),
                 }
             })
             .collect()

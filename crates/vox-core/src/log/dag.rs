@@ -155,6 +155,10 @@ pub enum ForkOutcome {
 pub enum Rejected {
     /// The author is not in the admitted set for the entry's `(channel, epoch)`.
     NotAdmitted,
+    /// The author was frozen by an attributable fork proof; its further entries are refused.
+    /// Split from [`Rejected::NotAdmitted`] (ADR-025 D3): sync classifies the two differently, and
+    /// a frozen author's position counts as filled where an unadmitted one's does not.
+    Frozen,
     /// The entry's authenticator (or author/structure) failed verification.
     Verification(Error),
     /// The entry conflicts with a stored entry at the same `(author, seq)`
@@ -320,7 +324,7 @@ impl Dag {
     /// Steps, in order (any failure leaves the DAG unchanged):
     /// 1. If the author is frozen, refuse ([`Rejected::Fork`] with the recorded
     ///    proof is *not* re-raised; later entries from a frozen author are simply
-    ///    refused via [`Rejected::NotAdmitted`]).
+    ///    refused via [`Rejected::Frozen`]).
     /// 2. Duplicate (same hash already stored) → [`Rejected::Duplicate`]
     ///    (idempotent replication).
     /// 3. Admission: author ∈ admitted set for `(channel, epoch)`.
@@ -357,7 +361,7 @@ impl Dag {
 
         // A frozen author's further entries are refused outright.
         if self.frozen.contains_key(&author) {
-            return Err(Rejected::NotAdmitted);
+            return Err(Rejected::Frozen);
         }
 
         // Idempotent duplicate.

@@ -428,6 +428,30 @@ impl Store {
             .map(|v| v.value().to_vec()))
     }
 
+    /// Read and replace one metadata entry in **one** write transaction, so two callers cannot
+    /// interleave between the read and the write (redb admits one writer at a time). `f` is
+    /// given the current value and returns the new one, plus whatever it wants to hand back.
+    pub fn update_meta<T>(
+        &self,
+        name: &str,
+        f: impl FnOnce(Option<&[u8]>) -> Result<(Vec<u8>, T)>,
+    ) -> Result<T> {
+        let txn = self.begin_write()?;
+        let out = {
+            let mut meta = txn.open_table(META).map_err(storage("open meta"))?;
+            let current = meta
+                .get(name)
+                .map_err(storage("read meta"))?
+                .map(|v| v.value().to_vec());
+            let (next, out) = f(current.as_deref())?;
+            meta.insert(name, next.as_slice())
+                .map_err(storage("write meta"))?;
+            out
+        };
+        txn.commit().map_err(storage("commit"))?;
+        Ok(out)
+    }
+
     /// Begin an atomic multi-write batch. Nothing is visible until
     /// [`Batch::commit`]; a dropped batch writes nothing.
     pub fn batch(&self) -> Result<Batch<'_>> {

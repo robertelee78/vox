@@ -274,7 +274,9 @@ pub fn ui_error(f: Fault) -> UiError {
         // A link that will not parse is malformed input, not a network failure.
         Fault::BadLink => UiError::Malformed,
         // Nobody has published the room where we looked: a reachability problem, not bad input.
-        Fault::Unreachable | Fault::RoomNotOnBoard => UiError::Unreachable,
+        Fault::Unreachable | Fault::BoardUnreachable | Fault::RoomNotOnBoard => {
+            UiError::Unreachable
+        }
         Fault::Refused => UiError::Refused,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,

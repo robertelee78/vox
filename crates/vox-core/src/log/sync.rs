@@ -602,7 +602,7 @@ pub fn wire_error_for(err: &Error) -> WireError {
 #[must_use]
 pub fn wire_error_for_rejected(rej: &Rejected) -> WireError {
     match rej {
-        Rejected::NotAdmitted => WireError::EpochMismatch,
+        Rejected::NotAdmitted | Rejected::Frozen => WireError::EpochMismatch,
         Rejected::Verification(e) => wire_error_for(e),
         Rejected::Feed(_) => WireError::AuthenticatorInvalid,
         Rejected::Fork(_) => WireError::AuthenticatorInvalid,
@@ -650,9 +650,16 @@ pub fn apply_entry<R: AuthorResolver>(
     entry_wire: &[u8],
 ) -> std::result::Result<ApplyOutcome, WireError> {
     let entry = Entry::from_wire(entry_wire).map_err(|e| wire_error_for(&e))?;
+    // **An author this node has not admitted is `NotAdmitted`, as the DAG says it** (#217) — not an
+    // authenticator failure. Nothing about the entry was shown to be forged: this node simply does
+    // not know the author yet. Measured: members that had just joined received, from their anchor,
+    // the first entry of a member who joined after them, and reported "sync failed: authenticator
+    // invalid" — an integrity failure — for an author their next sync admits. The stream still
+    // closes (ADR-008: an entry that cannot be verified is refused), with the code
+    // `Rejected::NotAdmitted` already maps to.
     let key = resolver
         .key_for(&entry.skeleton.author_id)
-        .ok_or(WireError::AuthenticatorInvalid)?;
+        .ok_or_else(|| wire_error_for_rejected(&Rejected::NotAdmitted))?;
     let kind = resolver.kind_for(&entry);
     match dag.accept(entry, kind, &key, admission) {
         Ok(_) => Ok(ApplyOutcome::Stored),
@@ -867,13 +874,19 @@ where
 /// was slow to answer then held the room for up to the frame timeout, and every other use of the
 /// room — a message being posted, the node's view being published after every event — waited
 /// behind it (ADR-008's own implementation note named the fix).
+///
+/// Every step also fails once the session has been **retired** (ADR-025 D1a): an abort stops the
+/// task that started the session, not a worker already running it, so the worker stops at its next
+/// room step instead.
 pub trait SessionRoom {
-    /// The room's frontiers, for `HAVE`.
+    /// The room's frontiers, for `HAVE`, and the room's generation read under the same lock
+    /// (ADR-025 D1): everything stored up to that generation is covered by this `HAVE`.
     ///
     /// # Errors
-    /// The room is unusable (poisoned, or moved to another epoch).
-    fn frontiers(&self) -> std::result::Result<Vec<FeedFrontier>, WireError>;
-    /// What to ask the peer for, given its `HAVE`.
+    /// The room is unusable (poisoned, moved to another epoch, or the session retired).
+    fn frontiers(&self) -> std::result::Result<(Vec<FeedFrontier>, u64), WireError>;
+    /// What to ask the peer for, given its `HAVE`. A frozen author's ranges are not asked for
+    /// (ADR-025 D3): its entries would be refused, and asking again would re-serve them for ever.
     ///
     /// # Errors
     /// As [`SessionRoom::frontiers`].
@@ -885,87 +898,426 @@ pub trait SessionRoom {
     fn entries(&self, wants: &[WantRange]) -> std::result::Result<Vec<Vec<u8>>, WireError>;
     /// Apply a batch of received entries under a fresh lock, **against the room's current rules**: an
     /// author revoked while the batch was on the wire is refused, and a room that moved to another
-    /// epoch refuses the whole batch. Returns how many were newly stored.
+    /// epoch refuses the whole batch. Returns each entry's class, in order, as far as the batch
+    /// got, how many entries were **persisted** (`stored` means persisted, ADR-025), and the hard
+    /// failure that stopped it, if one did.
+    fn apply(&self, staged: Vec<Vec<u8>>) -> ApplyReport;
+    /// The room's generation now.
     ///
     /// # Errors
-    /// A hard sync failure from an entry, or the room is unusable.
-    fn apply(&self, staged: Vec<Vec<u8>>) -> std::result::Result<usize, WireError>;
+    /// As [`SessionRoom::frontiers`].
+    fn generation(&self) -> std::result::Result<u64, WireError>;
 }
 
 /// How many received entries are staged before a batch is applied. Bounds what a session holds in
 /// memory between locks; each batch is one short hold of the room.
 pub const MAX_STAGED: usize = 256;
 
-/// One peer's half of a frontier session, over `t`, against `room` — the same protocol as
-/// [`frontier_session_peer`], with the room locked only inside each [`SessionRoom`] step and never
-/// across a send or a receive.
-///
-/// # Errors
-/// The coded [`WireError`] of a hard fail; the transport is closed with it.
-pub fn frontier_session_room<T, S>(t: &mut T, room: &S) -> std::result::Result<usize, WireError>
-where
-    T: Transport,
-    S: SessionRoom + ?Sized,
-{
-    match frontier_session_room_inner(t, room) {
-        Ok(applied) => Ok(applied),
-        Err(code) => {
-            t.close(code);
-            Err(code)
+/// What one received entry turned out to be (ADR-025 D3), from the predicates the DAG has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryClass {
+    /// Accepted and stored.
+    Stored,
+    /// Already held.
+    Duplicate,
+    /// Conflicted with a stored entry at the same `(author, seq)`: a fork, recorded (the author is
+    /// frozen on an attributable proof). This continued the session before ADR-025 too.
+    ForkHandled,
+    /// From an author a fork proof froze.
+    Frozen,
+    /// From an author this node has not admitted, or has no key for. **Continues the session**
+    /// (ADR-025): the entry is refused, the rest of the batch is applied, and the port asks again
+    /// once it has learned the room's members.
+    Unadmitted,
+}
+
+impl EntryClass {
+    /// Whether the entry fills its requested position (ADR-025 D3). An unadmitted entry does not:
+    /// it is still owed once its author is admitted.
+    #[must_use]
+    pub fn fills(self) -> bool {
+        !matches!(self, Self::Unadmitted)
+    }
+}
+
+/// What [`SessionRoom::apply`] did with one batch.
+#[derive(Debug, Default)]
+pub struct ApplyReport {
+    /// Each entry's class, in order, up to the entry that failed (exclusive).
+    pub classes: Vec<EntryClass>,
+    /// How many entries were newly persisted.
+    pub stored: usize,
+    /// The hard failure that stopped the batch.
+    pub fail: Option<WireError>,
+}
+
+/// Why a [`frontier_session_room`] did not complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionError {
+    /// This side failed it, with this code: a transport failure, or a frame or entry from the peer
+    /// that is not acceptable.
+    Local(WireError),
+    /// The peer refused or reset the stream with this code.
+    Peer(WireError),
+    /// The peer served an entry this side did not ask for, or served one twice (ADR-025 D3). Local
+    /// only: no wire code says it, and the stream is reset with the uninformative one.
+    ProtocolViolation,
+}
+
+impl SessionError {
+    /// The wire code the stream is closed with.
+    #[must_use]
+    pub fn close_code(self) -> WireError {
+        match self {
+            Self::Local(c) | Self::Peer(c) => c,
+            Self::ProtocolViolation => WireError::AuthenticatorInvalid,
         }
     }
 }
 
-fn frontier_session_room_inner<T, S>(t: &mut T, room: &S) -> std::result::Result<usize, WireError>
+/// What one [`frontier_session_room`] did, as this side saw it — including when it failed, so the
+/// entries it persisted before failing are still counted (ADR-025: a failure returns its committed
+/// prefix in a structured partial outcome).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RoomSession {
+    /// Entries newly persisted.
+    pub applied: usize,
+    /// Whether every position this side asked for was filled.
+    pub complete: bool,
+    /// Whether any requested position was newly filled.
+    pub filled_any: bool,
+    /// Entries refused as unadmitted.
+    pub unadmitted: usize,
+    /// Entries refused because their author is frozen.
+    pub frozen: usize,
+    /// Forks recorded.
+    pub forks: usize,
+    /// The room's generation read with this side's `HAVE` (`None` if the session failed before).
+    pub gen_have: Option<u64>,
+    /// The room's generation when the session ended.
+    pub gen_end: Option<u64>,
+    /// Why it did not complete.
+    pub fail: Option<SessionError>,
+}
+
+/// A set of `u64` positions as sorted, disjoint, non-adjacent inclusive intervals (ADR-025 D3:
+/// coverage is interval arithmetic, never per-position sets, because a `HAVE` may claim
+/// `max_seq = u64::MAX`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntervalSet(Vec<(u64, u64)>);
+
+impl IntervalSet {
+    /// Whether `x` is in the set.
+    #[must_use]
+    pub fn contains(&self, x: u64) -> bool {
+        let i = self.0.partition_point(|&(_, to)| to < x);
+        self.0.get(i).is_some_and(|&(from, _)| from <= x)
+    }
+
+    /// Add the interval `from..=to`.
+    pub fn insert(&mut self, from: u64, to: u64) {
+        if from > to {
+            return;
+        }
+        let (mut from, mut to) = (from, to);
+        // Every interval that overlaps or touches `from..=to` is merged into it.
+        let start = self.0.partition_point(|&(_, t)| t.saturating_add(1) < from);
+        let mut end = start;
+        while end < self.0.len() && self.0[end].0 <= to.saturating_add(1) {
+            from = from.min(self.0[end].0);
+            to = to.max(self.0[end].1);
+            end += 1;
+        }
+        self.0.splice(start..end, std::iter::once((from, to)));
+    }
+
+    /// Whether every position of `other` is in `self`.
+    #[must_use]
+    pub fn covers(&self, other: &Self) -> bool {
+        other.0.iter().all(|&(from, to)| {
+            let i = self.0.partition_point(|&(_, t)| t < from);
+            self.0.get(i).is_some_and(|&(f, t)| f <= from && to <= t)
+        })
+    }
+}
+
+/// What this side asked for, and what has arrived against it (ADR-025 D3).
+#[derive(Debug, Default)]
+struct Coverage {
+    /// Per author, the requested positions.
+    wanted: std::collections::BTreeMap<Digest32, IntervalSet>,
+    /// Per author, the positions an entry has arrived for (whatever its class).
+    arrived: std::collections::BTreeMap<Digest32, IntervalSet>,
+    /// Per author, the positions filled.
+    filled: std::collections::BTreeMap<Digest32, IntervalSet>,
+    /// Per `(author, seq)` of a single-position request, the head hash the peer advertised for it.
+    heads: std::collections::BTreeMap<(Digest32, u64), Digest32>,
+}
+
+impl Coverage {
+    fn new(wants: &[WantRange], remote: &[FeedFrontier]) -> Self {
+        let mut c = Self::default();
+        for w in wants.iter().filter(|w| w.from_seq <= w.to_seq) {
+            c.wanted
+                .entry(w.author_id)
+                .or_default()
+                .insert(w.from_seq, w.to_seq);
+            if w.from_seq == w.to_seq {
+                if let Some(f) = remote
+                    .iter()
+                    .find(|f| f.author_id == w.author_id && f.max_seq == w.to_seq)
+                {
+                    c.heads.insert((w.author_id, w.to_seq), f.head_hash);
+                }
+            }
+        }
+        c
+    }
+
+    /// Admit an arriving entry: it must fall in a requested, not yet arrived position of its
+    /// author, and a single-position request's entry must carry the advertised head hash.
+    fn admit(&mut self, author: Digest32, seq: u64, hash: &Digest32) -> bool {
+        if !self.wanted.get(&author).is_some_and(|w| w.contains(seq)) {
+            return false;
+        }
+        let arrived = self.arrived.entry(author).or_default();
+        if arrived.contains(seq) {
+            return false;
+        }
+        if let Some(head) = self.heads.get(&(author, seq)) {
+            if head != hash {
+                return false;
+            }
+        }
+        arrived.insert(seq, seq);
+        true
+    }
+
+    fn fill(&mut self, author: Digest32, seq: u64) {
+        self.filled.entry(author).or_default().insert(seq, seq);
+    }
+
+    fn complete(&self) -> bool {
+        self.wanted
+            .iter()
+            .all(|(a, w)| self.filled.get(a).is_some_and(|f| f.covers(w)))
+    }
+}
+
+/// One peer's half of a frontier session, over `t`, against `room` — the same protocol as
+/// [`frontier_session_peer`], with the room locked only inside each [`SessionRoom`] step and never
+/// across a send or a receive.
+///
+/// **Checks what arrives against what was asked** (ADR-025 D3): an entry outside this side's
+/// `WANT`, or at a position already served, is a protocol violation — the session fails, the entry
+/// is not stored, and the stream is reset. An unadmitted or frozen author's entry does not fail
+/// the session: it is classified and the rest is applied.
+///
+/// Never fails as a whole: the outcome carries what was persisted and why it stopped, if it did.
+/// On a failure the transport is closed with the code.
+pub fn frontier_session_room<T, S>(t: &mut T, room: &S) -> RoomSession
 where
     T: Transport,
     S: SessionRoom + ?Sized,
 {
-    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|e| wire_of(&e));
+    let mut out = RoomSession::default();
+    if let Err(e) = frontier_session_room_inner(t, room, &mut out) {
+        t.close(e.close_code());
+        out.fail = Some(e);
+        out.complete = false;
+    }
+    out
+}
+
+fn session_err(e: &Error) -> SessionError {
+    match e {
+        Error::PeerRefused(code) => SessionError::Peer(*code),
+        _ => SessionError::Local(WireError::TransportFailed),
+    }
+}
+
+fn frontier_session_room_inner<T, S>(
+    t: &mut T,
+    room: &S,
+    out: &mut RoomSession,
+) -> std::result::Result<(), SessionError>
+where
+    T: Transport,
+    S: SessionRoom + ?Sized,
+{
+    let local = SessionError::Local;
+    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|e| session_err(&e));
+    let recv = |t: &mut T| t.recv().map_err(|e| session_err(&e));
+    let decoded = |r: Option<Vec<u8>>| -> std::result::Result<SyncFrame, SessionError> {
+        match r {
+            Some(frame) => decode_frame(&frame).map_err(|_| local(WireError::SyncModeUnsupported)),
+            // A clean end-of-stream where a frame was due: the peer hung up mid-session.
+            None => Err(local(WireError::TransportFailed)),
+        }
+    };
 
     send(t, encode_hello(SYNC_MODE_FRONTIER))?;
-    let remote_hello = expect_hello(t.recv())?;
-    negotiate_mode(SYNC_MODE_FRONTIER, remote_hello)?;
+    let SyncFrame::Hello(remote_hello) = decoded(recv(t)?)? else {
+        return Err(local(WireError::SyncModeUnsupported));
+    };
+    negotiate_mode(SYNC_MODE_FRONTIER, remote_hello).map_err(local)?;
 
-    send(t, encode_have(&room.frontiers()?))?;
-    let remote_have = expect_have(t.recv())?;
+    let (frontiers, gen) = room.frontiers().map_err(local)?;
+    out.gen_have = Some(gen);
+    send(t, encode_have(&frontiers))?;
+    let SyncFrame::Have(remote_have) = decoded(recv(t)?)? else {
+        return Err(local(WireError::SyncModeUnsupported));
+    };
 
-    send(t, encode_want(&room.wants(&remote_have)?))?;
-    let their_wants = expect_want(t.recv())?;
+    let my_wants = room.wants(&remote_have).map_err(local)?;
+    let mut coverage = Coverage::new(&my_wants, &remote_have);
+    send(t, encode_want(&my_wants))?;
+    let SyncFrame::Want(their_wants) = decoded(recv(t)?)? else {
+        return Err(local(WireError::SyncModeUnsupported));
+    };
 
     // Served while the peer's entries are drained (V210-39): see `Transport::start_serving`.
     let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
     let frames: Vec<Vec<u8>> = room
-        .entries(&their_wants)?
+        .entries(&their_wants)
+        .map_err(local)?
         .iter()
         .map(|w| encode_entry(w))
         .collect();
     t.start_serving(frames, serve_deadline)
-        .map_err(|e| wire_of(&e))?;
+        .map_err(|e| session_err(&e))?;
 
     // Drained with no lock held; applied a batch at a time under a fresh one.
     let deadline = std::time::Instant::now() + DRAIN_BUDGET;
     let mut staged: Vec<Vec<u8>> = Vec::new();
-    let mut applied = 0;
-    while let Some(frame) = t.recv().map_err(|e| wire_of(&e))? {
+    let mut positions: Vec<(Digest32, u64)> = Vec::new();
+    let apply = |staged: Vec<Vec<u8>>,
+                 positions: Vec<(Digest32, u64)>,
+                 coverage: &mut Coverage,
+                 out: &mut RoomSession|
+     -> std::result::Result<(), SessionError> {
+        let report = room.apply(staged);
+        out.applied += report.stored;
+        for (class, (author, seq)) in report.classes.iter().zip(positions) {
+            match class {
+                EntryClass::Unadmitted => out.unadmitted += 1,
+                EntryClass::Frozen => out.frozen += 1,
+                EntryClass::ForkHandled => out.forks += 1,
+                EntryClass::Stored | EntryClass::Duplicate => {}
+            }
+            if class.fills() {
+                coverage.fill(author, seq);
+                out.filled_any = true;
+            }
+        }
+        match report.fail {
+            Some(code) => Err(local(code)),
+            None => Ok(()),
+        }
+    };
+    while let Some(frame) = recv(t)? {
         if std::time::Instant::now() >= deadline {
-            return Err(WireError::SyncModeUnsupported);
+            return Err(local(WireError::SyncModeUnsupported));
         }
         match decode_frame(&frame) {
             Ok(SyncFrame::Entry(wire)) => {
+                let entry = Entry::from_wire(&wire).map_err(|e| local(wire_error_for(&e)))?;
+                let (author, seq) = (entry.skeleton.author_id, entry.skeleton.seq);
+                if !coverage.admit(author, seq, &entry.entry_hash()) {
+                    // Nothing staged before it is lost: apply that first, then refuse.
+                    if !staged.is_empty() {
+                        apply(
+                            std::mem::take(&mut staged),
+                            std::mem::take(&mut positions),
+                            &mut coverage,
+                            out,
+                        )?;
+                    }
+                    return Err(SessionError::ProtocolViolation);
+                }
                 staged.push(wire);
+                positions.push((author, seq));
                 if staged.len() >= MAX_STAGED {
-                    applied += room.apply(std::mem::take(&mut staged))?;
+                    apply(
+                        std::mem::take(&mut staged),
+                        std::mem::take(&mut positions),
+                        &mut coverage,
+                        out,
+                    )?;
                 }
             }
-            Ok(_) | Err(_) => return Err(WireError::SyncModeUnsupported),
+            Ok(_) | Err(_) => return Err(local(WireError::SyncModeUnsupported)),
         }
     }
     if !staged.is_empty() {
-        applied += room.apply(staged)?;
+        apply(staged, positions, &mut coverage, out)?;
     }
-    t.finish_serving().map_err(|e| wire_of(&e))?;
-    Ok(applied)
+    t.finish_serving().map_err(|e| session_err(&e))?;
+    out.complete = coverage.complete();
+    out.gen_end = room.generation().ok();
+    Ok(())
+}
+
+/// Classify and apply one received entry (ADR-025 D3): the non-fatal classes are returned, and
+/// `Err` is a hard failure that ends the session, with its wire code.
+///
+/// # Errors
+/// The entry is malformed, fails verification, or does not link into its feed.
+pub fn apply_entry_classified<R: AuthorResolver>(
+    dag: &mut Dag,
+    resolver: &R,
+    admission: &AdmissionPolicy,
+    entry_wire: &[u8],
+) -> std::result::Result<EntryClass, WireError> {
+    let entry = Entry::from_wire(entry_wire).map_err(|e| wire_error_for(&e))?;
+    let Some(key) = resolver.key_for(&entry.skeleton.author_id) else {
+        return Ok(EntryClass::Unadmitted);
+    };
+    let kind = resolver.kind_for(&entry);
+    match dag.accept(entry, kind, &key, admission) {
+        Ok(_) => Ok(EntryClass::Stored),
+        Err(Rejected::Duplicate) => Ok(EntryClass::Duplicate),
+        Err(Rejected::Fork(_)) => Ok(EntryClass::ForkHandled),
+        Err(Rejected::Frozen) => Ok(EntryClass::Frozen),
+        Err(Rejected::NotAdmitted) => Ok(EntryClass::Unadmitted),
+        Err(other) => Err(wire_error_for_rejected(&other)),
+    }
+}
+
+/// Apply staged entries into `dag`, classifying each (ADR-025 D3), stopping at the first hard
+/// failure — the apply half of [`SessionRoom::apply`], for a caller that already holds its room.
+/// `stored` in the result counts entries the DAG took; the caller persists them and corrects it.
+pub fn apply_staged_classified<R: AuthorResolver>(
+    dag: &mut Dag,
+    resolver: &R,
+    admission: &AdmissionPolicy,
+    staged: &[Vec<u8>],
+) -> ApplyReport {
+    let mut report = ApplyReport::default();
+    for wire in staged {
+        match apply_entry_classified(dag, resolver, admission, wire) {
+            Ok(class) => {
+                if class == EntryClass::Stored {
+                    report.stored += 1;
+                }
+                report.classes.push(class);
+            }
+            Err(code) => {
+                report.fail = Some(code);
+                break;
+            }
+        }
+    }
+    report
+}
+
+/// [`wants_for`], without asking for a frozen author's entries (ADR-025 D3: the same prefix is
+/// not re-served for ever).
+#[must_use]
+pub fn wants_for_unfrozen(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
+    let mut wants = wants_for(dag, remote);
+    wants.retain(|w| !dag.is_frozen(&w.author_id));
+    wants
 }
 
 /// Apply staged entries into `dag`, returning how many were newly stored — the apply half of
