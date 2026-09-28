@@ -157,11 +157,22 @@ impl SyncBook {
             );
         }
         s.push_str("],\"reach\":[");
-        for (i, (peer, n)) in b.ladders.iter().enumerate() {
+        // Ladders from this book; circuits counted where every outbound circuit is asked for
+        // (`circuitstream::connect_through`). Every peer either names, in one row.
+        let circuits = crate::node::circuitstream::outbound_circuits();
+        let peers: std::collections::BTreeSet<&Digest32> =
+            b.ladders.keys().chain(circuits.keys()).collect();
+        for (i, peer) in peers.into_iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
-            let _ = write!(s, "{{\"peer\":\"{}\",\"ladders\":{n}}}", b32_encode(peer));
+            let _ = write!(
+                s,
+                "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{}}}",
+                b32_encode(peer),
+                b.ladders.get(peer).copied().unwrap_or(0),
+                circuits.get(peer).copied().unwrap_or(0)
+            );
         }
         s.push_str("]}");
         s

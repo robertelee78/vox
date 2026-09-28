@@ -338,6 +338,23 @@ where
     }
 }
 
+/// How many circuits this process has asked a relay for, per target peer (`vox status --json`'s
+/// `reach.circuits`, V210-53, #232). Counted here, in the one function every outbound circuit
+/// goes through — the ladder's circuit rung and `NodeNet::circuit_through` alike — so a second
+/// circuit to one peer shows however it was opened. One process is one node, so a process-wide
+/// count is that node's.
+static OUTBOUND_CIRCUITS: std::sync::Mutex<BTreeMap<Digest32, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// This node's outbound circuit count per target peer (see [`OUTBOUND_CIRCUITS`]).
+#[must_use]
+pub fn outbound_circuits() -> BTreeMap<Digest32, u64> {
+    OUTBOUND_CIRCUITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// Ask `relay` for a circuit to `peer` and, once it is up, dial `peer` through it.
 /// The connection that comes back is pinned to `peer` and authenticated by it, the
 /// same as a direct one.
@@ -349,6 +366,11 @@ pub async fn connect_through(
 ) -> Result<VoxConnection> {
     let (mut send, mut recv) = open_typed(relay, StreamKind::Circuit).await?;
     send_frame(&mut send, &CircuitFrame::Open { peer }).await?;
+    *OUTBOUND_CIRCUITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(peer)
+        .or_default() += 1;
     match opening_answer(&mut recv).await? {
         CircuitFrame::Opened => {}
         CircuitFrame::Refused { reason } => {
