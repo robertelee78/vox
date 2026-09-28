@@ -152,6 +152,10 @@ pub struct AnchoredChannel {
     /// Entries in the ciphertext copy of the log this node keeps for the channel
     /// (`None` when it keeps none — a client's board, or an anchor not yet caught up).
     pub entries: Option<u64>,
+    /// The address each member's live record on this board names, as the board would hand it to
+    /// any member asking where that member is (V210-51, #230): what `vox node` prints so an
+    /// operator — and a proof — can see which of a member's processes the board points at.
+    pub holding: Vec<(Digest32, Vec<String>)>,
 }
 
 /// A command from a client to the node.
