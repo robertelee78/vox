@@ -70,6 +70,43 @@ pub const MAX_FRAME: usize = 256 * 1024;
 /// Half a frame, so an estimate that ran short would still fit.
 pub const ROWS_BUDGET: usize = MAX_FRAME / 2;
 
+/// The environment variable [`frame_limit`] reads. **Test-only.**
+pub const TEST_MAX_FRAME_ENV: &str = "VOX_TEST_MAX_FRAME";
+
+/// The smallest frame [`TEST_MAX_FRAME_ENV`] may set: half of it still carries the largest room
+/// or trusted-identity entry, so a listing still pages.
+const MIN_TEST_FRAME: usize = 4 * 1024;
+
+/// The largest frame accepted in force: [`MAX_FRAME`], or **lower**, read once from
+/// [`TEST_MAX_FRAME_ENV`]. **Test-only: for proofs; nothing in a real deployment sets it.**
+///
+/// #189's proof shows that `vox room list` and `vox trust list` name every entry past one frame,
+/// through the shipped binary. At the real 256 KiB frame that takes about 1,540 rooms, each
+/// sealed with production Argon2id, which does not fit a watchdog; the decider puts a node's
+/// realistic ceiling at a couple of hundred rooms. With a smaller frame, a couple of hundred
+/// rooms outgrow one, so a reply that is not paged fails exactly as the defect did ("ipc frame
+/// length"), and a paged one crosses several pages. It only ever lowers the limit, clamped to
+/// [`MIN_TEST_FRAME`]..=[`MAX_FRAME`]; unset, empty or unparsable is [`MAX_FRAME`]. Under it, a
+/// single row larger than half the frame (a long message) is refused, so a proof that sets it
+/// keeps its rows small.
+#[must_use]
+pub fn frame_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var(TEST_MAX_FRAME_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(MAX_FRAME, |n| n.clamp(MIN_TEST_FRAME, MAX_FRAME))
+    })
+}
+
+/// What one reply may carry in force: half of [`frame_limit`] ([`ROWS_BUDGET`] unless a proof
+/// lowered the frame).
+#[must_use]
+pub fn rows_budget() -> usize {
+    frame_limit() / 2
+}
+
 /// Everything a row carries besides its text — two 32-byte hashes, a timestamp and the
 /// CBOR around them — rounded up.
 pub const ROW_OVERHEAD: usize = 128;
@@ -1319,7 +1356,7 @@ pub async fn read_frame(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
         Err(_) => return Err(Error::MalformedIpc("ipc read len")),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
+    if len > frame_limit() {
         return Err(Error::SizeLimitExceeded("ipc frame length"));
     }
     let mut body = vec![0u8; len];
@@ -1513,7 +1550,7 @@ fn page<T>(
             continue;
         }
         let cost = len + ENTRY_OVERHEAD;
-        if !out.is_empty() && (out.len() >= PAGE_ENTRIES || bytes + cost > ROWS_BUDGET) {
+        if !out.is_empty() && (out.len() >= PAGE_ENTRIES || bytes + cost > rows_budget()) {
             break;
         }
         bytes += cost;
@@ -1641,7 +1678,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     break;
                 }
                 let cost = r.text.len() + ROW_OVERHEAD;
-                if !rows.is_empty() && bytes + cost > ROWS_BUDGET {
+                if !rows.is_empty() && bytes + cost > rows_budget() {
                     break;
                 }
                 bytes += cost;
