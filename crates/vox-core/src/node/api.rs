@@ -399,6 +399,11 @@ pub enum Fault {
     KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
+    /// The identity passphrase was right, but something this identity sealed (its trust
+    /// keyring, pending consents or prekey ring) will not open under it: the data was altered,
+    /// or written by another identity. Not [`Fault::WrongPassphrase`], which sent a person to
+    /// retype a passphrase that had just been proved correct (V210-40).
+    SealedUnreadable,
     /// The node is shutting down.
     ShuttingDown,
     /// This node is not networked, or is locked, so it cannot reach anyone.
@@ -494,7 +499,12 @@ impl Fault {
                 "your trust keyring is full (1,024 identities)\n       remove one with `vox trust remove <fingerprint>`, then add again"
             }
             Fault::Storage => {
-                "the profile's store could not be written\n       check free disk space and that the data directory is writable"
+                "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
+            }
+            Fault::SealedUnreadable => {
+                "the identity passphrase is right, but this profile's trust keyring, pending \
+                 consents or prekey ring will not open under it\n       the store was altered, \
+                 or copied from another identity's profile"
             }
             Fault::ShuttingDown => "the node is shutting down",
             Fault::NotNetworked => {

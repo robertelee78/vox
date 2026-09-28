@@ -22,8 +22,9 @@
 //!
 //! **Where it is kept, and under what seal.** The counter and each trusted identity's value sit
 //! in one blob in the store's metadata table, sealed under HKDF of the identity's `self_seed`
-//! (as #208's open-room set is), so it is exactly as hard to open as the identity vault, and not
-//! under the classical `id_proof`-derived key the trust keyring still uses (#214). Each
+//! (as #208's open-room set is, and since #214 the trust keyring, pending consents and prekey
+//! ring too), so it is exactly as hard to open as the identity vault, never under a classical
+//! `id_proof`-derived key. Each
 //! generation's value is kept with the generation's origin in the room's own key material,
 //! which the room's SEK seals.
 //!

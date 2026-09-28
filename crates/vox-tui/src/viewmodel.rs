@@ -201,6 +201,8 @@ pub enum Event {
 pub enum UiError {
     /// Wrong channel passphrase on join.
     WrongPassphrase,
+    /// The identity opened, but what it sealed in the store would not (V210-40).
+    SealedUnreadable,
     /// Join proof-of-work is still being computed (Equihash delay).
     JoinPowDelay,
     /// Join proof-of-possession / identity mismatch.
@@ -266,6 +268,9 @@ impl UiError {
     pub fn message(self) -> &'static str {
         match self {
             UiError::WrongPassphrase => "wrong passphrase",
+            UiError::SealedUnreadable => {
+                "passphrase right, but this profile's keyring or prekeys will not open — altered, or another identity's"
+            }
             UiError::JoinPowDelay => "join proof-of-work in progress…",
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — both must be online (or run your node)",

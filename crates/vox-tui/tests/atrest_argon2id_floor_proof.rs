@@ -47,7 +47,15 @@ const FLOOR_T_COST: u32 = 3;
 const P_COST: u32 = 1;
 /// ADR-010's vault key schedule.
 const HKDF_INFO: &[u8] = b"vox/identity-vault-wrap/v1";
-const AAD: &[u8] = b"vox/identity-vault-aead/v1";
+/// The vault's AEAD associated data, by its version: v2 binds the version into it (V210-40, #214),
+/// so a relabelled vault does not open.
+fn aad(version: u64) -> &'static [u8] {
+    match version {
+        1 => b"vox/identity-vault-aead/v1",
+        2 => b"vox/identity-vault-aead/v2",
+        v => panic!("CANNOT MEASURE: a vault of unknown version {v}"),
+    }
+}
 
 /// The vault as it lies on disk: canonical CBOR
 /// `[version, profile_id, salt(16), nonce(12), ciphertext]`. Parsed here, by hand.
@@ -127,7 +135,7 @@ fn opens_with(v: &Vault, m_cost_kib: u32, t_cost: u32) -> bool {
             Nonce::from_slice(&v.nonce),
             Payload {
                 msg: &v.ciphertext,
-                aad: AAD,
+                aad: aad(v.version),
             },
         )
         .is_ok()

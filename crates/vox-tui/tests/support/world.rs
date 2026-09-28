@@ -36,7 +36,18 @@ impl VoxProc {
 
     /// [`VoxProc::spawn`] with extra environment, for the proofs' test-only knobs.
     pub fn spawn_env(name: &str, data: &Path, args: &[String], env: &[(&str, &str)]) -> Self {
-        let mut child = Command::new(VOX)
+        Self::spawn_exe(Path::new(VOX), name, data, args, env)
+    }
+
+    /// [`VoxProc::spawn_env`] with another `vox` binary (a previous release, for a migration).
+    pub fn spawn_exe(
+        exe: &Path,
+        name: &str,
+        data: &Path,
+        args: &[String],
+        env: &[(&str, &str)],
+    ) -> Self {
+        let mut child = Command::new(exe)
             .args(args)
             .envs(env.iter().copied())
             .env("VOX_DATA_DIR", data)
