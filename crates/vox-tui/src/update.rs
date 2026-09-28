@@ -680,22 +680,42 @@ fn sync_dir(dir: &Path) -> Result<(), AppError> {
         .map_err(AppError::Io)
 }
 
+/// Copy `from` to `to` and **flush the copy** before anyone renames it into place (V210-56, #242).
+///
+/// `fs::copy` returns once the bytes are handed to the kernel — on APFS it is a clone — and a
+/// rename that publishes the copy can reach the disk before the copy's own data and metadata do.
+/// A power loss in between left an empty or partial file under the name `vox` or `.vox-previous`:
+/// the one binary that had to survive. Every copy that is about to be renamed goes through here.
+/// `mode`, when given, is set before the flush, so the flush covers it too.
+fn copy_durably(from: &Path, to: &Path, mode: Option<u32>) -> Result<(), AppError> {
+    fs::copy(from, to).map_err(AppError::Io)?;
+    if let Some(mode) = mode {
+        fs::set_permissions(to, fs::Permissions::from_mode(mode)).map_err(AppError::Io)?;
+    }
+    fs::File::open(to)
+        .and_then(|f| f.sync_all())
+        .map_err(AppError::Io)
+}
+
 /// Make a verified candidate the active binary, keeping exactly one previous.
 ///
 /// The previous copy is completed *before* the rename, so a crash anywhere in here leaves a
-/// runnable `vox` — the old one or the new one, never a partial file.
+/// runnable `vox` — the old one or the new one, never a partial file. **Durably** (V210-56): each
+/// copy is flushed before the rename that publishes it, and the directory after each rename, so a
+/// power loss at any point leaves the same — not an empty file under a name that looked
+/// published.
 fn publish(install_dir: &Path, candidate: &Path) -> Result<(), AppError> {
     let active = install_dir.join(ACTIVE_NAME);
     let previous_partial = install_dir.join(PREVIOUS_PARTIAL);
-    fs::copy(&active, &previous_partial).map_err(AppError::Io)?;
+    copy_durably(&active, &previous_partial, None)?;
     fs::rename(&previous_partial, install_dir.join(PREVIOUS_NAME)).map_err(AppError::Io)?;
+    sync_dir(install_dir)?;
 
     // The download lives in a temporary directory that may be on another filesystem, so it is
     // copied next to the destination before the rename, which must be same-filesystem to be
     // atomic.
     let staged = install_dir.join(CANDIDATE_PARTIAL);
-    fs::copy(candidate, &staged).map_err(AppError::Io)?;
-    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).map_err(AppError::Io)?;
+    copy_durably(candidate, &staged, Some(0o755))?;
     fs::rename(&staged, &active).map_err(AppError::Io)?;
     sync_dir(install_dir)
 }
@@ -825,8 +845,12 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
     }
     let _lock = InstallLock::acquire(install_dir)?;
     let scratch = install_dir.join(ROLLBACK_PARTIAL);
-    fs::copy(&active, &scratch).map_err(AppError::Io)?;
+    // Durably, step by step (V210-56): the copy of the active binary is on disk before either
+    // rename, and each rename is on disk before the next — so a power loss anywhere leaves a
+    // runnable `vox` under that name, and the other binary under one of the two others.
+    copy_durably(&active, &scratch, None)?;
     fs::rename(&previous, &active).map_err(AppError::Io)?;
+    sync_dir(install_dir)?;
     fs::rename(&scratch, &previous).map_err(AppError::Io)?;
     sync_dir(install_dir)?;
     println!(
