@@ -218,6 +218,33 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
+    // Each node's sync counters (`vox status --json`, answered off the actor, so sampling them
+    // does not slow what is measured), every quarter second while Alice posts: a session, a busy
+    // refusal or a stall near a slow post shows here even when neither daemon printed anything.
+    let sampling = Arc::new(AtomicBool::new(true));
+    let samplers: Vec<_> = [("alice", alice_dir.clone()), ("bob", bob_dir.clone())]
+        .into_iter()
+        .map(|(who, dir)| {
+            let (sampling, said) = (Arc::clone(&sampling), Arc::clone(&said));
+            std::thread::spawn(move || {
+                let mut last = String::new();
+                while sampling.load(Ordering::Relaxed) {
+                    let (ok, out, _) = vox_once(&dir, &args(&["status", "--json"]));
+                    let out = out.trim().to_owned();
+                    if ok && out != last {
+                        said.lock().unwrap().push((
+                            t0.elapsed(),
+                            who,
+                            format!("sync counters {out}"),
+                        ));
+                        last = out;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            })
+        })
+        .collect();
+
     // ---- Alice's posts, timed ---------------------------------------------------------------
     let mut took: Vec<Duration> = Vec::with_capacity(POSTS);
     // Each post: which, when it started (against `t0`), how long it took.
@@ -233,7 +260,11 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         assert!(ok, "alice's post {i} failed: {err}");
     }
     stop.store(true, Ordering::Relaxed);
+    sampling.store(false, Ordering::Relaxed);
     bob_thread.join().unwrap();
+    for s in samplers {
+        s.join().unwrap();
+    }
     let bob_total = bob_posts.load(Ordering::Relaxed);
 
     // Bob's posts arrived at Alice during hers: the busy condition held for the measurement.
