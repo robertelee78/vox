@@ -346,7 +346,15 @@ pub async fn forward(
     // never blocked for more than one attempt.
     let deadline = Instant::now() + vox_core::node::up::HOST_PATIENCE;
     let mut said = false;
+    // **How long reaching the host took, said** (PRD-001 R42, #167). Counted from the first
+    // attempt — after this node has unlocked and opened the room, the two Argon2id steps a person
+    // waits for at the prompt — to the attempt that got through, every retry included: that is
+    // the wait R42 bounds ("a first connection to a peer, including NAT traversal, under 2 s"),
+    // and without it a slow first connection was indistinguishable from a slow unlock.
+    let first_attempt = Instant::now();
+    let mut attempts = 0u32;
     let out = loop {
+        attempts += 1;
         let out = node
             .apply(NodeCommand::Forward {
                 channel_id,
@@ -399,6 +407,12 @@ pub async fn forward(
             crate::ident::author_id(&host)
         )));
     }
+    eprintln!(
+        "vox: reached {} in {} ms ({attempts} attempt{})",
+        crate::ident::author_id(&host),
+        first_attempt.elapsed().as_millis(),
+        if attempts == 1 { "" } else { "s" }
+    );
     // The bound port comes back as an event, since port 0 is resolved by the OS.
     let bound = loop {
         match node.next_event().await {
@@ -712,6 +726,12 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         NodeEvent::Stalled { what, millis } => {
             eprintln!("vox: busy {millis}ms — {what} — nobody could be answered");
         }
+        NodeEvent::PublishCured { channel_id, what } => {
+            eprintln!(
+                "vox: {what} for room {} was taken on a republish, after the board refused it as stale",
+                short(channel_id)
+            );
+        }
         _ => {}
     }
 }
@@ -797,8 +817,15 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         // branch. The first version of this fix said "NOT the address or the
         // passphrase", which is the same false confidence as the sentence it replaced,
         // pointed the other way. Say what was and was not established.
+        //
+        // **And say which side was unreachable (#192).** One sentence covered both, and it said
+        // "every member the board knows is offline" when the board itself had never answered: a
+        // claim about members, made with no word from the board about any of them.
+        Some(Fault::BoardUnreachable) => {
+            "the anchor could not be reached, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the anchor is running (`vox node`) and that this node can reach its address"
+        }
         Some(Fault::Unreachable) => {
-            "nobody who can answer for this room could be reached\n       so your passphrase was never checked — this is not a verdict on it\n       every member the board knows is offline: ask one to come online, or check\n       `vox node` on the anchor shows more than `1m` for this room"
+            "the anchor answered, but no member it knows could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online, or check `vox node` on the anchor shows more than `1m` for this room"
         }
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
         // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
@@ -822,13 +849,16 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
 }
 
 /// The fault named in a daemon's reply to a join (`"Failed(Refused)"`), for the verbs that reach
-/// the node over its control socket, where only the outcome's name crosses the wire.
+/// the node over its control socket, where only the outcome's name crosses the wire. The name is
+/// the reply's first line; a failed join's steps follow it (see [`join_detail`]).
 pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
-    let name = reason.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
+    let first = reason.lines().next().unwrap_or_default();
+    let name = first.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
     Some(match name {
         "WrongPassphrase" => Fault::WrongPassphrase,
         "BadLink" => Fault::BadLink,
         "RoomNotOnBoard" => Fault::RoomNotOnBoard,
+        "BoardUnreachable" => Fault::BoardUnreachable,
         "Unreachable" => Fault::Unreachable,
         "Refused" => Fault::Refused,
         "NotNetworked" => Fault::NotNetworked,
@@ -837,6 +867,18 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
         "AlreadyMember" => Fault::AlreadyMember,
         _ => return None,
     })
+}
+
+/// What a daemon's reply to a failed join says after the fault's name: its `steps: …` and
+/// `said: …` lines, each indented under the advice as the house style indents a second line.
+/// Empty when the reply carried none.
+pub(crate) fn join_detail(reason: &str) -> String {
+    reason
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| format!("\n       {}", l.trim()))
+        .collect()
 }
 
 /// [`short`], reachable from the other CLI modules that report a peer.

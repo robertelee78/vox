@@ -2684,6 +2684,8 @@ dependencies = [
 name = "vox-tui"
 version = "0.2.9"
 dependencies = [
+ "aes-gcm",
+ "argon2",
  "clap",
  "clap_complete",
  "clap_mangen",
@@ -2692,6 +2694,7 @@ dependencies = [
  "hkdf",
  "qrcode",
  "ratatui",
+ "redb",
  "reqwest",
  "rustix 1.1.4",
  "secrecy",

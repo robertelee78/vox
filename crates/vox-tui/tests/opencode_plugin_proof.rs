@@ -35,6 +35,20 @@
 //!
 //! ## Honest coverage
 //!
+//! ## Every participant is the shipped binary
+//!
+//! The node is a real `vox daemon` holding a profile made as a person makes one — `vox id`,
+//! `vox daemon`, `vox room create` (passphrase on stdin) — and the codeword is posted with
+//! `vox room post`. The plugin is what `vox agent plugin opencode` prints, installed where a
+//! person puts it. Nothing in this process runs a node.
+//!
+//! ## The product mutation
+//!
+//! `--pure` removes the plugin from the harness; it does not break the product. So the proof
+//! is also run against a `vox` whose `vox agent hook` injects nothing (the drain returns
+//! before printing what is unread): the codeword must not reach the model, and the proof
+//! goes red at "the room never reached the model".
+//!
 //! OpenCode absent, or no usable credential, is reported **unproven and fails** —
 //! an absent prover is missing evidence, not evidence of correctness. Set
 //! `VOX_PROOF_ALLOW_UNPROVEN=opencode` to accept that gap deliberately and visibly.
@@ -44,15 +58,13 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
-use std::sync::Arc;
-
-use vox_core::node::actor::{Clock, Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, Secret};
-use vox_core::node::paths::Paths;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
+const IDENTITY: &str = "identity passphrase";
 
 /// Cheap and fast; overridable because pinning a model name in a test is brittle.
 fn model() -> String {
@@ -74,8 +86,46 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
+/// A `vox daemon`, killed by its own PID when dropped.
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `vox` against this profile, with `input` piped to stdin when given.
+fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, String, String) {
+    let mut child = Command::new(VOX)
+        .args(args)
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", cfg)
+        // In the environment, not argv: a command line is world-readable (ADR-015).
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn vox");
+    if let Some(text) = input {
+        let mut pipe = child.stdin.take().expect("vox stdin");
+        pipe.write_all(text.as_bytes()).expect("write stdin");
+        drop(pipe);
+    }
+    let out = child.wait_with_output().expect("vox ran");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// Where OpenCode keeps credentials. Copied into the test's own data dir so the run
@@ -153,24 +203,50 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
 
-    // ---- a real node, a real room, and a codeword only the room knows ----
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let clock: Clock = Arc::new(|| 1_800_000_000);
-    let node: NodeHandle = rt
-        .block_on(async {
-            Node::spawn_with(
-                paths.clone(),
-                clock,
-                vox_core::atrest::sek::Argon2Profile::default(),
-            )
-        })
-        .unwrap();
+    // ---- a real daemon, a real room, and a codeword only the room knows ----
+    let (ok, fp, err) = vox(&data, &cfg, &["id"], None);
+    assert!(ok && fp.trim().len() == 52, "vox id: {fp:?} {err}");
+    let _daemon = Daemon(
+        Command::new(VOX)
+            .args(["daemon", "--listen", "127.0.0.1:0"])
+            .env("VOX_DATA_DIR", &data)
+            .env("VOX_CONFIG_DIR", &cfg)
+            .env_remove("VOX_ROOM")
+            .stdin({
+                let pass = tmp.path().join("identity.pass");
+                std::fs::write(&pass, format!("{IDENTITY}\n")).unwrap();
+                Stdio::from(std::fs::File::open(&pass).unwrap())
+            })
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(tmp.path().join("daemon.err")).unwrap(),
+            ))
+            .spawn()
+            .expect("spawn vox daemon"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !vox(&data, &cfg, &["room", "list"], None).0 {
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: the daemon never answered; its stderr: {:?}",
+            std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let (ok, _, err) = vox(
+        &data,
+        &cfg,
+        &["room", "create", "--name", "agents"],
+        Some("channel passphrase\n"),
+    );
+    assert!(ok, "vox room create: {err}");
+    let room = vox(&data, &cfg, &["room", "list"], None)
+        .1
+        .split_whitespace()
+        .next()
+        .expect("the new room in `vox room list`")
+        .to_owned();
 
     // Unique per run, so a cached session cannot produce it and neither can a model
     // that has seen this file. Shaped to survive a model repeating it verbatim.
@@ -181,35 +257,19 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             .unwrap()
             .subsec_millis()
     );
-
-    let cid = rt.block_on(async {
-        assert!(node
-            .apply(NodeCommand::CreateIdentity {
-                passphrase: secret("identity passphrase"),
-            })
-            .await
-            .is_done());
-        assert!(node
-            .apply(NodeCommand::CreateChannel {
-                local_name: "agents".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-        let cid = node.view().channels[0].channel_id;
-        assert!(node
-            .apply(NodeCommand::SendText {
-                channel_id: cid,
-                text: format!("The codeword for this mission is {codeword}."),
-            })
-            .await
-            .is_done());
-        cid
-    });
-    let _server = rt
-        .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
-        .expect("bind");
-    let room = vox_core::node::link::b32_encode(&cid);
+    let (ok, _, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "post",
+            &room,
+            &format!("The codeword for this mission is {codeword}."),
+        ],
+        None,
+    );
+    assert!(ok, "vox room post: {err}");
+    println!("[proof] room {room} holds codeword {codeword}, posted through `vox room post`");
 
     // Isolate OpenCode's **configuration**, so the operator's own plugins, model
     // and provider settings cannot decide whether this passes.
@@ -266,11 +326,12 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     //
     // This is not a workaround for a defect in the plugin. It reproduces the state
     // every real project is in by its second turn.
-    std::fs::write(
-        project.join(".opencode/plugin/vox.js"),
-        vox_tui::agent_hook::OPENCODE_PLUGIN,
-    )
-    .unwrap();
+    let (ok, plugin, err) = vox(&data, &cfg, &["agent", "plugin", "opencode"], None);
+    assert!(
+        ok && plugin.contains("vox agent hook"),
+        "vox agent plugin opencode: {err}"
+    );
+    std::fs::write(project.join(".opencode/plugin/vox.js"), plugin).unwrap();
     for attempt in 0..3 {
         let _ = opencode_turn(&project, &env, false, "Reply with exactly: READY");
         if std::fs::read_to_string(&plugin_log)
@@ -290,6 +351,10 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
 
     // ---- the proof: a real model repeats something only the room told it ----
     let answer = opencode_turn(&project, &env, false, prompt);
+    println!(
+        "[proof] with the plugin, the model's answer contains the codeword: {}",
+        answer.contains(&codeword)
+    );
     assert!(
         answer.contains(&codeword),
         "the room never reached the model. Expected {codeword:?} in the model's answer, got: \
@@ -299,6 +364,10 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
 
     // ---- the mutation check: same everything, plugin disabled ----
     let without = opencode_turn(&project, &env, true, prompt);
+    println!(
+        "[proof] with --pure, the model's answer contains the codeword: {}",
+        without.contains(&codeword)
+    );
     assert!(
         !without.contains(&codeword),
         "`--pure` disables external plugins, so the codeword must be unreachable — if it still \

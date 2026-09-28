@@ -79,15 +79,24 @@ A proof whose prover is unavailable — an uninstalled shell, absent hardware, a
 MUST be reported as **unproven** and MUST fail the proof. It MUST NOT be silently skipped.
 
 A gap MAY be accepted deliberately, and when it is, the acceptance MUST be explicit and visible at the
-point of running (for example `VOX_PROOF_ALLOW_UNPROVEN=install.apple_gate_refuses_unsigned_bytes`)
+point of running (for example `VOX_PROOF_ALLOW_UNPROVEN=opencode`)
 and SHOULD be recorded here. A failing
 or blocked obligation MUST be recorded as failing or blocked, never as waived-green.
 
-**Accepted gaps, as of 2026-09-21:**
+**Accepted gaps, as of 2026-09-27** (the one CI still names):
 
-| Gap | Accepted because | What would close it |
+| Gap | Accepted because | Where it is proved instead |
 |---|---|---|
-| `install.apple_gate_refuses_unsigned_bytes` in `install_sh_proof` | the installer's Developer ID and notarization gate is macOS-only, so on Linux there is nothing to measure. On macOS it is proved, by forcing the gate on against an unsigned fixture. | nothing closes it on Linux; it is a property that does not exist there |
+| `opencode`: `agent_rehearsal_proof`, `drain_self_filter_proof`, `opencode_plugin_proof`, `tracker_rehearsal_proof` | they drive a live model through a real OpenCode, and CI runners have neither OpenCode nor a model account. The decider chose (2026-09-26) "Only on this Mac": they run with the decider's account on a real Mac. | `scripts/release-gate.sh`, which runs with **no** gap accepted and refuses a tag unless they are green |
+
+Until 2026-09-26 this table held `install.apple_gate_refuses_unsigned_bytes` (macOS-only, reported
+blocked on Linux). It is closed, as recorded below.
+
+**Closed 2026-09-26 (V210-20, #193): the Apple gate, and the update journey on CI.** A property a
+platform does not have is not a gap on that platform: `install_sh_proof` no longer makes the
+`install.apple_gate_refuses_unsigned_bytes` claim off macOS at all, and CI's macOS job proves it for
+real. `journey.update_replaces_an_older_install` had stayed on CI's list after it cleared (see
+below), and is removed. CI's list is now `opencode,cross-process-join,cross-process-tunnel`.
 
 **Closed by `v0.2.0`, 2026-09-22: the two `update_proof` gaps — and what the second one found.**
 Both were accepted because there was no earlier release to update *from*. `v0.2.0` supplied one, and
@@ -119,11 +128,13 @@ excuse `fish`**. An accepted gap that states its own remedy SHOULD be closed rat
 The whitelist is therefore per-environment, and CI's is the strict one:
 
 ```
-# CI (ubuntu + macOS, both with zsh, bash and fish installed):
-VOX_PROOF_ALLOW_UNPROVEN=journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes
+# CI (ubuntu + macOS, both with zsh, bash and fish installed), as of 2026-09-27:
+VOX_PROOF_ALLOW_UNPROVEN=opencode
+
+# the local release gate (scripts/release-gate.sh): none. It unsets the variable.
 
 # a developer machine that has no fish may additionally name it:
-VOX_PROOF_ALLOW_UNPROVEN=fish,journey.update_replaces_an_older_install,verify.digest_mismatch_is_refused,install.apple_gate_refuses_unsigned_bytes
+VOX_PROOF_ALLOW_UNPROVEN=fish,opencode
 ```
 
 A local list MAY be longer than CI's; it MUST NOT be shorter, and CI's MUST NOT grow to match a
@@ -494,7 +505,24 @@ made the close mechanical.
 
 ## Two proofs are excluded from the release gate, by name (2026-09-23)
 
-**Status: open defects, not accepted gaps.** Both are excluded from `release.yml`'s `--ignored` step
+**Status, 2026-09-27: neither is excluded any more.** `relayed_path_is_retried` was deleted with the
+in-process tests; RP-25 (#132) proves the upgrade through the shipped binary. `cross_process_join_proof`
+is back in the blocking gate (20 of 20 on 39c3884). Its independent verification saw one fast red in 3
+on 005b801 (a join straight after the invite, reported as `Unreachable`). Under #192 that red has not
+recurred: 12 of 12 on 1de7548 at 1-minute loads up to 69, and 15 of 15 with 005b801's product (and
+64b9074's test file) under 18 busy processes, at loads up to 95. **Its cause is not named**, and those
+runs only bound its rate: 30 clean runs in a row are what a 1–2% flake produces more often than not.
+What #192 changed is that the next red names itself. `vox room join` now says which side was
+unreachable — the anchor (`BoardUnreachable`) or every member it knows (`Unreachable`), which were one
+fault whose words blamed the members either way — and prints the join's recorded steps and what each
+responder said. And the proof reads each daemon's and the anchor's output line by line as it is
+written, where it used to read stderr to EOF, which comes only when the child exits after the panic, so
+every red's daemon and anchor sections were empty.
+Its `cross-process-join` and `cross-process-tunnel` allowances are removed from the proof's code, not
+only from CI's list: a join that fails there, or a file that does not cross, is red. The record below
+is the history.
+
+**Status then: open defects, not accepted gaps.** Both are excluded from `release.yml`'s `--ignored` step
 so a release can be built at all, and both still run in the same job as warnings so a change in their
 rate is visible rather than buried.
 
@@ -771,10 +799,12 @@ only, so a macOS-only red could not block a release; now it does. Both are shipp
 
 **How the suite is laid out in CI.** `build-test` (both OSes) runs fmt, clippy, the debug suite,
 rustdoc and the release `--ignored` suite **without** the PRD-001 transport gates, which run in
-parallel in `transport-gates` (`r40_`, `r41_`, `r42_`; ~20 minutes, the relay gate alone 11-22).
-Both are blocking. The by-name exclusion recorded in "Two proofs are excluded from the release gate,
-by name" now lives in `ci.yml`: `cross_process_join_proof` runs in `flaky-watch`, which reports and
-can never fail CI. Every `cargo test` runs `--no-fail-fast`, so one red cannot hide the rest.
+parallel in `transport-gates` (`r40_`, `r41_`; the in-process `r42_` gates were deleted 2026-09-26,
+and R42 is proved by RP-22/23/24 in `build-test`). Both are blocking. No proof is skipped by name
+(2026-09-27): `cross_process_join_proof` runs in `build-test`, and the reporting-only `flaky-watch` job
+that held it is removed. On the macOS runner R41's WAN link is reported rather than gated
+(`VOX_PERF_REPORT_ONLY=WAN`, a decider decision); it is gated on ubuntu and on real hardware by
+`scripts/release-gate.sh`. Every `cargo test` runs `--no-fail-fast`, so one red cannot hide the rest.
 
 **Re-running.** If CI on the tagged commit fails and a re-run of that CI run passes, re-run the
 release workflow (its `ci-passed` job reads the run's latest conclusion). Nothing is re-tagged.
@@ -817,12 +847,23 @@ vox-tui's in-process `interrupt_proof`.
 tunnel throughput (`perf_r41_tunnel_throughput_proof`), relay circuits on IPv6
 (`a_circuit_carries_an_ipv6_daemon_proof`), and the 56 other binary proofs.
 
-**Claims now unmeasured until a real-use proof is written**, each to be tracked as its own item: first
-connection under 2 s (R42: open, punched, relayed); a relayed pair upgrades to direct (#49); a severed
-circuit or a second circuit is not taken for a direct path (V29-15); a silent stream, a `.vox` name or a
-`want` cannot wedge the node; a join is not hostage to one member; `vox forward` binds loopback only;
-no consent without a keyring entry; revocation (M18); the path MTU follows the granted socket buffer
-(#174); the at-rest profile floor. The unshaped R42 and #174 claims are also exercised whenever R41 runs.
+**Claims now unmeasured until a real-use proof is written**, each tracked as its own item. Updated
+2026-09-27: most now have a real-use proof on integrate/v0.2.10, with a verdict on each: first
+connection under 2 s, direct (RP-22), punched (RP-23) and relayed (RP-24); a relayed pair upgrades
+to direct (RP-25, #49); a second circuit is decided alike (V29-15, #50); a silent stream, a `.vox`
+address and a `want` cannot stop a node (RP-03/04/05); a join is not hostage (RP-02); `vox forward`
+binds loopback only (RP-27); the at-rest Argon2id floor (RP-07). **Still unmeasured:** no consent
+without a keyring entry, M18 revocation, and #174's MTU ceiling (whose evidence is #206's path-stats
+runs).
+
+**No proof is excluded by name, and one gap remains (2026-09-27, #192 and #193).**
+`cross_process_join_proof`, excluded from the blocking gate since v0.2.2 as a flake (4 of 6), passed
+20 of 20 on integrate/v0.2.10 (7-12 s each, where it used to be bimodal: about 26 s, or past 60) and
+is back in the gate. Its two gaps (`cross-process-join`, `cross-process-tunnel`) close with it. The
+one accepted gap left is `opencode`. The five live-model proofs need OpenCode and a model account. The
+decider chose (2026-09-26) that they run on the local macOS release gate with the decider's account,
+and that **a tag is not cut unless they are green there**. CI keeps the exception, and says why in
+ci.yml.
 
 **§5 is stale, not current.** Its in-source suites (`governance/vectors.rs`, `cpace`, `cbor`, the UPnP
 mock, `deniable/tests.rs`, the Argon2id timing spike) no longer exist in the tree: there are no
@@ -834,7 +875,9 @@ run `vox`: `a_daemon_follows_its_anchor`, `a_long_room_reopens_proof`,
 `agent_rehearsal_proof`, `daemon_proof`, `it_just_works_with_a_daemon_running`,
 `opencode_plugin_proof`, `remote_interrupt_proof`,
 `shutdown_releases_the_profile_proof`, `work_board_proof`. Each is to have every participant run as
-the binary, or be deleted, and is tracked as its own item.
+the binary, or be deleted, and is tracked as its own item. **Done 2026-09-27:** all twelve are converted
+(RP-32/33/34/35/36/37/38/39/40/41/43) or retired into an all-real proof (RP-46). No test in the tree
+starts a node in-process (checked: no `Node::spawn`, `NodeHandle` or `Node::start` in any test).
 
 **How this is applied.** No new test may run the node in-process, assert an internal value, or stand
 in a proxy for what a person sees. A proof that needs an instrument (the R41 link emulator) keeps the

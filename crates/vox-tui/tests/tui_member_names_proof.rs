@@ -8,9 +8,16 @@
 
 #![cfg(unix)]
 
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
+
 #[test]
 #[ignore = "real daemons and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
 fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked() {
+    // A hung proof is a failing proof (ADR-018 §6). Unarmed, this one ran 40 min on the macOS CI
+    // runner until the job's 120-minute limit cancelled everything (run 36397085576, 2f49ffb). Armed,
+    // the watchdog dumps stacks and kills the pty driver, `vox tui` and the daemons (#201).
+    watchdog::arm();
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_member_names.py");
     let out = std::process::Command::new("python3")
         .args([script, env!("CARGO_BIN_EXE_vox"), "cargo"])

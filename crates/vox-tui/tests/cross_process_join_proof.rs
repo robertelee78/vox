@@ -25,138 +25,41 @@
 //! vox room post / read       # and they talk
 //! ```
 //!
-//! ## Honest coverage
+//! ## An ordinary gate (#192)
 //!
-//! The join defect in ADR-016 is open: a cross-process join through an anchor fails
-//! a large fraction of the time, measured between 40% and 80% depending on the
-//! tree. While it is open this proof reports **unproven** rather than red, named as
-//! `cross-process-join` — the repo's idiom for a gap that is a deliberate, visible
-//! decision rather than a silence or a false green. When the defect closes, the
-//! allowance comes off and this becomes an ordinary gate.
+//! It was written failing, when a cross-process join through an anchor failed 40–80% of the time,
+//! and reported **unproven** under the `cross-process-join` and `cross-process-tunnel` allowances
+//! while that defect was open. The allowances are gone: a join that fails here, or a tunnel that
+//! does not carry, is red, whatever `VOX_PROOF_ALLOW_UNPROVEN` says.
 //!
-//! It is written now, failing, on purpose: it gives that fix an agent-comms-shaped
-//! acceptance test, the same way the NAT gate became one for the accept-loop split.
+//! **What is and is not known (ADR-018, "No proof is excluded by name").** One red was seen after
+//! the allowances were withdrawn (on 005b801, `Unreachable`), and it has not recurred in the runs
+//! since. Its cause is **not named**, and those runs bound its rate; they do not show it is gone.
+//! What changed is that the next red names itself:
+//!
+//! - `vox room join` now says **which side** was unreachable — the anchor (`BoardUnreachable`) or
+//!   every member it knows (`Unreachable`) — and prints the join's recorded steps and what each
+//!   responder said, so the failing step is in the error;
+//! - each daemon's and the anchor's output is read line by line as it is written (the shared
+//!   harness's `VoxProc`), so a red prints what they said up to that moment. It used to read
+//!   stderr to EOF, which only arrives when the child exits — after the panic — so every red's
+//!   daemon and anchor sections were empty.
+//!
+//! Mutation: a join with a wrong room passphrase is red, and its panic shows non-empty daemon and
+//! anchor sections; an anchor killed between the invite and the join is red with the anchor named.
 
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+#[path = "support/world.rs"]
+mod world;
 
-const VOX: &str = env!("CARGO_BIN_EXE_vox");
+use std::io::Write;
+use std::process::{Command, Stdio};
 
-fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case(name))
-}
-
-/// A long-running `vox` child, killed however the test ends.
-struct Proc {
-    name: &'static str,
-    child: Child,
-    out: Option<BufReader<ChildStdout>>,
-    /// Everything the child wrote to stderr, drained continuously — see `spawn`.
-    err: Arc<Mutex<String>>,
-}
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Proc {
-    fn spawn(
-        name: &'static str,
-        dir: &std::path::Path,
-        args: &[String],
-        stdin: Option<&str>,
-    ) -> Self {
-        let mut cmd = Command::new(VOX);
-        cmd.args(args)
-            .env("VOX_DATA_DIR", dir)
-            .env("VOX_CONFIG_DIR", dir.join("cfg"))
-            .env_remove("VOX_ROOM")
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {name}: {e}"));
-        if let Some(text) = stdin {
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin")
-                .write_all(text.as_bytes())
-                .expect("write stdin");
-            drop(child.stdin.take());
-        }
-        let out = child.stdout.take().map(BufReader::new);
-        // **stderr is piped, so it must be read.** It was piped and never read, which is a
-        // 64 KiB fuse on the child: once the pipe buffer fills, the daemon blocks in `write` and
-        // the proof sees a node that has stopped doing anything, with no failure and no output —
-        // a hang, and bimodal in exactly the shape ADR-018 recorded for this gate's own flake.
-        // `vox daemon` now reports every event that explains a failure, so it writes more than it
-        // used to and this fuse got shorter, not longer. Drained on a thread into a string the
-        // panic below prints, so the bytes that were the hazard become the diagnosis.
-        let err = Arc::new(Mutex::new(String::new()));
-        if let Some(mut pipe) = child.stderr.take() {
-            let sink = Arc::clone(&err);
-            std::thread::spawn(move || {
-                let mut buf = String::new();
-                let _ = pipe.read_to_string(&mut buf);
-                if let Ok(mut guard) = sink.lock() {
-                    guard.push_str(&buf);
-                }
-            });
-        }
-        Self {
-            name,
-            child,
-            out,
-            err,
-        }
-    }
-
-    /// Wait for a line matching `want`, so readiness is observed rather than slept on.
-    fn expect_line(&mut self, what: &str, want: impl Fn(&str) -> bool) -> String {
-        let reader = self.out.as_mut().expect("stdout");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-        let mut seen = Vec::new();
-        while std::time::Instant::now() < deadline {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let l = line.trim_end().to_owned();
-                    if want(&l) {
-                        return l;
-                    }
-                    seen.push(l);
-                }
-                Err(_) => break,
-            }
-        }
-        let err = self
-            .err
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_else(|e| e.into_inner().clone());
-        panic!(
-            "{}: never printed {what}; saw: {seen:#?}\nits stderr:\n{err}",
-            self.name
-        );
-    }
-}
+use world::{VoxProc, IDENTITY, VOX};
 
 /// One `vox` command, run to completion.
 fn vox(dir: &std::path::Path, args: &[String], stdin: Option<&str>) -> (bool, String, String) {
@@ -166,7 +69,7 @@ fn vox(dir: &std::path::Path, args: &[String], stdin: Option<&str>) -> (bool, St
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         // Not `--identity-passphrase`: a command line is world-readable while the process
         // runs, so the flag is refused (ADR-015).
-        .env("VOX_IDENTITY_PASSPHRASE", "an identity passphrase")
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM")
         // Work coordination is owned per session (ADR-021 §4). Name one, and never let
         // a session the test process inherited from its own harness leak in.
@@ -230,15 +133,15 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     for d in [&anchor_dir, &alice_dir, &bob_dir] {
         std::fs::create_dir_all(d.join("cfg")).unwrap();
     }
-    let idpass = "an identity passphrase\n";
+    let idpass = tmp.path().join("identity-passphrase");
+    std::fs::write(&idpass, format!("{IDENTITY}\n")).unwrap();
     let roompass = "the room passphrase";
 
     // ---- the anchor: what makes this cross-process rather than loopback ----
-    let mut anchor = Proc::spawn(
+    let mut anchor = VoxProc::spawn(
         "anchor",
         &anchor_dir,
         &["node".into(), "--listen".into(), "127.0.0.1:0".into()],
-        None,
     );
     let spec = anchor
         .expect_line("an --anchor spec", |l| {
@@ -285,8 +188,8 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     // ---- daemons: agent comms with no terminal anywhere ----
     let mut daemons = Vec::new();
     for (name, dir) in [("alice", &alice_dir), ("bob", &bob_dir)] {
-        let mut d = Proc::spawn(
-            if name == "alice" { "alice" } else { "bob" },
+        let mut d = VoxProc::spawn(
+            name,
             dir,
             &[
                 "daemon".into(),
@@ -294,8 +197,9 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
                 "127.0.0.1:0".into(),
                 "--anchor".into(),
                 spec.clone(),
+                "--passphrase-file".into(),
+                idpass.to_string_lossy().into_owned(),
             ],
-            Some(idpass),
         );
         d.expect_line("its control socket", |l| l.contains("control socket"));
         daemons.push(d);
@@ -344,6 +248,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     );
 
     // ---- THE ACT UNDER TEST: bob joins, in a different process, through the anchor ----
+    let started = std::time::Instant::now();
     let (ok, _, err) = vox(
         &bob_dir,
         &[
@@ -355,16 +260,25 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         ],
         Some(&format!("{roompass}\n")),
     );
+    let took = started.elapsed().as_secs_f64();
+    println!(
+        "[proof] bob's join: {} in {took:.2}s",
+        if ok { "joined" } else { "FAILED" }
+    );
     if !ok {
-        assert!(
-            allow_unproven("cross-process-join"),
-            "UNPROVEN: a cross-process join through an anchor failed — {err}\n\
-             This is the open defect in ADR-016/ADR-012, not a regression in agent comms. \
-             Set VOX_PROOF_ALLOW_UNPROVEN=cross-process-join to accept it deliberately; \
-             remove that allowance when the defect closes and this becomes a real gate."
+        // **A red says why** (#192): the join's own error — which side was unreachable, the steps
+        // it took, what each responder said — and what each daemon and the anchor printed up to
+        // this moment, read line by line as they wrote it.
+        println!("[proof] bob's join said:\n{err}");
+        let transcript = format!(
+            "--- alice's daemon ---\n{}\n--- bob's daemon ---\n{}\n--- the anchor ---\n{}",
+            daemons[0].transcript(),
+            daemons[1].transcript(),
+            anchor.transcript()
         );
-        eprintln!("UNPROVEN (allowed): cross-process join failed: {err}");
-        return;
+        panic!(
+            "a cross-process join through an anchor failed after {took:.2}s — {err}\n{transcript}"
+        );
     }
 
     // ---- and they talk, over the overlay, as agents ----
@@ -425,7 +339,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     let source = tmp.path().join("artifact.bin");
     std::fs::write(&source, &payload).unwrap();
 
-    let mut offer = Proc::spawn(
+    let mut offer = VoxProc::spawn(
         "alice-send",
         &alice_dir,
         &[
@@ -434,7 +348,6 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
             room_for_file.clone(),
             source.to_string_lossy().into_owned(),
         ],
-        None,
     );
     offer.expect_line("the offer's announcement", |l| l.contains("offering"));
 
@@ -465,19 +378,14 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         None,
     );
     if !ok {
-        assert!(
-            allow_unproven("cross-process-tunnel"),
-            "UNPROVEN: a file transfer across processes failed — {err}\n\
-             `vox room send|get` rides a room-bound service and a `Forward`, which is \
-             the tunnel path ADR-012 records as failing at establishment and mid-stream. \
-             Set VOX_PROOF_ALLOW_UNPROVEN=cross-process-tunnel to accept it deliberately; \
-             remove the allowance when that path is fixed."
+        panic!(
+            "a file transfer across processes failed — {err}\n`vox room send|get` rides a \
+             room-bound service and a `Forward`\n--- alice's send ---\n{}\n--- alice's daemon \
+             ---\n{}\n--- bob's daemon ---\n{}",
+            offer.transcript(),
+            daemons[0].transcript(),
+            daemons[1].transcript()
         );
-        eprintln!("UNPROVEN (allowed): cross-process file transfer failed: {err}");
-        drop(offer);
-        drop(daemons);
-        drop(anchor);
-        return;
     }
     assert!(
         out.contains("verified"),

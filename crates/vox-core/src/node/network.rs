@@ -307,10 +307,33 @@ pub struct NodeNet {
     observed: Mutex<BTreeMap<Digest32, Multiaddr>>,
     /// What this node is relaying for others (ADR-012 rung 4), so the caps hold.
     circuits: Arc<CircuitLedger>,
+    /// The peers a [`NodeNet::reach`] is under way to, each with what its waiters are woken by.
+    /// **One ladder per peer at a time.** Two at once each raced a circuit through the same
+    /// relay, and the far end keeps one circuit per peer: attaching the second closed the
+    /// first, whose handshake then waited out its full attempt (10 s). Measured on the v0.3.0
+    /// merge, where a reopened room dialled its members beside a `vox forward`: cold relayed
+    /// connections of 10.8 s instead of about 260 ms (#226).
+    reaching: Mutex<HashMap<Digest32, Arc<tokio::sync::Notify>>>,
+    /// Where each ladder run is counted for `vox status --json`, once the node has one.
+    status: Mutex<Option<crate::node::status::SharedSyncBook>>,
     service: RendezvousService,
     membership: SharedMembership,
     policy: SharedPolicy,
     clock: Clock,
+}
+
+/// Ends a [`NodeNet::reach`]'s ownership of its peer: the entry goes, and every waiter wakes.
+struct ReachOwner<'a> {
+    reaching: &'a Mutex<HashMap<Digest32, Arc<tokio::sync::Notify>>>,
+    peer: Digest32,
+}
+
+impl Drop for ReachOwner<'_> {
+    fn drop(&mut self) {
+        if let Some(woken) = lock(self.reaching).remove(&self.peer) {
+            woken.notify_waiters();
+        }
+    }
 }
 
 impl std::fmt::Debug for NodeNet {
@@ -323,6 +346,11 @@ impl std::fmt::Debug for NodeNet {
 }
 
 impl NodeNet {
+    /// Count this node's reachability ladders in `book` (`vox status --json`'s `reach`).
+    pub fn count_ladders_in(&self, book: crate::node::status::SharedSyncBook) {
+        *lock(&self.status) = Some(book);
+    }
+
     /// Build the surface over a bound endpoint. The board it serves is fresh
     /// in-memory state (an anchor that persists a board is M15).
     #[must_use]
@@ -338,6 +366,8 @@ impl NodeNet {
             advertised: Mutex::new(None),
             observed: Mutex::new(BTreeMap::new()),
             circuits: Arc::new(CircuitLedger::default()),
+            reaching: Mutex::new(HashMap::new()),
+            status: Mutex::new(None),
             service,
             membership,
             policy: SharedPolicy::new(),
@@ -481,8 +511,9 @@ impl NodeNet {
         peer: Digest32,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
         let (kind, mut send, mut recv) = accept_typed_on(conn).await?;
-        if !PeerPolicy::allows(self.classify(&peer), kind) {
-            crate::node::net::refuse_stream(&mut send, &mut recv);
+        let class = self.classify(&peer);
+        if !PeerPolicy::allows(class, kind) {
+            crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
             return Err(crate::error::Error::StreamRefused(
                 "peer may not open this stream kind",
             ));
@@ -724,13 +755,62 @@ impl NodeNet {
     /// Exhausting every attempt is [`Error::Unreachable`]; the *last* helper's error is
     /// kept rather than a flattened one, because a peer that will not relay, one that
     /// cannot reach the target and a target that never answered are worth telling apart.
+    ///
+    /// **One ladder per peer at a time.** A reach that finds another under way to the same peer
+    /// waits for it and takes the connection it produced; only if it produced none does this one
+    /// run its own.
     pub async fn reach(
+        &self,
+        peer: Digest32,
+        endpoints: &EndpointList,
+    ) -> Result<Arc<VoxConnection>> {
+        loop {
+            if let Some(conn) = self.manager.existing(&peer) {
+                return Ok(conn);
+            }
+            let under_way = {
+                let mut reaching = lock(&self.reaching);
+                match reaching.get(&peer) {
+                    Some(woken) => Some(Arc::clone(woken)),
+                    None => {
+                        reaching.insert(peer, Arc::new(tokio::sync::Notify::new()));
+                        None
+                    }
+                }
+            };
+            let Some(woken) = under_way else {
+                // This call owns the ladder. The guard clears the entry and wakes every waiter
+                // however this ends, a cancelled caller included, so nobody waits for ever.
+                let _owner = ReachOwner {
+                    reaching: &self.reaching,
+                    peer,
+                };
+                return self.reach_ladder(peer, endpoints).await;
+            };
+            let notified = woken.notified();
+            tokio::pin!(notified);
+            // Registered before looking again, so a ladder that ends in between still wakes it.
+            notified.as_mut().enable();
+            if lock(&self.reaching)
+                .get(&peer)
+                .is_some_and(|w| Arc::ptr_eq(w, &woken))
+            {
+                notified.await;
+            }
+        }
+    }
+
+    /// [`NodeNet::reach`]'s ladder itself, run by one caller per peer at a time.
+    async fn reach_ladder(
         &self,
         peer: Digest32,
         endpoints: &EndpointList,
     ) -> Result<Arc<VoxConnection>> {
         if let Some(conn) = self.manager.existing(&peer) {
             return Ok(conn);
+        }
+        if let Some(book) = lock(&self.status).as_ref() {
+            crate::node::status::SyncBook::note_ladder(book, peer);
         }
         // Each rung is spawned with the label it will be reported under, because a rung
         // that fails is only actionable if the operator knows *which* rung it was: a
@@ -971,6 +1051,14 @@ impl NodeNet {
                     members: members.len(),
                     pending: guard.current_prejoins(&channel_id, now).len(),
                     entries: None,
+                    holding: guard
+                        .current_members(&channel_id, 0, now)
+                        .iter()
+                        .map(|r| {
+                            let addrs = r.endpoints.addrs().iter().map(ToString::to_string);
+                            (r.author_id, addrs.collect())
+                        })
+                        .collect(),
                 }
             })
             .collect()

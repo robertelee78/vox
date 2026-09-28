@@ -379,12 +379,10 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
             !ok && !home.join("bin/vox").exists() && text.contains("3T2D2YNTVW"),
             format!("with the Apple gate forced on, the installer said {text:?}"),
         ));
-    } else {
-        claims.push(blocked(
-            "install.apple_gate_refuses_unsigned_bytes",
-            "the Apple gate is macOS-only and this is not macOS",
-        ));
     }
+    // Elsewhere there is no Apple gate to prove, so no claim is made: reporting it "blocked" on
+    // Linux kept an accepted gap open for ever (ADR-018 §3) for a property Linux does not have.
+    // CI's macOS job proves it for real (V210-20, #193).
 
     // ---- a `vox` this installer did not install is never overwritten -----------------
     {

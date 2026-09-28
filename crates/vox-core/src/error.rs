@@ -97,6 +97,17 @@ pub enum Error {
     #[error("malformed identity bundle: {0}")]
     MalformedBundle(&'static str),
 
+    /// A message on a node's control socket could not be decoded (#211). Its own variant, never
+    /// [`Self::MalformedBundle`]: a bad or unknown IPC frame said "malformed identity bundle", which
+    /// points at identity corruption.
+    #[error("malformed control-socket message: {0}")]
+    MalformedIpc(&'static str),
+
+    /// A client sent the node a request it does not know: most often a client from another vox
+    /// version (#211).
+    #[error("the node does not know this request (the client may be a different vox version)")]
+    UnknownIpcRequest,
+
     /// A received CPace public share or the derived shared point `K` was the
     /// group identity (ADR-005 CPace `scalar_mult_vfy` MUST-abort). The session
     /// is aborted: the peer either sent a degenerate share or no agreement
@@ -381,6 +392,17 @@ pub enum Error {
     /// that died.
     #[error("sync failed: {0}")]
     SyncFailed(crate::wire::WireError),
+
+    /// A sync session did not complete because **the peer refused** it, with this coded reason.
+    /// Kept apart from [`Self::SyncFailed`] and [`Self::SyncRejected`] so that a report can say
+    /// which end stopped the session (#202's follow-up: all three used to read the same).
+    #[error("sync failed: the peer refused: {0}")]
+    SyncRefused(crate::wire::WireError),
+
+    /// A sync session did not complete because **this node** refused what the peer sent, with
+    /// this coded reason: an entry the log would not accept, or a frame out of protocol.
+    #[error("sync failed: this node refused what the peer sent: {0}")]
+    SyncRejected(crate::wire::WireError),
 
     /// The peer reset or stopped the stream with a coded reason (an ADR-008 [`WireError`]):
     /// it refused, deliberately, and said why. Distinct from [`Self::Unreachable`], which is a
