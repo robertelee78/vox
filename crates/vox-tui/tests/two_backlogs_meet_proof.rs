@@ -199,9 +199,9 @@ fn two_backlogs_that_meet_both_cross() {
             }
         }
     }
-    let alice = daemon("alice", &alice_dir, &spec, &idpass);
-    let bob = daemon("bob", &bob_dir, &spec, &idpass);
-    let carol = daemon("carol", &carol_dir, &spec, &idpass);
+    let mut alice = daemon("alice", &alice_dir, &spec, &idpass);
+    let mut bob = daemon("bob", &bob_dir, &spec, &idpass);
+    let mut carol = daemon("carol", &carol_dir, &spec, &idpass);
 
     let (ok, out, err) = vox_in(
         &alice_dir,
@@ -250,6 +250,16 @@ fn two_backlogs_that_meet_both_cross() {
         }
         if missing.is_empty() {
             break 'warm;
+        }
+        if Instant::now() >= deadline {
+            // Each daemon's own report, so a red names its cause.
+            for (name, p) in [
+                ("alice", &mut alice),
+                ("bob", &mut bob),
+                ("carol", &mut carol),
+            ] {
+                eprintln!("---- {name}'s daemon ----\n{}", p.transcript());
+            }
         }
         assert!(
             Instant::now() < deadline,
