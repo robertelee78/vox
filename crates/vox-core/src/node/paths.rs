@@ -245,18 +245,87 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
     set_mode(dir, 0o700, "chmod directory")
 }
 
-/// Write `bytes` to `path` atomically (temp file + rename) with mode `0600`.
+/// Write `bytes` to `path` atomically (temp file + rename) with mode `0600`, **durably**.
+///
+/// What this writes is what a person cannot get back: the identity vault and a headless node's
+/// identity seeds. So (V210-55, #241):
+/// - the temp file is created `0600` from its first byte, never at the umask's mode and
+///   `chmod`ed after, which left a headless node's plaintext seeds readable by other local
+///   users for a moment;
+/// - its bytes are flushed to the device (`sync_all`, which on macOS is `F_FULLFSYNC`)
+///   **before** the rename, or a power loss could leave the new name on an empty file and the
+///   identity lost;
+/// - the directory is flushed after the rename, so the rename itself survives a power loss.
+///
+/// A failure at any step leaves `path` as it was: the old file is replaced only by the rename,
+/// and only once the new bytes are on the device.
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| Error::Path {
-        op: "write file",
-        detail: format!("{}: {e}", tmp.display()),
+    let fail = |op: &'static str, at: &Path, e: std::io::Error| Error::Path {
+        op,
+        detail: format!("{}: {e}", at.display()),
+    };
+    // A temp file left by a crash may carry another mode: remove it, then create afresh.
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp)
+        .map_err(|e| fail("create file", &tmp, e))?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| fail("write file", &tmp, e));
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        fail("rename file", path, e)
     })?;
-    set_mode(&tmp, 0o600, "chmod file")?;
-    std::fs::rename(&tmp, path).map_err(|e| Error::Path {
-        op: "rename file",
-        detail: format!("{}: {e}", path.display()),
-    })
+    sync_dir(path)
+}
+
+/// Flush the directory holding `path`, so a rename into it is durable.
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<()> {
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    let dir_file = std::fs::File::open(dir).map_err(|e| Error::Path {
+        op: "open directory",
+        detail: format!("{}: {e}", dir.display()),
+    })?;
+    match dir_file.sync_all() {
+        Ok(()) => Ok(()),
+        // Some filesystems cannot flush a directory handle (macOS's `F_FULLFSYNC` on a
+        // directory may say so); the rename there is committed by the filesystem's own journal.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(Error::Path {
+            op: "sync directory",
+            detail: format!("{}: {e}", dir.display()),
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Set an existing file to `0600` (used for the store file the engine creates).
