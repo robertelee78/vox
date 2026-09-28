@@ -226,21 +226,24 @@ impl Store {
                     let mut to = w.open_table(SEGMENTS).map_err(storage("open segments"))?;
                     for item in from.iter().map_err(storage("iterate segments"))? {
                         let (k, v) = item.map_err(storage("iterate segments"))?;
-                        to.insert(k.value(), v.value()).map_err(storage("write segment"))?;
+                        to.insert(k.value(), v.value())
+                            .map_err(storage("write segment"))?;
                     }
                 }
                 if let Ok(from) = r.open_table(SEK_WRAPS) {
                     let mut to = w.open_table(SEK_WRAPS).map_err(storage("open sek_wraps"))?;
                     for item in from.iter().map_err(storage("iterate sek_wraps"))? {
                         let (k, v) = item.map_err(storage("iterate sek_wraps"))?;
-                        to.insert(k.value(), v.value()).map_err(storage("write sek wrap"))?;
+                        to.insert(k.value(), v.value())
+                            .map_err(storage("write sek wrap"))?;
                     }
                 }
                 if let Ok(from) = r.open_table(META) {
                     let mut to = w.open_table(META).map_err(storage("open meta"))?;
                     for item in from.iter().map_err(storage("iterate meta"))? {
                         let (k, v) = item.map_err(storage("iterate meta"))?;
-                        to.insert(k.value(), v.value()).map_err(storage("write meta"))?;
+                        to.insert(k.value(), v.value())
+                            .map_err(storage("write meta"))?;
                     }
                 }
             }
