@@ -336,11 +336,31 @@ pub struct NodeNet {
 struct ReachOwner<'a> {
     reaching: &'a Mutex<HashMap<Digest32, Arc<tokio::sync::Notify>>>,
     peer: Digest32,
+    /// Where a cancelled ladder is said (#229's diagnostics).
+    manager: &'a ConnectionManager,
+    /// Set when the ladder ran to its end; dropped unset, it was cancelled mid-way.
+    finished: bool,
+    started: std::time::Instant,
 }
 
 impl Drop for ReachOwner<'_> {
     fn drop(&mut self) {
-        if let Some(woken) = lock(self.reaching).remove(&self.peer) {
+        let woken = lock(self.reaching).remove(&self.peer);
+        if !self.finished {
+            self.manager.note(
+                self.peer,
+                format!(
+                    "a reach was cancelled {} ms into its ladder; {} waiting for it",
+                    self.started.elapsed().as_millis(),
+                    if woken.is_some() {
+                        "any reach"
+                    } else {
+                        "nothing"
+                    }
+                ),
+            );
+        }
+        if let Some(woken) = woken {
             woken.notify_waiters();
         }
     }
@@ -792,11 +812,16 @@ impl NodeNet {
             let Some(woken) = under_way else {
                 // This call owns the ladder. The guard clears the entry and wakes every waiter
                 // however this ends, a cancelled caller included, so nobody waits for ever.
-                let _owner = ReachOwner {
+                let mut owner = ReachOwner {
                     reaching: &self.reaching,
                     peer,
+                    manager: &self.manager,
+                    finished: false,
+                    started: std::time::Instant::now(),
                 };
-                return self.reach_ladder(peer, endpoints).await;
+                let result = self.reach_ladder(peer, endpoints).await;
+                owner.finished = true;
+                return result;
             };
             let notified = woken.notified();
             tokio::pin!(notified);
@@ -806,7 +831,26 @@ impl NodeNet {
                 .get(&peer)
                 .is_some_and(|w| Arc::ptr_eq(w, &woken))
             {
+                let waited = std::time::Instant::now();
                 notified.await;
+                let ms = waited.elapsed().as_millis();
+                // Said only after a wait worth noting (#229's diagnostics). A ladder that fails at
+                // once — nobody to relay through — is said by its own "could not reach", and every
+                // waiter repeating it drowned the log (seen on #243's anchor-restart proof).
+                let found = self.manager.existing(&peer).is_some();
+                if ms >= 250 {
+                    self.manager.note(
+                        peer,
+                        if found {
+                            format!("a reach waited {ms} ms for another under way, and took its connection")
+                        } else {
+                            format!(
+                                "a reach waited {ms} ms for another under way, which found no \
+                                 connection; it dials again"
+                            )
+                        },
+                    );
+                }
             }
         }
     }

@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::atrest::sek::Sek;
 use crate::atrest::sek::NONCE_LEN;
 use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
 use crate::cbor::{Decoder, Encoder};
@@ -23,13 +24,21 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
 use crate::node::store::Store;
-use crate::node::trust::{trust_sek, MAX_TRUSTED};
+use crate::node::trust::MAX_TRUSTED;
+
+/// HKDF label for the map's sealing key, taken over `self_seed` ([`crate::atrest::seal`]).
+pub const PENDING_CONSENT_SEK_INFO: &[u8] = b"vox/pending-consent-sek/v1";
+
+/// The map's sealing key.
+pub fn pending_consent_sek(signer: &dyn RootSigner) -> Result<Sek> {
+    crate::atrest::seal::sek(signer, PENDING_CONSENT_SEK_INFO)
+}
 
 /// The metadata key the sealed map is stored under.
-const META_KEY: &str = "pending-consent";
+pub const META_KEY: &str = "pending-consent";
 
 /// Its slot within [`SegmentKind::Trust`]; the keyring is slot 0.
-const SEGMENT_ID: u64 = 1;
+pub const SEGMENT_ID: u64 = 1;
 
 /// Encoding version of the body.
 const VERSION: u64 = 1;
@@ -117,7 +126,7 @@ impl PendingConsents {
 
     /// Seal and write. Requires an unlocked identity.
     pub fn save(&self, store: &Store, signer: &dyn RootSigner) -> Result<()> {
-        let sek = trust_sek(signer)?;
+        let sek = pending_consent_sek(signer)?;
         let sealed = seal_segment(&sek, SegmentKind::Trust, SEGMENT_ID, &self.to_bytes())?;
         let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
         blob.extend_from_slice(&sealed.nonce);
@@ -140,7 +149,7 @@ impl PendingConsents {
             nonce,
             ciphertext: ciphertext.to_vec(),
         };
-        let sek = trust_sek(signer)?;
+        let sek = pending_consent_sek(signer)?;
         let plain = open_segment(&sek, SegmentKind::Trust, SEGMENT_ID, &sealed)?;
         Self::from_bytes(&plain)
     }

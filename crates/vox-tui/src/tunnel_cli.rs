@@ -784,6 +784,12 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
                 short(channel_id)
             );
         }
+        NodeEvent::ConnectionNote { peer, note } => {
+            eprintln!(
+                "vox: connection to {} — {note}",
+                crate::ident::author_id(peer)
+            );
+        }
         _ => {}
     }
 }

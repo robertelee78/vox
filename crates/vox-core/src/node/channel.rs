@@ -41,7 +41,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::atrest::idfactor::SignatureIdentityFactor;
 use crate::atrest::sek::{Argon2Profile, Sek};
-use crate::atrest::store::{open_segment, seal_segment, SegmentKind};
+use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use std::net::SocketAddr;
@@ -2616,12 +2616,45 @@ impl ChannelState {
     /// # Errors
     /// If the marks cannot be persisted.
     pub fn mark_trust(&mut self, store: &Store, target: Digest32, decision: Stamp) -> Result<()> {
+        match self.mark_trust_sealed(target, decision)? {
+            None => Ok(()),
+            Some(seg) => {
+                if let Err(e) = store.put_segment(
+                    &self.channel_id,
+                    SegmentKind::KeyMaterial,
+                    SEG_TRUST_MARKS,
+                    &seg,
+                ) {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// [`Self::mark_trust`] without writing: the marks, sealed under this room's SEK, for the
+    /// caller to write with every other room's in **one** commit ([`Self::queue_marks`]), or
+    /// `None` when this room already holds the mark.
+    ///
+    /// A trust decision marks every open room, and one commit per room made `vox trust add` cost
+    /// a durable commit for each: about 7 s on the node's actor at 1,600 rooms (#189). If the
+    /// caller's commit fails, it must [`Self::poison`] each room it sealed for, as a failed
+    /// write here always has.
+    ///
+    /// # Errors
+    /// The room holds [`MAX_AUTHORS`] marks already, or the marks cannot be sealed.
+    pub fn mark_trust_sealed(
+        &mut self,
+        target: Digest32,
+        decision: Stamp,
+    ) -> Result<Option<SealedSegment>> {
         if self
             .trust_marks
             .get(&target)
             .is_some_and(|m| m.0 == decision)
         {
-            return Ok(());
+            return Ok(None);
         }
         if !self.trust_marks.contains_key(&target) && self.trust_marks.len() >= MAX_AUTHORS {
             return Err(Error::SizeLimitExceeded("trust marks"));
@@ -2632,7 +2665,26 @@ impl ChannelState {
             self.sender.current_position().0,
         );
         self.trust_marks.insert(target, position);
-        self.persist_marks(store)
+        let bytes = marks_bytes(&self.trust_marks);
+        seal_segment(&self.sek, SegmentKind::KeyMaterial, SEG_TRUST_MARKS, &bytes).map(Some)
+    }
+
+    /// Queue `channel_id`'s sealed marks ([`Self::mark_trust_sealed`]) into `batch`.
+    ///
+    /// # Errors
+    /// The write cannot be queued.
+    pub fn queue_marks(
+        batch: &mut crate::node::store::Batch<'_>,
+        channel_id: &Digest32,
+        seg: &SealedSegment,
+    ) -> Result<()> {
+        batch.put_segment(channel_id, SegmentKind::KeyMaterial, SEG_TRUST_MARKS, seg)
+    }
+
+    /// Mark this room poisoned: its state in memory is ahead of what reached the store, so it
+    /// must be reopened before it is used (a batched write of its state failed).
+    pub fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     /// Mark every decision in `order` taken while this room was closed (V210-45), with no
@@ -2897,11 +2949,6 @@ impl ChannelState {
     fn persist_entitled(&mut self, store: &Store) -> Result<()> {
         let bytes = positions_bytes(&self.entitled);
         self.persist_positions(store, SEG_ENTITLED, &bytes)
-    }
-
-    fn persist_marks(&mut self, store: &Store) -> Result<()> {
-        let bytes = marks_bytes(&self.trust_marks);
-        self.persist_positions(store, SEG_TRUST_MARKS, &bytes)
     }
 
     fn persist_positions(&mut self, store: &Store, id: u64, bytes: &[u8]) -> Result<()> {

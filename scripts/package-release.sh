@@ -38,6 +38,15 @@ else
   printf 'package-release: need sha256sum or shasum\n' >&2; exit 1
 fi
 
+# **No mutant ships.** ADR-025's P9 and P10 proofs run a deliberately misbehaving sync sender, built
+# from this tree with the `mutant-sender` feature (scripts/build-mutant-sender.sh). The release jobs
+# build `--bin vox` with the default features, so it cannot be this binary; this makes sure of it.
+# The mutant says its marker on stderr, so the string is in every mutant build and in no other.
+if grep -aq 'VOX-MUTANT-SENDER' "$BIN"; then
+  printf 'package-release: %s is a mutant sender build (it carries VOX-MUTANT-SENDER); refusing\n' "$BIN" >&2
+  exit 1
+fi
+
 mkdir -p dist
 cp "$BIN" "dist/$ASSET"
 chmod 0755 "dist/$ASSET"

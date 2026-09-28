@@ -82,6 +82,7 @@
 pub mod idfactor;
 pub mod lock;
 pub mod retention;
+pub mod seal;
 pub mod sek;
 pub mod store;
 pub mod vault;

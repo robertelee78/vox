@@ -10,10 +10,16 @@
 //!
 //! ## Staging
 //! Alice and Bob trust each other and share one room behind an anchor. Both read each other
-//! before the rounds. Then [`ROUNDS`] times, both run `vox room post` at the same instant (a
-//! barrier), and each post is timed from the moment its own `vox room post` returned to the
-//! moment it is readable on the **other** member's node, read over that node's control socket as
-//! `vox room read` reads it.
+//! before the rounds. Then [`ROUNDS`] times, both posts are made **simultaneous by force, not by
+//! hope**: both daemons are stopped (`SIGSTOP`, by PID), both members run `vox room post` (each
+//! request waits in its daemon's control socket for [`HOLD`]), and both daemons are continued by
+//! one `kill -CONT` naming both PIDs, once both ends' sessions with each other have ended (their
+//! `vox status --json` counters). Each daemon then takes its post and opens its session to the
+//! other at the same instant, whatever the machine's speed. (Timed by a barrier alone, a fast
+//! runner let one end's session deliver the other's post before that end had opened its own: 29
+//! and 18 sessions over 40 rounds on ubuntu, run 36389831839.) Each post is timed from the moment
+//! its own `vox room post` returned to the moment it is readable on the **other** member's node,
+//! read over that node's control socket as `vox room read` reads it.
 //!
 //! ## Asserted
 //! 1. `busy_refused = 0` on both daemons, from the shipped `vox status --json`;
@@ -21,8 +27,9 @@
 //!
 //! ## Precondition (else CANNOT MEASURE)
 //! At least [`MIN_TOGETHER`] rounds whose two posts returned within [`TOGETHER`] of each other,
-//! which is well inside the loopback round trip plus a session, so the two ends' sessions
-//! overlapped; and each daemon opened at least [`MIN_OPENED`] sessions to the other.
+//! which is well inside the loopback round trip plus a session; and at least [`MIN_BOTH`] rounds
+//! in which **both** daemons opened a session to the other (each round's `opened` counters, from
+//! `vox status --json` before and after it), so the two ends' sessions overlapped.
 //!
 //! ## Mutation
 //! Restore the busy refusal at the inbound check (refuse an inbound session while this side's
@@ -49,10 +56,18 @@ const BOUND: Duration = Duration::from_millis(250);
 const TOGETHER: Duration = Duration::from_millis(50);
 /// Rounds that must have been simultaneous for the run to measure anything.
 const MIN_TOGETHER: usize = 20;
-/// Sessions each end must have opened to the other over the rounds. Not one per round: on the
-/// base a post made while a session runs is owed to it rather than opening another.
-const MIN_OPENED: u64 = 20;
+/// Rounds in which both ends must have opened a session to the other.
+const MIN_BOTH: usize = 30;
+/// How long both daemons stay stopped while both `vox room post`s queue their requests.
+const HOLD: Duration = Duration::from_millis(500);
 const POLL: Duration = Duration::from_millis(5);
+
+/// Whether every session this member's node started or admitted with `peer` has ended (each ends
+/// as completed, partial, failed or stale), from its `vox status --json`.
+fn idle(status: &serde_json::Value, peer: &str) -> bool {
+    let c = |k: &str| counter(status, k, Some(peer));
+    c("opened") + c("admitted") <= c("completed") + c("partial") + c("failed") + c("stale")
+}
 
 #[test]
 #[ignore = "a real anchor and two real daemons with production Argon2id; CI runs it in release"]
@@ -101,20 +116,49 @@ fn simultaneous_posts_never_collide() {
     let mut lat: Vec<Duration> = Vec::new();
     let mut late: Vec<String> = Vec::new();
     let mut together = 0usize;
+    let mut both = 0usize;
+    let mut one_sided: Vec<String> = Vec::new();
+    let both_pids = [alice_d.pid().to_string(), bob_d.pid().to_string()];
+    let signal_both = |sig: &str| {
+        let ok = std::process::Command::new("kill")
+            .arg(sig)
+            .args(&both_pids)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "kill {sig} {both_pids:?}");
+    };
     for r in 0..ROUNDS {
         let (ta, tb) = (format!("p1 alice {r}"), format!("p1 bob {r}"));
-        let barrier = std::sync::Barrier::new(2);
+        // Both ends idle first: a session still running from the last round would take this
+        // round's post as owed to it and open none, and the round would not measure a crossing.
+        let quiet = Instant::now();
+        let (sa, sb) = loop {
+            let (sa, sb) = (alice.status(), bob.status());
+            if idle(&sa, &bob.fp) && idle(&sb, &alice.fp) {
+                break (sa, sb);
+            }
+            assert!(
+                quiet.elapsed() < Duration::from_secs(10),
+                "CANNOT MEASURE: the pair's sessions never went idle before round {r}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let opened_before = (
+            counter(&sa, "opened", Some(&bob.fp)),
+            counter(&sb, "opened", Some(&alice.fp)),
+        );
+        signal_both("-STOP");
         let (a_done, b_done) = std::thread::scope(|s| {
             let a = s.spawn(|| {
-                barrier.wait();
                 alice.post(&room, &ta);
                 Instant::now()
             });
             let b = s.spawn(|| {
-                barrier.wait();
                 bob.post(&room, &tb);
                 Instant::now()
             });
+            std::thread::sleep(HOLD);
+            signal_both("-CONT");
             (a.join().unwrap(), b.join().unwrap())
         });
         let skew = if a_done > b_done {
@@ -151,6 +195,15 @@ fn simultaneous_posts_never_collide() {
                 None => late.push(format!("round {r} {who}: never within 40 s")),
             }
         }
+        let opened = (
+            counter(&alice.status(), "opened", Some(&bob.fp)) - opened_before.0,
+            counter(&bob.status(), "opened", Some(&alice.fp)) - opened_before.1,
+        );
+        if opened.0 >= 1 && opened.1 >= 1 {
+            both += 1;
+        } else {
+            one_sided.push(format!("round {r}: alice {} bob {}", opened.0, opened.1));
+        }
     }
     // Let the last sessions finish and be counted.
     std::thread::sleep(Duration::from_secs(2));
@@ -169,8 +222,8 @@ fn simultaneous_posts_never_collide() {
     let p50 = pct(&mut lat.clone(), 50.0);
     let p95 = pct(&mut lat.clone(), 95.0);
     println!(
-        "[proof] P1: {ROUNDS} rounds, {together} simultaneous (posts returned within {TOGETHER:?}); \
-         {} crossings, p50 {p50:?} p95 {p95:?} max {max:?}, {} over {BOUND:?}; busy_refused {busy} \
+        "[proof] P1: {ROUNDS} rounds, {together} simultaneous (posts returned within {TOGETHER:?}), \
+         {both} with both ends opening a session; {} crossings, p50 {p50:?} p95 {p95:?} max {max:?}, {} over {BOUND:?}; busy_refused {busy} \
          (alice {} bob {}); opened alice {a_opened} bob {b_opened}; failed {failed}; last failures \
          alice {:?} bob {:?}",
         lat.len(),
@@ -183,16 +236,9 @@ fn simultaneous_posts_never_collide() {
     for l in late.iter().take(10) {
         println!("[late] {l}");
     }
-    assert!(
-        together >= MIN_TOGETHER,
-        "CANNOT MEASURE: only {together} of {ROUNDS} rounds had both posts return within \
-         {TOGETHER:?}"
-    );
-    assert!(
-        a_opened >= MIN_OPENED && b_opened >= MIN_OPENED,
-        "CANNOT MEASURE: the daemons opened {a_opened} and {b_opened} sessions to each other over \
-         {ROUNDS} rounds; both ends must have been opening sessions in most rounds"
-    );
+    for l in one_sided.iter().take(10) {
+        println!("[one-sided] {l}");
+    }
     assert_eq!(
         busy, 0,
         "two members posting at once refused each other {busy} time(s) (SessionBusy)"
@@ -202,5 +248,17 @@ fn simultaneous_posts_never_collide() {
         "{} of {} crossings took longer than {BOUND:?} after `vox room post` returned: {late:?}",
         late.len(),
         ROUNDS * 2
+    );
+    // The preconditions last: they are what make a green mean something, and a refusal or a late
+    // crossing above is red whether or not every round overlapped.
+    assert!(
+        together >= MIN_TOGETHER,
+        "CANNOT MEASURE: only {together} of {ROUNDS} rounds had both posts return within \
+         {TOGETHER:?}"
+    );
+    assert!(
+        both >= MIN_BOTH,
+        "CANNOT MEASURE: both daemons opened a session to the other in only {both} of {ROUNDS} \
+         rounds (at least {MIN_BOTH}; {a_opened} and {b_opened} sessions in all): {one_sided:?}"
     );
 }

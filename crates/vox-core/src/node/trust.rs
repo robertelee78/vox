@@ -39,9 +39,11 @@
 //!
 //! ## At rest
 //!
-//! Sealed under a key derived from this node's own identity
-//! ([`TRUST_SEK_INFO`]), mirroring how an anchor seals its log. Two consequences,
-//! both intended: a stolen disk yields no trust graph without the identity, and
+//! Sealed under a key derived from the vault's `self_seed` ([`TRUST_SEK_INFO`],
+//! [`crate::atrest::seal`]), which only the identity passphrase releases. It used to be
+//! derived from the Ed25519 `id_proof`, which a quantum adversary can compute from the
+//! public key (V210-40, #214). Two consequences, both intended: a stolen disk yields no
+//! trust graph without the identity passphrase, and
 //! **trust operations require an unlocked identity** — which is correct, since
 //! deciding whom to trust is an identity-level act. The sealed blob is then kept in
 //! the store's public metadata table, which stays honest: ciphertext is a public
@@ -49,11 +51,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hkdf::Hkdf;
-use sha2::Sha256;
-use zeroize::Zeroizing;
-
-use crate::atrest::sek::{Sek, NONCE_LEN, SEK_LEN};
+use crate::atrest::sek::{Sek, NONCE_LEN};
 use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -61,8 +59,12 @@ use crate::hash::{sha256, Digest32};
 use crate::identity::composite::RootSigner;
 use crate::node::store::Store;
 
-/// HKDF label for the keyring's sealing key.
-pub const TRUST_SEK_INFO: &[u8] = b"vox/trust-keyring-sek/v1";
+/// HKDF label for the keyring's sealing key, taken over `self_seed`.
+pub const TRUST_SEK_INFO: &[u8] = b"vox/trust-keyring-sek/v2";
+
+/// The label a version-1 vault's keyring was sealed under, over the identity factor
+/// (migration only; see [`crate::atrest::seal::legacy`]).
+pub const LEGACY_TRUST_SEK_INFO: &[u8] = b"vox/trust-keyring-sek/v1";
 
 /// Domain-separated context the identity factor is taken over. A fixed value
 /// because the keyring is node-wide: it belongs to no channel.
@@ -72,7 +74,7 @@ pub const TRUST_CONTEXT_LABEL: &[u8] = b"vox/trust-keyring-context/v1";
 pub const TRUST_META_KEY: &str = "trust";
 
 /// Only slot; the keyring is a single blob.
-const TRUST_SEGMENT_ID: u64 = 0;
+pub const TRUST_SEGMENT_ID: u64 = 0;
 
 /// Encoding version of the keyring body. Version 2 adds each identity's history grant;
 /// a version-1 body (no grants) still reads, as "from now on" for everyone.
@@ -100,15 +102,12 @@ pub const MAX_PETNAME: usize = 64;
 
 /// The sealing key for this identity's keyring.
 pub fn trust_sek(signer: &dyn RootSigner) -> Result<Sek> {
-    use crate::atrest::idfactor::{IdentityFactor, SignatureIdentityFactor};
-    let context = sha256(TRUST_CONTEXT_LABEL);
-    let factor = SignatureIdentityFactor::new(signer);
-    let factor_id = factor.factor_id(&context)?;
-    let hk = Hkdf::<Sha256>::new(None, factor_id.as_ref());
-    let mut key = Zeroizing::new([0u8; SEK_LEN]);
-    hk.expand(TRUST_SEK_INFO, key.as_mut())
-        .map_err(|_| Error::AtRestUnlockFailed)?;
-    Ok(Sek::from_bytes(key))
+    crate::atrest::seal::sek(signer, TRUST_SEK_INFO)
+}
+
+/// The key a version-1 vault's keyring was sealed under (migration only).
+pub fn legacy_trust_sek(signer: &dyn RootSigner) -> Result<Sek> {
+    crate::atrest::seal::legacy::sek(signer, &sha256(TRUST_CONTEXT_LABEL), LEGACY_TRUST_SEK_INFO)
 }
 
 /// This node's trusted identities, each with the petname this node calls it.

@@ -444,6 +444,11 @@ pub enum Fault {
     KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
+    /// The identity passphrase was right, but something this identity sealed (its trust
+    /// keyring, pending consents or prekey ring) will not open under it: the data was altered,
+    /// or written by another identity. Not [`Fault::WrongPassphrase`], which sent a person to
+    /// retype a passphrase that had just been proved correct (V210-40).
+    SealedUnreadable,
     /// The node is shutting down.
     ShuttingDown,
     /// This node is not networked, or is locked, so it cannot reach anyone.
@@ -542,7 +547,12 @@ impl Fault {
                 "your trust keyring is full (1,024 identities)\n       remove one with `vox trust remove <fingerprint>`, then add again"
             }
             Fault::Storage => {
-                "the profile's store could not be written\n       check free disk space and that the data directory is writable"
+                "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
+            }
+            Fault::SealedUnreadable => {
+                "the identity passphrase is right, but this profile's trust keyring, pending \
+                 consents or prekey ring will not open under it\n       the store was altered, \
+                 or copied from another identity's profile"
             }
             Fault::ShuttingDown => "the node is shutting down",
             Fault::NotNetworked => {
@@ -752,6 +762,16 @@ pub enum NodeEvent {
         channel_id: Digest32,
         /// Which record it was, and which board (`our address (board …)`).
         what: String,
+    },
+    /// What happened to a connection to `peer`, said so a failure that recurs names itself (#229,
+    /// after #232's CI reds): a newcomer that lost the one-connection-per-peer tie-break, a
+    /// retired connection closed, an anchor connection lost or redialled, a reach that waited for
+    /// another and what it did next. Diagnostics, never a decision.
+    ConnectionNote {
+        /// The peer the connection is to.
+        peer: Digest32,
+        /// What happened, for the operator.
+        note: String,
     },
     /// A join failed, with what each responder that was tried reported.
     ///

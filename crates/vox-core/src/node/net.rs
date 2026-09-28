@@ -395,6 +395,9 @@ pub struct ConnectionManager {
     heard: Mutex<HashMap<usize, (u64, Instant)>>,
     retire_grace_secs: u64,
     clock: Clock,
+    /// Where [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote)s go,
+    /// once the node that owns this manager says.
+    notes: Mutex<Option<tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>>>,
 }
 
 impl std::fmt::Debug for ConnectionManager {
@@ -423,6 +426,29 @@ impl ConnectionManager {
             heard: Mutex::new(HashMap::new()),
             retire_grace_secs: grace_secs,
             clock,
+            notes: Mutex::new(None),
+        }
+    }
+
+    /// Say what happens to this manager's connections on `events`, as
+    /// [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote)s.
+    pub fn report_to(&self, events: tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>) {
+        *lock(&self.notes) = Some(events);
+    }
+
+    /// Whether a live connection to `peer` is held, **looking only**: unlike [`Self::existing`]
+    /// this neither drops a dead connection nor promotes a retired one, so a diagnostic can ask
+    /// without changing what it observes.
+    #[must_use]
+    pub fn holds(&self, peer: &Digest32) -> bool {
+        lock(&self.conns).get(peer).is_some_and(|c| is_live(c))
+    }
+
+    /// One [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote), if
+    /// anyone is listening.
+    pub fn note(&self, peer: Digest32, note: String) {
+        if let Some(tx) = lock(&self.notes).as_ref() {
+            let _ = tx.send(crate::node::api::NodeEvent::ConnectionNote { peer, note });
         }
     }
 
@@ -773,8 +799,13 @@ impl ConnectionManager {
                 .map(|(c, _)| Arc::clone(c)),
         );
         // A closed or already-dead (silent, or severed) connection is no rival to `file_inner` or
-        // to a promotion.
-        held.retain(|c| is_live(c) && !self.is_dead(c));
+        // to a promotion; nor is one to **another process** of the identity, which the newcomer
+        // supersedes outright (see `file_inner`) — so a restarted peer is not made to wait out a
+        // probe of its dead predecessor, which it paid on every restart (V210-57: 250 ms, the
+        // floor of `probe_patience`).
+        held.retain(|c| {
+            is_live(c) && !self.is_dead(c) && c.peer_process() == newcomer.peer_process()
+        });
         // Probed at once, so a peer with a dead primary and a dead retired connection costs one
         // patience, not two.
         //
@@ -815,6 +846,43 @@ impl ConnectionManager {
                 dead.close(WireError::Unresponsive);
             }
         }
+        // **A newcomer from another process of the identity supersedes every connection to the
+        // one before** (V210-57). One profile is held by one process at a time and an identity is
+        // one device's, so a connection to a different process of the same identity is to a
+        // predecessor: dead, or on its way out. It is closed, not weighed. Weighed, it could win:
+        // the tie-break and the probe both ask whether a connection is *live*, and a dead
+        // process's connection can look live for a moment — and then a restarted process's anchor
+        // kept its predecessor's connection, closed the one the restarted process was using, and
+        // left it with no helper (CI run 36418572653: 30065 ms). Both ends agree without a vote:
+        // the restarted process holds only the newcomer.
+        //
+        // **No new power.** `conn` exists only because its leaf certificate was verified as signed
+        // by `peer`'s identity key (`identity_cert::verify_peer_certificate`, ADR-011): only the
+        // identity's holder can present a new process of it, and that holder can already speak as
+        // it. **Two live processes of one identity** (a copied profile, an old binary) would each
+        // supersede the other: that is bounded by the dialler's anchor backoff, which counts a
+        // connection lost soon after it was made as a failure (`ANCHOR_FLAP_SECS`), not a loop.
+        let process = conn.peer_process();
+        if let Some(existing) = map.get(&peer).filter(|e| e.peer_process() != process) {
+            let existing = Arc::clone(existing);
+            map.remove(&peer);
+            if is_live(&existing) {
+                existing.close(WireError::Unresponsive);
+                self.note(
+                    peer,
+                    "a new connection is from a new process of this identity: the connection to \
+                     the one before is closed"
+                        .to_owned(),
+                );
+            }
+        }
+        lock(&self.retiring).retain(|(c, _)| {
+            let superseded = c.peer_id() == peer && c.peer_process() != process;
+            if superseded && is_live(c) {
+                c.close(WireError::Unresponsive);
+            }
+            !superseded
+        });
         if let Some(existing) = map.get(&peer) {
             // **A held connection that is dead is not a rival.** Silent: the process behind it
             // is gone (see [`SILENCE_IS_DEATH`]). Severed: its circuit is gone, so it can send
@@ -825,7 +893,15 @@ impl ConnectionManager {
             // compute identically; the class is the connection's own recorded fact (see
             // [`path_class`]), not a reading of a table that changes underneath it.
             if is_live(existing) && self.is_dead(existing) {
+                let silent = self.silent_for(existing).as_secs();
                 existing.close(WireError::Unresponsive);
+                self.note(
+                    peer,
+                    format!(
+                        "a new connection replaced the one held, which was dead (silent {silent}s \
+                         or its circuit gone) and is closed"
+                    ),
+                );
             } else if is_live(existing) {
                 let existing = Arc::clone(existing);
                 let (new_class, held_class) = (
@@ -834,10 +910,18 @@ impl ConnectionManager {
                 );
                 let newcomer_loses = new_class < held_class
                     || (new_class == held_class && tie_key(&conn) >= tie_key(&existing));
+                let heard = self.silent_for(&existing).as_secs();
                 if newcomer_loses {
                     drop(map);
                     if !serve_loser {
                         conn.close(WireError::AuthenticatorInvalid);
+                        self.note(
+                            peer,
+                            format!(
+                                "a new connection lost the tie-break to the one held (last heard \
+                                 {heard}s ago, {held_class:?} against {new_class:?}) and was closed"
+                            ),
+                        );
                         return Filed {
                             kept: existing,
                             also_serve: None,
@@ -846,6 +930,15 @@ impl ConnectionManager {
                     let retire_at = (self.clock)().saturating_add(self.retire_grace_secs);
                     let retired = Arc::new(conn);
                     lock(&self.retiring).push((Arc::clone(&retired), retire_at));
+                    self.note(
+                        peer,
+                        format!(
+                            "a new connection lost the tie-break to the one held (last heard \
+                             {heard}s ago, {held_class:?} against {new_class:?}); retired, closed \
+                             in {}s unless still carried",
+                            self.retire_grace_secs
+                        ),
+                    );
                     return Filed {
                         kept: existing,
                         also_serve: Some(retired),
@@ -853,6 +946,13 @@ impl ConnectionManager {
                 }
                 let retire_at = (self.clock)().saturating_add(self.retire_grace_secs);
                 lock(&self.retiring).push((existing, retire_at));
+                self.note(
+                    peer,
+                    format!(
+                        "a new connection ({new_class:?}) displaced the one held (last heard \
+                         {heard}s ago, {held_class:?}); the old one is retired"
+                    ),
+                );
             }
         }
         let conn = Arc::new(conn);
@@ -890,7 +990,16 @@ impl ConnectionManager {
             // the person as `Connection reset by peer` in the middle of their work.
             let still_carried = Arc::strong_count(conn) > 1;
             if (now >= *at && !still_carried) || !is_live(conn) {
+                let why = if is_live(conn) {
+                    "its grace was over and nothing was carried on it"
+                } else {
+                    "the peer had closed it"
+                };
                 conn.close(WireError::AuthenticatorInvalid);
+                self.note(
+                    conn.peer_id(),
+                    format!("a retired connection was closed: {why}"),
+                );
                 false
             } else {
                 true

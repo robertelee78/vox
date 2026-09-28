@@ -187,6 +187,16 @@ impl Member {
     /// [`Member::daemon`], running the daemon from another build of `vox` (a mutant sender that
     /// plays a faulty peer, for the proofs that need one).
     pub fn daemon_bin(&self, bin: &str, anchor: Option<&str>) -> Proc {
+        self.daemon_env(bin, anchor, &[])
+    }
+
+    /// [`Member::daemon`] from the mutant sender build `bin` (see [`mutant_sender`]), misbehaving
+    /// as `mode` (`serve-nothing`, `serve-unasked`). Check [`announced`] once it has synced.
+    pub fn daemon_mutant(&self, bin: &str, mode: &str, anchor: Option<&str>) -> Proc {
+        self.daemon_env(bin, anchor, &[("VOX_MUTANT_SENDER_MODE", mode)])
+    }
+
+    fn daemon_env(&self, bin: &str, anchor: Option<&str>, env: &[(&str, &str)]) -> Proc {
         let mut argv = vec!["daemon", "--listen", "127.0.0.1:0"];
         if let Some(a) = anchor {
             argv.extend(["--anchor", a]);
@@ -198,6 +208,8 @@ impl Member {
             .env("VOX_DATA_DIR", &self.dir)
             .env("VOX_CONFIG_DIR", self.dir.join("cfg"))
             .env_remove("VOX_ROOM")
+            .env_remove("VOX_MUTANT_SENDER_MODE")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -280,6 +292,50 @@ impl Member {
             .expect("attach to the node");
         Reader { rt, client }
     }
+}
+
+/// What the mutant sender build says on stderr at its first session, and what no shipped binary
+/// carries. Hard-coded, not read from the product: the product's copy is compiled only into the
+/// mutant.
+pub const MUTANT_MARKER: &str = "VOX-MUTANT-SENDER";
+
+fn carries_marker(path: &str) -> std::io::Result<bool> {
+    let bytes = std::fs::read(path)?;
+    let m = MUTANT_MARKER.as_bytes();
+    Ok(bytes.windows(m.len()).any(|w| w == m))
+}
+
+/// The mutant sender build that `VOX_MUTANT_SENDER` names (`scripts/build-mutant-sender.sh` builds
+/// it; CI and the release gate run that before the proofs), checked before anything is measured:
+/// it carries the mutant's marker, and the shipped binary the rest of the proof runs does not.
+/// Else CANNOT MEASURE.
+pub fn mutant_sender() -> String {
+    let path = std::env::var("VOX_MUTANT_SENDER").unwrap_or_else(|_| {
+        panic!(
+            "CANNOT MEASURE: VOX_MUTANT_SENDER does not name the mutant sender build \
+             (VOX_MUTANT_SENDER=$(scripts/build-mutant-sender.sh))"
+        )
+    });
+    match carries_marker(&path) {
+        Ok(true) => {}
+        Ok(false) => panic!(
+            "CANNOT MEASURE: VOX_MUTANT_SENDER={path} is not a mutant sender build (it does not \
+             carry {MUTANT_MARKER})"
+        ),
+        Err(e) => panic!("CANNOT MEASURE: VOX_MUTANT_SENDER={path}: {e}"),
+    }
+    assert!(
+        !carries_marker(VOX).expect("read the shipped binary"),
+        "the shipped binary {VOX} carries the mutant sender's marker {MUTANT_MARKER}"
+    );
+    path
+}
+
+/// Whether the mutant daemon `p` announced it misbehaves as `mode` (it does at its first session).
+pub fn announced(p: &Proc, mode: &str) -> bool {
+    p.transcript()
+        .lines()
+        .any(|l| l.contains(MUTANT_MARKER) && l.contains(&format!("\"{mode}\"")))
 }
 
 /// A counter summed over a member's `(room, peer)` rows, optionally for one peer only.

@@ -52,6 +52,7 @@ pub mod prekeys;
 pub mod profile;
 pub mod resolver;
 pub mod retention;
+pub mod seal_migration;
 pub mod status;
 pub mod store;
 pub mod syncstream;

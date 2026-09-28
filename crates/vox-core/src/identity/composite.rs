@@ -328,6 +328,17 @@ pub trait RootSigner {
     fn ed25519_id_proof(&self, challenge: &[u8]) -> Result<Zeroizing<[u8; ED25519_SIG_LEN]>> {
         Ok(Zeroizing::new(self.sign(challenge)?.ed25519_bytes()))
     }
+
+    /// The secret an unlocked identity seals its node-wide blobs under (V210-40, #214): the
+    /// vault's `self_seed`, which only the identity passphrase releases.
+    ///
+    /// **Not the `id_proof`.** An `id_proof` is an Ed25519 signature, and Ed25519 falls to a
+    /// quantum adversary holding only the public key, so a key taken from it is not a secret
+    /// from that adversary. `None` for a signer that holds no vault (a headless `vox node`,
+    /// whose identity is a plaintext file by design).
+    fn at_rest_seed(&self) -> Option<&[u8; 32]> {
+        None
+    }
 }
 
 /// The complete in-software root-signing backend (ADR-002 §1).

@@ -121,6 +121,10 @@ jobs:
       # backends to feature-gate; the default build IS the whole build.
       - name: Clippy (default, pure-Rust)
         run: cargo clippy --all-targets -- -D warnings
+      # The mutant sender (vox-core's `mutant-sender` feature, ADR-025 P9/P10) is never in a
+      # default build, so it is linted and documented on its own here.
+      - name: Clippy (mutant sender)
+        run: cargo clippy -p vox-core --features mutant-sender -- -D warnings
       - name: Test (default, pure-Rust)
         run: cargo test --workspace --no-fail-fast
         env:
@@ -128,6 +132,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
       - name: Docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+      - name: Docs (mutant sender)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p vox-core --no-deps --features mutant-sender
       # The proofs that drive the shipped `vox` with production parameters (Argon2id, real
       # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
       # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
@@ -137,6 +143,15 @@ jobs:
       # No proof is excluded by name any more (V210-19, #192): `cross_process_join_proof`, excused
       # as a flake since v0.2.2, passed 20 of 20 on integrate/v0.2.10 and is back in this gate.
       # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
+      # ADR-025's P9 and P10 proofs run a deliberately misbehaving sync sender as the faulty peer
+      # (no `vox` command makes a correct node misbehave). It is built here from this commit, into
+      # its own path, and named to them by VOX_MUTANT_SENDER; the script rebuilds the shipped
+      # binary with the default features afterwards and checks that it does not carry the mutant.
+      # Without this both proofs fail as CANNOT MEASURE (run 36389831839).
+      - name: Build the mutant sender (ADR-025 P9, P10)
+        run: |
+          path=$(scripts/build-mutant-sender.sh)
+          echo "VOX_MUTANT_SENDER=$path" >> "$GITHUB_ENV"
       - name: Real-parameter gates (release)
         # Two causal_order_proof proofs are excluded here, **for a cause that is not the order**:
         # `three_members_one_offline_for_a_while_show_one_order` (ADR-023 M23.2 proof 1), excluded

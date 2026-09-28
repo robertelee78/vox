@@ -668,8 +668,20 @@ fn finish_connection(
     confirm_vox_alpn(&connection)?;
 
     let session = SessionEstablishment::new(peer_id, now_secs);
+    // The peer's leaf certificate is generated per endpoint — per process — and bound to the
+    // identity by a signature (`identity_cert`), so its digest says which *process* of the
+    // identity this connection is to (V210-57).
+    let peer_process = connection
+        .peer_identity()
+        .and_then(|any| {
+            any.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+        .and_then(|chain| chain.first().map(|leaf| crate::hash::sha256(leaf.as_ref())))
+        .ok_or(Error::SignatureInvalid)?;
     Ok(VoxConnection {
         peer_id,
+        peer_process,
         session,
         via_circuit,
         router: DatagramRouter::start(connection.clone()),
@@ -720,6 +732,9 @@ fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
 pub struct VoxConnection {
     connection: Connection,
     peer_id: Digest32,
+    /// Which process of `peer_id` this connection is to: the digest of its per-process leaf
+    /// certificate (see [`Self::peer_process`]).
+    peer_process: Digest32,
     session: SessionEstablishment,
     /// Whether this connection was set up over a relay circuit (see [`Self::via_circuit`]).
     via_circuit: bool,
@@ -740,6 +755,16 @@ impl VoxConnection {
     #[must_use]
     pub fn peer_id(&self) -> Digest32 {
         self.peer_id
+    }
+
+    /// Which **process** of the peer's identity this connection is to: the digest of the
+    /// peer's leaf certificate, whose key is generated per endpoint and so per process, and is
+    /// bound to the identity by the identity's signature (ADR-011). Two connections to one
+    /// identity with different values are to two processes of it; one profile is held by one
+    /// process at a time, and an identity is one device's (V210-57).
+    #[must_use]
+    pub fn peer_process(&self) -> Digest32 {
+        self.peer_process
     }
 
     /// Whether this connection was **set up over a relay circuit** (ADR-012 rung 4) — a fact

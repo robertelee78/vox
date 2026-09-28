@@ -1163,6 +1163,8 @@ where
     negotiate_mode(SYNC_MODE_FRONTIER, remote_hello).map_err(local)?;
 
     let (frontiers, gen) = room.frontiers().map_err(local)?;
+    #[cfg(feature = "mutant-sender")]
+    let (frontiers, unasked) = mutant::have(room, frontiers).map_err(local)?;
     out.gen_have = Some(gen);
     send(t, encode_have(&frontiers))?;
     let SyncFrame::Have(remote_have) = decoded(recv(t)?)? else {
@@ -1178,12 +1180,10 @@ where
 
     // Served while the peer's entries are drained (V210-39): see `Transport::start_serving`.
     let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
-    let frames: Vec<Vec<u8>> = room
-        .entries(&their_wants)
-        .map_err(local)?
-        .iter()
-        .map(|w| encode_entry(w))
-        .collect();
+    let served = room.entries(&their_wants).map_err(local)?;
+    #[cfg(feature = "mutant-sender")]
+    let served = mutant::serve(served, unasked);
+    let frames: Vec<Vec<u8>> = served.iter().map(|w| encode_entry(w)).collect();
     t.start_serving(frames, serve_deadline)
         .map_err(|e| session_err(&e))?;
 
@@ -1256,6 +1256,91 @@ where
     out.complete = coverage.complete();
     out.gen_end = room.generation().ok();
     Ok(())
+}
+
+/// **A deliberately misbehaving sender** (ADR-025 P9, P10): compiled only with the `mutant-sender`
+/// feature, which no shipped build enables. The proofs need a peer that breaks the protocol in a
+/// way no `vox` command can make a correct node break it, so they run a daemon built from this tree
+/// with this module in, and choose its misbehaviour with `VOX_MUTANT_SENDER_MODE`:
+///
+/// - `serve-nothing` (P10): its `HAVE` is true, and it serves nothing for any `WANT`;
+/// - `serve-unasked` (P9): its `HAVE` hides the newest entry of every feed (it advertises
+///   `max_seq - 1` and that entry's hash), and it serves the hidden entries on every session anyway.
+///
+/// Any other value, or none, sends correctly. The first session announces the build and the mode
+/// on stderr, [`MARKER`](mutant::MARKER), which the proofs require before they measure anything.
+#[cfg(feature = "mutant-sender")]
+pub mod mutant {
+    use super::{Entry, FeedFrontier, SessionRoom, WantRange, WireError};
+
+    /// What the mutant build says on stderr, and what release packaging refuses to find in a binary.
+    pub const MARKER: &str = "VOX-MUTANT-SENDER";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Correct,
+        ServeNothing,
+        ServeUnasked,
+    }
+
+    fn mode() -> Mode {
+        static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            let named = std::env::var("VOX_MUTANT_SENDER_MODE").unwrap_or_default();
+            let mode = match named.as_str() {
+                "serve-nothing" => Mode::ServeNothing,
+                "serve-unasked" => Mode::ServeUnasked,
+                _ => Mode::Correct,
+            };
+            eprintln!(
+                "{MARKER}: this build misbehaves as a sync sender; mode {mode:?} ({named:?})"
+            );
+            mode
+        })
+    }
+
+    /// The `HAVE` to send, and the entries to serve unasked.
+    pub(super) fn have<S: SessionRoom + ?Sized>(
+        room: &S,
+        frontiers: Vec<FeedFrontier>,
+    ) -> Result<(Vec<FeedFrontier>, Vec<Vec<u8>>), WireError> {
+        if mode() != Mode::ServeUnasked {
+            return Ok((frontiers, Vec::new()));
+        }
+        let one = |author_id, seq| {
+            room.entries(&[WantRange {
+                author_id,
+                from_seq: seq,
+                to_seq: seq,
+            }])
+        };
+        let mut shown = Vec::new();
+        let mut hidden = Vec::new();
+        for f in frontiers {
+            hidden.extend(one(f.author_id, f.max_seq)?);
+            if f.max_seq < 2 {
+                continue;
+            }
+            let prev = one(f.author_id, f.max_seq - 1)?;
+            if let Some(entry) = prev.first().and_then(|w| Entry::from_wire(w).ok()) {
+                shown.push(FeedFrontier {
+                    author_id: f.author_id,
+                    max_seq: f.max_seq - 1,
+                    head_hash: entry.entry_hash(),
+                });
+            }
+        }
+        Ok((shown, hidden))
+    }
+
+    /// The entries to serve, given what the peer asked for and what is served unasked.
+    pub(super) fn serve(asked: Vec<Vec<u8>>, unasked: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        match mode() {
+            Mode::Correct => asked,
+            Mode::ServeNothing => Vec::new(),
+            Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
+        }
+    }
 }
 
 /// Classify and apply one received entry (ADR-025 D3): the non-fatal classes are returned, and
