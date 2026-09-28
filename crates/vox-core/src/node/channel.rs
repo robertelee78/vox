@@ -2432,7 +2432,7 @@ impl ChannelState {
     /// Only ever lowers an existing row: owing more of what the target is entitled to is
     /// harmless — a generation already held is ignored by [`Self::accept_skdm`] — and
     /// owing less could strand it. What it is entitled to is the caller's
-    /// [`Self::history_floor`], never this ledger.
+    /// history floor, never this ledger.
     ///
     /// # Errors
     /// If the ledger cannot be persisted.
