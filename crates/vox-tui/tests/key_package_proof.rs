@@ -36,6 +36,8 @@
 //!
 //! Mutations: no key-package posted → B reads 0. The log path releasing forward-only from the key
 //! held when the consent fell due (what it did before #226) → B reads 0 of the six, D all six.
+//! R14 deleting every superseded generation whatever V210-45 still owes (as the merge had it) →
+//! D and B each read 3 of the six: generation one's key was gone before either joined.
 
 #![cfg(unix)]
 
@@ -642,7 +644,9 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
     assert_eq!(
         d_got,
         sent.len(),
-        "CANNOT MEASURE: D, reached directly, did not read the six — the comparison has no baseline"
+        "a member trusted before it joined, reached directly, must read every post made since its \
+         trust (V210-45) — across the rotation too: no generation it is owed may be deleted first \
+         (R14 deletes only what is no longer needed)"
     );
     assert_eq!(
         b_got, d_got,
