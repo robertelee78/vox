@@ -6,12 +6,19 @@ Alice creates a room; Bob and Carol join it, all through real daemons. Bob trust
 pty (pyte at 160x50). His members pane must name Alice "alice" (not her fingerprint), and Carol by
 26 characters of her fingerprint followed by "(not in keyring)", whole. Exit 0 = pass, 1 = red,
 2 = apparatus. Every process is recorded and killed by PID.
+
+Bounded throughout (`vox_pty.py`, V210-54): past its budget the driver says `HUNG at <stage>`
+with its stack, stops everything and exits red.
 """
-import fcntl, os, pty, re, select, signal, struct, subprocess, sys, termios, time
+import os, re, subprocess, sys, time
+
+sys.dont_write_bytecode = True  # no __pycache__ in the source tree
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from vox_pty import Hung, Tui, arm, pyte, stage  # noqa: E402
 
 VOX, TAG = sys.argv[1], sys.argv[2]
+BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "240"))
 SP = os.environ.get("VOX_PTY_SCRATCH") or __import__("tempfile").mkdtemp(prefix="vox-tui-names-")
-PY = os.environ.get("VOX_PYTE_PATH", "")  # where `pyte` is importable from, if not installed
 S = f"{SP}/tuin-{TAG}"
 subprocess.run(["rm", "-rf", S])
 for w in ("anchor", "alice", "bob", "carol"):
@@ -19,12 +26,9 @@ for w in ("anchor", "alice", "bob", "carol"):
         os.makedirs(f"{S}/{w}/{d}")
 open(f"{S}/idpass", "w").write("id pass")
 PROCS = []
-if PY:
-    sys.path.insert(0, PY)
-try:
-    import pyte
-except ImportError:
+if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)"); sys.exit(2)
+arm(BUDGET, TAG)
 
 def env(w):
     e = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "USER") if k in os.environ}
@@ -58,9 +62,10 @@ def until(pred, secs, step=0.5):
 def apparatus(why):
     print(f"{TAG} APPARATUS: {why}"); sys.exit(2)
 
-tui_pid = None
+tui = None
 code = 2
 try:
+    stage("anchor")
     anchor = spawn("anchor", "node", "--listen", "127.0.0.1:0", out="anchor")
     spec = None
     def got_spec():
@@ -69,6 +74,7 @@ try:
         spec = m.group(0) if m else None
         return spec
     if not until(got_spec, 30): apparatus("anchor spec")
+    stage("identities and daemons")
     fp = {}
     for w in ("alice", "bob", "carol"):
         r = run(w, "id", "--identity-passphrase-file", f"{S}/idpass")
@@ -78,6 +84,7 @@ try:
                         "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol")}
     for w in daemons:
         if not until(lambda: run(w, "room", "list").returncode == 0, 60): apparatus(f"{w} daemon")
+    stage("room create, invite, join")
     if run("alice", "room", "create", "--name", "m", stdin="room pass").returncode != 0: apparatus("create")
     room = run("alice", "room", "list").stdout.split()[0]
     link = run("alice", "room", "invite", room).stdout.strip()
@@ -86,6 +93,7 @@ try:
         if j.returncode != 0: apparatus(f"{w} join: {j.stderr.strip()}")
     t = run("bob", "trust", "add", fp["alice"], "--name", "alice", "--identity-passphrase-file", f"{S}/idpass")
     if t.returncode != 0: apparatus(f"trust add: {t.stderr}")
+    stage("bob's roster")
     # Bob's node must know both members before its TUI is opened.
     def roster():
         r = run("bob", "room", "roster", room)
@@ -93,49 +101,26 @@ try:
     if not until(roster, 90, 1): apparatus("bob never listed both alice and carol: " + run("bob", "room", "roster", room).stdout)
     stop(daemons["bob"])
 
-    tui_pid, fd = pty.fork()
-    if tui_pid == 0:
-        os.execve(VOX, [VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec], env("bob"))
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 160, 0, 0))
-    raw = bytearray()
-    def pump(secs):
-        end = time.time() + secs
-        while time.time() < end:
-            r, _, _ = select.select([fd], [], [], 0.1)
-            if r:
-                try:
-                    raw.extend(os.read(fd, 65536))
-                except OSError:
-                    return
-    def key(s, wait=1.0):
-        os.write(fd, s.encode()); pump(wait)
-    def screen():
-        scr = pyte.Screen(160, 50); pyte.ByteStream(scr).feed(bytes(raw))
-        return scr.display
-    pump(4)
-    key("id pass\r", 4)
-    key("\r", 2)
-    key("room pass\r", 4)
-    key("\r", 2)
-    key("\t", 1)   # timeline -> composer
-    key("\t", 1)   # composer -> members
+    stage("bob's tui: unlock and open the room")
+    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec], env("bob"))
+    tui.pump(4)
+    tui.key("id pass\r", 4)
+    tui.key("\r", 2)
+    tui.key("room pass\r", 4)
+    tui.key("\r", 2)
+    tui.key("\t", 1)   # timeline -> composer
+    tui.key("\t", 1)   # composer -> members
     # The members pane is the right-hand column; read every row of it from the emulated screen.
     def members():
-        rows = []
-        for row in screen():
-            m = re.search(r"│([^│]*)│?\s*$", row)
-            seg = row[100:] if len(row) > 100 else ""
-            rows.append(seg)
-        return rows
+        return [row[100:] if len(row) > 100 else "" for row in tui.display()]
     want_carol = fp["carol"][:26]
     def seen():
         txt = "\n".join(members())
         return "alice" in txt and want_carol in txt
-    end = time.time() + 30
-    while time.time() < end and not seen():
-        pump(1)
+    stage("bob's members pane")
+    tui.until(seen, 30, 1)
     pane = [r.rstrip() for r in members() if r.strip()]
-    open(f"{S}/tui.raw", "wb").write(bytes(raw))
+    print(f"{TAG} the TUI drew {tui.bytes} bytes")
     print(f"{TAG} members pane (cols 100+):")
     for r in pane:
         print(f"  |{r}")
@@ -148,17 +133,17 @@ try:
           f"carol by 26 chars + marker: {carol_ok}")
     code = 0 if (alice_ok and not alice_fp_shown and carol_ok) else 1
     print(f"{TAG} {'PASS' if code == 0 else 'RED'}")
+except Hung as h:
+    print(f"{TAG} HUNG at {h}")
+    code = 1
 finally:
-    if tui_pid:
-        try:
-            os.kill(tui_pid, signal.SIGTERM); time.sleep(1); os.kill(tui_pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            os.waitpid(tui_pid, 0)
-        except ChildProcessError:
-            pass
+    stage("stopping every process")
+    if tui is not None and not tui.stop():
+        # A driver that cannot stop what it started has leaked it, and is how a job hangs (#240).
+        print(f"{TAG} RED: vox tui (pid {tui.pid}) outlived SIGKILL and could not be reaped")
+        code = 1
     for p in PROCS:
         if p.poll() is None:
             stop(p)
+    stage(f"done, exit {code}")
 sys.exit(code)

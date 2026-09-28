@@ -11,6 +11,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
+
 #[test]
 #[ignore = "real daemons and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
 fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked() {
@@ -18,20 +21,22 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
     // runner until the job's 120-minute limit cancelled everything (run 36397085576, 2f49ffb). Armed,
     // the watchdog dumps stacks and kills the pty driver, `vox tui` and the daemons (#201).
     watchdog::arm();
+    // And the driver is bounded on its own (V210-54, #240): past its budget it says where it was
+    // and stops everything, and past `pty_driver::BOUND` it is stopped from outside.
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_member_names.py");
-    let out = std::process::Command::new("python3")
-        .args([script, env!("CARGO_BIN_EXE_vox"), "cargo"])
-        .output()
-        .expect("python3 must be on PATH to run the TUI proof");
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    eprintln!("{said}");
-    match out.status.code() {
+    let out = pty_driver::run(script, &[env!("CARGO_BIN_EXE_vox"), "cargo"]);
+    let said = out.stdout;
+    eprintln!("{said}\n[proof] the driver took {:?}", out.took);
+    match out.code {
         Some(0) => assert!(said.contains("cargo PASS"), "exit 0 without a PASS line: {said}"),
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
+        _ if said.contains("outlived SIGKILL") => {
+            panic!("the TUI proof could not stop the `vox tui` it started: {said}")
+        }
+        _ if said.contains("HUNG at") || out.code.is_none() => panic!(
+            "the TUI proof hung (its stage and stack are above, on stderr): exit {:?}: {said}",
+            out.code
+        ),
         _ => panic!("the TUI must name alice \"alice\" and carol by 26 characters + \"(not in keyring)\": {said}"),
     }
 }
