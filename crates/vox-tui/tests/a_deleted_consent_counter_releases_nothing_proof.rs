@@ -39,6 +39,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
+
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -261,22 +264,22 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
 
     // ---- close C as a person does: in the TUI ---------------------------------------------------
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_close_room.py");
-    let out = Command::new("python3")
-        .arg(script)
-        .arg(VOX)
-        .arg(&alice)
-        .arg(alice.join("cfg"))
-        .args([IDENTITY, ROOMPASS, "cargo"])
-        .output()
-        .expect("python3 must be on PATH to drive the TUI");
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    let out = pty_driver::run(
+        script,
+        &[
+            VOX,
+            &alice.to_string_lossy(),
+            &alice.join("cfg").to_string_lossy(),
+            IDENTITY,
+            ROOMPASS,
+            "cargo",
+        ],
     );
+    let said = out.stdout;
+    println!("[proof] the TUI driver took {:?}", out.took);
     println!("[proof] tui: {}", said.trim());
     assert!(
-        out.status.code() == Some(0) && said.contains("cargo the TUI said done to :close"),
+        out.code == Some(0) && said.contains("cargo the TUI said done to :close"),
         "CANNOT MEASURE: the TUI did not close room C: {said}"
     );
 
