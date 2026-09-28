@@ -823,10 +823,11 @@ impl NodeNet {
                 let waited = std::time::Instant::now();
                 notified.await;
                 let ms = waited.elapsed().as_millis();
-                // Said when it matters: a waiter the other reach left with nothing, or one that
-                // waited long enough for a person to notice (#229's diagnostics).
+                // Said only after a wait worth noting (#229's diagnostics). A ladder that fails at
+                // once — nobody to relay through — is said by its own "could not reach", and every
+                // waiter repeating it drowned the log (seen on #243's anchor-restart proof).
                 let found = self.manager.existing(&peer).is_some();
-                if !found || ms >= 1_000 {
+                if ms >= 250 {
                     self.manager.note(
                         peer,
                         if found {

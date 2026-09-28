@@ -799,8 +799,13 @@ impl ConnectionManager {
                 .map(|(c, _)| Arc::clone(c)),
         );
         // A closed or already-dead (silent, or severed) connection is no rival to `file_inner` or
-        // to a promotion.
-        held.retain(|c| is_live(c) && !self.is_dead(c));
+        // to a promotion; nor is one to **another process** of the identity, which the newcomer
+        // supersedes outright (see `file_inner`) — so a restarted peer is not made to wait out a
+        // probe of its dead predecessor, which it paid on every restart (V210-57: 250 ms, the
+        // floor of `probe_patience`).
+        held.retain(|c| {
+            is_live(c) && !self.is_dead(c) && c.peer_process() == newcomer.peer_process()
+        });
         // Probed at once, so a peer with a dead primary and a dead retired connection costs one
         // patience, not two.
         //
@@ -841,6 +846,43 @@ impl ConnectionManager {
                 dead.close(WireError::Unresponsive);
             }
         }
+        // **A newcomer from another process of the identity supersedes every connection to the
+        // one before** (V210-57). One profile is held by one process at a time and an identity is
+        // one device's, so a connection to a different process of the same identity is to a
+        // predecessor: dead, or on its way out. It is closed, not weighed. Weighed, it could win:
+        // the tie-break and the probe both ask whether a connection is *live*, and a dead
+        // process's connection can look live for a moment — and then a restarted process's anchor
+        // kept its predecessor's connection, closed the one the restarted process was using, and
+        // left it with no helper (CI run 36418572653: 30065 ms). Both ends agree without a vote:
+        // the restarted process holds only the newcomer.
+        //
+        // **No new power.** `conn` exists only because its leaf certificate was verified as signed
+        // by `peer`'s identity key (`identity_cert::verify_peer_certificate`, ADR-011): only the
+        // identity's holder can present a new process of it, and that holder can already speak as
+        // it. **Two live processes of one identity** (a copied profile, an old binary) would each
+        // supersede the other: that is bounded by the dialler's anchor backoff, which counts a
+        // connection lost soon after it was made as a failure (`ANCHOR_FLAP_SECS`), not a loop.
+        let process = conn.peer_process();
+        if let Some(existing) = map.get(&peer).filter(|e| e.peer_process() != process) {
+            let existing = Arc::clone(existing);
+            map.remove(&peer);
+            if is_live(&existing) {
+                existing.close(WireError::Unresponsive);
+                self.note(
+                    peer,
+                    "a new connection is from a new process of this identity: the connection to \
+                     the one before is closed"
+                        .to_owned(),
+                );
+            }
+        }
+        lock(&self.retiring).retain(|(c, _)| {
+            let superseded = c.peer_id() == peer && c.peer_process() != process;
+            if superseded && is_live(c) {
+                c.close(WireError::Unresponsive);
+            }
+            !superseded
+        });
         if let Some(existing) = map.get(&peer) {
             // **A held connection that is dead is not a rival.** Silent: the process behind it
             // is gone (see [`SILENCE_IS_DEATH`]). Severed: its circuit is gone, so it can send
