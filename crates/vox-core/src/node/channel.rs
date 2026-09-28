@@ -68,6 +68,7 @@ use crate::log::feed::lipmaa;
 use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
 use crate::nat::bootstrap::BootstrapSet;
 use crate::nat::record::Admission;
+use crate::node::consent_order::Stamp;
 use crate::node::content::Content;
 use crate::node::profile::Profile;
 use crate::node::store::Store;
@@ -116,6 +117,35 @@ const SEG_DELIVERED: u64 = 7;
 /// bundle at all, and would fall off every board — the same reason `SEG_ANCHORS`
 /// exists.
 const SEG_ADMISSION: u64 = 8;
+
+/// The history ledger segment id within [`SegmentKind::KeyMaterial`] (V210-45):
+/// target → the oldest of this identity's generations it is still owed. Same encoding
+/// as [`SEG_DELIVERED`]. A row exists only while some of that history is undelivered;
+/// it is never the authority on what the target may read — `SEG_ENTITLED` is.
+const SEG_HISTORY: u64 = 9;
+
+/// The entitlement segment id within [`SegmentKind::KeyMaterial`] (V210-45): target →
+/// the earliest `(chain_id, iteration)` of this identity's sender key the consent
+/// released to it. Every later release to that target — a re-key, a refused key owed
+/// again, history — starts there and never earlier, so a key taken at a position is
+/// never re-released from its generation's origin.
+const SEG_ENTITLED: u64 = 10;
+
+/// The trust-mark segment id within [`SegmentKind::KeyMaterial`] (V210-45): identity →
+/// `(decision, chain_id, iteration)`, the position this identity's sender key stood at
+/// in this room when it decided to trust that identity. `decision` is the decision's
+/// consent-order stamp, value and order id ([`crate::node::consent_order`], V210-49), so a
+/// mark from a withdrawn decision, or from a deleted counter's, can never date a later one.
+const SEG_TRUST_MARKS: u64 = 11;
+
+/// At-rest version of the entitlement segment.
+const POSITIONS_VERSION: u64 = 1;
+/// At-rest version of the trust-mark segment. Version 2 keeps the decision's order id
+/// (V210-49); a version-1 segment is read as holding no marks (narrower, never wider).
+const MARKS_VERSION: u64 = 2;
+
+/// A trust mark: the decision's stamp, and where this identity's sender key stood at it.
+type TrustMark = (Stamp, u64, u64);
 
 /// At-rest version of the delivery-ledger segment.
 const DELIVERED_VERSION: u64 = 1;
@@ -406,6 +436,15 @@ pub struct ChannelState {
     /// [`ChannelState::owed_rekeys`]; it is never itself the authority on who may
     /// read (the log is).
     delivered: BTreeMap<Digest32, u64>,
+    /// Target → the oldest generation it is still owed (V210-45), persisted in
+    /// `SEG_HISTORY`. See [`ChannelState::owe_history`].
+    history: BTreeMap<Digest32, u64>,
+    /// Target → the earliest `(chain_id, iteration)` released to it (V210-45), persisted
+    /// in `SEG_ENTITLED`. See [`ChannelState::entitled_from`].
+    entitled: BTreeMap<Digest32, (u64, u64)>,
+    /// Identity → `(decision, chain_id, iteration)` at the trust decision (V210-45),
+    /// persisted in `SEG_TRUST_MARKS`. See [`ChannelState::mark_trust`].
+    trust_marks: BTreeMap<Digest32, TrustMark>,
     /// The channel passphrase, retained **in memory only** for as long as the
     /// channel is open (M14.7c).
     ///
@@ -501,6 +540,7 @@ fn retain_generation(
     author: &Digest32,
     sender: &SenderChain,
     created_at: u64,
+    mint_seq: Stamp,
 ) -> Result<()> {
     let (iteration, origin_key) = sender.current_position();
     if iteration != 0 {
@@ -514,8 +554,103 @@ fn retain_generation(
         origin_key,
         sender.signing_pubkey().to_bytes(),
         created_at,
+        Some(mint_seq),
     );
     Ok(())
+}
+
+/// The entitlement segment: `[version, [[target, chain_id, iteration], …]]`.
+fn positions_bytes(rows: &BTreeMap<Digest32, (u64, u64)>) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(POSITIONS_VERSION).array(rows.len());
+    for (t, (c, i)) in rows {
+        e.array(3).bytes(t).uint(*c).uint(*i);
+    }
+    e.finish()
+}
+
+fn parse_positions(bytes: &[u8]) -> Result<BTreeMap<Digest32, (u64, u64)>> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 {
+        return Err(Error::MalformedAtRest("positions arity"));
+    }
+    if d.uint()? != POSITIONS_VERSION {
+        return Err(Error::MalformedAtRest("positions version"));
+    }
+    let n = d.array()?;
+    if n > MAX_AUTHORS {
+        return Err(Error::SizeLimitExceeded("positions rows"));
+    }
+    let mut out = BTreeMap::new();
+    for _ in 0..n {
+        if d.array()? != 3 {
+            return Err(Error::MalformedAtRest("positions row arity"));
+        }
+        let target: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("positions target"))?;
+        let chain_id = d.uint()?;
+        let iteration = d.uint()?;
+        out.insert(target, (chain_id, iteration));
+    }
+    d.finish()?;
+    Ok(out)
+}
+
+/// The trust-mark segment: `[version, [[target, decision, order_id, chain_id, iteration], …]]`.
+fn marks_bytes(rows: &BTreeMap<Digest32, TrustMark>) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(MARKS_VERSION).array(rows.len());
+    for (t, (d, c, i)) in rows {
+        e.array(5)
+            .bytes(t)
+            .uint(d.seq)
+            .bytes(&d.order)
+            .uint(*c)
+            .uint(*i);
+    }
+    e.finish()
+}
+
+fn parse_marks(bytes: &[u8]) -> Result<BTreeMap<Digest32, TrustMark>> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 {
+        return Err(Error::MalformedAtRest("trust marks arity"));
+    }
+    let version = d.uint()?;
+    // A version-1 mark carries no order id, so it cannot be matched to any decision: it is
+    // dropped, and a room opened later marks afresh at its position then (narrower).
+    if version == POSITIONS_VERSION {
+        return Ok(BTreeMap::new());
+    }
+    if version != MARKS_VERSION {
+        return Err(Error::MalformedAtRest("trust marks version"));
+    }
+    let n = d.array()?;
+    if n > MAX_AUTHORS {
+        return Err(Error::SizeLimitExceeded("trust marks rows"));
+    }
+    let mut out = BTreeMap::new();
+    for _ in 0..n {
+        if d.array()? != 5 {
+            return Err(Error::MalformedAtRest("trust marks row arity"));
+        }
+        let target: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("trust marks target"))?;
+        let seq = d.uint()?;
+        let order = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("trust marks order id"))?;
+        let chain_id = d.uint()?;
+        let iteration = d.uint()?;
+        out.insert(target, (Stamp { order, seq }, chain_id, iteration));
+    }
+    d.finish()?;
+    Ok(out)
 }
 
 /// The delivery ledger segment: `[version, [[target, chain_id], …]]`, targets in
@@ -853,7 +988,16 @@ impl ChannelState {
         // chain ratchets past iteration 0 the origin is unrecoverable, so it is kept
         // now or never (ADR-006 §History).
         let mut origins = OriginKeyStore::new();
-        retain_generation(&mut origins, &channel_id, epoch, &me, &sender, now_secs)?;
+        let mint_seq = crate::node::consent_order::stamp_mint(profile.store(), signer, 0)?;
+        retain_generation(
+            &mut origins,
+            &channel_id,
+            epoch,
+            &me,
+            &sender,
+            now_secs,
+            mint_seq,
+        )?;
 
         let manifest = manifest_bytes(&genesis, local_name, now_secs, epoch);
         let manifest_seg = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest)?;
@@ -933,6 +1077,9 @@ impl ChannelState {
             own_admission: Some(Admission::Creator),
             origins,
             delivered: BTreeMap::new(),
+            history: BTreeMap::new(),
+            entitled: BTreeMap::new(),
+            trust_marks: BTreeMap::new(),
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
@@ -1109,6 +1256,30 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
+        let history = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_HISTORY)? {
+            Some(seg) => {
+                let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_HISTORY, &seg)?;
+                parse_delivered(&bytes)?
+            }
+            None => BTreeMap::new(),
+        };
+        let entitled =
+            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ENTITLED)? {
+                Some(seg) => {
+                    let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_ENTITLED, &seg)?;
+                    parse_positions(&bytes)?
+                }
+                None => BTreeMap::new(),
+            };
+        let trust_marks =
+            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_TRUST_MARKS)? {
+                Some(seg) => {
+                    let bytes =
+                        open_segment(&sek, SegmentKind::KeyMaterial, SEG_TRUST_MARKS, &seg)?;
+                    parse_marks(&bytes)?
+                }
+                None => BTreeMap::new(),
+            };
 
         let evaluator = Arc::new(Self::build_evaluator(
             &genesis,
@@ -1138,6 +1309,9 @@ impl ChannelState {
             own_admission,
             origins,
             delivered,
+            history,
+            entitled,
+            trust_marks,
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
@@ -1271,7 +1445,16 @@ impl ChannelState {
         let epoch = 0u64;
         let sender = SenderChain::new(channel_id, epoch, &me, 0, now_secs)?;
         let mut origins = OriginKeyStore::new();
-        retain_generation(&mut origins, channel_id, epoch, &me, &sender, now_secs)?;
+        let mint_seq = crate::node::consent_order::stamp_mint(profile.store(), signer, 0)?;
+        retain_generation(
+            &mut origins,
+            channel_id,
+            epoch,
+            &me,
+            &sender,
+            now_secs,
+            mint_seq,
+        )?;
 
         let creator = genesis.body.creator_pubkey.fingerprint();
         let mut authors = BTreeMap::new();
@@ -1354,6 +1537,9 @@ impl ChannelState {
             own_admission: None,
             origins,
             delivered: BTreeMap::new(),
+            history: BTreeMap::new(),
+            entitled: BTreeMap::new(),
+            trust_marks: BTreeMap::new(),
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
@@ -1696,11 +1882,16 @@ impl ChannelState {
     /// `target` immediately reads as consented in this node's view.
     ///
     /// The SKDM delivery itself is the caller's (M14.5b); this records the consent.
+    ///
+    /// `entitled_from` is the earliest `(chain_id, iteration)` this consent releases to
+    /// `target` (V210-45): the delivered key's own position, or earlier when history
+    /// is owed too. It is recorded, and no later release to `target` starts before it.
     pub fn issue_consent(
         &mut self,
         profile: &Profile,
         target: Digest32,
         delivered_skdm: &Skdm,
+        entitled_from: (u64, u64),
         now_secs: u64,
     ) -> Result<ConsentGrant> {
         let signer = profile.signer()?;
@@ -1720,6 +1911,15 @@ impl ChannelState {
         // this member the new one (V210-30).
         self.delivered.insert(target, delivered_skdm.body.chain_id);
         self.persist_delivered(profile.store())?;
+        // An entitlement already held (an earlier consent never revoked) stands: both were
+        // decided, and the earlier one released what it released.
+        let from = self
+            .entitled
+            .get(&target)
+            .map_or(entitled_from, |e| (*e).min(entitled_from));
+        if self.entitled.insert(target, from) != Some(from) {
+            self.persist_entitled(profile.store())?;
+        }
         Ok(grant)
     }
 
@@ -1753,15 +1953,23 @@ impl ChannelState {
     /// rotation that persisted the chain but lost the origin would leave the members
     /// who kept consent permanently unable to read the messages sent before their
     /// re-key.
-    pub fn rotate_sender(&mut self, store: &Store, now_secs: u64) -> Result<u64> {
+    pub fn rotate_sender(&mut self, profile: &Profile, now_secs: u64) -> Result<u64> {
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
             ));
         }
+        let store = profile.store();
         let next = self.sender.rotated(now_secs)?;
         let chain_id = next.chain_id();
         let me = self.me();
+        // The mint's place in the consent order, persisted before the generation exists
+        // (V210-45): a value is never handed out twice, so no later decision can tie it.
+        let mint_seq = crate::node::consent_order::stamp_mint(
+            store,
+            profile.signer()?,
+            self.newest_mint_seq(),
+        )?;
         retain_generation(
             &mut self.origins,
             &self.channel_id,
@@ -1769,6 +1977,7 @@ impl ChannelState {
             &me,
             &next,
             now_secs,
+            mint_seq,
         )?;
         let sender_seg = seal_segment(
             &self.sek,
@@ -1960,7 +2169,7 @@ impl ChannelState {
         }
         // Rotate first: the entry names the generation that excludes `target`, so
         // that generation has to exist before the fact is signed.
-        let new_chain_id = self.rotate_sender(profile.store(), now_secs)?;
+        let new_chain_id = self.rotate_sender(profile, now_secs)?;
         let signer = profile.signer()?;
         let revocation =
             issue_consent_revocation(signer, &self.channel_id, self.epoch, target, new_chain_id)?;
@@ -1969,6 +2178,16 @@ impl ChannelState {
         // starts from "holds nothing".
         if self.delivered.remove(&target).is_some() {
             self.persist_delivered(profile.store())?;
+        }
+        // Nor any history: and none is owed again, because `history_floor` refuses a
+        // member this identity has ever revoked here.
+        if self.history.remove(&target).is_some() {
+            self.persist_history(profile.store())?;
+        }
+        // And what the consent released is released no more: a later re-consent is
+        // entitled from its own position only.
+        if self.entitled.remove(&target).is_some() {
+            self.persist_entitled(profile.store())?;
         }
         Ok(revocation)
     }
@@ -1984,6 +2203,348 @@ impl ChannelState {
     pub fn forget_delivery(&mut self, store: &Store, target: &Digest32) -> Result<()> {
         if self.delivered.remove(target).is_some() {
             self.persist_delivered(store)?;
+        }
+        Ok(())
+    }
+
+    /// This identity's retained generations here, `(chain_id, mint_seq)` ascending.
+    fn my_generations(&self) -> Vec<(u64, Option<Stamp>)> {
+        self.origins
+            .generations(&self.channel_id, self.epoch, &self.me())
+    }
+
+    /// The consent-order value of this identity's newest generation here, or 0 when none
+    /// has one. A trust decision is stamped above it ([`crate::node::consent_order`]). Only a
+    /// floor: a value under another counter's id raises a stamp and never orders anything.
+    #[must_use]
+    pub fn newest_mint_seq(&self) -> u64 {
+        self.my_generations()
+            .into_iter()
+            .filter_map(|(_, s)| s.map(|s| s.seq))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Record where this identity's sender key stands **now**, as the position at which it
+    /// decided to trust `target` (decision value `decision`) — V210-45. Called at the
+    /// decision for every open room, and on opening a room for a decision taken while it was
+    /// closed (nothing is sealed in a closed room, so its position then is its position now).
+    ///
+    /// # Errors
+    /// If the marks cannot be persisted.
+    pub fn mark_trust(&mut self, store: &Store, target: Digest32, decision: Stamp) -> Result<()> {
+        if self
+            .trust_marks
+            .get(&target)
+            .is_some_and(|m| m.0 == decision)
+        {
+            return Ok(());
+        }
+        if !self.trust_marks.contains_key(&target) && self.trust_marks.len() >= MAX_AUTHORS {
+            return Err(Error::SizeLimitExceeded("trust marks"));
+        }
+        let position = (
+            decision,
+            self.sender.chain_id(),
+            self.sender.current_position().0,
+        );
+        self.trust_marks.insert(target, position);
+        self.persist_marks(store)
+    }
+
+    /// Mark every decision in `order` taken while this room was closed (V210-45), with no
+    /// mark of its own here yet: every decision not provably taken **before** the live
+    /// generation was minted. A decision provably before it needs none: that generation, and
+    /// every later one, is released whole.
+    ///
+    /// A live generation stamped by another counter (the blob was deleted and recreated,
+    /// V210-49), or by none, cannot be ordered against any decision, so every decision is
+    /// marked here. That mark is at or after the decision — nothing is sealed in a closed room,
+    /// and a room open at a decision was marked then — so it releases nothing sealed before it.
+    ///
+    /// # Errors
+    /// If the marks cannot be persisted.
+    pub fn mark_decisions_on_open(
+        &mut self,
+        store: &Store,
+        order: &crate::node::consent_order::ConsentOrder,
+    ) -> Result<()> {
+        let current = self.sender.chain_id();
+        let live = self
+            .my_generations()
+            .into_iter()
+            .find(|(c, _)| *c == current)
+            .and_then(|(_, s)| s);
+        for (target, decision) in order.decisions() {
+            // `mark_trust` keeps a mark this decision already has.
+            if !live.is_some_and(|l| l.after(&decision)) {
+                self.mark_trust(store, target, decision)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What of this identity's sender key a member it decided to trust at consent-order
+    /// value `decision` may read here (V210-45), oldest first, as `(chain_id, iteration)`
+    /// releases — or `None` when the decision entitles it to nothing before the ordinary
+    /// forward-only release.
+    ///
+    /// Trust is the consent **decision** (ADR-020 §3); a room delivers it later, once the
+    /// identity is a member there, which may be long after. Forward-only consent (ADR-006)
+    /// is measured from the decision, and the order is logical, never a clock
+    /// ([`crate::node::consent_order`]):
+    /// - a generation minted **after** the decision (a greater value) holds only posts
+    ///   sealed after it, so it is released **whole**, at its origin — the argument M18.1's
+    ///   re-key at iteration 0 rests on;
+    /// - the generation **live at** the decision is released from the position it had
+    ///   then, which this room recorded at the decision ([`Self::mark_trust`]); with no
+    ///   such mark it is not released here at all;
+    /// - nothing older is released.
+    ///
+    /// Narrower, never wider:
+    /// - no decision value (a keyring row from before the order was kept) → `None`;
+    /// - a generation with no value (minted before the order was kept), or one stamped by
+    ///   another counter than the decision's (a deleted and recreated one, V210-49), is not
+    ///   provably after the decision: it is released only from this room's mark of the
+    ///   decision, if the mark lies in it, and it ends the walk;
+    /// - a hole in the retained generations ends the walk, and the live generation's origin
+    ///   must be retained for anything to be released;
+    /// - an identity this identity has **ever** revoked here → `None`: its re-consent is
+    ///   dated by its own delivery, and what was sealed while it was excluded stays closed
+    ///   to it (ADR-007).
+    ///
+    /// The work is bounded by what is held: at most [`MAX_RETAINED_ORIGINS`] generations,
+    /// each at most `ROTATE_AFTER_MESSAGES` iterations long, so a receiver deriving a
+    /// released generation never needs more than `MAX_SKIP` steps of it.
+    ///
+    /// [`MAX_RETAINED_ORIGINS`]: crate::group::history::MAX_RETAINED_ORIGINS
+    #[must_use]
+    pub fn history_plan(
+        &self,
+        target: &Digest32,
+        decision: Option<Stamp>,
+    ) -> Option<Vec<(u64, u64)>> {
+        let decision = decision?;
+        let me = self.me();
+        let revoked_here = self.gov_entries.iter().any(|g| {
+            matches!(
+                &g.body,
+                crate::governance::entry::GovBody::ConsentRevocation(r)
+                    if r.body.author_id == me && r.body.target_id == *target
+            )
+        });
+        if revoked_here {
+            return None;
+        }
+        let current = self.sender.chain_id();
+        let mut plan = Vec::new();
+        let mut expect = current;
+        for (chain_id, mint_seq) in self.my_generations().into_iter().rev() {
+            if chain_id > current {
+                continue;
+            }
+            // Contiguous from the live generation down: a hole ends what can be released.
+            if chain_id != expect {
+                break;
+            }
+            if mint_seq.is_some_and(|m| m.after(&decision)) {
+                // Minted after the decision, in the decision's own counter: whole.
+                plan.push((chain_id, 0));
+            } else {
+                // Live at the decision, or not provably after it (no stamp, or another
+                // counter's): only from where this room marked the decision, and nothing before.
+                if let Some(&(d, c, i)) = self.trust_marks.get(target) {
+                    if d == decision && c == chain_id {
+                        plan.push((chain_id, i));
+                    }
+                }
+                break;
+            }
+            let Some(below) = chain_id.checked_sub(1) else {
+                break;
+            };
+            expect = below;
+        }
+        plan.reverse();
+        (!plan.is_empty()).then_some(plan)
+    }
+
+    /// Release this identity's generation `chain_id` at `iteration` (V210-45). The live
+    /// generation whose origin is not retained can only be released at its current
+    /// position, which is later: narrower, never wider.
+    ///
+    /// # Errors
+    /// No signer, or a generation that cannot be released.
+    pub fn release_generation(
+        &self,
+        profile: &Profile,
+        chain_id: u64,
+        iteration: u64,
+    ) -> Result<Skdm> {
+        let signer = profile.signer()?;
+        if self.origins.has(&self.channel_id, self.epoch, chain_id) {
+            return self.origins.release_at(
+                signer,
+                &self.channel_id,
+                self.epoch,
+                chain_id,
+                iteration,
+            );
+        }
+        if chain_id == self.sender.chain_id() {
+            let (at, key) = self.sender.current_position();
+            if at >= iteration {
+                return self.sender.skdm_for(signer, at, key);
+            }
+        }
+        Err(Error::MalformedBundle("no retained origin for generation"))
+    }
+
+    /// The earliest `(chain_id, iteration)` of this identity's sender key released to
+    /// `target` here, if a consent recorded one (V210-45). Every later release to it
+    /// starts there.
+    #[must_use]
+    pub fn entitled_from(&self, target: &Digest32) -> Option<(u64, u64)> {
+        self.entitled.get(target).copied()
+    }
+
+    /// The re-key of the live generation for `target`: at its origin, unless `target`'s
+    /// entitlement begins inside the live generation, and then from there (V210-45). A key
+    /// released at a position, refused, and owed again is therefore owed at that position,
+    /// never from the origin, which would reveal the posts sealed before the consent.
+    ///
+    /// # Errors
+    /// No signer, or a generation that cannot be released.
+    pub fn rekey_skdm_for(&self, profile: &Profile, target: &Digest32) -> Result<Skdm> {
+        match self.entitled.get(target) {
+            Some(&(c, i)) if c == self.sender.chain_id() => self.release_generation(profile, c, i),
+            Some(&(c, _)) if c > self.sender.chain_id() => Err(Error::MalformedAtRest(
+                "entitlement past the live generation",
+            )),
+            _ => self.rekey_skdm(profile),
+        }
+    }
+
+    /// Record that `target` is owed this identity's generations from `floor` up to the
+    /// current one **whole**, so the re-key round delivers them ([`Self::owed_history`],
+    /// [`Self::history_skdms`]) and retries them until they are taken (V210-45).
+    ///
+    /// Only ever lowers an existing row: owing more of what the target is entitled to is
+    /// harmless — a generation already held is ignored by [`Self::accept_skdm`] — and
+    /// owing less could strand it. What it is entitled to is the caller's
+    /// [`Self::history_floor`], never this ledger.
+    ///
+    /// # Errors
+    /// If the ledger cannot be persisted.
+    pub fn owe_history(&mut self, store: &Store, target: Digest32, floor: u64) -> Result<()> {
+        if floor >= self.sender.chain_id() {
+            // Only the live generation: the ordinary re-key covers it.
+            return Ok(());
+        }
+        let entry = self.history.entry(target).or_insert(floor);
+        if *entry < floor {
+            return Ok(());
+        }
+        *entry = floor;
+        self.persist_history(store)
+    }
+
+    /// The consenters still owed history, with the oldest generation each is owed.
+    /// Filtered by the consent set on the log, so a revoked member is never owed any.
+    #[must_use]
+    pub fn owed_history(&self) -> BTreeMap<Digest32, u64> {
+        let me = self.me();
+        let readers = MembershipView::new(&self.evaluator).readers_of(&me);
+        self.history
+            .iter()
+            .filter(|(t, _)| **t != me && readers.contains(*t))
+            .map(|(t, f)| (*t, *f))
+            .collect()
+    }
+
+    /// The SKDMs releasing this identity's retained generations from `floor` to the
+    /// current one, oldest first, each from where `target` is entitled
+    /// ([`Self::entitled_from`]): the generation its entitlement begins in from that
+    /// iteration, every later one at its origin, and none before it. A target with no
+    /// recorded entitlement gets none. A generation whose origin is no longer retained is
+    /// skipped: it cannot be released by anybody.
+    pub fn history_skdms(
+        &self,
+        profile: &Profile,
+        target: &Digest32,
+        floor: u64,
+    ) -> Result<Vec<Skdm>> {
+        let Some((from_chain, from_iteration)) = self.entitled_from(target) else {
+            return Ok(Vec::new());
+        };
+        let signer = profile.signer()?;
+        let current = self.sender.chain_id();
+        let mut out = Vec::new();
+        for chain_id in floor.max(from_chain)..=current {
+            if self.origins.has(&self.channel_id, self.epoch, chain_id) {
+                let iteration = if chain_id == from_chain {
+                    from_iteration
+                } else {
+                    0
+                };
+                out.push(self.origins.release_at(
+                    signer,
+                    &self.channel_id,
+                    self.epoch,
+                    chain_id,
+                    iteration,
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record that every generation `target` was owed from its history floor has gone
+    /// out; a refusal of any of them owes it again ([`Self::owe_history`]).
+    ///
+    /// # Errors
+    /// If the ledger cannot be persisted.
+    pub fn note_history_delivered(&mut self, store: &Store, target: &Digest32) -> Result<()> {
+        if self.history.remove(target).is_some() {
+            self.persist_history(store)?;
+        }
+        Ok(())
+    }
+
+    fn persist_entitled(&mut self, store: &Store) -> Result<()> {
+        let bytes = positions_bytes(&self.entitled);
+        self.persist_positions(store, SEG_ENTITLED, &bytes)
+    }
+
+    fn persist_marks(&mut self, store: &Store) -> Result<()> {
+        let bytes = marks_bytes(&self.trust_marks);
+        self.persist_positions(store, SEG_TRUST_MARKS, &bytes)
+    }
+
+    fn persist_positions(&mut self, store: &Store, id: u64, bytes: &[u8]) -> Result<()> {
+        let seg = seal_segment(&self.sek, SegmentKind::KeyMaterial, id, bytes)?;
+        if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, id, &seg) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn persist_history(&mut self, store: &Store) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_HISTORY,
+            &delivered_bytes(&self.history),
+        )?;
+        if let Err(e) = store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_HISTORY,
+            &seg,
+        ) {
+            self.poisoned = true;
+            return Err(e);
         }
         Ok(())
     }

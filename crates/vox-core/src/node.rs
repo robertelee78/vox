@@ -28,6 +28,7 @@ pub mod anchor;
 pub mod api;
 pub mod channel;
 pub mod circuitstream;
+pub mod consent_order;
 pub mod content;
 pub mod coordstream;
 pub mod headless;
