@@ -66,6 +66,11 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
         .collect();
     let started = std::time::Instant::now();
     let queue: Vec<&String> = names.iter().collect();
+    // Progress every 100 rooms, with the time the last hundred took: a create that grows slower
+    // as rooms accumulate shows here, where a total time cannot tell growth from a steady cost.
+    let made = std::sync::atomic::AtomicUsize::new(0);
+    let last = std::sync::Mutex::new(started);
+    let (made, last) = (&made, &last);
     std::thread::scope(|scope| {
         for chunk in queue.chunks(queue.len().div_ceil(PARALLEL)) {
             scope.spawn(move || {
@@ -76,6 +81,16 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
                         Some("page room passphrase"),
                     );
                     assert!(o.ok, "room create {name}: {o:?}");
+                    let n = made.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n % 100 == 0 {
+                        let mut prev = last.lock().unwrap();
+                        eprintln!(
+                            "[progress] {n} rooms at {:.1}s; the last 100 took {:.1}s",
+                            started.elapsed().as_secs_f64(),
+                            prev.elapsed().as_secs_f64()
+                        );
+                        *prev = std::time::Instant::now();
+                    }
                 }
             });
         }
@@ -129,6 +144,13 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
             ],
         );
         assert!(o.ok, "trust add {fp}: {o:?}");
+        if (i + 1) % 50 == 0 {
+            eprintln!(
+                "[progress] {} trusted at {:.1}s",
+                i + 1,
+                started.elapsed().as_secs_f64()
+            );
+        }
         fingerprints.insert(fp);
     }
     eprintln!(
