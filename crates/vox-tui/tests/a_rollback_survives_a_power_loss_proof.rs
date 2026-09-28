@@ -222,3 +222,136 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
         failures.join("\n")
     );
 }
+
+/// Run `vox update --rollback` from `dir`'s own `vox`, nothing of the person's touched.
+fn rollback(dir: &Path, home: &Path) -> (bool, String) {
+    let out = Command::new(dir.join("vox"))
+        .args(["update", "--rollback"])
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("VOX_NO_SHELL_SETUP", "1")
+        .output()
+        .expect("run vox update --rollback");
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// **A rollback a power loss interrupted is finished by the next one, not refused** (#242, the
+/// verifier's follow-up). `do_rollback` copies `vox` to `.vox-rollback.partial`, renames
+/// `.vox-previous` onto `vox`, then renames the copy to `.vox-previous`. A power loss between the
+/// renames left `vox` (the rolled-back binary) and the partial copy (the other one), with no
+/// `.vox-previous`, and every later `--rollback` refused: "no previous vox was retained". Staged
+/// here directly, as each state a power loss can leave (the binary that runs the next rollback is
+/// whatever is `vox` then, so this build is `vox`, and the other binary is a runnable stub):
+///
+/// 1. **between the renames** — `--rollback` finishes the swap and stops there: `vox` is still
+///    this build, `.vox-previous` is the other binary, no partial is left;
+/// 2. **before the first rename** — the partial is only a copy of `vox`: it is discarded, and the
+///    rollback runs;
+/// 3. **a partial that does not run** (cut short before its flush) — it is never installed: it is
+///    discarded, `vox` is untouched, and with no previous the rollback refuses.
+///
+/// Mutation: the recovery removed → (1) is refused.
+#[test]
+#[ignore = "real install directories and the shipped binary; the macOS release gate runs it"]
+fn an_interrupted_rollback_is_finished_by_the_next_one() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut failures: Vec<String> = Vec::new();
+
+    // 1. between the renames
+    {
+        let root = tmp.path().join("between");
+        let dir = install_dir(&root);
+        previous_stub(&dir.join(".vox-rollback.partial"), "0.0.1");
+        let (ok, said) = rollback(&dir, &home);
+        let (active, previous) = (
+            version_of(&dir.join("vox")),
+            version_of(&dir.join(".vox-previous")),
+        );
+        let partial_left = dir.join(".vox-rollback.partial").exists();
+        eprintln!(
+            "[proof] (1) between the renames: ok={ok}; vox {active:?}; .vox-previous {previous:?}; \
+             partial left: {partial_left}; said {:?}",
+            said.trim()
+        );
+        if !(ok
+            && active.as_deref().is_some_and(|v| v.contains(VERSION))
+            && previous.as_deref() == Some("vox 0.0.1")
+            && !partial_left)
+        {
+            failures.push(format!(
+                "(1) an interrupted rollback was not finished: ok={ok}, vox {active:?}, \
+                 .vox-previous {previous:?}, partial left {partial_left}: {said}"
+            ));
+        }
+    }
+    // 2. before the first rename
+    {
+        let root = tmp.path().join("before");
+        let dir = install_dir(&root);
+        previous_stub(&dir.join(".vox-previous"), "0.0.1");
+        std::fs::copy(dir.join("vox"), dir.join(".vox-rollback.partial")).unwrap();
+        let (ok, said) = rollback(&dir, &home);
+        let (active, previous) = (
+            version_of(&dir.join("vox")),
+            version_of(&dir.join(".vox-previous")),
+        );
+        let partial_left = dir.join(".vox-rollback.partial").exists();
+        eprintln!(
+            "[proof] (2) before the first rename: ok={ok}; vox {active:?}; .vox-previous \
+             {previous:?}; partial left: {partial_left}"
+        );
+        if !(ok
+            && active.as_deref() == Some("vox 0.0.1")
+            && previous.as_deref().is_some_and(|v| v.contains(VERSION))
+            && !partial_left)
+        {
+            failures.push(format!(
+                "(2) a rollback over a leftover copy did not run cleanly: ok={ok}, vox {active:?}, \
+                 .vox-previous {previous:?}, partial left {partial_left}: {said}"
+            ));
+        }
+    }
+    // 3. a partial that does not run
+    {
+        let root = tmp.path().join("broken");
+        let dir = install_dir(&root);
+        std::fs::write(dir.join(".vox-rollback.partial"), b"").unwrap();
+        let (ok, said) = rollback(&dir, &home);
+        let active = version_of(&dir.join("vox"));
+        let partial_left = dir.join(".vox-rollback.partial").exists();
+        let previous_made = dir.join(".vox-previous").exists();
+        eprintln!(
+            "[proof] (3) an empty partial: ok={ok}; vox {active:?}; partial left: {partial_left}; \
+             .vox-previous made: {previous_made}; said {:?}",
+            said.trim()
+        );
+        if !(!ok
+            && said.contains("no previous vox was retained")
+            && active.as_deref().is_some_and(|v| v.contains(VERSION))
+            && !partial_left
+            && !previous_made)
+        {
+            failures.push(format!(
+                "(3) an empty partial was not discarded safely: ok={ok}, vox {active:?}, partial \
+                 left {partial_left}, .vox-previous made {previous_made}: {said}"
+            ));
+        }
+    }
+    eprintln!("[proof] {} of 3 states failed", failures.len());
+    assert!(
+        failures.is_empty(),
+        "a rollback does not recover what a power loss left:\n{}",
+        failures.join("\n")
+    );
+}

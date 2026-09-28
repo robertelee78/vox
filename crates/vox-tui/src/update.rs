@@ -837,14 +837,35 @@ fn owned(installed: Channel, what: &str) -> Result<(PathBuf, String), AppError> 
 fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
     let active = install_dir.join(ACTIVE_NAME);
     let previous = install_dir.join(PREVIOUS_NAME);
+    let scratch = install_dir.join(ROLLBACK_PARTIAL);
+    let _lock = InstallLock::acquire(install_dir)?;
+    // **A rollback a power loss interrupted is finished, not refused** (#242, verifier). The steps
+    // below leave two states behind them. Between the renames, the previous binary is already
+    // `vox` and the other one is still the scratch copy, with no `.vox-previous`. That rollback
+    // happened: its swap is completed, and this one stops there rather than swapping back. Before
+    // the first rename, both names are intact and the scratch is only a copy of `vox`: it goes.
+    // A scratch that does not run (a copy cut short before its flush) is never installed.
+    if scratch.is_file() {
+        if !previous.is_file() && binary_version(&scratch).is_some() {
+            fs::rename(&scratch, &previous).map_err(AppError::Io)?;
+            sync_dir(install_dir)?;
+            println!(
+                "finished a rollback that was interrupted: {} is {}, and {} is kept for --rollback",
+                active.display(),
+                binary_version(&active).unwrap_or_else(|| "unknown".to_owned()),
+                previous.display()
+            );
+            return Ok(());
+        }
+        fs::remove_file(&scratch).map_err(AppError::Io)?;
+        sync_dir(install_dir)?;
+    }
     if !previous.is_file() {
         return Err(usage(format!(
             "no previous vox was retained in {} — nothing to roll back to",
             install_dir.display()
         )));
     }
-    let _lock = InstallLock::acquire(install_dir)?;
-    let scratch = install_dir.join(ROLLBACK_PARTIAL);
     // Durably, step by step (V210-56): the copy of the active binary is on disk before either
     // rename, and each rename is on disk before the next — so a power loss anywhere leaves a
     // runnable `vox` under that name, and the other binary under one of the two others.
