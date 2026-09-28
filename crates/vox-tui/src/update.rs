@@ -837,14 +837,37 @@ fn owned(installed: Channel, what: &str) -> Result<(PathBuf, String), AppError> 
 fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
     let active = install_dir.join(ACTIVE_NAME);
     let previous = install_dir.join(PREVIOUS_NAME);
+    let scratch = install_dir.join(ROLLBACK_PARTIAL);
+    let _lock = InstallLock::acquire(install_dir)?;
+    // **A rollback a power loss interrupted is finished, not refused** (#242, verifier). The steps
+    // below leave two states behind them. Between the renames, the previous binary is already
+    // `vox` and the other one is still the scratch copy, with no `.vox-previous`. That rollback
+    // happened: its swap is completed, and this one stops there rather than swapping back. Before
+    // the first rename, both names are intact and the scratch is only a copy of `vox`: it goes.
+    // A scratch that does not run (a copy cut short before its flush) is never installed.
+    if scratch.is_file() {
+        if !previous.is_file() && runs_as_vox(&scratch) {
+            fs::rename(&scratch, &previous).map_err(AppError::Io)?;
+            sync_dir(install_dir)?;
+            println!(
+                "finished a rollback that was interrupted: {} is {}, and {} is kept for --rollback",
+                active.display(),
+                binary_version(&active).unwrap_or_else(|| "unknown".to_owned()),
+                previous.display()
+            );
+            // As any rollback does: the binary now in place brings its own completions.
+            run_shell_setup(&active);
+            return Ok(());
+        }
+        fs::remove_file(&scratch).map_err(AppError::Io)?;
+        sync_dir(install_dir)?;
+    }
     if !previous.is_file() {
         return Err(usage(format!(
             "no previous vox was retained in {} — nothing to roll back to",
             install_dir.display()
         )));
     }
-    let _lock = InstallLock::acquire(install_dir)?;
-    let scratch = install_dir.join(ROLLBACK_PARTIAL);
     // Durably, step by step (V210-56): the copy of the active binary is on disk before either
     // rename, and each rename is on disk before the next — so a power loss anywhere leaves a
     // runnable `vox` under that name, and the other binary under one of the two others.
@@ -860,6 +883,57 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
     );
     run_shell_setup(&active);
     Ok(())
+}
+
+/// How long [`runs_as_vox`] waits for `--version` before it counts a binary as not running.
+const RUNS_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether `path` is a `vox` that runs: `--version` exits 0 within [`RUNS_WITHIN`] and says
+/// `vox <version>` (#247, verifier). A leftover a power loss may have cut short is installed only
+/// on this; one that hangs, fails, or answers anything else is not a `vox`.
+fn runs_as_vox(path: &Path) -> bool {
+    let Ok(mut child) = Command::new(path)
+        .arg("--version")
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < RUNS_WITHIN => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    };
+    let mut out = Vec::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout
+            .by_ref()
+            .take(MAX_VERSION_OUTPUT_BYTES as u64 + 1)
+            .read_to_end(&mut out);
+    }
+    if !status.success() || out.len() > MAX_VERSION_OUTPUT_BYTES {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out);
+    let mut words = text.split_whitespace();
+    words.next() == Some("vox")
+        && words.next().is_some_and(|v| {
+            let mut parts = v.split(['.', '-', '+']);
+            (0..3).all(|_| parts.next().is_some_and(|p| p.parse::<u64>().is_ok()))
+        })
+        && words.next().is_none()
 }
 
 /// What `vox --version` on `path` reports, as a bare version string.
