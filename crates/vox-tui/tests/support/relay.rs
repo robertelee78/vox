@@ -69,6 +69,31 @@ impl Anchor {
         }
     }
 
+    /// Stop this anchor (by its PID) and start it again from the same `dir` on the same port, so
+    /// every spec naming it still does (V210-57's proof of a prompt redial). A new process: a new
+    /// endpoint, a new certificate, every connection to the old one gone.
+    pub fn restart(&mut self, dir: &std::path::Path) {
+        let port: u16 = self
+            .v4_spec
+            .rsplit('/')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("the anchor's port");
+        let listen = format!("[::]:{port}");
+        // The old one first, by its own handle, so the port is free for the new one.
+        let _ = self.proc.child.kill();
+        let _ = self.proc.child.wait();
+        let before = self.proc.transcript();
+        self.proc = VoxProc::spawn("anchor", dir, &args(&["node", "--listen", &listen]));
+        self.proc
+            .seen
+            .extend(before.lines().map(|l| format!("(before the restart) {l}")));
+        self.proc
+            .expect_line("the restarted anchor's --anchor spec", |l| {
+                !l.starts_with("! ") && l.trim_start().contains('@')
+            });
+    }
+
     /// How many circuits the anchor says it carries, from the latest report it printed. It prints
     /// on change, so this drains its output (waiting `settle` for a line in flight) and reads the
     /// last one.
