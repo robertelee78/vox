@@ -314,6 +314,7 @@ pub fn run_node(
         let mut last_state: (usize, usize, usize) = (usize::MAX, 0, 0);
         // What the board actually holds per room, reported when it changes. See below.
         let mut last_board: Vec<String> = Vec::new();
+        let mut last_holding: Vec<String> = Vec::new();
         let mut stalls = node.subscribe();
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
@@ -395,6 +396,29 @@ pub fn run_node(
                         println!("vox node: board — {}", board.join(", "));
                         last_board = board;
                     }
+                    // **Where the board points each member** (V210-51, #230): the address its live
+                    // record names, which is what this board hands anyone asking where that member
+                    // is. A process that restarts publishes a new one; a board still naming the old
+                    // process's address sends every dial to a socket nobody holds, and nothing else
+                    // an operator can read says so. On change, like the rest.
+                    let holding: Vec<String> = view
+                        .anchoring
+                        .iter()
+                        .flat_map(|a| {
+                            a.holding.iter().map(|(member, addrs)| {
+                                format!(
+                                    "{} holding {} for {}",
+                                    crate::tunnel_cli::short_id_of(&a.channel_id),
+                                    addrs.join(" "),
+                                    crate::ident::author_id(member)
+                                )
+                            })
+                        })
+                        .collect();
+                    for line in holding.iter().filter(|l| !last_holding.contains(*l)) {
+                        println!("vox node: board — {line}");
+                    }
+                    last_holding = holding;
                     // Drained without blocking: this arm also has an anchors file to
                     // write, and a status line nobody reads is better than a tick nobody
                     // reaches.

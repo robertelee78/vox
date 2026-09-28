@@ -972,6 +972,14 @@ impl NodeNet {
                     members: members.len(),
                     pending: guard.current_prejoins(&channel_id, now).len(),
                     entries: None,
+                    holding: guard
+                        .current_members(&channel_id, 0, now)
+                        .iter()
+                        .map(|r| {
+                            let addrs = r.endpoints.addrs().iter().map(ToString::to_string);
+                            (r.author_id, addrs.collect())
+                        })
+                        .collect(),
                 }
             })
             .collect()

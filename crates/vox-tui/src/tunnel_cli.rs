@@ -726,6 +726,12 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         NodeEvent::Stalled { what, millis } => {
             eprintln!("vox: busy {millis}ms — {what} — nobody could be answered");
         }
+        NodeEvent::PublishCured { channel_id, what } => {
+            eprintln!(
+                "vox: {what} for room {} was taken on a republish, after the board refused it as stale",
+                short(channel_id)
+            );
+        }
         _ => {}
     }
 }
