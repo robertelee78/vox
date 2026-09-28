@@ -5028,11 +5028,42 @@ impl Node {
         else {
             return;
         };
+        // **One commit for every room** (#189): each room marks and seals under its own lock,
+        // and the write happens once, after, with no room's lock held. A commit per room made
+        // `vox trust add` cost one durable commit per open room on the actor, about 7 s at
+        // 1,600 rooms. The write transaction is never held while awaiting a room's lock: a sync
+        // holds a room's lock while it waits for a write transaction, so that order would
+        // deadlock. Nothing else on the actor runs between the seals and the commit, and nothing
+        // off it writes a room's marks, so no newer marks can be overwritten by these.
+        let mut sealed: Vec<(SharedChannel, Digest32, crate::atrest::store::SealedSegment)> =
+            Vec::new();
         for ch in shared {
-            let _ = ch
-                .lock()
-                .await
-                .mark_trust(profile.store(), fingerprint, decision);
+            let (seg, id) = {
+                let mut room = ch.lock().await;
+                (
+                    room.mark_trust_sealed(fingerprint, decision),
+                    room.channel_id(),
+                )
+            };
+            if let Ok(Some(seg)) = seg {
+                sealed.push((ch, id, seg));
+            }
+        }
+        if sealed.is_empty() {
+            return;
+        }
+        let written = (|| -> crate::error::Result<()> {
+            let mut batch = profile.store().batch()?;
+            for (_, id, seg) in &sealed {
+                ChannelState::queue_marks(&mut batch, id, seg)?;
+            }
+            batch.commit()
+        })();
+        if written.is_err() {
+            // As a failed per-room write always did: memory is ahead of the store.
+            for (ch, _, _) in sealed {
+                ch.lock().await.poison();
+            }
         }
     }
 
