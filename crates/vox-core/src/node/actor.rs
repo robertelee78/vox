@@ -6068,6 +6068,27 @@ impl Node {
                 b.failures = 0;
             }
         }
+        // **A clean session the peer opened releases a backoff that said the peer could not take
+        // ours** (ADR-025 D5, V210-34). The peer just ran a session with this node, in this room, at
+        // this epoch, over a live connection: whatever refused this side's own (`Policy`: the room
+        // not held there yet, another epoch; `Busy`; `Unreachable`) no longer holds, so the port
+        // syncs at once instead of waiting out the backoff. Measured through the shipped binaries
+        // (P2, CI run 36389831839): a joiner refuses the push its host makes while it is still
+        // sealing the room (`EpochMismatch`), the host's port took a 30 s `Policy` backoff, and a
+        // post made there 6 s later reached the joiner after 24 s, although the joiner had synced
+        // with the host in between. `NoProgress` is kept: a peer that syncs *from* this node says
+        // nothing about whether it serves what it advertises (P10).
+        if attempt.dir == crate::node::ports::Dir::In
+            && report.fail.is_none()
+            && port
+                .backoff
+                .is_some_and(|b| b.kind != crate::node::status::BackoffKind::NoProgress)
+        {
+            port.clear_backoff();
+            crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
+                c.backoff = None;
+            });
+        }
         match &report.fail {
             None if o.complete => {
                 // **Clean**: consume the requests this attempt saw, and credit the peer with the

@@ -9,20 +9,40 @@
 //!
 //! ## Staging
 //! Alice creates [`ROOMS`] rooms and Bob joins each; they trust each other, and Bob reads a
-//! warm-up post in every room. Then Alice posts once in every room at the same instant
-//! ([`ROOMS`] concurrent `vox room post`s). Each post is timed from its own `vox room post`
-//! returning to readable on Bob's node, over his control socket as `vox room read` reads it.
+//! warm-up post in every room (each timed from Alice's first warm-up post there, printed). Then
+//! Alice posts once in every room at the same instant ([`ROOMS`] concurrent `vox room post`s). Each
+//! post is timed from its own `vox room post` returning to readable on Bob's node, over his control
+//! socket as `vox room read` reads it.
+//!
+//! Then **V210-34, staged deterministically**: one more room, joined last, while Alice posts in it
+//! every [`STAGE_EVERY`]. One of her pushes lands inside Bob's seconds-long seal of the room, which
+//! he refuses (`EpochMismatch`: not held here yet), and her port with him for it takes a 30 s
+//! `Policy` backoff. A join no push met is not the staging, and another room is joined, up to
+//! [`STAGE_TRIES`]. Once Bob's own sessions with her there have run and settled (her `vox status
+//! --json`: an admitted session, none running, the row unchanged for [`SETTLE`]), Alice posts once
+//! more, timed to Bob's read and to her own push opening.
 //!
 //! ## Asserted
-//! Every post readable by Bob within [`BOUND`].
+//! 1. Every post of the burst readable by Bob within [`BOUND`];
+//! 2. the post in the late-joined room readable by Bob, and **carried by Alice's own push** (her
+//!    `opened` rises), both within [`LATE_BOUND`]. Before the fix nothing released Alice's backoff
+//!    when Bob synced with her, so her push waited out the 30 s (CI run 36389831839: the burst's
+//!    post in room 39, 24 s). The push is asserted, not only the read, because Bob's own 30 s tick
+//!    can carry the post and would hide a port still backing off.
 //!
-//! ## Precondition (else CANNOT MEASURE)
-//! The burst reached the slot cap: on Alice's `vox status --json`, `skipped_at_cap` rose (the
-//! base) or `queued` rose (ADR-025). A burst that never met the cap proves nothing.
+//! ## Preconditions (else CANNOT MEASURE)
+//! - The burst reached the slot cap: on Alice's `vox status --json`, `skipped_at_cap` rose (the
+//!   base) or `queued` rose (ADR-025). A burst that never met the cap proves nothing.
+//! - During the late join, Alice's `vox status --json` row for that room and Bob showed the
+//!   refusal (`last_failure` "epoch mismatch") and a `policy` backoff. Without it (2) measures
+//!   nothing.
 //!
 //! ## Mutation
-//! Restore `try_acquire`-or-skip in place of the queue: a skipped port waits for the interval and
-//! the bound goes red.
+//! - Restore `try_acquire`-or-skip in place of the queue: a skipped port waits for the interval and
+//!   (1) goes red.
+//! - Remove the release of a backoff by a clean session the peer opened (`file_session`, V210-34),
+//!   or release it only on sessions this node opened: Alice's port waits out the 30 s and (2) goes
+//!   red, on every run.
 
 #![cfg(unix)]
 
@@ -40,7 +60,40 @@ use sync_pair::{counter, failures, pct, Member};
 const ROOMS: usize = 40;
 /// Each post readable by Bob within this of its `vox room post` returning.
 const BOUND: Duration = Duration::from_secs(2);
+/// The post in the late-joined room readable by Bob within this, once he has synced with Alice
+/// there: well under the 30 s `Policy` backoff the refused push used to wait out (24 s on CI).
+const LATE_BOUND: Duration = Duration::from_secs(5);
+/// How often Alice posts in the late-joined room while Bob's join of it runs.
+const STAGE_EVERY: Duration = Duration::from_millis(50);
+/// How long she keeps posting after Bob's `vox room join` returns.
+const STAGE_AFTER: Duration = Duration::from_secs(2);
+/// Late joins tried for one whose seal met a push (it did in 6 of 7 single tries measured).
+const STAGE_TRIES: usize = 5;
+/// How long Alice's row for the late-joined room must stay unchanged and idle before the timed post.
+const SETTLE: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
+
+/// Alice's ports to `peer` that are in backoff, as `room-prefix kind/failures (last failure)`.
+fn backoffs(status: &serde_json::Value, peer: &str) -> Vec<String> {
+    status["sync"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| r["peer"].as_str().is_some_and(|p| peer.starts_with(p)))
+                .filter(|r| !r["backoff"].is_null())
+                .map(|r| {
+                    format!(
+                        "{} {}/{} ({})",
+                        &r["room"].as_str().unwrap_or("?")[..8],
+                        r["backoff"]["kind"].as_str().unwrap_or("?"),
+                        r["backoff"]["failures"],
+                        r["last_failure"].as_str().unwrap_or("-")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 #[test]
 #[ignore = "two real daemons with production Argon2id and 40 rooms; CI runs it in release"]
@@ -64,14 +117,16 @@ fn a_burst_past_the_slot_cap_is_queued() {
     let mut rb = bob.reader();
     let ids: Vec<_> = rooms.iter().map(|r| rb.room(r)).collect();
 
-    // Bob reads a post in every room first: keys have flowed in every room.
+    // Bob reads a post in every room first: keys have flowed in every room. Each room's read is
+    // timed from Alice's first warm-up post there (V210-34): right after the joins, this is where a
+    // push refused while Bob was still sealing a room shows.
     let start = Instant::now();
+    let mut first_post: Vec<Option<Instant>> = vec![None; ROOMS];
+    let mut read_at: Vec<Option<Instant>> = vec![None; ROOMS];
     let mut n = 0;
     loop {
         n += 1;
-        let unread: Vec<usize> = (0..ROOMS)
-            .filter(|&i| !rb.texts(ids[i]).iter().any(|t| t.starts_with("warm ")))
-            .collect();
+        let unread: Vec<usize> = (0..ROOMS).filter(|&i| read_at[i].is_none()).collect();
         if unread.is_empty() {
             break;
         }
@@ -83,13 +138,43 @@ fn a_burst_past_the_slot_cap_is_queued() {
         );
         for &i in &unread {
             alice.post(&rooms[i], &format!("warm {i} {n}"));
+            first_post[i].get_or_insert_with(Instant::now);
         }
-        std::thread::sleep(Duration::from_secs(2));
+        let round = Instant::now();
+        while round.elapsed() < Duration::from_secs(2) && read_at.iter().any(Option::is_none) {
+            for i in 0..ROOMS {
+                if read_at[i].is_none() && rb.texts(ids[i]).iter().any(|t| t.starts_with("warm ")) {
+                    read_at[i] = Some(Instant::now());
+                }
+            }
+            std::thread::sleep(POLL);
+        }
     }
+    let mut warm_late: Vec<String> = Vec::new();
+    let mut warm_max = Duration::ZERO;
+    for i in 0..ROOMS {
+        if let (Some(p), Some(r)) = (first_post[i], read_at[i]) {
+            let l = r.saturating_duration_since(p);
+            warm_max = warm_max.max(l);
+            if l > Duration::from_secs(2) {
+                warm_late.push(format!("room {i}: {l:?}"));
+            }
+        }
+    }
+    println!(
+        "[proof] warm-up: first posts read after at most {warm_max:?}; {} over 2s \
+         {warm_late:?}",
+        warm_late.len()
+    );
     eprintln!("[proof] warm-up done after {:?}", start.elapsed());
     // Let the warm-up's sessions drain, so the burst starts from idle slots.
     std::thread::sleep(Duration::from_secs(3));
     let before = alice.status();
+    let held_back = backoffs(&before, &bob.fp);
+    println!(
+        "[proof] at the burst, alice's ports to bob in backoff: {} {held_back:?}",
+        held_back.len()
+    );
 
     let barrier = std::sync::Barrier::new(ROOMS);
     let done: Vec<Instant> = std::thread::scope(|s| {
@@ -147,9 +232,30 @@ fn a_burst_past_the_slot_cap_is_queued() {
         late.len(),
         failures(&after)
     );
+    let refused: Vec<usize> = (0..ROOMS)
+        .filter(|&i| {
+            after["sync"].as_array().is_some_and(|rows| {
+                rows.iter().any(|r| {
+                    r["room"].as_str().is_some_and(|x| x.starts_with(&rooms[i]))
+                        && r["peer"].as_str().is_some_and(|p| bob.fp.starts_with(p))
+                        && r["last_failure"]
+                            .as_str()
+                            .is_some_and(|f| f.contains("epoch mismatch"))
+                })
+            })
+        })
+        .collect();
+    println!("[proof] rooms whose alice->bob sessions bob refused as epoch mismatch: {refused:?}");
+    let after_backoffs = backoffs(&after, &bob.fp);
+    println!(
+        "[proof] after the burst, alice's ports to bob in backoff: {} {after_backoffs:?}",
+        after_backoffs.len()
+    );
     for l in late.iter().take(10) {
         println!("[late] {l}");
     }
+
+    // The burst's claim is settled before the late join is staged.
     assert!(
         skipped >= 1 || queued >= 1,
         "CANNOT MEASURE: the burst never met the slot cap (skipped_at_cap {skipped}, queued \
@@ -159,5 +265,135 @@ fn a_burst_past_the_slot_cap_is_queued() {
         late.is_empty(),
         "{} of {ROOMS} posts took longer than {BOUND:?} to reach bob: {late:?}",
         late.len()
+    );
+    // **V210-34, staged.** One more room, joined last, while Alice posts in it every
+    // [`STAGE_EVERY`]: one of her pushes lands inside Bob's seconds-long seal of the room, which he
+    // refuses (`EpochMismatch`), and her port with him for it takes a 30 s `Policy` backoff. Seen
+    // on her `vox status --json` while the join runs (with the fix, Bob's first clean session to
+    // her clears it moments after his join returns, so it is looked for as it happens). A join
+    // whose seal no push met is not the staging, and another room is joined, up to
+    // [`STAGE_TRIES`].
+    let row_in = |st: &serde_json::Value, room: &str| -> serde_json::Value {
+        st["sync"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|r| {
+                        r["room"].as_str().is_some_and(|x| x.starts_with(room))
+                            && r["peer"].as_str().is_some_and(|p| bob.fp.starts_with(p))
+                    })
+                    .cloned()
+            })
+            .unwrap_or_default()
+    };
+    let mut staged: Option<(String, String)> = None;
+    let mut tries: Vec<String> = Vec::new();
+    for k in 0..STAGE_TRIES {
+        let name = format!("latejoin{k}");
+        let lr = alice.create(&name);
+        let link = alice.invite(&lr);
+        let mut posts = 0usize;
+        std::thread::scope(|s| {
+            let joining = s.spawn(|| bob.join(&link, &name));
+            let mut after_join: Option<Instant> = None;
+            loop {
+                if after_join.is_none() && joining.is_finished() {
+                    after_join = Some(Instant::now());
+                }
+                if staged.is_some() || after_join.is_some_and(|t| t.elapsed() > STAGE_AFTER) {
+                    break;
+                }
+                posts += 1;
+                alice.post(&lr, &format!("during join {posts}"));
+                let r = row_in(&alice.status(), &lr);
+                let refused = r["last_failure"]
+                    .as_str()
+                    .is_some_and(|f| f.contains("epoch mismatch"));
+                if refused && r["backoff"]["kind"].as_str() == Some("policy") {
+                    staged = Some((lr.clone(), r.to_string()));
+                }
+                std::thread::sleep(STAGE_EVERY);
+            }
+            joining.join().unwrap();
+        });
+        tries.push(format!(
+            "{name}: {posts} posts, {}",
+            if staged.is_some() {
+                "refused"
+            } else {
+                "not refused"
+            }
+        ));
+        if staged.is_some() {
+            break;
+        }
+    }
+    println!("[proof] late joins: {tries:?}");
+    let Some((lr, refusal)) = staged else {
+        panic!(
+            "CANNOT MEASURE: in {STAGE_TRIES} late joins, no push of alice's was refused as epoch \
+             mismatch into a policy backoff: {tries:?}"
+        );
+    };
+    println!("[proof] late join: refusal and policy backoff seen: {refusal}");
+    let row = |st: &serde_json::Value| row_in(st, &lr);
+    let c = |r: &serde_json::Value, k: &str| r[k].as_u64().unwrap_or(0);
+    let idle = |r: &serde_json::Value| {
+        c(r, "opened") + c(r, "admitted")
+            <= c(r, "completed") + c(r, "partial") + c(r, "failed") + c(r, "stale")
+    };
+
+    // Bob's own sessions with Alice there have run, cleanly, since the refusal, and settled: on her
+    // side at least one admitted session, nothing running and nothing changing for [`SETTLE`].
+    let lid = rb.room(&lr);
+    let synced = Instant::now();
+    let mut last = String::new();
+    let mut still_since = Instant::now();
+    let settled = loop {
+        let r = row(&alice.status());
+        let now = r.to_string();
+        if now != last {
+            last = now;
+            still_since = Instant::now();
+        } else if c(&r, "admitted") >= 1 && idle(&r) && still_since.elapsed() >= SETTLE {
+            break r;
+        }
+        assert!(
+            synced.elapsed() < Duration::from_secs(20),
+            "CANNOT MEASURE: bob's sessions with alice in the late-joined room never ran and \
+             settled: {r}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let synced = synced.elapsed();
+
+    // The timed post: readable by Bob, **carried by Alice's own push** (her `opened` rises). Bob's
+    // pulls could carry it too, on his 30 s tick, and would hide a port still backing off.
+    let opened_before = c(&settled, "opened");
+    alice.post(&lr, "late timed");
+    let posted = Instant::now();
+    let (mut read_at, mut pushed_at) = (None, None);
+    while (read_at.is_none() || pushed_at.is_none()) && posted.elapsed() < Duration::from_secs(45) {
+        if read_at.is_none() && rb.has(lid, "late timed") {
+            read_at = Some(posted.elapsed());
+        }
+        if pushed_at.is_none() && c(&row(&alice.status()), "opened") > opened_before {
+            pushed_at = Some(posted.elapsed());
+        }
+        std::thread::sleep(POLL);
+    }
+    println!(
+        "[proof] late join: bob's sessions ran and settled {synced:?} after it; alice's backoff \
+         then {}; the timed post read by bob after {read_at:?}, alice's own push opened after \
+         {pushed_at:?}",
+        settled["backoff"]
+    );
+    assert!(
+        read_at.is_some_and(|t| t <= LATE_BOUND) && pushed_at.is_some_and(|t| t <= LATE_BOUND),
+        "in the room whose join refused alice's push, after bob had synced with her there, her \
+         next post reached bob after {read_at:?} and her own push to him opened after \
+         {pushed_at:?} (both at most {LATE_BOUND:?}; her backoff then {}): the 30 s policy \
+         backoff was not released",
+        settled["backoff"]
     );
 }

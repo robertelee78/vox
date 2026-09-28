@@ -10,8 +10,12 @@
 //! refusal that used to hide it, an honest pair retrying zero-progress sessions would loop.
 //!
 //! ## The mutant sender
-//! Built from this tree with one change: it serves nothing for any `WANT` (its `HAVE` is true).
-//! Its path is `VOX_MUTANT_SENDER`; without it the proof cannot measure and says so.
+//! `vox` built from this tree with vox-core's `mutant-sender` feature, by
+//! `scripts/build-mutant-sender.sh` (CI and the release gate run it before the proofs), and started
+//! with `VOX_MUTANT_SENDER_MODE=serve-nothing`: it serves nothing for any `WANT` (its `HAVE` is
+//! true). Its path is `VOX_MUTANT_SENDER`. Without it, or if it is not a mutant build, or if it
+//! never announces the mode, the proof cannot measure and says so; and the shipped binary the
+//! other member runs must not carry the mutant's marker.
 //!
 //! ## Staging
 //! Two daemons, no anchor. Bob (the mutant) posts; his `HAVE` now advertises an entry Alice lacks,
@@ -37,19 +41,19 @@ mod watchdog;
 
 use std::time::{Duration, Instant};
 
-use sync_pair::{counter, Member};
+use sync_pair::{announced, counter, mutant_sender, Member};
 
 const WINDOW: Duration = Duration::from_secs(30);
 /// Backoff from 1 s doubling (1, 2, 4, 8, 16 s) allows five sessions in 30 s, plus the first.
 const MAX_SESSIONS: u64 = 6;
+/// The mutant sender's misbehaviour here.
+const MODE: &str = "serve-nothing";
 
 #[test]
-#[ignore = "a real daemon against a mutant sender build (VOX_MUTANT_SENDER); run by hand in release"]
+#[ignore = "a real daemon against the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
 fn a_peer_that_serves_nothing_is_paced() {
     watchdog::arm();
-    let sender = std::env::var("VOX_MUTANT_SENDER").unwrap_or_else(|_| {
-        panic!("CANNOT MEASURE: VOX_MUTANT_SENDER does not name the mutant sender build")
-    });
+    let sender = mutant_sender();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let alice = Member::new(root, "alice");
@@ -57,7 +61,7 @@ fn a_peer_that_serves_nothing_is_paced() {
     alice.trust(&bob);
     bob.trust(&alice);
     let alice_d = alice.daemon(None);
-    let bob_d = bob.daemon_bin(&sender, None);
+    let bob_d = bob.daemon_mutant(&sender, MODE, None);
     let room = alice.create("pair");
     bob.join(&alice.invite(&room), "pair");
     // Let the join's own sessions settle before counting.
@@ -83,6 +87,11 @@ fn a_peer_that_serves_nothing_is_paced() {
     println!(
         "[proof] P10: over {WINDOW:?} alice opened {opened} session(s) to bob, admitted {admitted} \
          from him; {partial} ended partial; no_progress backoff seen: {saw_backoff}"
+    );
+    assert!(
+        announced(&bob_d, MODE),
+        "CANNOT MEASURE: bob's daemon never announced the mutant mode {MODE:?}\nbob:\n{}",
+        bob_d.transcript()
     );
     assert!(
         partial >= 1,
