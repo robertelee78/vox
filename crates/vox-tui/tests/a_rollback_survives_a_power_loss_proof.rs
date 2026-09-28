@@ -225,14 +225,26 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
 
 /// Run `vox update --rollback` from `dir`'s own `vox`, nothing of the person's touched.
 fn rollback(dir: &Path, home: &Path) -> (bool, String) {
-    let out = Command::new(dir.join("vox"))
-        .args(["update", "--rollback"])
+    rollback_with(dir, home, false, None)
+}
+
+/// [`rollback`], with the shell set-up it runs afterwards allowed (`shell`, against the private
+/// `home`) and under the syscall recorder when `log` is given.
+fn rollback_with(dir: &Path, home: &Path, shell: bool, log: Option<&Path>) -> (bool, String) {
+    let mut cmd = Command::new(dir.join("vox"));
+    cmd.args(["update", "--rollback"])
         .env_clear()
         .env("HOME", home)
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("VOX_NO_SHELL_SETUP", "1")
-        .output()
-        .expect("run vox update --rollback");
+        .env("SHELL", "/bin/zsh");
+    if !shell {
+        cmd.env("VOX_NO_SHELL_SETUP", "1");
+    }
+    if let Some(log) = log {
+        cmd.env("DYLD_INSERT_LIBRARIES", syscalls::interposer())
+            .env("VOX_INTERPOSE_LOG", log);
+    }
+    let out = cmd.output().expect("run vox update --rollback");
     (
         out.status.success(),
         format!(
@@ -241,6 +253,14 @@ fn rollback(dir: &Path, home: &Path) -> (bool, String) {
             String::from_utf8_lossy(&out.stderr)
         ),
     )
+}
+
+/// A leftover that exits 0 but is not a `vox`, or that hangs.
+fn impostor(path: &Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let mut p = std::fs::metadata(path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o755);
+    std::fs::set_permissions(path, p).unwrap();
 }
 
 /// **A rollback a power loss interrupted is finished by the next one, not refused** (#242, the
@@ -352,6 +372,184 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
     assert!(
         failures.is_empty(),
         "a rollback does not recover what a power loss left:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// #247's verifier's gaps, each shown on the shipped binary:
+///
+/// 4. a leftover that **hangs** is not a `vox`: it is discarded within the check's timeout, never
+///    installed, and the rollback answers in seconds;
+/// 5. a leftover that exits 0 but does not say `vox <version>` is not installed either;
+/// 6. the recovery path is **durable** (read with the syscall recorder): finishing an interrupted
+///    swap flushes the directory after its rename; discarding a leftover copy flushes the
+///    directory before anything new is put under that name;
+/// 7. finishing an interrupted rollback refreshes shell completions, as a rollback does.
+///
+/// Mutations: the flushes of the recovery path removed → red on (6); completions skipped → red on
+/// (7); the check's timeout or its `vox <version>` rule removed → red on (4) or (5).
+#[test]
+#[ignore = "real install directories and the shipped binary; the macOS release gate runs it"]
+fn the_recovery_path_is_bounded_durable_and_complete() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut failures: Vec<String> = Vec::new();
+
+    // 4. a leftover that hangs
+    {
+        let dir = install_dir(&tmp.path().join("hangs"));
+        impostor(&dir.join(".vox-rollback.partial"), "sleep 600");
+        let t0 = std::time::Instant::now();
+        let (ok, said) = rollback(&dir, &home);
+        let took = t0.elapsed();
+        let installed = dir.join(".vox-previous").exists();
+        let left = dir.join(".vox-rollback.partial").exists();
+        eprintln!(
+            "[proof] (4) a hanging leftover: ok={ok} in {took:?}; installed as .vox-previous: \
+             {installed}; left: {left}"
+        );
+        if ok || installed || left || took > std::time::Duration::from_secs(20) {
+            failures.push(format!(
+                "(4) a hanging leftover: ok={ok}, took {took:?}, installed {installed}, left \
+                 {left}: {said}"
+            ));
+        }
+    }
+    // 5. a leftover that answers, but not as a vox
+    {
+        let dir = install_dir(&tmp.path().join("impostor"));
+        impostor(&dir.join(".vox-rollback.partial"), "echo hello world");
+        let (ok, said) = rollback(&dir, &home);
+        let installed = dir.join(".vox-previous").exists();
+        eprintln!(
+            "[proof] (5) a leftover that says \"hello world\": ok={ok}; installed: {installed}"
+        );
+        if ok || installed {
+            failures.push(format!(
+                "(5) a leftover that is not a vox was installed: ok={ok}, installed {installed}: \
+                 {said}"
+            ));
+        }
+    }
+    // 6a. finishing the swap flushes the directory after its rename
+    {
+        let dir = install_dir(&tmp.path().join("durable-finish"));
+        previous_stub(&dir.join(".vox-rollback.partial"), "0.0.1");
+        let log = tmp.path().join("finish.tsv");
+        let (ok, said) = rollback_with(&dir, &home, false, Some(&log));
+        let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
+        let (scratch, previous, dir_n) = (
+            norm(&dir.join(".vox-rollback.partial")),
+            norm(&dir.join(".vox-previous")),
+            std::fs::canonicalize(&dir).unwrap(),
+        );
+        let renamed = find(
+            &events,
+            0,
+            |c| matches!(c, Call::Rename { from, to } if norm(from) == scratch && norm(to) == previous),
+        );
+        let flushed_after = renamed.is_some_and(|i| {
+            events[i + 1..].iter().any(|e| {
+                (e.ret == 0 || e.errno == 22 || e.errno == 45)
+                    && matches!(&e.call, Call::Sync { path, .. }
+                        if std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()) == dir_n)
+            })
+        });
+        eprintln!(
+            "[proof] (6a) finishing the swap: ok={ok}; {} calls; rename seen: {}; directory \
+             flushed after it: {flushed_after}",
+            events.len(),
+            renamed.is_some()
+        );
+        if !ok || renamed.is_none() {
+            failures.push(format!(
+                "CANNOT MEASURE (6a): the recovery or its rename was not seen: ok={ok}: {said}"
+            ));
+        } else if !flushed_after {
+            failures.push("(6a) the directory was not flushed after finishing the swap".to_owned());
+        }
+    }
+    // 6b. discarding a leftover copy flushes the directory before the name is used again
+    {
+        let dir = install_dir(&tmp.path().join("durable-discard"));
+        previous_stub(&dir.join(".vox-previous"), "0.0.1");
+        std::fs::copy(dir.join("vox"), dir.join(".vox-rollback.partial")).unwrap();
+        let log = tmp.path().join("discard.tsv");
+        let (ok, said) = rollback_with(&dir, &home, false, Some(&log));
+        let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
+        let (scratch, dir_n) = (
+            norm(&dir.join(".vox-rollback.partial")),
+            std::fs::canonicalize(&dir).unwrap(),
+        );
+        let refilled = events.iter().position(|e| e.call.fills(&scratch));
+        let flushed_before = refilled.is_some_and(|i| {
+            events[..i].iter().any(|e| {
+                (e.ret == 0 || e.errno == 22 || e.errno == 45)
+                    && matches!(&e.call, Call::Sync { path, .. }
+                        if std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()) == dir_n)
+            })
+        });
+        eprintln!(
+            "[proof] (6b) discarding a leftover copy: ok={ok}; {} calls; the name refilled: {}; \
+             directory flushed before that: {flushed_before}",
+            events.len(),
+            refilled.is_some()
+        );
+        if !ok || refilled.is_none() {
+            failures.push(format!(
+                "CANNOT MEASURE (6b): the rollback after the discard was not seen: ok={ok}: {said}"
+            ));
+        } else if !flushed_before {
+            failures.push(
+                "(6b) the directory was not flushed between discarding the leftover and reusing \
+                 its name"
+                    .to_owned(),
+            );
+        }
+    }
+    // 7. completions, as a rollback refreshes them
+    {
+        let normal = install_dir(&tmp.path().join("shell-normal"));
+        previous_stub(&normal.join(".vox-previous"), "0.0.1");
+        let (ok_n, said_n) = rollback_with(&normal, &tmp.path().join("home-n"), true, None);
+        let finish = install_dir(&tmp.path().join("shell-finish"));
+        previous_stub(&finish.join(".vox-rollback.partial"), "0.0.1");
+        let (ok_f, said_f) = rollback_with(&finish, &tmp.path().join("home-f"), true, None);
+        // What follows each command's own first line is the shell set-up's; the recovery's
+        // `vox` is this build, the normal rollback's is the stub, so compare the recovery against
+        // the shell set-up this build prints on its own.
+        let own = Command::new(finish.join("vox"))
+            .arg("shell-setup")
+            .env_clear()
+            .env("HOME", tmp.path().join("home-own"))
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("SHELL", "/bin/zsh")
+            .output()
+            .expect("vox shell-setup");
+        let own_said = String::from_utf8_lossy(&own.stdout).trim().to_owned();
+        let tail_f: String = said_f.lines().skip(1).collect::<Vec<_>>().join("\n");
+        let refreshed =
+            !own_said.is_empty() && tail_f.contains(own_said.lines().next().unwrap_or(""));
+        eprintln!(
+            "[proof] (7) completions: a normal rollback ok={ok_n} printed {} line(s) after its \
+             own; the finished recovery ok={ok_f} printed {} (this build's shell-setup begins {:?}); \
+             refreshed: {refreshed}",
+            said_n.lines().count().saturating_sub(1),
+            said_f.lines().count().saturating_sub(1),
+            own_said.lines().next().unwrap_or("")
+        );
+        if !(ok_f && refreshed) {
+            failures.push(format!(
+                "(7) finishing an interrupted rollback did not refresh completions: {said_f}"
+            ));
+        }
+    }
+    eprintln!("[proof] {} of 5 claims failed", failures.len());
+    assert!(
+        failures.is_empty(),
+        "the recovery path is not bounded, durable and complete:\n{}",
         failures.join("\n")
     );
 }

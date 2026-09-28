@@ -846,7 +846,7 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
     // the first rename, both names are intact and the scratch is only a copy of `vox`: it goes.
     // A scratch that does not run (a copy cut short before its flush) is never installed.
     if scratch.is_file() {
-        if !previous.is_file() && binary_version(&scratch).is_some() {
+        if !previous.is_file() && runs_as_vox(&scratch) {
             fs::rename(&scratch, &previous).map_err(AppError::Io)?;
             sync_dir(install_dir)?;
             println!(
@@ -855,6 +855,8 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
                 binary_version(&active).unwrap_or_else(|| "unknown".to_owned()),
                 previous.display()
             );
+            // As any rollback does: the binary now in place brings its own completions.
+            run_shell_setup(&active);
             return Ok(());
         }
         fs::remove_file(&scratch).map_err(AppError::Io)?;
@@ -881,6 +883,57 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
     );
     run_shell_setup(&active);
     Ok(())
+}
+
+/// How long [`runs_as_vox`] waits for `--version` before it counts a binary as not running.
+const RUNS_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether `path` is a `vox` that runs: `--version` exits 0 within [`RUNS_WITHIN`] and says
+/// `vox <version>` (#247, verifier). A leftover a power loss may have cut short is installed only
+/// on this; one that hangs, fails, or answers anything else is not a `vox`.
+fn runs_as_vox(path: &Path) -> bool {
+    let Ok(mut child) = Command::new(path)
+        .arg("--version")
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < RUNS_WITHIN => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    };
+    let mut out = Vec::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout
+            .by_ref()
+            .take(MAX_VERSION_OUTPUT_BYTES as u64 + 1)
+            .read_to_end(&mut out);
+    }
+    if !status.success() || out.len() > MAX_VERSION_OUTPUT_BYTES {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out);
+    let mut words = text.split_whitespace();
+    words.next() == Some("vox")
+        && words.next().is_some_and(|v| {
+            let mut parts = v.split(['.', '-', '+']);
+            (0..3).all(|_| parts.next().is_some_and(|p| p.parse::<u64>().is_ok()))
+        })
+        && words.next().is_none()
 }
 
 /// What `vox --version` on `path` reports, as a bare version string.
