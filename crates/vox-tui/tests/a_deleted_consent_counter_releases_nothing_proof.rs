@@ -275,8 +275,18 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
             "cargo",
         ],
     );
-    let said = out.stdout;
-    println!("[proof] the TUI driver took {:?}", out.took);
+    let said = out.stdout.clone();
+    println!(
+        "[proof] the TUI driver took {:?}; its last stage: {:?}",
+        out.took, out.stage
+    );
+    assert!(
+        out.has_verdict("cargo"),
+        "CANNOT MEASURE: the TUI driver was stopped before it gave a verdict — by its faulthandler \
+         backstop, or from outside — at stage {:?} (exit {:?}): {said}",
+        out.stage.as_deref().unwrap_or("(before its first stage)"),
+        out.code
+    );
     println!("[proof] tui: {}", said.trim());
     assert!(
         out.code == Some(0) && said.contains("cargo the TUI said done to :close"),

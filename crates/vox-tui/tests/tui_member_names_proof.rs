@@ -25,11 +25,21 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
     // and stops everything, and past `pty_driver::BOUND` it is stopped from outside.
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_member_names.py");
     let out = pty_driver::run(script, &[env!("CARGO_BIN_EXE_vox"), "cargo"]);
-    let said = out.stdout;
-    eprintln!("{said}\n[proof] the driver took {:?}", out.took);
+    let said = out.stdout.clone();
+    eprintln!(
+        "{said}\n[proof] the driver took {:?}; its last stage: {:?}",
+        out.took, out.stage
+    );
     match out.code {
         Some(0) => assert!(said.contains("cargo PASS"), "exit 0 without a PASS line: {said}"),
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
+        _ if !out.has_verdict("cargo") => panic!(
+            "the TUI proof's driver was stopped before it gave a verdict — by its faulthandler \
+             backstop, or from outside — at stage {:?} (exit {:?}; its stack is above, on \
+             stderr): {said}",
+            out.stage.as_deref().unwrap_or("(before its first stage)"),
+            out.code
+        ),
         _ if said.contains("outlived SIGKILL") => {
             panic!("the TUI proof could not stop the `vox tui` it started: {said}")
         }

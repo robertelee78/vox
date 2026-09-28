@@ -42,8 +42,18 @@ class Hung(Exception):
 
 
 def stage(name):
+    """Name what the driver is doing now: on stderr as it happens, and in the file the Rust
+    wrapper names (`VOX_PTY_STAGE_FILE`), so a driver that dies with no verdict — its
+    `faulthandler` backstop, or a kill — is still reported by where it stopped."""
     STAGE[0] = name
     print(f"[pty {time.time() - T0:6.1f}s] {name}", file=sys.stderr, flush=True)
+    path = os.environ.get("VOX_PTY_STAGE_FILE")
+    if path:
+        try:
+            with open(path, "w") as f:
+                f.write(name)
+        except OSError:
+            pass
 
 
 def arm(secs, tag):
@@ -60,6 +70,14 @@ def arm(secs, tag):
     signal.signal(signal.SIGTERM, hung)
     signal.alarm(secs)
     faulthandler.dump_traceback_later(secs + 60, exit=True)
+
+
+def disarm():
+    """The run is over: its budget no longer applies. Called first thing in a driver's cleanup,
+    so a run that finished just under budget is not interrupted while it cleans up; the
+    cleanup's own waits are bounded, and the Rust wrapper's bound still stands behind them."""
+    signal.alarm(0)
+    faulthandler.cancel_dump_traceback_later()
 
 
 def reap(pid, secs, drain=None):
