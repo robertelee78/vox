@@ -1,7 +1,8 @@
 //! PRD-001 R20 / ADR-017 decision 7 — **local names**: `ssh nas.family.vox`, where `nas`
 //! is the name *this* machine gave that node when it trusted it and `family` is *this*
-//! machine's name for the room. Proved with the shipped binary (`vox up`, `vox forward`,
-//! `vox trust rename`) against real nodes.
+//! machine's name for the room. Proved with the shipped binary only: every member is a
+//! `vox daemon`, and everything they do is a `vox` verb (`vox trust add/rename/remove`,
+//! `vox room create/invite/join/roster`, `vox service add`, `vox up`, `vox forward`).
 //!
 //! The scene, from alice's side:
 //!
@@ -18,138 +19,253 @@
 //! 3. An unknown room, an unknown node, and an ambiguous node name are refused, each with
 //!    a sentence saying which.
 //! 4. A node that is no longer trusted has no name.
+//!
+//! `vox service add` opens the profile itself, so it cannot run beside the daemon that holds
+//! it. bob and carol therefore offer their services the way a person would have to: stop the
+//! daemon, `vox service add`, start the daemon again with the room passphrases. Each comes
+//! back on the UDP port it had.
 
 #![cfg(unix)]
+
+#[path = "support/world.rs"]
+mod world;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use vox_core::hash::Digest32;
-use vox_core::node::actor::{Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
-use vox_core::node::link::b32_encode;
-use vox_core::node::paths::Paths;
+use world::{args, VoxProc, IDENTITY, VOX};
 
-const VOX: &str = env!("CARGO_BIN_EXE_vox");
-const TIMEOUT: Duration = Duration::from_secs(60);
+const SETUP: Duration = Duration::from_secs(90);
 
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
+/// A one-shot `vox` verb in `dir`'s profile, `stdin` piped in when given.
+fn vox(dir: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    let mut child = Command::new(VOX)
+        .args(argv)
+        .env("VOX_DATA_DIR", dir)
+        .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ANCHORS")
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run vox");
+    if let Some(text) = stdin {
+        let mut pipe = child.stdin.take().expect("stdin");
+        pipe.write_all(text.as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().expect("vox finished");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
+/// One member: a profile directory, a fingerprint, the UDP port its daemon keeps, and the
+/// daemon while it runs.
 struct Member {
-    data: std::path::PathBuf,
-    cfg: std::path::PathBuf,
-    paths: Paths,
-    node: NodeHandle,
+    name: &'static str,
+    dir: PathBuf,
+    fp: String,
+    listen: String,
+    daemon: Option<VoxProc>,
+}
+
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn member(tmp: &Path, name: &'static str) -> Member {
+    let dir = tmp.join(name);
+    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    let (ok, out, err) = vox(&dir, &["id", "--listen", "127.0.0.1:0"], None);
+    assert!(ok, "vox id ({name}): {err}");
+    let fp = out.trim().to_owned();
+    assert_eq!(fp.len(), 52, "{name}'s fingerprint: {out:?}");
+    Member {
+        name,
+        dir,
+        fp,
+        listen: format!("127.0.0.1:{}", free_udp_port()),
+        daemon: None,
+    }
 }
 
 impl Member {
-    fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(VOX);
-        c.args(args)
-            .env("VOX_DATA_DIR", &self.data)
-            .env("VOX_CONFIG_DIR", &self.cfg)
-            .env_remove("VOX_ROOM")
-            .env_remove("VOX_ANCHORS");
-        c
+    fn trust(&self, peer: &Member, as_name: &str) {
+        let (ok, out, err) = vox(
+            &self.dir,
+            &[
+                "trust",
+                "add",
+                &peer.fp,
+                "--name",
+                as_name,
+                "--listen",
+                "127.0.0.1:0",
+            ],
+            None,
+        );
+        assert!(
+            ok,
+            "{} trusts {} as {as_name}: {out}{err}",
+            self.name, peer.name
+        );
     }
 
-    fn fp(&self) -> Digest32 {
-        self.node.view().identity.unwrap().fingerprint
-    }
-}
-
-async fn member(tmp: &tempfile::TempDir, name: &str) -> Member {
-    let data = tmp.path().join(name).join("data");
-    let cfg = tmp.path().join(name).join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
-    let node = Node::spawn_networked(paths.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
-    assert!(node
-        .apply(NodeCommand::CreateIdentity {
-            passphrase: secret("identity passphrase"),
-        })
-        .await
-        .is_done());
-    Member {
-        data,
-        cfg,
-        paths,
-        node,
-    }
-}
-
-async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) -> T {
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match h.next_event().await {
-                Some(e) => {
-                    if let Some(v) = f(e) {
-                        return v;
-                    }
-                }
-                None => panic!("event stream ended"),
-            }
+    /// `vox daemon`, its passphrases from a file: the identity's, then one line per room.
+    /// Returns once the daemon answers `vox room list` and holds every room in `rooms` open.
+    fn start(&mut self, anchor: &str, room_passes: &[&str], rooms: &[&str]) {
+        let pass_file = self.dir.join("passphrases");
+        let mut text = format!("{IDENTITY}\n");
+        for p in room_passes {
+            text.push_str(p);
+            text.push('\n');
         }
-    })
-    .await
-    .expect("timed out waiting for an event")
-}
-
-/// `creator` makes a room; everyone in `joiners` joins it under `local_name`.
-async fn room(creator: &Member, joiners: &[&Member], local_name: &str) -> Digest32 {
-    assert!(creator
-        .node
-        .apply(NodeCommand::CreateChannel {
-            local_name: local_name.into(),
-            passphrase: secret(&format!("{local_name} passphrase")),
-        })
-        .await
-        .is_done());
-    let cid = wait_for(&creator.node, |e| match e {
-        NodeEvent::ChannelOpened { channel_id } => Some(channel_id),
-        _ => None,
-    })
-    .await;
-    assert!(creator
-        .node
-        .apply(NodeCommand::Invite { channel_id: cid })
-        .await
-        .is_done());
-    let url = wait_for(&creator.node, |e| match e {
-        NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
-        _ => None,
-    })
-    .await;
-    for j in joiners {
-        assert!(j
-            .node
-            .apply(NodeCommand::JoinChannel {
-                link: url.clone(),
-                local_name: local_name.into(),
-                passphrase: secret(&format!("{local_name} passphrase")),
-            })
-            .await
-            .is_done());
+        std::fs::write(&pass_file, text).unwrap();
+        let mut p = VoxProc::spawn(
+            self.name,
+            &self.dir,
+            &args(&[
+                "daemon",
+                "--listen",
+                &self.listen,
+                "--anchor",
+                anchor,
+                "--passphrase-file",
+                pass_file.to_str().unwrap(),
+            ]),
+        );
+        let deadline = Instant::now() + SETUP;
+        loop {
+            let (ok, out, _) = vox(&self.dir, &["room", "list"], None);
+            if ok
+                && rooms.iter().all(|r| {
+                    out.lines()
+                        .any(|l| l.starts_with(r) && !l.contains("[closed]"))
+                })
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "{}'s daemon never held {rooms:?} open; room list said {out:?}. It said:\n{}",
+                    self.name,
+                    p.transcript()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        self.daemon = Some(p);
     }
-    cid
-}
 
-async fn trust(who: &Member, peer: &Member, name: &str) {
-    assert!(who
-        .node
-        .apply(NodeCommand::Trust {
-            fingerprint: peer.fp(),
-            petname: name.into(),
-        })
-        .await
-        .is_done());
+    /// Stop the daemon by its PID with SIGTERM and wait until it has exited, so the profile
+    /// is free for a verb that opens it itself.
+    fn stop(&mut self) {
+        let Some(mut p) = self.daemon.take() else {
+            return;
+        };
+        let ok = Command::new("kill")
+            .args(["-TERM", &p.child.id().to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "kill -TERM {}", self.name);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if matches!(p.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("{}'s daemon did not exit on SIGTERM", self.name);
+        // Drop would kill it by PID.
+    }
+
+    /// `vox room create --name <local>`, passphrase on stdin; the room's id as `vox room
+    /// list` prints it.
+    fn create(&self, local: &str, pass: &str) -> String {
+        let (ok, out, err) = vox(
+            &self.dir,
+            &["room", "create", "--name", local],
+            Some(&format!("{pass}\n")),
+        );
+        assert!(ok, "{} creates {local}: {out}{err}", self.name);
+        let (ok, list, err) = vox(&self.dir, &["room", "list"], None);
+        assert!(ok, "vox room list: {err}");
+        list.lines()
+            .find(|l| l.split_whitespace().nth(1) == Some(local))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_else(|| panic!("{local} is not listed: {list}"))
+            .to_owned()
+    }
+
+    fn invite(&self, room: &str) -> String {
+        let (ok, link, err) = vox(&self.dir, &["room", "invite", room], None);
+        assert!(ok, "vox room invite {room}: {err}");
+        link.trim().to_owned()
+    }
+
+    fn join(&self, link: &str, local: &str, pass: &str) {
+        let (ok, out, err) = vox(
+            &self.dir,
+            &["room", "join", link, "--name", local],
+            Some(&format!("{pass}\n")),
+        );
+        assert!(ok, "{} joins {local}: {out}{err}", self.name);
+    }
+
+    /// `vox service add <room> 22 <at>` — the profile must not be held by a daemon.
+    fn serve(&self, room: &str, pass: &str, at: SocketAddr) {
+        let (ok, out, err) = vox(
+            &self.dir,
+            &[
+                "service",
+                "add",
+                room,
+                "22",
+                &at.to_string(),
+                "--passphrase",
+                pass,
+                "--listen",
+                "127.0.0.1:0",
+            ],
+            None,
+        );
+        assert!(ok, "{} offers 22 in {room}: {out}{err}", self.name);
+    }
+
+    /// `vox forward <name> 22 0`: whether it bound, and what it said.
+    fn forward(&self, name: &str) -> (bool, String) {
+        let mut p = VoxProc::spawn(
+            &format!("{} forward {name}", self.name),
+            &self.dir,
+            &args(&["forward", name, "22", "0"]),
+        );
+        let bound = p
+            .wait_for(Duration::from_secs(20), |l| l.contains("forwarding"))
+            .is_some();
+        // Whatever it printed as it went (a refusal ends the process, which ends the wait).
+        std::thread::sleep(Duration::from_millis(100));
+        let said = p.transcript();
+        (bound, said)
+    }
 }
 
 /// A TCP service that answers each line with `<owner>:<line>`.
@@ -221,130 +337,74 @@ fn who_answers(proxy: SocketAddr, name: &str) -> Result<String, u8> {
     Ok(line.split(':').next().unwrap_or("").to_owned())
 }
 
-/// `vox forward <name> 22 0` on alice: whether it bound, and what it said.
-fn forward(alice: &Member, name: &str) -> (bool, String) {
-    let mut child = alice
-        .command(&["forward", name, "22", "0"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let said = Arc::new(Mutex::new(String::new()));
-    for pipe in [
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let sink = Arc::clone(&said);
-        let mut pipe = pipe;
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            while let Ok(n) = pipe.read(&mut buf) {
-                if n == 0 {
-                    return;
-                }
-                sink.lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n]));
-            }
-        });
-    }
-    let until = Instant::now() + Duration::from_secs(20);
-    let mut bound = false;
-    while Instant::now() < until {
-        if said.lock().unwrap().contains("forwarding") {
-            bound = true;
-            break;
-        }
-        if let Ok(Some(_)) = child.try_wait() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    std::thread::sleep(Duration::from_millis(100));
-    let out = said.lock().unwrap().clone();
-    (bound, out)
-}
-
-struct Proxy(Child);
-
-impl Drop for Proxy {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[test]
-#[ignore = "three real nodes and real child processes; CI runs it in release"]
+#[ignore = "an anchor, three vox daemons and real child processes; CI runs it in release"]
 fn a_local_name_reaches_the_node_it_names() {
     watchdog::arm();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let (nas_echo, laptop_echo, laptop_work_echo) =
         (echo("bob"), echo("carol"), echo("carol-work"));
-    let (alice, bob, carol) = rt.block_on(async {
-        let alice = member(&tmp, "alice").await;
-        let bob = member(&tmp, "bob").await;
-        let carol = member(&tmp, "carol").await;
-        let family = room(&bob, &[&alice, &carol], "family").await;
-        let work = room(&carol, &[&alice], "work").await;
-        trust(&alice, &bob, "nas").await;
-        trust(&alice, &carol, "laptop").await;
-        trust(&bob, &alice, "alice").await;
-        trust(&carol, &alice, "alice").await;
-        for (who, cid, at) in [
-            (&bob, family, nas_echo),
-            (&carol, family, laptop_echo),
-            (&carol, work, laptop_work_echo),
-        ] {
-            assert!(who
-                .node
-                .apply(NodeCommand::AddService {
-                    channel_id: cid,
-                    service_tag: "22".into(),
-                    local: at,
-                })
-                .await
-                .is_done());
-        }
-        (alice, bob, carol)
-    });
+
+    let anchor_dir = tmp.path().join("anchor");
+    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    let mut anchor = VoxProc::spawn(
+        "anchor",
+        &anchor_dir,
+        &args(&["node", "--listen", "127.0.0.1:0"]),
+    );
+    let spec = anchor
+        .expect_line("an --anchor spec", |l| {
+            l.trim_start().contains("@/ip4/127.0.0.1/udp/")
+        })
+        .trim()
+        .to_owned();
+
+    let mut alice = member(tmp.path(), "alice");
+    let mut bob = member(tmp.path(), "bob");
+    let mut carol = member(tmp.path(), "carol");
+    alice.trust(&bob, "nas");
+    alice.trust(&carol, "laptop");
+    bob.trust(&alice, "alice");
+    carol.trust(&alice, "alice");
+
+    // The rooms: bob makes family and carol joins it; carol makes work.
+    let (family_pass, work_pass) = ("family passphrase", "work passphrase");
+    bob.start(&spec, &[], &[]);
+    carol.start(&spec, &[], &[]);
+    let family = bob.create("family", family_pass);
+    let work = carol.create("work", work_pass);
+    carol.join(&bob.invite(&family), "family", family_pass);
+
+    // The services, offered with the daemons down, then the daemons back on their ports.
+    bob.stop();
+    carol.stop();
+    bob.serve(&family, family_pass, nas_echo);
+    carol.serve(&family, family_pass, laptop_echo);
+    carol.serve(&work, work_pass, laptop_work_echo);
+    bob.start(&spec, &[family_pass], &[&family]);
+    carol.start(&spec, &[family_pass, work_pass], &[&family, &work]);
+
+    // alice joins both.
+    alice.start(&spec, &[], &[]);
+    alice.join(&bob.invite(&family), "family", family_pass);
+    alice.join(&carol.invite(&work), "work", work_pass);
+
     // **Precondition: alice knows carol is in `family`.** carol joined through bob, so alice
     // learns her as a member from the board, not from a join of her own. On v0.2.9 that takes a
     // sync interval (measured on the v0.3.0 integration: about 26 s; the naming branch's base was
     // faster), and this proof is about names, not about how fast membership travels. Waited for,
-    // bounded, and timed, so a regression in that latency still shows here as a number.
+    // bounded, and timed — through `vox room roster` — so a regression in that latency still
+    // shows here as a number.
     {
         let started = Instant::now();
-        let carol_fp = carol.fp();
-        let known = |alice: &Member| {
-            alice
-                .node
-                .view()
-                .open_channels
-                .iter()
-                .any(|d| d.local_name == "family" && d.members.contains(&carol_fp))
-        };
-        while !known(&alice) {
+        loop {
+            let (_, roster, _) = vox(&alice.dir, &["room", "roster", &family], None);
+            if roster.lines().any(|l| l.trim() == carol.fp) {
+                break;
+            }
             assert!(
-                started.elapsed() < Duration::from_secs(90),
-                "alice never learned that carol is in family"
+                started.elapsed() < SETUP,
+                "alice never learned that carol is in family; her roster: {roster:?}"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -353,23 +413,14 @@ fn a_local_name_reaches_the_node_it_names() {
             started.elapsed().as_millis()
         );
     }
-    let _sock = rt.block_on(async { vox_core::node::ipc::bind(alice.node.clone(), &alice.paths) });
 
-    // `vox up`, no room: the proxy inside alice's node, across every room it holds.
-    let mut up = alice
-        .command(&["up", "--bind", "127.0.0.1:0"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut out = up.stdout.take().unwrap();
-    let mut first = String::new();
-    let mut byte = [0u8; 1];
-    while !first.ends_with('\n') && out.read(&mut byte).unwrap_or(0) == 1 {
-        first.push(byte[0] as char);
-    }
-    let _up = Proxy(up);
+    // `vox up`, no room: the proxy inside alice's daemon, across every room it holds.
+    let mut up = VoxProc::spawn(
+        "alice up",
+        &alice.dir,
+        &args(&["up", "--bind", "127.0.0.1:0"]),
+    );
+    let first = up.expect_line("vox up's address", |l| l.starts_with("vox up on "));
     let proxy: SocketAddr = first
         .split_whitespace()
         .nth(3)
@@ -388,40 +439,27 @@ fn a_local_name_reaches_the_node_it_names() {
     .map(|n| (n, who_answers(proxy, n)))
     .collect();
     // (3): refusals, with reasons, from `vox forward`.
-    let unknown_room = forward(&alice, "nas.nowhere.vox");
-    let unknown_node = forward(&alice, "ghost.family.vox");
-    let not_there = forward(&alice, "nas.work.vox");
-    let named = forward(&alice, "laptop.family.vox");
+    let unknown_room = alice.forward("nas.nowhere.vox");
+    let unknown_node = alice.forward("ghost.family.vox");
+    let not_there = alice.forward("nas.work.vox");
+    let named = alice.forward("laptop.family.vox");
     // Two trusted nodes called `nas` in family: ambiguous.
-    let rename = alice
-        .command(&["trust", "rename", &b32_encode(&carol.fp()), "nas"])
-        .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
-        .output()
-        .unwrap();
-    let ambiguous = forward(&alice, "nas.family.vox");
+    let rename = vox(&alice.dir, &["trust", "rename", &carol.fp, "nas"], None);
+    let ambiguous = alice.forward("nas.family.vox");
     let ambiguous_socks = who_answers(proxy, "nas.family.vox");
     // (4): untrusting carol takes her name away.
-    rt.block_on(async {
-        assert!(alice
-            .node
-            .apply(NodeCommand::Untrust {
-                fingerprint: carol.fp(),
-            })
-            .await
-            .is_done());
-    });
-    let untrusted = forward(&alice, "nas.family.vox");
+    let untrust = vox(&alice.dir, &["trust", "remove", &carol.fp], None);
+    let untrusted = alice.forward("nas.family.vox");
     let now_bob = who_answers(proxy, "nas.family.vox");
     let untrusted_laptop = who_answers(proxy, "laptop.work.vox");
 
     eprintln!(
         "reached: {reached:?}\nunknown room: {unknown_room:?}\nunknown node: {unknown_node:?}\n\
-         nas in work: {not_there:?}\nforward laptop.family: {:?}\nrename: {}{}\nambiguous: \
-         {ambiguous:?} / socks {ambiguous_socks:?}\nafter untrusting carol: forward \
-         nas.family {untrusted:?}, socks nas.family {now_bob:?}, laptop.work {untrusted_laptop:?}",
+         nas in work: {not_there:?}\nforward laptop.family: {:?}\nrename: {rename:?}\n\
+         ambiguous: {ambiguous:?} / socks {ambiguous_socks:?}\nuntrust: {untrust:?}\n\
+         after untrusting carol: forward nas.family {untrusted:?}, socks nas.family \
+         {now_bob:?}, laptop.work {untrusted_laptop:?}",
         named.0,
-        String::from_utf8_lossy(&rename.stdout),
-        String::from_utf8_lossy(&rename.stderr)
     );
     let answered = |n: &str| {
         reached
@@ -465,7 +503,7 @@ fn a_local_name_reaches_the_node_it_names() {
         !not_there.0 && not_there.1.contains("not a member of `work`"),
         "{not_there:?}"
     );
-    assert!(rename.status.success(), "the rename must succeed");
+    assert!(rename.0, "the rename must succeed: {rename:?}");
     assert!(
         !ambiguous.0 && ambiguous.1.contains("names 2 nodes you trust in `family`"),
         "{ambiguous:?}"
@@ -475,6 +513,7 @@ fn a_local_name_reaches_the_node_it_names() {
         Err(2),
         "the proxy refuses an ambiguous name"
     );
+    assert!(untrust.0, "the untrust must succeed: {untrust:?}");
     assert!(
         untrusted.0,
         "with carol untrusted, `nas` is bob's again: {untrusted:?}"
@@ -485,5 +524,5 @@ fn a_local_name_reaches_the_node_it_names() {
         Err(2),
         "carol is no longer trusted, so no name reaches her"
     );
-    drop(bob);
+    drop((up, alice, bob, carol, anchor));
 }
