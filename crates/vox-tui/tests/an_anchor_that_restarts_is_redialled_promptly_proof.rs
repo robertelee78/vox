@@ -114,9 +114,10 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     let carried = carried.unwrap_or_else(|| {
         panic!(
             "the forward never carried again within {:?} of the anchor's return\n---- the forward \
-             ----\n{said}\n---- the anchor ----\n{}",
+             ----\n{said}\n---- the anchor ----\n{}\n---- the host ----\n{}",
             BACK_WITHIN + Duration::from_secs(20),
-            w.anchor.proc.transcript()
+            w.anchor.proc.transcript(),
+            w.host.as_mut().map(|h| h.transcript()).unwrap_or_default()
         )
     });
     assert!(

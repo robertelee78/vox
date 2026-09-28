@@ -3717,6 +3717,14 @@ impl Node {
                         .get(&peer)
                         .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
                     self.anchor_backoff.insert(peer, (self.now() + wait, wait));
+                    if let Some(net) = self.net.as_ref() {
+                        net.manager().note(
+                            peer,
+                            format!(
+                                "dialling this anchor failed ({why}); the next try is in {wait}s"
+                            ),
+                        );
+                    }
                 }
                 self.answer_pending_consents(
                     |_, target| *target == peer,
@@ -3733,6 +3741,12 @@ impl Node {
                 // The backoff is kept until the connection has lasted (`ANCHOR_FLAP_SECS`): one
                 // superseded at once is a flap, not a success.
                 self.anchor_connected_at.insert(peer, self.now());
+                // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
+                // whose forward said it dialled and then nothing).
+                if let Some(net) = self.net.as_ref() {
+                    net.manager()
+                        .note(peer, "connected to this anchor".to_owned());
+                }
                 self.anchor_ids.insert(peer);
                 self.adopt_connection(Arc::clone(&conn));
                 self.refresh_network_view().await;
