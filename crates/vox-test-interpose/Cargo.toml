@@ -1,0 +1,14 @@
+[package]
+name = "vox-test-interpose"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Test apparatus only: a DYLD_INSERT_LIBRARIES interposer that records the file-system calls the shipped vox binary makes. Never linked into vox."
+
+[lib]
+crate-type = ["cdylib"]
+
+# No dependencies: the apparatus must not bring anything in, and must build offline.
+
+# Its own workspace root: never a member of vox's, wherever the checkout sits.
+[workspace]
