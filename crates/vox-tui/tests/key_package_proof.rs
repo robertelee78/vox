@@ -27,7 +27,15 @@
 //! (ADR-023 decision 4's accepted consequence), read from B's timeline and log; the `vox status`
 //! line is added when status reaches this branch.
 //!
-//! Mutation: no key-package posted → B reads 0.
+//! The third test is #226's (V030-01): **a key through the log releases what a direct one does.**
+//! What a member may read depends on when it was trusted (V210-45), never on the path its key
+//! took. A trusts B and D *before* posting six messages across a rotation, and neither has joined
+//! yet; both join while A is down. When A comes back, D is up and reached directly, and B is down
+//! and reached only through the log. B, reading through C alone, must read the same six D reads;
+//! and neither reads the message A posted before trusting them (never wider).
+//!
+//! Mutations: no key-package posted → B reads 0. The log path releasing forward-only from the key
+//! held when the consent fell due (what it did before #226) → B reads 0 of the six, D all six.
 
 #![cfg(unix)]
 
@@ -228,7 +236,8 @@ struct Cast {
     b: std::path::PathBuf,
     c: std::path::PathBuf,
     d: std::path::PathBuf,
-    fps: [String; 4],
+    e: std::path::PathBuf,
+    fps: [String; 5],
     room: String,
     link: String,
 }
@@ -240,15 +249,16 @@ fn cast() -> Cast {
         std::fs::create_dir_all(d.join("cfg")).unwrap();
         d
     };
-    let (a, b, c, d) = (mk("a"), mk("b"), mk("c"), mk("d"));
+    let (a, b, c, d, e) = (mk("a"), mk("b"), mk("c"), mk("d"), mk("e"));
     let fp = |d: &std::path::Path| ok(d, &["id"], "").trim().lines().next().unwrap().to_owned();
-    let fps = [fp(&a), fp(&b), fp(&c), fp(&d)];
+    let fps = [fp(&a), fp(&b), fp(&c), fp(&d), fp(&e)];
     Cast {
         _tmp: tmp,
         a,
         b,
         c,
         d,
+        e,
         fps,
         room: String::new(),
         link: String::new(),
@@ -485,4 +495,164 @@ fn without_an_always_on_member_keys_wait_for_overlap() {
         "with no member online with both, B can read nothing of A's"
     );
     assert_eq!(b_held, 0, "and nothing carried a key to B");
+}
+
+/// Wait until `dir`'s node reads every one of `texts` in `room`; how many it read.
+fn read_all(dir: &std::path::Path, room: &str, texts: &[String], secs: u64) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let got = readable(dir, room, texts);
+        if got == texts.len() || Instant::now() >= deadline {
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[test]
+#[ignore = "five real daemons restarted in turn, production Argon2id; CI runs it in release"]
+fn a_key_through_the_log_releases_what_a_direct_one_does() {
+    watchdog::arm();
+    let mut k = cast();
+    let (b_fp, d_fp, e_fp) = (k.fps[1].clone(), k.fps[3].clone(), k.fps[4].clone());
+
+    // ---- C makes the room and stays up; A joins and C reads it ----
+    let c = Daemon::start("c", &k.c);
+    ok(
+        &k.c,
+        &["room", "create", "--name", "r"],
+        &format!("{ROOMPASS}\n"),
+    );
+    k.room = ok(&k.c, &["room", "list"], "")
+        .split_whitespace()
+        .find(|w| w.len() >= 12 && w.chars().all(|ch| ch.is_ascii_alphanumeric()))
+        .expect("a room id")
+        .to_owned();
+    k.link = ok(&k.c, &["room", "invite", &k.room], "")
+        .lines()
+        .find(|l| l.starts_with("vox://"))
+        .expect("an address")
+        .trim()
+        .to_owned();
+    let join = |dir: &std::path::Path| {
+        ok(
+            dir,
+            &["room", "join", &k.link, "--name", "r"],
+            &format!("{ROOMPASS}\n"),
+        );
+    };
+    let a = Daemon::start("a", &k.a);
+    join(&k.a);
+    ok(&k.a, &["trust", "add", &k.fps[2], "--name", "c"], "");
+    let warmed = |dir: &std::path::Path, tag: &str| {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            ok(&k.a, &["room", "post", &k.room, tag], "");
+            std::thread::sleep(Duration::from_secs(2));
+            if ok(dir, &["room", "read", &k.room], "").contains(tag) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "CANNOT MEASURE: {tag} never read"
+            );
+        }
+    };
+    warmed(&k.c, "v226-warm-c");
+
+    // ---- E joins and is consented to directly, so that removing it later rotates A's key ----
+    let e = Daemon::start("e", &k.e);
+    join(&k.e);
+    ok(&k.e, &["trust", "add", &k.fps[0], "--name", "a"], "");
+    ok(&k.a, &["trust", "add", &e_fp, "--name", "e"], "");
+    warmed(&k.e, "v226-warm-e");
+    e.stop();
+
+    // ---- one post before B and D are trusted, then the trust, then six posts across a rotation ----
+    let before = "v226-before-the-trust".to_owned();
+    ok(&k.a, &["room", "post", &k.room, &before], "");
+    ok(&k.a, &["trust", "add", &b_fp, "--name", "b"], "");
+    ok(&k.a, &["trust", "add", &d_fp, "--name", "d"], "");
+    let mut sent = Vec::new();
+    for i in 0..3 {
+        let t = format!("v226-generation-one-{i}");
+        ok(&k.a, &["room", "post", &k.room, &t], "");
+        sent.push(t);
+    }
+    ok(&k.a, &["trust", "remove", &e_fp], "");
+    for i in 0..3 {
+        let t = format!("v226-generation-two-{i}");
+        ok(&k.a, &["room", "post", &k.room, &t], "");
+        sent.push(t);
+    }
+    // C holds everything before A goes: it reads A's last entry.
+    let got = read_all(&k.c, &k.room, &sent, 90);
+    assert_eq!(
+        got,
+        sent.len(),
+        "CANNOT MEASURE: C never held A's six posts"
+    );
+    a.stop();
+
+    // ---- B and D join while A is down; B goes down again, D stays ----
+    let b = Daemon::start("b", &k.b);
+    join(&k.b);
+    ok(&k.b, &["trust", "add", &k.fps[0], "--name", "a"], "");
+    b.stop();
+    let d = Daemon::start("d", &k.d);
+    join(&k.d);
+    ok(&k.d, &["trust", "add", &k.fps[0], "--name", "a"], "");
+
+    // ---- A comes back: D is reached directly, B only through the log ----
+    let a = Daemon::start("a", &k.a);
+    let b_short: String = b_fp.chars().take(12).collect();
+    a.wait_err_count("that B cannot be reached", 0, 120, |l| {
+        l.contains("could not reach") && l.contains(&b_short)
+    });
+    let d_got = read_all(&k.d, &k.room, &sent, 120);
+    let d_early = readable(&k.d, &k.room, std::slice::from_ref(&before));
+    // A's entries reach C in order: C reading a post made after the packages means C holds them.
+    ok(&k.a, &["room", "post", &k.room, "v226-sentinel"], "");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !ok(&k.c, &["room", "read", &k.room], "").contains("v226-sentinel") {
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: C never received A's sentinel\nA stderr:\n{}",
+            a.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    a.stop();
+    d.stop();
+
+    // ---- B comes back with only C up ----
+    let b = Daemon::start("b", &k.b);
+    let b_got = read_all(&k.b, &k.room, &sent, 120);
+    let b_early = readable(&k.b, &k.room, std::slice::from_ref(&before));
+    let b_said = b.stderr();
+    b.stop();
+    c.stop();
+    let (b_held, b_opened) = packages_at_rest(&k.b, &b32(&b_fp));
+    eprintln!(
+        "[V030-01] trusted before six posts across a rotation: D (reached directly) read {d_got} of \
+         {n}, B (through the log only) read {b_got} of {n}; the post before the trust: D {d_early}, \
+         B {b_early} of 1; key-packages for B at rest: {b_held}, B opens {b_opened}",
+        n = sent.len()
+    );
+    assert_eq!(
+        d_got,
+        sent.len(),
+        "CANNOT MEASURE: D, reached directly, did not read the six — the comparison has no baseline"
+    );
+    assert_eq!(
+        b_got, d_got,
+        "a member reached only through the log must read what a directly reached one reads\n\
+         B stderr:\n{b_said}"
+    );
+    assert_eq!(
+        (d_early, b_early),
+        (0, 0),
+        "never wider: a post made before the trust stays unreadable, whichever path the key took"
+    );
+    assert_eq!(b_opened, b_held, "B's own ring opens every package for B");
 }
