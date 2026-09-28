@@ -1,6 +1,8 @@
 //! PRD-001 R18 — `vox share`: a file offered to a room over a room-bound HTTP service,
 //! announced with its name, size and SHA-256, pulled with curl through `vox up` or with
-//! `vox room get`. Proved with the shipped binary against real nodes.
+//! `vox room get`. Proved with the shipped binary only: every member is a `vox daemon`, and
+//! everything they do is a `vox` verb (`vox trust add`, `vox room create/invite/join/post/
+//! read/get`, `vox share`, `vox up`).
 //!
 //! alice shares; bob, whom she trusts, pulls it twice — once with `curl` through his own
 //! `vox up`, once with `vox room get`, which lands it in his downloads directory. mallory
@@ -10,52 +12,140 @@
 
 #![cfg(unix)]
 
+#[path = "support/world.rs"]
+mod world;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use std::io::BufRead as _;
+use std::io::Write as _;
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
-use vox_core::hash::Digest32;
-use vox_core::node::actor::{Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
-use vox_core::node::link::b32_encode;
-use vox_core::node::paths::Paths;
+use world::{args, VoxProc, IDENTITY, VOX};
 
-const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const TIMEOUT: Duration = Duration::from_secs(60);
+const SETUP: Duration = Duration::from_secs(90);
+const ROOM_PASS: &str = "room passphrase";
 
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
+/// A one-shot `vox` verb in `dir`'s profile, `stdin` piped in when given.
+fn vox(dir: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    let mut child = Command::new(VOX)
+        .args(argv)
+        .env("VOX_DATA_DIR", dir)
+        .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ANCHORS")
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run vox");
+    if let Some(text) = stdin {
+        let mut pipe = child.stdin.take().expect("stdin");
+        pipe.write_all(text.as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().expect("vox finished");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
+/// One member: a profile directory, its fingerprint, and its `vox daemon` once started.
 struct Member {
-    data: std::path::PathBuf,
-    cfg: std::path::PathBuf,
-    paths: Paths,
-    node: NodeHandle,
+    name: &'static str,
+    dir: PathBuf,
+    fp: String,
+    daemon: Option<VoxProc>,
+}
+
+fn member(tmp: &Path, name: &'static str) -> Member {
+    let dir = tmp.join(name);
+    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    let (ok, out, err) = vox(&dir, &["id", "--listen", "127.0.0.1:0"], None);
+    assert!(ok, "vox id ({name}): {err}");
+    let fp = out.trim().to_owned();
+    assert_eq!(fp.len(), 52, "{name}'s fingerprint: {out:?}");
+    Member {
+        name,
+        dir,
+        fp,
+        daemon: None,
+    }
 }
 
 impl Member {
-    fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(VOX);
-        c.args(args)
-            .env("VOX_DATA_DIR", &self.data)
-            .env("VOX_CONFIG_DIR", &self.cfg)
-            .env_remove("VOX_ROOM")
-            .env_remove("VOX_ANCHORS");
-        c
+    fn trust(&self, peer: &Member, as_name: &str) {
+        let (ok, out, err) = vox(
+            &self.dir,
+            &[
+                "trust",
+                "add",
+                &peer.fp,
+                "--name",
+                as_name,
+                "--listen",
+                "127.0.0.1:0",
+            ],
+            None,
+        );
+        assert!(
+            ok,
+            "{} trusts {} as {as_name}: {out}{err}",
+            self.name, peer.name
+        );
     }
 
-    fn fp(&self) -> Digest32 {
-        self.node.view().identity.unwrap().fingerprint
+    /// `vox daemon` with the identity passphrase from a file; returns once it answers
+    /// `vox room list`.
+    fn start(&mut self, anchor: &str) {
+        let pass_file = self.dir.join("passphrases");
+        std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+        let mut p = VoxProc::spawn(
+            self.name,
+            &self.dir,
+            &args(&[
+                "daemon",
+                "--listen",
+                "127.0.0.1:0",
+                "--anchor",
+                anchor,
+                "--passphrase-file",
+                pass_file.to_str().unwrap(),
+            ]),
+        );
+        let deadline = Instant::now() + SETUP;
+        while !vox(&self.dir, &["room", "list"], None).0 {
+            if Instant::now() >= deadline {
+                panic!(
+                    "{}'s daemon never answered `vox room list`. It said:\n{}",
+                    self.name,
+                    p.transcript()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        self.daemon = Some(p);
     }
 
-    /// Wait until `vox room read` shows `what`: the announcement has synced here.
+    fn run(&self, argv: &[&str]) -> (bool, String) {
+        let (ok, out, err) = vox(&self.dir, argv, None);
+        (ok, format!("{out}{err}"))
+    }
+
+    /// Wait until `vox room read` shows `what`: it has synced here, and this member can
+    /// read its author.
     fn sees(&self, room: &str, what: &str) {
         let until = Instant::now() + TIMEOUT;
         while Instant::now() < until {
@@ -64,139 +154,20 @@ impl Member {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        panic!("the announcement of {what} never reached this member");
+        panic!("{what} never reached {}", self.name);
     }
 
-    fn run(&self, args: &[&str]) -> (bool, String) {
-        let out = self.command(args).stdin(Stdio::null()).output().unwrap();
-        (
-            out.status.success(),
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            ),
-        )
+    /// A `vox up` with no room, carried by this member's daemon, and where it listens.
+    fn up(&self) -> (VoxProc, SocketAddr) {
+        let mut p = VoxProc::spawn(
+            &format!("{} up", self.name),
+            &self.dir,
+            &args(&["up", "--bind", "127.0.0.1:0"]),
+        );
+        let line = p.expect_within(TIMEOUT, "vox up's address", |l| l.starts_with("vox up on "));
+        let addr = line.split_whitespace().nth(3).unwrap().parse().unwrap();
+        (p, addr)
     }
-}
-
-/// A long-running child, killed by PID however the test ends, its output kept.
-struct Proc {
-    child: Child,
-    said: Arc<Mutex<String>>,
-}
-
-impl Proc {
-    fn spawn(mut cmd: Command) -> Self {
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let said = Arc::new(Mutex::new(String::new()));
-        for pipe in [
-            child
-                .stdout
-                .take()
-                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-            child
-                .stderr
-                .take()
-                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let sink = Arc::clone(&said);
-            std::thread::spawn(move || {
-                for line in std::io::BufReader::new(pipe).lines() {
-                    let Ok(line) = line else { return };
-                    let mut s = sink.lock().unwrap();
-                    s.push_str(&line);
-                    s.push('\n');
-                }
-            });
-        }
-        Self { child, said }
-    }
-
-    fn said(&self) -> String {
-        self.said.lock().unwrap().clone()
-    }
-
-    fn wait_line(&self, what: &str, prefix: &str) -> String {
-        let until = Instant::now() + TIMEOUT;
-        while Instant::now() < until {
-            if let Some(l) = self.said().lines().find(|l| l.starts_with(prefix)) {
-                return l.to_owned();
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        panic!("timed out waiting for {what}; it said: {}", self.said());
-    }
-}
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-async fn member(tmp: &tempfile::TempDir, name: &str) -> Member {
-    let data = tmp.path().join(name).join("data");
-    let cfg = tmp.path().join(name).join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
-    let node = Node::spawn_networked(paths.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
-    assert!(node
-        .apply(NodeCommand::CreateIdentity {
-            passphrase: secret("identity passphrase"),
-        })
-        .await
-        .is_done());
-    Member {
-        data,
-        cfg,
-        paths,
-        node,
-    }
-}
-
-async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) -> T {
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match h.next_event().await {
-                Some(e) => {
-                    if let Some(v) = f(e) {
-                        return v;
-                    }
-                }
-                None => panic!("event stream ended"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for an event")
-}
-
-async fn trust(who: &Member, peer: &Member, name: &str) {
-    assert!(who
-        .node
-        .apply(NodeCommand::Trust {
-            fingerprint: peer.fp(),
-            petname: name.into(),
-        })
-        .await
-        .is_done());
-}
-
-/// A `vox up` for `who`, and where it listens.
-fn up(who: &Member) -> (Proc, SocketAddr) {
-    let p = Proc::spawn(who.command(&["up", "--bind", "127.0.0.1:0"]));
-    let line = p.wait_line("vox up's address", "vox up on ");
-    let addr = line.split_whitespace().nth(3).unwrap().parse().unwrap();
-    (p, addr)
 }
 
 /// `curl` through `proxy`: whether it succeeded, and the bytes.
@@ -221,14 +192,9 @@ fn sha(b: &[u8]) -> String {
 }
 
 #[test]
-#[ignore = "three real nodes and real child processes; CI runs it in release"]
+#[ignore = "an anchor, three vox daemons and real child processes; CI runs it in release"]
 fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     watchdog::arm();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let payload: Vec<u8> = (0..700_000u32)
         .map(|i| (i.wrapping_mul(97) >> 3) as u8)
@@ -240,93 +206,100 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     std::fs::write(folder.join("a.txt"), b"first").unwrap();
     std::fs::write(folder.join("2026").join("b.txt"), b"second").unwrap();
 
-    let (alice, bob, mallory, room, _socks) = rt.block_on(async {
-        let alice = member(&tmp, "alice").await;
-        let bob = member(&tmp, "bob").await;
-        let mallory = member(&tmp, "mallory").await;
-        assert!(alice
-            .node
-            .apply(NodeCommand::CreateChannel {
-                local_name: "files".into(),
-                passphrase: secret("room passphrase"),
-            })
-            .await
-            .is_done());
-        let cid = alice.node.view().channels[0].channel_id;
-        assert!(alice
-            .node
-            .apply(NodeCommand::Invite { channel_id: cid })
-            .await
-            .is_done());
-        let url = wait_for(&alice.node, |e| match e {
-            NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
-            _ => None,
+    let anchor_dir = tmp.path().join("anchor");
+    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    let mut anchor = VoxProc::spawn(
+        "anchor",
+        &anchor_dir,
+        &args(&["node", "--listen", "127.0.0.1:0"]),
+    );
+    let spec = anchor
+        .expect_line("an --anchor spec", |l| {
+            l.trim_start().contains("@/ip4/127.0.0.1/udp/")
         })
-        .await;
-        for who in [&bob, &mallory] {
-            assert!(who
-                .node
-                .apply(NodeCommand::JoinChannel {
-                    link: url.clone(),
-                    local_name: "files".into(),
-                    passphrase: secret("room passphrase"),
-                })
-                .await
-                .is_done());
-        }
-        trust(&alice, &bob, "bob").await;
-        trust(&bob, &alice, "alice").await;
-        // mallory trusts alice — she would like what alice shares — but alice has not
-        // trusted her.
-        trust(&mallory, &alice, "alice").await;
-        wait_for(&bob.node, |e| match e {
-            NodeEvent::SenderKeyReceived {
-                channel_id, peer, ..
-            } if channel_id == cid && peer == alice.fp() => Some(()),
-            _ => None,
-        })
-        .await;
-        let socks = [
-            vox_core::node::ipc::bind(alice.node.clone(), &alice.paths).unwrap(),
-            vox_core::node::ipc::bind(bob.node.clone(), &bob.paths).unwrap(),
-            vox_core::node::ipc::bind(mallory.node.clone(), &mallory.paths).unwrap(),
-        ];
-        (alice, bob, mallory, cid, socks)
-    });
-    let room_b32 = b32_encode(&room);
+        .trim()
+        .to_owned();
+
+    let mut alice = member(tmp.path(), "alice");
+    let mut bob = member(tmp.path(), "bob");
+    let mut mallory = member(tmp.path(), "mallory");
+    alice.trust(&bob, "bob");
+    bob.trust(&alice, "alice");
+    // mallory trusts alice — she would like what alice shares — but alice has not
+    // trusted her.
+    mallory.trust(&alice, "alice");
+    for m in [&mut alice, &mut bob, &mut mallory] {
+        m.start(&spec);
+    }
+
+    let (ok, out, err) = vox(
+        &alice.dir,
+        &["room", "create", "--name", "files"],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(ok, "vox room create: {out}{err}");
+    let (ok, list, err) = vox(&alice.dir, &["room", "list"], None);
+    assert!(ok, "vox room list: {err}");
+    let room = list
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some("files"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("files is not listed: {list}"))
+        .to_owned();
+    let (ok, link, err) = vox(&alice.dir, &["room", "invite", &room], None);
+    assert!(ok, "vox room invite: {err}");
+    for who in [&bob, &mallory] {
+        let (ok, out, err) = vox(
+            &who.dir,
+            &["room", "join", link.trim(), "--name", "files"],
+            Some(&format!("{ROOM_PASS}\n")),
+        );
+        assert!(ok, "{} joins files: {out}{err}", who.name);
+    }
+    // **Precondition: bob reads alice.** Until alice's key reaches him he can read none of
+    // what she posts, the announcement included; that is key distribution, not sharing, so
+    // it is waited for here rather than measured below.
+    let (ok, said) = alice.run(&["room", "post", &room, "hello from alice"]);
+    assert!(ok, "alice posts: {said}");
+    bob.sees(&room, "hello from alice");
+
     let bob_dl = tmp.path().join("bob-downloads");
     std::fs::write(
-        bob.paths.config_file(),
+        bob.dir.join("cfg").join("config"),
         format!("downloads = {}\n", bob_dl.display()),
     )
     .unwrap();
 
-    let share =
-        Proc::spawn(alice.command(&["share", &room_b32, file.to_str().unwrap(), "--count", "2"]));
-    let line = share.wait_line("the share's port", "vox: sharing ");
+    let mut share = VoxProc::spawn(
+        "alice share",
+        &alice.dir,
+        &args(&["share", &room, file.to_str().unwrap(), "--count", "2"]),
+    );
+    let line = share.expect_within(TIMEOUT, "the share's port", |l| {
+        l.starts_with("vox: sharing ")
+    });
     let port: u16 = line
         .split("on port ")
         .nth(1)
         .and_then(|p| p.trim().parse().ok())
         .unwrap_or_else(|| panic!("no port in {line:?}"));
-    let (_bob_up, bob_proxy) = up(&bob);
-    let (_mal_up, mal_proxy) = up(&mallory);
+    let (_bob_up, bob_proxy) = bob.up();
+    let (_mal_up, mal_proxy) = mallory.up();
     let url = format!("http://alice.files.vox:{port}/report.bin");
 
     // Fetch 1: bob, with curl through his own `vox up`.
     let (curl_ok, curled) = curl(bob_proxy, &url);
     // mallory: the same URL through her own proxy, and `vox room get`. Neither is a fetch.
     let (mal_curl_ok, mal_curled) = curl(mal_proxy, &url);
-    let (mal_get_ok, mal_get_said) = mallory.run(&["room", "get", &room_b32, "report.bin"]);
-    let fetches_before_get = share.said().matches("vox: fetched ").count();
+    let (mal_get_ok, mal_get_said) = mallory.run(&["room", "get", &room, "report.bin"]);
+    let fetches_before_get = share.transcript().matches("vox: fetched ").count();
     // Fetch 2: bob, with `vox room get`, into his downloads directory, once the
     // announcement has reached him.
-    bob.sees(&room_b32, "report.bin");
-    let (get_ok, get_said) = bob.run(&["room", "get", &room_b32, "report.bin"]);
+    bob.sees(&room, "report.bin");
+    let (get_ok, get_said) = bob.run(&["room", "get", &room, "report.bin"]);
     let landed = bob_dl.join("report.bin");
     let got = std::fs::read(&landed).unwrap_or_default();
     // Two fetches: the share stops by itself.
-    let mut share = share;
     let until = Instant::now() + Duration::from_secs(20);
     let mut ended = None;
     while Instant::now() < until {
@@ -336,18 +309,21 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // Its last words, drained after it has exited.
+    std::thread::sleep(Duration::from_millis(200));
+    let share_said = share.transcript();
 
     // A folder, as one tar.
-    let folder_share = Proc::spawn(alice.command(&[
-        "share",
-        &room_b32,
-        folder.to_str().unwrap(),
-        "--for",
-        "120s",
-    ]));
-    folder_share.wait_line("the folder share", "vox: sharing ");
-    bob.sees(&room_b32, "photos.tar");
-    let (tar_ok, tar_said) = bob.run(&["room", "get", &room_b32, "photos.tar"]);
+    let mut folder_share = VoxProc::spawn(
+        "alice share folder",
+        &alice.dir,
+        &args(&["share", &room, folder.to_str().unwrap(), "--for", "120s"]),
+    );
+    folder_share.expect_within(TIMEOUT, "the folder share", |l| {
+        l.starts_with("vox: sharing ")
+    });
+    bob.sees(&room, "photos.tar");
+    let (tar_ok, tar_said) = bob.run(&["room", "get", &room, "photos.tar"]);
     let listing = Command::new("tar")
         .args(["-tf", bob_dl.join("photos.tar").to_str().unwrap()])
         .output()
@@ -358,7 +334,7 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         "curl by bob: ok {curl_ok}, {} bytes, sha {}\nsent {} bytes, sha {}\n\
          mallory curl: ok {mal_curl_ok}, {} bytes; mallory get: ok {mal_get_ok}: {mal_get_said}\
          fetches counted before bob's get: {fetches_before_get}\nbob's get: ok {get_ok}: \
-         {get_said}landed {} ({} bytes, sha {})\nshare ended {ended:?}; it said:\n{}\n\
+         {get_said}landed {} ({} bytes, sha {})\nshare ended {ended:?}; it said:\n{share_said}\n\
          folder get: ok {tar_ok}: {tar_said}tar lists:\n{listing}",
         curled.len(),
         sha(&curled),
@@ -368,7 +344,6 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         landed.display(),
         got.len(),
         sha(&got),
-        share.said()
     );
     assert!(
         curl_ok && sha(&curled) == sha(&payload),
@@ -390,7 +365,7 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         "and land the same bytes in his downloads directory"
     );
     assert!(
-        ended.is_some_and(|s| s.success()) && share.said().contains("fetched 2 time(s)"),
+        ended.is_some_and(|s| s.success()) && share_said.contains("fetched 2 time(s)"),
         "the share must stop by itself after --count 2"
     );
     assert!(tar_ok, "the folder share must be collectable");
@@ -405,5 +380,5 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
             "the tar must hold {entry}"
         );
     }
-    drop((alice, mallory));
+    drop((folder_share, share, alice, bob, mallory, anchor));
 }
