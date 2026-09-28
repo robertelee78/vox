@@ -482,6 +482,13 @@ impl NodeConfig {
 /// for up to 30 s (CI run 36418572653: a first relayed connection in 30065 ms, 55 attempts).
 const ANCHOR_REDIAL_SECS: u64 = 30;
 
+/// An anchor connection lost within this long of being made counts as a **failure** for the
+/// backoff, not as a loss to redial at once (V210-57): two live processes of one identity (a
+/// copied profile, an old binary) supersede each other at the anchor, and redialling each loss at
+/// once would make that a loop at the tick's rate. Backed off, it settles to one try per
+/// [`ANCHOR_REDIAL_SECS`].
+const ANCHOR_FLAP_SECS: u64 = 10;
+
 /// What a sync session runs against: a member's channel, or an anchor's copy.
 enum SessionTarget {
     Channel(SharedChannel),
@@ -1877,6 +1884,9 @@ pub struct Node {
     /// starting up dialled each anchor from both its start and its first tick, and the
     /// duplicate lost a tie-break against the first on every start.
     anchor_dials: Arc<std::sync::Mutex<BTreeSet<Digest32>>>,
+    /// When each anchor's current connection was made (unix seconds), so one lost soon after is
+    /// told from one lost after a while ([`ANCHOR_FLAP_SECS`]).
+    anchor_connected_at: BTreeMap<Digest32, u64>,
     /// The anchors this node held a connection to at the last look, so losing one is said when
     /// it happens, not only when it is next redialled (#229's diagnostics).
     anchors_up: BTreeSet<Digest32>,
@@ -2168,6 +2178,7 @@ impl Node {
             port_mappings: Vec::new(),
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
+            anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeSet::new(),
             renew_mappings_at: None,
             ports: BTreeMap::new(),
@@ -3182,11 +3193,34 @@ impl Node {
             .map(|a| a.id)
             .filter(|id| net.manager().holds(id))
             .collect();
-        for lost in self.anchors_up.difference(&up) {
-            net.manager().note(
-                *lost,
-                "the connection to this anchor is gone; it is redialled now".to_owned(),
-            );
+        let lost: Vec<Digest32> = self.anchors_up.difference(&up).copied().collect();
+        for lost in lost {
+            let lasted = self
+                .anchor_connected_at
+                .remove(&lost)
+                .map(|at| now.saturating_sub(at));
+            if lasted.is_some_and(|s| s < ANCHOR_FLAP_SECS) {
+                // Lost almost as soon as it was made: backed off like a failed dial.
+                let wait = self
+                    .anchor_backoff
+                    .get(&lost)
+                    .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
+                self.anchor_backoff.insert(lost, (now + wait, wait));
+                net.manager().note(
+                    lost,
+                    format!(
+                        "the connection to this anchor is gone {}s after it was made; it is \
+                         redialled in {wait}s",
+                        lasted.unwrap_or(0)
+                    ),
+                );
+            } else {
+                self.anchor_backoff.remove(&lost);
+                net.manager().note(
+                    lost,
+                    "the connection to this anchor is gone; it is redialled now".to_owned(),
+                );
+            }
         }
         self.anchors_up = up;
         for anchor in known {
@@ -3691,7 +3725,9 @@ impl Node {
             }
             NetEvent::AnchorConnected { conn } => {
                 let peer = conn.peer_id();
-                self.anchor_backoff.remove(&peer);
+                // The backoff is kept until the connection has lasted (`ANCHOR_FLAP_SECS`): one
+                // superseded at once is a flap, not a success.
+                self.anchor_connected_at.insert(peer, self.now());
                 self.anchor_ids.insert(peer);
                 self.adopt_connection(Arc::clone(&conn));
                 self.refresh_network_view().await;

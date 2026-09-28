@@ -855,6 +855,13 @@ impl ConnectionManager {
         // kept its predecessor's connection, closed the one the restarted process was using, and
         // left it with no helper (CI run 36418572653: 30065 ms). Both ends agree without a vote:
         // the restarted process holds only the newcomer.
+        //
+        // **No new power.** `conn` exists only because its leaf certificate was verified as signed
+        // by `peer`'s identity key (`identity_cert::verify_peer_certificate`, ADR-011): only the
+        // identity's holder can present a new process of it, and that holder can already speak as
+        // it. **Two live processes of one identity** (a copied profile, an old binary) would each
+        // supersede the other: that is bounded by the dialler's anchor backoff, which counts a
+        // connection lost soon after it was made as a failure (`ANCHOR_FLAP_SECS`), not a loop.
         let process = conn.peer_process();
         if let Some(existing) = map.get(&peer).filter(|e| e.peer_process() != process) {
             let existing = Arc::clone(existing);
