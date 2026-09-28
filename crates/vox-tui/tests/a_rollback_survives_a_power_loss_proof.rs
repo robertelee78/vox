@@ -517,28 +517,17 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
         let finish = install_dir(&tmp.path().join("shell-finish"));
         previous_stub(&finish.join(".vox-rollback.partial"), "0.0.1");
         let (ok_f, said_f) = rollback_with(&finish, &tmp.path().join("home-f"), true, None);
-        // What follows each command's own first line is the shell set-up's; the recovery's
-        // `vox` is this build, the normal rollback's is the stub, so compare the recovery against
-        // the shell set-up this build prints on its own.
-        let own = Command::new(finish.join("vox"))
-            .arg("shell-setup")
-            .env_clear()
-            .env("HOME", tmp.path().join("home-own"))
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("SHELL", "/bin/zsh")
-            .output()
-            .expect("vox shell-setup");
-        let own_said = String::from_utf8_lossy(&own.stdout).trim().to_owned();
-        let tail_f: String = said_f.lines().skip(1).collect::<Vec<_>>().join("\n");
-        let refreshed =
-            !own_said.is_empty() && tail_f.contains(own_said.lines().next().unwrap_or(""));
+        // What follows the recovery's own line is the shell set-up's, as after a rollback. This
+        // build's set-up says `vox shell-setup: <shell>: …`; its paths name the private HOME, so
+        // the prefix is what is compared.
+        let tail_f: Vec<&str> = said_f.lines().skip(1).collect();
+        let refreshed = tail_f.iter().any(|l| l.starts_with("vox shell-setup:"));
         eprintln!(
             "[proof] (7) completions: a normal rollback ok={ok_n} printed {} line(s) after its \
-             own; the finished recovery ok={ok_f} printed {} (this build's shell-setup begins {:?}); \
-             refreshed: {refreshed}",
+             own; the finished recovery ok={ok_f} printed {}, the shell set-up's among them: \
+             {refreshed}",
             said_n.lines().count().saturating_sub(1),
-            said_f.lines().count().saturating_sub(1),
-            own_said.lines().next().unwrap_or("")
+            tail_f.len()
         );
         if !(ok_f && refreshed) {
             failures.push(format!(
