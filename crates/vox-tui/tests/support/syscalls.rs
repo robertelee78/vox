@@ -34,6 +34,8 @@ pub enum Call {
     Rename { from: PathBuf, to: PathBuf },
     /// `chmod`/`fchmod`.
     Chmod { path: PathBuf, mode: u32 },
+    /// `write`, `pwrite`, `writev`, `pwritev`: the descriptor's path and the bytes asked for.
+    Write { path: PathBuf, bytes: u64 },
 }
 
 /// A call, with where it came from and what it returned.
@@ -152,6 +154,13 @@ pub fn parse(log: &str) -> Vec<Event> {
                     },
                     &f[6..],
                 ),
+                Some("write") if f.len() == 8 => (
+                    Call::Write {
+                        path: f[3].into(),
+                        bytes: f[5].parse().unwrap_or_else(|_| bad()),
+                    },
+                    &f[6..],
+                ),
                 Some("chmod") if f.len() == 8 => (
                     Call::Chmod {
                         path: f[3].into(),
@@ -198,7 +207,10 @@ pub struct Publication {
     pub created: Option<Event>,
     /// `chmod`s of the renamed file between its creation and the rename.
     pub chmods: Vec<Event>,
-    /// Successful flushes of the renamed file between its creation and the rename.
+    /// Successful writes to the renamed file between its creation and the rename.
+    pub writes: Vec<Event>,
+    /// Successful flushes of the renamed file **after its last write** and before the rename:
+    /// a flush before the bytes are written flushes nothing (found in verification of #241).
     pub synced_before: Vec<Event>,
     /// Flushes of the directory after the rename (any result).
     pub dir_synced_after: Vec<Event>,
@@ -230,13 +242,25 @@ pub fn publication(events: &[Event], target: &Path) -> Option<Publication> {
             .filter(|e| matches!(&e.call, Call::Chmod { path, .. } if norm(path) == from))
             .map(|e| (*e).clone())
             .collect(),
-        synced_before: since
+        writes: since
             .iter()
             .filter(|e| {
-                e.ret == 0 && matches!(&e.call, Call::Sync { path, .. } if norm(path) == from)
+                e.ret >= 0 && matches!(&e.call, Call::Write { path, .. } if norm(path) == from)
             })
             .map(|e| (*e).clone())
             .collect(),
+        synced_before: {
+            let last_write = since
+                .iter()
+                .rposition(|e| matches!(&e.call, Call::Write { path, .. } if norm(path) == from));
+            since[last_write.map_or(0, |k| k + 1)..]
+                .iter()
+                .filter(|e| {
+                    e.ret == 0 && matches!(&e.call, Call::Sync { path, .. } if norm(path) == from)
+                })
+                .map(|e| (*e).clone())
+                .collect()
+        },
         dir_synced_after: events[i + 1..]
             .iter()
             .filter(same)
@@ -252,7 +276,9 @@ pub fn publication(events: &[Event], target: &Path) -> Option<Publication> {
 /// Whether `target` was published the way a file a person cannot get back must be: created
 /// `O_CREAT | O_EXCL` with mode `0600` from its first byte and never `chmod`ed after, flushed
 /// before the rename, and its directory flushed after (a flush the filesystem refuses for a
-/// directory, `EINVAL` or `ENOTSUP`, is recorded and accepted). `Err` says what was missing.
+/// directory, `EINVAL` or `ENOTSUP`, is recorded and accepted). "Flushed" means after the file's
+/// **last** write: a flush of a file still empty, its bytes written after, publishes unflushed
+/// data. `Err` says what was missing.
 pub fn published_durably(events: &[Event], target: &Path) -> Result<(), String> {
     let p = publication(events, target)
         .ok_or_else(|| format!("no rename onto {} was recorded", target.display()))?;
@@ -274,8 +300,11 @@ pub fn published_durably(events: &[Event], target: &Path) -> Result<(), String> 
     if !p.chmods.is_empty() {
         missing.push(format!("chmod after creation: {:?}", p.chmods));
     }
+    if p.writes.is_empty() {
+        missing.push("no write to it was recorded".to_owned());
+    }
     if p.synced_before.is_empty() {
-        missing.push("not flushed before the rename".to_owned());
+        missing.push("not flushed after its last write and before the rename".to_owned());
     }
     let dir_ok = p
         .dir_synced_after

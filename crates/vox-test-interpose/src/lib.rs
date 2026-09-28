@@ -22,6 +22,11 @@
 //!   path is the descriptor's, taken with `F_GETPATH` at the moment of the call.
 //! - `rename from to how ret errno`: `rename`, `renameat`, `renamex_np`, `renameatx_np`.
 //! - `chmod path mode(octal) how ret errno`: `chmod`, `fchmod`.
+//! - `write path how bytes ret errno`: `write`, `pwrite`, `writev`, `pwritev`; `bytes` is what the
+//!   call asked to write, `ret` what it wrote. The path is the descriptor's, as for `sync`, so a
+//!   proof can require the **last** write to a file to come before its flush (a flush of a file
+//!   still empty, with the bytes written after, publishes unflushed data; found in verification
+//!   of #241).
 //!
 //! Paths are as the call named them (for `open` and `rename`) or as the kernel reports them (for a
 //! descriptor), so a reader compares them after canonicalising the directory.
@@ -68,9 +73,19 @@ extern "C" {
     fn chmod(path: *const c_char, mode: u16) -> c_int;
     fn fchmod(fd: c_int, mode: u16) -> c_int;
     fn write(fd: c_int, buf: *const u8, n: usize) -> isize;
+    fn pwrite(fd: c_int, buf: *const u8, n: usize, offset: i64) -> isize;
+    fn writev(fd: c_int, iov: *const IoVec, count: c_int) -> isize;
+    fn pwritev(fd: c_int, iov: *const IoVec, count: c_int, offset: i64) -> isize;
     fn getpid() -> c_int;
     fn getenv(name: *const c_char) -> *const c_char;
     fn __error() -> *mut c_int;
+}
+
+/// `struct iovec`.
+#[repr(C)]
+pub struct IoVec {
+    base: *const u8,
+    len: usize,
 }
 
 // ---- the log ------------------------------------------------------------------------------
@@ -138,6 +153,25 @@ fn outcome(ret: c_int) -> (String, String) {
     // SAFETY: __error returns this thread's errno location.
     let errno = if ret < 0 { unsafe { *__error() } } else { 0 };
     (ret.to_string(), errno.to_string())
+}
+
+/// `(ret, errno)` of a call returning a byte count.
+fn outcome_len(ret: isize) -> (String, String) {
+    // SAFETY: __error returns this thread's errno location.
+    let errno = if ret < 0 { unsafe { *__error() } } else { 0 };
+    (ret.to_string(), errno.to_string())
+}
+
+/// Bytes an iovec array asks to write.
+fn iov_len(iov: *const IoVec, count: c_int) -> usize {
+    if iov.is_null() || count <= 0 {
+        return 0;
+    }
+    // SAFETY: the caller passed `count` iovecs to the call being recorded.
+    unsafe { std::slice::from_raw_parts(iov, count as usize) }
+        .iter()
+        .map(|v| v.len)
+        .sum()
 }
 
 fn text(p: *const c_char) -> String {
@@ -313,6 +347,47 @@ pub unsafe extern "C" fn vti_fchmod(fd: c_int, mode: u16) -> c_int {
     r
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn vti_write(fd: c_int, buf: *const u8, n: usize) -> isize {
+    let path = fd_path(fd);
+    let r = write(fd, buf, n);
+    let (ret, errno) = outcome_len(r);
+    record(&["write", &path, "write", &n.to_string(), &ret, &errno]);
+    r
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vti_pwrite(fd: c_int, buf: *const u8, n: usize, offset: i64) -> isize {
+    let path = fd_path(fd);
+    let r = pwrite(fd, buf, n, offset);
+    let (ret, errno) = outcome_len(r);
+    record(&["write", &path, "pwrite", &n.to_string(), &ret, &errno]);
+    r
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vti_writev(fd: c_int, iov: *const IoVec, count: c_int) -> isize {
+    let (path, n) = (fd_path(fd), iov_len(iov, count));
+    let r = writev(fd, iov, count);
+    let (ret, errno) = outcome_len(r);
+    record(&["write", &path, "writev", &n.to_string(), &ret, &errno]);
+    r
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vti_pwritev(
+    fd: c_int,
+    iov: *const IoVec,
+    count: c_int,
+    offset: i64,
+) -> isize {
+    let (path, n) = (fd_path(fd), iov_len(iov, count));
+    let r = pwritev(fd, iov, count, offset);
+    let (ret, errno) = outcome_len(r);
+    record(&["write", &path, "pwritev", &n.to_string(), &ret, &errno]);
+    r
+}
+
 // ---- trampolines for the variadic calls ----------------------------------------------------
 
 // Apple arm64: the variadic argument is the first 8-byte slot at the caller's `sp`. Load it into
@@ -383,4 +458,8 @@ interpose! {
     I_RENAMEATX_NP: vti_renameatx_np => renameatx_np;
     I_CHMOD: vti_chmod => chmod;
     I_FCHMOD: vti_fchmod => fchmod;
+    I_WRITE: vti_write => write;
+    I_PWRITE: vti_pwrite => pwrite;
+    I_WRITEV: vti_writev => writev;
+    I_PWRITEV: vti_pwritev => pwritev;
 }

@@ -4,13 +4,15 @@
 //! A proof built on the recorder is only as good as the recorder. So before any proof asserts that
 //! vox flushes a file before publishing it, this one shows the recorder sees each kind of call the
 //! real binary makes, on a real `vox id`:
-//! - the vault's temporary file being created, with its flags and mode, and renamed into place;
+//! - the vault's temporary file being created, with its flags and mode, written, and renamed into
+//!   place;
 //! - at least one flush of the profile's store (redb flushes on every commit), resolved to the
 //!   store's path;
 //! - every event from the `vox` process itself.
 //!
 //! It asserts nothing about whether vox's order is durable; the proofs that use the recorder do.
-//! Mutation: an interposer that stops recording `fcntl(F_FULLFSYNC)` fails the second point.
+//! Mutations: an interposer that stops recording `write` fails the first point; one that stops
+//! recording `fcntl(F_FULLFSYNC)` fails the second.
 
 #![cfg(target_os = "macos")]
 
@@ -55,6 +57,14 @@ fn the_recorder_sees_what_the_shipped_binary_does() {
     let renamed = events
         .iter()
         .find(|e| matches!(&e.call, Call::Rename { to, .. } if norm(to) == vault));
+    // The bytes written into the file that becomes vault.cbor.
+    let vault_writes = match renamed.map(|e| &e.call) {
+        Some(Call::Rename { from, .. }) => events
+            .iter()
+            .filter(|e| matches!(&e.call, Call::Write { path, bytes } if norm(path) == norm(from) && *bytes > 0))
+            .count(),
+        _ => 0,
+    };
     let store_syncs = events
         .iter()
         .filter(|e| matches!(&e.call, Call::Sync { path, .. } if norm(path) == store))
@@ -62,7 +72,8 @@ fn the_recorder_sees_what_the_shipped_binary_does() {
     let pids: std::collections::BTreeSet<u32> = events.iter().map(|e| e.pid).collect();
     println!(
         "[proof] `vox id` under the recorder: {} calls from {} process(es); the vault's file \
-         created = {:?}; renamed into vault.cbor = {}; flushes of store.redb = {store_syncs}",
+         created = {:?}; renamed into vault.cbor = {}; writes to it = {vault_writes}; flushes of \
+         store.redb = {store_syncs}",
         events.len(),
         pids.len(),
         created.map(|e| &e.call),
@@ -75,6 +86,10 @@ fn the_recorder_sees_what_the_shipped_binary_does() {
     assert!(
         renamed.is_some(),
         "the recorder saw no rename onto vault.cbor"
+    );
+    assert!(
+        vault_writes > 0,
+        "the recorder saw no write to the file renamed into vault.cbor"
     );
     assert!(
         store_syncs > 0,
