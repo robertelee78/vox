@@ -283,6 +283,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
         NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
         NetEvent::PublishDone { .. } => "filing what a board said to a publish",
+        NetEvent::RepublishTo { .. } => "publishing a refused record again",
+        NetEvent::StaleGraceOver { .. } => "naming a refusal no republish cured",
         NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
@@ -669,6 +671,24 @@ enum NetEvent {
         board: Digest32,
         /// Each kind of record and the board's refusal of it, if any.
         outcomes: Vec<(&'static str, Option<String>)>,
+    },
+    /// Publish this room's records to `board` again: sent just past the next second by the
+    /// `PublishDone` handler when the board refused one of this node's **own** records as stale.
+    RepublishTo {
+        /// The room.
+        channel_id: Digest32,
+        /// The board that refused.
+        board: Digest32,
+    },
+    /// The grace for one of this node's own records refused as stale is over: said now if no
+    /// round since has cured it (see `report_publish`).
+    StaleGraceOver {
+        /// The room.
+        channel_id: Digest32,
+        /// The record and board, as `report_publish` keys them.
+        what: String,
+        /// The board's refusal.
+        why: String,
     },
     /// A join exchange finished on its own task and is handing back what the actor must
     /// apply: the admission, the session, and the event a person sees.
@@ -1161,6 +1181,24 @@ const MAX_JOIN_RESPONDERS: usize = 3;
 /// enough that a node genuinely stranded off a board is named while somebody is still
 /// looking at the terminal.
 const PUBLISH_REFUSAL_GRACE: u64 = 60;
+
+/// How long this node's own record refused as stale goes unreported: long enough for the republish
+/// past the next second (`NetEvent::RepublishTo`) to land, short enough that a refusal it does not
+/// cure is named while somebody is still looking.
+const STALE_REFUSAL_GRACE: u64 = 5;
+
+/// How many times in a row a node republishes one of its own records to a board that refused it as
+/// stale: enough to get past the second the refused one was signed in, with room for a clock that
+/// steps, and few enough that a real refusal stops being retried.
+const STALE_REPUBLISH_TRIES: u32 = 3;
+
+/// Whether a publish outcome is one of this node's **own** records refused by the board as stale.
+fn own_stale_refusal(kind: &str, why: &Option<String>) -> bool {
+    matches!(kind, "our address" | "our member bundle")
+        && why
+            .as_deref()
+            .is_some_and(|w| w.contains(crate::nat::service::RejectReason::Stale.as_str()))
+}
 
 /// Whether a failed join attempt is worth repeating against a different member.
 ///
@@ -1927,6 +1965,9 @@ pub struct Node {
     publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// Publishes asked for while that `(room, board)` round was in flight: run when it ends.
     publish_again: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// How many times in a row each board has refused one of this node's own records as stale,
+    /// for [`NetEvent::RepublishTo`]'s cap. Cleared by a round that went on.
+    stale_retries: BTreeMap<(Digest32, Digest32), u32>,
     /// Creates and joins answered once their room's publish rounds have ended: see
     /// `answer_when_published`.
     publish_waiters: Vec<(Digest32, oneshot::Sender<Outcome>, Outcome)>,
@@ -2132,6 +2173,7 @@ impl Node {
             board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
             publish_again: std::collections::BTreeSet::new(),
+            stale_retries: BTreeMap::new(),
             publish_waiters: Vec::new(),
             member_dialed_at: BTreeMap::new(),
             pending_consents: Vec::new(),
@@ -2919,15 +2961,43 @@ impl Node {
                     // Our own records, refused because nobody has vouched for us yet: the
                     // ordinary opening move of a join, which cures when a member mirrors us
                     // onward. Say nothing until it has had time to cure.
-                    let curable = matches!(kind, "our member bundle" | "our address")
+                    let not_yet_vouched = matches!(kind, "our member bundle" | "our address")
                         && why.contains("author is not a channel member");
-                    if curable {
+                    // Our own record refused as stale is cured by the republish past the second
+                    // (`NetEvent::RepublishTo`); said only if it is still refused after that.
+                    let stale = own_stale_refusal(kind, &Some(why.clone()));
+                    let grace = if stale {
+                        STALE_REFUSAL_GRACE
+                    } else {
+                        PUBLISH_REFUSAL_GRACE
+                    };
+                    if not_yet_vouched || stale {
                         let now = self.now();
+                        let seen_before = self.publish_refusal_first_seen.contains_key(&key);
                         let first = *self
                             .publish_refusal_first_seen
                             .entry(key.clone())
                             .or_insert(now);
-                        if now.saturating_sub(first) < PUBLISH_REFUSAL_GRACE {
+                        if now.saturating_sub(first) < grace {
+                            // **Held, never dropped.** A stale refusal is re-reported only by a
+                            // later round, and a cured one has none; so its grace ends on a timer,
+                            // and the refusal is said then unless a round has taken the record.
+                            if stale && !seen_before {
+                                let tx = self.net_tx.clone();
+                                let (channel_id, what, why) =
+                                    (*channel_id, what.clone(), why.clone());
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_secs(STALE_REFUSAL_GRACE))
+                                        .await;
+                                    let _ = tx
+                                        .send(NetEvent::StaleGraceOver {
+                                            channel_id,
+                                            what,
+                                            why,
+                                        })
+                                        .await;
+                                });
+                            }
                             continue;
                         }
                     }
@@ -3611,12 +3681,63 @@ impl Node {
                     why,
                 });
             }
+            NetEvent::StaleGraceOver {
+                channel_id,
+                what,
+                why,
+            } => {
+                // Still refused: no round since took it (one that did cleared the key).
+                let key = (channel_id, what.clone());
+                if self.publish_refusal_first_seen.remove(&key).is_some() {
+                    self.last_publish_refusal.insert(key, why.clone());
+                    let _ = self.event_tx.send(NodeEvent::PublishRefused {
+                        channel_id,
+                        what,
+                        why,
+                    });
+                }
+            }
+            NetEvent::RepublishTo { channel_id, board } => {
+                let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
+                if let Some(conn) = conn {
+                    // Queued behind a round in flight to that board, as any other publish is.
+                    self.publish_channel_to_anchor(&channel_id, &conn).await;
+                }
+            }
             NetEvent::PublishDone {
                 channel_id,
                 board,
                 outcomes,
             } => {
                 self.publishing.remove(&(channel_id, board));
+                // **Our own record refused as stale, from a fresh process: publish again just past
+                // the next second.** A board takes a replacement only with a later `timestamp`, in
+                // whole seconds (the one-change-a-second anti-spam bound, `nat::store`), and a
+                // process that starts within the second the last one published in — a restart, or
+                // one one-shot verb after another — signs its first record in that same second. It
+                // was refused, and this node stayed at its old address on that board until its next
+                // round: every cold `vox forward` logged `a board would not take our address … the
+                // board holds a newer record` (integrate 1de7548). Capped, so a board that really
+                // holds something newer from this identity — two live processes of one identity —
+                // is not asked every second for ever.
+                let own_stale = outcomes
+                    .iter()
+                    .any(|(kind, why)| own_stale_refusal(kind, why));
+                let key = (channel_id, board);
+                if own_stale {
+                    let tries = self.stale_retries.entry(key).or_insert(0);
+                    *tries = tries.saturating_add(1);
+                    if *tries <= STALE_REPUBLISH_TRIES {
+                        let past_the_second = 1_000 - (self.millis_clock)() % 1_000 + 50;
+                        let tx = self.net_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(past_the_second)).await;
+                            let _ = tx.send(NetEvent::RepublishTo { channel_id, board }).await;
+                        });
+                    }
+                } else if outcomes.iter().all(|(_, why)| why.is_none()) {
+                    self.stale_retries.remove(&key);
+                }
                 self.report_publish(&channel_id, board, outcomes);
                 if !self.publishing.iter().any(|(room, _)| *room == channel_id) {
                     let (ready, waiting): (Vec<_>, Vec<_>) =
