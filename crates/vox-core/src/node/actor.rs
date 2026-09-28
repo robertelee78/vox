@@ -2120,6 +2120,49 @@ pub struct Node {
     status: crate::node::status::StatusBook,
 }
 
+/// The key a from-now-on consent releases to `target` in `channel_id`: the one taken when the
+/// consent was decided and held since (V210-30), or, with none held for the room's current epoch,
+/// one taken now and held. Every path that delivers a consent — the pairwise stream, and the
+/// room's log when the member cannot be reached (ADR-023 M23.3) — delivers this same key.
+fn held_consent_key(
+    consent_keys: &mut crate::node::pending_consent::PendingConsents,
+    profile: &Profile,
+    channel: &ChannelState,
+    channel_id: &Digest32,
+    target: Digest32,
+) -> crate::error::Result<crate::group::skdm::Skdm> {
+    let held = consent_keys
+        .get(channel_id, &target)
+        .and_then(|w| crate::group::skdm::Skdm::from_wire(w).ok())
+        .filter(|s| s.body.epoch == channel.epoch());
+    if let Some(s) = held {
+        return Ok(s);
+    }
+    let s = channel.skdm_for_consent(profile)?;
+    consent_keys.insert(*channel_id, target, s.to_wire());
+    consent_keys.save(profile.store(), profile.signer()?)?;
+    Ok(s)
+}
+
+/// Drop the key held for a consent, **before** the consent is recorded, never after: a key left on
+/// disk would be delivered again after a revocation and a new consent (found in verification of
+/// #203). An error means nothing was removed, and the consent must not be recorded.
+fn forget_consent_key(
+    consent_keys: &mut crate::node::pending_consent::PendingConsents,
+    profile: &Profile,
+    channel_id: &Digest32,
+    target: Digest32,
+) -> crate::error::Result<()> {
+    if consent_keys.get(channel_id, &target).is_none() {
+        return Ok(());
+    }
+    let mut next = consent_keys.clone();
+    next.remove(channel_id, &target);
+    next.save(profile.store(), profile.signer()?)?;
+    *consent_keys = next;
+    Ok(())
+}
+
 impl Node {
     /// Spawn the node for `paths` on the current tokio runtime with the system
     /// clock and the production Argon2id profile. An existing identity is
@@ -4906,20 +4949,14 @@ impl Node {
             let minted = if full {
                 channel.skdms_for_full_history(profile)
             } else {
-                let held = self
-                    .consent_keys
-                    .get(channel_id, &target)
-                    .and_then(|w| crate::group::skdm::Skdm::from_wire(w).ok())
-                    .filter(|s| s.body.epoch == channel.epoch());
-                match held {
-                    Some(s) => Ok(vec![s]),
-                    None => channel.skdm_for_consent(profile).and_then(|s| {
-                        self.consent_keys.insert(*channel_id, target, s.to_wire());
-                        let signer = profile.signer()?;
-                        self.consent_keys.save(profile.store(), signer)?;
-                        Ok(vec![s])
-                    }),
-                }
+                held_consent_key(
+                    &mut self.consent_keys,
+                    profile,
+                    &channel,
+                    channel_id,
+                    target,
+                )
+                .map(|s| vec![s])
             };
             match minted {
                 Ok(s) => s,
@@ -4970,16 +5007,8 @@ impl Node {
         // and the next attempt delivers the same key again. A failure between the removal and the
         // record can only lose the held key, so that consent is taken again from a later position:
         // narrower, never wider.
-        if self.consent_keys.get(channel_id, &target).is_some() {
-            let mut next = self.consent_keys.clone();
-            next.remove(channel_id, &target);
-            let saved = profile
-                .signer()
-                .and_then(|signer| next.save(profile.store(), signer));
-            if let Err(e) = saved {
-                return Outcome::Failed(fault_of(&e));
-            }
-            self.consent_keys = next;
+        if let Err(e) = forget_consent_key(&mut self.consent_keys, profile, channel_id, target) {
+            return Outcome::Failed(fault_of(&e));
         }
         {
             let mut channel = shared.lock().await;
@@ -5210,12 +5239,6 @@ impl Node {
         }
     }
 
-    /// Issue consent to every trusted, admitted author that does not hold it yet,
-    /// across every open channel (ADR-020 §3).
-    ///
-    /// Retried on the tick for the same reason a re-key is: consent *is* a network
-    /// act — the SKDM rides a pairwise session — so a trusted member that is
-    /// offline right now is skipped, not failed, and picked up when it returns.
     /// Delete every superseded sender-key generation this node no longer needs
     /// (ADR-023 decision 4, PRD-001 R14), room by room: kept only while a trusted
     /// identity with a **full-history** grant is still owed its consent there, because
@@ -5242,6 +5265,12 @@ impl Node {
         }
     }
 
+    /// Issue consent to every trusted, admitted author that does not hold it yet,
+    /// across every open channel (ADR-020 §3).
+    ///
+    /// Retried on the tick for the same reason a re-key is: consent *is* a network
+    /// act — the SKDM rides a pairwise session — so a trusted member that is
+    /// offline right now is skipped, not failed, and picked up when it returns.
     ///
     /// `asked_for` is the identity a person just trusted: it is dialled at once rather than after
     /// the automatic spacing, and only once, since a connection is per member and not per room.
@@ -6144,11 +6173,22 @@ impl Node {
                 )
             };
             if owes_consent {
+                // **The key held since the consent was decided** (V210-30), the one the pairwise
+                // stream would have carried. A key taken now, when the dial failed, starts after
+                // every post made since the decision, which that member could then never read:
+                // the defect V210-30 closed, back through this path (#226).
                 let skdm = {
                     let Some(profile) = self.profile.as_ref() else {
                         return;
                     };
-                    let Ok(skdm) = shared.lock().await.skdm_for_consent(profile) else {
+                    let channel = shared.lock().await;
+                    let Ok(skdm) = held_consent_key(
+                        &mut self.consent_keys,
+                        profile,
+                        &channel,
+                        &channel_id,
+                        peer,
+                    ) else {
                         continue;
                     };
                     skdm
@@ -6159,6 +6199,12 @@ impl Node {
                         let Some(profile) = self.profile.as_ref() else {
                             return;
                         };
+                        // Forgotten before the consent is recorded, as on the direct path.
+                        if forget_consent_key(&mut self.consent_keys, profile, &channel_id, peer)
+                            .is_err()
+                        {
+                            continue;
+                        }
                         shared
                             .lock()
                             .await
