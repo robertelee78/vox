@@ -25,7 +25,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use world::{args, vox_once, VoxProc, IDENTITY, VOX};
@@ -38,6 +38,11 @@ const MAX_BOUND: Duration = Duration::from_millis(500);
 /// Bob must have this many posts in before Alice starts, so the room is busy for all of hers.
 const BOB_HEAD_START: usize = 20;
 const TIMEOUT: Duration = Duration::from_secs(90);
+/// What the daemons said: when (against the proof's clock), who, and the line.
+type Said = Arc<Mutex<Vec<(Duration, &'static str, String)>>>;
+
+/// How many of Alice's slowest posts are named, with what the daemons said around each.
+const SLOWEST: usize = 10;
 
 fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     let mut child = Command::new(VOX)
@@ -126,8 +131,21 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         assert!(ok, "vox trust add {name}: {out}{err}");
     }
 
-    let _alice = daemon("alice", &alice_dir, &spec, &idpass);
-    let _bob = daemon("bob", &bob_dir, &spec, &idpass);
+    let mut alice_d = daemon("alice", &alice_dir, &spec, &idpass);
+    let mut bob_d = daemon("bob", &bob_dir, &spec, &idpass);
+    // Everything either daemon says from here on, stamped against one clock, so a slow post can
+    // be read against what the nodes were doing at that moment.
+    let t0 = Instant::now();
+    let said: Said = Arc::default();
+    for (who, p) in [("alice", &mut alice_d), ("bob", &mut bob_d)] {
+        let rx = std::mem::replace(&mut p.lines, mpsc::channel().1);
+        let said = Arc::clone(&said);
+        std::thread::spawn(move || {
+            for line in rx {
+                said.lock().unwrap().push((t0.elapsed(), who, line));
+            }
+        });
+    }
 
     let (ok, out, err) = vox_in(
         &alice_dir,
@@ -202,6 +220,8 @@ fn a_post_answers_promptly_while_a_peer_posts() {
 
     // ---- Alice's posts, timed ---------------------------------------------------------------
     let mut took: Vec<Duration> = Vec::with_capacity(POSTS);
+    // Each post: which, when it started (against `t0`), how long it took.
+    let mut posts: Vec<(usize, Duration, Duration)> = Vec::with_capacity(POSTS);
     for i in 0..POSTS {
         let t = Instant::now();
         let (ok, _, err) = vox_once(
@@ -209,6 +229,7 @@ fn a_post_answers_promptly_while_a_peer_posts() {
             &args(&["room", "post", &room, &format!("alice {i}")]),
         );
         took.push(t.elapsed());
+        posts.push((i, t.duration_since(t0), t.elapsed()));
         assert!(ok, "alice's post {i} failed: {err}");
     }
     stop.store(true, Ordering::Relaxed);
@@ -231,6 +252,24 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         P95_BOUND.as_millis(),
         MAX_BOUND.as_millis()
     );
+    // **The slowest posts name themselves** (a red on one CI runner, p95 148ms, did not): each
+    // with when it started, and what either daemon said from a second before it until just after.
+    posts.sort_by_key(|p| std::cmp::Reverse(p.2));
+    let said = said.lock().unwrap().clone();
+    for (i, start, dur) in posts.iter().take(SLOWEST) {
+        println!(
+            "[slow] alice {i}: {}ms, from +{:.3}s",
+            dur.as_millis(),
+            start.as_secs_f64()
+        );
+        let (from, to) = (
+            start.saturating_sub(Duration::from_secs(1)),
+            *start + *dur + Duration::from_millis(500),
+        );
+        for (at, who, line) in said.iter().filter(|(at, _, _)| *at >= from && *at <= to) {
+            println!("[slow]     +{:.3}s {who}: {line}", at.as_secs_f64());
+        }
+    }
     assert!(
         bob_seen >= BOB_HEAD_START,
         "CANNOT PROVE: only {bob_seen} of Bob's {bob_total} posts reached Alice"
@@ -244,5 +283,5 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         max.as_millis(),
         MAX_BOUND.as_millis()
     );
-    drop(anchor);
+    drop((alice_d, bob_d, anchor));
 }
