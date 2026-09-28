@@ -44,8 +44,10 @@ use world::{args, vox_once, VoxProc};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "identity passphrase";
-/// Past QUIC's idle timeout (`MAX_IDLE_MS`, 60 s): the connection is closed at both ends.
-const FREEZE: Duration = Duration::from_secs(70);
+/// Past the 30 s silence line, as in CI's red (31.3 s).
+const FREEZE: Duration = Duration::from_secs(35);
+/// How long carol stays frozen while bob, back, tries her and posts (CI's red: 7.5 s).
+const CAROL_FROZEN: Duration = Duration::from_secs(10);
 /// Rows carol posts while bob is frozen.
 const POSTS: usize = 20;
 /// How soon after bob is continued he must read all of carol's rows: a periodic request (at most
@@ -111,16 +113,16 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
     panic!("{name}'s daemon never answered `vox room list`");
 }
 
-/// How many of carol's `SILENT-` rows `data`'s node reads.
-fn rows_read(data: &Path, room: &str) -> usize {
+/// How many of the `<tag>-NNN` rows `data`'s node reads.
+fn rows_read(data: &Path, room: &str, tag: &str) -> usize {
     let (_, out, _) = vox_once(data, &args(&["room", "read", room]));
     (0..POSTS)
-        .filter(|i| out.contains(&format!("SILENT-{i:03}")))
+        .filter(|i| out.contains(&format!("{tag}-{i:03}")))
         .count()
 }
 
 #[test]
-#[ignore = "real vox processes and a 70 s freeze; CI runs it in release"]
+#[ignore = "real vox processes and 45 s of freezes; CI runs it in release"]
 fn a_member_whose_connection_died_is_synced_again() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
@@ -226,7 +228,7 @@ fn a_member_whose_connection_died_is_synced_again() {
     }
     std::thread::sleep(FREEZE.saturating_sub(frozen.elapsed()));
 
-    // ---- 3. no anchor left; bob continued -------------------------------------------------------
+    // ---- 3. no anchor left; carol frozen while bob comes back and tries her -----------------
     let anchor_said = anchor.transcript();
     signal(&anchor, "-INT");
     let stopping = Instant::now();
@@ -237,24 +239,46 @@ fn a_member_whose_connection_died_is_synced_again() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    signal(&carol, "-STOP");
     signal(&bob, "-CONT");
-    let back = Instant::now();
     println!("[proof] bob was frozen for {:.1?}", frozen.elapsed());
-    let early = rows_read(&bob_dir, &room);
+    let carol_frozen = Instant::now();
+    for i in 0..POSTS {
+        let (ok, out, err) = vox_once(
+            &bob_dir,
+            &args(&["room", "post", &room, &format!("RETURNED-{i:03}")]),
+        );
+        assert!(ok, "bob post {i}: {out}{err}");
+    }
+    std::thread::sleep(CAROL_FROZEN.saturating_sub(carol_frozen.elapsed()));
+    let early = rows_read(&bob_dir, &room, "SILENT");
     assert_eq!(
         early, 0,
-        "CANNOT MEASURE: bob already read {early}/{POSTS} of carol's rows before he could sync"
+        "CANNOT MEASURE: bob already read {early}/{POSTS} of carol's rows before they could sync"
     );
-    let mut read = 0;
+
+    // ---- 4. carol continued: each holds rows the other lacks ------------------------------------
+    signal(&carol, "-CONT");
+    let back = Instant::now();
+    println!(
+        "[proof] carol was frozen for {:.1?}",
+        carol_frozen.elapsed()
+    );
+    let (mut bob_has, mut carol_has) = (0, 0);
     while back.elapsed() < BACK_WITHIN {
-        read = rows_read(&bob_dir, &room);
-        if read == POSTS {
+        bob_has = rows_read(&bob_dir, &room, "SILENT");
+        carol_has = rows_read(&carol_dir, &room, "RETURNED");
+        if bob_has == POSTS && carol_has == POSTS {
             break;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
     let took = back.elapsed();
-    println!("[proof] {took:.1?} after bob was continued: he reads {read}/{POSTS} of carol's rows");
+    let read = bob_has.min(carol_has);
+    println!(
+        "[proof] {took:.1?} after both were back: bob reads {bob_has}/{POSTS} of carol's rows, \
+         carol reads {carol_has}/{POSTS} of bob's"
+    );
     if read < POSTS {
         println!("---- bob said ----\n{}", bob.transcript());
         println!("---- carol said ----\n{}", carol.transcript());
@@ -262,7 +286,8 @@ fn a_member_whose_connection_died_is_synced_again() {
     }
     assert_eq!(
         read, POSTS,
-        "a member whose connection was dropped as dead was not synced with again within \
-         {BACK_WITHIN:?}: bob reads {read}/{POSTS} of carol's rows"
+        "members whose connection was dropped as dead were not synced with each other again within \
+         {BACK_WITHIN:?}: bob reads {bob_has}/{POSTS} of carol's rows, carol {carol_has}/{POSTS} of \
+         bob's"
     );
 }
