@@ -27,6 +27,10 @@
 //!   proof can require the **last** write to a file to come before its flush (a flush of a file
 //!   still empty, with the bytes written after, publishes unflushed data; found in verification
 //!   of #241).
+//! - `copy dest how src ret errno`: `clonefile`, `clonefileat`, `fclonefileat`, `copyfile`,
+//!   `fcopyfile`. A clone or copy fills a file without `write` (`std::fs::copy` on macOS), so it
+//!   is the destination's content event just as a write is. `copy_file_range` is Linux's and
+//!   this library is macOS-only (dyld interposing), so it is not recorded.
 //!
 //! Paths are as the call named them (for `open` and `rename`) or as the kernel reports them (for a
 //! descriptor), so a reader compares them after canonicalising the directory.
@@ -76,6 +80,17 @@ extern "C" {
     fn pwrite(fd: c_int, buf: *const u8, n: usize, offset: i64) -> isize;
     fn writev(fd: c_int, iov: *const IoVec, count: c_int) -> isize;
     fn pwritev(fd: c_int, iov: *const IoVec, count: c_int, offset: i64) -> isize;
+    fn clonefile(src: *const c_char, dst: *const c_char, flags: u32) -> c_int;
+    fn clonefileat(
+        src_dirfd: c_int,
+        src: *const c_char,
+        dst_dirfd: c_int,
+        dst: *const c_char,
+        flags: u32,
+    ) -> c_int;
+    fn fclonefileat(srcfd: c_int, dst_dirfd: c_int, dst: *const c_char, flags: u32) -> c_int;
+    fn copyfile(from: *const c_char, to: *const c_char, state: *mut u8, flags: u32) -> c_int;
+    fn fcopyfile(from: c_int, to: c_int, state: *mut u8, flags: u32) -> c_int;
     fn getpid() -> c_int;
     fn getenv(name: *const c_char) -> *const c_char;
     fn __error() -> *mut c_int;
@@ -388,6 +403,78 @@ pub unsafe extern "C" fn vti_pwritev(
     r
 }
 
+// A clone or copy puts a file's contents in place without `write` (`std::fs::copy` on macOS
+// clones with `fclonefileat`, or falls back to `fcopyfile`), so each is recorded as the
+// destination's content event, keyed by the destination's path like a write.
+
+#[no_mangle]
+pub unsafe extern "C" fn vti_clonefile(
+    src: *const c_char,
+    dst: *const c_char,
+    flags: u32,
+) -> c_int {
+    let r = clonefile(src, dst, flags);
+    let (ret, errno) = outcome(r);
+    record(&["copy", &text(dst), "clonefile", &text(src), &ret, &errno]);
+    r
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vti_clonefileat(
+    src_dirfd: c_int,
+    src: *const c_char,
+    dst_dirfd: c_int,
+    dst: *const c_char,
+    flags: u32,
+) -> c_int {
+    let (s, d) = (at_path(src_dirfd, src), at_path(dst_dirfd, dst));
+    let r = clonefileat(src_dirfd, src, dst_dirfd, dst, flags);
+    let (ret, errno) = outcome(r);
+    record(&["copy", &d, "clonefileat", &s, &ret, &errno]);
+    r
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vti_fclonefileat(
+    srcfd: c_int,
+    dst_dirfd: c_int,
+    dst: *const c_char,
+    flags: u32,
+) -> c_int {
+    let (s, d) = (fd_path(srcfd), at_path(dst_dirfd, dst));
+    let r = fclonefileat(srcfd, dst_dirfd, dst, flags);
+    let (ret, errno) = outcome(r);
+    record(&["copy", &d, "fclonefileat", &s, &ret, &errno]);
+    r
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vti_copyfile(
+    from: *const c_char,
+    to: *const c_char,
+    state: *mut u8,
+    flags: u32,
+) -> c_int {
+    let r = copyfile(from, to, state, flags);
+    let (ret, errno) = outcome(r);
+    record(&["copy", &text(to), "copyfile", &text(from), &ret, &errno]);
+    r
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vti_fcopyfile(
+    from: c_int,
+    to: c_int,
+    state: *mut u8,
+    flags: u32,
+) -> c_int {
+    let (s, d) = (fd_path(from), fd_path(to));
+    let r = fcopyfile(from, to, state, flags);
+    let (ret, errno) = outcome(r);
+    record(&["copy", &d, "fcopyfile", &s, &ret, &errno]);
+    r
+}
+
 // ---- trampolines for the variadic calls ----------------------------------------------------
 
 // Apple arm64: the variadic argument is the first 8-byte slot at the caller's `sp`. Load it into
@@ -462,4 +549,9 @@ interpose! {
     I_PWRITE: vti_pwrite => pwrite;
     I_WRITEV: vti_writev => writev;
     I_PWRITEV: vti_pwritev => pwritev;
+    I_CLONEFILE: vti_clonefile => clonefile;
+    I_CLONEFILEAT: vti_clonefileat => clonefileat;
+    I_FCLONEFILEAT: vti_fclonefileat => fclonefileat;
+    I_COPYFILE: vti_copyfile => copyfile;
+    I_FCOPYFILE: vti_fcopyfile => fcopyfile;
 }
