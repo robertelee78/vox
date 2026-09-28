@@ -75,7 +75,7 @@ pub const TEST_MAX_FRAME_ENV: &str = "VOX_TEST_MAX_FRAME";
 
 /// The smallest frame [`TEST_MAX_FRAME_ENV`] may set: half of it still carries the largest room
 /// or trusted-identity entry, so a listing still pages.
-const MIN_TEST_FRAME: usize = 4 * 1024;
+pub const MIN_TEST_FRAME: usize = 4 * 1024;
 
 /// The largest frame accepted in force: [`MAX_FRAME`], or **lower**, read once from
 /// [`TEST_MAX_FRAME_ENV`]. **Test-only: for proofs; nothing in a real deployment sets it.**
