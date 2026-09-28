@@ -42,8 +42,18 @@ class Hung(Exception):
 
 
 def stage(name):
+    """Name what the driver is doing now: on stderr as it happens, and in the file the Rust
+    wrapper names (`VOX_PTY_STAGE_FILE`), so a driver that dies with no verdict — its
+    `faulthandler` backstop, or a kill — is still reported by where it stopped."""
     STAGE[0] = name
     print(f"[pty {time.time() - T0:6.1f}s] {name}", file=sys.stderr, flush=True)
+    path = os.environ.get("VOX_PTY_STAGE_FILE")
+    if path:
+        try:
+            with open(path, "w") as f:
+                f.write(name)
+        except OSError:
+            pass
 
 
 def arm(secs, tag):

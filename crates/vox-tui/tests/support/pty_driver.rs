@@ -11,9 +11,15 @@
 //!   stops every process it started; if it still runs [`GRACE`] later it is killed;
 //! - **however the driver ends** — a pass, a red, its own `faulthandler` backstop hard-exiting, or
 //!   this bound — every process it was seen to start (found by parent pid, every
-//!   [`SNAPSHOT_EVERY`]) that is still alive and now orphaned is killed. A driver that dies
-//!   without its own cleanup (SIGTERM with no handler kills Python outright, measured; so does
-//!   `faulthandler`'s exit) leaves no `vox` daemon behind, reparented to init.
+//!   [`SNAPSHOT_EVERY`]) that is still alive, now orphaned, **and still the same process** — the
+//!   same start time as when it was seen — is killed. A driver that dies without its own cleanup
+//!   (SIGTERM with no handler kills Python outright, measured; so does `faulthandler`'s exit)
+//!   leaves no `vox` daemon behind, reparented to init. The start time is what makes this safe on
+//!   a busy machine: a run keeps its pids for up to [`BOUND`] + [`GRACE`], which is longer than
+//!   the pid space can take to wrap under load, and every launchd job has parent 1 too — a pid
+//!   reused by one of them has another start time and is never touched;
+//! - the driver's last stage is read back (from a file it writes, `VOX_PTY_STAGE_FILE`), so a
+//!   driver that ended with no verdict is reported by where it stopped.
 //!
 //! The driver's own budget (`VOX_PTY_BUDGET_SECS`, 240 s by default) comes first; this bound is
 //! the backstop for a driver that cannot run its own.
@@ -37,14 +43,34 @@ pub struct Driven {
     pub code: Option<i32>,
     pub stdout: String,
     pub took: Duration,
+    /// The last stage the driver named, if it named any.
+    pub stage: Option<String>,
+}
+
+impl Driven {
+    /// Whether the driver printed a verdict line of `tag`'s: a pass, a red, an apparatus
+    /// failure or its own hang report. A driver with none was stopped before it could say.
+    #[must_use]
+    pub fn has_verdict(&self, tag: &str) -> bool {
+        ["PASS", "RED", "APPARATUS", "HUNG at", "the TUI said done"]
+            .iter()
+            .any(|v| self.stdout.contains(&format!("{tag} {v}")))
+    }
 }
 
 /// Run `python3 <script> <args…>`, bounded; see the module docs.
 pub fn run(script: &str, args: &[&str]) -> Driven {
     let t0 = Instant::now();
+    let stage_file = std::env::temp_dir().join(format!(
+        "vox-pty-stage-{}-{}",
+        std::process::id(),
+        t0.elapsed().as_nanos() ^ u128::from(std::process::id())
+    ));
+    let _ = std::fs::remove_file(&stage_file);
     let mut child = Command::new("python3")
         .arg(script)
         .args(args)
+        .env("VOX_PTY_STAGE_FILE", &stage_file)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -57,11 +83,14 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
         s
     });
     let mut stopped = None;
-    let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    // pid → its start time, as first seen.
+    let mut seen: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
     let mut looked = Instant::now() - SNAPSHOT_EVERY;
     let status = loop {
         if looked.elapsed() >= SNAPSHOT_EVERY {
-            seen.extend(descendants(child.id()));
+            for (pid, start) in descendants(child.id()) {
+                seen.entry(pid).or_insert(start);
+            }
             looked = Instant::now();
         }
         if let Some(status) = child.try_wait().expect("wait for the driver") {
@@ -69,11 +98,14 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
         }
         match stopped {
             None if t0.elapsed() >= BOUND => {
-                seen.extend(descendants(child.id()));
+                for (pid, start) in descendants(child.id()) {
+                    seen.entry(pid).or_insert(start);
+                }
                 eprintln!(
                     "[pty] the driver still runs after {BOUND:?}: sending it SIGTERM (pid {}; it \
-                     started {seen:?})",
-                    child.id()
+                     started {:?})",
+                    child.id(),
+                    seen.keys().collect::<Vec<_>>()
                 );
                 let _ = Command::new("kill")
                     .args(["-TERM", &child.id().to_string()])
@@ -92,7 +124,11 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
     };
     // Whatever the driver started and left behind, however it ended, goes now: alive, and
     // orphaned — its parent gone, so nothing else will ever stop it.
-    let left: Vec<u32> = seen.iter().copied().filter(|&p| orphaned(p)).collect();
+    let left: Vec<u32> = seen
+        .iter()
+        .filter(|(pid, start)| left_behind(**pid, start))
+        .map(|(pid, _)| *pid)
+        .collect();
     if !left.is_empty() {
         eprintln!("[pty] the driver left {left:?} running: killing them");
         for pid in &left {
@@ -112,32 +148,42 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
     } else {
         "(the driver's stdout was still held open by a process it left behind)".to_owned()
     };
+    let stage = std::fs::read_to_string(&stage_file)
+        .ok()
+        .map(|s| s.trim().to_owned());
+    let _ = std::fs::remove_file(&stage_file);
     Driven {
         code: status.and_then(|s| s.code()),
         stdout,
         took: t0.elapsed(),
+        stage,
     }
 }
 
-/// Every process below `root`, deepest first, from `ps`'s parent pids.
-fn descendants(root: u32) -> Vec<u32> {
-    let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,ppid="]).output() else {
+/// Every process below `root`, deepest first, with its start time, from `ps`.
+fn descendants(root: u32) -> Vec<(u32, String)> {
+    let Ok(out) = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,lstart="])
+        .output()
+    else {
         return Vec::new();
     };
-    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&out.stdout)
+    let rows: Vec<(u32, u32, String)> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
-            let mut w = l.split_whitespace().map(str::parse::<u32>);
-            Some((w.next()?.ok()?, w.next()?.ok()?))
+            let mut w = l.split_whitespace();
+            let pid = w.next()?.parse().ok()?;
+            let ppid = w.next()?.parse().ok()?;
+            Some((pid, ppid, w.collect::<Vec<_>>().join(" ")))
         })
         .collect();
-    let mut found = Vec::new();
+    let mut found: Vec<(u32, String)> = Vec::new();
     let mut frontier = vec![root];
     while let Some(parent) = frontier.pop() {
-        for &(pid, ppid) in &pairs {
-            if ppid == parent && !found.contains(&pid) {
-                found.push(pid);
-                frontier.push(pid);
+        for (pid, ppid, start) in &rows {
+            if *ppid == parent && !found.iter().any(|(p, _)| p == pid) {
+                found.push((*pid, start.clone()));
+                frontier.push(*pid);
             }
         }
     }
@@ -145,12 +191,18 @@ fn descendants(root: u32) -> Vec<u32> {
     found
 }
 
-/// Whether `pid` is still running and has been reparented to init: a process the driver left
-/// behind. A pid that exited (and was perhaps reused by something with a live parent) is not.
-fn orphaned(pid: u32) -> bool {
-    Command::new("ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
+/// Whether `pid` is a process the driver left behind: still running, reparented to init, and
+/// **the same process that was seen** — started at `start`. A pid that exited and was reused,
+/// even by another orphan (every launchd job has parent 1), has another start time.
+fn left_behind(pid: u32, start: &str) -> bool {
+    let Ok(out) = Command::new("ps")
+        .args(["-o", "ppid=,lstart=", "-p", &pid.to_string()])
         .stderr(Stdio::null())
         .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+    else {
+        return false;
+    };
+    let now = String::from_utf8_lossy(&out.stdout);
+    let mut w = now.split_whitespace();
+    w.next() == Some("1") && w.collect::<Vec<_>>().join(" ") == start
 }
