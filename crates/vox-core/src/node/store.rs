@@ -222,7 +222,7 @@ impl Store {
             let r = old.begin_read().map_err(storage("begin read"))?;
             let w = fresh.begin_write().map_err(storage("begin write"))?;
             {
-                if let Ok(from) = r.open_table(SEGMENTS) {
+                if let Some(from) = source_table(&r, SEGMENTS, "open segments")? {
                     let mut to = w.open_table(SEGMENTS).map_err(storage("open segments"))?;
                     for item in from.iter().map_err(storage("iterate segments"))? {
                         let (k, v) = item.map_err(storage("iterate segments"))?;
@@ -230,7 +230,7 @@ impl Store {
                             .map_err(storage("write segment"))?;
                     }
                 }
-                if let Ok(from) = r.open_table(SEK_WRAPS) {
+                if let Some(from) = source_table(&r, SEK_WRAPS, "open sek_wraps")? {
                     let mut to = w.open_table(SEK_WRAPS).map_err(storage("open sek_wraps"))?;
                     for item in from.iter().map_err(storage("iterate sek_wraps"))? {
                         let (k, v) = item.map_err(storage("iterate sek_wraps"))?;
@@ -238,7 +238,7 @@ impl Store {
                             .map_err(storage("write sek wrap"))?;
                     }
                 }
-                if let Ok(from) = r.open_table(META) {
+                if let Some(from) = source_table(&r, META, "open meta")? {
                     let mut to = w.open_table(META).map_err(storage("open meta"))?;
                     for item in from.iter().map_err(storage("iterate meta"))? {
                         let (k, v) = item.map_err(storage("iterate meta"))?;
@@ -549,6 +549,27 @@ impl Store {
             Backing::Writable(db) => db.compact().map_err(storage("compact")),
             Backing::ReadOnly(_) | Backing::Closed => Ok(false),
         }
+    }
+}
+
+/// `table` in the store being rewritten, or `None` only when it **does not exist**: a store that
+/// never wrote a table has nothing of it to carry. Every other failure (I/O, corruption, a type
+/// mismatch) is returned, so [`Store::rewrite_fresh`] stops before the rename and the old store
+/// stays as it was. Skipping on any error, as this first did, would have committed a new file
+/// missing that table and renamed it over the only copy: a failed read of `sek_wraps` during an
+/// upgrade would have deleted every room's key (found in verification of #214).
+fn source_table<K: redb::Key + 'static, V: redb::Value + 'static>(
+    r: &redb::ReadTransaction,
+    table: TableDefinition<K, V>,
+    op: &'static str,
+) -> Result<Option<redb::ReadOnlyTable<K, V>>> {
+    match r.open_table(table) {
+        Ok(t) => Ok(Some(t)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(Error::Storage {
+            op,
+            detail: e.to_string(),
+        }),
     }
 }
 

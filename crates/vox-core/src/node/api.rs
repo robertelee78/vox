@@ -499,7 +499,7 @@ impl Fault {
                 "your trust keyring is full (1,024 identities)\n       remove one with `vox trust remove <fingerprint>`, then add again"
             }
             Fault::Storage => {
-                "the profile's store could not be written\n       check free disk space and that the data directory is writable"
+                "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
             }
             Fault::SealedUnreadable => {
                 "the identity passphrase is right, but this profile's trust keyring, pending \

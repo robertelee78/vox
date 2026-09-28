@@ -32,6 +32,9 @@
 //! migration anywhere in them. redb is copy-on-write, so a re-sealed blob's old page stays in the
 //! file unless the store is rewritten (found in verification of #214).
 //!
+//! 2c: a store with a table the rewrite cannot open (not a missing one) is refused and left
+//! byte-identical, the vault still version 1.
+//!
 //! Mutations: any one blob sealed with its old key again, or with a key from anything public,
 //! breaks (1); a migration that does not rewrite the store breaks (2); an unlock that does not
 //! migrate breaks (2); the vault's version left out of its AEAD, or a loader that falls back to
@@ -685,6 +688,49 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         small_scan_after.iter().all(|n| *n == 0),
         "the old seals, openable from the public key, are still on disk after migration: \
          {small_scan_after:?} copies"
+    );
+
+    // ---- 2c. a store the rewrite cannot read is left alone ------------------------------------
+    // The rewrite copies each table into a new file and renames it over the old one. A table it
+    // cannot open for any reason but "it does not exist" must stop it before the rename: skipping
+    // it would commit a store without that table over the only copy (a failed read of
+    // `sek_wraps` would lose every room's key; found in verification of #214). An I/O error
+    // cannot be injected from outside a process, so the fault staged here is the one a damaged
+    // file can present as well: `sek_wraps` present with the wrong key type. A profile with no
+    // room never reads that table, so only the rewrite meets it.
+    let (gina, hal) = (dir("gina"), dir("hal"));
+    let hal_fp = ok(&old, &hal, &["id"], None).trim().to_owned();
+    ok(&old, &gina, &["id"], None);
+    ok(
+        &old,
+        &gina,
+        &["trust", "add", &hal_fp, "--name", "hal"],
+        None,
+    );
+    let damaged = Disk::of(&gina);
+    {
+        const WRONG: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("sek_wraps");
+        let db = redb::Database::open(&damaged.store_file).expect("open gina's stopped store");
+        let w = db.begin_write().unwrap();
+        w.open_table(WRONG)
+            .unwrap()
+            .insert("not a channel id", b"x".as_slice())
+            .unwrap();
+        w.commit().unwrap();
+    }
+    let bytes_before = std::fs::read(&damaged.store_file).unwrap();
+    let facts_before = file_facts(&damaged);
+    let (migrated, out, err) = vox_with(&new, &gina, &["trust", "list"], None);
+    let untouched = std::fs::read(&damaged.store_file).unwrap() == bytes_before;
+    let version = damaged.vault().version;
+    println!(
+        "[proof] a store whose sek_wraps table will not open: the migrating unlock succeeded = \
+         {migrated}; store.redb byte-identical = {untouched} ({facts_before:?} -> {:?}); vault v{version}",
+        file_facts(&damaged)
+    );
+    assert!(
+        !migrated && untouched && version == 1,
+        "a store the rewrite could not read was replaced anyway: {out}{err}"
     );
 
     // ---- 3. no way back to the old keys -------------------------------------------------------
