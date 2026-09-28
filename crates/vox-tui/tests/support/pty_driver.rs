@@ -8,9 +8,11 @@
 //!   prints if it hangs, reach the log as they happen, whatever becomes of this process after;
 //! - its **stdout** (the verdict lines) is collected and returned;
 //! - past [`BOUND`] it is sent SIGTERM, on which it prints `HUNG at <stage>` with its stack and
-//!   stops every process it started; if it still runs [`GRACE`] later, every process it started
-//!   (found by parent pid, deepest first) is killed, then the driver — so a driver killed without
-//!   its own cleanup leaves no `vox` daemon behind, reparented to init.
+//!   stops every process it started; if it still runs [`GRACE`] later it is killed. Either way,
+//!   every process it had started when it was told to stop (found by parent pid, deepest first)
+//!   and that is still alive afterwards is killed — so a driver that dies without its own cleanup
+//!   (SIGTERM with no handler kills Python outright, measured) leaves no `vox` daemon behind,
+//!   reparented to init.
 //!
 //! The driver's own budget (`VOX_PTY_BUDGET_SECS`, 240 s by default) comes first; this bound is
 //! the backstop for a driver that cannot run its own.
@@ -51,14 +53,17 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
         s
     });
     let mut stopped = None;
+    let mut below: Vec<u32> = Vec::new();
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait for the driver") {
             break Some(status);
         }
         match stopped {
             None if t0.elapsed() >= BOUND => {
+                below = descendants(child.id());
                 eprintln!(
-                    "[pty] the driver still runs after {BOUND:?}: sending it SIGTERM (pid {})",
+                    "[pty] the driver still runs after {BOUND:?}: sending it SIGTERM (pid {}; it \
+                     started {below:?})",
                     child.id()
                 );
                 let _ = Command::new("kill")
@@ -67,17 +72,7 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
                 stopped = Some(Instant::now());
             }
             Some(at) if at.elapsed() >= GRACE => {
-                let below = descendants(child.id());
-                eprintln!(
-                    "[pty] the driver did not stop within {GRACE:?} of SIGTERM: killing it and \
-                     the {} process(es) it started: {below:?}",
-                    below.len()
-                );
-                for pid in &below {
-                    let _ = Command::new("kill")
-                        .args(["-KILL", &pid.to_string()])
-                        .status();
-                }
+                eprintln!("[pty] the driver did not stop within {GRACE:?} of SIGTERM: killing it");
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -86,6 +81,16 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    // Whatever the driver had started when it was told to stop, and left alive, goes now.
+    let left: Vec<u32> = below.iter().copied().filter(|&p| alive(p)).collect();
+    if !left.is_empty() {
+        eprintln!("[pty] the driver left {left:?} running: killing them");
+        for pid in &left {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+    }
     // The driver is gone; its pipe closes with it unless a process it started still holds it, so
     // the collected stdout is waited for with a bound too.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -128,4 +133,13 @@ fn descendants(root: u32) -> Vec<u32> {
     }
     found.reverse();
     found
+}
+
+/// Whether `pid` is still running (`kill -0`).
+fn alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }

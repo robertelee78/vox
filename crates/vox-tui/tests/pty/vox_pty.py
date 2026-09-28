@@ -14,7 +14,14 @@ it stood, then cleans up and exits red:
 - `Tui` starts `vox tui` on a pty that is **already** `cols`x`rows` when it starts (not resized
   after the fork, which raced the TUI's first read of its size), feeds pyte **only the new bytes**
   (re-feeding the whole history on every look costs more per look the longer the TUI runs), and
-  stops it with bounded waits.
+  stops it with bounded waits **while still reading its pty**.
+
+**The hang itself** (reproduced on 8df7b66's driver, 2026-09-28): a process that exits while its
+pty holds output nobody has read cannot finish exiting on macOS — closing its terminal waits for
+that output to drain (`ps` shows it in state `E`). The old driver's cleanup sent SIGTERM, then
+SIGKILL, then `waitpid(pid, 0)` without reading the pty: the TUI waited for the driver to read,
+the driver waited for the TUI to exit, for ever. Any output the TUI drew after the driver's last
+read was enough.
 """
 import faulthandler, fcntl, os, select, signal, struct, sys, termios, time
 
@@ -55,10 +62,12 @@ def arm(secs, tag):
     faulthandler.dump_traceback_later(secs + 60, exit=True)
 
 
-def reap(pid, secs):
-    """Wait for `pid` at most `secs`; whether it was reaped."""
+def reap(pid, secs, drain=None):
+    """Wait for `pid` at most `secs`, calling `drain` meanwhile; whether it was reaped."""
     end = time.time() + secs
     while True:
+        if drain is not None:
+            drain()
         try:
             done, _ = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
@@ -131,13 +140,34 @@ class Tui:
                 return True
         return False
 
+    def drain(self):
+        """Read and discard whatever the pty holds, without waiting: a TUI that is exiting cannot
+        finish while its output is unread."""
+        if self.fd is None:
+            return
+        while select.select([self.fd], [], [], 0)[0]:
+            try:
+                if not os.read(self.fd, 65536):
+                    return
+            except OSError:
+                return
+
     def stop(self):
-        """SIGTERM, then SIGKILL, each waited for with a bound; whether it was reaped."""
+        """SIGTERM, then SIGKILL, each waited for with a bound **while draining the pty**; then,
+        if it still has not exited, close the pty, which releases an exit waiting on it. Whether
+        it was reaped."""
         for sig, secs in ((signal.SIGTERM, 3), (signal.SIGKILL, 5)):
             try:
                 os.kill(self.pid, sig)
             except ProcessLookupError:
-                return reap(self.pid, 1)
-            if reap(self.pid, secs):
+                break
+            if reap(self.pid, secs, self.drain):
+                self.close()
                 return True
-        return False
+        self.close()
+        return reap(self.pid, 5)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
