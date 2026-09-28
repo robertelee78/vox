@@ -811,8 +811,15 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         // branch. The first version of this fix said "NOT the address or the
         // passphrase", which is the same false confidence as the sentence it replaced,
         // pointed the other way. Say what was and was not established.
+        //
+        // **And say which side was unreachable (#192).** One sentence covered both, and it said
+        // "every member the board knows is offline" when the board itself had never answered: a
+        // claim about members, made with no word from the board about any of them.
+        Some(Fault::BoardUnreachable) => {
+            "the anchor could not be reached, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the anchor is running (`vox node`) and that this node can reach its address"
+        }
         Some(Fault::Unreachable) => {
-            "nobody who can answer for this room could be reached\n       so your passphrase was never checked — this is not a verdict on it\n       every member the board knows is offline: ask one to come online, or check\n       `vox node` on the anchor shows more than `1m` for this room"
+            "the anchor answered, but no member it knows could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online, or check `vox node` on the anchor shows more than `1m` for this room"
         }
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
         // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
@@ -836,13 +843,16 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
 }
 
 /// The fault named in a daemon's reply to a join (`"Failed(Refused)"`), for the verbs that reach
-/// the node over its control socket, where only the outcome's name crosses the wire.
+/// the node over its control socket, where only the outcome's name crosses the wire. The name is
+/// the reply's first line; a failed join's steps follow it (see [`join_detail`]).
 pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
-    let name = reason.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
+    let first = reason.lines().next().unwrap_or_default();
+    let name = first.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
     Some(match name {
         "WrongPassphrase" => Fault::WrongPassphrase,
         "BadLink" => Fault::BadLink,
         "RoomNotOnBoard" => Fault::RoomNotOnBoard,
+        "BoardUnreachable" => Fault::BoardUnreachable,
         "Unreachable" => Fault::Unreachable,
         "Refused" => Fault::Refused,
         "NotNetworked" => Fault::NotNetworked,
@@ -851,6 +861,18 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
         "AlreadyMember" => Fault::AlreadyMember,
         _ => return None,
     })
+}
+
+/// What a daemon's reply to a failed join says after the fault's name: its `steps: …` and
+/// `said: …` lines, each indented under the advice as the house style indents a second line.
+/// Empty when the reply carried none.
+pub(crate) fn join_detail(reason: &str) -> String {
+    reason
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| format!("\n       {}", l.trim()))
+        .collect()
 }
 
 /// [`short`], reachable from the other CLI modules that report a peer.

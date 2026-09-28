@@ -507,10 +507,20 @@ made the close mechanical.
 
 **Status, 2026-09-27: neither is excluded any more.** `relayed_path_is_retried` was deleted with the
 in-process tests; RP-25 (#132) proves the upgrade through the shipped binary. `cross_process_join_proof`
-is back in the blocking gate (20 of 20 on 39c3884). But its independent verification saw one fast red
-in 3 on 005b801 (a join straight after the invite, "every member the board knows is offline"), and
-that cause is to be named and fixed under #192 before the gate is called honest. The record below is
-the history.
+is back in the blocking gate (20 of 20 on 39c3884). Its independent verification saw one fast red in 3
+on 005b801 (a join straight after the invite, reported as `Unreachable`). Under #192 that red has not
+recurred: 12 of 12 on 1de7548 at 1-minute loads up to 69, and 15 of 15 with 005b801's product (and
+64b9074's test file) under 18 busy processes, at loads up to 95. **Its cause is not named**, and those
+runs only bound its rate: 30 clean runs in a row are what a 1–2% flake produces more often than not.
+What #192 changed is that the next red names itself. `vox room join` now says which side was
+unreachable — the anchor (`BoardUnreachable`) or every member it knows (`Unreachable`), which were one
+fault whose words blamed the members either way — and prints the join's recorded steps and what each
+responder said. And the proof reads each daemon's and the anchor's output line by line as it is
+written, where it used to read stderr to EOF, which comes only when the child exits after the panic, so
+every red's daemon and anchor sections were empty.
+Its `cross-process-join` and `cross-process-tunnel` allowances are removed from the proof's code, not
+only from CI's list: a join that fails there, or a file that does not cross, is red. The record below
+is the history.
 
 **Status then: open defects, not accepted gaps.** Both are excluded from `release.yml`'s `--ignored` step
 so a release can be built at all, and both still run in the same job as warnings so a change in their
