@@ -3536,6 +3536,10 @@ impl Node {
                         .insert(channel_id, Arc::new(tokio::sync::Mutex::new(channel)));
                     self.adopt_channel_anchors(&channel_id, None).await;
                     self.refresh_network_view().await;
+                    // Who may reach this room's services and apps: the app gate holds no room it
+                    // was not told about, and refused every dial here with "this node does not
+                    // hold that room" until a sync happened to refresh it (#227, family-LAN proof).
+                    self.refresh_reachers().await;
                     self.publish_channel_locally(&channel_id).await;
                     self.publish_channel_to_anchors(&channel_id).await;
                     self.install_key_packages(&channel_id).await;
@@ -7316,6 +7320,8 @@ impl Node {
                     .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
                 self.adopt_channel_anchors(channel_id, None).await;
                 self.refresh_network_view().await;
+                // As a reopened room: the app gate must know the room before anything dials it.
+                self.refresh_reachers().await;
                 self.publish_channel_locally(channel_id).await;
                 self.publish_channel_to_anchors(channel_id).await;
                 self.install_key_packages(channel_id).await;
