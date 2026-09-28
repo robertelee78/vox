@@ -2195,10 +2195,20 @@ impl ChannelState {
 
     /// The oldest generation of this identity's sender key that a release still owes
     /// someone (V210-45): the generation a `trusted` identity's trust mark stands in, for
-    /// one this identity has not consented to yet — whether or not it has joined — and
+    /// one this identity has not consented to yet — whether or not it has joined — the first
+    /// one for a trusted identity with no mark here (trusted before the room existed), and
     /// every history floor still owed. `None`: nothing older than the live one is needed.
     #[must_use]
     pub fn oldest_generation_needed(&self, trusted: &BTreeSet<Digest32>) -> Option<u64> {
+        let me = self.me();
+        // A trusted identity with **no mark here** was trusted before this room existed, so every
+        // generation of the room is after its decision and all of them are its (`history_plan`):
+        // nothing may go until it is consented to.
+        if trusted.iter().any(|id| {
+            *id != me && !self.entitled.contains_key(id) && !self.trust_marks.contains_key(id)
+        }) {
+            return Some(0);
+        }
         let pending = self
             .trust_marks
             .iter()
