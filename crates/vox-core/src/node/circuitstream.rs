@@ -346,7 +346,7 @@ where
 static OUTBOUND_CIRCUITS: std::sync::Mutex<BTreeMap<Digest32, u64>> =
     std::sync::Mutex::new(BTreeMap::new());
 
-/// This node's outbound circuit count per target peer (see [`OUTBOUND_CIRCUITS`]).
+/// This node's outbound circuit count per target peer, counted in [`connect_through`].
 #[must_use]
 pub fn outbound_circuits() -> BTreeMap<Digest32, u64> {
     OUTBOUND_CIRCUITS

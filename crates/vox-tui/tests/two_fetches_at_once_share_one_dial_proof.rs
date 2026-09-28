@@ -26,9 +26,13 @@
 //!   A ladder count alone missed a verifier's mutant that opened a second circuit outside the ladder
 //!   (#232, mutant C).
 //!
+//! Each cycle's counts are read [`SETTLE`] after the fetches return and before the next restart
+//! zeroes them, so a circuit opened late is counted too.
+//!
 //! Mutations: every reach runs its own ladder (the coalescing removed) — red, more than one ladder
 //! and circuit; a woken reach dials again instead of taking the connection the first made — red,
-//! two ladders; a woken reach opens a second circuit outside the ladder — red, two circuits.
+//! two ladders; a woken reach opens a second circuit outside the ladder — red, two circuits; and
+//! a woken reach opens that second circuit 1.5 s later — red, two circuits.
 
 #![cfg(unix)]
 
@@ -49,6 +53,10 @@ const CYCLES: usize = 5;
 /// How long one fetch may take: a relayed fetch of the file, cold, is well under a second here; a
 /// circuit handshake lost to a second circuit costs 10 s.
 const FETCH_WITHIN: Duration = Duration::from_secs(5);
+/// How long after both fetches return each cycle's counts are read: past any circuit a woken
+/// reach might still open (the verifier's mutant D opened one 1.5 s on), and well before the next
+/// restart.
+const SETTLE: Duration = Duration::from_secs(4);
 
 struct Running(Child, Arc<Mutex<String>>);
 
@@ -378,6 +386,10 @@ fn two_fetches_at_once_share_one_dial() {
                 slow.push(format!("cycle {cycle} fetch {which}: {took:?}"));
             }
         }
+        // Read after the dust settles and before the next restart zeroes the count: a second
+        // circuit opened late — 1.5 s after the fetches, in the verifier's mutant D — was missed
+        // by a read the moment they returned.
+        std::thread::sleep(SETTLE);
         let (ok, json, err) = bob.vox(&["status", "--json"]);
         assert!(ok, "vox status --json: {err}");
         let v: serde_json::Value = serde_json::from_str(&json).expect("status JSON");
