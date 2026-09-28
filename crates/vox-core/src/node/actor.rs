@@ -474,9 +474,20 @@ impl NodeConfig {
     }
 }
 
-/// How often a node checks that its anchors are still connected, and redials the
-/// ones that are not.
+/// The longest an anchor that keeps failing waits between dials (V210-57, #243). A lost or
+/// failing anchor is dialled on the next tick, then after 1, 2, 4… seconds, doubling to this.
+/// It used to be the *only* redial: every anchor was checked once per 30 s, so a node whose
+/// anchor closed its connection a moment after it connected — a restarted process of an
+/// identity, which the anchor still knew by its dead predecessor's connection — had no helper
+/// for up to 30 s (CI run 36418572653: a first relayed connection in 30065 ms, 55 attempts).
 const ANCHOR_REDIAL_SECS: u64 = 30;
+
+/// An anchor connection lost within this long of being made counts as a **failure** for the
+/// backoff, not as a loss to redial at once (V210-57): two live processes of one identity (a
+/// copied profile, an old binary) supersede each other at the anchor, and redialling each loss at
+/// once would make that a loop at the tick's rate. Backed off, it settles to one try per
+/// [`ANCHOR_REDIAL_SECS`].
+const ANCHOR_FLAP_SECS: u64 = 10;
 
 /// What a sync session runs against: a member's channel, or an anchor's copy.
 enum SessionTarget {
@@ -1865,8 +1876,17 @@ pub struct Node {
     /// The gateway port mapping in force, if one was granted. Held so it can be
     /// renewed before its lifetime elapses (RFC 6886/6887 put renewal on the client).
     port_mappings: Vec<crate::nat::portmap::PortMapping>,
-    /// When the anchors are next checked for a dropped connection (unix seconds).
-    redial_anchors_at: u64,
+    /// Per anchor that failed to connect: when it may be dialled again (unix seconds), and the
+    /// wait that set it, doubling to [`ANCHOR_REDIAL_SECS`] (V210-57). No entry: dial when
+    /// needed.
+    anchor_backoff: BTreeMap<Digest32, (u64, u64)>,
+    /// The anchors being dialled right now, so none is dialled twice at once (V210-57): a node
+    /// starting up dialled each anchor from both its start and its first tick, and the
+    /// duplicate lost a tie-break against the first on every start.
+    anchor_dials: Arc<std::sync::Mutex<BTreeSet<Digest32>>>,
+    /// When each anchor's current connection was made (unix seconds), so one lost soon after is
+    /// told from one lost after a while ([`ANCHOR_FLAP_SECS`]).
+    anchor_connected_at: BTreeMap<Digest32, u64>,
     /// The anchors this node held a connection to at the last look, so losing one is said when
     /// it happens, not only when it is next redialled (#229's diagnostics).
     anchors_up: BTreeSet<Digest32>,
@@ -2156,7 +2176,9 @@ impl Node {
             pow_params,
             stream_loops: std::collections::BTreeSet::new(),
             port_mappings: Vec::new(),
-            redial_anchors_at: 0,
+            anchor_backoff: BTreeMap::new(),
+            anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
+            anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeSet::new(),
             renew_mappings_at: None,
             ports: BTreeMap::new(),
@@ -2436,7 +2458,7 @@ impl Node {
                 // Dial straight away rather than waiting for the throttle: the caller
                 // refreshed because something changed, and the whole point is not to sit
                 // on a stale address.
-                self.redial_anchors_at = 0;
+                self.anchor_backoff.clear();
                 self.redial_anchors_if_due();
                 // And give the rooms the new address too. A channel keeps the anchor set
                 // it adopted when it was created or joined, and that set is what an
@@ -2703,25 +2725,9 @@ impl Node {
         // The configured anchors are dialled at once, each on its own task: they are
         // where this node's records go and the helpers its ladder climbs through, and
         // an anchor that is down must not hold up the ones that are not.
-        for anchor in self.anchors.nodes() {
-            let net = Arc::clone(&net);
-            let tx = self.net_tx.clone();
-            let (id, endpoints) = (anchor.id, anchor.endpoints.clone());
-            tokio::spawn(async move {
-                match net.manager().connect(id, &endpoints).await {
-                    Ok(conn) => {
-                        let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(NetEvent::ReachFailed {
-                                peer: id,
-                                why: e.to_string(),
-                            })
-                            .await;
-                    }
-                }
-            });
+        let configured: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
+        for anchor in configured {
+            self.dial_anchor(&net, anchor.id, anchor.endpoints.clone());
         }
         // No membership refresh here: the network only starts when the identity
         // unlocks, and `lock_all` cleared every channel, so there is nothing to
@@ -3179,59 +3185,120 @@ impl Node {
     }
 
     /// Dial any configured or learned anchor this node is not connected to. Runs on
-    /// the tick, throttled: an anchor that restarted, or a link that dropped, is
-    /// re-established without anyone noticing.
+    /// the tick: an anchor that restarted, or a link that dropped, is re-established on the
+    /// next tick, and only one that keeps failing is backed off (V210-57).
     fn redial_anchors_if_due(&mut self) {
         let now = self.now();
-        if let Some(net) = self.net.as_ref() {
-            let up: BTreeSet<Digest32> = self
-                .anchors
-                .nodes()
-                .iter()
-                .map(|a| a.id)
-                .filter(|id| net.manager().holds(id))
-                .collect();
-            for lost in self.anchors_up.difference(&up) {
-                net.manager().note(
-                    *lost,
-                    format!(
-                        "the connection to this anchor is gone; it is redialled in at most {}s",
-                        self.redial_anchors_at.saturating_sub(now)
-                    ),
-                );
-            }
-            self.anchors_up = up;
-        }
-        if now < self.redial_anchors_at {
-            return;
-        }
-        self.redial_anchors_at = now + ANCHOR_REDIAL_SECS;
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
         let known: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
+        let up: BTreeSet<Digest32> = known
+            .iter()
+            .map(|a| a.id)
+            .filter(|id| net.manager().holds(id))
+            .collect();
+        let lost: Vec<Digest32> = self.anchors_up.difference(&up).copied().collect();
+        for lost in lost {
+            let lasted = self
+                .anchor_connected_at
+                .remove(&lost)
+                .map(|at| now.saturating_sub(at));
+            if lasted.is_some_and(|s| s < ANCHOR_FLAP_SECS) {
+                // Lost almost as soon as it was made: backed off like a failed dial.
+                let wait = self
+                    .anchor_backoff
+                    .get(&lost)
+                    .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
+                self.anchor_backoff.insert(lost, (now + wait, wait));
+                net.manager().note(
+                    lost,
+                    format!(
+                        "the connection to this anchor is gone {}s after it was made; it is \
+                         redialled in {wait}s",
+                        lasted.unwrap_or(0)
+                    ),
+                );
+            } else {
+                self.anchor_backoff.remove(&lost);
+                net.manager().note(
+                    lost,
+                    "the connection to this anchor is gone; it is redialled now".to_owned(),
+                );
+            }
+        }
+        self.anchors_up = up;
         for anchor in known {
-            if anchor.id == net.local_id() || net.manager().existing(&anchor.id).is_some() {
+            if anchor.id == net.local_id() || self.anchors_up.contains(&anchor.id) {
                 continue;
             }
-            let net = Arc::clone(&net);
-            let tx = self.net_tx.clone();
-            tokio::spawn(async move {
-                match net.manager().connect(anchor.id, &anchor.endpoints).await {
-                    Ok(conn) => {
-                        let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(NetEvent::ReachFailed {
-                                peer: anchor.id,
-                                why: e.to_string(),
-                            })
-                            .await;
-                    }
-                }
-            });
+            // **On the next tick, not the next half-minute** (V210-57): an anchor is this node's
+            // board and its relay, and a node without one reaches nobody it cannot dial directly.
+            // Only an anchor that keeps failing is backed off.
+            if self
+                .anchor_backoff
+                .get(&anchor.id)
+                .is_some_and(|(at, _)| now < *at)
+            {
+                continue;
+            }
+            // Said only for a retry: a first dial, or one right after a loss (said above), is no news.
+            let waited = self.anchor_backoff.get(&anchor.id).map_or(0, |(_, w)| *w);
+            if self.dial_anchor(&net, anchor.id, anchor.endpoints.clone()) && waited > 0 {
+                net.manager().note(
+                    anchor.id,
+                    format!("dialling this anchor again, {waited}s after it last failed"),
+                );
+            }
         }
+    }
+
+    /// Dial the anchor `id` unless it is connected or already being dialled; whether a dial was
+    /// started. The one place an anchor is dialled from (V210-57): the node's start, a room's
+    /// anchors, and the redial each used to spawn their own, and at start two of them raced.
+    fn dial_anchor(
+        &mut self,
+        net: &Arc<NodeNet>,
+        id: Digest32,
+        endpoints: crate::nat::multiaddr::EndpointList,
+    ) -> bool {
+        if id == net.local_id() || net.manager().existing(&id).is_some() {
+            return false;
+        }
+        if !self
+            .anchor_dials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id)
+        {
+            return false;
+        }
+        let (net, tx, dials) = (
+            Arc::clone(net),
+            self.net_tx.clone(),
+            Arc::clone(&self.anchor_dials),
+        );
+        tokio::spawn(async move {
+            let dialled = net.manager().connect(id, &endpoints).await;
+            dials
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            match dialled {
+                Ok(conn) => {
+                    let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(NetEvent::ReachFailed {
+                            peer: id,
+                            why: e.to_string(),
+                        })
+                        .await;
+                }
+            }
+        });
+        true
     }
 
     /// Make a channel's anchors this node's: record `more` on the channel (persisted
@@ -3261,27 +3328,7 @@ impl Node {
                 continue;
             }
             self.anchor_ids.insert(anchor.id);
-            if net.manager().existing(&anchor.id).is_some() {
-                continue;
-            }
-            let net = Arc::clone(&net);
-            let tx = self.net_tx.clone();
-            let (id, endpoints) = (anchor.id, anchor.endpoints.clone());
-            tokio::spawn(async move {
-                match net.manager().connect(id, &endpoints).await {
-                    Ok(conn) => {
-                        let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(NetEvent::ReachFailed {
-                                peer: id,
-                                why: e.to_string(),
-                            })
-                            .await;
-                    }
-                }
-            });
+            self.dial_anchor(&net, anchor.id, anchor.endpoints.clone());
         }
     }
 
@@ -3662,6 +3709,15 @@ impl Node {
                 }
             }
             NetEvent::ReachFailed { peer, why } => {
+                // An anchor that failed to connect waits before its next dial, doubling to
+                // `ANCHOR_REDIAL_SECS` (V210-57).
+                if self.anchors.nodes().iter().any(|a| a.id == peer) {
+                    let wait = self
+                        .anchor_backoff
+                        .get(&peer)
+                        .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
+                    self.anchor_backoff.insert(peer, (self.now() + wait, wait));
+                }
                 self.answer_pending_consents(
                     |_, target| *target == peer,
                     Some(Outcome::Failed(Fault::Unreachable)),
@@ -3674,6 +3730,9 @@ impl Node {
             }
             NetEvent::AnchorConnected { conn } => {
                 let peer = conn.peer_id();
+                // The backoff is kept until the connection has lasted (`ANCHOR_FLAP_SECS`): one
+                // superseded at once is a flap, not a success.
+                self.anchor_connected_at.insert(peer, self.now());
                 self.anchor_ids.insert(peer);
                 self.adopt_connection(Arc::clone(&conn));
                 self.refresh_network_view().await;
