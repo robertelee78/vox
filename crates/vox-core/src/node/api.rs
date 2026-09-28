@@ -702,6 +702,16 @@ pub enum NodeEvent {
         /// Which record it was, and which board (`our address (board …)`).
         what: String,
     },
+    /// What happened to a connection to `peer`, said so a failure that recurs names itself (#229,
+    /// after #232's CI reds): a newcomer that lost the one-connection-per-peer tie-break, a
+    /// retired connection closed, an anchor connection lost or redialled, a reach that waited for
+    /// another and what it did next. Diagnostics, never a decision.
+    ConnectionNote {
+        /// The peer the connection is to.
+        peer: Digest32,
+        /// What happened, for the operator.
+        note: String,
+    },
     /// A join failed, with what each responder that was tried reported.
     ///
     /// `Outcome::Failed(Fault)` is a single token with no room for a reason, so this carries the
