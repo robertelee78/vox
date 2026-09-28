@@ -1,7 +1,12 @@
 //! PRD-001 R37 — a running daemon notifies its operator when `vox status` would flag
 //! something, **once** when it starts and **once** when it clears.
 //!
-//! Two real `vox daemon` processes, alice and bob, trusting each other in one room.
+//! Every participant is the shipped binary, driven as a person would (ADR-018, "Only real use
+//! of the product is a test"): an anchor (`vox node`), and alice and bob, each a `vox daemon`
+//! made with `vox id`, trusting each other with `vox trust add`, sharing one room made with
+//! `vox room create`, `vox room invite` and `vox room join`. What the proof reads is what a
+//! person can read: `vox status --json`, and what the daemon prints.
+//!
 //! alice's daemon runs with `VOX_NOTIFY_COMMAND` pointed at a script that appends each
 //! notification to a file, so what is counted is the shipped binary's own decision to
 //! notify. Kill bob: exactly one "unreachable" notification. Leave him dead for three
@@ -9,257 +14,78 @@
 
 #![cfg(unix)]
 
+#[path = "support/world.rs"]
+mod world;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use std::io::{Read as _, Write as _};
-use std::net::SocketAddr;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use vox_core::hash::Digest32;
-use vox_core::nat::multiaddr::Multiaddr;
-use vox_core::node::actor::{Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
-use vox_core::node::link::b32_encode;
 use vox_core::node::paths::Paths;
+use world::{args, vox_once, VoxProc, IDENTITY, VOX};
 
-const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const TIMEOUT: Duration = Duration::from_secs(60);
+const ROOM_PASS: &str = "room passphrase";
+/// Generous: production Argon2id and a real proof of work happen inside a join.
+const SETUP: Duration = Duration::from_secs(180);
 
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
-}
-
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
+/// A one-shot `vox` verb with `stdin` piped in, in `data`'s profile.
+fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
+    let mut child = Command::new(VOX)
+        .args(argv)
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", data.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run vox");
+    child
+        .stdin
+        .take()
         .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("vox finished");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
-/// A profile's directories, and how the binary is pointed at them.
-#[derive(Clone)]
-struct Dirs {
-    data: PathBuf,
-    cfg: PathBuf,
+/// `vox status --json`, parsed.
+fn status(data: &Path) -> Value {
+    let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
+    assert!(ok, "vox status failed: {err}");
+    serde_json::from_str(&out).expect("vox status --json prints JSON")
 }
 
-impl Dirs {
-    fn new(tmp: &tempfile::TempDir, name: &str) -> Self {
-        Self {
-            data: tmp.path().join(name).join("data"),
-            cfg: tmp.path().join(name).join("cfg"),
-        }
-    }
-
-    fn paths(&self) -> Paths {
-        Paths::resolve("default", Some(&self.data), Some(&self.cfg)).unwrap()
-    }
-
-    fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(VOX);
-        c.args(args)
-            .env("VOX_DATA_DIR", &self.data)
-            .env("VOX_CONFIG_DIR", &self.cfg)
-            .env_remove("VOX_ROOM")
-            .env_remove("VOX_ANCHORS")
-            .env_remove("VOX_LISTEN");
-        c
-    }
-
-    /// `vox status --json`, parsed.
-    fn status(&self) -> Value {
-        let out = self
-            .command(&["status", "--json"])
-            .stdin(Stdio::null())
-            .output()
-            .expect("spawn vox status");
-        assert!(
-            out.status.success(),
-            "vox status failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        serde_json::from_slice(&out.stdout).expect("vox status --json prints JSON")
-    }
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
-/// A child process, killed by its PID however the test ends.
-struct Proc {
-    child: Child,
-    said: Arc<Mutex<String>>,
-}
-
-impl Proc {
-    fn spawn(mut cmd: Command, stdin: &str) -> Self {
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn vox");
-        let mut into = child.stdin.take().unwrap();
-        into.write_all(stdin.as_bytes()).unwrap();
-        drop(into);
-        let said = Arc::new(Mutex::new(String::new()));
-        for pipe in [
-            child
-                .stdout
-                .take()
-                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-            child
-                .stderr
-                .take()
-                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let sink = Arc::clone(&said);
-            let mut pipe = pipe;
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = pipe.read(&mut buf) {
-                    if n == 0 {
-                        return;
-                    }
-                    sink.lock()
-                        .unwrap()
-                        .push_str(&String::from_utf8_lossy(&buf[..n]));
-                }
-            });
-        }
-        Self { child, said }
-    }
-
-    fn said(&self) -> String {
-        self.said.lock().unwrap().clone()
-    }
-
-    fn wait_said(&self, what: &str, needle: &str) -> String {
-        let until = Instant::now() + TIMEOUT;
-        while Instant::now() < until {
-            let s = self.said();
-            if s.contains(needle) {
-                return s;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        panic!("timed out waiting for {what}; it said: {}", self.said());
-    }
-
-    fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
-async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) -> T {
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match h.next_event().await {
-                Some(e) => {
-                    if let Some(v) = f(e) {
-                        return v;
-                    }
-                }
-                None => panic!("event stream ended"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for an event")
-}
-
-async fn create_room(node: &NodeHandle) -> (Digest32, String) {
-    assert!(node
-        .apply(NodeCommand::CreateChannel {
-            local_name: "ops".into(),
-            passphrase: secret("room passphrase"),
-        })
-        .await
-        .is_done());
-    let cid = node.view().channels[0].channel_id;
-    assert!(node
-        .apply(NodeCommand::Invite { channel_id: cid })
-        .await
-        .is_done());
-    let url = wait_for(node, |e| match e {
-        NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
-        _ => None,
-    })
-    .await;
-    (cid, url)
-}
-
-async fn join(node: &NodeHandle, url: &str) {
-    let out = node
-        .apply(NodeCommand::JoinChannel {
-            link: url.to_owned(),
-            local_name: "ops".into(),
-            passphrase: secret("room passphrase"),
-        })
-        .await;
-    assert!(out.is_done(), "join: {out:?}");
-}
-
-async fn trust(node: &NodeHandle, peer: Digest32) {
-    assert!(node
-        .apply(NodeCommand::Trust {
-            fingerprint: peer,
-            petname: "peer".into(),
-        })
-        .await
-        .is_done());
-}
-
-async fn networked(dirs: &Dirs) -> NodeHandle {
-    let node = Node::spawn_networked(dirs.paths(), "127.0.0.1:0".parse().unwrap()).unwrap();
-    assert!(node
-        .apply(NodeCommand::CreateIdentity {
-            passphrase: secret("identity passphrase"),
-        })
-        .await
-        .is_done());
-    node
-}
-
-fn fp(node: &NodeHandle) -> Digest32 {
-    node.view().identity.unwrap().fingerprint
-}
-
-/// Wait until nothing holds UDP `port`, so a daemon can bind it.
-async fn port_free(addr: SocketAddr) {
+/// Wait until nothing holds UDP `port`, so a daemon can bind it again.
+fn port_free(port: u16) {
     let until = Instant::now() + TIMEOUT;
     while Instant::now() < until {
-        if std::net::UdpSocket::bind(addr).is_ok() {
-            // Let the store's lock go too: it is released with the same node.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("{addr} was never released by the stopped node");
-}
-
-fn loopback(node: &NodeHandle) -> SocketAddr {
-    node.view()
-        .listening
-        .iter()
-        .filter_map(|m| Multiaddr::parse(m).ok())
-        .filter_map(|m| m.socket_addr())
-        .find(|a| a.ip().is_loopback())
-        .expect("listens on loopback")
+    panic!("127.0.0.1:{port} was never released by the stopped daemon");
 }
 
 /// The notifications the script has recorded, one per line.
@@ -278,17 +104,6 @@ fn count(lines: &[String], needle: &str, peer: &str) -> usize {
         .count()
 }
 
-fn daemon(dirs: &Dirs, listen: SocketAddr, notify: Option<&Path>) -> Proc {
-    let listen = listen.to_string();
-    let mut cmd = dirs.command(&["daemon", "--listen", &listen]);
-    if let Some(script) = notify {
-        cmd.env("VOX_NOTIFY_COMMAND", script);
-    }
-    let p = Proc::spawn(cmd, "identity passphrase\nroom passphrase\n");
-    p.wait_said("the daemon to hold the room", "holding room");
-    p
-}
-
 fn wait_until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
     let until = Instant::now() + within;
     while Instant::now() < until {
@@ -300,15 +115,51 @@ fn wait_until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-#[test]
-#[ignore = "two real daemons, one killed for three minutes; CI runs it in release"]
-fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
-    watchdog::arm();
-    let rt = rt();
-    let tmp = tempfile::tempdir().unwrap();
-    let alice_dirs = Dirs::new(&tmp, "alice");
-    let bob_dirs = Dirs::new(&tmp, "bob");
-    let file = tmp.path().join("notifications.log");
+/// A member's profile directory, as the harness lays it out (`cfg` inside it).
+fn member_dir(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+    let d = tmp.path().join(name);
+    std::fs::create_dir_all(d.join("cfg")).unwrap();
+    d
+}
+
+/// A `vox daemon` on `port`, unlocked (and its rooms opened) from `pass_file`, answering
+/// `vox room list` before this returns.
+fn daemon(
+    name: &str,
+    data: &Path,
+    port: u16,
+    anchor: &str,
+    pass_file: &Path,
+    env: &[(&str, &str)],
+) -> VoxProc {
+    let listen = format!("127.0.0.1:{port}");
+    let p = VoxProc::spawn_env(
+        name,
+        data,
+        &args(&[
+            "daemon",
+            "--listen",
+            &listen,
+            "--anchor",
+            anchor,
+            "--passphrase-file",
+            pass_file.to_str().unwrap(),
+        ]),
+        env,
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        if vox_once(data, &args(&["room", "list"])).0 {
+            return p;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!("{name}'s daemon never answered `vox room list`");
+}
+
+/// The script `VOX_NOTIFY_COMMAND` runs: one line per notification, into `file`.
+fn notify_script(tmp: &tempfile::TempDir, file: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let script = tmp.path().join("notify.sh");
     std::fs::write(
         &script,
@@ -318,41 +169,143 @@ fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
         ),
     )
     .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// The scene both proofs share: an anchor, and alice's and bob's daemons trusting each other
+/// in one room, alice's notifying through `script`. Returns when alice's `vox status` shows
+/// bob connected.
+struct Scene {
+    _anchor: VoxProc,
+    anchor: String,
+    alice: VoxProc,
+    alice_dir: PathBuf,
+    bob: VoxProc,
+    bob_dir: PathBuf,
+    bob_port: u16,
+    bob_id: String,
+    pass_file: PathBuf,
+}
+
+fn scene(tmp: &tempfile::TempDir, script: &Path, before_alice: impl FnOnce(&Path)) -> Scene {
+    let anchor_dir = member_dir(tmp, "anchor");
+    let alice_dir = member_dir(tmp, "alice");
+    let bob_dir = member_dir(tmp, "bob");
+    // The identity passphrase, and a line that opens the room once there is one: that is
+    // what reopens bob's room when his daemon starts again.
+    let pass_file = tmp.path().join("passphrases");
+    std::fs::write(&pass_file, format!("{IDENTITY}\n{ROOM_PASS}\n")).unwrap();
+
+    let mut anchor = VoxProc::spawn(
+        "anchor",
+        &anchor_dir,
+        &args(&["node", "--listen", "127.0.0.1:0"]),
+    );
+    let spec = anchor
+        .expect_line("an --anchor spec", |l| {
+            l.trim_start().contains("@/ip4/127.0.0.1/udp/")
+        })
+        .trim()
+        .to_owned();
+
+    let fp = |d: &Path| {
+        let (ok, out, err) = vox_once(d, &args(&["id"]));
+        assert!(ok, "vox id: {err}");
+        out.trim().to_owned()
+    };
+    let (alice_id, bob_id) = (fp(&alice_dir), fp(&bob_dir));
+    for (d, peer, name) in [(&alice_dir, &bob_id, "bob"), (&bob_dir, &alice_id, "alice")] {
+        let (ok, out, err) = vox_once(d, &args(&["trust", "add", peer, "--name", name]));
+        assert!(ok, "vox trust add {name}: {out}{err}");
+    }
+    before_alice(&alice_dir);
+
+    let (alice_port, bob_port) = (free_udp_port(), free_udp_port());
+    let script = script.to_str().unwrap();
+    let alice = daemon(
+        "alice",
+        &alice_dir,
+        alice_port,
+        &spec,
+        &pass_file,
+        &[("VOX_NOTIFY_COMMAND", script)],
+    );
+    let bob = daemon("bob", &bob_dir, bob_port, &spec, &pass_file, &[]);
+
+    let (ok, out, err) = vox_in(&alice_dir, &["room", "create", "--name", "ops"], ROOM_PASS);
+    assert!(ok, "vox room create: {out}{err}");
+    let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
+    assert!(ok, "vox room list: {err}");
+    let room = list
+        .lines()
+        .find(|l| l.contains("ops"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("room not listed: {list}"))
+        .to_owned();
+    let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
+    assert!(ok, "vox room invite: {err}");
+    let deadline = Instant::now() + SETUP;
+    loop {
+        let (ok, out, err) = vox_in(
+            &bob_dir,
+            &["room", "join", link.trim(), "--name", "ops"],
+            ROOM_PASS,
+        );
+        if ok {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: bob never joined: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_secs(5));
     }
 
-    let (alice_listen, bob_listen, bob_fp) = rt.block_on(async {
-        let alice = networked(&alice_dirs).await;
-        let bob = networked(&bob_dirs).await;
-        let (_, url) = create_room(&alice).await;
-        join(&bob, &url).await;
-        trust(&alice, fp(&bob)).await;
-        trust(&bob, fp(&alice)).await;
-        let (a, b, bob_fp) = (loopback(&alice), loopback(&bob), fp(&bob));
-        for n in [&alice, &bob] {
-            assert!(n.apply(NodeCommand::Shutdown).await.is_done());
-        }
-        drop((alice, bob));
-        port_free(a).await;
-        port_free(b).await;
-        (a, b, bob_fp)
+    wait_until("alice's daemon to reach bob's", SETUP, || {
+        connected(&status(&alice_dir), &bob_id)
     });
-    let bob_id = b32_encode(&bob_fp);
+    Scene {
+        _anchor: anchor,
+        anchor: spec,
+        alice,
+        alice_dir,
+        bob,
+        bob_dir,
+        bob_port,
+        bob_id,
+        pass_file,
+    }
+}
+
+/// Whether alice's `vox status` shows `peer` connected in her room.
+fn connected(s: &Value, peer: &str) -> bool {
+    s["rooms"][0]["members"].as_array().is_some_and(|ms| {
+        ms.iter()
+            .any(|m| m["id"].as_str() == Some(peer) && m["connected"] == true)
+    })
+}
+
+#[test]
+#[ignore = "an anchor and two real daemons, one killed for three minutes; CI runs it in release"]
+fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("notifications.log");
+    let script = notify_script(&tmp, &file);
+    let Scene {
+        _anchor,
+        anchor,
+        alice: _alice,
+        alice_dir: _,
+        mut bob,
+        bob_dir,
+        bob_port,
+        bob_id,
+        pass_file,
+    } = scene(&tmp, &script, |_| {});
     let bob_short: String = bob_id.chars().take(12).collect();
 
-    let _alice = daemon(&alice_dirs, alice_listen, Some(&script));
-    let mut bob = daemon(&bob_dirs, bob_listen, None);
-    let connected = |s: &Value| {
-        s["rooms"][0]["members"].as_array().is_some_and(|ms| {
-            ms.iter()
-                .any(|m| m["id"].as_str() == Some(bob_id.as_str()) && m["connected"] == true)
-        })
-    };
-    wait_until("alice's daemon to reach bob's", TIMEOUT, || {
-        connected(&alice_dirs.status())
-    });
     // Two checks' worth, so a notification for a healthy state would have fired by now.
     std::thread::sleep(Duration::from_secs(11));
     let healthy = notes(&file);
@@ -362,9 +315,10 @@ fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
         "nothing about bob while he is up: {healthy:?}"
     );
 
-    // Kill bob. QUIC notices at its idle timeout.
+    // Kill bob's daemon by its PID. QUIC notices at its idle timeout.
     let killed = Instant::now();
-    bob.kill();
+    let _ = bob.child.kill();
+    let _ = bob.child.wait();
     wait_until(
         "the unreachable notification",
         Duration::from_secs(150),
@@ -374,10 +328,24 @@ fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
     // Three minutes of the same condition.
     std::thread::sleep(Duration::from_secs(180));
     let held = notes(&file);
+    eprintln!(
+        "raised {raised_after:?} after the kill; after 3 minutes of the condition: {} \
+         unreachable line(s)",
+        count(&held, "unreachable", &bob_short)
+    );
+    assert_eq!(
+        count(&held, "unreachable", &bob_short),
+        1,
+        "three minutes of one condition is one notification, not one per check: {held:?}"
+    );
 
-    // Bring bob back on the same port.
-    rt.block_on(port_free(bob_listen));
-    let _bob_again = daemon(&bob_dirs, bob_listen, None);
+    // Bring bob back on the same port; his passphrase file reopens the room.
+    drop(bob);
+    port_free(bob_port);
+    let mut bob_again = daemon("bob", &bob_dir, bob_port, &anchor, &pass_file, &[]);
+    bob_again.expect_within(TIMEOUT, "bob's daemon to hold the room", |l| {
+        l.contains("holding room")
+    });
     let back = Instant::now();
     wait_until(
         "the recovered notification",
@@ -389,17 +357,9 @@ fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
     std::thread::sleep(Duration::from_secs(11));
     let end = notes(&file);
     eprintln!(
-        "raised {raised_after:?} after the kill, recovered {recovered_after:?} after the \
-         restart\nafter 3 minutes of the condition: {} unreachable line(s)\nall notifications \
-         ({}):\n{}",
-        count(&held, "unreachable", &bob_short),
+        "recovered {recovered_after:?} after the restart\nall notifications ({}):\n{}",
         end.len(),
         end.join("\n")
-    );
-    assert_eq!(
-        count(&held, "unreachable", &bob_short),
-        1,
-        "three minutes of one condition is one notification, not one per check"
     );
     assert_eq!(
         count(&end, "unreachable", &bob_short) - count(&end, "recovered", &bob_short),
@@ -416,88 +376,53 @@ fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
 /// **Opt-out.** With `notify = off` in alice's config the same death raises nothing, and
 /// the daemon says at start that notifications are off.
 #[test]
-#[ignore = "two real daemons, one killed; CI runs it in release"]
+#[ignore = "an anchor and two real daemons, one killed; CI runs it in release"]
 fn notify_off_raises_nothing() {
     watchdog::arm();
-    let rt = rt();
     let tmp = tempfile::tempdir().unwrap();
-    let alice_dirs = Dirs::new(&tmp, "alice");
-    let bob_dirs = Dirs::new(&tmp, "bob");
     let file = tmp.path().join("notifications.log");
-    let script = tmp.path().join("notify.sh");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> '{}'\n",
-            file.display()
-        ),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let (alice_listen, bob_listen, bob_fp) = rt.block_on(async {
-        let alice = networked(&alice_dirs).await;
-        let bob = networked(&bob_dirs).await;
-        let (_, url) = create_room(&alice).await;
-        join(&bob, &url).await;
-        trust(&alice, fp(&bob)).await;
-        trust(&bob, fp(&alice)).await;
-        let (a, b, bob_fp) = (loopback(&alice), loopback(&bob), fp(&bob));
-        for n in [&alice, &bob] {
-            assert!(n.apply(NodeCommand::Shutdown).await.is_done());
-        }
-        drop((alice, bob));
-        port_free(a).await;
-        port_free(b).await;
-        (a, b, bob_fp)
-    });
-    std::fs::write(
-        alice_dirs.paths().config_file(),
-        "# set by the proof\nnotify = off\n",
-    )
-    .unwrap();
-    let bob_id = b32_encode(&bob_fp);
-    let alice = daemon(&alice_dirs, alice_listen, Some(&script));
-    let mut bob = daemon(&bob_dirs, bob_listen, None);
-    wait_until("alice's daemon to reach bob's", TIMEOUT, || {
-        alice_dirs.status()["rooms"][0]["members"]
-            .as_array()
-            .is_some_and(|ms| {
-                ms.iter()
-                    .any(|m| m["id"].as_str() == Some(bob_id.as_str()) && m["connected"] == true)
-            })
+    let script = notify_script(&tmp, &file);
+    let Scene {
+        _anchor,
+        mut alice,
+        alice_dir,
+        mut bob,
+        bob_id,
+        ..
+    } = scene(&tmp, &script, |alice_dir| {
+        let config = Paths::resolve("default", Some(alice_dir), Some(&alice_dir.join("cfg")))
+            .unwrap()
+            .config_file();
+        std::fs::write(config, "# set by the proof\nnotify = off\n").unwrap();
     });
     std::thread::sleep(Duration::from_secs(2));
-    bob.kill();
+    let _ = bob.child.kill();
+    let _ = bob.child.wait();
     // Until the condition is certainly flagged — status shows it — and one check more.
     let short: String = bob_id.chars().take(12).collect();
     wait_until(
         "alice's status to flag bob",
         Duration::from_secs(150),
         || {
-            alice_dirs.status()["unhealthy"]
-                .as_array()
-                .is_some_and(|u| {
-                    u.iter()
-                        .any(|l| l["key"].as_str().is_some_and(|k| k.contains(&bob_id)))
-                })
+            status(&alice_dir)["unhealthy"].as_array().is_some_and(|u| {
+                u.iter()
+                    .any(|l| l["key"].as_str().is_some_and(|k| k.contains(&bob_id)))
+            })
         },
     );
     std::thread::sleep(Duration::from_secs(11));
     let lines = notes(&file);
+    let said = alice.transcript();
     eprintln!(
-        "notify = off: {} notification(s) {lines:?}; alice said: {}",
-        lines.len(),
-        alice.said()
+        "notify = off: {} notification(s) {lines:?}; alice said: {said}",
+        lines.len()
     );
     assert!(
         lines.is_empty(),
         "notify = off must raise nothing about {short}"
     );
     assert!(
-        alice.said().contains("notifications off"),
+        said.contains("notifications off"),
         "and the daemon must say they are off"
     );
 }
