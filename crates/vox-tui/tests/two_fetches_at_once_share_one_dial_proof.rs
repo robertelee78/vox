@@ -350,6 +350,7 @@ fn two_fetches_at_once_share_one_dial() {
 
     let mut slow: Vec<String> = Vec::new();
     let mut extra: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
     for cycle in 0..CYCLES {
         // A fresh daemon for bob: no connection to alice to reuse.
         drop(bob.daemon.take());
@@ -359,11 +360,14 @@ fn two_fetches_at_once_share_one_dial() {
         for (which, h) in [("a", a), ("b", b)] {
             let (ok, took, said) = h.join().unwrap();
             eprintln!("[proof] cycle {cycle} fetch {which}: ok={ok} in {took:?}");
-            assert!(
-                ok,
-                "CANNOT PROVE: cycle {cycle} fetch {which} failed ({took:?}):\n{said}\n---- bob's daemon ----\n{}",
-                bob.daemon.as_ref().map(Running::said).unwrap_or_default()
-            );
+            // A fetch that fails is the claim failing, not the scene: a reach whose circuit another
+            // reach closed waits out its attempt and gives up (red on the uncoalesced mutant, 10.24 s).
+            if !ok {
+                failed.push(format!(
+                    "cycle {cycle} fetch {which} failed after {took:?}:\n{said}\n---- bob's daemon ----\n{}",
+                    bob.daemon.as_ref().map(Running::said).unwrap_or_default()
+                ));
+            }
             if took > FETCH_WITHIN {
                 slow.push(format!("cycle {cycle} fetch {which}: {took:?}"));
             }
@@ -392,6 +396,12 @@ fn two_fetches_at_once_share_one_dial() {
     assert!(
         carried > 0,
         "CANNOT PROVE: the anchor carried no circuit, so the path was not relayed"
+    );
+    assert!(
+        failed.is_empty(),
+        "fetches started together must all succeed — a reach lost its circuit to another reach to \
+         the same peer:\n{}",
+        failed.join("\n")
     );
     assert!(
         extra.is_empty(),
