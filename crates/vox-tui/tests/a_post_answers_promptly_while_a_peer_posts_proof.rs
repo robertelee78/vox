@@ -43,6 +43,8 @@ type Said = Arc<Mutex<Vec<(Duration, &'static str, String)>>>;
 
 /// How many of Alice's slowest posts are named, with what the daemons said around each.
 const SLOWEST: usize = 10;
+/// A post slower than this takes a snapshot of both nodes' sync counters after it.
+const LATE: Duration = Duration::from_millis(50);
 
 fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     let mut child = Command::new(VOX)
@@ -218,32 +220,25 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    // Each node's sync counters (`vox status --json`, answered off the actor, so sampling them
-    // does not slow what is measured), every quarter second while Alice posts: a session, a busy
-    // refusal or a stall near a slow post shows here even when neither daemon printed anything.
-    let sampling = Arc::new(AtomicBool::new(true));
-    let samplers: Vec<_> = [("alice", alice_dir.clone()), ("bob", bob_dir.clone())]
-        .into_iter()
-        .map(|(who, dir)| {
-            let (sampling, said) = (Arc::clone(&sampling), Arc::clone(&said));
-            std::thread::spawn(move || {
-                let mut last = String::new();
-                while sampling.load(Ordering::Relaxed) {
-                    let (ok, out, _) = vox_once(&dir, &args(&["status", "--json"]));
-                    let out = out.trim().to_owned();
-                    if ok && out != last {
-                        said.lock().unwrap().push((
-                            t0.elapsed(),
-                            who,
-                            format!("sync counters {out}"),
-                        ));
-                        last = out;
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-            })
-        })
-        .collect();
+    // Each node's sync counters (`vox status --json`), snapshotted **only outside the timed
+    // posts**: once before them, once right after any post that ran late (its time already
+    // taken), and once after. The counters are cumulative, so the snapshots either side of a slow
+    // post show the sessions that ran across it. Polling them throughout cost 3–7 ms of p95 here
+    // (p95 36 ms off against 39–43 ms on, alternating under the timing lock), which a slower
+    // runner would multiply; this costs a fast run nothing.
+    let snapshot = |label: &str| {
+        for (who, dir) in [("alice", &alice_dir), ("bob", &bob_dir)] {
+            let (ok, out, _) = vox_once(dir, &args(&["status", "--json"]));
+            if ok {
+                said.lock().unwrap().push((
+                    t0.elapsed(),
+                    who,
+                    format!("sync counters ({label}) {}", out.trim()),
+                ));
+            }
+        }
+    };
+    snapshot("before the timed posts");
 
     // ---- Alice's posts, timed ---------------------------------------------------------------
     let mut took: Vec<Duration> = Vec::with_capacity(POSTS);
@@ -255,16 +250,17 @@ fn a_post_answers_promptly_while_a_peer_posts() {
             &alice_dir,
             &args(&["room", "post", &room, &format!("alice {i}")]),
         );
-        took.push(t.elapsed());
-        posts.push((i, t.duration_since(t0), t.elapsed()));
+        let dur = t.elapsed();
+        took.push(dur);
+        posts.push((i, t.duration_since(t0), dur));
         assert!(ok, "alice's post {i} failed: {err}");
+        if dur > LATE {
+            snapshot(&format!("after alice {i}, {}ms", dur.as_millis()));
+        }
     }
+    snapshot("after the timed posts");
     stop.store(true, Ordering::Relaxed);
-    sampling.store(false, Ordering::Relaxed);
     bob_thread.join().unwrap();
-    for s in samplers {
-        s.join().unwrap();
-    }
     let bob_total = bob_posts.load(Ordering::Relaxed);
 
     // Bob's posts arrived at Alice during hers: the busy condition held for the measurement.
@@ -297,7 +293,22 @@ fn a_post_answers_promptly_while_a_peer_posts() {
             start.saturating_sub(Duration::from_secs(1)),
             *start + *dur + Duration::from_millis(500),
         );
-        for (at, who, line) in said.iter().filter(|(at, _, _)| *at >= from && *at <= to) {
+        // What either daemon printed near it, and the counter snapshots either side of it.
+        let before = said
+            .iter()
+            .filter(|(at, _, l)| *at < *start && l.starts_with("sync counters"))
+            .rev()
+            .take(2);
+        let after = said
+            .iter()
+            .filter(|(at, _, l)| *at >= *start + *dur && l.starts_with("sync counters"))
+            .take(2);
+        let near = said
+            .iter()
+            .filter(|(at, _, l)| *at >= from && *at <= to && !l.starts_with("sync counters"));
+        let mut around: Vec<_> = before.chain(near).chain(after).collect();
+        around.sort_by_key(|(at, _, _)| *at);
+        for (at, who, line) in around {
             println!("[slow]     +{:.3}s {who}: {line}", at.as_secs_f64());
         }
     }
