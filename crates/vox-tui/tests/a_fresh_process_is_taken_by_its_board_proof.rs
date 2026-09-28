@@ -1,30 +1,39 @@
 //! V210-51 (#230) — **a fresh process's address is taken by its board**, through the shipped binary.
 //!
-//! A board replaces a member's record only with a later `timestamp`, in whole seconds — ADR-012's
-//! bound of one changed claim a second per author (`nat::store::check_replacement`). A process that
-//! starts within the second its predecessor last published in signs its first record in that same
-//! second, and the board refused it as stale. Every cold `vox forward` on integrate 1de7548 logged
-//! `a board would not take our address … the board holds a newer record from that author`, and
-//! the board went on naming the previous, dead process's address until the next publish round.
+//! A board replaces a member's record only with a later `seq` and `timestamp` (ADR-012's bound of
+//! one changed claim a second per author, `nat::store::check_replacement`). A process that signs
+//! its first record at or below its predecessor's — in the same second, or with a clock a moment
+//! behind — was refused as stale, and the board went on naming the previous, dead process's address
+//! until the next publish round. Every cold `vox forward` on integrate 1de7548 logged `a board would
+//! not take our address … the board holds a newer record from that author`.
 //!
 //! The node now publishes its own record again just past the next second when a board refuses it
-//! as stale (`NetEvent::RepublishTo`), and a refusal no republish cures is said once its short grace
-//! is over (`NetEvent::StaleGraceOver`) — held, never dropped.
+//! as stale (`NetEvent::RepublishTo`, at most three in a row), says so when a republish is taken
+//! (`vox: our address (board …) … was taken on a republish, after the board refused it as stale`),
+//! and says a refusal no republish cured once its short grace is over — held, never dropped.
 //!
-//! **Read through the product.** `vox node` prints, per member, the address its board holds for it
-//! (`board — <room> holding <addr> for <member>`): what the board hands anyone asking where that
-//! member is. The decider chose this readout for the proof (#230).
+//! **Staged, not hoped for.** A fresh process usually publishes more than a second after its
+//! predecessor, so back to back the refusal came or not by chance (#230's first verdict: 0 of 30
+//! samples refused in two runs). So each sample is a pair of processes of the guest's identity:
+//! **A**, a plain `vox forward` whose address the anchor is seen to hold, then killed; and **B**, a
+//! `vox forward` started at once with its millisecond clock [`SKEW_MS`] behind
+//! (`VOX_TEST_CLOCK_SKEW_MS`, test-only, inert when unset — the clock that floors a record's
+//! `seq`). B publishes about a second after A (kill, unlock, bind), so its first record is at or
+//! below A's: refused as stale. Its republishes, a second apart, pass A's `seq` as real time
+//! catches up. A fixed predecessor per sample keeps every sample alike; one skew across a chain
+//! of forwards did not (each as far behind as the last: only the first was ever refused).
 //!
-//! **The scene.** A host serves an echo behind a real `vox node` anchor; a guest joins; then
-//! [`SAMPLES`] cold `vox forward`s run one after another from the guest's profile, each a new process
-//! on its own UDP port, started as soon as the last one is killed.
+//! **Read through the product.** Each forward's own stderr says the refusal was cured (or not); the
+//! anchor's `vox node` prints the address its board holds for each member (`board — <room> holding
+//! <addr> … for <member>`).
 //!
-//! **What must hold:** within [`TAKEN_WITHIN`] of each forward binding, the anchor prints that it
-//! holds **that** process's address for the guest; and no forward says a board would not take its
-//! address.
+//! **What must hold, every sample:** the forward reports its address refused as stale **and taken
+//! on a republish** (a sample with no refusal is CANNOT MEASURE); it never reports a refusal left
+//! uncured; and the anchor, in lines printed after the sample began, holds **that** process's
+//! address for the guest.
 //!
-//! Mutation: `NetEvent::RepublishTo` does nothing — red: the anchor keeps the previous process's
-//! address, and the forward says a board would not take its address.
+//! Mutations: `NetEvent::RepublishTo` does nothing; the republish sent at once instead of past the
+//! second; no republish at all (cap 0) — each red.
 
 #![cfg(unix)]
 
@@ -44,12 +53,16 @@ use world::{args, vox_once, VoxProc};
 
 /// Cold forwards, one after another.
 const SAMPLES: usize = 5;
-/// How long after a forward binds the anchor may take to hold its address.
-const TAKEN_WITHIN: Duration = Duration::from_secs(2);
-/// How long each forward is watched for a refusal it did not cure: past the node's grace for a
-/// stale refusal (5 s).
-const WATCH: Duration = Duration::from_secs(8);
-/// What a node prints when a board would not take its own address.
+/// How far behind B's millisecond clock runs: far enough that the first republish, a second
+/// on, is still refused and the second one cures it — so the proof sees more than one republish,
+/// with the third still to spare under the cap (measured: cured at about 2.0 s, 2 of 2).
+const SKEW_MS: i64 = -2500;
+/// How long a sample may take, from binding, to report its refusal cured and have the anchor hold
+/// its address: the republishes go a second apart, three at most.
+const CURED_WITHIN: Duration = Duration::from_secs(7);
+/// What a forward prints when a republish is taken after a refusal as stale.
+const CURED: &str = "was taken on a republish, after the board refused it as stale";
+/// What a node prints when a board would not take its own address, and no republish cured it.
 const REFUSED: &str = "would not take our address";
 
 /// A UDP port nobody holds right now.
@@ -61,10 +74,41 @@ fn free_udp_port() -> u16 {
         .port()
 }
 
+/// A `vox forward` of the guest's identity on UDP `port`, with its millisecond clock skewed if asked.
+fn spawn_forward(w: &RelayWorld, port: u16, skew: Option<&str>) -> VoxProc {
+    let listen = format!("127.0.0.1:{port}");
+    let env: Vec<(&str, &str)> = skew
+        .map(|s| vec![("VOX_TEST_CLOCK_SKEW_MS", s)])
+        .unwrap_or_default();
+    VoxProc::spawn_env(
+        "forward",
+        &w.guest_dir,
+        &args(&[
+            "forward",
+            &w.room,
+            &w.host_fp,
+            &w.service,
+            "127.0.0.1:0",
+            "--passphrase",
+            &w.passphrase,
+            "--anchor",
+            &w.anchor.v4_spec,
+            "--listen",
+            &listen,
+        ]),
+        &env,
+    )
+}
+
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn a_fresh_process_is_taken_by_its_board() {
     watchdog::arm();
+    let skew: i64 = std::env::var("VOX_PROOF_230_SKEW_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SKEW_MS);
+    let skew_env = skew.to_string();
     let mut w = RelayWorld::new(Split::None);
     let (ok, took, out, err) = w.join_guest();
     assert!(
@@ -75,57 +119,98 @@ fn a_fresh_process_is_taken_by_its_board() {
     assert!(ok, "vox id (guest): {err}");
     let guest: String = guest_fp.trim().chars().take(26).collect();
 
-    let mut refused: Vec<String> = Vec::new();
-    for n in 0..SAMPLES {
-        // A fresh `vox forward` on a port of its own, started as soon as the previous one is
-        // killed by its PID.
+    let mut failures: Vec<String> = Vec::new();
+    let mut refusals = 0usize;
+    let samples: usize = std::env::var("VOX_PROOF_230_SAMPLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SAMPLES);
+    for n in 0..samples {
+        // Only the anchor's lines printed from here on count for this sample.
         drop(w.fwd.take());
+        let mark = w.anchor.proc.transcript().lines().count();
+        // A: the previous process, plain, until the anchor holds its address.
+        let a_port = free_udp_port();
+        let mut a = spawn_forward(&w, a_port, None);
+        a.expect_line("A's bound address", |l| {
+            l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+        });
+        let a_tag = format!("/udp/{a_port}");
+        let deadline = Instant::now() + CURED_WITHIN;
+        loop {
+            let anchor = w.anchor.proc.transcript();
+            if anchor.lines().skip(mark).any(|l| {
+                l.contains(" holding ")
+                    && l.contains(&a_tag)
+                    && l.ends_with(&format!(" for {guest}"))
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "CANNOT MEASURE: sample {n}'s previous process was never held by the anchor"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(a);
+        let mark = w.anchor.proc.transcript().lines().count();
+        // B: the fresh process, a moment behind.
         let port = free_udp_port();
-        let listen = format!("127.0.0.1:{port}");
-        let mut fwd = VoxProc::spawn(
-            "forward",
-            &w.guest_dir,
-            &args(&[
-                "forward",
-                &w.room,
-                &w.host_fp,
-                &w.service,
-                "127.0.0.1:0",
-                "--passphrase",
-                &w.passphrase,
-                "--anchor",
-                &w.anchor.v4_spec,
-                "--listen",
-                &listen,
-            ]),
-        );
+        let mut fwd = spawn_forward(&w, port, Some(&skew_env));
         fwd.expect_line("the forward's bound address", |l| {
             l.starts_with("vox: 127.0.0.1:") && l.contains('→')
         });
         let bound = Instant::now();
-        let held = format!("/udp/{port} for {guest}");
-        let line = w.anchor.proc.expect_within(
-            TAKEN_WITHIN,
-            &format!("the anchor holding sample {n}'s address (port {port}) for the guest"),
-            |l| l.contains(" holding ") && l.contains(&held),
-        );
+        let port_tag = format!("/udp/{port}");
+        let for_guest = format!(" for {guest}");
+        let (mut cured, mut refused, mut held) = (None, 0usize, None);
+        while bound.elapsed() < CURED_WITHIN {
+            let said = fwd.transcript();
+            if cured.is_none() && said.contains(CURED) {
+                cured = Some(bound.elapsed());
+            }
+            refused = said.lines().filter(|l| l.contains(REFUSED)).count();
+            if held.is_none() {
+                let anchor = w.anchor.proc.transcript();
+                if anchor.lines().skip(mark).any(|l| {
+                    l.contains(" holding ") && l.contains(&port_tag) && l.ends_with(&for_guest)
+                }) {
+                    held = Some(bound.elapsed());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         eprintln!(
-            "[proof] sample {n}: the anchor holds its address {:?} after binding: {}",
-            bound.elapsed(),
-            line.trim()
+            "[proof] sample {n} (clock {skew} ms): refused and cured after {cured:?}; uncured \
+             refusals said: {refused}; the anchor holds its address after {held:?}"
         );
-        std::thread::sleep(WATCH.saturating_sub(bound.elapsed()));
-        let said = fwd.transcript();
-        refused.extend(
-            said.lines()
-                .filter(|l| l.contains(REFUSED))
-                .map(|l| format!("sample {n}: {l}")),
-        );
+        if cured.is_some() || refused > 0 {
+            refusals += 1;
+        }
+        if cured.is_none() {
+            failures.push(format!("sample {n}: never reported its refusal cured"));
+        }
+        if refused > 0 {
+            failures.push(format!(
+                "sample {n}: {refused} uncured refusal(s) said:\n{}",
+                fwd.transcript()
+            ));
+        }
+        if held.is_none() {
+            failures.push(format!(
+                "sample {n}: the anchor never held its address (port {port}) within {CURED_WITHIN:?}"
+            ));
+        }
         w.fwd = Some(fwd);
     }
+    eprintln!("[proof] {refusals} of {samples} samples were refused as stale");
     assert!(
-        refused.is_empty(),
-        "a fresh process was told its board would not take its address:\n{}",
-        refused.join("\n")
+        refusals > 0,
+        "CANNOT MEASURE: no sample was refused (clock {skew} ms is not far enough behind), so the \
+         republish was never exercised"
+    );
+    assert!(
+        failures.is_empty(),
+        "a fresh process's address was not taken by its board: {failures:?}"
     );
 }
