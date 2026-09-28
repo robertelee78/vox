@@ -471,19 +471,23 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         // the pending consent, written to disk.
         let bob_pid = bob_d.child.id();
         signal(bob_pid, "-STOP");
-        // Its outcome is not the point: whether the delivery to a stopped bob is reported as a
-        // failure or not, the key is written before it is tried. The blob on disk is checked below.
-        let (_, out, err) = vox_with(
-            &new,
-            &alice,
-            &["trust", "add", &bob_fp, "--name", "bob"],
-            None,
-        );
-        eprintln!(
-            "[alice trusts bob while he is stopped] {}{}",
-            out.trim(),
-            err.trim()
-        );
+        // A consent whose key cannot be delivered now is held on disk: the pending consents.
+        // Since V210-45 a first trust is dated in the profile's consent order and needs no held
+        // key, so the path that holds one is a **re-trust** after a revocation, whose consent is
+        // dated by its delivery (ADR-007). Outcomes are not the point here: the blob on disk is
+        // checked below.
+        for step in [
+            vec!["trust", "add", bob_fp.as_str(), "--name", "bob"],
+            vec!["trust", "remove", bob_fp.as_str()],
+            vec!["trust", "add", bob_fp.as_str(), "--name", "bob"],
+        ] {
+            let (_, out, err) = vox_with(&new, &alice, &step, None);
+            eprintln!(
+                "[alice, bob stopped] {step:?}: {}{}",
+                out.trim(),
+                err.trim()
+            );
+        }
         std::thread::sleep(Duration::from_secs(3));
         drop(alice_d);
         signal(bob_pid, "-CONT");
