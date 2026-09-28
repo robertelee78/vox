@@ -36,6 +36,19 @@ pub enum Call {
     Chmod { path: PathBuf, mode: u32 },
     /// `write`, `pwrite`, `writev`, `pwritev`: the descriptor's path and the bytes asked for.
     Write { path: PathBuf, bytes: u64 },
+    /// A clone or copy onto `path` (`clonefile`, `clonefileat`, `fclonefileat`, `copyfile`,
+    /// `fcopyfile`): `std::fs::copy` on macOS fills a file this way, without `write`.
+    Copy { path: PathBuf, from: PathBuf },
+}
+
+impl Call {
+    /// Whether this call put content into `file` (a write, or a clone or copy onto it).
+    pub fn fills(&self, file: &Path) -> bool {
+        match self {
+            Call::Write { path, .. } | Call::Copy { path, .. } => norm(path) == *file,
+            _ => false,
+        }
+    }
 }
 
 /// A call, with where it came from and what it returned.
@@ -161,6 +174,13 @@ pub fn parse(log: &str) -> Vec<Event> {
                     },
                     &f[6..],
                 ),
+                Some("copy") if f.len() == 8 => (
+                    Call::Copy {
+                        path: f[3].into(),
+                        from: f[5].into(),
+                    },
+                    &f[6..],
+                ),
                 Some("chmod") if f.len() == 8 => (
                     Call::Chmod {
                         path: f[3].into(),
@@ -207,10 +227,11 @@ pub struct Publication {
     pub created: Option<Event>,
     /// `chmod`s of the renamed file between its creation and the rename.
     pub chmods: Vec<Event>,
-    /// Successful writes to the renamed file between its creation and the rename.
-    pub writes: Vec<Event>,
-    /// Successful flushes of the renamed file **after its last write** and before the rename:
-    /// a flush before the bytes are written flushes nothing (found in verification of #241).
+    /// Successful content events for the renamed file (writes, and clones or copies onto it)
+    /// between its creation and the rename.
+    pub content: Vec<Event>,
+    /// Successful flushes of the renamed file **after its last content event** and before the
+    /// rename: a flush before the bytes are in flushes nothing (found in verification of #241).
     pub synced_before: Vec<Event>,
     /// Flushes of the directory after the rename (any result).
     pub dir_synced_after: Vec<Event>,
@@ -242,18 +263,14 @@ pub fn publication(events: &[Event], target: &Path) -> Option<Publication> {
             .filter(|e| matches!(&e.call, Call::Chmod { path, .. } if norm(path) == from))
             .map(|e| (*e).clone())
             .collect(),
-        writes: since
+        content: since
             .iter()
-            .filter(|e| {
-                e.ret >= 0 && matches!(&e.call, Call::Write { path, .. } if norm(path) == from)
-            })
+            .filter(|e| e.ret >= 0 && e.call.fills(&from))
             .map(|e| (*e).clone())
             .collect(),
         synced_before: {
-            let last_write = since
-                .iter()
-                .rposition(|e| matches!(&e.call, Call::Write { path, .. } if norm(path) == from));
-            since[last_write.map_or(0, |k| k + 1)..]
+            let last_content = since.iter().rposition(|e| e.call.fills(&from));
+            since[last_content.map_or(0, |k| k + 1)..]
                 .iter()
                 .filter(|e| {
                     e.ret == 0 && matches!(&e.call, Call::Sync { path, .. } if norm(path) == from)
@@ -277,8 +294,8 @@ pub fn publication(events: &[Event], target: &Path) -> Option<Publication> {
 /// `O_CREAT | O_EXCL` with mode `0600` from its first byte and never `chmod`ed after, flushed
 /// before the rename, and its directory flushed after (a flush the filesystem refuses for a
 /// directory, `EINVAL` or `ENOTSUP`, is recorded and accepted). "Flushed" means after the file's
-/// **last** write: a flush of a file still empty, its bytes written after, publishes unflushed
-/// data. `Err` says what was missing.
+/// **last** content event (a write, or a clone or copy onto it): a flush of a file still empty,
+/// its bytes put in after, publishes unflushed data. `Err` says what was missing.
 pub fn published_durably(events: &[Event], target: &Path) -> Result<(), String> {
     let p = publication(events, target)
         .ok_or_else(|| format!("no rename onto {} was recorded", target.display()))?;
@@ -300,11 +317,13 @@ pub fn published_durably(events: &[Event], target: &Path) -> Result<(), String> 
     if !p.chmods.is_empty() {
         missing.push(format!("chmod after creation: {:?}", p.chmods));
     }
-    if p.writes.is_empty() {
-        missing.push("no write to it was recorded".to_owned());
+    if p.content.is_empty() {
+        missing.push("no write, clone or copy into it was recorded".to_owned());
     }
     if p.synced_before.is_empty() {
-        missing.push("not flushed after its last write and before the rename".to_owned());
+        missing.push(
+            "not flushed after its last write, clone or copy, and before the rename".to_owned(),
+        );
     }
     let dir_ok = p
         .dir_synced_after
