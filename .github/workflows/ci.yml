@@ -137,6 +137,15 @@ jobs:
       # No proof is excluded by name any more (V210-19, #192): `cross_process_join_proof`, excused
       # as a flake since v0.2.2, passed 20 of 20 on integrate/v0.2.10 and is back in this gate.
       # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
+      # ADR-025's P9 and P10 proofs run a deliberately misbehaving sync sender as the faulty peer
+      # (no `vox` command makes a correct node misbehave). It is built here from this commit, into
+      # its own path, and named to them by VOX_MUTANT_SENDER; the script rebuilds the shipped
+      # binary with the default features afterwards and checks that it does not carry the mutant.
+      # Without this both proofs fail as CANNOT MEASURE (run 36389831839).
+      - name: Build the mutant sender (ADR-025 P9, P10)
+        run: |
+          path=$(scripts/build-mutant-sender.sh)
+          echo "VOX_MUTANT_SENDER=$path" >> "$GITHUB_ENV"
       - name: Real-parameter gates (release)
         run: |
           cargo test --release --workspace --no-fail-fast -- --ignored \

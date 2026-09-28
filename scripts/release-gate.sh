@@ -57,6 +57,13 @@ step "fmt" cargo fmt --all --check
 step "clippy" polite cargo clippy --all-targets -- -D warnings
 step "debug suite" polite cargo test --workspace --no-fail-fast
 step "rustdoc" env RUSTDOCFLAGS="-D warnings" nice -n 10 cargo doc --workspace --no-deps
+# ADR-025 P9 and P10 run against the mutant sender, built from this commit (as CI builds it).
+if VOX_MUTANT_SENDER=$(polite scripts/build-mutant-sender.sh); then
+  export VOX_MUTANT_SENDER
+  note "mutant sender: $VOX_MUTANT_SENDER"
+else
+  bad "building the mutant sender"
+fi
 step "release suite (all proofs, live-model and transport included)" \
   polite cargo test --release --workspace --no-fail-fast -- --ignored
 

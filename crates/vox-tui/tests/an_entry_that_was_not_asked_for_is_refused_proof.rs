@@ -10,10 +10,13 @@
 //! (security-relevant: the sender chooses what the receiver stores).
 //!
 //! ## The mutant sender
-//! Built from this tree with one change (see the ADR-025 P9 branch notes): its `HAVE` hides the
-//! newest entry of every feed (it advertises `max_seq - 1`), and it serves that hidden entry on
-//! every session anyway. A correct receiver never asks for it. Its path is `VOX_MUTANT_SENDER`;
-//! without it the proof cannot measure and says so.
+//! `vox` built from this tree with vox-core's `mutant-sender` feature, by
+//! `scripts/build-mutant-sender.sh` (CI and the release gate run it before the proofs), and started
+//! with `VOX_MUTANT_SENDER_MODE=serve-unasked`: its `HAVE` hides the newest entry of every feed (it
+//! advertises `max_seq - 1`), and it serves that hidden entry on every session anyway. A correct
+//! receiver never asks for it. Its path is `VOX_MUTANT_SENDER`. Without it, or if it is not a
+//! mutant build, or if it never announces the mode, the proof cannot measure and says so; and the
+//! shipped binary the other member runs must not carry the mutant's marker.
 //!
 //! ## Staging
 //! Two daemons, no anchor. After the warm-up, Alice posts "p9 visible" and then "p9 hidden". The
@@ -38,27 +41,27 @@ mod watchdog;
 
 use std::time::{Duration, Instant};
 
-use sync_pair::{counter, failures, Member};
+use sync_pair::{announced, counter, failures, mutant_sender, Member};
 
 /// How long Bob is watched for the entry he did not ask for.
 const WATCH: Duration = Duration::from_secs(10);
 /// What the receiver says of it.
 const VIOLATION: &str = "the peer served an entry that was not asked for";
+/// The mutant sender's misbehaviour here.
+const MODE: &str = "serve-unasked";
 
 #[test]
-#[ignore = "a real daemon against a mutant sender build (VOX_MUTANT_SENDER); run by hand in release"]
+#[ignore = "a real daemon against the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
 fn an_entry_that_was_not_asked_for_is_refused() {
     watchdog::arm();
-    let sender = std::env::var("VOX_MUTANT_SENDER").unwrap_or_else(|_| {
-        panic!("CANNOT MEASURE: VOX_MUTANT_SENDER does not name the mutant sender build")
-    });
+    let sender = mutant_sender();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let alice = Member::new(root, "alice");
     let bob = Member::new(root, "bob");
     alice.trust(&bob);
     bob.trust(&alice);
-    let alice_d = alice.daemon_bin(&sender, None);
+    let alice_d = alice.daemon_mutant(&sender, MODE, None);
     let bob_d = bob.daemon(None);
     let room = alice.create("pair");
     bob.join(&alice.invite(&room), "pair");
@@ -112,6 +115,11 @@ fn an_entry_that_was_not_asked_for_is_refused() {
         "[proof] P9: visible read after {visible_at:?}; hidden read after {hidden_at:?}; bob's \
          sessions with alice failed {failed}; last failures {:?}",
         failures(&st)
+    );
+    assert!(
+        announced(&alice_d, MODE),
+        "CANNOT MEASURE: alice's daemon never announced the mutant mode {MODE:?}\nalice:\n{}",
+        alice_d.transcript()
     );
     assert!(
         visible_at.is_some(),
