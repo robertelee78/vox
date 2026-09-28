@@ -3184,7 +3184,7 @@ impl Node {
                 .nodes()
                 .iter()
                 .map(|a| a.id)
-                .filter(|id| net.manager().existing(id).is_some())
+                .filter(|id| net.manager().holds(id))
                 .collect();
             for lost in self.anchors_up.difference(&up) {
                 net.manager().note(
@@ -3211,10 +3211,6 @@ impl Node {
             }
             let net = Arc::clone(&net);
             let tx = self.net_tx.clone();
-            net.manager().note(
-                anchor.id,
-                "no connection to this anchor: redialling it".to_owned(),
-            );
             tokio::spawn(async move {
                 match net.manager().connect(anchor.id, &anchor.endpoints).await {
                     Ok(conn) => {

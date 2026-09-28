@@ -436,6 +436,14 @@ impl ConnectionManager {
         *lock(&self.notes) = Some(events);
     }
 
+    /// Whether a live connection to `peer` is held, **looking only**: unlike [`Self::existing`]
+    /// this neither drops a dead connection nor promotes a retired one, so a diagnostic can ask
+    /// without changing what it observes.
+    #[must_use]
+    pub fn holds(&self, peer: &Digest32) -> bool {
+        lock(&self.conns).get(peer).is_some_and(|c| is_live(c))
+    }
+
     /// One [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote), if
     /// anyone is listening.
     pub fn note(&self, peer: Digest32, note: String) {
