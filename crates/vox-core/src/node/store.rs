@@ -263,13 +263,10 @@ impl Store {
                 detail: format!("{}: {e}", self.path.display()),
             });
         }
-        if let Some(dir) = self.path.parent() {
-            if let Ok(d) = std::fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-        }
+        // The store is open again before the directory's flush is reported, so a failed flush
+        // leaves a usable store and says so, rather than being ignored (V210-55).
         *backing = Backing::Writable(Database::create(&self.path).map_err(open_error)?);
-        Ok(())
+        super::paths::sync_dir(&self.path)
     }
 
     /// Begin a read transaction on whichever handle is open.

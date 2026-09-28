@@ -5,6 +5,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms"]
+# Test apparatus only (V210-55, #242): built on its own by the proofs that need it, never a member,
+# never linked into vox.
+exclude = ["crates/vox-test-interpose"]
 
 [workspace.package]
 version = "0.2.9"
