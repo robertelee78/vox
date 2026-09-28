@@ -5526,9 +5526,12 @@ impl Node {
     }
 
     /// Delete every superseded sender-key generation this node no longer needs
-    /// (ADR-023 decision 4, PRD-001 R14), room by room: kept only while a trusted
-    /// identity with a **full-history** grant is still owed its consent there, because
-    /// that grant is what the old generations exist to serve.
+    /// (ADR-023 decision 4, PRD-001 R14), room by room. Kept: every generation while a
+    /// trusted identity with a **full-history** grant is still owed its consent there; and
+    /// otherwise every generation from the oldest a decision-dated release still owes
+    /// (V210-45) — a trusted identity not yet consented to, joined or not, and history not
+    /// yet delivered. Deleting those left a member trusted before it joined unable to read
+    /// what was posted after its trust (found by #226's log-path proof: 3 of 6).
     async fn prune_superseded_keys(&mut self) {
         let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
             return;
@@ -5539,6 +5542,7 @@ impl Node {
             .into_iter()
             .filter(|fp| self.trust.history(fp) == crate::node::trust::HistoryGrant::Full)
             .collect();
+        let trusted: BTreeSet<Digest32> = self.trust.trusted().into_iter().collect();
         for shared in self.channels.values() {
             // A room mid-session is skipped, not waited for; the next tick comes round.
             let Ok(mut channel) = shared.try_lock() else {
@@ -5547,7 +5551,10 @@ impl Node {
             if channel.key_generations() <= 1 || !channel.owed_consents(&full).is_empty() {
                 continue;
             }
-            let _ = channel.prune_superseded_origins(&store);
+            let keep_from = channel
+                .oldest_generation_needed(&trusted)
+                .unwrap_or(u64::MAX);
+            let _ = channel.prune_superseded_origins(&store, keep_from);
         }
     }
 

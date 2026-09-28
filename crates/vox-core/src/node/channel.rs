@@ -2193,13 +2193,30 @@ impl ChannelState {
             .len()
     }
 
+    /// The oldest generation of this identity's sender key that a release still owes
+    /// someone (V210-45): the generation a `trusted` identity's trust mark stands in, for
+    /// one this identity has not consented to yet — whether or not it has joined — and
+    /// every history floor still owed. `None`: nothing older than the live one is needed.
+    #[must_use]
+    pub fn oldest_generation_needed(&self, trusted: &BTreeSet<Digest32>) -> Option<u64> {
+        let pending = self
+            .trust_marks
+            .iter()
+            .filter(|(id, _)| trusted.contains(*id) && !self.entitled.contains_key(*id))
+            .map(|(_, (_, chain_id, _))| *chain_id);
+        pending.chain(self.history.values().copied()).min()
+    }
+
     /// Delete every superseded generation's origin key (ADR-023 decision 4, PRD-001
-    /// R14), keeping only the live one. The caller decides *when*: not while a
-    /// full-history grant is still owed to somebody, because that grant is the one thing
-    /// the old generations are kept for. Returns how many were deleted.
-    pub fn prune_superseded_origins(&mut self, store: &Store) -> Result<usize> {
+    /// R14) older than generation `keep_from`, and never the live one. The caller decides
+    /// *when* and *from where*: nothing a release still owes somebody —
+    /// [`Self::oldest_generation_needed`], or all of it while a full-history grant is owed
+    /// — because "no longer needed" is what R14 deletes. Returns how many were deleted.
+    pub fn prune_superseded_origins(&mut self, store: &Store, keep_from: u64) -> Result<usize> {
         let live = self.sender.chain_id();
-        let gone = self.origins.retain_only(&self.channel_id, self.epoch, live);
+        let gone = self
+            .origins
+            .retain_from(&self.channel_id, self.epoch, keep_from.min(live));
         if gone == 0 {
             return Ok(0);
         }
