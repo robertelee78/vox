@@ -1898,6 +1898,8 @@ pub struct Node {
     /// The anchors this node held a connection to at the last look, so losing one is said when
     /// it happens, not only when it is next redialled (#229's diagnostics).
     anchors_up: BTreeSet<Digest32>,
+    /// Peers a room's sync is dialling right now (`reach_for_sync`), so one is not dialled twice.
+    sync_dials: BTreeSet<Digest32>,
     /// When the granted mappings must be renewed (unix seconds), or `None` when there
     /// is nothing to renew. A mapping a gateway grants for two hours outlives no
     /// long-running node by itself: it is re-requested at half its lifetime, the
@@ -2188,6 +2190,7 @@ impl Node {
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeSet::new(),
+            sync_dials: BTreeSet::new(),
             renew_mappings_at: None,
             ports: BTreeMap::new(),
             port_queue: crate::node::ports::Queue::default(),
@@ -3550,6 +3553,7 @@ impl Node {
                 board,
             } => {
                 let peer = conn.peer_id();
+                self.sync_dials.remove(&peer);
                 self.adopt_connection(Arc::clone(&conn));
                 if let Some(net) = self.net.as_ref().map(Arc::clone) {
                     if crate::node::net::path_class(net.manager().endpoint(), &conn)
@@ -3731,6 +3735,28 @@ impl Node {
                             format!(
                                 "dialling this anchor failed ({why}); the next try is in {wait}s"
                             ),
+                        );
+                    }
+                }
+                self.sync_dials.remove(&peer);
+                // A member no reach could get to: its ports that have no connection back off as
+                // Unreachable (ADR-025 D5), so the scheduler does not ask again at once (#246).
+                let unconnected = self
+                    .net
+                    .as_ref()
+                    .is_some_and(|n| n.manager().existing(&peer).is_none());
+                if unconnected {
+                    let rooms: Vec<Digest32> = self
+                        .ports
+                        .keys()
+                        .filter(|(_, p)| *p == peer)
+                        .map(|(r, _)| *r)
+                        .collect();
+                    for room in rooms {
+                        self.enter_backoff(
+                            room,
+                            peer,
+                            crate::node::status::BackoffKind::Unreachable,
                         );
                     }
                 }
@@ -5765,6 +5791,35 @@ impl Node {
                 self.port_queue.remove(&room, &peer);
             }
         }
+        // **A port with no connection reaches its peer** (ADR-025 D2, V210-58 #246). A port runs
+        // only over a connection that exists, and nothing else dials a member for sync: members are
+        // dialled for key work, and through the board's anchor. So a member whose connection was
+        // dropped — silent past `SILENCE_IS_DEATH` (30 s), a laptop lid, a frozen process — was
+        // never synced with again once the anchor was gone too: two members with a backlog each
+        // for the other sat for 150 s with neither dialling (CI run 36452063803). One reach per
+        // peer at a time, off the actor, paced by the port's own backoff: a failed reach backs the
+        // peer's ports off as Unreachable (`NetEvent::ReachFailed`, 200 ms doubling to 8 s). Not
+        // `reach_member`'s 30 s spacing for key work: with it, two members who each tried the other
+        // while the other was away could not try again for up to 30 s after both were back (#246's
+        // proof: 1 run in 2 still unsynced 10 s after).
+        let lacking: std::collections::BTreeMap<Digest32, Digest32> = self
+            .ports
+            .iter()
+            .filter(|(key, port)| {
+                port.out.is_none()
+                    && port.needs()
+                    && !port.backing_off(now)
+                    && !self.publishing.contains(*key)
+                    && self
+                        .net
+                        .as_ref()
+                        .is_some_and(|n| n.manager().existing(&key.1).is_none())
+            })
+            .map(|((room, peer), _)| (*peer, *room))
+            .collect();
+        for (peer, room) in lacking {
+            self.reach_for_sync(&room, peer);
+        }
         let mut ran = false;
         loop {
             let slots = Arc::clone(&self.slots);
@@ -6839,6 +6894,51 @@ impl Node {
             });
         }
         None
+    }
+
+    /// Reach `peer` for a room's sync (ADR-025 D2, #246): one dial at a time per peer, off the
+    /// actor, reporting `Dialed` (a new connection, which clears the port's backoff) or
+    /// `ReachFailed` (which backs it off). Unlike [`Self::reach_member`] it keeps no spacing of its
+    /// own: the port's backoff paces it.
+    ///
+    /// **Not an anchor.** An anchor has its own dial (`redial_anchors_if_due`, V210-57): paced by
+    /// its own backoff, and announced as `AnchorConnected`, which records when it connected and
+    /// publishes this node's records to it. A sync reach to an anchor would be a second dial
+    /// that bypasses both, and its failure would advance the anchor's backoff as well as the
+    /// port's. When the anchor path reconnects it, the new connection syncs like any other.
+    fn reach_for_sync(&mut self, channel_id: &Digest32, peer: Digest32) {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        if self.anchors.nodes().iter().any(|a| a.id == peer) {
+            return;
+        }
+        if net.manager().existing(&peer).is_some() || !self.sync_dials.insert(peer) {
+            return;
+        }
+        let endpoints = net.board_endpoints(channel_id, &peer);
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            match net.reach(peer, &endpoints).await {
+                Ok(conn) => {
+                    let _ = tx
+                        .send(NetEvent::Dialed {
+                            conn,
+                            endpoints,
+                            board: false,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(NetEvent::ReachFailed {
+                            peer,
+                            why: e.to_string(),
+                        })
+                        .await;
+                }
+            }
+        });
     }
 
     /// The pairwise session for `(channel, target)`, opening one from that member's
