@@ -18,7 +18,7 @@ import os, sys
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, TAG = sys.argv[1:7]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "180"))
@@ -69,6 +69,7 @@ except Hung as h:
     print(f"{TAG} HUNG at {h}")
     code = 1
 finally:
+    disarm()
     if tui is not None and not tui.stop():
         # A driver that cannot stop what it started has leaked it, and is how a job hangs (#240).
         print(f"{TAG} RED: vox tui (pid {tui.pid}) outlived SIGKILL and could not be reaped")

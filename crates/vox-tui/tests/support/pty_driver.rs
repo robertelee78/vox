@@ -8,11 +8,12 @@
 //!   prints if it hangs, reach the log as they happen, whatever becomes of this process after;
 //! - its **stdout** (the verdict lines) is collected and returned;
 //! - past [`BOUND`] it is sent SIGTERM, on which it prints `HUNG at <stage>` with its stack and
-//!   stops every process it started; if it still runs [`GRACE`] later it is killed. Either way,
-//!   every process it had started when it was told to stop (found by parent pid, deepest first)
-//!   and that is still alive afterwards is killed — so a driver that dies without its own cleanup
-//!   (SIGTERM with no handler kills Python outright, measured) leaves no `vox` daemon behind,
-//!   reparented to init.
+//!   stops every process it started; if it still runs [`GRACE`] later it is killed;
+//! - **however the driver ends** — a pass, a red, its own `faulthandler` backstop hard-exiting, or
+//!   this bound — every process it was seen to start (found by parent pid, every
+//!   [`SNAPSHOT_EVERY`]) that is still alive and now orphaned is killed. A driver that dies
+//!   without its own cleanup (SIGTERM with no handler kills Python outright, measured; so does
+//!   `faulthandler`'s exit) leaves no `vox` daemon behind, reparented to init.
 //!
 //! The driver's own budget (`VOX_PTY_BUDGET_SECS`, 240 s by default) comes first; this bound is
 //! the backstop for a driver that cannot run its own.
@@ -26,6 +27,9 @@ use std::time::{Duration, Instant};
 pub const BOUND: Duration = Duration::from_secs(360);
 /// How long a driver told to stop has to clean up before it is killed.
 pub const GRACE: Duration = Duration::from_secs(30);
+/// How often the driver's processes are looked up, so that whatever it leaves behind, however it
+/// ends, is known.
+pub const SNAPSHOT_EVERY: Duration = Duration::from_secs(1);
 
 /// What a driver run came to: its exit code (`None` if it was killed or killed by a signal), and
 /// everything it printed on stdout.
@@ -53,17 +57,22 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
         s
     });
     let mut stopped = None;
-    let mut below: Vec<u32> = Vec::new();
+    let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut looked = Instant::now() - SNAPSHOT_EVERY;
     let status = loop {
+        if looked.elapsed() >= SNAPSHOT_EVERY {
+            seen.extend(descendants(child.id()));
+            looked = Instant::now();
+        }
         if let Some(status) = child.try_wait().expect("wait for the driver") {
             break Some(status);
         }
         match stopped {
             None if t0.elapsed() >= BOUND => {
-                below = descendants(child.id());
+                seen.extend(descendants(child.id()));
                 eprintln!(
                     "[pty] the driver still runs after {BOUND:?}: sending it SIGTERM (pid {}; it \
-                     started {below:?})",
+                     started {seen:?})",
                     child.id()
                 );
                 let _ = Command::new("kill")
@@ -81,8 +90,9 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    // Whatever the driver had started when it was told to stop, and left alive, goes now.
-    let left: Vec<u32> = below.iter().copied().filter(|&p| alive(p)).collect();
+    // Whatever the driver started and left behind, however it ended, goes now: alive, and
+    // orphaned — its parent gone, so nothing else will ever stop it.
+    let left: Vec<u32> = seen.iter().copied().filter(|&p| orphaned(p)).collect();
     if !left.is_empty() {
         eprintln!("[pty] the driver left {left:?} running: killing them");
         for pid in &left {
@@ -135,11 +145,12 @@ fn descendants(root: u32) -> Vec<u32> {
     found
 }
 
-/// Whether `pid` is still running (`kill -0`).
-fn alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
+/// Whether `pid` is still running and has been reparented to init: a process the driver left
+/// behind. A pid that exited (and was perhaps reused by something with a live parent) is not.
+fn orphaned(pid: u32) -> bool {
+    Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
 }

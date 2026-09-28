@@ -14,7 +14,7 @@ import os, re, subprocess, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
 
 VOX, TAG = sys.argv[1], sys.argv[2]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "240"))
@@ -137,6 +137,7 @@ except Hung as h:
     print(f"{TAG} HUNG at {h}")
     code = 1
 finally:
+    disarm()
     stage("stopping every process")
     if tui is not None and not tui.stop():
         # A driver that cannot stop what it started has leaked it, and is how a job hangs (#240).

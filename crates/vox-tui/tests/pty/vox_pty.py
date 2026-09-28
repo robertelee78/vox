@@ -62,6 +62,14 @@ def arm(secs, tag):
     faulthandler.dump_traceback_later(secs + 60, exit=True)
 
 
+def disarm():
+    """The run is over: its budget no longer applies. Called first thing in a driver's cleanup,
+    so a run that finished just under budget is not interrupted while it cleans up; the
+    cleanup's own waits are bounded, and the Rust wrapper's bound still stands behind them."""
+    signal.alarm(0)
+    faulthandler.cancel_dump_traceback_later()
+
+
 def reap(pid, secs, drain=None):
     """Wait for `pid` at most `secs`, calling `drain` meanwhile; whether it was reaped."""
     end = time.time() + secs
