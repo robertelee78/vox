@@ -167,7 +167,7 @@ fn profile_busy(socket: &std::path::Path) -> AppError {
 /// **Whatever holds a profile answers for it** (V030-04 #236, V030-05 #237). A one-shot verb
 /// — `serve`, `connect`, `service`, `forward`, `up`, `lan up` — holds the profile for as long as
 /// it runs, and served nothing: `vox status`, `vox trust add/remove` and the `vox room …` verbs
-/// were refused with [`profile_busy`]'s message, which named a control socket that did not
+/// were refused with `profile_busy`'s message, which named a control socket that did not
 /// exist and a remedy that did not work, and withdrawing trust from a running LAN took a
 /// restart. Now the running node answers on the socket the message names, as a `vox daemon`'s
 /// does.
