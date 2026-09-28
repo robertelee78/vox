@@ -2216,6 +2216,53 @@ fn held_consent_key(
     Ok(s)
 }
 
+/// Every `(chain_id, iteration)` a consent releases, oldest first (V210-45).
+type ReleasePlan = Vec<(u64, u64)>;
+
+/// What a consent to `target` releases, and the key that goes to it now — **the same whichever
+/// path carries it**, the pairwise stream or the room's log (V210-45, PRD-001 R12, #226): what a
+/// member may read depends on when it was trusted, never on how its key travelled.
+///
+/// Returns the key to deliver now (the live generation) and the plan: every `(chain_id, iteration)`
+/// the consent covers, oldest first, or `None` when it covers only the delivered key's own position.
+/// The plan's first position is the member's entitlement; the generations before the live one are
+/// owed as history and go out as their own deliveries.
+///
+/// - **Full history** (R12): every generation still held, each from its origin.
+/// - Otherwise, **dated by the decision** (V210-45): every generation minted after the decision
+///   whole, the one live at the decision from where it stood then, nothing older.
+/// - With no plan (no recorded decision), **the key held since the consent was decided**
+///   (V210-30).
+fn consent_release(
+    consent_keys: &mut crate::node::pending_consent::PendingConsents,
+    profile: &Profile,
+    channel: &ChannelState,
+    channel_id: &Digest32,
+    target: Digest32,
+    full: bool,
+    decision: Option<crate::node::consent_order::Stamp>,
+) -> crate::error::Result<(crate::group::skdm::Skdm, Option<ReleasePlan>)> {
+    if full {
+        let mut all = channel.skdms_for_full_history(profile)?;
+        let plan = all
+            .iter()
+            .map(|s| (s.body.chain_id, s.body.iteration))
+            .collect();
+        let live = all.pop().ok_or(crate::error::Error::MalformedAtRest(
+            "a full-history grant with no live generation",
+        ))?;
+        return Ok((live, Some(plan)));
+    }
+    let plan = channel.history_plan(&target, decision);
+    if let Some(&(live, from)) = plan.as_ref().and_then(|p| p.last()) {
+        return Ok((channel.release_generation(profile, live, from)?, plan));
+    }
+    Ok((
+        held_consent_key(consent_keys, profile, channel, channel_id, target)?,
+        None,
+    ))
+}
+
 /// Drop the key held for a consent, **before** the consent is recorded, never after: a key left on
 /// disk would be delivered again after a revocation and a new consent (found in verification of
 /// #203). An error means nothing was removed, and the consent must not be recorded.
@@ -5084,57 +5131,21 @@ impl Node {
                 // it and cannot know we are releasing to the right party.
                 return Outcome::Failed(Fault::UnknownChannel);
             }
-            if full {
-                // **PRD-001 R12, every generation still held, each at its origin.** The live
-                // generation's key is delivered here; the older ones are owed below as history
-                // from the oldest one's origin, and the re-key round delivers them, retrying until
-                // each is taken — the same path V210-45's owed history takes.
-                let mut all = match channel.skdms_for_full_history(profile) {
-                    Ok(all) => all,
-                    Err(e) => return Outcome::Failed(fault_of(&e)),
-                };
-                plan = Some(
-                    all.iter()
-                        .map(|s| (s.body.chain_id, s.body.iteration))
-                        .collect(),
-                );
-                let Some(live) = all.pop() else {
-                    return Outcome::Failed(Fault::Internal);
-                };
-                live
-            } else {
-                // **Consent is dated by the decision, not the delivery** (V210-45), in the
-                // profile's logical consent order, never by a clock. Every generation minted
-                // after the decision goes whole; the one live at the decision goes from where it
-                // stood then; nothing older. The live generation's key is delivered here, and the
-                // older ones the plan covers are owed below and delivered by the re-key round,
-                // which retries until each is taken. Without this a member trusted before a room
-                // existed, joining after 1,500 posts, read only the 500 of the generation live at
-                // its join.
-                plan = channel.history_plan(&target, decision);
-                if let Some(&(live, from)) = plan.as_ref().and_then(|p| p.last()) {
-                    match channel.release_generation(profile, live, from) {
-                        Ok(s) => s,
-                        Err(e) => return Outcome::Failed(fault_of(&e)),
-                    }
-                } else {
-                    // **The key is taken once, when the consent is decided** (V210-30). A member
-                    // that cannot be reached now gets, whenever it is reached, the key from this
-                    // moment — not one built then, from a later position, which would leave every
-                    // post made in between sealed before it and unreadable to that member for
-                    // good. A key taken for an earlier epoch (the passphrase was rotated since) is
-                    // no key for this one.
-                    match held_consent_key(
-                        &mut self.consent_keys,
-                        profile,
-                        &channel,
-                        channel_id,
-                        target,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => return Outcome::Failed(fault_of(&e)),
-                    }
+            // PRD-001 R12's full history, or V210-45's decision-dated plan (`consent_release`).
+            match consent_release(
+                &mut self.consent_keys,
+                profile,
+                &channel,
+                channel_id,
+                target,
+                full,
+                decision,
+            ) {
+                Ok((skdm, p)) => {
+                    plan = p;
+                    skdm
                 }
+                Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
         // No session need exist yet: one is opened from this member's bundle record
@@ -6815,90 +6826,119 @@ impl Node {
             let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
                 continue;
             };
-            let (owes_consent, owes_rekey) = {
-                let channel = shared.lock().await;
-                (
-                    channel.owed_consents(&trusted).contains(&peer),
-                    channel.owed_rekeys().contains(&peer),
-                )
-            };
+            let owes_consent = shared.lock().await.owed_consents(&trusted).contains(&peer);
             if owes_consent {
-                // **The key held since the consent was decided** (V210-30), the one the pairwise
-                // stream would have carried. A key taken now, when the dial failed, starts after
-                // every post made since the decision, which that member could then never read:
-                // the defect V210-30 closed, back through this path (#226).
-                let skdm = {
+                // **The same release the pairwise stream would have carried** (`consent_release`):
+                // what this member may read depends on when it was trusted, never on the path its
+                // key took (V210-45, #226). A key taken now, when the dial failed, would start
+                // after every post made since the decision, which that member could then never
+                // read: the defect V210-30 closed, back through this path.
+                let full = self.trust.history(&peer) == crate::node::trust::HistoryGrant::Full;
+                let decision = self.trust_decision(&peer);
+                let (skdm, plan) = {
                     let Some(profile) = self.profile.as_ref() else {
                         return;
                     };
                     let channel = shared.lock().await;
-                    let Ok(skdm) = held_consent_key(
+                    let Ok(release) = consent_release(
                         &mut self.consent_keys,
                         profile,
                         &channel,
                         &channel_id,
                         peer,
+                        full,
+                        decision,
                     ) else {
                         continue;
                     };
-                    skdm
+                    release
                 };
-                if self.post_key_package(&channel_id, peer, &skdm).await {
-                    let now = self.now();
-                    let issued = {
-                        let Some(profile) = self.profile.as_ref() else {
-                            return;
-                        };
-                        // Forgotten before the consent is recorded, as on the direct path.
-                        if forget_consent_key(&mut self.consent_keys, profile, &channel_id, peer)
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        shared
-                            .lock()
-                            .await
-                            // A package carries the live generation only: a consent through the
-                            // log releases from now on, whatever the trust's history grant.
-                            .issue_consent(
-                                profile,
-                                peer,
-                                &skdm,
-                                false,
-                                (skdm.body.chain_id, skdm.body.iteration),
-                                now,
-                            )
-                            .is_ok()
-                    };
-                    if issued {
-                        self.note_local_append(&channel_id);
-                        let _ = self.event_tx.send(NodeEvent::Consented {
-                            channel_id,
-                            target: peer,
-                        });
-                    }
+                if !self.post_key_package(&channel_id, peer, &skdm).await {
+                    continue;
                 }
-            } else if owes_rekey {
-                let (skdm, generation) = {
+                let now = self.now();
+                let issued = {
                     let Some(profile) = self.profile.as_ref() else {
                         return;
                     };
-                    let channel = shared.lock().await;
-                    let Ok(skdm) = channel.rekey_skdm(profile) else {
+                    // Forgotten before the consent is recorded, as on the direct path.
+                    if forget_consent_key(&mut self.consent_keys, profile, &channel_id, peer)
+                        .is_err()
+                    {
                         continue;
-                    };
-                    (skdm, channel.sender_generation())
+                    }
+                    // Recorded exactly as the direct path records it: the entitlement from the
+                    // plan's first position, and the generations before the live one owed as
+                    // history, which go out below.
+                    let entitled_from = plan
+                        .as_ref()
+                        .and_then(|p| p.first().copied())
+                        .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
+                    let mut channel = shared.lock().await;
+                    channel
+                        .issue_consent(profile, peer, &skdm, full, entitled_from, now)
+                        .is_ok()
+                        && (entitled_from.0 >= skdm.body.chain_id
+                            || channel
+                                .owe_history(profile.store(), peer, entitled_from.0)
+                                .is_ok())
                 };
-                if self.post_key_package(&channel_id, peer, &skdm).await {
-                    let Some(profile) = self.profile.as_ref() else {
-                        return;
-                    };
-                    let _ = shared
-                        .lock()
-                        .await
-                        .note_delivered(profile.store(), peer, generation);
+                if issued {
+                    self.note_local_append(&channel_id);
+                    let _ = self.event_tx.send(NodeEvent::Consented {
+                        channel_id,
+                        target: peer,
+                    });
                 }
             }
+            // What this member is still owed — history from its floor, or the live generation
+            // after a rotation — each from where its entitlement begins and never before it
+            // (V210-45, #224), exactly as the direct re-key round releases it.
+            let (history, rekey, generation) = {
+                let Some(profile) = self.profile.as_ref() else {
+                    return;
+                };
+                let channel = shared.lock().await;
+                let history = channel
+                    .owed_history()
+                    .get(&peer)
+                    .and_then(|floor| channel.history_skdms(profile, &peer, *floor).ok())
+                    .filter(|batch| !batch.is_empty());
+                let rekey = if history.is_none() && channel.owed_rekeys().contains(&peer) {
+                    channel.rekey_skdm_for(profile, &peer).ok()
+                } else {
+                    None
+                };
+                (history, rekey, channel.sender_generation())
+            };
+            let owed_history = history.is_some();
+            let keys: Vec<crate::group::skdm::Skdm> = match (history, rekey) {
+                (Some(batch), _) => batch,
+                (None, Some(k)) => vec![k],
+                (None, None) => continue,
+            };
+            let mut all_posted = true;
+            for key in &keys {
+                if !self.post_key_package(&channel_id, peer, key).await {
+                    all_posted = false;
+                    break;
+                }
+            }
+            if !all_posted {
+                continue;
+            }
+            // Recorded only after every package went out, so a failed post stays owed.
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let mut channel = shared.lock().await;
+            let history_noted = if owed_history {
+                channel.note_history_delivered(profile.store(), &peer)
+            } else {
+                Ok(())
+            };
+            let _ = history_noted
+                .and_then(|()| channel.note_delivered(profile.store(), peer, generation));
         }
     }
 
