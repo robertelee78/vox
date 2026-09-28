@@ -162,6 +162,23 @@ fn profile_busy(socket: &std::path::Path) -> AppError {
     ))
 }
 
+/// Serve this profile's control socket for as long as the returned guard lives.
+///
+/// **Whatever holds a profile answers for it** (V030-04 #236, V030-05 #237). A one-shot verb
+/// — `serve`, `connect`, `service`, `forward`, `up`, `lan up` — holds the profile for as long as
+/// it runs, and served nothing: `vox status`, `vox trust add/remove` and the `vox room …` verbs
+/// were refused with [`profile_busy`]'s message, which named a control socket that did not
+/// exist and a remedy that did not work, and withdrawing trust from a running LAN took a
+/// restart. Now the running node answers on the socket the message names, as a `vox daemon`'s
+/// does.
+pub fn serve_control_socket(
+    node: &NodeHandle,
+    socket: std::path::PathBuf,
+) -> Result<vox_core::node::ipc::IpcServer, AppError> {
+    vox_core::node::ipc::bind_at(node.clone(), socket)
+        .map_err(|e| AppError::Usage(format!("control socket: {e}")))
+}
+
 pub async fn open_profile(
     paths: Paths,
     listen: SocketAddr,
@@ -937,6 +954,7 @@ where
     F: FnOnce(NodeHandle, Digest32) -> Fut,
     Fut: std::future::Future<Output = Result<(), AppError>>,
 {
+    let socket = target.paths.socket_file();
     let (node, channel_id) = open_room(
         target.paths,
         target.listen,
@@ -946,6 +964,7 @@ where
         &target.room_passphrase,
     )
     .await?;
+    let _control = serve_control_socket(&node, socket)?;
     let handle = node.clone();
     let result = body(node, channel_id).await;
     // The verbs are one-shot; `forward` shuts the node down itself when the person

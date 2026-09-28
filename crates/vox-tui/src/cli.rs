@@ -221,7 +221,9 @@ where
     let listen = profile.listen;
     let anchors_for_body = anchors.clone();
     let outcome = rt.block_on(async move {
+        let socket = paths.socket_file();
         let node = crate::tunnel_cli::open_profile(paths, listen, anchors, &identity).await?;
+        let _control = crate::tunnel_cli::serve_control_socket(&node, socket)?;
         body(node, anchors_for_body).await
     });
     match outcome {
@@ -422,6 +424,10 @@ pub struct LanUpArgs {
     /// sends still come back. ICMP echo always passes.
     #[arg(long, value_delimiter = ',')]
     pub allow: Vec<u16>,
+    /// Serve Prometheus metrics on this local address (`127.0.0.1:9090`), as `vox daemon
+    /// --metrics` does.
+    #[arg(long)]
+    pub metrics: Option<SocketAddr>,
 }
 
 /// `vox app` — app streams from a shell, over a running node.
@@ -2153,7 +2159,19 @@ pub fn run() -> ExitCode {
             }
             let (socket, stats) = (a.helper_socket.clone(), a.stats_file.clone());
             let allow = a.allow.iter().copied().collect();
+            let metrics = a.metrics;
             run_tunnel_verb(a.room.clone(), move |node, cid| async move {
+                if let Some(addr) = metrics {
+                    let listener = vox_core::node::status::bind_metrics(addr)
+                        .await
+                        .map_err(|e| crate::app::AppError::Usage(e.to_string()))?;
+                    let bound = listener.local_addr().map_err(crate::app::AppError::Io)?;
+                    tokio::spawn(vox_core::node::status::serve_metrics(
+                        listener,
+                        node.clone(),
+                    ));
+                    println!("vox lan: metrics http://{bound}/metrics");
+                }
                 crate::lan_cli::up(&node, cid, socket, stats, allow).await
             })
         }
