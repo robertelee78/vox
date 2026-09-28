@@ -296,7 +296,7 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Flush the directory holding `path`, so a rename into it is durable.
 #[cfg(unix)]
-fn sync_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     let Some(dir) = path.parent() else {
         return Ok(());
     };
@@ -324,7 +324,7 @@ fn sync_dir(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> Result<()> {
+pub(crate) fn sync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
