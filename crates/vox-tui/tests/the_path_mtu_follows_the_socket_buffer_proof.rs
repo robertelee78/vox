@@ -37,7 +37,9 @@
 //!
 //! On a Mac (`kern.ipc.maxsockbuf` 8 MiB by default) the grant is full, and a short one there is
 //! CANNOT MEASURE rather than a pass, so the no-notice arm is always the one measured. On CI's
-//! ubuntu runner the grant is short and the notice arm is measured. Both arms are in CI's release
+//! ubuntu runner the grant is short and the notice arm is measured; a Linux host that grants the
+//! full buffer is CANNOT MEASURE too, so the Linux arm can never pass silently on the no-notice
+//! path, which the always-8192 mutant would also pass. Both arms are in CI's release
 //! `--ignored` job, which runs on both runners.
 //!
 //! **Mutations that must turn it red.**
@@ -129,6 +131,14 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
             !short,
             "CANNOT MEASURE: this Mac granted {granted} bytes of the 4 MiB asked for \
              (kern.ipc.maxsockbuf below 8 MiB?); the macOS arm of this proof is the full grant"
+        );
+    }
+    if cfg!(target_os = "linux") {
+        assert!(
+            short,
+            "CANNOT MEASURE: this Linux host granted the full {granted} bytes read back \
+             (net.core.rmem_max at least 4 MiB?); the Linux arm of this proof is the short grant, \
+             and a full one here would pass without ever measuring the 1452 notice"
         );
     }
     let expected_notice = format!(
