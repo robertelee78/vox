@@ -207,6 +207,20 @@ good.
 **Raising a request** (`req_gen += 1`): a new connection, the tick, new board members, a person's
 `vox room sync`, and a D3 or D5 outcome.
 
+**A port with no connection reaches its peer** (added 2026-09-28, V210-58, #246). A port that needs a
+session and is not backing off, but has no connection to its peer, must reach that peer itself:
+- off the actor;
+- one reach per peer at a time;
+- from the member's known addresses (this node's board and peer book);
+- never through a session.
+
+A reach that fails backs that peer's unconnected ports off as `Unreachable` (D5). One that succeeds is
+a new connection, which D2 already makes a trigger and D5 a reset.
+
+Before this, a connection dropped as dead (silent past `SILENCE_IS_DEATH`) was never replaced when no
+anchor was left between the two members, and neither synced with the other again. CI saw this twice,
+in `two_backlogs_meet_proof`.
+
 **Capture and consumption:**
 - An attempt captures `req_at_start` when it is admitted.
 - A completion that D3 counts as **clean** sets `req_done = max(req_done, req_at_start)`.
