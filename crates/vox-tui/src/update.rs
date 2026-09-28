@@ -889,18 +889,33 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
 const RUNS_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whether `path` is a `vox` that runs: `--version` exits 0 within [`RUNS_WITHIN`] and says
-/// `vox <version>` (#247, verifier). A leftover a power loss may have cut short is installed only
-/// on this; one that hangs, fails, or answers anything else is not a `vox`.
+/// exactly `vox <major>.<minor>.<patch>`, with an optional `-<pre-release>` (#247, verifier). A
+/// leftover a power loss may have cut short is installed only on this; one that hangs, fails, or
+/// answers anything else is not a `vox`.
+///
+/// **Bounded whatever it starts.** It runs in its own process group, and the whole group is
+/// killed on the timeout *and* once it has exited, before its output is read: a leftover that left
+/// a child holding stdout would otherwise keep the read open past the bound (a staged one took
+/// 12 s and was installed), and one that hung would leave its children behind.
 fn runs_as_vox(path: &Path) -> bool {
+    use std::os::unix::process::CommandExt as _;
     let Ok(mut child) = Command::new(path)
         .arg("--version")
         .env_clear()
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
     else {
         return false;
+    };
+    let kill_group = |pgid: u32| {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{pgid}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     };
     let started = std::time::Instant::now();
     let status = loop {
@@ -910,12 +925,15 @@ fn runs_as_vox(path: &Path) -> bool {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             _ => {
+                kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 return false;
             }
         }
     };
+    // Whatever it started is gone before its output is read, so the read ends now.
+    kill_group(child.id());
     let mut out = Vec::new();
     if let Some(mut stdout) = child.stdout.take() {
         let _ = stdout
@@ -923,17 +941,31 @@ fn runs_as_vox(path: &Path) -> bool {
             .take(MAX_VERSION_OUTPUT_BYTES as u64 + 1)
             .read_to_end(&mut out);
     }
-    if !status.success() || out.len() > MAX_VERSION_OUTPUT_BYTES {
+    status.success() && out.len() <= MAX_VERSION_OUTPUT_BYTES && says_vox_version(&out)
+}
+
+/// Whether `out` is exactly `vox <major>.<minor>.<patch>[-<pre-release>]` and a line end.
+fn says_vox_version(out: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(out) else {
         return false;
-    }
-    let text = String::from_utf8_lossy(&out);
-    let mut words = text.split_whitespace();
-    words.next() == Some("vox")
-        && words.next().is_some_and(|v| {
-            let mut parts = v.split(['.', '-', '+']);
-            (0..3).all(|_| parts.next().is_some_and(|p| p.parse::<u64>().is_ok()))
+    };
+    let Some(version) = text.strip_suffix('\n').unwrap_or(text).strip_prefix("vox ") else {
+        return false;
+    };
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (version, None),
+    };
+    let numbers: Vec<&str> = core.split('.').collect();
+    numbers.len() == 3
+        && numbers
+            .iter()
+            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        && pre.is_none_or(|p| {
+            !p.is_empty()
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
         })
-        && words.next().is_none()
 }
 
 /// What `vox --version` on `path` reports, as a bare version string.

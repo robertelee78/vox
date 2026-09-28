@@ -384,7 +384,11 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
 /// 6. the recovery path is **durable** (read with the syscall recorder): finishing an interrupted
 ///    swap flushes the directory after its rename; discarding a leftover copy flushes the
 ///    directory before anything new is put under that name;
-/// 7. finishing an interrupted rollback refreshes shell completions, as a rollback does.
+/// 7. finishing an interrupted rollback refreshes shell completions, as a rollback does;
+/// 8. a leftover that leaves a child holding its stdout cannot keep the check past its bound;
+/// 9. `vox 1.2.3.4` is not a vox version.
+///
+/// And nothing a staged leftover started is left running afterwards.
 ///
 /// Mutations: the flushes of the recovery path removed → red on (6); completions skipped → red on
 /// (7); the check's timeout or its `vox <version>` rule removed → red on (4) or (5).
@@ -400,7 +404,7 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
     // 4. a leftover that hangs
     {
         let dir = install_dir(&tmp.path().join("hangs"));
-        impostor(&dir.join(".vox-rollback.partial"), "sleep 600");
+        impostor(&dir.join(".vox-rollback.partial"), "sleep 613");
         let t0 = std::time::Instant::now();
         let (ok, said) = rollback(&dir, &home);
         let took = t0.elapsed();
@@ -430,6 +434,38 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
             failures.push(format!(
                 "(5) a leftover that is not a vox was installed: ok={ok}, installed {installed}: \
                  {said}"
+            ));
+        }
+    }
+    // 8. a leftover that leaves a child holding its stdout: the check is still bounded
+    {
+        let dir = install_dir(&tmp.path().join("holds-stdout"));
+        impostor(
+            &dir.join(".vox-rollback.partial"),
+            "sleep 31.5 &\necho \"vox 0.0.1\"",
+        );
+        let t0 = std::time::Instant::now();
+        let (ok, said) = rollback(&dir, &home);
+        let took = t0.elapsed();
+        eprintln!("[proof] (8) a leftover whose child holds stdout: ok={ok} in {took:?}");
+        if took > std::time::Duration::from_secs(20) {
+            failures.push(format!(
+                "(8) a leftover's child holding stdout kept the rollback {took:?}: {said}"
+            ));
+        }
+    }
+    // 9. a version with a fourth number is not a vox's
+    {
+        let dir = install_dir(&tmp.path().join("four-numbers"));
+        impostor(&dir.join(".vox-rollback.partial"), "echo \"vox 1.2.3.4\"");
+        let (ok, said) = rollback(&dir, &home);
+        let installed = dir.join(".vox-previous").exists();
+        eprintln!(
+            "[proof] (9) a leftover that says \"vox 1.2.3.4\": ok={ok}; installed: {installed}"
+        );
+        if ok || installed {
+            failures.push(format!(
+                "(9) a leftover saying vox 1.2.3.4 was installed: ok={ok}: {said}"
             ));
         }
     }
@@ -535,7 +571,31 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
             ));
         }
     }
-    eprintln!("[proof] {} of 5 claims failed", failures.len());
+    // Nothing the staged leftovers started outlives the test: a check that kills only the
+    // leftover leaves its children behind (#247, verifier).
+    let stray: Vec<String> = ["sleep 613", "sleep 31.5"]
+        .iter()
+        .flat_map(|pat| {
+            let out = Command::new("pgrep").args(["-f", pat]).output().ok();
+            out.map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+        })
+        .collect();
+    for pid in &stray {
+        let _ = Command::new("kill").args(["-KILL", pid]).status();
+    }
+    eprintln!("[proof] processes the leftovers left running: {stray:?}");
+    if !stray.is_empty() {
+        failures.push(format!(
+            "the leftovers' children outlived the rollback: {stray:?} (killed by PID now)"
+        ));
+    }
+    eprintln!("[proof] {} of 8 claims failed", failures.len());
     assert!(
         failures.is_empty(),
         "the recovery path is not bounded, durable and complete:\n{}",
