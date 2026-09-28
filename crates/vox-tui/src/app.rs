@@ -480,6 +480,12 @@ pub fn run_node(
                                         crate::ident::author_id(&peer)
                                     );
                                 }
+                                vox_core::node::api::NodeEvent::ConnectionNote { peer, note } => {
+                                    eprintln!(
+                                        "vox node: connection to {} — {note}",
+                                        crate::ident::author_id(&peer)
+                                    );
+                                }
                                 vox_core::node::api::NodeEvent::Synced {
                                     channel_id,
                                     applied,

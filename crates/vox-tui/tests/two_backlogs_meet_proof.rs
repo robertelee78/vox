@@ -311,6 +311,9 @@ fn two_backlogs_that_meet_both_cross() {
     );
 
     // ---- 3. alice and the anchor stop; carol frozen; bob, alone, writes his backlog -----------
+    // What they said while they ran, kept for a red: they are stopped by design from here on.
+    let (mut alice, mut anchor) = (alice, anchor);
+    let (alice_said, anchor_said) = (alice.transcript(), anchor.transcript());
     stop(alice);
     stop(anchor);
     signal(&carol, "-STOP");
@@ -348,9 +351,24 @@ fn two_backlogs_that_meet_both_cross() {
         back.elapsed()
     );
     let (mut bob, mut carol) = (bob, carol);
-    for (who, p) in [("bob", &mut bob), ("carol", &mut carol)] {
-        for l in p.transcript().lines().rev().take(6) {
-            println!("[tail {who}] {l}");
+    let crossed = bob_has >= POSTS && carol_has_b >= POSTS;
+    // On a red, everything every process said — the anchor and alice too, not only the tails of the
+    // two that did not cross: a stall's cause may be on the side that looked healthy (#229).
+    let (bob_said, carol_said) = (bob.transcript(), carol.transcript());
+    if crossed {
+        for (who, said) in [("bob", &bob_said), ("carol", &carol_said)] {
+            for l in said.lines().rev().take(6) {
+                println!("[tail {who}] {l}");
+            }
+        }
+    } else {
+        for (who, said) in [
+            ("alice (until stopped)", &alice_said),
+            ("the anchor (until stopped)", &anchor_said),
+            ("bob", &bob_said),
+            ("carol", &carol_said),
+        ] {
+            println!("---- {who} said ----\n{said}");
         }
     }
     assert!(

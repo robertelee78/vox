@@ -1867,6 +1867,9 @@ pub struct Node {
     port_mappings: Vec<crate::nat::portmap::PortMapping>,
     /// When the anchors are next checked for a dropped connection (unix seconds).
     redial_anchors_at: u64,
+    /// The anchors this node held a connection to at the last look, so losing one is said when
+    /// it happens, not only when it is next redialled (#229's diagnostics).
+    anchors_up: BTreeSet<Digest32>,
     /// When the granted mappings must be renewed (unix seconds), or `None` when there
     /// is nothing to renew. A mapping a gateway grants for two hours outlives no
     /// long-running node by itself: it is re-requested at half its lifetime, the
@@ -2154,6 +2157,7 @@ impl Node {
             stream_loops: std::collections::BTreeSet::new(),
             port_mappings: Vec::new(),
             redial_anchors_at: 0,
+            anchors_up: BTreeSet::new(),
             renew_mappings_at: None,
             ports: BTreeMap::new(),
             port_queue: crate::node::ports::Queue::default(),
@@ -2650,6 +2654,7 @@ impl Node {
         });
         let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
         net.count_ladders_in(Arc::clone(&self.sync_book));
+        net.manager().report_to(self.event_tx.clone());
         // **A record landing on this node's board is an event, not something to notice later.**
         // A newcomer becomes findable to everyone away from the room only because a member that
         // already knows it publishes its bundle onward, and until now nothing told this node one
@@ -3178,6 +3183,25 @@ impl Node {
     /// re-established without anyone noticing.
     fn redial_anchors_if_due(&mut self) {
         let now = self.now();
+        if let Some(net) = self.net.as_ref() {
+            let up: BTreeSet<Digest32> = self
+                .anchors
+                .nodes()
+                .iter()
+                .map(|a| a.id)
+                .filter(|id| net.manager().holds(id))
+                .collect();
+            for lost in self.anchors_up.difference(&up) {
+                net.manager().note(
+                    *lost,
+                    format!(
+                        "the connection to this anchor is gone; it is redialled in at most {}s",
+                        self.redial_anchors_at.saturating_sub(now)
+                    ),
+                );
+            }
+            self.anchors_up = up;
+        }
         if now < self.redial_anchors_at {
             return;
         }

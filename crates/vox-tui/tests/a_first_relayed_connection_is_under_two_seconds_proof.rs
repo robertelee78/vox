@@ -105,6 +105,17 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
         ms[ms.len() / 2],
         ms[ms.len() - 1]
     );
+    if samples
+        .iter()
+        .any(|(m, _)| Duration::from_millis(*m) >= R42)
+    {
+        // A red names its cause from the other ends too: the anchor carrying the circuits and the
+        // host behind them, whose connection notes say what they did with each new process (#229).
+        eprintln!("---- the anchor said ----\n{}", w.anchor.proc.transcript());
+        if let Some(host) = w.host.as_mut() {
+            eprintln!("---- the host said ----\n{}", host.transcript());
+        }
+    }
     for (m, line) in &samples {
         assert!(
             Duration::from_millis(*m) < R42,
