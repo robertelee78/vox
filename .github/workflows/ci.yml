@@ -121,6 +121,10 @@ jobs:
       # backends to feature-gate; the default build IS the whole build.
       - name: Clippy (default, pure-Rust)
         run: cargo clippy --all-targets -- -D warnings
+      # The mutant sender (vox-core's `mutant-sender` feature, ADR-025 P9/P10) is never in a
+      # default build, so it is linted and documented on its own here.
+      - name: Clippy (mutant sender)
+        run: cargo clippy -p vox-core --features mutant-sender -- -D warnings
       - name: Test (default, pure-Rust)
         run: cargo test --workspace --no-fail-fast
         env:
@@ -128,6 +132,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
       - name: Docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+      - name: Docs (mutant sender)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p vox-core --no-deps --features mutant-sender
       # The proofs that drive the shipped `vox` with production parameters (Argon2id, real
       # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
       # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
