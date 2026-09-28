@@ -32,13 +32,14 @@
 //! migration anywhere in them. redb is copy-on-write, so a re-sealed blob's old page stays in the
 //! file unless the store is rewritten (found in verification of #214).
 //!
-//! 2c: a store with a table the rewrite cannot open (not a missing one) is refused and left
-//! byte-identical, the vault still version 1.
+//! 2c: a store rewrite that fails stops the migration with the vault still version 1, and the
+//! next unlock completes it.
 //!
 //! Mutations: any one blob sealed with its old key again, or with a key from anything public,
-//! breaks (1); a migration that does not rewrite the store breaks (2); an unlock that does not
-//! migrate breaks (2); the vault's version left out of its AEAD, or a loader that falls back to
-//! the old key, breaks (3); the refusal reported as a wrong passphrase breaks (3a).
+//! breaks (1); an unlock that does not migrate, or migrates without rewriting the store, breaks
+//! (2) and (2b); one that goes on when the rewrite fails breaks (2c); the vault's version left
+//! out of its AEAD, or a loader that falls back to the old key, breaks (3); the refusal reported
+//! as a wrong passphrase breaks (3a).
 
 #![cfg(unix)]
 
@@ -690,14 +691,15 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
          {small_scan_after:?} copies"
     );
 
-    // ---- 2c. a store the rewrite cannot read is left alone ------------------------------------
-    // The rewrite copies each table into a new file and renames it over the old one. A table it
-    // cannot open for any reason but "it does not exist" must stop it before the rename: skipping
-    // it would commit a store without that table over the only copy (a failed read of
-    // `sek_wraps` would lose every room's key; found in verification of #214). An I/O error
-    // cannot be injected from outside a process, so the fault staged here is the one a damaged
-    // file can present as well: `sek_wraps` present with the wrong key type. A profile with no
-    // room never reads that table, so only the rewrite meets it.
+    // ---- 2c. a rewrite that fails leaves the profile to migrate again ------------------------
+    // The rewrite writes a new file beside the store and renames it over the old one; the vault
+    // moves to v2 only after that. If the rewrite fails, the vault must stay v1, so the next
+    // unlock repeats the migration: a v2 vault over an un-rewritten store would keep the old
+    // seals on disk for good, since a v2 vault never migrates. The failure staged here is the
+    // new file not being creatable (a directory in its place). A read error on one table, the
+    // case verification of #214 found, cannot be injected from outside the process; that path
+    // (`source_table`: only a missing table is skipped, every other error stops the rewrite
+    // before the rename) is covered by code review only.
     let (gina, hal) = (dir("gina"), dir("hal"));
     let hal_fp = ok(&old, &hal, &["id"], None).trim().to_owned();
     ok(&old, &gina, &["id"], None);
@@ -707,32 +709,46 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         &["trust", "add", &hal_fp, "--name", "hal"],
         None,
     );
-    let damaged = Disk::of(&gina);
     {
-        const WRONG: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("sek_wraps");
-        let db = redb::Database::open(&damaged.store_file).expect("open gina's stopped store");
-        let w = db.begin_write().unwrap();
-        // v0.2.9 created the table (keyed by a 32-byte channel id) even with no room in it.
-        w.delete_table(WRONG).unwrap();
-        w.open_table(WRONG)
-            .unwrap()
-            .insert("not a channel id", b"x".as_slice())
-            .unwrap();
-        w.commit().unwrap();
+        let (_node, spec) = anchor(&old, &dir("old-anchor-3"));
+        let _gina_d = daemon(&old, "gina (v0.2.9)", &gina, &spec, &idpass);
     }
-    let bytes_before = std::fs::read(&damaged.store_file).unwrap();
-    let facts_before = file_facts(&damaged);
+    let blocked = Disk::of(&gina);
+    let gina_old = fingerprints_of(&blobs(&blocked));
+    let mut squatter = blocked.store_file.clone().into_os_string();
+    squatter.push(".rewrite");
+    let squatter = PathBuf::from(squatter);
+    std::fs::create_dir(&squatter).unwrap();
+    std::fs::write(
+        squatter.join("keep"),
+        b"a directory where the new store would go",
+    )
+    .unwrap();
+    let inode_before = file_facts(&blocked).1;
     let (migrated, out, err) = vox_with(&new, &gina, &["trust", "list"], None);
-    let untouched = std::fs::read(&damaged.store_file).unwrap() == bytes_before;
-    let version = damaged.vault().version;
+    let (inode_after, version) = (file_facts(&blocked).1, blocked.vault().version);
     println!(
-        "[proof] a store whose sek_wraps table will not open: the migrating unlock succeeded = \
-         {migrated}; store.redb byte-identical = {untouched} ({facts_before:?} -> {:?}); vault v{version}",
-        file_facts(&damaged)
+        "[proof] the rewrite's new file cannot be created: the migrating unlock succeeded = \
+         {migrated}; store.redb replaced = {}; vault v{version}",
+        inode_after != inode_before
     );
     assert!(
-        !migrated && untouched && version == 1,
-        "a store the rewrite could not read was replaced anyway: {out}{err}"
+        !migrated && inode_after == inode_before && version == 1,
+        "a migration whose store rewrite failed went on (vault v{version}): {out}{err}"
+    );
+    std::fs::remove_dir_all(&squatter).unwrap();
+    let listed = ok(&new, &gina, &["trust", "list"], None);
+    let residue = occurrences(&blocked, &gina_old);
+    let version = blocked.vault().version;
+    println!(
+        "[proof] with the obstacle gone, the next unlock: vault v{version}, `trust list` names hal \
+         = {}, old seals on disk {residue:?}",
+        listed.contains("hal")
+    );
+    assert!(
+        version == 2 && listed.contains("hal") && residue.iter().all(|n| *n == 0),
+        "the migration did not complete once the rewrite could: vault v{version}, old seals \
+         {residue:?}: {listed}"
     );
 
     // ---- 3. no way back to the old keys -------------------------------------------------------
