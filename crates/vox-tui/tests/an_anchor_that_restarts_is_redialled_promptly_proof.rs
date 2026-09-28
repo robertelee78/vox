@@ -8,10 +8,16 @@
 //! failing is backed off.
 //!
 //! **The scene** (`support/relay.rs`, `Split::Families`, so the only path is a circuit through the
-//! anchor): the host serves an echo and the guest's `vox forward` carries it. The anchor is killed a
-//! few seconds after the forward started and brought back [`DOWN`] later **on the same port**. It is
-//! a new process, so every connection to the old one is gone. The forward must carry an echo again
-//! within [`BACK_WITHIN`] of the anchor's return, and say it saw the anchor go.
+//! anchor): the host serves an echo and the guest's `vox forward` carries it. A few seconds after
+//! the forward started, the anchor is **stopped** (SIGINT, as a person stops it: it closes every
+//! connection, so its peers learn at once that it is gone, which is the shape of CI's red, where the
+//! anchor *closed* a connection) and brought back [`DOWN`] later **on the same port**. It is a new
+//! process, so every connection to the old one is gone. The forward must carry an echo again within
+//! [`BACK_WITHIN`] of the anchor's return, and say it saw the anchor go.
+//!
+//! **Not covered: an anchor that crashes.** A crash sends no close, so its peers learn of it only
+//! when its connection falls silent (`SILENCE_IS_DEATH`). How soon a node *learns* of a loss is not
+//! what #243 changed; how soon it *acts* on one is.
 //!
 //! **Why the bound separates the two:** the old redial ran at the node's start and then every 30 s,
 //! so a forward started at `t` redialled at `t + 30`. The anchor returns at about `t + 9`, so the
@@ -67,16 +73,25 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     w.expect_still_relayed();
     std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
 
-    // ---- the anchor goes, and comes back on the same port ------------------------------------
+    // ---- the anchor is stopped, and comes back on the same port --------------------------------
     let anchor_dir = w.tmp.path().join("anchor");
     let killed = Instant::now();
-    let _ = w.anchor.proc.child.kill();
-    let _ = w.anchor.proc.child.wait();
+    let _ = std::process::Command::new("kill")
+        .args(["-INT", &w.anchor.proc.child.id().to_string()])
+        .status();
+    let stopping = Instant::now();
+    while w.anchor.proc.child.try_wait().ok().flatten().is_none() {
+        assert!(
+            stopping.elapsed() < Duration::from_secs(10),
+            "CANNOT MEASURE: the anchor did not stop within 10 s of SIGINT"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     std::thread::sleep(DOWN);
     w.anchor.restart(&anchor_dir);
     let back = Instant::now();
     eprintln!(
-        "[proof] the anchor was killed {:?} after the forward started, and is back {:?} later",
+        "[proof] the anchor was stopped {:?} after the forward started, and is back {:?} later",
         killed.duration_since(started),
         back.duration_since(killed)
     );
