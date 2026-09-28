@@ -5,7 +5,8 @@
 //! Swift program (`crates/vox-ffi/swift-harness/main.swift`) is compiled with `swiftc`
 //! against the macOS slice, so what runs is the static library an app links and the Swift
 //! an app calls — nothing in between. On the other side is a real `vox daemon`, driven by
-//! the real `vox` verbs.
+//! the real `vox` verbs: its identity is made by `vox id`, and no participant but the
+//! Swift app's embedded node is anything other than the shipped `vox` binary.
 //!
 //! What must hold:
 //!
@@ -28,10 +29,6 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use vox_core::node::actor::Node;
-use vox_core::node::api::{NodeCommand, Secret};
-use vox_core::node::paths::Paths;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -207,31 +204,18 @@ fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
     let tmp = tempfile::tempdir().unwrap();
     let harness = build_harness(&tmp.path().join("build"));
 
-    // The daemon's identity, made once, then the profile handed to a real `vox daemon`.
+    // The daemon's identity, made by `vox id` as a person setting up a profile would,
+    // then the profile handed to a real `vox daemon`.
     let d = Daemon {
         data: tmp.path().join("daemon/data"),
         cfg: tmp.path().join("daemon/cfg"),
     };
-    let daemon_fp = {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let paths = Paths::resolve("default", Some(&d.data), Some(&d.cfg)).unwrap();
-            let node = Node::spawn_networked(paths, "127.0.0.1:0".parse().unwrap()).unwrap();
-            assert!(node
-                .apply(NodeCommand::CreateIdentity {
-                    passphrase: Secret::new(b"daemon identity".to_vec()),
-                })
-                .await
-                .is_done());
-            let fp = node.view().identity.unwrap().fingerprint;
-            assert!(node.apply(NodeCommand::Shutdown).await.is_done());
-            vox_core::node::link::b32_encode(&fp)
-        })
-    };
+    let daemon_fp = d.run(&["id"], "").trim().to_owned();
+    assert_eq!(
+        daemon_fp.len(),
+        vox_core::node::link::B32_DIGEST_LEN,
+        "`vox id` must print the whole fingerprint: {daemon_fp:?}"
+    );
     let mut daemon = d
         .command(&["daemon", "--listen", "127.0.0.1:0"])
         .stdin(Stdio::piped())

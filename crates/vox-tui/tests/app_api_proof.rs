@@ -1,8 +1,13 @@
 //! ADR-022 M22.5 — **the app API**, proved with the shipped `vox` binary against real
 //! nodes (ADR-022 proofs 7 and 8).
 //!
-//! Two member nodes, alice and bob, share a room; each serves its control socket, and
-//! the `vox app listen` / `vox app open` verbs are the programs. What each case asserts:
+//! Every participant is a real `vox` process, driven as a person would drive it (ADR-018,
+//! "Only real use of the product is a test"). Two member nodes, alice and bob, are
+//! `vox daemon`s sharing a room made with `vox room create` / `invite` / `join`; trust is
+//! decided with `vox trust add` / `remove`; the programs are the `vox app listen` /
+//! `vox app open` verbs; room messages go through `vox room post` / `tail`; and what each
+//! node's app layer counted is read from its own `vox status --json`. What each case
+//! asserts:
 //!
 //! 1. **It carries.** A 1 MiB stream round-trips through both nodes with its SHA-256
 //!    intact, and 1000 datagrams on a flow bound to a stream all arrive.
@@ -16,40 +21,40 @@
 //! 5. **Withdrawing trust tears a live stream down**, on both ends.
 //! 6. **Stalled app streams cannot starve the room.** 200 app streams held open waiting,
 //!    and a message still crosses in under a second.
+//!
+//! **One participant is not the product, deliberately: the attacker in case 4.** mallory
+//! is a real member — her identity is made by `vox id`, and she joins with her own
+//! `vox daemon` and `vox room join` — but what probes alice is a raw QUIC endpoint holding
+//! her identity, which opens a stream of a kind that does not exist. No product
+//! participant ever does that, and the claim is about what the wire carries back to
+//! someone who does, so it can only be observed from outside the product.
 
 #![cfg(unix)]
+
+#[path = "support/world.rs"]
+mod world;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
 use std::io::{BufRead as _, Read as _, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use vox_core::hash::Digest32;
-use vox_core::node::actor::{Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
-use vox_core::node::paths::Paths;
+use world::{args, vox_once, VoxProc, IDENTITY, VOX};
 
-const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// Room setup through real daemons: Argon2id derivations and a first sync each way.
+const SETUP: Duration = Duration::from_secs(90);
 const LABEL: &str = "proof/v1";
+const ROOM_PASS: &str = "room passphrase";
 
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
-}
-
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap()
-}
-
-/// A child `vox`, killed by PID however the test ends.
+/// A child `vox` with stdin and stdout piped to the test and stderr captured, killed by
+/// its PID however the test ends.
 struct Proc {
     child: Child,
     said: Arc<Mutex<String>>,
@@ -70,6 +75,23 @@ impl Proc {
             std::thread::sleep(Duration::from_millis(20));
         }
         None
+    }
+
+    /// Wait until `vox app listen` says its node has the listener registered.
+    fn listening(&mut self) {
+        let until = Instant::now() + TIMEOUT;
+        while Instant::now() < until {
+            if self.said().contains("vox app: listening for") {
+                return;
+            }
+            assert!(
+                !matches!(self.child.try_wait(), Ok(Some(_))),
+                "`vox app listen` exited before listening: {}",
+                self.said()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the listener never registered: {}", self.said());
     }
 }
 
@@ -96,23 +118,53 @@ fn drain_into(stream: Option<impl std::io::Read + Send + 'static>, into: &Arc<Mu
     });
 }
 
+/// `vox <args>` on `data`'s profile, `stdin` written to it, run to completion.
+fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
+    let mut child = Command::new(VOX)
+        .args(argv)
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", data.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .env_remove("VOX_ANCHORS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run vox");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("vox finished");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A member: its own profile, and its own `vox daemon` serving it.
 struct Member {
-    data: std::path::PathBuf,
-    cfg: std::path::PathBuf,
-    paths: Paths,
-    node: NodeHandle,
-    id: Digest32,
-    _sock: Option<vox_core::node::ipc::IpcServer>,
+    name: String,
+    data: PathBuf,
+    /// Its fingerprint, as `vox id` prints it.
+    fp: String,
+    daemon: VoxProc,
 }
 
 impl Member {
-    /// `vox <args>` with stdin and stdout piped to the test, stderr captured.
-    fn vox(&self, args: &[&str]) -> Proc {
+    /// `vox <args>` on this member's profile, stdin and stdout piped, stderr captured.
+    fn vox(&self, argv: &[&str]) -> Proc {
         let mut child = Command::new(VOX)
-            .args(args)
+            .args(argv)
             .env("VOX_DATA_DIR", &self.data)
-            .env("VOX_CONFIG_DIR", &self.cfg)
+            .env("VOX_CONFIG_DIR", self.data.join("cfg"))
             .env_remove("VOX_ROOM")
+            .env_remove("VOX_ROOM_PASSPHRASE")
+            .env_remove("VOX_ANCHORS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -122,167 +174,190 @@ impl Member {
         drain_into(child.stderr.take(), &said);
         Proc { child, said }
     }
-}
 
-async fn member(tmp: &tempfile::TempDir, name: &str) -> Member {
-    let data = tmp.path().join(name).join("data");
-    let cfg = tmp.path().join(name).join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
-    let node = Node::spawn_networked(paths.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
-    assert!(node
-        .apply(NodeCommand::CreateIdentity {
-            passphrase: secret("identity passphrase"),
-        })
-        .await
-        .is_done());
-    let id = node.view().identity.unwrap().fingerprint;
-    Member {
-        data,
-        cfg,
-        paths,
-        node,
-        id,
-        _sock: None,
+    /// A one-shot verb that must succeed; its stdout.
+    fn run(&self, argv: &[&str]) -> String {
+        let (ok, out, err) = vox_once(&self.data, &args(argv));
+        assert!(ok, "{}: vox {argv:?} failed: {out}{err}", self.name);
+        out
+    }
+
+    /// `vox trust add <peer>`, over the running daemon.
+    fn trust(&self, peer: &Member) {
+        self.run(&["trust", "add", &peer.fp, "--name", &peer.name]);
+    }
+
+    /// The node's own report, `vox status --json`.
+    fn status(&self) -> Value {
+        let out = self.run(&["status", "--json"]);
+        serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("{}: status did not parse ({e}): {out}", self.name))
+    }
+
+    /// The app layer's counters from `vox status --json`.
+    fn app(&self) -> App {
+        App(self.status()["app"].clone())
     }
 }
 
-async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) -> T {
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match h.next_event().await {
-                Some(e) => {
-                    if let Some(v) = f(e) {
-                        return v;
-                    }
-                }
-                None => panic!("event stream ended"),
-            }
+/// The `app` object of a node's status report.
+#[derive(Clone)]
+struct App(Value);
+
+impl App {
+    fn n(&self, k: &str) -> u64 {
+        self.0
+            .get(k)
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("the status report has no app.{k}: {}", self.0))
+    }
+
+    /// App streams handed to a listening program. The report does not print this count;
+    /// every inbound stream ends in exactly one of the gate's refusals or an announcement
+    /// (`app::serve_inbound`), so once none is in flight it is the remainder.
+    fn announced(&self) -> u64 {
+        self.n("inbound")
+            - self.n("refused_untrusted")
+            - self.n("refused_busy")
+            - self.n("refused_no_listener")
+    }
+}
+
+impl std::fmt::Debug for App {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A fresh profile under `tmp/<name>` with an identity made by `vox id`, and a
+/// `vox daemon` serving it that answers `vox room list`.
+fn member(tmp: &Path, name: &str) -> Member {
+    let data = tmp.join(name);
+    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    let pass = tmp.join("identity-passphrase");
+    std::fs::write(&pass, IDENTITY).unwrap();
+    let (ok, out, err) = vox_once(&data, &args(&["id"]));
+    assert!(ok, "{name}: vox id: {out}{err}");
+    let fp = out.trim().to_owned();
+    let mut daemon = VoxProc::spawn(
+        name,
+        &data,
+        &args(&[
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ]),
+    );
+    let until = Instant::now() + SETUP;
+    while Instant::now() < until {
+        if vox_once(&data, &args(&["room", "list"])).0 {
+            return Member {
+                name: name.to_owned(),
+                data,
+                fp,
+                daemon,
+            };
         }
-    })
-    .await
-    .expect("timed out waiting for an event")
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!(
+        "{name}'s daemon never answered `vox room list`:\n{}",
+        daemon.transcript()
+    );
 }
 
-async fn trust(who: &Member, peer: &Member, name: &str) {
-    assert!(who
-        .node
-        .apply(NodeCommand::Trust {
-            fingerprint: peer.id,
-            petname: name.into(),
-        })
-        .await
-        .is_done());
+/// `vox room join <link>` on `who`'s daemon.
+fn join(who: &Member, link: &str) {
+    let (ok, out, err) = vox_in(
+        &who.data,
+        &["room", "join", link, "--name", "calls"],
+        ROOM_PASS,
+    );
+    assert!(ok, "{} joins: {out}{err}", who.name);
 }
 
-/// A room alice created and bob (and any `extra`) joined, with each member's control
-/// socket up. Nobody trusts anybody yet.
+/// A room alice created and bob joined, each on its own daemon. Nobody trusts anybody
+/// yet.
 struct Scene {
+    tmp: tempfile::TempDir,
     alice: Member,
     bob: Member,
-    room: Digest32,
-    room_b32: String,
+    room: String,
+    link: String,
 }
 
-async fn scene(tmp: &tempfile::TempDir) -> (Scene, String) {
-    let mut alice = member(tmp, "alice").await;
-    let mut bob = member(tmp, "bob").await;
-    assert!(alice
-        .node
-        .apply(NodeCommand::CreateChannel {
-            local_name: "calls".into(),
-            passphrase: secret("room passphrase"),
-        })
-        .await
-        .is_done());
-    let room = alice.node.view().channels[0].channel_id;
-    assert!(alice
-        .node
-        .apply(NodeCommand::Invite { channel_id: room })
-        .await
-        .is_done());
-    let url = wait_for(&alice.node, |e| match e {
-        NodeEvent::InviteLink { channel_id, url } if channel_id == room => Some(url),
-        _ => None,
-    })
-    .await;
-    join(&bob, &url).await;
-    alice._sock = Some(vox_core::node::ipc::bind(alice.node.clone(), &alice.paths).unwrap());
-    bob._sock = Some(vox_core::node::ipc::bind(bob.node.clone(), &bob.paths).unwrap());
-    let room_b32 = vox_core::node::link::b32_encode(&room);
-    (
-        Scene {
-            alice,
-            bob,
-            room,
-            room_b32,
-        },
-        url,
-    )
-}
-
-async fn join(who: &Member, url: &str) {
-    assert!(who
-        .node
-        .apply(NodeCommand::JoinChannel {
-            link: url.to_owned(),
-            local_name: "calls".into(),
-            passphrase: secret("room passphrase"),
-        })
-        .await
-        .is_done());
-}
-
-/// Both trust each other, and each has received the other's sender key — so the room
-/// is live in both directions and both gates admit.
-async fn mutual(s: &Scene) {
-    trust(&s.alice, &s.bob, "bob").await;
-    trust(&s.bob, &s.alice, "alice").await;
-    for (who, peer) in [(&s.alice, s.bob.id), (&s.bob, s.alice.id)] {
-        wait_for(&who.node, |e| match e {
-            NodeEvent::SenderKeyReceived {
-                channel_id,
-                peer: p,
-                ..
-            } if channel_id == s.room && p == peer => Some(()),
-            _ => None,
-        })
-        .await;
+fn scene() -> Scene {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = member(tmp.path(), "alice");
+    let bob = member(tmp.path(), "bob");
+    let (ok, out, err) = vox_in(
+        &alice.data,
+        &["room", "create", "--name", "calls"],
+        ROOM_PASS,
+    );
+    assert!(ok, "vox room create: {out}{err}");
+    let list = alice.run(&["room", "list"]);
+    let room = list
+        .lines()
+        .find(|l| l.contains("calls"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("the room is not listed: {list}"))
+        .to_owned();
+    let link = alice.run(&["room", "invite", &room]).trim().to_owned();
+    join(&bob, &link);
+    Scene {
+        tmp,
+        alice,
+        bob,
+        room,
+        link,
     }
 }
 
-/// Wait until the node has a listener registered for [`LABEL`] in `room`.
-async fn listening(node: &NodeHandle, room: Digest32) {
-    let until = Instant::now() + TIMEOUT;
-    while Instant::now() < until {
-        if node.app().is_listening(Some(room), LABEL) {
+/// Both trust each other, and each reads what the other posted — so each holds the
+/// other's sender key, the room is live in both directions and both gates admit.
+fn mutual(s: &mut Scene) {
+    s.alice.trust(&s.bob);
+    s.bob.trust(&s.alice);
+    for m in [&s.alice, &s.bob] {
+        m.run(&["room", "post", &s.room, &format!("hello from {}", m.name)]);
+    }
+    let until = Instant::now() + SETUP;
+    loop {
+        let a = s.alice.run(&["room", "read", &s.room]);
+        let b = s.bob.run(&["room", "read", &s.room]);
+        if a.contains("hello from bob") && b.contains("hello from alice") {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if Instant::now() >= until {
+            for m in [&mut s.alice, &mut s.bob] {
+                eprintln!("---- {}'s daemon ----\n{}", m.name, m.daemon.transcript());
+            }
+            panic!(
+                "CANNOT MEASURE: after {SETUP:?} alice and bob do not read each other.\nalice \
+                 reads:\n{a}\nbob reads:\n{b}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("the listener never registered");
 }
 
 /// **(1) It carries.** 1 MiB round trip, SHA-256 checked, then 1000 datagrams.
 #[test]
-#[ignore = "real nodes and real child processes; CI runs it in release"]
+#[ignore = "real vox daemons and real child processes; CI runs it in release"]
 fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     watchdog::arm();
-    let rt = rt();
-    let tmp = tempfile::tempdir().unwrap();
-    let (s, _) = rt.block_on(async {
-        let (s, url) = scene(&tmp).await;
-        mutual(&s).await;
-        (s, url)
-    });
-    let bob_b32 = vox_core::node::link::b32_encode(&s.bob.id);
-    let alice_b32 = vox_core::node::link::b32_encode(&s.alice.id);
+    let mut s = scene();
+    mutual(&mut s);
 
     // ---- a mebibyte there and back ----
     let payload: Vec<u8> = (0..1024 * 1024u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
-    let mut listen = s.alice.vox(&["app", "listen", &s.room_b32, LABEL]);
-    rt.block_on(listening(&s.alice.node, s.room));
+    let mut listen = s.alice.vox(&["app", "listen", &s.room, LABEL]);
+    listen.listening();
     // The listener echoes: whatever comes out of it goes straight back in, and once the
     // whole mebibyte has, its input ends — which ends its half of the stream.
     {
@@ -305,7 +380,7 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
             }
         });
     }
-    let mut open = s.bob.vox(&["app", "open", &s.room_b32, &alice_b32, LABEL]);
+    let mut open = s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]);
     let echoed = Arc::new(Mutex::new(Vec::new()));
     {
         let mut from = open.child.stdout.take().unwrap();
@@ -346,13 +421,17 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
         status.is_some_and(|s| s.success()),
         "the opener must end cleanly"
     );
-    let (a, b) = (s.alice.node.app().stats(), s.bob.node.app().stats());
-    assert_eq!((a.accepted, b.opened), (1, 1), "alice {a:?} bob {b:?}");
+    let (a, b) = (s.alice.app(), s.bob.app());
+    assert_eq!(
+        (a.n("accepted"), b.n("opened")),
+        (1, 1),
+        "alice {a:?} bob {b:?}"
+    );
     drop((listen, open));
 
     // ---- a thousand datagrams ----
-    let mut listen = s.alice.vox(&["app", "listen", &s.room_b32, LABEL]);
-    rt.block_on(listening(&s.alice.node, s.room));
+    let mut listen = s.alice.vox(&["app", "listen", &s.room, LABEL]);
+    listen.listening();
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     {
         let from = listen.child.stdout.take().unwrap();
@@ -366,7 +445,7 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     }
     let mut open = s
         .bob
-        .vox(&["app", "open", &s.room_b32, &alice_b32, LABEL, "--datagrams"]);
+        .vox(&["app", "open", &s.room, &s.alice.fp, LABEL, "--datagrams"]);
     // Paced, one a millisecond, so this measures delivery and not a burst into a
     // receive buffer.
     std::thread::sleep(Duration::from_millis(500));
@@ -393,12 +472,11 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
         (0..1000).map(|i| format!("datagram {i:04}")).collect();
     let intact = got.iter().filter(|l| expected.contains(*l)).count();
     eprintln!(
-        "datagrams: sent 1000, the listener printed {} ({} distinct, {} intact); bob \
-         listens at {:?}\nopener said: {}\nlistener said: {}",
+        "datagrams: sent 1000, the listener printed {} ({} distinct, {} intact)\nopener \
+         said: {}\nlistener said: {}",
         got.len(),
         distinct.len(),
         intact,
-        s.bob.node.view().listening,
         open.said(),
         listen.said()
     );
@@ -407,44 +485,42 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
         (1000, 1000),
         "all 1000 datagrams must arrive, each intact"
     );
-    let _ = bob_b32;
 }
 
 /// **(2) The responder's gate.** bob trusts alice; alice does not trust bob. bob's open is
 /// refused by alice's node, and alice's listener hears about **nothing**.
 #[test]
-#[ignore = "real nodes and real child processes; CI runs it in release"]
+#[ignore = "real vox daemons and real child processes; CI runs it in release"]
 fn an_opener_outside_the_responders_ring_reaches_no_listener() {
     watchdog::arm();
-    let rt = rt();
-    let tmp = tempfile::tempdir().unwrap();
-    let s = rt.block_on(async {
-        let (s, _) = scene(&tmp).await;
-        trust(&s.bob, &s.alice, "alice").await;
-        s
-    });
-    let alice_b32 = vox_core::node::link::b32_encode(&s.alice.id);
-    let listen = s.alice.vox(&["app", "listen", &s.room_b32, LABEL]);
-    rt.block_on(listening(&s.alice.node, s.room));
-    let mut open = s.bob.vox(&["app", "open", &s.room_b32, &alice_b32, LABEL]);
+    let s = scene();
+    s.bob.trust(&s.alice);
+    let mut listen = s.alice.vox(&["app", "listen", &s.room, LABEL]);
+    listen.listening();
+    let mut open = s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]);
     let status = open.exited_within(TIMEOUT);
     // Give a wrongly admitted stream every chance to reach the listener.
     std::thread::sleep(Duration::from_secs(1));
-    let a = s.alice.node.app().stats();
+    let a = s.alice.app();
+    let listener_running = matches!(listen.child.try_wait(), Ok(None));
     eprintln!(
-        "alice's app layer: {a:?}\nopener exit {status:?}, said: {}\nlistener said: {}",
+        "alice's app layer: {a:?}\nopener exit {status:?}, said: {}\nlistener still \
+         running: {listener_running}, said: {}",
         open.said(),
         listen.said()
     );
     assert_eq!(
-        a.inbound, 1,
+        a.n("inbound"),
+        1,
         "bob's stream must have reached alice's gate: {a:?}"
     );
     assert_eq!(
-        a.announced, 0,
+        a.announced(),
+        0,
         "the listener must see 0 incoming streams from an opener outside the ring: {a:?}"
     );
-    assert_eq!(a.refused_untrusted, 1, "{a:?}");
+    assert_eq!(a.n("refused_untrusted"), 1, "{a:?}");
+    assert_eq!(a.n("accepted"), 0, "{a:?}");
     assert!(
         status.is_some_and(|s| !s.success()),
         "the opener must fail, not hang"
@@ -455,8 +531,8 @@ fn an_opener_outside_the_responders_ring_reaches_no_listener() {
         open.said()
     );
     assert!(
-        !listen.said().contains(" from "),
-        "the listener must never have accepted anything: {}",
+        listener_running && !listen.said().contains(" from "),
+        "the listener must never have accepted anything, and still be waiting: {}",
         listen.said()
     );
 }
@@ -464,33 +540,29 @@ fn an_opener_outside_the_responders_ring_reaches_no_listener() {
 /// **(3) The opener's gate.** alice trusts bob; bob does not trust alice. bob's own node
 /// refuses to open, and alice never sees a stream.
 #[test]
-#[ignore = "real nodes and real child processes; CI runs it in release"]
+#[ignore = "real vox daemons and real child processes; CI runs it in release"]
 fn a_target_outside_the_openers_ring_is_refused_locally() {
     watchdog::arm();
-    let rt = rt();
-    let tmp = tempfile::tempdir().unwrap();
-    let s = rt.block_on(async {
-        let (s, _) = scene(&tmp).await;
-        trust(&s.alice, &s.bob, "bob").await;
-        s
-    });
-    let alice_b32 = vox_core::node::link::b32_encode(&s.alice.id);
-    let _listen = s.alice.vox(&["app", "listen", &s.room_b32, LABEL]);
-    rt.block_on(listening(&s.alice.node, s.room));
-    let mut open = s.bob.vox(&["app", "open", &s.room_b32, &alice_b32, LABEL]);
+    let s = scene();
+    s.alice.trust(&s.bob);
+    let mut listen = s.alice.vox(&["app", "listen", &s.room, LABEL]);
+    listen.listening();
+    let mut open = s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]);
     let status = open.exited_within(TIMEOUT);
     std::thread::sleep(Duration::from_secs(1));
-    let (a, b) = (s.alice.node.app().stats(), s.bob.node.app().stats());
+    let (a, b) = (s.alice.app(), s.bob.app());
     eprintln!(
         "bob's app layer: {b:?}\nalice's: {a:?}\nopener exit {status:?}, said: {}",
         open.said()
     );
     assert_eq!(
-        b.refused_locally, 1,
+        b.n("refused_locally"),
+        1,
         "bob's node must refuse the open itself: {b:?}"
     );
     assert_eq!(
-        a.inbound, 0,
+        a.n("inbound"),
+        0,
         "nothing may reach the target when the opener's node refuses: {a:?}"
     );
     assert!(status.is_some_and(|s| !s.success()), "the opener must fail");
@@ -524,62 +596,95 @@ async fn probe(
     (format!("{read:?}"), format!("{stopped:?}"))
 }
 
+/// Stop a daemon with SIGTERM, by its PID, and wait for it to go, so its profile is free.
+fn stop(mut p: VoxProc) {
+    let ok = Command::new("kill")
+        .args(["-TERM", &p.child.id().to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok, "kill -TERM {}", p.name);
+    let until = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < until {
+        if matches!(p.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{}'s daemon did not stop on SIGTERM", p.name);
+}
+
 /// **(4) The untrusted tier says nothing.** mallory joined the room — it is a member, and
 /// may open app streams — but alice does not trust it. Its app stream to a label nobody
 /// listens for must be refused **exactly** as a stream of a kind that does not exist is.
 ///
-/// Observed with a raw QUIC client holding mallory's real identity, so what is compared is
+/// Observed with a raw QUIC client holding mallory's real identity — the attacker, the one
+/// participant here that is not the product (see the header) — so what is compared is
 /// what the wire carries, not what an API chose to report. A trusted member asking the
-/// same question is told `no-listener`, which shows the probe can see a difference.
+/// same question with `vox app open` is told `no-listener`, which shows the probe can see
+/// a difference.
 #[test]
-#[ignore = "real nodes and a raw QUIC client; CI runs it in release"]
+#[ignore = "real vox daemons and a raw QUIC client; CI runs it in release"]
 fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
     watchdog::arm();
-    let rt = rt();
-    let tmp = tempfile::tempdir().unwrap();
-    rt.block_on(async {
-        let (s, url) = scene(&tmp).await;
-        mutual(&s).await;
-        // mallory joins, then its node stops so the identity can be used raw.
-        let mallory = member(&tmp, "mallory").await;
-        join(&mallory, &url).await;
-        let mallory_id = mallory.id;
-        assert!(mallory.node.apply(NodeCommand::Shutdown).await.is_done());
-        drop(mallory.node);
-        let mut profile = None;
-        for _ in 0..100 {
-            if let Ok(p) = vox_core::node::profile::Profile::open(mallory.paths.clone()) {
-                profile = Some(p);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let mut profile = profile.expect("mallory's profile reopens once its node is gone");
-        profile.unlock(b"identity passphrase").unwrap();
+    let mut s = scene();
+    mutual(&mut s);
+    // mallory joins with her own daemon, which then stops so the identity can be used raw.
+    let mallory = member(s.tmp.path(), "mallory");
+    join(&mallory, &s.link);
+    let Member {
+        data: mallory_data,
+        daemon,
+        ..
+    } = mallory;
+    stop(daemon);
+
+    // Where alice listens, and the room's whole id, from her own report.
+    let report = s.alice.status();
+    let alice_addr = report["listening"]
+        .as_array()
+        .expect("alice's report lists where she listens")
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|m| vox_core::nat::multiaddr::Multiaddr::parse(m).ok())
+        .filter_map(|m| m.socket_addr())
+        .find(|a| a.ip().is_loopback())
+        .expect("alice listens on loopback");
+    let room_id = report["rooms"]
+        .as_array()
+        .and_then(|rs| rs.iter().find(|r| r["name"] == "calls"))
+        .and_then(|r| r["id"].as_str())
+        .map(|id| vox_core::node::link::b32_decode(id, "room id").unwrap())
+        .unwrap_or_else(|| panic!("alice's report lists the room: {report}"));
+    let alice_id = vox_core::node::link::b32_decode(&s.alice.fp, "fingerprint")
+        .expect("`vox id` prints the whole fingerprint");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (app, unknown, before, after) = rt.block_on(async {
+        let paths = vox_core::node::paths::Paths::resolve(
+            "default",
+            Some(&mallory_data),
+            Some(&mallory_data.join("cfg")),
+        )
+        .unwrap();
+        let mut profile = vox_core::node::profile::Profile::open(paths)
+            .expect("mallory's profile opens once her daemon is gone");
+        profile.unlock(IDENTITY.as_bytes()).unwrap();
         let signer = profile.signer_arc().unwrap();
         let ep =
             vox_core::transport::quic::VoxEndpoint::bind(&*signer, "127.0.0.1:0".parse().unwrap())
                 .unwrap();
-        let alice_addr = s
-            .alice
-            .node
-            .view()
-            .listening
-            .iter()
-            .filter_map(|m| vox_core::nat::multiaddr::Multiaddr::parse(m).ok())
-            .filter_map(|m| m.socket_addr())
-            .find(|a| a.ip().is_loopback())
-            .expect("alice listens on loopback");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let conn = ep.connect(alice_addr, s.alice.id, now).await.unwrap();
-        assert_eq!(conn.peer_id(), s.alice.id);
-        let _ = mallory_id;
-
+        let conn = ep.connect(alice_addr, alice_id, now).await.unwrap();
+        assert_eq!(conn.peer_id(), alice_id);
         let open = vox_core::node::app::AppOpen {
-            channel_id: s.room,
+            channel_id: room_id,
             labels: vec![LABEL.to_owned()],
             flags: 0,
         }
@@ -589,58 +694,53 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
             e.array(1).uint(k);
             e.finish()
         };
-        let before = s.alice.node.app().stats();
+        let before = s.alice.app();
         let app = probe(&conn, &kind(8), &open).await;
-        let after = s.alice.node.app().stats();
+        let after = s.alice.app();
         let unknown = probe(&conn, &kind(99), &open).await;
-        // The contrast: bob is trusted, and asks the same question through the API.
-        let told = s
-            .bob
-            .node
-            .app()
-            .open(s.room, s.alice.id, vec![LABEL.to_owned()], false)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string());
-        eprintln!(
-            "untrusted app stream: {app:?}\nunknown kind:         {unknown:?}\ntrusted \
-             member told: {told:?}\nalice's app layer before {before:?} after {after:?}"
-        );
-        assert_eq!(
-            after.inbound,
-            before.inbound + 1,
-            "mallory's app stream must have reached the app gate — otherwise it was \
-             refused as a stream kind and this compares nothing"
-        );
-        assert_eq!(after.refused_untrusted, before.refused_untrusted + 1);
-        assert_eq!(
-            app, unknown,
-            "an untrusted peer's app refusal must be indistinguishable from an unknown \
-             stream kind"
-        );
-        assert!(
-            told.as_ref().is_err_and(|e| e.contains("no-listener")),
-            "a trusted member is told why: {told:?}"
-        );
+        (app, unknown, before, after)
     });
+    // The contrast: bob is trusted, and asks the same question with `vox app open`.
+    let mut told = s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]);
+    let told_exit = told.exited_within(TIMEOUT);
+    eprintln!(
+        "untrusted app stream: {app:?}\nunknown kind:         {unknown:?}\ntrusted member \
+         told: exit {told_exit:?}, {}\nalice's app layer before {before:?} after {after:?}",
+        told.said()
+    );
+    assert_eq!(
+        after.n("inbound"),
+        before.n("inbound") + 1,
+        "mallory's app stream must have reached the app gate — otherwise it was refused as \
+         a stream kind and this compares nothing"
+    );
+    assert_eq!(
+        after.n("refused_untrusted"),
+        before.n("refused_untrusted") + 1,
+        "alice's gate must refuse mallory's app stream as untrusted: {after:?}"
+    );
+    assert_eq!(
+        app, unknown,
+        "an untrusted peer's app refusal must be indistinguishable from an unknown stream \
+         kind"
+    );
+    assert!(
+        told_exit.is_some_and(|s| !s.success()) && told.said().contains("no-listener"),
+        "a trusted member is told why: {}",
+        told.said()
+    );
 }
 
 /// **(5) Withdrawing trust tears a live stream down**, on both ends, promptly.
 #[test]
-#[ignore = "real nodes and real child processes; CI runs it in release"]
+#[ignore = "real vox daemons and real child processes; CI runs it in release"]
 fn withdrawing_trust_tears_down_a_live_app_stream() {
     watchdog::arm();
-    let rt = rt();
-    let tmp = tempfile::tempdir().unwrap();
-    let s = rt.block_on(async {
-        let (s, _) = scene(&tmp).await;
-        mutual(&s).await;
-        s
-    });
-    let alice_b32 = vox_core::node::link::b32_encode(&s.alice.id);
-    let mut listen = s.alice.vox(&["app", "listen", &s.room_b32, LABEL]);
-    rt.block_on(listening(&s.alice.node, s.room));
-    let mut open = s.bob.vox(&["app", "open", &s.room_b32, &alice_b32, LABEL]);
+    let mut s = scene();
+    mutual(&mut s);
+    let mut listen = s.alice.vox(&["app", "listen", &s.room, LABEL]);
+    listen.listening();
+    let mut open = s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]);
     // Live in both directions first: a line each way.
     let heard = |p: &mut Proc| {
         let mut out = std::io::BufReader::new(p.child.stdout.take().unwrap());
@@ -660,26 +760,27 @@ fn withdrawing_trust_tears_down_a_live_app_stream() {
         (at_alice.trim(), at_bob.trim()),
         ("hello from bob", "hello from alice")
     );
-    // Both stdins stay open: nothing but the withdrawal can end this stream.
+    // Both stdins stay open: nothing but the withdrawal can end this stream. alice
+    // withdraws with `vox trust remove`, and the clock starts as she runs it.
     let withdrew = Instant::now();
-    assert!(rt
-        .block_on(s.alice.node.apply(NodeCommand::Untrust {
-            fingerprint: s.bob.id,
-        }))
-        .is_done());
-    let alice_side = listen.exited_within(Duration::from_secs(5));
+    s.alice.run(&["trust", "remove", &s.bob.fp]);
+    let removed = withdrew.elapsed();
+    // Both bounded by 5 s from the start of the untrust, not from its return.
+    let left = || Duration::from_secs(5).saturating_sub(withdrew.elapsed());
+    let alice_side = listen.exited_within(left());
     let a_took = withdrew.elapsed();
-    let bob_side = open.exited_within(Duration::from_secs(5));
+    let bob_side = open.exited_within(left());
     let b_took = withdrew.elapsed();
-    let a = s.alice.node.app().stats();
+    let a = s.alice.app();
     eprintln!(
-        "after untrust: alice's end exited {alice_side:?} in {a_took:?}, bob's {bob_side:?} \
-         in {b_took:?}; alice's app layer {a:?}\nlistener said: {}\nopener said: {}",
+        "after untrust (`vox trust remove` took {removed:?}): alice's end exited \
+         {alice_side:?} in {a_took:?}, bob's {bob_side:?} in {b_took:?}; alice's app layer \
+         {a:?}\nlistener said: {}\nopener said: {}",
         listen.said(),
         open.said()
     );
     assert!(
-        a.withdrawn >= 1,
+        a.n("withdrawn") >= 1,
         "alice's node must have torn the stream down: {a:?}"
     );
     assert!(
@@ -701,108 +802,120 @@ fn withdrawing_trust_tears_down_a_live_app_stream() {
 /// **(6) Stalled app streams cannot starve the room.** bob opens 200 app streams to a
 /// listener on alice that never accepts, and while they wait, a room message from bob
 /// reaches alice in under a second.
+///
+/// The listener that never accepts is a real `vox app listen`, suspended (`SIGSTOP`, a
+/// person's Ctrl-Z) once it is listening: its node announces every stream to it and none
+/// is ever taken. The 200 are 200 `vox app open` processes, started together.
 #[test]
-#[ignore = "real nodes and 200 app streams; CI runs it in release"]
+#[ignore = "real vox daemons and 200 app streams; CI runs it in release"]
 fn stalled_app_streams_do_not_hold_up_a_room_message() {
     watchdog::arm();
-    let rt = rt();
-    let tmp = tempfile::tempdir().unwrap();
-    rt.block_on(async {
-        let (s, _) = scene(&tmp).await;
-        mutual(&s).await;
-        // A listener that never accepts: every stream it is told about waits.
-        let _never = s.alice.node.app().listen(Some(s.room), LABEL).unwrap();
-        // Opened through the in-process API, all at once: the control socket's listen
-        // backlog would otherwise pace them, and the point is 200 waiting together.
-        let open_count: usize = 200;
-        let mut opens = tokio::task::JoinSet::new();
-        for _ in 0..open_count {
-            let hub = std::sync::Arc::clone(s.bob.node.app());
-            let (room, alice) = (s.room, s.alice.id);
-            opens.spawn(async move {
-                hub.open(room, alice, vec![LABEL.to_owned()], false)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            });
-        }
-        // A fixed second after they start, not "once all 200 have arrived": if the app
-        // streams were holding the connection's stream slots, they would also hold up
-        // their own arrival, and waiting for it would wait the stall out.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let at_post = s.alice.node.app().stats();
-        let sent = Instant::now();
-        assert!(s
-            .bob
-            .node
-            .apply(NodeCommand::SendText {
-                channel_id: s.room,
-                text: "still here".into(),
-            })
-            .await
-            .is_done());
-        // Polled from alice's view, as every other delivery gate does: the rendered
-        // timeline is what a person would see.
-        let sees = |h: &NodeHandle| {
-            h.view()
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == s.room)
-                .is_some_and(|d| d.timeline.iter().any(|r| r.text == "still here"))
-        };
-        let arrived = tokio::time::timeout(Duration::from_secs(10), async {
-            while !sees(&s.alice.node) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+    let mut s = scene();
+    mutual(&mut s);
+    let mut never = s.alice.vox(&["app", "listen", &s.room, LABEL]);
+    never.listening();
+    let ok = Command::new("kill")
+        .args(["-STOP", &never.child.id().to_string()])
+        .status()
+        .is_ok_and(|st| st.success());
+    assert!(ok, "kill -STOP the listener");
+    // What alice sees arrive, as a person watching the room would.
+    let mut tail = VoxProc::spawn(
+        "alice-tail",
+        &s.alice.data,
+        &args(&["room", "tail", &s.room]),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let open_count: usize = 200;
+    let started = Instant::now();
+    let mut opens: Vec<Proc> = (0..open_count)
+        .map(|_| s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]))
+        .collect();
+    let spawned = started.elapsed();
+    // Once all 200 have reached alice's gate. If the app streams were holding the
+    // connection's stream slots, they would also hold up their own arrival, and this
+    // would not come.
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut at_post = s.alice.app();
+    while at_post.n("inbound") < open_count as u64 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+        at_post = s.alice.app();
+    }
+    let arrived_after = started.elapsed();
+    let sent = Instant::now();
+    s.bob.run(&["room", "post", &s.room, "still here"]);
+    let arrived = tail
+        .wait_for(Duration::from_secs(10), |l| l.contains("still here"))
+        .map(|_| sent.elapsed());
+    let still_waiting = s.alice.app();
+    // Every opener ends: refused busy, or refused once nobody accepted in time.
+    let mut outcomes = std::collections::BTreeMap::<String, usize>::new();
+    for o in &mut opens {
+        let key = match o.exited_within(Duration::from_secs(30)) {
+            None => "still running".to_owned(),
+            Some(st) if st.success() => "accepted".to_owned(),
+            Some(_) => {
+                let said = o.said();
+                let why = said.split("app: ").nth(1).unwrap_or(&said);
+                why.split('—').next().unwrap_or(why).trim().to_owned()
             }
-            sent.elapsed()
-        })
-        .await;
-        let still_waiting = s.alice.node.app().stats();
-        let mut outcomes = std::collections::BTreeMap::<String, usize>::new();
-        while let Some(r) = opens.join_next().await {
-            let key = match r.unwrap() {
-                Ok(()) => "accepted".to_owned(),
-                Err(e) => e.split('—').next().unwrap_or(&e).trim().to_owned(),
-            };
-            *outcomes.entry(key).or_default() += 1;
-        }
-        let end = s.alice.node.app().stats();
-        eprintln!(
-            "message crossed in {arrived:?} with {} app streams at alice's gate; alice at the \
-             post {at_post:?}; while waiting {still_waiting:?}; at the end {end:?}; the 200 \
-             opens ended as {outcomes:?}",
-            at_post.inbound
-        );
-        let took = arrived.expect("the room message must arrive at all");
-        // One actor tick plus half a second. A local append is pushed within one tick
-        // (`TICK`, 1 s) by design, so even with no app streams at all a message takes
-        // anywhere from ~30 ms to ~1.03 s here (measured, three runs). ADR-022's "under
-        // 1 s" is therefore not a bound anything can meet; what 200 stalled app streams
-        // must not do is add to it.
-        //
-        // **Temporary.** The tick is itself a defect against PRD-001 R40 (a chat message
-        // arrives in under 1 s). When R40's fix to the sync scheduling lands, this bound
-        // returns to 1 s.
-        assert!(
-            took < Duration::from_millis(1500),
-            "a room message took {took:?} behind 200 stalled app streams"
-        );
-        assert_eq!(
-            at_post.inbound, 200,
-            "all 200 app streams must have reached alice's gate before the message: {at_post:?}"
-        );
-        assert!(
-            at_post.announced > at_post.refused_unaccepted,
-            "some app streams must still be waiting when the message is sent: {at_post:?}"
-        );
-        assert!(
-            end.announced <= 16 && end.refused_busy >= 184,
-            "at most 16 may wait on one peer's behalf, the rest refused busy: {end:?}"
-        );
-        assert_eq!(
-            end.announced + end.refused_busy,
-            200,
-            "every one of the 200 accounted for: {end:?}"
-        );
-    });
+        };
+        *outcomes.entry(key).or_default() += 1;
+    }
+    let end = s.alice.app();
+    eprintln!(
+        "200 opens spawned in {spawned:?}, all at alice's gate after {arrived_after:?}; the \
+         message crossed in {arrived:?}; alice at the post {at_post:?} (announced {}); while \
+         waiting {still_waiting:?}; at the end {end:?} (announced {}); the 200 opens ended \
+         as {outcomes:?}",
+        at_post.announced(),
+        end.announced()
+    );
+    let took = arrived.expect("the room message must arrive at all");
+    // One actor tick plus half a second. A local append is pushed within one tick
+    // (`TICK`, 1 s) by design, so even with no app streams at all a message takes
+    // anywhere from ~30 ms to ~1.03 s here (measured, three runs). ADR-022's "under
+    // 1 s" is therefore not a bound anything can meet; what 200 stalled app streams
+    // must not do is add to it.
+    //
+    // **Temporary.** The tick is itself a defect against PRD-001 R40 (a chat message
+    // arrives in under 1 s). When R40's fix to the sync scheduling lands, this bound
+    // returns to 1 s.
+    assert!(
+        took < Duration::from_millis(1500),
+        "a room message took {took:?} behind 200 stalled app streams"
+    );
+    assert_eq!(
+        at_post.n("inbound"),
+        200,
+        "all 200 app streams must have reached alice's gate before the message: {at_post:?}"
+    );
+    assert!(
+        at_post.announced() > at_post.n("refused_unaccepted") + at_post.n("accepted"),
+        "some app streams must still be waiting when the message is sent: {at_post:?}"
+    );
+    assert!(
+        end.announced() <= 16 && end.n("refused_busy") >= 184,
+        "at most 16 may wait on one peer's behalf, the rest refused busy: {end:?}"
+    );
+    assert_eq!(
+        (
+            end.n("refused_untrusted"),
+            end.n("refused_no_listener"),
+            end.n("accepted")
+        ),
+        (0, 0, 0),
+        "every stream was trusted, found the listener, and none was accepted: {end:?}"
+    );
+    assert_eq!(
+        end.announced() + end.n("refused_busy"),
+        200,
+        "every one of the 200 accounted for: {end:?}"
+    );
+    assert_eq!(
+        outcomes.values().sum::<usize>(),
+        200,
+        "every opener accounted for: {outcomes:?}"
+    );
 }
