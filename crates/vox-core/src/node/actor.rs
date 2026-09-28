@@ -6623,12 +6623,6 @@ impl Node {
         });
     }
 
-    /// A connection to `target`: the live one if there is one, otherwise dialled
-    /// through the ADR-012 ladder.
-    ///
-    /// `ConnectionManager::existing` alone means "whoever we happen to be talking to",
-    /// which is not a membership property — it made delivery depend on connection
-    /// history rather than on the room.
     /// Dial every other member of a room this node has just opened, in the background — what
     /// a restart needs to find them again (`node::peer_book`). `reach_member` dials off the
     /// actor, and a connection it makes is adopted with a sync due at once.
@@ -6636,15 +6630,42 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let (me, members) = {
-            let ch = shared.lock().await;
-            (ch.me(), ch.members())
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
         };
+        let (me, members, anchored) = {
+            let ch = shared.lock().await;
+            let anchored = ch.anchors().nodes().iter().any(|a| a.id != net.local_id());
+            (ch.me(), ch.members(), anchored)
+        };
+        // **A room with an anchor is left to its board.** The board says where every member is
+        // within moments of opening, and a dial started before it from where a member was last
+        // reached races a circuit through that anchor against the direct path: whichever
+        // landed, the circuit stayed on the anchor for its idle timeout, and anything else that
+        // reached the member meanwhile took the relayed path (#226: a `vox forward` beside a
+        // reopened room left a circuit on the anchor in 5 of 5 runs, where v0.2.10 left none).
+        // This dial is for a room with no anchor, whose members are found nowhere else.
+        if anchored {
+            return;
+        }
         for member in members.into_iter().filter(|m| *m != me) {
+            // Only a member there is an address for: with none in the book either, there is
+            // nothing to dial.
+            if net.board_endpoints(channel_id, &member).is_empty()
+                && self.peer_book.endpoints(&member).is_empty()
+            {
+                continue;
+            }
             let _ = self.reach_member(channel_id, member, false).await;
         }
     }
 
+    /// A connection to `target`: the live one if there is one, otherwise dialled
+    /// through the ADR-012 ladder.
+    ///
+    /// `ConnectionManager::existing` alone means "whoever we happen to be talking to",
+    /// which is not a membership property — it made delivery depend on connection
+    /// history rather than on the room.
     async fn reach_member(
         &mut self,
         channel_id: &Digest32,
