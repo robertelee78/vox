@@ -712,6 +712,8 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         const WRONG: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("sek_wraps");
         let db = redb::Database::open(&damaged.store_file).expect("open gina's stopped store");
         let w = db.begin_write().unwrap();
+        // v0.2.9 created the table (keyed by a 32-byte channel id) even with no room in it.
+        w.delete_table(WRONG).unwrap();
         w.open_table(WRONG)
             .unwrap()
             .insert("not a channel id", b"x".as_slice())
