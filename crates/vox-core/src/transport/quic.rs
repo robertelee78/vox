@@ -654,6 +654,7 @@ fn finish_connection(
         .and_then(|chain| chain.first().map(|leaf| crate::hash::sha256(leaf.as_ref())))
         .ok_or(Error::SignatureInvalid)?;
     Ok(VoxConnection {
+        serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
         connection,
         peer_id,
         peer_process,
@@ -718,6 +719,8 @@ fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
 /// every datagram returned by [`VoxConnection::recv_datagram`] has passed the
 /// window.
 pub struct VoxConnection {
+    /// This connection's name in this process, never given to another (see [`Self::serial`]).
+    serial: u64,
     connection: Connection,
     peer_id: Digest32,
     /// Which process of `peer_id` this connection is to: the digest of its per-process leaf
@@ -736,7 +739,21 @@ pub struct VoxConnection {
     datagrams_dropped: AtomicU64,
 }
 
+/// The next [`VoxConnection::serial`].
+static NEXT_SERIAL: AtomicU64 = AtomicU64::new(0);
+
 impl VoxConnection {
+    /// **A name for this connection that no other connection in this process is ever given.**
+    ///
+    /// quinn's `stable_id` is not one: it is the address of the connection's state, and a
+    /// connection allocated after another was freed can be given the same address. Anything
+    /// that remembers connections past their lifetime — which have a stream loop, when each
+    /// was last heard — keys on this instead.
+    #[must_use]
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
     /// The authenticated peer identity fingerprint.
     #[must_use]
     pub fn peer_id(&self) -> Digest32 {
