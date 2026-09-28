@@ -130,6 +130,9 @@ const T_STALLED: u64 = 1715;
 const T_PEER_UNREACHABLE: u64 = 1716;
 /// `NodeEvent::PublishRefused`. Additive, and deliberately away from the sequential range.
 const T_PUBLISH_REFUSED: u64 = 1717;
+/// `NodeEvent::PublishCured` (V210-51). Additive, away from both the sequential range and the tags
+/// the v0.3.0 line uses.
+const T_PUBLISH_CURED: u64 = 2091;
 /// [`NodeEvent::JoinSteps`]: where a join's time went.
 const T_JOIN_STEPS: u64 = 1718;
 /// `NodeEvent::KeyNotTaken`.
@@ -875,6 +878,12 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .text(what)
                 .text(why);
         }
+        NodeEvent::PublishCured { channel_id, what } => {
+            e.array(3)
+                .uint(T_PUBLISH_CURED)
+                .bytes(channel_id)
+                .text(what);
+        }
         NodeEvent::SyncFailed {
             channel_id,
             peer,
@@ -1164,6 +1173,13 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             why: d
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc room not remembered why"))?
+                .to_owned(),
+        },
+        (T_PUBLISH_CURED, 3) => NodeEvent::PublishCured {
+            channel_id: digest(d)?,
+            what: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc publish cured what"))?
                 .to_owned(),
         },
         (T_PUBLISH_REFUSED, 4) => NodeEvent::PublishRefused {

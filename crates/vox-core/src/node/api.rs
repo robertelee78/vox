@@ -694,6 +694,14 @@ pub enum NodeEvent {
         /// What the board said.
         why: String,
     },
+    /// A board took one of this node's own records on a republish, after refusing it as stale
+    /// (V210-51, #230): the refusal happened, and was mended. Said once per refusal.
+    PublishCured {
+        /// The room the record was for.
+        channel_id: Digest32,
+        /// Which record it was, and which board (`our address (board …)`).
+        what: String,
+    },
     /// A join failed, with what each responder that was tried reported.
     ///
     /// `Outcome::Failed(Fault)` is a single token with no room for a reason, so this carries the

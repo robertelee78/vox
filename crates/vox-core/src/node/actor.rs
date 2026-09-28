@@ -413,7 +413,7 @@ impl NodeConfig {
     pub fn new() -> Self {
         Self {
             clock: system_clock(),
-            millis_clock: crate::time::system_millis_clock(),
+            millis_clock: crate::time::millis_clock_with_test_skew(),
             argon2: Argon2Profile::default(),
             bind: None,
             pow_params: None,
@@ -1968,6 +1968,12 @@ pub struct Node {
     /// How many times in a row each board has refused one of this node's own records as stale,
     /// for [`NetEvent::RepublishTo`]'s cap. Cleared by a round that went on.
     stale_retries: BTreeMap<(Digest32, Digest32), u32>,
+    /// The (room, board) pairs with a `NetEvent::RepublishTo` already on its way: one at a time,
+    /// so the refusals a single burst of rounds brings back arm one republish, not one each.
+    republish_pending: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// This node's own records a board refused as stale and has not yet taken, by
+    /// `report_publish`'s key: a round that takes one says so (`NodeEvent::PublishCured`).
+    stale_held: std::collections::BTreeSet<(Digest32, String)>,
     /// Creates and joins answered once their room's publish rounds have ended: see
     /// `answer_when_published`.
     publish_waiters: Vec<(Digest32, oneshot::Sender<Outcome>, Outcome)>,
@@ -2174,6 +2180,8 @@ impl Node {
             publishing: std::collections::BTreeSet::new(),
             publish_again: std::collections::BTreeSet::new(),
             stale_retries: BTreeMap::new(),
+            republish_pending: std::collections::BTreeSet::new(),
+            stale_held: std::collections::BTreeSet::new(),
             publish_waiters: Vec::new(),
             member_dialed_at: BTreeMap::new(),
             pending_consents: Vec::new(),
@@ -2971,6 +2979,9 @@ impl Node {
                     } else {
                         PUBLISH_REFUSAL_GRACE
                     };
+                    if stale {
+                        self.stale_held.insert(key.clone());
+                    }
                     if not_yet_vouched || stale {
                         let now = self.now();
                         let seen_before = self.publish_refusal_first_seen.contains_key(&key);
@@ -3013,6 +3024,14 @@ impl Node {
                 None => {
                     self.last_publish_refusal.remove(&key);
                     self.publish_refusal_first_seen.remove(&key);
+                    // A refusal as stale, cured by the republish past the second: said once, so
+                    // a person — and a proof — can see the refusal happened and was mended.
+                    if self.stale_held.remove(&key) {
+                        let _ = self.event_tx.send(NodeEvent::PublishCured {
+                            channel_id: *channel_id,
+                            what,
+                        });
+                    }
                 }
             }
         }
@@ -3698,6 +3717,8 @@ impl Node {
                 }
             }
             NetEvent::RepublishTo { channel_id, board } => {
+                self.republish_pending.remove(&(channel_id, board));
+                *self.stale_retries.entry((channel_id, board)).or_insert(0) += 1;
                 let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
                 if let Some(conn) = conn {
                     // Queued behind a round in flight to that board, as any other publish is.
@@ -3725,9 +3746,16 @@ impl Node {
                     .any(|(kind, why)| own_stale_refusal(kind, why));
                 let key = (channel_id, board);
                 if own_stale {
-                    let tries = self.stale_retries.entry(key).or_insert(0);
-                    *tries = tries.saturating_add(1);
-                    if *tries <= STALE_REPUBLISH_TRIES {
+                    // **One republish at a time, counted when it goes.** A node publishes to a board
+                    // in bursts, so a stale record comes back refused several times within
+                    // milliseconds. Counting each refusal spent the cap on one burst and armed a
+                    // timer per refusal, all firing in the same instant a second later, into a second
+                    // still refused; nothing came after (#230's verifier and the tries log: seven
+                    // refusals and six republishes inside 200 ms, then silence). Now each refusal
+                    // arms the next republish only if none is on its way, and a try is counted when
+                    // the republish goes, so the waves are a second apart and there are three.
+                    let tries = self.stale_retries.get(&key).copied().unwrap_or(0);
+                    if tries < STALE_REPUBLISH_TRIES && self.republish_pending.insert(key) {
                         let past_the_second = 1_000 - (self.millis_clock)() % 1_000 + 50;
                         let tx = self.net_tx.clone();
                         tokio::spawn(async move {
