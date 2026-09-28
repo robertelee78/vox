@@ -3662,6 +3662,27 @@ impl Node {
                 }
             }
             NetEvent::ReachFailed { peer, why } => {
+                // A member no reach could get to: its ports that have no connection back off as
+                // Unreachable (ADR-025 D5), so the scheduler does not ask again at once (#246).
+                let unconnected = self
+                    .net
+                    .as_ref()
+                    .is_some_and(|n| n.manager().existing(&peer).is_none());
+                if unconnected {
+                    let rooms: Vec<Digest32> = self
+                        .ports
+                        .keys()
+                        .filter(|(_, p)| *p == peer)
+                        .map(|(r, _)| *r)
+                        .collect();
+                    for room in rooms {
+                        self.enter_backoff(
+                            room,
+                            peer,
+                            crate::node::status::BackoffKind::Unreachable,
+                        );
+                    }
+                }
                 self.answer_pending_consents(
                     |_, target| *target == peer,
                     Some(Outcome::Failed(Fault::Unreachable)),
@@ -5648,6 +5669,32 @@ impl Node {
                 port.queued = false;
                 self.port_queue.remove(&room, &peer);
             }
+        }
+        // **A port with no connection reaches its peer** (ADR-025 D2, V210-58 #246). A port runs
+        // only over a connection that exists, and nothing else dials a member for sync: members are
+        // dialled for key work, and through the board's anchor. So a member whose connection was
+        // dropped — silent past `SILENCE_IS_DEATH` (30 s), a laptop lid, a frozen process — was
+        // never synced with again once the anchor was gone too: two members with a backlog each
+        // for the other sat for 150 s with neither dialling (CI run 36452063803). One reach per
+        // peer, off the actor (`reach_member`, which spaces automatic dials), and a failed reach
+        // backs the peer's ports off as Unreachable (`NetEvent::ReachFailed`).
+        let lacking: std::collections::BTreeMap<Digest32, Digest32> = self
+            .ports
+            .iter()
+            .filter(|(key, port)| {
+                port.out.is_none()
+                    && port.needs()
+                    && !port.backing_off(now)
+                    && !self.publishing.contains(*key)
+                    && self
+                        .net
+                        .as_ref()
+                        .is_some_and(|n| n.manager().existing(&key.1).is_none())
+            })
+            .map(|((room, peer), _)| (*peer, *room))
+            .collect();
+        for (peer, room) in lacking {
+            let _ = self.reach_member(&room, peer, false).await;
         }
         let mut ran = false;
         loop {
