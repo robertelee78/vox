@@ -14,8 +14,12 @@
 //! **The scene**, all real `vox` processes:
 //! 1. An anchor, and two `vox daemon`s, carol and bob, trusting each other in one room. Each
 //!    reads the other's latest hello.
-//! 2. Bob is frozen (`SIGSTOP`) for [`FREEZE`], deterministically past the 30 s line. Carol posts
-//!    [`POSTS`] rows meanwhile, so she drops his connection as dead.
+//! 2. Bob is frozen (`SIGSTOP`) for [`FREEZE`], past QUIC's 60 s idle timeout, so the connection
+//!    between them is **gone at both ends**, whatever either node did meanwhile. Carol posts
+//!    [`POSTS`] rows meanwhile. (A freeze just past the 30 s silence line was not enough to stage it:
+//!    a node drops a silent connection only when it next looks at it, and a port in backoff
+//!    does not look. With the reach removed, bob still read carol's rows over the surviving
+//!    connection, 2 runs of 2. CI's 31.3 s happened to be looked at.)
 //! 3. The anchor is stopped, so no board or relay is left between them. Then bob is continued.
 //!
 //! **What must hold:** bob reads every one of carol's rows within [`BACK_WITHIN`] of being
@@ -40,8 +44,8 @@ use world::{args, vox_once, VoxProc};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "identity passphrase";
-/// Past `SILENCE_IS_DEATH` (30 s), so bob's connection is dropped as dead, with margin.
-const FREEZE: Duration = Duration::from_secs(35);
+/// Past QUIC's idle timeout (`MAX_IDLE_MS`, 60 s): the connection is closed at both ends.
+const FREEZE: Duration = Duration::from_secs(70);
 /// Rows carol posts while bob is frozen.
 const POSTS: usize = 20;
 /// How soon after bob is continued he must read all of carol's rows: a periodic request (at most
@@ -116,7 +120,7 @@ fn rows_read(data: &Path, room: &str) -> usize {
 }
 
 #[test]
-#[ignore = "real vox processes and a 35 s freeze; CI runs it in release"]
+#[ignore = "real vox processes and a 70 s freeze; CI runs it in release"]
 fn a_member_whose_connection_died_is_synced_again() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
