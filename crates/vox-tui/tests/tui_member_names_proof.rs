@@ -30,6 +30,9 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
     match out.code {
         Some(0) => assert!(said.contains("cargo PASS"), "exit 0 without a PASS line: {said}"),
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
+        _ if said.contains("outlived SIGKILL") => {
+            panic!("the TUI proof could not stop the `vox tui` it started: {said}")
+        }
         _ if said.contains("HUNG at") || out.code.is_none() => panic!(
             "the TUI proof hung (its stage and stack are above, on stderr): exit {:?}: {said}",
             out.code

@@ -70,5 +70,7 @@ except Hung as h:
     code = 1
 finally:
     if tui is not None and not tui.stop():
-        print(f"{TAG} vox tui (pid {tui.pid}) outlived SIGKILL")
+        # A driver that cannot stop what it started has leaked it, and is how a job hangs (#240).
+        print(f"{TAG} RED: vox tui (pid {tui.pid}) outlived SIGKILL and could not be reaped")
+        code = 1
 sys.exit(code)
