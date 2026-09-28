@@ -317,7 +317,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         drop(up);
     }
 
-    let w = NatWorld::new(Kind::PortRestrictedCone);
+    let mut w = NatWorld::new(Kind::PortRestrictedCone);
     let mut any = Vec::new();
     let mut punched = Vec::new();
     let mut first_over_circuit = 0usize;
@@ -409,8 +409,12 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
                     e.len
                 );
             }
+        }
+        // A sample that never punched, or punched late, says what its `vox up` noticed (#243's
+        // CI red on dd78874: sample 0 punched after 61.9 s, and nothing said why).
+        if d >= TARGET {
             for l in up.transcript().lines().filter(|l| l.starts_with("! ")) {
-                eprintln!("[proof]   up said: {l}");
+                eprintln!("[proof]   up-{i} said: {l}");
             }
         }
         if direct_at.is_some() {
@@ -441,6 +445,13 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
     let punched_max = stats("on the punched path", &punched);
     let over_any = any.iter().filter(|d| **d >= TARGET).count();
     let over_punched = punched.iter().filter(|d| **d >= TARGET).count();
+    if never > 0 || over_any > 0 || over_punched > 0 {
+        for (who, p) in [("host", &mut w._host), ("anchor", &mut w._anchor)] {
+            for l in p.transcript().lines().filter(|l| l.starts_with("! ")) {
+                eprintln!("[proof]   {who} said: {l}");
+            }
+        }
+    }
     assert!(
         never == 0 && over_any == 0 && over_punched == 0,
         "R42 punch: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
