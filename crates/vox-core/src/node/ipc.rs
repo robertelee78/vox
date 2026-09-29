@@ -36,7 +36,9 @@
 //! ## Lifecycle facts, measured rather than assumed (M19.1b spike)
 //!
 //! - `UnixListener::bind` yields a **0755** socket (the mode comes from the
-//!   umask), so the explicit `chmod` to `0600` is REQUIRED, not belt-and-braces.
+//!   umask), so the explicit `chmod` to `0600` is REQUIRED, not belt-and-braces. It is
+//!   done under a staging name before the socket is renamed into place, so the path a
+//!   client connects to is never there at any other mode (V210-72).
 //! - A leftover socket file from a process that died makes `bind` fail with
 //!   `AddrInUse` (errno 48), so the stale file is unlinked first — deliberately,
 //!   rather than inheriting a confusing "address in use".
@@ -272,7 +274,9 @@ pub enum Request {
         /// The last room of the previous page, or `None` for the first.
         after: Option<Digest32>,
     },
-    /// Offer a local TCP endpoint as a room-bound service (ADR-013).
+    /// Offer a local TCP endpoint as a room-bound service (ADR-013), for as long as this
+    /// connection stays open: it is withdrawn when the connection closes, however the client
+    /// ends, and never persisted (V210-72). A [`Request::Forward`] likewise.
     AddService {
         /// The room.
         channel_id: Digest32,
@@ -1395,44 +1399,79 @@ impl Drop for IpcServer {
 /// Bind the control socket at `path` and serve `handle`'s event stream to every
 /// client that connects.
 ///
+/// The directory is made private to this user first ([`prepare_socket_dir`]), and one that
+/// is not is refused: whoever owns the directory can replace the socket in it.
+///
 /// The stale socket file of a process that died is **unlinked first**: `bind`
 /// fails with `AddrInUse` otherwise (measured), and inheriting that error would
-/// report a dead predecessor as a live conflict. The socket is then chmod'd to
-/// `0600` — `bind` itself yields `0755` from the umask (also measured), so this
-/// is load-bearing, not decoration.
+/// report a dead predecessor as a live conflict. The socket is bound under a staging
+/// name and chmod'd to `0600` there — `bind` itself yields `0755` from the umask (also
+/// measured), so this is load-bearing, not decoration — and only then renamed to `path`,
+/// so `path` is never a socket at any other mode (V210-72).
+///
+/// [`prepare_socket_dir`]: crate::node::paths::prepare_socket_dir
 pub fn bind_at(handle: NodeHandle, path: PathBuf) -> Result<IpcServer> {
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| Error::Path {
-            op: "unlink stale control socket",
-            detail: format!("{}: {e}", path.display()),
-        })?;
+    crate::node::paths::prepare_socket_dir(&path)?;
+    // Never longer than `path`, so it fits wherever `path` does.
+    let staging = path.with_extension("new");
+    for stale in [&staging, &path] {
+        if std::fs::symlink_metadata(stale).is_ok() {
+            std::fs::remove_file(stale).map_err(|e| Error::Path {
+                op: "unlink stale control socket",
+                detail: format!("{}: {e}", stale.display()),
+            })?;
+        }
     }
-    let listener = UnixListener::bind(&path).map_err(|e| Error::Path {
+    let listener = UnixListener::bind(&staging).map_err(|e| Error::Path {
         op: "bind control socket",
-        detail: format!("{}: {e}", path.display()),
+        detail: format!("{}: {e}", staging.display()),
     })?;
-    #[cfg(unix)]
-    {
+    let placed = {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            Error::Path {
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::Path {
                 op: "chmod control socket",
-                detail: format!("{}: {e}", path.display()),
-            }
-        })?;
+                detail: format!("{}: {e}", staging.display()),
+            })
+            .and_then(|()| {
+                std::fs::rename(&staging, &path).map_err(|e| Error::Path {
+                    op: "place control socket",
+                    detail: format!("{}: {e}", path.display()),
+                })
+            })
+    };
+    if let Err(e) = placed {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
     }
 
+    let me = crate::node::paths::my_uid();
     let task = tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                // The listener is gone; nothing left to accept.
-                return;
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                // **An accept error is not the end of the socket** (V210-72). They are
+                // transient — the process or the system out of descriptors (EMFILE,
+                // ENFILE), a connection aborted before it was taken (ECONNABORTED), no
+                // buffer space — and returning here ended the control socket for good
+                // while the daemon ran on, and every client after was told nothing was
+                // listening. The pause keeps an exhausted descriptor table from being
+                // spun on; the connection waits in the backlog meanwhile.
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             };
+            // Only this user: the directory and the mode already say so, and the kernel's
+            // word for who connected is checked as well, so neither is the only guard.
+            if !stream.peer_cred().is_ok_and(|c| c.uid() == me) {
+                continue;
+            }
             // Each client gets its own task and its own subscription, so one
             // client's pace — or death — reaches no other and never the actor.
             let stream_handle = handle.clone();
             tokio::spawn(async move {
-                let _ = serve_client(stream, stream_handle).await;
+                serve_client(stream, stream_handle).await;
             });
         }
     });
@@ -1445,8 +1484,93 @@ pub fn bind(handle: NodeHandle, paths: &crate::node::paths::Paths) -> Result<Ipc
     bind_at(handle, paths.socket_file())
 }
 
-/// One client: greet, wait for `Subscribe`, then stream until either side stops.
-async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> {
+/// What a client opened over its connection and has not closed: a file offer's service,
+/// a get's forward.
+///
+/// **They last as long as the connection** (V210-72). `vox room send` and `vox room get`
+/// withdrew them only on Ctrl-C, so a SIGTERM, a SIGHUP, a closed terminal or a crash left
+/// the offer's service registered — persisted, and pointing at a port some later process
+/// could take — and the get's forward listening. The daemon sees the connection close
+/// however the process ends, so it withdraws them itself.
+#[derive(Default)]
+struct Held {
+    services: Vec<(Digest32, String)>,
+    forwards: Vec<String>,
+}
+
+impl Held {
+    /// What `request` would open or close, taken before it is served (a request is not
+    /// cloned for this: some carry passphrases).
+    fn intent(request: &Request) -> Intent {
+        match request {
+            Request::AddService {
+                channel_id,
+                service_tag,
+                ..
+            } => Intent::Offer(*channel_id, service_tag.clone()),
+            Request::RemoveService {
+                channel_id,
+                service_tag,
+            } => Intent::Withdraw(*channel_id, service_tag.clone()),
+            Request::Forward { .. } => Intent::Forward,
+            Request::StopForward { local } => Intent::StopForward(local.clone()),
+            _ => Intent::Nothing,
+        }
+    }
+
+    /// Note what `intent` did, given the node's `reply`.
+    fn note(&mut self, intent: Intent, reply: &Frame) {
+        match (intent, reply) {
+            (Intent::Offer(c, t), Frame::Ok) => self.services.push((c, t)),
+            (Intent::Withdraw(c, t), _) => self.services.retain(|(hc, ht)| !(*hc == c && *ht == t)),
+            (Intent::Forward, Frame::Bound { local }) => self.forwards.push(local.clone()),
+            (Intent::StopForward(local), _) => self.forwards.retain(|l| *l != local),
+            _ => {}
+        }
+    }
+
+    /// Withdraw everything still held.
+    async fn release(self, handle: &NodeHandle) {
+        for (channel_id, service_tag) in self.services {
+            let _ = handle
+                .apply(crate::node::api::NodeCommand::RemoveService {
+                    channel_id,
+                    service_tag,
+                })
+                .await;
+        }
+        for local in self.forwards {
+            if let Ok(local) = local.parse() {
+                let _ = handle
+                    .apply(crate::node::api::NodeCommand::StopForward { local })
+                    .await;
+            }
+        }
+    }
+}
+
+/// See [`Held::intent`].
+enum Intent {
+    Offer(Digest32, String),
+    Withdraw(Digest32, String),
+    Forward,
+    StopForward(String),
+    Nothing,
+}
+
+/// One client, until it goes, and then whatever it left open is withdrawn.
+async fn serve_client(stream: UnixStream, handle: NodeHandle) {
+    let mut held = Held::default();
+    let _ = serve_requests(stream, &handle, &mut held).await;
+    held.release(&handle).await;
+}
+
+/// Greet, serve requests, and stream once subscribed, until either side stops.
+async fn serve_requests(
+    mut stream: UnixStream,
+    handle: &NodeHandle,
+    held: &mut Held,
+) -> Result<()> {
     write_frame(
         &mut stream,
         &Frame::Hello {
@@ -1502,7 +1626,9 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
             write_frame(&mut stream, &Frame::Ok.to_bytes()).await?;
             return pump(stream, events).await;
         }
-        let reply = serve_request(&handle, request).await;
+        let intent = Held::intent(&request);
+        let reply = serve_request(handle, request).await;
+        held.note(intent, &reply);
         write_frame(&mut stream, &reply.to_bytes()).await?;
     }
 }
@@ -1730,6 +1856,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     channel_id,
                     service_tag,
                     local,
+                    // Offered over this socket, it lasts as long as the client's connection
+                    // (`Held`), and so never outlives this node's run either.
+                    persist: false,
                 })
                 .await
             {
@@ -1953,6 +2082,47 @@ pub struct IpcClient {
     me: Option<Digest32>,
 }
 
+/// Connect to the control socket at `path` only if it is this user's own (V210-72).
+///
+/// A client sends the node passphrases, so it checks before connecting that `path` is a
+/// socket owned by this uid — not a symlink, not another user's — and after connecting
+/// that the process serving it runs as this uid too. Another user can satisfy neither.
+///
+/// # Errors
+/// [`IpcHandshake::Unreachable`] if nothing is there or nothing listens;
+/// [`IpcHandshake::NotYours`] if it, or what serves it, belongs to someone else.
+pub async fn connect_own(path: &Path) -> Result<UnixStream> {
+    let unreachable = |e: std::io::Error| {
+        Error::Ipc(IpcHandshake::Unreachable {
+            reason: e.to_string(),
+        })
+    };
+    std::fs::symlink_metadata(path).map_err(unreachable)?;
+    crate::node::paths::check_socket_owner(path).map_err(|e| {
+        Error::Ipc(IpcHandshake::NotYours {
+            detail: match e {
+                Error::Path { detail, .. } => detail,
+                other => other.to_string(),
+            },
+        })
+    })?;
+    let stream = UnixStream::connect(path).await.map_err(unreachable)?;
+    let me = crate::node::paths::my_uid();
+    match stream.peer_cred() {
+        Ok(c) if c.uid() == me => Ok(stream),
+        Ok(c) => Err(Error::Ipc(IpcHandshake::NotYours {
+            detail: format!(
+                "{} is served by uid {}, not by you (uid {me})",
+                path.display(),
+                c.uid()
+            ),
+        })),
+        Err(e) => Err(Error::Ipc(IpcHandshake::NotYours {
+            detail: format!("cannot tell who serves {}: {e}", path.display()),
+        })),
+    }
+}
+
 impl IpcClient {
     /// This client's own identity fingerprint, as the node reported it at hello,
     /// or `None` if the node has no identity yet.
@@ -1969,11 +2139,7 @@ impl IpcClient {
     /// the connection into an event stream, after which no further request can be
     /// sent on it.
     pub async fn open(path: &Path) -> Result<Self> {
-        let mut stream = UnixStream::connect(path).await.map_err(|e| {
-            Error::Ipc(IpcHandshake::Unreachable {
-                reason: e.to_string(),
-            })
-        })?;
+        let mut stream = connect_own(path).await?;
         let Some(hello) = read_frame(&mut stream).await? else {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };

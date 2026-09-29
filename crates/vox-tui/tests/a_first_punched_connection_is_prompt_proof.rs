@@ -167,8 +167,8 @@ impl NatWorld {
             &args(&[
                 "connect",
                 &address,
-                "--passphrase",
-                &passphrase,
+                "--passphrase-file",
+                &world::room_pass_file(&guest_dir, &passphrase),
                 "--anchor",
                 &guest_spec,
                 "--listen",
@@ -204,8 +204,8 @@ impl NatWorld {
             &args(&[
                 "up",
                 &self.room,
-                "--passphrase",
-                &self.passphrase,
+                "--passphrase-file",
+                &world::room_pass_file(&self.guest_dir, &self.passphrase),
                 "--bind",
                 "127.0.0.1:0",
                 "--anchor",

@@ -233,8 +233,8 @@ fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
         .args([
             "connect",
             &address,
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &world::room_pass_file(&guest_dir, &passphrase),
             "--anchor",
             &anchor_spec,
             "--listen",

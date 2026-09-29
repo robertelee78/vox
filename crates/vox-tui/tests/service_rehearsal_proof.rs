@@ -50,6 +50,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// Write the room passphrase `pass` beside the profile at `dir`, for `--passphrase-file`: a
+/// room passphrase is never taken from argv or the environment (V210-72).
+fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let at = dir.join("room-passphrase");
+    std::fs::write(&at, pass).unwrap();
+    at.to_str().unwrap().to_owned()
+}
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// Generous: three production Argon2id derivations and a real PoW happen inside it.
 const LINE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -384,8 +392,8 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         &[
             "connect".into(),
             address.clone(),
-            "--passphrase".into(),
-            passphrase.clone(),
+            "--passphrase-file".into(),
+            room_pass_file(&guest_dir, &passphrase),
             "--anchor".into(),
             anchor_spec.clone(),
             "--listen".into(),
@@ -409,8 +417,8 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
             // room's store is sealed under it (ADR-010), so opening the room requires it
             // every time. A guest therefore keeps the passphrase for as long as it wants
             // to reach the service, not merely to join once.
-            "--passphrase".into(),
-            passphrase.clone(),
+            "--passphrase-file".into(),
+            room_pass_file(&guest_dir, &passphrase),
             "--bind".into(),
             "127.0.0.1:0".into(),
             "--anchor".into(),
@@ -485,8 +493,8 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         &[
             "connect".into(),
             address.clone(),
-            "--passphrase".into(),
-            passphrase.clone(),
+            "--passphrase-file".into(),
+            room_pass_file(&stranger_dir, &passphrase),
             "--anchor".into(),
             anchor_spec.clone(),
             "--listen".into(),
@@ -504,8 +512,8 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         &[
             "up".into(),
             room.clone(),
-            "--passphrase".into(),
-            passphrase.clone(),
+            "--passphrase-file".into(),
+            room_pass_file(&stranger_dir, &passphrase),
             "--bind".into(),
             "127.0.0.1:0".into(),
             "--anchor".into(),
