@@ -19,8 +19,8 @@
 //! `vox forward` started at once with its millisecond clock [`SKEW_MS`] behind
 //! (`VOX_TEST_CLOCK_SKEW_MS`, test-only, inert when unset — the clock that floors a record's
 //! `seq`). B publishes about a second after A (kill, unlock, bind), so its first record is at or
-//! below A's: refused as stale. Its republishes, a second apart, pass A's `seq` as real time
-//! catches up. A fixed predecessor per sample keeps every sample alike; one skew across a chain
+//! below A's: refused as stale. Its republishes, a second apart, each move its `seq` floor further
+//! past its clock (V210-61) until one passes A's. A fixed predecessor per sample keeps every sample alike; one skew across a chain
 //! of forwards did not (each as far behind as the last: only the first was ever refused).
 //!
 //! **Read through the product.** Each forward's own stderr says the refusal was cured (or not); the
@@ -33,7 +33,8 @@
 //! address for the guest.
 //!
 //! Mutations: `NetEvent::RepublishTo` does nothing; the republish sent at once instead of past the
-//! second; no republish at all (cap 0) — each red.
+//! second; no republish at all (cap 0); the `seq` floor left where the clock puts it (V210-61) —
+//! each red.
 
 #![cfg(unix)]
 
@@ -53,10 +54,12 @@ use world::{args, vox_once, VoxProc};
 
 /// Cold forwards, one after another.
 const SAMPLES: usize = 5;
-/// How far behind B's millisecond clock runs: far enough that the first republish, a second
-/// on, is still refused and the second one cures it — so the proof sees more than one republish,
-/// with the third still to spare under the cap (measured: cured at about 2.0 s, 2 of 2).
-const SKEW_MS: i64 = -2500;
+/// How far behind B's millisecond clock runs: **further than waiting can cure** (V210-61). At
+/// -2500 ms the cure came on the last of the three tries in 57 of 60 samples on integrate dd78874,
+/// and now and then not at all, because each try only waited a second for the clock. Five
+/// seconds is out of reach of three such waits, so this stage is red unless each republish also
+/// moves the record's `seq` floor past the clock.
+const SKEW_MS: i64 = -5000;
 /// How long a sample may take, from binding, to report its refusal cured and have the anchor hold
 /// its address: the republishes go a second apart, three at most.
 const CURED_WITHIN: Duration = Duration::from_secs(7);

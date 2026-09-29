@@ -1203,6 +1203,10 @@ const STALE_REFUSAL_GRACE: u64 = 5;
 /// steps, and few enough that a real refusal stops being retried.
 const STALE_REPUBLISH_TRIES: u32 = 3;
 
+/// How far the first republish after a stale refusal moves this process's record `seq` floor
+/// past its clock, in milliseconds; each later try doubles it (see `NetEvent::PublishDone`).
+const STALE_SEQ_STEP_MS: u64 = 2_000;
+
 /// Whether a publish outcome is one of this node's **own** records refused by the board as stale.
 fn own_stale_refusal(kind: &str, why: &Option<String>) -> bool {
     matches!(kind, "our address" | "our member bundle")
@@ -3845,6 +3849,21 @@ impl Node {
                     // the republish goes, so the waves are a second apart and there are three.
                     let tries = self.stale_retries.get(&key).copied().unwrap_or(0);
                     if tries < STALE_REPUBLISH_TRIES && self.republish_pending.insert(key) {
+                        // **And the `seq` floor moves on, not only the clock** (V210-61). A board
+                        // wants a later `seq` as well as a later second, and `seq` is floored by
+                        // this process's millisecond clock: waiting a second per try let a process
+                        // whose clock is behind its predecessor's catch up by one second a try, so
+                        // three tries cured a lag of about three seconds and no more. #230's own
+                        // proof, staged 2.5 s behind, was cured on its last try in 57 of 60 samples
+                        // on integrate dd78874, and now and then not at all: the node then said a
+                        // board "would not take our address" and the board kept the dead process's.
+                        // Each armed republish moves the floor 2, 4, then 8 s past where it is, so
+                        // three tries cover a lag of more than 15 s. `seq` is only compared, never
+                        // bounded by a board, and it stays this process's own and increasing.
+                        let floor = (self.millis_clock)();
+                        let ahead = STALE_SEQ_STEP_MS << tries.min(8);
+                        let entry = self.record_seq.entry(channel_id).or_insert(0);
+                        *entry = (*entry).max(floor).saturating_add(ahead);
                         let past_the_second = 1_000 - (self.millis_clock)() % 1_000 + 50;
                         let tx = self.net_tx.clone();
                         tokio::spawn(async move {
