@@ -561,6 +561,32 @@ impl ConnectionManager {
         Some(conn)
     }
 
+    /// Probe `conn` and close it if nothing at all comes back within [`probe_patience`] — the
+    /// question [`Self::probe_held`] asks of a held connection when a newcomer arrives, asked
+    /// here by a caller whose own traffic went unanswered. Returns whether it was closed.
+    ///
+    /// A live far end ACKs the probe from its QUIC stack whatever its application is doing, so
+    /// a slow answer from a busy peer never closes a connection; only a process that is gone
+    /// fails it. Closing ends every wait on the connection at once, with an error its callers
+    /// already handle by dialling again (V210-80: a key sent to a restarted member's dead
+    /// predecessor waited out `SILENCE_IS_DEATH` before anything tried the new process).
+    pub async fn close_if_unanswered(&self, conn: &VoxConnection) -> bool {
+        let Some(before) = probe_unanswered(conn).await else {
+            return false;
+        };
+        if !is_live(conn) || conn.quinn().stats().udp_rx.datagrams != before {
+            return false;
+        }
+        conn.close(WireError::Unresponsive);
+        self.note(
+            conn.peer_id(),
+            "what was sent on the connection went unanswered, and so did a probe: the process \
+             behind it is gone, and the connection is closed"
+                .to_owned(),
+        );
+        true
+    }
+
     /// Whether `conn` is the connection currently filed for its peer. A reader serving a
     /// retired connection asks this before it gives up at the grace: a retired connection can be
     /// promoted (see [`Self::existing`]), and then it is the peer's connection and must be read
