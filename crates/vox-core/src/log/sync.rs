@@ -1301,7 +1301,9 @@ where
 /// - `strip-payload` (V210-74): it serves every entry with its payload stripped, the skeleton and
 ///   its signature intact;
 /// - `author-unclassifiable` (V210-74): what it posts is a signed entry whose payload is neither a
-///   governance body nor a sender-key message.
+///   governance body nor a sender-key message;
+/// - `old-row-ids` (V210-74): a room it reopens resumes its row ids from the log rows alone, as
+///   before V210-73, so its own store gets the collision that lost received messages.
 ///
 /// Any other value, or none, sends correctly. The first session announces the build and the mode
 /// on stderr, [`MARKER`](mutant::MARKER), which the proofs require before they measure anything.
@@ -1319,6 +1321,7 @@ pub mod mutant {
         ServeUnasked,
         StripPayload,
         AuthorUnclassifiable,
+        OldRowIds,
     }
 
     fn mode() -> Mode {
@@ -1330,6 +1333,7 @@ pub mod mutant {
                 "serve-unasked" => Mode::ServeUnasked,
                 "strip-payload" => Mode::StripPayload,
                 "author-unclassifiable" => Mode::AuthorUnclassifiable,
+                "old-row-ids" => Mode::OldRowIds,
                 _ => Mode::Correct,
             };
             eprintln!(
@@ -1376,7 +1380,7 @@ pub mod mutant {
     /// The entries to serve, given what the peer asked for and what is served unasked.
     pub(super) fn serve(asked: Vec<Vec<u8>>, unasked: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         match mode() {
-            Mode::Correct | Mode::AuthorUnclassifiable => asked,
+            Mode::Correct | Mode::AuthorUnclassifiable | Mode::OldRowIds => asked,
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
             Mode::StripPayload => asked
@@ -1390,6 +1394,12 @@ pub mod mutant {
                 })
                 .collect(),
         }
+    }
+
+    /// Whether a reopened room resumes its row ids from the log rows alone (`old-row-ids`).
+    #[must_use]
+    pub fn old_row_ids() -> bool {
+        mode() == Mode::OldRowIds
     }
 
     /// The payload this build signs in place of `payload` when it posts: in

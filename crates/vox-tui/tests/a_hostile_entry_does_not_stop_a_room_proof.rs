@@ -27,13 +27,23 @@
 //! 2. once Alice is back, Bob reads her post;
 //! 3. and still does after his daemon restarts.
 //!
+//! ## A message lost before V210-73 is reported ([`a_message_lost_to_the_old_row_ids_is_reported`])
+//! Before V210-73 a reopened room resumed its row ids from its log rows alone, so its first post
+//! overwrote the cache row of the last message it had received, the only plaintext of it. That
+//! cannot be undone (its message key was used up when it was read), so it is reported. Bob's store
+//! is damaged the old way: his daemon is the mutant build as `old-row-ids` while he receives
+//! Alice's posts, restarts, and posts. Then the shipped daemon opens it. Asserted: `vox status`
+//! reports exactly one message lost that way, and Bob reads one post fewer (else CANNOT MEASURE:
+//! nothing was lost).
+//!
 //! ## Mutations
 //! - no refusal of an unclassifiable entry before it is held (`unclassifiable` answering `None`):
 //!   arm 1 goes red at (4), the entry was stored;
 //! - that, and a refusal after it is held ending the pass as an error again: red at (2), the room's
 //!   sync is poisoned;
 //! - no refusal of a withheld payload: arm 2 goes red at (2), Bob holds an empty copy and never asks
-//!   again.
+//!   again;
+//! - no report of a lost message: arm 3 goes red.
 
 #![cfg(unix)]
 
@@ -45,7 +55,7 @@ mod watchdog;
 
 use std::time::{Duration, Instant};
 
-use sync_pair::{anchor, announced, counter, mutant_sender, Member};
+use sync_pair::{anchor, announced, counter, failures, mutant_sender, Member};
 
 /// How long a post may take to reach a member before it counts as never.
 const ARRIVES_WITHIN: Duration = Duration::from_secs(30);
@@ -68,11 +78,12 @@ fn arrives(m: &Member, room: &str, text: &str) -> Option<Duration> {
     None
 }
 
-/// Wait until `m`'s status counts at least one refused entry from `from`; the count seen.
-fn refused_from(m: &Member, from: &Member) -> u64 {
+/// Wait until `m`'s status counts at least one refused entry, from `from` or from anyone; the count
+/// seen.
+fn refused_by(m: &Member, from: Option<&Member>) -> u64 {
     let t = Instant::now();
     loop {
-        let n = counter(&m.status(), "refused", Some(&from.fp));
+        let n = counter(&m.status(), "refused", from.map(|f| f.fp.as_str()));
         if n > 0 || t.elapsed() > ARRIVES_WITHIN {
             return n;
         }
@@ -122,7 +133,8 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
     );
 
     mallory.post(&room, "whatever mallory typed");
-    let refused = refused_from(&bob, &mallory) + counter(&bob.status(), "refused", Some(&alice.fp));
+    // From whichever peer served it first: Mallory, or the anchor holding it for her.
+    let refused = refused_by(&bob, None);
     assert!(
         announced(&mallory_d, MODE),
         "CANNOT MEASURE: mallory's daemon never announced {MODE:?}:\n{}",
@@ -146,6 +158,16 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
         refused >= 1,
         "CANNOT MEASURE: bob never refused mallory's entry (it never reached him)\nbob's status: {}",
         bob.status()
+    );
+    // A refusal is not a failed session: before, it ended bob's session with the refusal as its
+    // reason and poisoned the room's sync until a reopen. The reason is hard-coded here.
+    let poisoned: Vec<String> = failures(&bob.status())
+        .into_iter()
+        .filter(|f| f.contains("neither a group message nor a governance struct"))
+        .collect();
+    assert!(
+        poisoned.is_empty(),
+        "mallory's unclassifiable entry failed bob's sync sessions: {poisoned:?}"
     );
 
     // ---- bob restarts: the room is held again, whole, and nothing hostile was stored --------
@@ -199,17 +221,17 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     );
 
     // ---- bob's only copy of alice's post is mallory's --------------------------------------
-    bob_d.signal("STOP");
+    bob_d.signal("-STOP");
     let post = "alice, while bob was away";
     alice.post(&room, post);
     let held = arrives(&mallory, &room, post);
-    alice_d.signal("STOP");
-    bob_d.signal("CONT");
+    alice_d.signal("-STOP");
+    bob_d.signal("-CONT");
     assert!(
         held.is_some(),
         "CANNOT MEASURE: mallory never had alice's post, so bob could not get it from her"
     );
-    let refused = refused_from(&bob, &mallory);
+    let refused = refused_by(&bob, Some(&mallory));
     assert!(
         announced(&mallory_d, MODE),
         "CANNOT MEASURE: mallory's daemon never announced {MODE:?}:\n{}",
@@ -223,7 +245,7 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     );
 
     // ---- alice comes back: bob gets her post whole ------------------------------------------
-    alice_d.signal("CONT");
+    alice_d.signal("-CONT");
     let took = arrives(&bob, &room, post);
     println!("[proof] stripped: bob refused {refused} entr(ies) from mallory; alice's post reached him: {took:?}");
     assert!(
@@ -240,5 +262,75 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
         reopened.is_some(),
         "after a restart bob's room is not open, or has lost alice's post\nbob's status: {}",
         bob.status()
+    );
+}
+
+#[test]
+#[ignore = "real daemons with the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
+fn a_message_lost_to_the_old_row_ids_is_reported() {
+    const MODE: &str = "old-row-ids";
+    watchdog::arm();
+    let sender = mutant_sender();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (_anchor, spec) = anchor(root);
+    let alice = Member::new(root, "alice");
+    let bob = Member::new(root, "bob");
+    alice.trust(&bob);
+    bob.trust(&alice);
+    let _alice_d = alice.daemon(Some(&spec));
+    let bob_d = bob.daemon_mutant(&sender, MODE, Some(&spec));
+    let room = alice.create("old");
+    bob.join(&alice.invite(&room), "old");
+    let hers = ["alice one", "alice two", "alice three"];
+    for p in hers {
+        alice.post(&room, p);
+    }
+    for p in hers {
+        assert!(
+            arrives(&bob, &room, p).is_some(),
+            "CANNOT MEASURE: bob never received {p:?}"
+        );
+    }
+    // ---- bob's store is damaged the old way: restart, post ---------------------------------
+    drop(bob_d);
+    let bob_d = bob.daemon_mutant(&sender, MODE, Some(&spec));
+    bob.post(&room, "bob, after the restart");
+    assert!(
+        announced(&bob_d, MODE),
+        "CANNOT MEASURE: bob's daemon never announced {MODE:?}:\n{}",
+        bob_d.transcript()
+    );
+    drop(bob_d);
+
+    // ---- the shipped daemon opens it --------------------------------------------------------
+    let _bob_d = bob.daemon(Some(&spec));
+    assert!(
+        arrives(&bob, &room, "bob, after the restart").is_some(),
+        "CANNOT MEASURE: the shipped daemon does not hold bob's room"
+    );
+    let (_, read, _) = bob.vox(&["room", "read", &room], None);
+    let kept = hers
+        .iter()
+        .filter(|p| read.lines().any(|l| l.ends_with(**p)))
+        .count();
+    let lost: Vec<String> = set_aside(&bob)
+        .into_iter()
+        .filter(|e| e.contains("lost to the row-id collision"))
+        .collect();
+    println!(
+        "[proof] old row ids: bob reads {kept} of alice's 3 posts; vox status reports {} lost: \
+         {lost:?}",
+        lost.len()
+    );
+    assert!(
+        kept < hers.len(),
+        "CANNOT MEASURE: the old row ids lost nothing (bob reads {kept} of 3)"
+    );
+    assert_eq!(
+        lost.len(),
+        hers.len() - kept,
+        "bob lost {} of alice's posts to the old row ids; vox status reports {lost:?}",
+        hers.len() - kept
     );
 }

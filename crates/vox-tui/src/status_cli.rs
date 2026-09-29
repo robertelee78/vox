@@ -37,7 +37,7 @@ pub fn render(json: &str) -> String {
         {
             let _ = writeln!(
                 out,
-                "room {room}: a stored entry was set aside when it opened — {}",
+                "room {room}, when it opened: {}",
                 e.as_str().unwrap_or("?")
             );
         }
