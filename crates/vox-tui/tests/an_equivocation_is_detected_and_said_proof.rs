@@ -32,11 +32,13 @@
 //!   (V210-66) — carol's daemon is restarted, and `vox status --json` still lists both;
 //! - **kept by the anchor**: the anchor, which said it holds eve and frank back, is restarted
 //!   alone and says both again (V210-66).
+//! - **in the TUI**: carol's real `vox tui`, in a pty, says both — each on its own line, by the
+//!   names carol gave them (V210-66).
 //!
 //! Mutations: the old `wants_for` (from past our head, no comparison of a shorter peer's head) —
 //! eve's fork is never listed; the `room read` notice removed; `keep_forks` doing nothing — the
 //! restarted carol lists neither; the anchor's `keep_forks` doing nothing — the restarted anchor
-//! says neither.
+//! says neither; the TUI drawing only the first — frank is never said.
 
 #![cfg(unix)]
 
@@ -45,6 +47,9 @@ mod world;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 
 use std::io::Write as _;
 use std::path::Path;
@@ -512,5 +517,43 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
             anchor_holds(&said, f),
             "the anchor forgot it holds {name} back across a restart:\n{said}"
         );
+    }
+    stop(anchor);
+
+    // ---- the TUI says both, each on its own line, by carol's names for them (V210-66) ----------
+    // Carol's real `vox tui`, on her stopped profile, in a pty (`tests/pty/tui_equivocation.py`).
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_equivocation.py");
+    let (data, cfg) = (carol_dir.to_str().unwrap(), carol_dir.join("cfg"));
+    let out = pty_driver::run(
+        script,
+        &[
+            env!("CARGO_BIN_EXE_vox"),
+            "eq",
+            data,
+            cfg.to_str().unwrap(),
+            "eq",
+        ],
+    );
+    eprintln!(
+        "{}\n[proof] the TUI driver took {:?}; its last stage: {:?}",
+        out.stdout, out.took, out.stage
+    );
+    match out.code {
+        Some(0) => assert!(
+            out.stdout.contains("eq PASS"),
+            "exit 0 without PASS: {}",
+            out.stdout
+        ),
+        Some(2) => panic!("CANNOT MEASURE: the TUI apparatus failed: {}", out.stdout),
+        _ if !out.has_verdict("eq") => panic!(
+            "the TUI driver was stopped before it gave a verdict, at stage {:?} (exit {:?}): {}",
+            out.stage.as_deref().unwrap_or("(before its first stage)"),
+            out.code,
+            out.stdout
+        ),
+        _ => panic!(
+            "carol's TUI must say eve and frank are held back, each on its own line: {}",
+            out.stdout
+        ),
     }
 }

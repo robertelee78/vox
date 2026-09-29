@@ -131,6 +131,9 @@ pub struct ChannelView {
     pub members: Vec<MemberView>,
     /// The render-gated timeline, oldest-first.
     pub timeline: Vec<MessageView>,
+    /// One notice per member this node holds back for equivocating here (V210-63, V210-66), by
+    /// the name this operator gave them; drawn above the timeline, **each on its own line**.
+    pub held_back: Vec<String>,
     /// This channel's reachability.
     pub reachability: Reachability,
 }
