@@ -79,12 +79,16 @@ fn arrives(m: &Member, room: &str, text: &str) -> Option<Duration> {
     None
 }
 
-/// Wait until `m`'s status counts at least one refused entry, from `from` or from anyone; the count
-/// seen.
-fn refused_by(m: &Member, from: Option<&Member>) -> u64 {
+/// `m`'s count of refused entries, from `from` or from anyone.
+fn refused(m: &Member, from: Option<&Member>) -> u64 {
+    counter(&m.status(), "refused", from.map(|f| f.fp.as_str()))
+}
+
+/// Wait until `m` has refused more than `since` entries, from `from` or from anyone; how many more.
+fn refused_by(m: &Member, from: Option<&Member>, since: u64) -> u64 {
     let t = Instant::now();
     loop {
-        let n = counter(&m.status(), "refused", from.map(|f| f.fp.as_str()));
+        let n = refused(m, from).saturating_sub(since);
         if n > 0 || t.elapsed() > ARRIVES_WITHIN {
             return n;
         }
@@ -133,9 +137,10 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
         "CANNOT MEASURE: alice's first post never reached bob, before anything hostile"
     );
 
+    let since = refused(&bob, None);
     mallory.post(&room, "whatever mallory typed");
     // From whichever peer served it first: Mallory, or the anchor holding it for her.
-    let refused = refused_by(&bob, None);
+    let refused = refused_by(&bob, None, since);
     assert!(
         announced(&mallory_d, MODE),
         "CANNOT MEASURE: mallory's daemon never announced {MODE:?}:\n{}",
@@ -234,6 +239,8 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
         counter(&st, "opened", Some(&m.fp)) + counter(&st, "admitted", Some(&m.fp))
     };
     let with_mallory = sessions(&mallory);
+    // Bob may have refused a stripped copy already, of the first post: only a new one counts.
+    let since = refused(&bob, Some(&mallory));
     bob_d.signal("-STOP");
     let post = "alice, while bob was away";
     alice.post(&room, post);
@@ -244,7 +251,7 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
         held.is_some(),
         "CANNOT MEASURE: mallory never had alice's post, so bob could not get it from her"
     );
-    let refused = refused_by(&bob, Some(&mallory));
+    let refused = refused_by(&bob, Some(&mallory), since);
     let served = sessions(&mallory).saturating_sub(with_mallory);
     assert!(
         announced(&mallory_d, MODE),
