@@ -177,8 +177,22 @@ pub async fn local_route_ip() -> Option<IpAddr> {
 /// leaves that entry out. A node with no dialable address is not broken — it reaches
 /// peers outbound and is reached by hole punching or a relay (the ladder's later
 /// rungs), which is the ordinary case for a client inside a private network.
-pub async fn advertise_endpoints(bound_port: u16) -> (EndpointList, Vec<PortMapping>) {
-    let ips = local_route_ips().await;
+///
+/// **Only addresses the socket accepts traffic on are advertised.** The machine's routable
+/// addresses are this socket's addresses only when it is bound to the wildcard of their
+/// family (`[::]` is dual-stack and takes both). A socket bound to one particular address
+/// listens on that address alone: advertising the machine's others with its port sent every
+/// peer to a destination where nothing listens, and each such dial waited out a full timeout
+/// — a host on `[::1]` published its global IPv6 and LAN IPv4 addresses and not `::1` at all
+/// (#223). So a specific-bound socket advertises its bound address, plus whichever routable
+/// address (and that address's gateway mapping) *is* its bound address.
+pub async fn advertise_endpoints(bound: SocketAddr) -> (EndpointList, Vec<PortMapping>) {
+    let bound_port = bound.port();
+    let ips: Vec<IpAddr> = local_route_ips()
+        .await
+        .into_iter()
+        .filter(|ip| listens_on(bound, *ip))
+        .collect();
     let v6 = ips.iter().find_map(|ip| match ip {
         IpAddr::V6(a) => Some(*a),
         IpAddr::V4(_) => None,
@@ -205,8 +219,19 @@ pub async fn advertise_endpoints(bound_port: u16) -> (EndpointList, Vec<PortMapp
         },
     );
 
-    let list = compose_endpoints(bound_port, v6, v4, mapped.as_ref());
+    let list = compose_endpoints(bound, v6, v4, mapped.as_ref());
     (list, pinhole.into_iter().chain(mapped).collect())
+}
+
+/// Whether a socket bound to `bound` receives datagrams sent to `ip`: any address of its family
+/// when it is bound to a wildcard (the IPv6 wildcard is dual-stack), else only its own address.
+#[must_use]
+pub fn listens_on(bound: SocketAddr, ip: IpAddr) -> bool {
+    match bound.ip() {
+        IpAddr::V6(b) if b.is_unspecified() => true,
+        IpAddr::V4(b) if b.is_unspecified() => ip.to_canonical().is_ipv4(),
+        b => b.to_canonical() == ip.to_canonical(),
+    }
 }
 
 /// Put the ladder's findings in ADR-012 preference order. Pure: no network, so the
@@ -217,11 +242,12 @@ pub async fn advertise_endpoints(bound_port: u16) -> (EndpointList, Vec<PortMapp
 /// translation — so it is not an input here.
 #[must_use]
 fn compose_endpoints(
-    bound_port: u16,
+    bound: SocketAddr,
     v6: Option<Ipv6Addr>,
     v4: Option<Ipv4Addr>,
     mapped: Option<&PortMapping>,
 ) -> EndpointList {
+    let bound_port = bound.port();
     let mut addrs: Vec<Multiaddr> = Vec::new();
     // Rung 1: a routable IPv6 address is dialable as it stands — nothing is
     // translated — so it goes first.
@@ -243,10 +269,16 @@ fn compose_endpoints(
             addrs.push(mapped_addr);
         }
     }
-    // Last rung: loopback, so two profiles on one machine can still reach each other.
-    let loopback = Multiaddr::Ip4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, bound_port));
-    if !addrs.contains(&loopback) {
-        addrs.push(loopback);
+    // Last rung: loopback, so two profiles on one machine can still reach each other — the
+    // loopback this socket listens on. A wildcard socket takes `127.0.0.1`; a socket bound to
+    // one address takes that address alone, loopback or not, and it is what it advertises.
+    let own = if bound.ip().is_unspecified() {
+        Multiaddr::Ip4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, bound_port))
+    } else {
+        Multiaddr::from(SocketAddr::new(bound.ip().to_canonical(), bound_port))
+    };
+    if !addrs.contains(&own) {
+        addrs.push(own);
     }
     // `EndpointList::new` caps the count; a truncation here would silently drop the
     // *last* (least preferred) rungs, which is the right direction.
@@ -380,14 +412,16 @@ pub async fn connect_direct_within(
     // the relay's connection, whatever this socket's family. Filtered by family, an IPv6-only
     // node refused every circuit it dialled — "circuit via …: no direct candidates" — and could
     // reach an IPv4 host no way at all (#173's proof, red once #197 merged).
+    //
+    // **Nor is a candidate the socket's scope cannot reach.** A socket bound to a *particular*
+    // IPv6 address cannot send to an IPv4-mapped one either — `::ffff:a.b.c.d` is IPv6 in
+    // form only, and the kernel refuses it (`EADDRNOTAVAIL`) — and a loopback-bound socket
+    // cannot send off the machine. Kept, each was a dial that could only time out: a guest on
+    // `[::1]` waited on `[::ffff:127.0.0.1]`, the observed address a dual-stack anchor reports
+    // for an IPv4 host (#222).
     let local = endpoint.local_addr().ok();
     let reachable = |c: &SocketAddr| {
-        crate::transport::mux::in_circuit_range(*c)
-            || match local {
-                Some(SocketAddr::V4(_)) => c.is_ipv4(),
-                Some(SocketAddr::V6(l)) => c.is_ipv6() || l.ip().is_unspecified(),
-                None => true,
-            }
+        crate::transport::mux::in_circuit_range(*c) || local.is_none_or(|l| can_send_to(l, *c))
     };
     // **An IPv4-mapped IPv6 address is an IPv4 address.** A peer on a dual-stack socket (`[::]`)
     // sees an IPv4 sender as `::ffff:a.b.c.d`, and that is what it reports back as the sender's
@@ -464,6 +498,33 @@ pub async fn connect_direct_within(
                 None => return Err(exhausted(&why)),
             }
         }
+    }
+}
+
+/// Whether a UDP socket bound to `local` can send a datagram to `to` at all: the address
+/// family and the scope of the bound address both decide it.
+///
+/// - The IPv6 wildcard (`[::]`) is dual-stack: it reaches IPv6 and, as IPv4-mapped addresses,
+///   IPv4. The IPv4 wildcard reaches IPv4.
+/// - A socket bound to a particular IPv6 address is IPv6 only: an IPv4-mapped destination is
+///   refused by the kernel.
+/// - A loopback-bound socket reaches loopback only, and a link-local-bound IPv6 socket reaches
+///   its link only: the source address has no route anywhere else.
+#[must_use]
+pub fn can_send_to(local: SocketAddr, to: SocketAddr) -> bool {
+    match local.ip() {
+        // An IPv4 socket cannot address an IPv6 destination, mapped or not: the caller turns a
+        // mapped candidate into plain IPv4 before asking.
+        IpAddr::V4(l) => to.is_ipv4() && (!l.is_loopback() || to.ip().is_loopback()),
+        IpAddr::V6(l) if l.is_unspecified() => true,
+        IpAddr::V6(l) => match to {
+            SocketAddr::V4(_) => false,
+            SocketAddr::V6(t) => {
+                t.ip().to_ipv4_mapped().is_none()
+                    && (!l.is_loopback() || t.ip().is_loopback())
+                    && (!l.is_unicast_link_local() || t.ip().is_unicast_link_local())
+            }
+        },
     }
 }
 

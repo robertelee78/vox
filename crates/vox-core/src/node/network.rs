@@ -482,7 +482,7 @@ impl NodeNet {
         let Ok(bound) = self.manager.endpoint().local_addr() else {
             return Vec::new();
         };
-        let (list, mappings) = crate::nat::reachability::advertise_endpoints(bound.port()).await;
+        let (list, mappings) = crate::nat::reachability::advertise_endpoints(bound).await;
         *lock(&self.advertised) = Some(list);
         mappings
     }
