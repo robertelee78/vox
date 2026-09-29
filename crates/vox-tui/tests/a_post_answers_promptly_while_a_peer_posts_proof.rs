@@ -11,7 +11,18 @@
 //! batch of 133 entries held it for 2.3 s and Alice's post waited behind it. The fix commits the
 //! batch once (`ChannelState::absorb_arrived`, `render_content_into`).
 //!
-//! Mutation: restore one commit per entry in `absorb_arrived`, and this goes red on the tail.
+//! **The second cause was a storm on the actor** (CI ubuntu, p95 148 ms with a normal p50). A
+//! member's routine republish of a record a board already held counted as news, so the board's
+//! node republished its own records, which counted as news back: two members' boards woke each
+//! other about a hundred times a second. And every sync that brought ordinary messages started a
+//! publish round of its own. Each round signs on the actor, and a local post queues behind it on
+//! a slow runner. So this also counts, through `vox status --json`, the publish rounds each node
+//! started and the records it took for news during Alice's posts: two members only posting
+//! change nothing to republish ([`QUIET_ROUNDS`]).
+//!
+//! Mutations: restore one commit per entry in `absorb_arrived`, and this goes red on the tail;
+//! count a board's refresh of what it already holds as news, or start a publish round after
+//! every sync that applied entries, and it goes red on the counts.
 
 #![cfg(unix)]
 
@@ -41,6 +52,11 @@ const TIMEOUT: Duration = Duration::from_secs(90);
 /// What the daemons said: when (against the proof's clock), who, and the line.
 type Said = Arc<Mutex<Vec<(Duration, &'static str, String)>>>;
 
+/// Publish rounds, and records passed on as board news, a node may start while two members only
+/// post (#179). Measured during Alice's posts: 0 with the fix; 51–151 rounds and 137–430 news
+/// before it, the two members' boards waking each other. Room for a real change of address or
+/// admission, and ten times under the storm.
+const QUIET_ROUNDS: u64 = 5;
 /// How many of Alice's slowest posts are named, with what the daemons said around each.
 const SLOWEST: usize = 10;
 /// A post slower than this takes a snapshot of both nodes' sync counters after it.
@@ -344,6 +360,15 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         "[proof] during alice's posts: publish rounds alice {} bob {}; board news alice {} bob {}",
         alice_pub.0, bob_pub.0, alice_pub.1, bob_pub.1
     );
+    for (who, (rounds, news)) in [("alice", alice_pub), ("bob", bob_pub)] {
+        assert!(
+            rounds <= QUIET_ROUNDS && news <= QUIET_ROUNDS,
+            "{who}'s node published {rounds} rounds and passed on {news} records as news while \
+             two members only posted: nothing about who they are or where they are changed, so \
+             there was nothing to republish (#179). Each round signs on the actor a post queues \
+             behind"
+        );
+    }
     assert!(
         p95 <= P95_BOUND && max <= MAX_BOUND,
         "`vox room post` waited on another member's traffic: p95 {}ms (bound {}ms), max {}ms \
