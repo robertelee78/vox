@@ -417,6 +417,11 @@ pub struct NodeConfig {
     /// the copy holds nothing this node could read. `vox node` turns it on; a client
     /// leaves it off, so a stranger's genesis on its board costs it nothing.
     pub anchor_logs: bool,
+    /// For an anchor, which creators' rooms it serves: `None` serves any room published to
+    /// it (`vox node --serve anyone`), `Some` only rooms whose genesis names one of these
+    /// (`--serve trusted`, the anchor profile's `vox trust` list). Ignored unless
+    /// [`NodeConfig::anchor_logs`] is on.
+    pub serve_only: Option<BTreeSet<Digest32>>,
 }
 
 impl std::fmt::Debug for NodeConfig {
@@ -449,7 +454,16 @@ impl NodeConfig {
             anchors: BootstrapSet::new(),
             headless: None,
             anchor_logs: false,
+            serve_only: None,
         }
+    }
+
+    /// As an anchor, serve only rooms created by one of `creators` (`vox node --serve
+    /// trusted`); see [`NodeConfig::serve_only`].
+    #[must_use]
+    pub fn serve_only(mut self, creators: BTreeSet<Digest32>) -> Self {
+        self.serve_only = Some(creators);
+        self
     }
 
     /// Keep a ciphertext copy of every anchored channel's log.
@@ -2131,6 +2145,8 @@ pub struct Node {
     headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
     /// Whether this node keeps a ciphertext copy of every anchored channel's log.
     anchor_logs: bool,
+    /// See [`NodeConfig::serve_only`].
+    serve_only: Option<BTreeSet<Digest32>>,
     /// The store a headless node keeps its anchored logs in (a profile node uses its
     /// profile's store).
     anchor_store: Option<Arc<crate::node::store::Store>>,
@@ -2506,6 +2522,7 @@ impl Node {
             anchors,
             headless,
             anchor_logs,
+            serve_only,
         } = cfg;
         // A headless node networks as its key file and holds no room, so it never opens the
         // profile's vault — which a `vox node --serve trusted` profile has, to keep its trust
@@ -2534,6 +2551,7 @@ impl Node {
             anchors,
             headless,
             anchor_logs,
+            serve_only,
             anchor_store: None,
             anchored: BTreeMap::new(),
             forwards: BTreeMap::new(),
@@ -3107,8 +3125,13 @@ impl Node {
             }
         });
         let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
-        // Only an anchor keeps a board for a room it does not hold (V210-70).
-        net.serve_any_room(self.anchor_logs);
+        // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
+        // narrows that to rooms its operator's trust list created (V210-70).
+        net.serve_rooms(match (self.anchor_logs, self.serve_only.as_ref()) {
+            (false, _) => crate::nat::service::AnchorRooms::Held,
+            (true, None) => crate::nat::service::AnchorRooms::Anyone,
+            (true, Some(creators)) => crate::nat::service::AnchorRooms::CreatedBy(creators.clone()),
+        });
         net.count_ladders_in(Arc::clone(&self.sync_book));
         net.manager().report_to(self.event_tx.clone());
         // **A record landing on this node's board is an event, not something to notice later.**
@@ -3605,6 +3628,9 @@ impl Node {
         let Some(genesis) = net.board_genesis(channel_id) else {
             return;
         };
+        if !net.may_anchor(&genesis) {
+            return;
+        }
         let (Some(store), Some(sek)) = (self.log_store(), self.anchor_sek(channel_id)) else {
             return;
         };
@@ -3674,6 +3700,11 @@ impl Node {
                 continue;
             };
             if let Ok(state) = crate::node::anchor::AnchorState::open(&store, sek, &cid) {
+                // A room anchored under `--serve anyone` is not served after a restart under
+                // `--serve trusted` unless its creator is trusted.
+                if !net.may_anchor(state.genesis()) {
+                    continue;
+                }
                 let _ = net.publish_anchored(&state.genesis().to_wire());
                 self.anchored
                     .insert(cid, Arc::new(tokio::sync::Mutex::new(state)));

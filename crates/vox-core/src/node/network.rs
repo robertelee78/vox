@@ -423,11 +423,18 @@ impl NodeNet {
         self.service.on_admitted(hook);
     }
 
-    /// Keep a board for any room a peer gives this node the genesis of — an anchor's job,
-    /// and no other node's. Set before this is shared, like [`Self::on_board_growth`]; see
-    /// [`crate::nat::service::RendezvousService::serve_any_room`].
-    pub fn serve_any_room(&mut self, on: bool) {
-        self.service.serve_any_room(on);
+    /// Which rooms this node keeps a board for when a peer brings their genesis — an anchor's
+    /// job, and no other node's. Set before this is shared, like [`Self::on_board_growth`];
+    /// see [`crate::nat::service::RendezvousService::serve_rooms`].
+    pub fn serve_rooms(&mut self, rooms: crate::nat::service::AnchorRooms) {
+        self.service.serve_rooms(rooms);
+    }
+
+    /// Whether this node may anchor the room `genesis` founds: the same predicate the board's
+    /// genesis acceptance uses ([`crate::nat::service::AnchorRooms::may_anchor`]).
+    #[must_use]
+    pub fn may_anchor(&self, genesis: &Genesis) -> bool {
+        self.service.may_anchor(genesis)
     }
 
     /// Drop every expired record from this node's board. The store bounds its buckets by
