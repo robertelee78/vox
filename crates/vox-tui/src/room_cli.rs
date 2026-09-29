@@ -1873,36 +1873,97 @@ pub async fn get_file(
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
 
-    // The most recent matching offer wins: re-offering a file supersedes.
-    let offer = rows
-        .iter()
-        .rev()
-        .filter_map(|r| {
-            let env = Envelope::parse(&r.text).ok()?;
-            if env.kind != FILE {
-                return None;
-            }
-            let d = &env.data;
-            let name = d.get("name")?.as_str()?.to_owned();
-            let sha256 = d.get("sha256")?.as_str()?.to_owned();
-            let tag = d.get("tag")?.as_str()?.to_owned();
-            let size = d.get("size")?.as_u64()?;
-            (name == selector || sha256.starts_with(selector) || tag == selector).then_some(Offer {
+    // Newest first: re-offering a file supersedes. But **an offer that has ended does not
+    // hide one that is still served** (V210-84): each offer has a tag of its own, so the newest
+    // match may be one whose `vox room send` has stopped while an older offer of the same file
+    // still runs. Each match is tried in turn, newest first, until one is collected.
+    let mut offers: Vec<Offer> = Vec::new();
+    for r in rows.iter().rev() {
+        let Ok(env) = Envelope::parse(&r.text) else {
+            continue;
+        };
+        if env.kind != FILE {
+            continue;
+        }
+        let d = &env.data;
+        let field = |k: &str| d.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+        let (Some(name), Some(sha256), Some(tag), Some(size)) = (
+            field("name"),
+            field("sha256"),
+            field("tag"),
+            d.get("size").and_then(serde_json::Value::as_u64),
+        ) else {
+            continue;
+        };
+        let matches = name == selector || sha256.starts_with(selector) || tag == selector;
+        if matches && !offers.iter().any(|o| o.author == r.author && o.tag == tag) {
+            offers.push(Offer {
                 author: r.author,
                 name,
                 size,
                 sha256,
                 tag,
-            })
-        })
-        .next()
-        .ok_or_else(|| {
-            AppError::Usage(format!(
-                "no offer in this room matches {selector:?} — `vox room read` shows what was \
-                 announced"
-            ))
-        })?;
+            });
+        }
+        // Each try that is not served costs a dial; this many is past any real case of one
+        // file offered again while an older offer of it still runs.
+        if offers.len() == MAX_OFFERS_TRIED {
+            break;
+        }
+    }
+    if offers.is_empty() {
+        return Err(AppError::Usage(format!(
+            "no offer in this room matches {selector:?} — `vox room read` shows what was \
+             announced"
+        )));
+    }
 
+    let mut first_error = None;
+    let tried = offers.len();
+    for (i, offer) in offers.iter().enumerate() {
+        let result = collect_offer(&mut client, paths, channel_id, offer, dir, out).await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if i + 1 < tried {
+                    eprintln!(
+                        "vox: the offer {} of {} was not collected ({e}); trying an older offer \
+                         of it",
+                        offer.tag, offer.name
+                    );
+                }
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    let Some(e) = first_error else {
+        return Err(AppError::Usage(format!(
+            "no offer matching {selector:?} was tried"
+        )));
+    };
+    Err(if tried > 1 {
+        AppError::Usage(format!(
+            "{e} (and {} older offer{} of it could not be collected either)",
+            tried - 1,
+            if tried > 2 { "s" } else { "" }
+        ))
+    } else {
+        e
+    })
+}
+
+/// The most matching offers `vox room get` tries, newest first (V210-84).
+const MAX_OFFERS_TRIED: usize = 16;
+
+/// Collect one offer: choose where it lands, forward to it, transfer, verify.
+async fn collect_offer(
+    client: &mut IpcClient,
+    paths: &Paths,
+    channel_id: Digest32,
+    offer: &Offer,
+    dir: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+) -> Result<(), AppError> {
     let dest = match out {
         Some(exact) => {
             if exact.symlink_metadata().is_ok() {
@@ -1946,7 +2007,7 @@ pub async fn get_file(
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
 
-    let result = collect(&bound, &dest, &offer).await;
+    let result = collect(&bound, &dest, offer).await;
     let _ = client
         .request(&Request::StopForward {
             local: bound.clone(),

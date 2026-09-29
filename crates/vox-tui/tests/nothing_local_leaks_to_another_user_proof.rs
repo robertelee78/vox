@@ -11,7 +11,9 @@
 //!    the withdrawn offer; "the local service did not accept the connection" is the leaked one.
 //!    And **two offers of the same file are two offers**: their tags were the content's, so
 //!    ending one withdrew the other while it still ran. Staged: two `room send`s of one file,
-//!    the first ended by SIGTERM, and bob collects the file whole by the second's tag.
+//!    the first ended by SIGTERM, and bob collects the file whole by the second's tag. And a
+//!    get **by name** is not hidden by a newer offer that has ended: a third offer is announced
+//!    and ended, and `vox room get twin.bin` still collects the file through the second.
 //! 2. **An offer is never persisted.** It was: a daemon that stopped while an offer ran came
 //!    back offering its port. Staged: alice's daemon is stopped with an offer live, and
 //!    `vox service list` reads alice's store; a `vox service add` afterwards is the control
@@ -44,10 +46,11 @@
 //! review, and the directory being `0700` is what (4) asserts.
 //!
 //! Mutations, each red for its own reason: (1) the daemon not releasing what a closed
-//! connection held, and an offer's tag being its content's alone (the twin case); (2) an
-//! offer over the control socket persisted; (3) the same as (1), for the forward; (4) the old flat `<tmp>/vox-<hex>.sock` fallback; (5) the client's owner check
-//! removed; (6) the accept loop returning on its first error; (7) the rc written `0644` over
-//! the path; (8) `--passphrase` accepted.
+//! connection held, an offer's tag being its content's alone, and a get trying only the newest
+//! matching offer (the twin cases); (2) an offer over the control socket persisted; (3) the
+//! same as (1), for the forward; (4) the old flat `<tmp>/vox-<hex>.sock` fallback; (5) the
+//! client's owner check removed; (6) the accept loop returning on its first error; (7) the rc
+//! written `0644` over the path; (8) `--passphrase` accepted.
 
 #![cfg(unix)]
 
@@ -497,6 +500,42 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         ok && collected.as_deref() == Some(&twin_bytes[..]),
         "ending one offer of a file withdrew another offer of the same file that was still \
          running (tags {t1} and {t2}): {stdout} {stderr}"
+    );
+
+    // ---- (1c) a get by name is not hidden by a newer offer that has ended ----
+    let mut third = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let t3 = tag_of(&third.wait_for("vox: offering", Duration::from_secs(60)));
+    until(
+        &bob,
+        "the third twin offer to reach bob",
+        &["room", "read", &room, "--json"],
+        |o| o.contains(&t3),
+    );
+    signal(third.pid(), "TERM");
+    assert!(
+        third.exited_within(Duration::from_secs(10)).is_some(),
+        "CANNOT MEASURE: the newest twin offer did not end on SIGTERM"
+    );
+    let by_name = tmp.path().join("twin-by-name.bin");
+    let (ok, stdout, stderr) = bob.vox(&[
+        "room",
+        "get",
+        &room,
+        "twin.bin",
+        "--out",
+        by_name.to_str().unwrap(),
+    ]);
+    let collected = std::fs::read(&by_name).ok();
+    eprintln!(
+        "[proof] get by name with the newest offer ({t3}) ended and an older one ({t2}) live: \
+         ok={ok}, {} bytes of 65536; said: {}",
+        collected.as_ref().map_or(0, Vec::len),
+        stderr.trim()
+    );
+    assert!(
+        ok && collected.as_deref() == Some(&twin_bytes[..]),
+        "a get by name failed on the newest offer, which had ended, although an older offer of \
+         the same file was still served: {stdout} {stderr}"
     );
     drop(second);
 
