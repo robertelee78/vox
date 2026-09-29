@@ -29,6 +29,17 @@ pub fn author_id(fp: &Digest32) -> String {
     b32_encode(fp).chars().take(AUTHOR_CHARS).collect()
 }
 
+/// What a person is told about a member this node holds back for equivocating (V210-63):
+/// `name` signed two different messages at one position, `seq`, in the room being read. The
+/// wording is the decider's (2026-09-28).
+#[must_use]
+pub fn equivocation_notice(name: &str, seq: u64) -> String {
+    format!(
+        "{name} signed two different messages at the same place in this room (their message \
+         {seq}). Their later messages are held back."
+    )
+}
+
 /// A member's name where the keyring is known: the petname the operator gave it, or its
 /// fingerprint at [`AUTHOR_CHARS`] followed by [`NOT_IN_KEYRING`].
 #[must_use]

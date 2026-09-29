@@ -153,6 +153,7 @@ fn detail_of(ch: &ChannelState) -> ChannelDetail {
             .iter()
             .map(|(tag, addr)| (tag.clone(), *addr))
             .collect(),
+        equivocations: ch.equivocations(),
     }
 }
 

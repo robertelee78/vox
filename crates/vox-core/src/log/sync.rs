@@ -492,11 +492,29 @@ pub fn wants_for(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
         let local = dag.feed(&rf.author_id);
         let local_max = local.map_or(0, |f| f.max_seq());
         if rf.max_seq > local_max {
+            // **From our own head, not past it** (V210-63). The peer's entry at our head is
+            // compared with ours: the same one is a duplicate and costs one entry, a different
+            // one is two signed entries at one `(author, seq)` — a fork proof, wherever the two
+            // histories parted. Asked only from past our head, a feed that parted below it was
+            // refused one entry later as a broken link (`Rejected::Feed`), which proves nothing,
+            // and the member holding the shorter history stayed stuck behind it in silence.
             wants.push(WantRange {
                 author_id: rf.author_id,
-                from_seq: local_max + 1,
+                from_seq: local_max.max(1),
                 to_seq: rf.max_seq,
             });
+        } else if rf.max_seq < local_max && rf.max_seq > 0 {
+            // **The peer's head, held here too, is compared as well** (V210-63): the member with
+            // the longer history asks for nothing, so without this it never learned of a fork the
+            // shorter one could show it. Only a head that differs from ours is asked for.
+            let ours = local.and_then(|f| f.get(rf.max_seq)).map(Entry::entry_hash);
+            if ours.is_some_and(|h| h != rf.head_hash) {
+                wants.push(WantRange {
+                    author_id: rf.author_id,
+                    from_seq: rf.max_seq,
+                    to_seq: rf.max_seq,
+                });
+            }
         } else if rf.max_seq == local_max && local_max > 0 {
             // Equal head seq: compare the gossiped head hashes. A mismatch is a
             // divergence (equal-length fork) — pull the remote head entry so the

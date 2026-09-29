@@ -1465,7 +1465,17 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         };
         // ADR-025 S0b: `vox status --json`. Answered, and the connection serves on.
         if crate::node::status::is_request(&body) {
-            crate::node::status::serve(&mut stream, handle.sync_book()).await?;
+            let equivocations: Vec<(Digest32, Digest32, u64)> = handle
+                .view()
+                .open_channels
+                .iter()
+                .flat_map(|d| {
+                    d.equivocations
+                        .iter()
+                        .map(move |(author, seq)| (d.channel_id, *author, *seq))
+                })
+                .collect();
+            crate::node::status::serve(&mut stream, handle.sync_book(), &equivocations).await?;
             continue;
         }
         let request = match Request::from_bytes(&body) {

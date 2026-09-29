@@ -122,9 +122,10 @@ impl SyncBook {
         *b.ladders.entry(peer).or_default() += 1;
     }
 
-    /// The counters as `vox status --json` prints them.
+    /// The counters as `vox status --json` prints them, with the rooms' equivocations
+    /// (`(room, author, position)`, V210-63).
     #[must_use]
-    pub fn to_json(book: &SharedSyncBook) -> String {
+    pub fn to_json(book: &SharedSyncBook, equivocations: &[(Digest32, Digest32, u64)]) -> String {
         let b = book.lock().unwrap_or_else(PoisonError::into_inner);
         let mut s = String::from("{\"sync\":[");
         for (i, ((room, peer), c)) in b.ports.iter().enumerate() {
@@ -174,6 +175,21 @@ impl SyncBook {
                 circuits.get(peer).copied().unwrap_or(0)
             );
         }
+        // **Who this node holds back for equivocating, and where** (V210-63): each an author seen
+        // signing two different messages at one position in a room. For agents, as full ids; a
+        // person reads it in `vox room read`.
+        s.push_str("],\"equivocations\":[");
+        for (i, (room, author, position)) in equivocations.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(
+                s,
+                "{{\"room\":\"{}\",\"author\":\"{}\",\"position\":{position}}}",
+                b32_encode(room),
+                b32_encode(author),
+            );
+        }
         s.push_str("]}");
         s
     }
@@ -217,11 +233,15 @@ pub fn is_request(body: &[u8]) -> bool {
 ///
 /// # Errors
 /// If the reply cannot be written.
-pub async fn serve(stream: &mut UnixStream, book: &SharedSyncBook) -> Result<()> {
+pub async fn serve(
+    stream: &mut UnixStream,
+    book: &SharedSyncBook,
+    equivocations: &[(Digest32, Digest32, u64)],
+) -> Result<()> {
     let mut e = Encoder::new();
     e.array(2)
         .uint(T_STATUS_REPORT)
-        .text(&SyncBook::to_json(book));
+        .text(&SyncBook::to_json(book, equivocations));
     write_frame(stream, &e.finish()).await
 }
 
