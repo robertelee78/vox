@@ -8,13 +8,13 @@
 //! [`VoxConnection::accept_stream`]): QUIC gives per-stream flow control with no
 //! cross-stream head-of-line blocking, so bulk log replication on one stream never
 //! stalls an interactive flow on another (ADR-011 §"Two contracts on one
-//! connection"). Low-latency, loss-tolerant flows use RFC 9221 datagrams
-//! ([`VoxConnection::send_datagram`] / [`VoxConnection::recv_datagram`]); the
-//! connection itself applies the [`crate::transport::datagram`] 64-bit sequence
-//! framing and the DTLS-style anti-replay window (ADR-011 §"Datagram
-//! anti-replay"), so a replayed, duplicate, out-of-window or unframed datagram is
-//! dropped before it can reach the application — that is a property of the
-//! connection, never caller discipline (2026-09-19 review).
+//! connection"). Low-latency, loss-tolerant flows use RFC 9221 datagrams on
+//! **flows** ([`VoxConnection::bind_flow`]): each flow is bound to a stream and lives
+//! exactly as long as it, and the connection's one
+//! [`DatagramRouter`] — started with the
+//! connection, the only reader of its datagrams — hands each datagram to its flow and
+//! drops and counts the rest (ADR-022). Replay is QUIC's own concern (RFC 9000 §12.3);
+//! Vox adds no sequence number of its own.
 //!
 //! ## Authentication + the recorded session
 //! Connecting and accepting both authenticate the peer via the
@@ -36,18 +36,19 @@
 //! divergent logs over this transport in the tests.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 
 use quinn::{Connection, Endpoint, RecvStream, Runtime, SendStream};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
-use crate::transport::datagram::{parse_datagram, DatagramSender, ReplayWindow, SEQ_PREFIX_LEN};
 use crate::transport::identity_cert::build_leaf_certificate;
 use crate::transport::mux::{CircuitPort, MuxSocket};
 use crate::transport::provider::{client_config, server_config, X25519MLKEM768_CODE_POINT};
+use crate::transport::router::{
+    DatagramFlow, DatagramRouter, DatagramStats, FlowMode, MAX_PACKET_HEADER,
+};
 use crate::transport::session::SessionEstablishment;
 use crate::transport::verifier::{VerifiedPeer, VoxClientCertVerifier, VoxServerCertVerifier};
 use crate::wire::WireError;
@@ -260,10 +261,21 @@ fn endpoint_config(mtu_ceiling: u16) -> quinn::EndpointConfig {
     cfg
 }
 
+/// How many bidirectional streams a peer may have open to this node at once.
+///
+/// Set explicitly rather than left at quinn's default of 100 (ADR-022 decision 7). App
+/// streams are opened by other programs, so a peer can hold many of them open while they
+/// wait, and every one of them occupies a slot a `sync` or `join` stream would otherwise
+/// take: at 100, a hundred stalled app streams were enough to stop a room's messages. The
+/// per-peer app limit (`node::app::MAX_APP_STREAMS_PER_PEER`) is what keeps app streams
+/// few; this is the headroom that keeps the node's own streams opening while they are.
+pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 1024;
+
 /// The transport parameters every Vox connection runs with, in both directions.
 fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
+    cfg.max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_CONCURRENT_BIDI_STREAMS));
     // `From<VarInt>` rather than `try_from(Duration)`: the millisecond value is a compile-
     // time constant inside the varint range, so there is no error case to handle.
     cfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
@@ -387,6 +399,20 @@ impl VoxEndpoint {
     /// If the OS CSPRNG is unavailable, since the address is drawn from it.
     pub fn attach_circuit(&self, peer: &Digest32) -> Result<CircuitPort> {
         self.mux.attach(peer)
+    }
+
+    /// [`VoxEndpoint::attach_circuit`], recording `relay` as the peer carrying it.
+    ///
+    /// # Errors
+    /// As [`VoxEndpoint::attach_circuit`].
+    pub fn attach_circuit_via(&self, peer: &Digest32, relay: &Digest32) -> Result<CircuitPort> {
+        self.mux.attach_via(peer, relay)
+    }
+
+    /// The relay carrying `peer`'s live circuit, if one is recorded.
+    #[must_use]
+    pub fn circuit_relay_of(&self, peer: &Digest32) -> Option<Digest32> {
+        self.mux.circuit_relay_of(peer)
     }
 
     /// Whether `addr` is a **live circuit** on this endpoint's socket — answered from the
@@ -655,24 +681,13 @@ fn finish_connection(
         .ok_or(Error::SignatureInvalid)?;
     Ok(VoxConnection {
         serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
-        connection,
         peer_id,
         peer_process,
         session,
         via_circuit,
-        datagram_tx: Mutex::new(DatagramSender::new()),
-        datagram_rx: Mutex::new(ReplayWindow::default()),
-        datagrams_dropped: AtomicU64::new(0),
+        router: DatagramRouter::start(connection.clone()),
+        connection,
     })
-}
-
-/// Lock a piece of per-connection datagram state. The critical sections are a
-/// single counter/bitmap update with no `.await` inside, so the state is always
-/// consistent between operations; a poisoned lock (another thread panicked while
-/// holding it — impossible in this `deny(clippy::panic)` crate outside tests) is
-/// therefore safe to recover rather than propagate.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Confirm this handshake ran under the Vox TLS configuration, by its ALPN.
@@ -712,12 +727,9 @@ fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
 
 /// An authenticated QUIC connection to one Vox peer.
 ///
-/// Owns the per-connection datagram anti-replay state (ADR-011): an outbound
-/// [`DatagramSender`] sequence counter and an inbound [`ReplayWindow`] of
-/// [`crate::transport::datagram::DEFAULT_WINDOW`] packets. Both are private, so
-/// every datagram sent through [`VoxConnection::send_datagram`] is sequenced and
-/// every datagram returned by [`VoxConnection::recv_datagram`] has passed the
-/// window.
+/// Owns the connection's [`DatagramRouter`], started with it: every datagram the peer
+/// sends is read there and handed to the flow it names, so there is no way to read a
+/// datagram that bypasses the flow table (ADR-022).
 pub struct VoxConnection {
     /// This connection's name in this process, never given to another (see [`Self::serial`]).
     serial: u64,
@@ -729,14 +741,16 @@ pub struct VoxConnection {
     session: SessionEstablishment,
     /// Whether this connection was set up over a relay circuit (see [`Self::via_circuit`]).
     via_circuit: bool,
-    /// Outbound datagram sequence numbers (monotonic, saturating).
-    datagram_tx: Mutex<DatagramSender>,
-    /// Inbound sliding anti-replay window.
-    datagram_rx: Mutex<ReplayWindow>,
-    /// Inbound datagrams dropped as replay / out-of-window / unframed. Exposed
-    /// for observability ([`VoxConnection::datagrams_dropped`]); a rising count
-    /// on a live connection is a replay signal worth surfacing.
-    datagrams_dropped: AtomicU64,
+    router: Arc<DatagramRouter>,
+}
+
+impl Drop for VoxConnection {
+    fn drop(&mut self) {
+        // The router's reader holds a connection handle; without this it would keep
+        // an otherwise-unused connection open for ever. Flows still bound keep it
+        // reading until they end.
+        self.router.release_owner();
+    }
 }
 
 /// The next [`VoxConnection::serial`].
@@ -832,57 +846,53 @@ impl VoxConnection {
             .map_err(|_| Error::Unreachable("quic stream: the connection is closed"))
     }
 
-    /// Send one RFC 9221 unreliable datagram carrying `payload`. The connection
-    /// prepends the next 64-bit sequence number (ADR-011 datagram framing); the
-    /// caller never sees or chooses sequences. Fails if the framed datagram
-    /// exceeds the peer's advertised limit ([`VoxConnection::max_datagram_payload`]).
-    pub fn send_datagram(&self, payload: &[u8]) -> Result<()> {
-        let frame = lock(&self.datagram_tx).frame(payload);
-        self.connection
-            .send_datagram(bytes::Bytes::from(frame))
-            .map_err(|_| Error::MalformedBundle("quic send_datagram"))
+    /// Bind a datagram flow to the bidirectional stream `send`/`recv` (ADR-022
+    /// decision 1). The flow takes the stream: from here it carries no bytes, and the
+    /// flow ends when the stream does — dropped here, or finished, reset or stopped by
+    /// the peer. Both ends bind the same stream, so both name the flow by its ID.
+    ///
+    /// Bind only a stream whose kind's gate has already admitted the peer: a flow
+    /// accepts every datagram that names it.
+    ///
+    /// # Errors
+    /// If the connection is closed, or the stream is already bound.
+    pub fn bind_flow(&self, send: SendStream, recv: RecvStream) -> Result<DatagramFlow> {
+        self.router.bind(send, recv, FlowMode::Packets)
     }
 
-    /// Receive the next inbound datagram's **payload** that passes the
-    /// anti-replay window. Datagrams that are unframed (shorter than the sequence
-    /// prefix), duplicates, or below the window are dropped here — counted in
-    /// [`VoxConnection::datagrams_dropped`] — and never returned, exactly as
-    /// ADR-011 §"Datagram anti-replay" specifies. Only a transport-level read
-    /// failure (connection closed) is an error.
-    pub async fn recv_datagram(&self) -> Result<Vec<u8>> {
-        loop {
-            let raw = self
-                .connection
-                .read_datagram()
-                .await
-                .map_err(|_| Error::MalformedBundle("quic read_datagram"))?;
-            let Some((seq, payload)) = parse_datagram(&raw) else {
-                self.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            if !lock(&self.datagram_rx).accept(seq) {
-                self.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            return Ok(payload.to_vec());
-        }
+    /// Bind a flow that delivers each datagram's context and body as it arrived,
+    /// fragments included, for a relay to [`DatagramFlow::forward`] without reading
+    /// or reassembling it (ADR-022 decision 5).
+    ///
+    /// # Errors
+    /// As [`VoxConnection::bind_flow`].
+    pub fn bind_forwarding_flow(&self, send: SendStream, recv: RecvStream) -> Result<DatagramFlow> {
+        self.router.bind(send, recv, FlowMode::Forward)
     }
 
-    /// Number of inbound datagrams this connection has dropped as replayed,
-    /// duplicate, out-of-window, or unframed.
+    /// Bind a datagram flow to the stream `send` belongs to, **sharing** it: the stream
+    /// keeps carrying bytes, and the caller must end the flow with the stream by holding
+    /// both in one object (ADR-022 decisions 1 and 7; `node::app::AppStream` is that
+    /// object). Crate-private because that discipline is not one to hand out.
+    pub(crate) fn bind_shared_flow(&self, send: &SendStream) -> Result<DatagramFlow> {
+        self.router
+            .bind_shared(u64::from(send.id()), FlowMode::Packets)
+    }
+
+    /// This connection's datagram counters: delivered, and dropped by reason.
     #[must_use]
-    pub fn datagrams_dropped(&self) -> u64 {
-        self.datagrams_dropped.load(Ordering::Relaxed)
+    pub fn datagram_stats(&self) -> DatagramStats {
+        self.router.stats()
     }
 
-    /// The maximum datagram **payload** the peer will accept right now (its
-    /// advertised datagram size minus the sequence prefix), if datagrams are
-    /// enabled on the connection.
+    /// The largest packet any flow on this connection sends as one datagram right now
+    /// (the peer's advertised datagram size less the largest flow header); larger
+    /// packets are fragmented. `None` if datagrams are not enabled on the connection.
     #[must_use]
     pub fn max_datagram_payload(&self) -> Option<usize> {
         self.connection
             .max_datagram_size()
-            .map(|n| n.saturating_sub(SEQ_PREFIX_LEN))
+            .map(|n| n.saturating_sub(MAX_PACKET_HEADER))
     }
 
     /// Close the connection with an application code + reason.

@@ -89,6 +89,13 @@ impl SyncSchedule {
         self.pending_append = true;
     }
 
+    /// When a session last ran, in seconds; 0 if none has since the peer connected.
+    /// Read-only, for `vox status`.
+    #[must_use]
+    pub fn last_sync(&self) -> u64 {
+        self.last_sync
+    }
+
     /// Record that a session ran at `now_secs`.
     pub fn note_synced(&mut self, now_secs: u64) {
         self.last_sync = now_secs;

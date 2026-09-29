@@ -12,11 +12,11 @@
 //!
 //! ## Pinned field list (ADR-007, exact order)
 //! `{ nonce(16 B random), created(uint epoch-seconds),
-//!    policy{ history_mode(enum), deniability_mode(enum), ttl(uint, 0=never) },
+//!    policy{ history_mode(enum), retired_deniability(uint, always 0), ttl(uint, 0=never) },
 //!    creator_pubkey(composite, ADR-002), algo_ids }`
 //!
 //! encoded as the canonical-CBOR array
-//! `[nonce, created, [history_mode, deniability_mode, ttl], creator_pubkey,
+//! `[nonce, created, [history_mode, 0, ttl], creator_pubkey,
 //!   [sign_algo]]` (ADR-008 COSE-style arrays). `algo_ids` is a 1-element array
 //! holding the composite signature class (`0x0304`) — the only algorithm a
 //! genesis record commits to (there is no AEAD or KEM at the genesis layer).
@@ -137,54 +137,31 @@ impl HistoryMode {
     }
 }
 
-/// The channel **deniability mode** (ADR-007 policy axis; **genesis-immutable**).
+/// The genesis policy slot that once selected an ADR-009 deniable room.
 ///
-/// Set once in the genesis record. A policy-update MUST NOT change it (the
-/// evaluator and [`crate::governance::policy`] reject any attempt): members join
-/// under a fixed authorship-accountability contract, and flipping
-/// attributable↔deniable mid-life would change the threat model under existing
-/// members and the fork-handling split (ADR-007/ADR-008).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum DeniabilityMode {
-    /// Message content is composite-signed and attributable (ADR-008). Governance
-    /// is always attributable regardless of this axis.
-    Attributable,
-    /// Message content carries the ADR-009 deniable (forgeable) authenticator
-    /// (the crypto is M7); governance stays attributable.
-    Deniable,
-}
+/// Deniable rooms were removed (PRD-001 R43). The slot stays in the wire layout because a
+/// room's channelID is the hash of these bytes: dropping it would change the ID of every
+/// room that exists. It is always written as `0` (attributable) and any other value is
+/// refused, so a genesis asking for a deniable room can be neither created nor joined.
+const ATTRIBUTABLE_SLOT: u64 = 0;
 
-impl DeniabilityMode {
-    /// The wire discriminant (a canonical-CBOR uint).
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        match self {
-            DeniabilityMode::Attributable => 0,
-            DeniabilityMode::Deniable => 1,
-        }
-    }
-
-    /// Resolve from the wire discriminant, rejecting out-of-domain values.
-    pub fn from_u64(v: u64) -> Result<Self> {
-        match v {
-            0 => Ok(DeniabilityMode::Attributable),
-            1 => Ok(DeniabilityMode::Deniable),
-            _ => Err(Error::MalformedGovernance("deniability_mode out of domain")),
-        }
+/// Accept the retired deniability slot only at its one remaining value.
+fn attributable_slot(v: u64) -> Result<()> {
+    if v == ATTRIBUTABLE_SLOT {
+        Ok(())
+    } else {
+        Err(Error::MalformedGovernance("deniable rooms were removed"))
     }
 }
 
 /// The channel policy carried in the genesis record (ADR-007).
 ///
 /// `history_mode` and `ttl` are *mutable* by a later policy-update
-/// ([`crate::governance::policy`]); `deniability_mode` is **genesis-immutable**.
+/// ([`crate::governance::policy`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelPolicy {
     /// History retention/release mode (mutable).
     pub history_mode: HistoryMode,
-    /// Attributable vs deniable content authorship (genesis-immutable).
-    pub deniability_mode: DeniabilityMode,
     /// Payload time-to-live in seconds; `0` means never expire (mutable). The
     /// actual erasure is M8 (ADR-010); this is the policy value.
     pub ttl: u64,
@@ -212,7 +189,7 @@ pub struct GenesisBody {
     pub nonce: [u8; GENESIS_NONCE_LEN],
     /// Channel creation time (epoch seconds).
     pub created: u64,
-    /// The channel policy (history / deniability / ttl).
+    /// The channel policy (history / ttl / floor).
     pub policy: ChannelPolicy,
     /// The **service grant** (ADR-017 decision 3): capabilities conferred on every
     /// identity this node has admitted as an author of the channel, with no
@@ -250,7 +227,7 @@ impl GenesisBody {
             .uint(self.created)
             .array(4)
             .uint(self.policy.history_mode.as_u64())
-            .uint(self.policy.deniability_mode.as_u64())
+            .uint(ATTRIBUTABLE_SLOT)
             .uint(self.policy.ttl)
             .uint(u64::from(self.policy.min_suite))
             .array(grant.len());
@@ -294,7 +271,7 @@ impl GenesisBody {
             return Err(Error::MalformedGovernance("genesis policy arity"));
         }
         let history_mode = HistoryMode::from_u64(d.uint()?)?;
-        let deniability_mode = DeniabilityMode::from_u64(d.uint()?)?;
+        attributable_slot(d.uint()?)?;
         let ttl = d.uint()?;
         let min_suite = u16_from(d.uint()?)?;
         let service_grant = decode_service_grant(&mut d)?;
@@ -324,7 +301,6 @@ impl GenesisBody {
             created,
             policy: ChannelPolicy {
                 history_mode,
-                deniability_mode,
                 ttl,
                 min_suite,
             },
@@ -443,7 +419,7 @@ impl Genesis {
             .uint(b.created)
             .array(4)
             .uint(b.policy.history_mode.as_u64())
-            .uint(b.policy.deniability_mode.as_u64())
+            .uint(ATTRIBUTABLE_SLOT)
             .uint(b.policy.ttl)
             .uint(u64::from(b.policy.min_suite))
             .array(grant.len());

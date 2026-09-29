@@ -71,7 +71,7 @@ fn a_forward_refuses_to_bind_where_the_network_can_reach_it() {
             "--passphrase",
             &w.passphrase,
             "--anchor",
-            &w.anchor_spec,
+            &w.guest_anchor,
             "--listen",
             "127.0.0.1:0",
         ]),

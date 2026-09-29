@@ -406,6 +406,16 @@ impl OriginKeyStore {
         self.records.retain(|_, r| r.created_at >= cutoff);
     }
 
+    /// Drop every retained origin of `(channel_id, epoch)` older than generation `from`
+    /// (ADR-023 decision 4, PRD-001 R14): a superseded generation's key is deleted —
+    /// zeroized on drop — once nothing still has to release it. Returns how many went.
+    pub fn retain_from(&mut self, channel_id: &Digest32, epoch: u64, from: u64) -> usize {
+        let before = self.records.len();
+        self.records
+            .retain(|(c, e, id), _| c != channel_id || *e != epoch || *id >= from);
+        before - self.records.len()
+    }
+
     /// The number of retained generations (for tests / capacity reporting).
     #[must_use]
     pub fn len(&self) -> usize {

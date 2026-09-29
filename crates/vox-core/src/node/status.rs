@@ -1,34 +1,637 @@
-//! ADR-025 S0b — **simple sync counters**, per `(room, peer)`, behind `vox status --json`.
+//! PRD-001 R35 and R38 — **what this node is doing, and whether it is well**: the report
+//! behind `vox status`, its JSON form, and the Prometheus text `vox daemon --metrics`
+//! serves.
 //!
-//! The decider's decision 3 (2026-09-26): the proofs assert what a person sees — above all how
-//! long a post takes to become readable — and use a handful of counters only for what a person
-//! cannot see directly: that nothing was refused, skipped or left stale. There is deliberately no
-//! session journal.
+//! Every fact here is **read** from state the node already keeps — the published view,
+//! the connection manager, the sync schedules, the app layer and each connection's
+//! datagram router — plus three small ledgers this module keeps for the purpose
+//! ([`StatusBook`]): when each room last completed a sync, when each peer was last seen
+//! connected, and which tunnels are being served right now. Nothing here decides
+//! anything, and nothing the node does waits on it.
 //!
-//! The counters live in a [`SyncBook`] shared between the actor (the only writer) and every
-//! [`crate::node::actor::NodeHandle`] (readers), behind a plain mutex held for a few map updates
-//! at a time, so `vox status` answers even while the actor is busy.
+//! ## What "unhealthy" means
 //!
-//! ## The request
+//! A line in [`StatusReport::unhealthy`] is something an operator should look at:
 //!
-//! `vox status --json` asks the running node over its control socket with the request
-//! `[2301]`, and the node answers `[2302, json]`. The tags are the ones PRD-001 R35's fuller
-//! `vox status` uses on the v0.3.0 line, so that report can fold this one in: the JSON is an
-//! object whose `"sync"` key holds the per-`(room, peer)` rows, and other sections can be added
-//! beside it without changing this one.
+//! - a room with other members that has not completed a sync in [`STALE_SYNC_SECS`];
+//! - a **trusted** member of an open room this node was connected to and no longer is.
+//!
+//! An untrusted member that is offline is not flagged: nothing this node does depends on
+//! reaching it. A trusted one is who this node reads, and is read by.
+//!
+//! ## What is not knowable yet
+//!
+//! Whether a room has an **always-on member** is ADR-023's question and nothing records
+//! it yet, so the report says so and shows when each member was last seen instead.
+//! "Direct" covers both a dialled and a hole-punched path: which rung won is not kept
+//! once the connection is filed.
+//!
+//! ## ADR-025 S0b's sync counters
+//!
+//! Beside the report, `vox status --json` carries v0.2.10's **simple sync counters** (the
+//! decider's decision 3, 2026-09-26): a `"sync"` row per `(room, peer)` — sessions opened,
+//! admitted, refused busy, completed, partial, failed, stale, skipped at the cap, queued, and the
+//! backoff a port is in — and a `"reach"` row per peer, counting reachability ladders and outbound
+//! circuits (V210-53). They are what a person cannot see directly: that nothing was refused,
+//! skipped or left stale. They live in a [`SyncBook`] the actor writes and every handle reads.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
+use crate::node::actor::NodeHandle;
+use crate::node::app::AppStats;
 use crate::node::ipc::{read_frame, write_frame, Frame, PROTOCOL_VERSION};
 use crate::node::link::b32_encode;
+use crate::transport::router::DatagramStats;
+
+/// A room with other members and no completed sync for this long is flagged.
+pub const STALE_SYNC_SECS: u64 = 10 * 60;
+
+/// One tunnel this node is serving right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedTunnel {
+    /// The member reaching it.
+    pub client: Digest32,
+    /// The room it is bound to.
+    pub channel_id: Digest32,
+    /// The service.
+    pub service_tag: String,
+    /// When it was authorized, seconds since the epoch.
+    pub since: u64,
+}
+
+/// The ledgers this module keeps beside the node's own state.
+#[derive(Debug, Default)]
+pub struct StatusBook {
+    /// Room → when a sync this node ran there last completed.
+    pub room_synced: BTreeMap<Digest32, u64>,
+    /// Peer → when a sync session with it last completed, in any room.
+    pub member_synced: BTreeMap<Digest32, u64>,
+    /// Peer → when this node last saw a live connection to it.
+    pub last_seen: BTreeMap<Digest32, u64>,
+    /// Tunnels being served, by a local id; entries leave when the tunnel ends.
+    pub served: Arc<Mutex<BTreeMap<u64, ServedTunnel>>>,
+    /// When the node started, seconds since the epoch: a room that has not synced *yet*
+    /// is not stale until it has had [`STALE_SYNC_SECS`] to do so.
+    pub started: u64,
+    next_tunnel: u64,
+}
+
+/// A place in [`StatusBook::served`], given back when the tunnel ends.
+#[derive(Debug)]
+pub struct ServedGuard {
+    id: u64,
+    served: Arc<Mutex<BTreeMap<u64, ServedTunnel>>>,
+}
+
+impl ServedGuard {
+    /// The tunnel was authorized: it is now being served.
+    pub fn serving(&self, tunnel: ServedTunnel) {
+        self.served
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(self.id, tunnel);
+    }
+}
+
+impl Drop for ServedGuard {
+    fn drop(&mut self) {
+        self.served
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+impl StatusBook {
+    /// A guard for one inbound tunnel stream; it shows as served once
+    /// [`ServedGuard::serving`] says so, and stops when the guard drops.
+    pub fn tunnel(&mut self) -> ServedGuard {
+        self.next_tunnel += 1;
+        ServedGuard {
+            id: self.next_tunnel,
+            served: Arc::clone(&self.served),
+        }
+    }
+
+    /// The tunnels being served now.
+    #[must_use]
+    pub fn served_now(&self) -> Vec<ServedTunnel> {
+        self.served
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+}
+
+/// One member of a room, as this node sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberStatus {
+    /// Its identity.
+    pub id: Digest32,
+    /// Whether it is this node.
+    pub me: bool,
+    /// Whether this node's keyring trusts it.
+    pub trusted: bool,
+    /// Whether this node has a live connection to it now.
+    pub connected: bool,
+    /// When this node last saw it connected (now, if it is).
+    pub last_seen: Option<u64>,
+    /// When a sync session with it last ran.
+    pub last_sync: Option<u64>,
+}
+
+/// One open room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomStatus {
+    /// The room.
+    pub id: Digest32,
+    /// Its local name.
+    pub name: String,
+    /// Its epoch.
+    pub epoch: u64,
+    /// When a sync this node ran there last completed.
+    pub last_sync: Option<u64>,
+    /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
+    /// and the node's own (ADR-023 decision 2). `None` when the room was mid-session and could
+    /// not be read without waiting.
+    pub retention: Option<u64>,
+    /// How many generations of this node's own sender key it still holds here (PRD-001
+    /// R14: one, unless a full-history grant is still owed). `None` when the room was
+    /// mid-session and could not be read without waiting.
+    pub key_generations: Option<usize>,
+    /// Authors this node froze here for signing two entries at one position (ADR-008). `None`
+    /// when the room was mid-session and could not be read without waiting.
+    pub frozen: Option<Vec<Digest32>>,
+    /// Entries this node refused here as at or below their author's checkpoint since it opened
+    /// the room (ADR-023 decision 3). `None` as for `frozen`.
+    pub refused_below_checkpoint: Option<u64>,
+    /// Its members.
+    pub members: Vec<MemberStatus>,
+}
+
+/// One connected peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerStatus {
+    /// Its identity.
+    pub id: Digest32,
+    /// `direct` (dialled or hole-punched) or `relayed`.
+    pub path: &'static str,
+    /// The relay carrying it, when relayed and known.
+    pub relay: Option<Digest32>,
+    /// QUIC's smoothed round-trip time, milliseconds.
+    pub rtt_ms: u64,
+    /// This connection's datagram counters.
+    pub datagrams: DatagramStats,
+}
+
+/// A local port forwarded to a member's service (the dial side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialedTunnel {
+    /// The room.
+    pub channel_id: Digest32,
+    /// The member hosting it.
+    pub host: Digest32,
+    /// The service.
+    pub service_tag: String,
+    /// Where it listens locally.
+    pub local: SocketAddr,
+}
+
+/// Everything `vox status` shows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusReport {
+    /// When this was taken, seconds since the epoch.
+    pub now: u64,
+    /// When the node started, seconds since the epoch.
+    pub started: u64,
+    /// This node.
+    pub identity: Option<Digest32>,
+    /// Whether it is on the network.
+    pub networked: bool,
+    /// Where it listens.
+    pub listening: Vec<String>,
+    /// Its open rooms.
+    pub rooms: Vec<RoomStatus>,
+    /// Its live connections.
+    pub peers: Vec<PeerStatus>,
+    /// How many circuits it carries for others.
+    pub relaying: usize,
+    /// Tunnels it serves now.
+    pub tunnels_served: Vec<ServedTunnel>,
+    /// Ports it forwards to others' services.
+    pub tunnels_dialed: Vec<DialedTunnel>,
+    /// Datagram counters, summed over every connection.
+    pub datagrams: DatagramStats,
+    /// The app layer's counters.
+    pub app: AppStats,
+    /// What needs looking at.
+    pub unhealthy: Vec<Unhealthy>,
+}
+
+/// One condition that needs looking at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unhealthy {
+    /// A stable name for the condition — `peer-unreachable:<room>:<peer>` or
+    /// `room-stale:<room>` — the same for as long as the condition holds, so a notifier
+    /// can tell it starting from it continuing (PRD-001 R37).
+    pub key: String,
+    /// What a person reads. May change while the condition holds ("last seen 12s ago").
+    pub message: String,
+}
+
+fn short(d: &Digest32) -> String {
+    b32_encode(d).chars().take(12).collect()
+}
+
+impl StatusReport {
+    /// Work out the unhealthy lines from the rest of the report.
+    pub fn diagnose(&mut self) {
+        let mut out = Vec::new();
+        for room in &self.rooms {
+            let others = room.members.iter().filter(|m| !m.me).count();
+            if others == 0 || !self.networked {
+                continue;
+            }
+            // Measured from the last completed sync, or from the node's start when there
+            // has been none: a daemon that has just started is not unhealthy for not
+            // having synced in its first seconds, and would otherwise alarm on every start.
+            let since = room.last_sync.unwrap_or(self.started);
+            let stale = self.now.saturating_sub(since) > STALE_SYNC_SECS;
+            if stale {
+                out.push(Unhealthy {
+                    key: format!("room-stale:{}", b32_encode(&room.id)),
+                    message: format!(
+                        "room {} ({}): no completed sync in {} minutes",
+                        short(&room.id),
+                        room.name,
+                        STALE_SYNC_SECS / 60
+                    ),
+                });
+            }
+            for m in &room.members {
+                if m.me || !m.trusted || m.connected {
+                    continue;
+                }
+                if let Some(seen) = m.last_seen {
+                    out.push(Unhealthy {
+                        key: format!(
+                            "peer-unreachable:{}:{}",
+                            b32_encode(&room.id),
+                            b32_encode(&m.id)
+                        ),
+                        message: format!(
+                            "room {} ({}): trusted member {} unreachable, last seen {}s ago",
+                            short(&room.id),
+                            room.name,
+                            short(&m.id),
+                            self.now.saturating_sub(seen)
+                        ),
+                    });
+                }
+            }
+        }
+        self.unhealthy = out;
+    }
+
+    /// The report as JSON (what `vox status --json` prints). Hand-written, because the
+    /// shape is small and fixed and the crate carries no serializer.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let mut j = String::from("{");
+        let _ = write!(j, "\"now\":{},", self.now);
+        let _ = write!(
+            j,
+            "\"identity\":{},",
+            self.identity.map_or("null".into(), |d| q(&b32_encode(&d)))
+        );
+        let _ = write!(j, "\"networked\":{},", self.networked);
+        let _ = write!(
+            j,
+            "\"listening\":[{}],",
+            list(self.listening.iter().map(|s| q(s)))
+        );
+        let _ = write!(
+            j,
+            "\"always_on_member\":{},",
+            q("unknown: not recorded until ADR-023; see each member's last_seen")
+        );
+        let rooms = self.rooms.iter().map(|r| {
+            let members = r.members.iter().map(|m| {
+                format!(
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen\":{},\"last_sync\":{}}}",
+                    q(&b32_encode(&m.id)),
+                    m.me,
+                    m.trusted,
+                    m.connected,
+                    opt(m.last_seen),
+                    opt(m.last_sync)
+                )
+            });
+            format!(
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"frozen\":{},\"refused_below_checkpoint\":{},\"members\":[{}]}}",
+                q(&b32_encode(&r.id)),
+                q(&r.name),
+                r.epoch,
+                opt(r.last_sync),
+                opt(r.retention),
+                opt(r.key_generations.map(|n| n as u64)),
+                r.frozen.as_ref().map_or("null".into(), |f| format!(
+                    "[{}]",
+                    list(f.iter().map(|d| q(&b32_encode(d))))
+                )),
+                opt(r.refused_below_checkpoint),
+                list(members)
+            )
+        });
+        let _ = write!(j, "\"rooms\":[{}],", list(rooms));
+        let peers = self.peers.iter().map(|p| {
+            format!(
+                "{{\"id\":{},\"path\":{},\"relay\":{},\"rtt_ms\":{},\"datagrams\":{}}}",
+                q(&b32_encode(&p.id)),
+                q(p.path),
+                p.relay.map_or("null".into(), |d| q(&b32_encode(&d))),
+                p.rtt_ms,
+                dgram_json(&p.datagrams)
+            )
+        });
+        let _ = write!(j, "\"peers\":[{}],", list(peers));
+        let _ = write!(j, "\"relaying\":{},", self.relaying);
+        let served = self.tunnels_served.iter().map(|t| {
+            format!(
+                "{{\"client\":{},\"room\":{},\"service\":{},\"since\":{}}}",
+                q(&b32_encode(&t.client)),
+                q(&b32_encode(&t.channel_id)),
+                q(&t.service_tag),
+                t.since
+            )
+        });
+        let _ = write!(j, "\"tunnels_served\":[{}],", list(served));
+        let dialed = self.tunnels_dialed.iter().map(|t| {
+            format!(
+                "{{\"host\":{},\"room\":{},\"service\":{},\"local\":{}}}",
+                q(&b32_encode(&t.host)),
+                q(&b32_encode(&t.channel_id)),
+                q(&t.service_tag),
+                q(&t.local.to_string())
+            )
+        });
+        let _ = write!(j, "\"tunnels_dialed\":[{}],", list(dialed));
+        let _ = write!(j, "\"datagrams\":{},", dgram_json(&self.datagrams));
+        let a = &self.app;
+        let _ = write!(
+            j,
+            "\"app\":{{\"inbound\":{},\"accepted\":{},\"opened\":{},\"refused_untrusted\":{},\"refused_busy\":{},\"refused_no_listener\":{},\"refused_unaccepted\":{},\"refused_locally\":{},\"withdrawn\":{}}},",
+            a.inbound,
+            a.accepted,
+            a.opened,
+            a.refused_untrusted,
+            a.refused_busy,
+            a.refused_no_listener,
+            a.refused_unaccepted,
+            a.refused_locally,
+            a.withdrawn
+        );
+        let _ = write!(
+            j,
+            "\"unhealthy\":[{}]",
+            list(self.unhealthy.iter().map(|u| format!(
+                "{{\"key\":{},\"message\":{}}}",
+                q(&u.key),
+                q(&u.message)
+            )))
+        );
+        j.push('}');
+        j
+    }
+
+    /// The report as Prometheus text exposition (what `vox daemon --metrics` serves).
+    #[must_use]
+    pub fn to_prometheus(&self) -> String {
+        let mut m = String::new();
+        let mut gauge = |name: &str, help: &str, rows: Vec<(String, u64)>| {
+            let _ = writeln!(m, "# HELP {name} {help}");
+            let _ = writeln!(m, "# TYPE {name} gauge");
+            for (labels, v) in rows {
+                let _ = writeln!(m, "{name}{labels} {v}");
+            }
+        };
+        gauge(
+            "vox_up",
+            "1 while the node answers.",
+            vec![(String::new(), 1)],
+        );
+        gauge(
+            "vox_networked",
+            "1 when the node is on the network.",
+            vec![(String::new(), u64::from(self.networked))],
+        );
+        gauge(
+            "vox_peers_connected",
+            "Live connections.",
+            vec![(String::new(), self.peers.len() as u64)],
+        );
+        gauge(
+            "vox_peer_relayed",
+            "1 when the path to this peer runs through a relay, 0 when direct.",
+            self.peers
+                .iter()
+                .map(|p| {
+                    (
+                        format!(
+                            "{{peer=\"{}\",relay=\"{}\"}}",
+                            b32_encode(&p.id),
+                            p.relay.map(|r| b32_encode(&r)).unwrap_or_default()
+                        ),
+                        u64::from(p.path == "relayed"),
+                    )
+                })
+                .collect(),
+        );
+        gauge(
+            "vox_peer_rtt_milliseconds",
+            "QUIC smoothed round-trip time per peer.",
+            self.peers
+                .iter()
+                .map(|p| (format!("{{peer=\"{}\"}}", b32_encode(&p.id)), p.rtt_ms))
+                .collect(),
+        );
+        gauge(
+            "vox_room_members",
+            "Members per open room.",
+            self.rooms
+                .iter()
+                .map(|r| {
+                    (
+                        format!("{{room=\"{}\"}}", b32_encode(&r.id)),
+                        r.members.len() as u64,
+                    )
+                })
+                .collect(),
+        );
+        gauge(
+            "vox_room_last_sync_seconds",
+            "When a sync this node ran in the room last completed (0: never).",
+            self.rooms
+                .iter()
+                .map(|r| {
+                    (
+                        format!("{{room=\"{}\"}}", b32_encode(&r.id)),
+                        r.last_sync.unwrap_or(0),
+                    )
+                })
+                .collect(),
+        );
+        gauge(
+            "vox_relaying_circuits",
+            "Circuits carried for other peers.",
+            vec![(String::new(), self.relaying as u64)],
+        );
+        gauge(
+            "vox_tunnels_served",
+            "Tunnels being served now.",
+            vec![(String::new(), self.tunnels_served.len() as u64)],
+        );
+        gauge(
+            "vox_tunnels_dialed",
+            "Local forwards to members' services.",
+            vec![(String::new(), self.tunnels_dialed.len() as u64)],
+        );
+        gauge(
+            "vox_unhealthy",
+            "Lines `vox status` flags as needing attention.",
+            vec![(String::new(), self.unhealthy.len() as u64)],
+        );
+        let d = &self.datagrams;
+        let mut counter = |name: &str, help: &str, v: u64| {
+            let _ = writeln!(m, "# HELP {name} {help}");
+            let _ = writeln!(m, "# TYPE {name} counter");
+            let _ = writeln!(m, "{name} {v}");
+        };
+        counter(
+            "vox_datagrams_sent_total",
+            "Datagrams handed to QUIC.",
+            d.sent,
+        );
+        counter(
+            "vox_datagrams_delivered_total",
+            "Datagrams delivered to a flow.",
+            d.delivered,
+        );
+        counter(
+            "vox_datagrams_fragmented_total",
+            "Packets sent as fragments.",
+            d.fragmented,
+        );
+        counter(
+            "vox_datagrams_dropped_total",
+            "Datagrams dropped: unknown flow, full inbox, malformed, reassembly, or unsendable.",
+            d.unknown_flow
+                + d.inbox_full
+                + d.malformed
+                + d.unknown_context
+                + d.reassembly_expired
+                + d.reassembly_evicted
+                + d.reassembly_rejected
+                + d.send_dropped,
+        );
+        let a = &self.app;
+        counter(
+            "vox_app_streams_inbound_total",
+            "App streams that arrived.",
+            a.inbound,
+        );
+        counter(
+            "vox_app_streams_accepted_total",
+            "App streams accepted.",
+            a.accepted,
+        );
+        counter(
+            "vox_app_streams_opened_total",
+            "App streams opened.",
+            a.opened,
+        );
+        counter(
+            "vox_app_streams_refused_total",
+            "App streams refused, for any reason.",
+            a.refused_untrusted
+                + a.refused_busy
+                + a.refused_no_listener
+                + a.refused_unaccepted
+                + a.refused_locally,
+        );
+        m
+    }
+}
+
+fn q(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn opt(v: Option<u64>) -> String {
+    v.map_or("null".into(), |v| v.to_string())
+}
+
+fn list(items: impl Iterator<Item = String>) -> String {
+    items.collect::<Vec<_>>().join(",")
+}
+
+fn dgram_json(d: &DatagramStats) -> String {
+    format!(
+        "{{\"sent\":{},\"delivered\":{},\"fragmented\":{},\"unknown_flow\":{},\"inbox_full\":{},\"malformed\":{},\"send_dropped\":{}}}",
+        d.sent,
+        d.delivered,
+        d.fragmented,
+        d.unknown_flow,
+        d.inbox_full,
+        d.malformed + d.unknown_context,
+        d.send_dropped
+    )
+}
+
+/// Add `b` into `a`, field by field.
+pub fn add_stats(a: &mut DatagramStats, b: &DatagramStats) {
+    a.delivered += b.delivered;
+    a.unknown_flow += b.unknown_flow;
+    a.inbox_full += b.inbox_full;
+    a.malformed += b.malformed;
+    a.unknown_context += b.unknown_context;
+    a.reassembly_expired += b.reassembly_expired;
+    a.reassembly_evicted += b.reassembly_evicted;
+    a.reassembly_rejected += b.reassembly_rejected;
+    a.sent += b.sent;
+    a.fragmented += b.fragmented;
+    a.send_dropped += b.send_dropped;
+}
+
+// ---- ADR-025 S0b: sync and reach counters ----------------------------------
 
 /// The kinds of backoff a port can be in (ADR-025 D5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,12 +725,14 @@ impl SyncBook {
         *b.ladders.entry(peer).or_default() += 1;
     }
 
-    /// The counters as `vox status --json` prints them, with the rooms' equivocations
-    /// (`(room, author, position)`, V210-63).
+    /// The counters as `vox status --json` carries them: its `"sync"`, `"reach"` and
+    /// `"equivocations"` members, without the enclosing braces, for [`serve`] to add beside
+    /// [`StatusReport::to_json`]'s. `equivocations` is each `(room, author, position)` the node
+    /// holds back (V210-63).
     #[must_use]
-    pub fn to_json(book: &SharedSyncBook, equivocations: &[(Digest32, Digest32, u64)]) -> String {
+    pub fn sections_json(book: &SharedSyncBook, equivocations: &[(Digest32, Digest32, u64)]) -> String {
         let b = book.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut s = String::from("{\"sync\":[");
+        let mut s = String::from("\"sync\":[");
         for (i, ((room, peer), c)) in b.ports.iter().enumerate() {
             if i > 0 {
                 s.push(',');
@@ -147,7 +752,7 @@ impl SyncBook {
                 c.failed,
                 c.last_failure
                     .as_deref()
-                    .map_or_else(|| "null".to_owned(), json_string),
+                    .map_or_else(|| "null".to_owned(), q),
                 c.stale,
                 c.skipped_at_cap,
                 c.queued,
@@ -190,34 +795,13 @@ impl SyncBook {
                 b32_encode(author),
             );
         }
-        s.push_str("]}");
+        s.push(']');
         s
     }
 }
 
-/// `text` as a JSON string literal.
-fn json_string(text: &str) -> String {
-    let mut s = String::with_capacity(text.len() + 2);
-    s.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => s.push_str("\\\""),
-            '\\' => s.push_str("\\\\"),
-            '\n' => s.push_str("\\n"),
-            '\r' => s.push_str("\\r"),
-            '\t' => s.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(s, "\\u{:04x}", c as u32);
-            }
-            c => s.push(c),
-        }
-    }
-    s.push('"');
-    s
-}
-
 // ---- IPC -------------------------------------------------------------------
-// Additive to the control protocol, away from the sequential tags, as PRD-001 R35's are.
+// Additive to protocol 6, away from the sequential tags as the other late ones are.
 
 const T_STATUS: u64 = 2301;
 const T_STATUS_REPORT: u64 = 2302;
@@ -233,22 +817,42 @@ pub fn is_request(body: &[u8]) -> bool {
 ///
 /// # Errors
 /// If the reply cannot be written.
-pub async fn serve(
-    stream: &mut UnixStream,
-    book: &SharedSyncBook,
-    equivocations: &[(Digest32, Digest32, u64)],
-) -> Result<()> {
-    let mut e = Encoder::new();
-    e.array(2)
-        .uint(T_STATUS_REPORT)
-        .text(&SyncBook::to_json(book, equivocations));
-    write_frame(stream, &e.finish()).await
+pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
+    let body = match handle.status().await {
+        Ok(report) => {
+            // ADR-025 S0b's counters join the report as its `sync` and `reach` members, and the
+            // rooms' equivocations as `equivocations` (V210-63).
+            let equivocations: Vec<(Digest32, Digest32, u64)> = handle
+                .view()
+                .open_channels
+                .iter()
+                .flat_map(|d| {
+                    d.equivocations
+                        .iter()
+                        .map(move |(author, seq)| (d.channel_id, *author, *seq))
+                })
+                .collect();
+            let mut json = report.to_json();
+            json.pop();
+            json.push(',');
+            json.push_str(&SyncBook::sections_json(handle.sync_book(), &equivocations));
+            json.push('}');
+            let mut e = Encoder::new();
+            e.array(2).uint(T_STATUS_REPORT).text(&json);
+            e.finish()
+        }
+        Err(e) => Frame::Error {
+            reason: e.to_string(),
+        }
+        .to_bytes(),
+    };
+    write_frame(stream, &body).await
 }
 
-/// Ask the node listening on `path` for its status, as JSON.
+/// Ask the node at `path` for its status, as JSON.
 ///
 /// # Errors
-/// If the node cannot be reached or answers something else.
+/// If no node answers, or it refuses.
 pub async fn request(path: &Path) -> Result<String> {
     let mut stream = UnixStream::connect(path).await.map_err(|e| Error::Path {
         op: "connect control socket",
@@ -275,10 +879,55 @@ pub async fn request(path: &Path) -> Result<String> {
             .map_err(|_| Error::MalformedBundle("ipc status reply"));
     }
     match Frame::from_bytes(&body)? {
-        Frame::Error { reason } => Err(Error::Path {
-            op: "vox status",
-            detail: reason,
-        }),
+        Frame::Error { reason } => Err(Error::AppRefused(reason)),
         _ => Err(Error::MalformedBundle("ipc status reply")),
+    }
+}
+
+// ---- metrics endpoint ------------------------------------------------------
+
+/// Bind the metrics endpoint, **loopback only**: the counters name every peer and room
+/// this node talks to, which is exactly what a relay operator must not learn, so they
+/// are not offered to the network. The same rule `vox forward` enforces.
+///
+/// # Errors
+/// If `addr` is not a loopback address, or cannot be bound.
+pub async fn bind_metrics(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    if !addr.ip().is_loopback() {
+        return Err(Error::AppRefused(format!(
+            "--metrics {addr}: the metrics endpoint binds loopback only (127.0.0.1 or ::1); \
+             it names every peer and room this node talks to"
+        )));
+    }
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| Error::Path {
+            op: "bind metrics endpoint",
+            detail: format!("{addr}: {e}"),
+        })
+}
+
+/// Serve Prometheus text on every connection to `listener`, until it is dropped.
+pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle) {
+    while let Ok((mut sock, _)) = listener.accept().await {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            // The request itself is not interpreted: every path answers the metrics. A
+            // bounded read is enough to consume a scraper's request line and headers.
+            let mut buf = [0u8; 2048];
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), sock.read(&mut buf)).await;
+            let body = match handle.status().await {
+                Ok(r) => r.to_prometheus(),
+                Err(_) => "vox_up 0\n".to_owned(),
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
     }
 }

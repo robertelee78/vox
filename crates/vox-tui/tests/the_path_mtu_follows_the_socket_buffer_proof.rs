@@ -164,7 +164,7 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
     let host = w.host.take().expect("the world's host");
     // Moved out (the temp dir stays with `w`) so it is killed last, after everything that
     // reaches through it.
-    let anchor = w._anchor;
+    let anchor = w.anchor;
     let mut checked = 0;
     for proc in [forward, host, anchor] {
         let name = proc.name.clone();
