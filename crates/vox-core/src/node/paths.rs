@@ -195,11 +195,25 @@ impl Paths {
 /// directory. Ids are already base32 or uuid-shaped in practice; this is the
 /// boundary check, not a formatting step, because the session id arrives from a
 /// harness and is not ours to trust.
+///
+/// **Two ids never share a name** (V210-79). Dropping characters alone made `agent.1` and
+/// `agent1` — or any two ids alike past 96 characters, or any two made only of other
+/// characters — one file: one session's drain then advanced the other's cursor, and the
+/// other never saw what it skipped. An id that is already safe is kept as it is; any other
+/// keeps a safe prefix and adds `~` (which no safe id contains) and a digest of the whole id.
 fn sanitize(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(96)
-        .collect()
+    let safe = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    if !s.is_empty() && s.len() <= 96 && s.chars().all(safe) {
+        return s.to_owned();
+    }
+    let digest = crate::hash::domain_hash("vox/path-component/v1", s.as_bytes());
+    let mut out: String = s.chars().filter(|c| safe(*c)).take(64).collect();
+    out.push('~');
+    for b in &digest[..10] {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 fn home_dir() -> Result<PathBuf> {

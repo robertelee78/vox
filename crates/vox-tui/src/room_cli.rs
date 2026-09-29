@@ -438,6 +438,12 @@ pub async fn post_cmd(
         urgent: opts.urgent,
         re: opts.re.clone(),
         thread: opts.thread.clone(),
+        // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's
+        // budget less one, so an urgent reply chain ends at zero instead of looping.
+        hops: opts
+            .re
+            .as_ref()
+            .map(|re| crate::wake::reply_hops(re, &snap.rows)),
         body: body.trim_end().to_owned(),
         data,
     };
@@ -1023,6 +1029,14 @@ async fn run_op(
         .outcomes
         .get(&posting.entry_hash)
         .cloned();
+    // **A claim is recorded when it is made** (V210-79), so one that lapses before this
+    // session's next drain is still reported lost there. By what the operation did, not by
+    // what the fold says now: a short ttl can already have run out by the read-back.
+    if matches!(kind, claim::CLAIM | claim::RENEW) && outcome == Some(Outcome::Applied) {
+        if let Some(resource) = draft.data.get("resource").and_then(|v| v.as_str()) {
+            crate::agent_hook::note_held(paths, &room_key, &session, resource);
+        }
+    }
     Ok(Done {
         posting,
         outcome,
