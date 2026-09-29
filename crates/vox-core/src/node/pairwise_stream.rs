@@ -187,7 +187,29 @@ pub async fn send_skdm(
 /// `hello` is `Some` exactly when this node has just opened the session from the
 /// peer's bundle record and the peer therefore does not hold it yet. It goes first,
 /// on the same stream, so the peer has accepted the session before it reads the SKDM.
+///
+/// Bounded by [`WRITE_PATIENCE`]: the caller is the node's actor, and a peer that grants no
+/// stream or flow credit would otherwise hold it for as long as it liked (V210-71).
 pub async fn deliver_skdm(
+    conn: &VoxConnection,
+    channel_id: &crate::hash::Digest32,
+    session: &mut Session,
+    skdm: &Skdm,
+    hello: Option<&InitialMessage>,
+) -> Result<quinn::RecvStream> {
+    tokio::time::timeout(
+        WRITE_PATIENCE,
+        deliver_skdm_unbounded(conn, channel_id, session, skdm, hello),
+    )
+    .await
+    .map_err(|_| Error::Unreachable("the peer did not take a pairwise stream in time"))?
+}
+
+/// How long writing a key, or a hello, to a peer may take. The frames are a few KiB on a live
+/// connection, so anything near this is a peer withholding credit, not a slow network.
+pub const WRITE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn deliver_skdm_unbounded(
     conn: &VoxConnection,
     channel_id: &crate::hash::Digest32,
     session: &mut Session,
@@ -277,7 +299,23 @@ pub async fn refused(mut recv: quinn::RecvStream, patience: std::time::Duration)
 ///
 /// This grants nothing. See [`PairwiseFrame::Open`] for why the session needs it and
 /// why meeting that need with a sender key was the defect.
+///
+/// Bounded by [`WRITE_PATIENCE`], as [`deliver_skdm`] is.
 pub async fn open_sending_direction(
+    conn: &VoxConnection,
+    channel_id: &crate::hash::Digest32,
+    session: &mut Session,
+    hello: Option<&InitialMessage>,
+) -> Result<()> {
+    tokio::time::timeout(
+        WRITE_PATIENCE,
+        open_sending_direction_unbounded(conn, channel_id, session, hello),
+    )
+    .await
+    .map_err(|_| Error::Unreachable("the peer did not take a pairwise stream in time"))?
+}
+
+async fn open_sending_direction_unbounded(
     conn: &VoxConnection,
     channel_id: &crate::hash::Digest32,
     session: &mut Session,

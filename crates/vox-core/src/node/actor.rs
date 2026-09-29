@@ -285,6 +285,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
     match e {
         NetEvent::JoinRequest { .. } => "answering somebody's join",
         NetEvent::SyncRequest { .. } => "answering a sync",
+        NetEvent::Pairwise(..) => "taking a pairwise stream",
         NetEvent::Stream { .. } => "serving a stream",
         NetEvent::Connected { .. } => "filing a new connection",
         NetEvent::BetterPath { .. } => "adopting a connection",
@@ -631,6 +632,8 @@ enum NetEvent {
         /// The stream's receive half.
         recv: quinn::RecvStream,
     },
+    /// A peer's pairwise stream, its frames **already read** off the actor (V210-71).
+    Pairwise(PairwiseIn),
     /// A peer connected inbound: it gets a sync schedule, due immediately.
     Connected {
         /// The authenticated peer.
@@ -911,6 +914,8 @@ fn spawn_stream_loop(
         // unusable and which keeps a pathological peer from spinning this task.
         const MAX_CONSECUTIVE_STREAM_FAILURES: u32 = 16;
         let mut failures = 0;
+        // This connection's pairwise reader, started with its first pairwise stream.
+        let mut pairwise: Option<mpsc::Sender<(quinn::SendStream, quinn::RecvStream)>> = None;
         loop {
             // **The kinds this node serves to completion get a task each.** `accept_stream`
             // served them inline — `dispatch`'s own doc says to put it on its own task when
@@ -1041,6 +1046,29 @@ fn spawn_stream_loop(
                             .await;
                     });
                 }
+                // A pairwise stream's frames are read **here too, off the actor** (V210-71), and
+                // for the same reason as a sync preamble: acting on them needs the actor, waiting
+                // for them must not. The actor used to read them inline, `FRAME_PATIENCE` per
+                // frame and two frames behind a hello, so a member that opened a pairwise stream
+                // and sent nothing held the whole node for 30-60 s, and could do it again.
+                //
+                // One reader per connection rather than a task per stream, because the order of a
+                // peer's pairwise streams is load-bearing: a hello and the key that follows it can
+                // be separate streams, and reordering them is the race F12 was. So a silent stream
+                // holds back only the pairwise streams its own peer opened after it.
+                Ok(Inbound::Pairwise { peer, send, recv }) => {
+                    failures = 0;
+                    let queue = pairwise.get_or_insert_with(|| {
+                        let (q, rx) = mpsc::channel(PAIRWISE_QUEUE);
+                        tokio::spawn(read_pairwise_streams(peer, rx, tx.clone()));
+                        q
+                    });
+                    // Back-pressure on this peer's own connection only: a full queue means this
+                    // peer has that many unread pairwise streams outstanding.
+                    if queue.send((send, recv)).await.is_err() {
+                        return; // the reader ended with the actor
+                    }
+                }
                 Ok(inbound) => {
                     failures = 0;
                     let event = NetEvent::Stream {
@@ -1065,6 +1093,57 @@ fn spawn_stream_loop(
         // This peer's report of our address dies with its connection.
         net.forget_observed(&peer);
     })
+}
+
+/// How many of one connection's pairwise streams may wait to be read.
+const PAIRWISE_QUEUE: usize = 32;
+
+/// Read one connection's pairwise streams in the order they arrived and hand each to the actor
+/// as [`NetEvent::Pairwise`] once its frames are in hand (V210-71). Each read is bounded by
+/// `framing::FRAME_PATIENCE`; a stream that sends nothing usable is dropped here, as the actor
+/// dropped it before.
+async fn read_pairwise_streams(
+    peer: Digest32,
+    mut streams: mpsc::Receiver<(quinn::SendStream, quinn::RecvStream)>,
+    tx: mpsc::Sender<NetEvent>,
+) {
+    use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
+    while let Some((send, mut recv)) = streams.recv().await {
+        let Ok(Some(first)) = recv_pairwise(&mut recv).await else {
+            continue;
+        };
+        // A hello is followed on the same stream by the frame it opens the session for, written
+        // without waiting for anything, so it is read now too.
+        let second = if matches!(first, PairwiseFrame::Hello { .. }) {
+            recv_pairwise(&mut recv).await.ok().flatten()
+        } else {
+            None
+        };
+        let stream = PairwiseIn {
+            peer,
+            first,
+            second,
+            send,
+            recv,
+        };
+        if tx.send(NetEvent::Pairwise(stream)).await.is_err() {
+            return; // the actor is gone
+        }
+    }
+}
+
+/// A pairwise stream whose frames have been read off the actor.
+struct PairwiseIn {
+    /// The authenticated peer.
+    peer: Digest32,
+    /// The stream's first frame.
+    first: crate::node::pairwise_stream::PairwiseFrame,
+    /// The frame behind a `Hello`, if there was one; always `None` behind any other frame.
+    second: Option<crate::node::pairwise_stream::PairwiseFrame>,
+    /// The stream's send half, for the answer.
+    send: quinn::SendStream,
+    /// The stream's receive half, held until the answer is given.
+    recv: quinn::RecvStream,
 }
 
 /// Accept connections and their streams forever, forwarding to the actor the ones
@@ -2034,13 +2113,7 @@ pub struct Node {
     unlock_waiters: Vec<oneshot::Sender<Outcome>>,
     /// Pairwise streams for a room still being joined, held until the join reports back: see
     /// `take_inbound_skdm`.
-    held_pairwise: Vec<(
-        Digest32,
-        Digest32,
-        crate::node::pairwise_stream::PairwiseFrame,
-        quinn::SendStream,
-        quinn::RecvStream,
-    )>,
+    held_pairwise: Vec<(Digest32, PairwiseIn)>,
     /// Per room, the members this node's board has held a bundle record for. A record from an
     /// author not in it is a member this node has just learned of, which is what
     /// `note_new_members` passes on at once; a refresh of a known member's record is not.
@@ -3761,8 +3834,8 @@ impl Node {
                     .into_iter()
                     .partition(|(r, ..)| *r == room);
                 self.held_pairwise = kept;
-                for (_, peer, first, send, recv) in held {
-                    self.handle_pairwise(peer, first, send, recv).await;
+                for (_, stream) in held {
+                    self.handle_pairwise(stream).await;
                 }
                 // **The joiner's consent at admission too, before `room join` is answered.** The same
                 // ForwardOnly window f4d13d8 closed on the host's side (see `apply_join_outcome`) was
@@ -3819,6 +3892,9 @@ impl Node {
                     self.publish_channel_to_anchors(&channel_id).await;
                     self.note_new_members(&channel_id).await;
                 }
+            }
+            NetEvent::Pairwise(stream) => {
+                self.take_inbound_skdm(stream).await;
             }
             NetEvent::SyncRequest {
                 conn,
@@ -4216,8 +4292,9 @@ impl Node {
                         // Unreachable: the stream loop turns these into
                         // `NetEvent::JoinRequest` once the request is read.
                     }
-                    Inbound::Pairwise { peer, send, recv } => {
-                        self.take_inbound_skdm(peer, send, recv).await;
+                    Inbound::Pairwise { .. } => {
+                        // Unreachable: the stream loop reads these and sends
+                        // `NetEvent::Pairwise` once the frames are in hand.
                     }
                     Inbound::Sync { .. } => {
                         // Unreachable: the stream loop converts these into
@@ -7177,18 +7254,11 @@ impl Node {
     }
 
     /// Take an inbound sealed control message: an ADR-006 SKDM, which makes that
-    /// author's messages readable and backfills any already held as ciphertext.
-    async fn take_inbound_skdm(
-        &mut self,
-        peer: Digest32,
-        send: quinn::SendStream,
-        mut recv: quinn::RecvStream,
-    ) {
-        use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
-        let Ok(Some(first)) = recv_pairwise(&mut recv).await else {
-            return;
-        };
-        let room = match &first {
+    /// author's messages readable and backfills any already held as ciphertext. Its frames were
+    /// read off the actor (see `read_pairwise_streams`); nothing here waits on the peer.
+    async fn take_inbound_skdm(&mut self, stream: PairwiseIn) {
+        use crate::node::pairwise_stream::PairwiseFrame;
+        let room = match &stream.first {
             PairwiseFrame::Skdm { channel_id, .. }
             | PairwiseFrame::Open { channel_id, .. }
             | PairwiseFrame::Hello { channel_id, .. } => *channel_id,
@@ -7201,32 +7271,41 @@ impl Node {
         // ran on the actor the stream waited in the queue until the room existed; this puts that
         // ordering back. `JoinerDone` replays whatever was held.
         if self.joining.contains(&room) && !self.channels.contains_key(&room) {
-            self.held_pairwise.push((room, peer, first, send, recv));
+            self.held_pairwise.push((room, stream));
             return;
         }
-        self.handle_pairwise(peer, first, send, recv).await;
+        self.handle_pairwise(stream).await;
     }
 
-    /// Act on a pairwise stream whose first frame has been read.
-    async fn handle_pairwise(
-        &mut self,
-        peer: Digest32,
-        first: crate::node::pairwise_stream::PairwiseFrame,
-        mut send: quinn::SendStream,
-        mut recv: quinn::RecvStream,
-    ) {
+    /// Act on a pairwise stream whose frames have been read.
+    async fn handle_pairwise(&mut self, stream: PairwiseIn) {
+        let PairwiseIn {
+            peer,
+            first,
+            second,
+            mut send,
+            recv,
+        } = stream;
         // **Taken, or said not to be.** A sender cannot learn from the transport whether its key
         // was taken: QUIC acknowledges the bytes before this node decides anything. So a stream
         // that carried a key is answered, one byte once the key is taken, and reset with a wire
         // code when it is not. A stream that carried no key (a bare hello, an `Open`) is finished.
-        match self.take_pairwise(peer, first, &mut recv).await {
+        match self.take_pairwise(peer, first, second).await {
             Some(Ok(())) => {
-                let _ = send
-                    .write_all(&[crate::node::pairwise_stream::KEY_TAKEN])
+                // Written on its own task, bounded (V210-71): a peer that grants no flow credit
+                // would otherwise hold the actor on this one byte for as long as it liked.
+                tokio::spawn(async move {
+                    let _recv = recv;
+                    let _ = tokio::time::timeout(
+                        crate::transport::framing::FRAME_PATIENCE,
+                        send.write_all(&[crate::node::pairwise_stream::KEY_TAKEN]),
+                    )
                     .await;
-                let _ = send.finish();
+                    let _ = send.finish();
+                });
             }
             Some(Err(why)) => {
+                let mut recv = recv;
                 let _ = send.reset(why.code());
                 let _ = recv.stop(why.code());
             }
@@ -7243,10 +7322,10 @@ impl Node {
         &mut self,
         peer: Digest32,
         first: crate::node::pairwise_stream::PairwiseFrame,
-        recv: &mut quinn::RecvStream,
+        second: Option<crate::node::pairwise_stream::PairwiseFrame>,
     ) -> Option<Result<(), crate::node::pairwise_stream::KeyRefusal>> {
         use crate::node::pairwise_stream::KeyRefusal;
-        use crate::node::pairwise_stream::{open_skdm, recv_pairwise, PairwiseFrame};
+        use crate::node::pairwise_stream::{open_skdm, PairwiseFrame};
         // A `Hello` opens a session the join path never created (ADR-016): accept it
         // against our own prekey ring, exactly as the join responder does, then read
         // the SKDM it precedes.
@@ -7271,9 +7350,9 @@ impl Node {
                 if !self.accept_hello(channel_id, peer, &initial).await {
                     return Some(Err(KeyRefusal::HelloRefused));
                 }
-                match recv_pairwise(recv).await {
-                    Ok(Some(PairwiseFrame::Skdm { channel_id, sealed })) => (channel_id, sealed),
-                    Ok(Some(PairwiseFrame::Open { channel_id, sealed })) => {
+                match second {
+                    Some(PairwiseFrame::Skdm { channel_id, sealed }) => (channel_id, sealed),
+                    Some(PairwiseFrame::Open { channel_id, sealed }) => {
                         let now = self.now();
                         if let Some(session) = self.sessions.get_mut(&(channel_id, peer)) {
                             if let Ok(message) =
