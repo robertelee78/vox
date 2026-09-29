@@ -36,6 +36,7 @@
 //! divergent logs over this transport in the tests.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use quinn::{Connection, Endpoint, RecvStream, Runtime, SendStream};

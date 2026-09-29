@@ -307,12 +307,11 @@ impl Dag {
     /// DAG is rebuilt from the stored entries, which hold only one side of the fork.
     ///
     /// **The proof is checked, not trusted**, as a new one would be: both entries by
-    /// `proof.author_id` at `proof.seq`, different, attributable, and each verified against
+    /// `proof.author_id` at `proof.seq`, different, still signed, and each verified against
     /// `author_root`. Anything else is refused and freezes nothing.
     ///
     /// # Errors
-    /// [`Rejected::Verification`] if either entry fails to verify; [`Rejected::Fork`] with a
-    /// deniable outcome if the pair is not a proof.
+    /// [`Rejected::Verification`] if the pair is not a proof or either entry fails to verify.
     pub fn restore_fork(
         &mut self,
         proof: ForkProof,
@@ -320,19 +319,15 @@ impl Dag {
     ) -> std::result::Result<(), Rejected> {
         let same_place =
             |e: &Entry| e.skeleton.author_id == proof.author_id && e.skeleton.seq == proof.seq;
-        let not_a_proof = || {
-            Rejected::Fork(ForkOutcome::DeniableAlarm {
-                author_id: proof.author_id,
-                seq: proof.seq,
-            })
-        };
         if !same_place(&proof.existing)
             || !same_place(&proof.conflicting)
             || proof.existing.entry_hash() == proof.conflicting.entry_hash()
-            || !proof.existing.authenticator.is_attributable()
-            || !proof.conflicting.authenticator.is_attributable()
+            || !proof.existing.is_signed()
+            || !proof.conflicting.is_signed()
         {
-            return Err(not_a_proof());
+            return Err(Rejected::Verification(Error::MalformedBundle(
+                "kept fork proof is not two different signed entries at one place",
+            )));
         }
         proof
             .existing

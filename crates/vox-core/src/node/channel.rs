@@ -2306,7 +2306,7 @@ impl ChannelState {
         } else {
             self.trust_marks
                 .iter()
-                .filter(|(id, _)| trusted.contains(*id) && unjoined(*id))
+                .filter(|(id, _)| trusted.contains(*id) && unjoined(id))
                 .map(|(_, (_, chain_id, _))| *chain_id)
                 .min()
         };
@@ -2320,7 +2320,10 @@ impl ChannelState {
                 .unwrap_or(u64::MAX);
             floor.max(young)
         });
-        waiting.into_iter().chain(self.history.values().copied()).min()
+        waiting
+            .into_iter()
+            .chain(self.history.values().copied())
+            .min()
     }
 
     /// How long a superseded generation is kept for a trusted identity that has not joined:

@@ -3153,7 +3153,7 @@ dependencies = [
 
 [[package]]
 name = "vox-ffi"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "thiserror 2.0.18",
  "tokio",

@@ -730,7 +730,10 @@ impl SyncBook {
     /// [`StatusReport::to_json`]'s. `equivocations` is each `(room, author, position)` the node
     /// holds back (V210-63).
     #[must_use]
-    pub fn sections_json(book: &SharedSyncBook, equivocations: &[(Digest32, Digest32, u64)]) -> String {
+    pub fn sections_json(
+        book: &SharedSyncBook,
+        equivocations: &[(Digest32, Digest32, u64)],
+    ) -> String {
         let b = book.lock().unwrap_or_else(PoisonError::into_inner);
         let mut s = String::from("\"sync\":[");
         for (i, ((room, peer), c)) in b.ports.iter().enumerate() {
