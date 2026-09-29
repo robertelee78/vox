@@ -127,9 +127,9 @@ where
             return ExitCode::FAILURE;
         }
     };
-    let room_pp = match crate::tunnel_cli::passphrase_or_prompt(
+    let room_pp = match crate::tunnel_cli::room_passphrase_for(
         room.passphrase.as_ref(),
-        "room passphrase",
+        room.passphrase_file.as_deref(),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -804,10 +804,20 @@ pub struct RoomArgs {
     pub profile: ProfileArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// The room's passphrase. Prompted for (unechoed) when omitted, which is the way
-    /// to give it: a passphrase in a flag is in the shell's history.
-    #[arg(long, env = "VOX_ROOM_PASSPHRASE")]
+    /// **Refused**, like `--identity-passphrase`: a command line is readable by every
+    /// process on the machine while it runs. Still parsed so that anything scripted against
+    /// it is told the replacement. `VOX_ROOM_PASSPHRASE` is refused for the same reason: a
+    /// process's environment is readable by whatever runs as its user, and is inherited by
+    /// everything it starts (V210-72).
+    ///
+    /// Use `--passphrase-file`, or let it prompt (it reads a line from stdin when stdin is
+    /// not a terminal).
+    #[arg(long)]
     pub passphrase: Option<String>,
+    /// Read the room passphrase from this file (first line). The scripted way to give it: a
+    /// file has an owner and a mode, where a command line has neither.
+    #[arg(long)]
+    pub passphrase_file: Option<std::path::PathBuf>,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
     /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
     /// machine, and lands in the shell's history besides. It is still accepted by the
@@ -984,10 +994,20 @@ pub struct ConnectArgs {
     pub profile: ProfileArgs,
     /// The `vox://…` address you were given.
     pub address: String,
-    /// The room passphrase. Prompted for (unechoed) when omitted, which is the way to
-    /// give it: a passphrase in a flag is in the shell's history.
-    #[arg(long, env = "VOX_ROOM_PASSPHRASE")]
+    /// **Refused**, like `--identity-passphrase`: a command line is readable by every
+    /// process on the machine while it runs. Still parsed so that anything scripted against
+    /// it is told the replacement. `VOX_ROOM_PASSPHRASE` is refused for the same reason: a
+    /// process's environment is readable by whatever runs as its user, and is inherited by
+    /// everything it starts (V210-72).
+    ///
+    /// Use `--passphrase-file`, or let it prompt (it reads a line from stdin when stdin is
+    /// not a terminal).
+    #[arg(long)]
     pub passphrase: Option<String>,
+    /// Read the room passphrase from this file (first line). The scripted way to give it: a
+    /// file has an owner and a mode, where a command line has neither.
+    #[arg(long)]
+    pub passphrase_file: Option<std::path::PathBuf>,
     /// A local name for the room (this device only).
     #[arg(long, default_value = "service")]
     pub name: String,
@@ -1236,9 +1256,9 @@ pub fn run() -> ExitCode {
             )
         }
         Cmd::Connect(args) => {
-            let room_pp = match crate::tunnel_cli::passphrase_or_prompt(
+            let room_pp = match crate::tunnel_cli::room_passphrase_for(
                 args.passphrase.as_ref(),
-                "room passphrase",
+                args.passphrase_file.as_deref(),
             ) {
                 Ok(p) => p,
                 Err(e) => {

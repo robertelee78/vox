@@ -689,6 +689,8 @@ enum NetEvent {
         chain_id: u64,
         /// What the recipient's side said.
         why: String,
+        /// The serial of the session the key was sealed under (V210-78).
+        session: Option<u64>,
     },
     /// A publish round to a board ended (see `publish_channel_to_anchor`).
     PublishDone {
@@ -2147,6 +2149,11 @@ pub struct Node {
     /// Sessions this node kept against a peer's competing hello, whose peer must now
     /// be sent this node's hello so it adopts the same session; drained on the tick.
     reopen: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// Which session each pair holds, by a serial drawn when it was filed, so a key refused for
+    /// lack of a session forgets only the session it was sealed under (V210-78).
+    session_serial: BTreeMap<(Digest32, Digest32), u64>,
+    /// The last serial drawn.
+    last_session_serial: u64,
     /// The identity's key-agreement keys (ADR-002 §2), held only while unlocked:
     /// loaded (or generated on first use) by [`crate::node::prekeys::load_or_create`]
     /// after the identity unlocks and dropped on lock, so no prekey secret is in
@@ -2327,6 +2334,8 @@ impl Node {
             initiated: BTreeMap::new(),
             accepted_hello: BTreeMap::new(),
             reopen: std::collections::BTreeSet::new(),
+            session_serial: BTreeMap::new(),
+            last_session_serial: 0,
             prekeys: None,
             channels: BTreeMap::new(),
             clock,
@@ -2489,6 +2498,7 @@ impl Node {
                         net.manager().retire_expired();
                     }
                     self.retry_upgrades_if_due().await;
+                    self.maintain_prekeys();
                     self.renew_mappings_if_due();
                     self.adopt_anchored_from_board().await;
                     if self.view_stale.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2511,6 +2521,7 @@ impl Node {
                     // connection died (D1a) and raises the periodic request (D7).
                     self.sync_tick().await;
                     let ran = self.schedule().await;
+                    self.retry_orphaned_consents().await;
                     if ran || self.paths_moved() {
                         self.publish().await;
                     }
@@ -2644,7 +2655,11 @@ impl Node {
                 channel_id,
                 service_tag,
                 local,
-            } => self.add_service(&channel_id, &service_tag, local).await,
+                persist,
+            } => {
+                self.add_service(&channel_id, &service_tag, local, persist)
+                    .await
+            }
             NodeCommand::RemoveService {
                 channel_id,
                 service_tag,
@@ -3651,6 +3666,11 @@ impl Node {
                     && !self.channels.contains_key(&channel_id)
                     && self.profile.as_ref().is_some_and(Profile::is_unlocked);
                 if wanted {
+                    crate::node::status::SyncBook::note_set_aside(
+                        &self.sync_book,
+                        channel_id,
+                        channel.set_aside(),
+                    );
                     self.channels
                         .insert(channel_id, Arc::new(tokio::sync::Mutex::new(*channel)));
                     self.mark_decisions_on_open(&channel_id).await;
@@ -3985,6 +4005,7 @@ impl Node {
                 peer,
                 chain_id,
                 why,
+                session,
             } => {
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
@@ -4005,6 +4026,23 @@ impl Node {
                     }) {
                         let _ = channel.owe_history(profile.store(), peer, chain_id);
                     }
+                }
+                // **The member holds no session with us** (V210-78): it restarted or locked, and
+                // sessions live only in memory. Ours is dead at its end, and resending under it is
+                // refused the same way for good. Forget it, so the retry opens a fresh one from
+                // the member's bundle and offers it — unless a newer one has been filed since the
+                // key was sealed, which the member does hold.
+                use crate::node::pairwise_stream::KeyRefusal;
+                let key = (channel_id, peer);
+                if why == KeyRefusal::describe(KeyRefusal::NoSession.code().into_inner())
+                    && session.is_some()
+                    && self.session_serial.get(&key).copied() == session
+                {
+                    self.sessions.remove(&key);
+                    self.initiated.remove(&key);
+                    self.accepted_hello.remove(&key);
+                    self.reopen.remove(&key);
+                    self.session_serial.remove(&key);
                 }
                 // 2, 4, 8 … 64s: a refusal that cures (a session that converges, a member learnt
                 // from the board) is retried promptly, and one that does not stops costing a
@@ -4201,8 +4239,14 @@ impl Node {
                             reason: fail.to_string(),
                         });
                     }
-                    self.answer_pending_consents(|room, _| *room == channel_id, None)
-                        .await;
+                    // Only a consent to this session's peer: a session with another member fetched
+                    // nothing that consent waits for, and retrying it there used its attempts up
+                    // (V210-78).
+                    self.answer_pending_consents(
+                        |room, target| *room == channel_id && *target == peer,
+                        None,
+                    )
+                    .await;
                 }
                 self.refresh_network_view().await;
                 let o = report.out;
@@ -5036,8 +5080,9 @@ impl Node {
             let channel = shared.lock().await;
             if !channel.is_author(&target) {
                 // We have not admitted this identity, so we hold no verified key for
-                // it and cannot know we are releasing to the right party.
-                return Outcome::Failed(Fault::UnknownChannel);
+                // it and cannot know we are releasing to the right party. Said as that, not as
+                // "no such room" (V210-78); an explicit consent waits for a sync with it.
+                return Outcome::Failed(Fault::NotAdmitted);
             }
             // **Consent is dated by the decision, not the delivery** (V210-45), in the
             // profile's logical consent order, never by a clock. Every generation minted after
@@ -5067,8 +5112,10 @@ impl Node {
                     Some(s) => s,
                     None => match channel.skdm_for_consent(profile) {
                         Ok(s) => {
-                            self.consent_keys.insert(*channel_id, target, s.to_wire());
-                            if let Ok(signer) = profile.signer() {
+                            // Past the bound nothing is held (V210-77): the key goes now if
+                            // the member is reachable, and is taken again when it is.
+                            let held = self.consent_keys.insert(*channel_id, target, s.to_wire());
+                            if let (true, Ok(signer)) = (held, profile.signer()) {
                                 if let Err(e) = self.consent_keys.save(profile.store(), signer) {
                                     return Outcome::Failed(fault_of(&e));
                                 }
@@ -5150,6 +5197,9 @@ impl Node {
                 false
             }
         };
+        // The grant is on the log now, and a reader renders nothing without it: pushed at once,
+        // as every local append is, not on the next tick (V210-78).
+        self.note_local_append(channel_id);
         // The generation delivered is the key's own: a key taken before a rotation is the older
         // one, and a refusal must re-owe exactly that (V210-30).
         let chain_id = skdm.body.chain_id;
@@ -5171,7 +5221,8 @@ impl Node {
     /// `vox tui`: a consent to a member who was online failed at once, in 0.75s, with
     /// `no reachable peer`, at 0, 3, 6 and 10s after the room opened, and succeeded from 15s. So a
     /// sync with that member is started, since that is what fetches its records, and the consent
-    /// is retried when the room's session is done.
+    /// is retried when the session with that member is done. `NotAdmitted` waits the same way:
+    /// the same sync is what admits it.
     async fn settle_consent(
         &mut self,
         channel_id: Digest32,
@@ -5181,8 +5232,10 @@ impl Node {
         attempts: u8,
     ) {
         const MAX_CONSENT_ATTEMPTS: u8 = 3;
-        if !matches!(outcome, Outcome::Failed(Fault::Unreachable))
-            || attempts >= MAX_CONSENT_ATTEMPTS
+        if !matches!(
+            outcome,
+            Outcome::Failed(Fault::Unreachable | Fault::NotAdmitted)
+        ) || attempts >= MAX_CONSENT_ATTEMPTS
         {
             let _ = reply.send(outcome);
             return;
@@ -5211,8 +5264,9 @@ impl Node {
                 let _ = reply.send(outcome);
                 return;
             }
-        } else if attempts > 0 {
-            // A dial already landed once for this consent and the connection is gone again.
+        } else if attempts > 0 || matches!(outcome, Outcome::Failed(Fault::NotAdmitted)) {
+            // A dial already landed once for this consent and the connection is gone again; or
+            // the member is not admitted here, for which no dial was started, so none would answer.
             let _ = reply.send(outcome);
             return;
         }
@@ -5259,6 +5313,29 @@ impl Node {
         }
         // The view reflects whatever was granted before anyone reads it.
         self.publish().await;
+    }
+
+    /// Retry the explicit consents waiting on a session with their member that no longer runs
+    /// (V210-78). A retired attempt — its connection died, its room was held again — is aborted
+    /// and reports nothing, so the `SyncDone` such a consent waits for never comes. One waiting on
+    /// a dial is left to `Dialed` or `ReachFailed`.
+    async fn retry_orphaned_consents(&mut self) {
+        let net = self.net.as_ref().map(Arc::clone);
+        let orphaned: Vec<(Digest32, Digest32)> = self
+            .pending_consents
+            .iter()
+            .map(|(room, target, _, _)| (*room, *target))
+            .filter(|key| {
+                net.as_ref()
+                    .is_some_and(|n| n.manager().existing(&key.1).is_some())
+                    && !self.ports.get(key).is_some_and(|p| p.busy())
+            })
+            .collect();
+        if orphaned.is_empty() {
+            return;
+        }
+        self.answer_pending_consents(|room, target| orphaned.contains(&(*room, *target)), None)
+            .await;
     }
 
     /// Consent to `target` reading this identity's messages — ADR-007 step 3, the
@@ -6451,6 +6528,7 @@ impl Node {
         let o = &report.out;
         let progress = o.progress();
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
+            c.refused += u64::try_from(o.refused).unwrap_or(u64::MAX);
             match &report.fail {
                 None if o.complete => c.completed += 1,
                 None => c.partial += 1,
@@ -6817,16 +6895,38 @@ impl Node {
             // own, and neither could open the key the other sent.
             let me = self.profile.as_ref().map(|p| p.fingerprint());
             let existing_mine = self.initiated.contains_key(&key);
-            if let Some(me) = me {
-                if !incoming_session_wins(&me, &peer, existing_mine) {
-                    // Ours wins. The peer is holding its own, so it must be offered ours
-                    // again: until it adopts it, nothing we seal can be opened there.
-                    if let Some(i) = self.initiated.get_mut(&key) {
-                        i.hello_delivered = false;
-                    }
-                    self.reopen.insert(key);
-                    return false;
+            let mut ours_wins =
+                me.is_some_and(|me| !incoming_session_wins(&me, &peer, existing_mine));
+            if ours_wins
+                && self
+                    .initiated
+                    .get(&key)
+                    .is_some_and(|i| i.initial.is_none())
+            {
+                // Ours was opened on the join path, which delivered its hello, so it has none to
+                // offer again (V210-78). A peer sending a hello holds none of ours — it restarted
+                // or locked — and kept, ours would split the pair for good: neither end could
+                // open what the other sealed. Replace it with a fresh one from the peer's bundle,
+                // which can be offered; the rule still keeps it, since it is ours too. With no
+                // bundle to open one from, take the peer's instead.
+                self.sessions.remove(&key);
+                self.initiated.remove(&key);
+                self.accepted_hello.remove(&key);
+                self.session_serial.remove(&key);
+                if self.ensure_session(&channel_id, peer).await.is_some() {
+                    self.forget_delivery(&channel_id, &peer).await;
+                } else {
+                    ours_wins = false;
                 }
+            }
+            if ours_wins {
+                // Ours wins. The peer is holding its own, so it must be offered ours
+                // again: until it adopts it, nothing we seal can be opened there.
+                if let Some(i) = self.initiated.get_mut(&key) {
+                    i.hello_delivered = false;
+                }
+                self.reopen.insert(key);
+                return false;
             }
             replaces = true;
         }
@@ -6903,6 +7003,7 @@ impl Node {
             return false;
         };
         self.sessions.insert(key, session);
+        self.stamp_session(key);
         self.initiated.remove(&key);
         self.reopen.remove(&key);
         self.accepted_hello.insert(key, hello_hash);
@@ -6972,6 +7073,7 @@ impl Node {
             self.forget_delivery(&channel_id, &peer).await;
         }
         self.sessions.insert(key, session);
+        self.stamp_session(key);
         self.accepted_hello.remove(&key);
         self.reopen.remove(&key);
         if mine {
@@ -7026,6 +7128,12 @@ impl Node {
         }
     }
 
+    /// Draw the serial of the session just filed for `key`.
+    fn stamp_session(&mut self, key: (Digest32, Digest32)) {
+        self.last_session_serial = self.last_session_serial.wrapping_add(1);
+        self.session_serial.insert(key, self.last_session_serial);
+    }
+
     /// Record that the peer now holds the hello for a session this node opened.
     fn hello_delivered(&mut self, channel_id: &Digest32, peer: Digest32) {
         if let Some(i) = self.initiated.get_mut(&(*channel_id, peer)) {
@@ -7042,6 +7150,7 @@ impl Node {
         target: Digest32,
         chain_id: u64,
     ) {
+        let session = self.session_serial.get(&(channel_id, target)).copied();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
             let event =
@@ -7051,6 +7160,7 @@ impl Node {
                         peer: target,
                         chain_id,
                         why,
+                        session,
                     },
                     None => NetEvent::SkdmTaken {
                         channel_id,
@@ -7214,7 +7324,9 @@ impl Node {
             ctx.floor,
         )
         .ok()?;
+        drop(ring);
         self.sessions.insert((*channel_id, target), session);
+        self.stamp_session((*channel_id, target));
         self.accepted_hello.remove(&(*channel_id, target));
         self.initiated.insert(
             (*channel_id, target),
@@ -7396,6 +7508,40 @@ impl Node {
         Ok(())
     }
 
+    /// Keep the prekey ring up **while the node runs** (V210-77), not only at unlock: rotate the
+    /// signed prekey when its cadence is up, refill the one-time pool at its low-water mark,
+    /// and drop consumed one-time prekeys whose retention is over. A node up for weeks otherwise
+    /// ran out of one-time prekeys after 64 sessions and never rotated. Cheap when nothing is
+    /// due; a join holding the ring is left alone, and the next tick does it.
+    fn maintain_prekeys(&mut self) {
+        let now = self.now();
+        let (Some(profile), Some(ring)) = (self.profile.as_ref(), self.prekeys.as_ref()) else {
+            return;
+        };
+        let Ok(signer) = profile.signer() else {
+            return;
+        };
+        let Ok(mut ring) = ring.try_lock() else {
+            return;
+        };
+        let Ok(done) = ring.maintain(signer, now) else {
+            return;
+        };
+        if done.changed() {
+            // A failed save is not fatal: the ring is saved with the next consume, and
+            // maintained again at the next unlock.
+            let _ = prekeys::save(profile.store(), signer, &ring);
+        }
+        crate::node::status::SyncBook::note_prekeys(
+            &self.sync_book,
+            ring.one_time_len(),
+            ring.consumed_len(),
+            ring.signed_prekey_id(),
+            done.rotated,
+            done.one_time_added,
+        );
+    }
+
     async fn lock_all(&mut self) {
         let was_unlocked = self.profile.as_ref().is_some_and(Profile::is_unlocked);
         for (_, shared) in std::mem::take(&mut self.channels) {
@@ -7432,6 +7578,7 @@ impl Node {
         self.initiated.clear();
         self.accepted_hello.clear();
         self.reopen.clear();
+        self.session_serial.clear();
         // And take the network down: a locked node has no identity to present, so it
         // must not keep serving or holding connections (M14.7d).
         self.stop_network().await;
@@ -7587,7 +7734,7 @@ impl Node {
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
         let id = channel.channel_id();
-        if let Err(e) = channel.add_service(profile.store(), profile, &tag, endpoint) {
+        if let Err(e) = channel.add_service(profile.store(), profile, &tag, endpoint, true) {
             // Drop the room rather than keep a half-made one. Nothing outside this
             // function has seen it: it is not in `self.channels` and has not been
             // published, so forgetting it here is the whole of the rollback.
@@ -7733,6 +7880,11 @@ impl Node {
         };
         match ChannelState::open(profile, channel_id, passphrase, now) {
             Ok(ch) => {
+                crate::node::status::SyncBook::note_set_aside(
+                    &self.sync_book,
+                    *channel_id,
+                    ch.set_aside(),
+                );
                 self.remember_or_say(&ch);
                 self.channels
                     .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
@@ -7788,6 +7940,7 @@ impl Node {
         channel_id: &Digest32,
         service_tag: &str,
         local: std::net::SocketAddr,
+        persist: bool,
     ) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -7797,7 +7950,7 @@ impl Node {
         };
         let outcome = {
             let mut channel = shared.lock().await;
-            channel.add_service(profile.store(), profile, service_tag, local)
+            channel.add_service(profile.store(), profile, service_tag, local, persist)
         };
         match outcome {
             Ok(_) => {
