@@ -3358,6 +3358,11 @@ impl ChannelState {
         }
         self.log_ids.insert(hash, id);
         self.next_log_id = id.saturating_add(1);
+        // A new entry of this room: its ports need a session (ADR-025 D2), as after a post.
+        // Without this a checkpoint waited for the periodic sync, so a member that pruned before
+        // it arrived kept every signature below it (ADR-023 decision 3), and a conflicting entry
+        // there was not refused as pre-checkpoint (R10).
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
