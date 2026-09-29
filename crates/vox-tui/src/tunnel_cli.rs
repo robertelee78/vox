@@ -16,7 +16,7 @@ use vox_core::hash::Digest32;
 use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::nat::multiaddr::Multiaddr;
 use vox_core::nat::reachability::is_routable;
-use vox_core::node::actor::{Bind, Node, NodeConfig, NodeHandle};
+use vox_core::node::actor::{Bind, EventStreamItem, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome, Secret};
 use vox_core::node::link::{b32_decode, b32_encode, vox_hostname};
 use vox_core::node::paths::Paths;
@@ -575,36 +575,168 @@ pub async fn serve(
 ///
 /// One-shot: joining is a durable act recorded in the profile, so there is nothing to
 /// keep running. What makes the printed name resolve is `vox up` (decision 5).
+///
+/// `waiting` is kept on the step the join is in, so a `vox connect` stopped part-way says
+/// where it was (V210-85).
 pub async fn connect(
     node: &NodeHandle,
     url: &str,
     name: &str,
     room_passphrase: &str,
+    waiting: &Waiting,
 ) -> Result<(), AppError> {
-    let out = node
-        .apply(NodeCommand::JoinChannel {
-            link: url.to_owned(),
-            local_name: name.to_owned(),
-            // Canonicalization is the node's, at its one boundary — see
-            // `actor::room_passphrase`. Doing it here as well would be a second place
-            // for the two sides to disagree.
-            passphrase: Secret::new(room_passphrase.as_bytes().to_vec()),
-        })
-        .await;
+    // Taken before the command, so the join's first step is not raised before anyone listens.
+    let mut steps = node.subscribe();
+    waiting.on("the node to take the join");
+    let join = node.apply(NodeCommand::JoinChannel {
+        link: url.to_owned(),
+        local_name: name.to_owned(),
+        // Canonicalization is the node's, at its one boundary — see
+        // `actor::room_passphrase`. Doing it here as well would be a second place
+        // for the two sides to disagree.
+        passphrase: Secret::new(room_passphrase.as_bytes().to_vec()),
+    });
+    tokio::pin!(join);
+    let out = loop {
+        tokio::select! {
+            out = &mut join => break out,
+            item = steps.next() => match item {
+                Some(EventStreamItem::Event(NodeEvent::JoinStep { step })) => waiting.on(step),
+                Some(_) => {}
+                None => break (&mut join).await,
+            },
+        }
+    };
     if !out.is_done() {
         return Err(AppError::Usage(why_a_join_failed(node, out).await));
     }
-    let channel_id = loop {
-        match node.next_event().await {
-            Some(NodeEvent::Joined { channel_id, .. }) => break channel_id,
-            Some(ref other) => say_if_it_explains_a_failure(other),
-            None => return Err(AppError::Usage("the node stopped".into())),
-        }
-    };
+    // **`Done` is the join.** This waited on the event stream for `Joined`, with no bound — and
+    // that stream drops its oldest events under a burst, so a `Joined` lost there left `vox
+    // connect` waiting for good, saying nothing. The node raises `Joined` and the join's steps
+    // before it answers, so what they explain is already queued: say it, and take the room from
+    // the address the node just joined by.
+    while let Some(ev) = node.try_next_event() {
+        say_if_it_explains_a_failure(&ev);
+    }
+    let channel_id = vox_core::node::link::InviteLink::parse(url)
+        .map_err(|e| AppError::Usage(format!("joined, but the address no longer reads: {e}")))?
+        .channel_id;
     println!("joined. reachable as {}", vox_hostname(&channel_id));
     println!("        run `vox up` on this machine to make that name resolve");
     let _ = node.apply(NodeCommand::Shutdown).await;
     Ok(())
+}
+
+/// What a one-shot verb is waiting for, and since when: what it says when it is stopped before it
+/// finishes (V210-85).
+///
+/// A `vox connect` stopped by Ctrl-C or a SIGTERM died on the signal's default action and printed
+/// nothing, so a person — or a proof reading its stderr — got a non-zero exit with no reason at
+/// all, after however long it had been joining. A SIGKILL cannot be answered; these two can.
+pub struct Waiting {
+    started: Instant,
+    /// What the verb could not finish without.
+    outcome: &'static str,
+    now: std::sync::Mutex<(String, Instant)>,
+}
+
+impl Waiting {
+    /// Start the clock. `outcome` is what did not happen if the verb is stopped: `the room was not
+    /// joined`.
+    #[must_use]
+    pub fn new(outcome: &'static str) -> std::sync::Arc<Self> {
+        let now = Instant::now();
+        std::sync::Arc::new(Self {
+            started: now,
+            outcome,
+            now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+        })
+    }
+
+    /// The verb now waits for `what`.
+    pub fn on(&self, what: impl Into<String>) {
+        if let Ok(mut now) = self.now.lock() {
+            *now = (what.into(), Instant::now());
+        }
+    }
+
+    /// The error a verb stopped by `signal` ends with: how long it ran, what did not happen, and
+    /// what it had been waiting for, for how long. Exits 128 + the signal's number, as a shell
+    /// reports a process the signal killed.
+    #[must_use]
+    pub fn stopped_by(&self, signal: StopSignal) -> AppError {
+        let (what, since) = self
+            .now
+            .lock()
+            .map(|n| (n.0.clone(), n.1))
+            .unwrap_or_else(|_| (String::from("something it cannot name"), self.started));
+        AppError::Refused {
+            code: signal.exit_code(),
+            message: format!(
+                "stopped by {} after {:.1}s — {}\n       it had waited {:.1}s for {what}",
+                signal.name(),
+                self.started.elapsed().as_secs_f64(),
+                self.outcome,
+                since.elapsed().as_secs_f64(),
+            ),
+        }
+    }
+}
+
+/// A signal that asks a process to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopSignal {
+    /// Ctrl-C.
+    Interrupt,
+    /// A service manager's, or `kill`'s.
+    Terminate,
+}
+
+impl StopSignal {
+    fn name(self) -> &'static str {
+        match self {
+            StopSignal::Interrupt => "SIGINT",
+            StopSignal::Terminate => "SIGTERM",
+        }
+    }
+
+    fn exit_code(self) -> u8 {
+        match self {
+            StopSignal::Interrupt => 130,
+            StopSignal::Terminate => 143,
+        }
+    }
+}
+
+/// The first SIGINT or SIGTERM.
+///
+/// **Taking one replaces its default action for the rest of the process**, so only a verb that
+/// races this for its whole run may call it: anywhere else, Ctrl-C would stop doing anything.
+pub async fn a_stop_signal() -> StopSignal {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            // A handler that could not be taken is not a signal: that branch just never fires.
+            Ok(mut term) => tokio::select! {
+                Ok(()) = tokio::signal::ctrl_c() => StopSignal::Interrupt,
+                Some(()) = term.recv() => StopSignal::Terminate,
+                else => std::future::pending().await,
+            },
+            Err(_) => interrupt().await,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        interrupt().await
+    }
+}
+
+/// Ctrl-C, or never.
+async fn interrupt() -> StopSignal {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    StopSignal::Interrupt
 }
 
 /// `vox up` — the local entry point: a SOCKS5 proxy carrying one room's services

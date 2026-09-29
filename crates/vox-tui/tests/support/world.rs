@@ -186,6 +186,16 @@ pub fn vox_once(data: &Path, args: &[String]) -> (bool, String, String) {
         .stdin(Stdio::null())
         .output()
         .expect("run vox");
+    // **How it ended, not only whether it succeeded** (V210-85). A `vox connect` killed by the
+    // watchdog's SIGKILL read as `false` with empty output — the same as a verb that failed and
+    // said nothing — and was reported as a product failure with no reason.
+    if !out.status.success() {
+        eprintln!(
+            "[vox_once] vox {}: {}",
+            args.first().map_or("", String::as_str),
+            out.status
+        );
+    }
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),

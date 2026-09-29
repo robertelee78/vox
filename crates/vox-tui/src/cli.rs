@@ -182,6 +182,29 @@ where
     F: FnOnce(vox_core::node::actor::NodeHandle, BootstrapSet) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
 {
+    run_new_room_verb_with(
+        profile,
+        identity_passphrase,
+        identity_passphrase_file,
+        None,
+        body,
+    )
+}
+
+/// [`run_new_room_verb`] for a verb that says what it was waiting for when SIGINT or SIGTERM
+/// stops it (`vox connect`, V210-85): with `waiting`, the whole run — the unlock too — races
+/// [`crate::tunnel_cli::a_stop_signal`], and a stop ends with [`crate::tunnel_cli::Waiting::stopped_by`].
+fn run_new_room_verb_with<F, Fut>(
+    profile: ProfileArgs,
+    identity_passphrase: Option<String>,
+    identity_passphrase_file: Option<std::path::PathBuf>,
+    waiting: Option<std::sync::Arc<crate::tunnel_cli::Waiting>>,
+    body: F,
+) -> ExitCode
+where
+    F: FnOnce(vox_core::node::actor::NodeHandle, BootstrapSet) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
+{
     let paths = match profile.paths() {
         Ok(p) => p,
         Err(e) => {
@@ -220,15 +243,28 @@ where
     };
     let listen = profile.listen;
     let anchors_for_body = anchors.clone();
-    let outcome = rt.block_on(async move {
+    let unlocking = waiting.clone();
+    let work = async move {
+        if let Some(w) = &unlocking {
+            w.on("this profile's identity to unlock");
+        }
         let node = crate::tunnel_cli::open_profile(paths, listen, anchors, &identity).await?;
         body(node, anchors_for_body).await
+    };
+    let outcome = rt.block_on(async move {
+        match waiting {
+            None => work.await,
+            Some(waiting) => tokio::select! {
+                done = work => done,
+                signal = crate::tunnel_cli::a_stop_signal() => Err(waiting.stopped_by(signal)),
+            },
+        }
     });
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("vox: {e}");
-            ExitCode::FAILURE
+            e.exit_code()
         }
     }
 }
@@ -1267,12 +1303,15 @@ pub fn run() -> ExitCode {
                 }
             };
             let a = args.clone();
-            run_new_room_verb(
+            let waiting = crate::tunnel_cli::Waiting::new("the room was not joined");
+            let steps = std::sync::Arc::clone(&waiting);
+            run_new_room_verb_with(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
+                Some(waiting),
                 move |node, _anchors| async move {
-                    crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp).await
+                    crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp, &steps).await
                 },
             )
         }
