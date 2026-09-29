@@ -1,6 +1,12 @@
 # ADR-009: Deniability Mode (per-channel)
 
-**Status**: implemented (M7 core + the `dgka-setup` codec, `crates/vox-core/src/deniable/`) — **still not enabled for shipping**: the formal analysis is outstanding, and so is the re-key hardening of gap (3) (see Implementation notes)
+**Status**: **withdrawn** — 2026-09-24, by the decider (PRD-001 R43). The code (`crates/vox-core/src/deniable/`, the `Authenticator::Deniable` wire seam and the non-attributable fork alarm) is **removed**; this record keeps the design. It was never enabled in any release.
+
+**Why withdrawn.** Asked for its best use case — a transcript that leaks from a seized device proves nothing to an outsider — the decider judged it not worth finishing for a system built for himself and his family: enabling it needed a driver to run the protocol over a log, re-key hardening, and a formal analysis. Nothing else in Vox depended on it.
+
+**What remains on the wire.** The genesis policy keeps its deniability slot so every existing room's channelID (the hash of the genesis bytes) is unchanged; the slot is always written `0` and any other value is refused (`governance/genesis.rs`, `attributable_slot`). A log entry's `auth_type` `2` is refused like any unknown type. Every entry is composite-signed, so every fork is attributable.
+
+**Previous status** (kept for the record): implemented (M7 core + the `dgka-setup` codec) — still not enabled for shipping: the formal analysis was outstanding, and so was the re-key hardening of gap (3).
 **Date**: 2026-06-20
 **Updated**: 2026-09-21 — shipping blocker (2) closed: `deniable::wire::DgkaMessage` frames all four rounds as `0x000B` entries and the whole M7 suite now runs through it, so deniable mode can travel on a log for the first time. Closing it surfaced that the re-key path had never executed anywhere; it does now, which makes gap (3)'s weakness reproducible rather than theoretical. The formal analysis remains the blocker to enabling the mode. 2026-09-19 — status reconciled; Implementation notes (M7) added recording formula drift (code normative) and the shipping blockers.
 **Deciders**: Robert E. Lee <robert@agidreams.us>

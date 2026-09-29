@@ -317,18 +317,28 @@ pub fn service_list(node: &NodeHandle, channel_id: Digest32) {
 pub async fn forward(
     node: &NodeHandle,
     channel_id: Digest32,
-    host_prefix: &str,
-    tag: &str,
+    host_prefix: Option<&str>,
+    service: &str,
     local: SocketAddr,
 ) -> Result<(), AppError> {
     let view = node.view();
-    let members: Vec<Digest32> = view
+    let detail = view
         .open_channels
         .iter()
-        .find(|d| d.channel_id == channel_id)
-        .map(|d| d.members.clone())
-        .unwrap_or_default();
-    let host = resolve_prefix(host_prefix, &members)?;
+        .find(|d| d.channel_id == channel_id);
+    let host = match host_prefix {
+        Some(prefix) => {
+            let members: Vec<Digest32> = detail.map(|d| d.members.clone()).unwrap_or_default();
+            resolve_prefix(prefix, &members)?
+        }
+        // A `.vox` name reaches the room's genesis creator (ADR-017).
+        None => detail
+            .map(|d| d.creator)
+            .ok_or_else(|| AppError::Usage("that room is not open".into()))?,
+    };
+    // `53/udp` is the service `udp/53`; anything that is not a port spec is a tag as is.
+    let label = vox_core::tunnel::udp::service_label(service).unwrap_or_else(|| service.to_owned());
+    let tag = label.as_str();
     // **Retried until the host becomes reachable, not asked once.**
     //
     // `forward` is a one-shot verb: it starts a node, opens the room and dials, all inside a few
@@ -463,8 +473,11 @@ fn reachable_or_relayed(node: &NodeHandle, anchors: &BootstrapSet) -> bool {
     })
 }
 
-/// `vox serve <port>` — create a service room, offer the port in it, and serve until
-/// interrupted (ADR-017 decisions 3 and 4).
+/// `vox serve <port>[/udp] …` — create a service room, offer the ports in it, and serve
+/// until interrupted (ADR-017 decisions 3 and 4; ADR-022 decision 6 for `/udp`).
+///
+/// The first spec creates the room; any further ones are added to it, so TCP 53 and UDP 53
+/// can be served together (`vox serve 53 53/udp`). `--at` applies to every spec.
 ///
 /// Prints three things and says plainly that two of them must travel separately: the
 /// address is a rendezvous, and the passphrase is what turns it into access (ADR-005).
@@ -472,9 +485,26 @@ pub async fn serve(
     node: &NodeHandle,
     anchors: &BootstrapSet,
     name: &str,
-    port: u16,
+    specs: &[String],
     at: Option<SocketAddr>,
 ) -> Result<(), AppError> {
+    // Parsed before anything is created: a typo must not leave a half-made room.
+    let mut services: Vec<(u16, String)> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let label = vox_core::tunnel::udp::service_label(spec).ok_or_else(|| {
+            AppError::Usage(format!(
+                "{spec:?} is not a port: use <port>, <port>/tcp or <port>/udp"
+            ))
+        })?;
+        let port = label
+            .trim_start_matches("udp/")
+            .parse()
+            .map_err(|_| AppError::Usage(format!("{spec:?} is not a port")))?;
+        services.push((port, label));
+    }
+    let Some((port, first)) = services.first().cloned() else {
+        return Err(AppError::Usage("name at least one port to serve".into()));
+    };
     if !reachable_or_relayed(node, anchors) {
         return Err(AppError::Usage(
             "this machine has no address a guest could reach and no anchor to relay \
@@ -491,6 +521,7 @@ pub async fn serve(
             local_name: name.to_owned(),
             passphrase: Secret::new(passphrase.as_bytes().to_vec()),
             port,
+            udp: vox_core::tunnel::udp::is_udp(&first),
             at,
         })
         .await;
@@ -505,6 +536,20 @@ pub async fn serve(
         .find(|id| !before.contains(id))
         .ok_or_else(|| AppError::Usage("the room was not created".into()))?;
 
+    for (port, label) in services.iter().skip(1) {
+        let local = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], *port)));
+        let out = node
+            .apply(NodeCommand::AddService {
+                channel_id,
+                service_tag: label.clone(),
+                local,
+            })
+            .await;
+        if !out.is_done() {
+            return Err(AppError::Usage(format!("cannot serve {label}: {out:?}")));
+        }
+    }
+
     let out = node.apply(NodeCommand::Invite { channel_id }).await;
     if !out.is_done() {
         return Err(AppError::Usage(format!("cannot mint an address: {out}")));
@@ -517,16 +562,23 @@ pub async fn serve(
         }
     };
 
-    let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)));
     println!("room       {}", b32_encode(&channel_id));
     println!("address    {url}");
     println!("passphrase {}", passphrase.as_str());
     println!("           ^ send this by a different channel than the address");
     println!();
-    println!(
-        "serving {endpoint} at port {port} of {}",
-        vox_hostname(&channel_id)
-    );
+    for (port, label) in &services {
+        let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], *port)));
+        let proto = if vox_core::tunnel::udp::is_udp(label) {
+            "/udp"
+        } else {
+            ""
+        };
+        println!(
+            "serving {endpoint} at port {port}{proto} of {}",
+            vox_hostname(&channel_id)
+        );
+    }
     // **Not "anyone who joins with both".** That was true of the withdrawn model, where a
     // room's genesis authorized every admitted member and joining WAS the authorization
     // (ADR-017 decision 3 as revised, M17.7). Printing it now would tell a person the
@@ -1002,12 +1054,18 @@ pub async fn trust_add(
     node: &NodeHandle,
     fingerprint: &str,
     petname: &str,
+    full_history: bool,
 ) -> Result<(), AppError> {
     let target = resolve_trust_target(node, fingerprint)?;
     let out = node
-        .apply(NodeCommand::Trust {
+        .apply(NodeCommand::TrustWith {
             fingerprint: target,
             petname: petname.to_owned(),
+            history: if full_history {
+                vox_core::node::trust::HistoryGrant::Full
+            } else {
+                vox_core::node::trust::HistoryGrant::Now
+            },
         })
         .await;
     if !out.is_done() {
@@ -1016,9 +1074,134 @@ pub async fn trust_add(
         )));
     }
     println!("vox: trusting {} as {petname:?}", short(&target));
+    if full_history {
+        println!("     with full history: it may also read what you wrote before now");
+    }
     println!("     it may now read what you write in every room you share — now and later");
     println!("     and reach every service you bind to a room you are both in");
     println!("     `vox trust remove` undoes it and changes the lock everywhere");
+    Ok(())
+}
+
+/// `vox up` with no room: the proxy runs inside the node already holding this profile
+/// and carries every room it holds, until ^C (PRD-001 R20).
+pub async fn up_all(paths: &Paths, bind: SocketAddr) -> Result<(), AppError> {
+    let sock = paths.socket_file();
+    let mut up = vox_core::node::nameipc::up(&sock, bind)
+        .await
+        .map_err(|e| {
+            AppError::Usage(format!(
+                "`vox up` without a room runs inside the node holding this profile, and {}: {e}\n\
+             \x20      start one with `vox daemon`, or name a room: `vox up <room>`",
+                sock.display()
+            ))
+        })?;
+    let bound = up.bound;
+    println!("vox up on {bound} — carrying every room this node holds");
+    println!();
+    println!("add this to ~/.ssh/config, once:");
+    println!();
+    for line in vox_core::node::up::ssh_config_hint(bound).lines() {
+        println!("    {line}");
+    }
+    println!();
+    println!("then:  ssh user@<node>.<room>.vox   (the names you gave them: `vox trust list`)");
+    println!("other tools:  ALL_PROXY=socks5h://{bound}");
+    println!("Ctrl-C to stop");
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            note = up.next_note() => match note {
+                Some(note) => eprintln!("vox: {note}"),
+                None => {
+                    return Err(AppError::Usage("the node stopped, and the proxy with it".into()));
+                }
+            },
+        }
+    }
+    println!("vox: stopping the proxy");
+    Ok(())
+}
+
+/// `vox forward <node>.<room>.vox <service> [<local>]`: resolved and carried by the node
+/// already holding this profile, until ^C (PRD-001 R20).
+pub async fn forward_named(
+    paths: &Paths,
+    name: &str,
+    service: &str,
+    local: &str,
+) -> Result<(), AppError> {
+    let sock = paths.socket_file();
+    let (channel_id, host) = vox_core::node::nameipc::resolve(&sock, name)
+        .await
+        .map_err(|e| AppError::Usage(format!("{name}: {e}")))?;
+    // A bare port means loopback; `127.0.0.1:0` picks one.
+    let local = match local.parse::<u16>() {
+        Ok(port) => format!("127.0.0.1:{port}"),
+        Err(_) => local.to_owned(),
+    };
+    let mut client = vox_core::node::ipc::IpcClient::open(&sock)
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    let bound = match client
+        .request(&vox_core::node::ipc::Request::Forward {
+            channel_id,
+            host,
+            service_tag: service.to_owned(),
+            local,
+        })
+        .await
+    {
+        Ok(vox_core::node::ipc::Frame::Bound { local }) => local,
+        Ok(vox_core::node::ipc::Frame::Error { reason }) => {
+            return Err(AppError::Usage(format!("{name}: {reason}")))
+        }
+        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    println!(
+        "vox: forwarding {bound} to {service} on {name} ({})",
+        short(&host)
+    );
+    println!("Ctrl-C to stop");
+    let _ = tokio::signal::ctrl_c().await;
+    let _ = client
+        .request(&vox_core::node::ipc::Request::StopForward { local: bound })
+        .await;
+    Ok(())
+}
+
+/// `vox trust rename` — change the name this node calls a trusted identity.
+///
+/// Only an identity already in the ring: renaming must never be a way to trust.
+pub async fn trust_rename(
+    node: &NodeHandle,
+    fingerprint: &str,
+    name: &str,
+) -> Result<(), AppError> {
+    let target = resolve_trust_target(node, fingerprint)?;
+    if !node.view().trusted.iter().any(|(fp, _)| *fp == target) {
+        return Err(AppError::Usage(format!(
+            "{} is not trusted, so it has no name to change — `vox trust add` it first",
+            short(&target)
+        )));
+    }
+    let out = node
+        .apply(NodeCommand::Trust {
+            fingerprint: target,
+            petname: name.to_owned(),
+        })
+        .await;
+    if !out.is_done() {
+        return Err(AppError::Usage(format!(
+            "cannot rename that identity: {out:?}"
+        )));
+    }
+    println!(
+        "vox: {} is now {name:?} — reachable as {}.<room>.vox",
+        short(&target),
+        vox_core::node::resolver::label_of(name)
+    );
     Ok(())
 }
 

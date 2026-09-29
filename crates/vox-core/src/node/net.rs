@@ -1174,9 +1174,7 @@ pub fn refuse_disallowed(
 /// Reset both halves of a stream with the coded rejection — the same code an
 /// unauthenticated peer gets, so probing stream kinds reveals nothing.
 pub fn refuse_stream(send: &mut SendStream, recv: &mut RecvStream) {
-    let code = close_code(WireError::AuthenticatorInvalid);
-    let _ = send.reset(code);
-    let _ = recv.stop(code);
+    crate::transport::streams::refuse(send, recv);
 }
 
 /// Reset both halves of a stream with a **specific** coded reason, for a peer that is owed one

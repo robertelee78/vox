@@ -3,10 +3,16 @@
 **Status**: **revised — the authorization model of decision 3 is withdrawn.** Decisions 5, 6 and 7 are
 built (`node::up`, `node::resolver`, and M17.4's `<config_dir>/anchors` as of 2026-09-22). An earlier
 draft of this line claimed decision 7 shipped when it did not; it was corrected to "not built" by review
-and is now genuinely built, with a real-binary proof. Decisions 1, 3, 4, 8, 9,
-10 and 11 are **proposed and not built**; what ships today implements the withdrawn model and is a live
+and is now genuinely built, with a real-binary proof. Decisions 1 and 9 are
+**superseded by decision 12** (fourth revision), which is built. Decisions 3, 4, 8, 10 and 11 are **proposed
+and not built**; what ships today implements the withdrawn model and is a live
 vulnerability until M17.6–M17.13 land.
 **Date**: 2026-09-21
+**Updated**: 2026-09-24 (fourth revision) — **names are this machine's own words** (decision 12, the
+decider's answer to PRD-001 R20): `nas.family.vox` is the node *this* machine named `nas` when it trusted
+it, in the room *this* machine calls `family`. Nothing is published or global. Decision 1's host-committed
+random label and decision 9's service descriptor are **superseded**, and the milestones that would have
+built them — **M17.9, M17.10 and M17.12 — are withdrawn**, never built. Decision 12 is built (M17.18).
 **Updated**: 2026-09-24 — PRD-001: refusals through `vox up`/`vox forward` are honest, removing a service cuts its live sessions, and forwards survive a host restart (ADR-013 "Tunnel honesty").
 **Updated**: 2026-09-21 (third revision, then revised again the same day after independent review) —
 **capability-bearing rooms are withdrawn.** Decision 3 held that *"'may this member dial it' and 'is this
@@ -153,6 +159,10 @@ Three facts shape the rest of the design:
 ## Decision
 
 ### 1. The name is a host-committed random label
+
+> **Superseded by decision 12 (fourth revision, 2026-09-24). Not built, and not to be.** Kept for the
+> reasoning it records. The decider chose local names: what a person types names a node and a room in their
+> own words, so there is no name to publish, no nonce to keep secret, and no descriptor to authenticate.
 
 The capability is a **room-bound service**: a TCP service offered by a host *into a room*, reachable by
 exactly those members of that room that are in its host's trust keyring. What a person types at a tool is
@@ -678,6 +688,11 @@ where Vox deliberately has none but yours (ADR-012: no Vox-operated infrastructu
 
 ### 9. The descriptor is content, sealed to the host's ring
 
+> **Superseded by decision 12 (fourth revision).** A descriptor existed to carry a published name and the
+> ports behind it to approved readers. With local names there is no published name, and the port is the
+> service tag the tunnel request already carries (decision 4), so there is nothing for a descriptor to
+> carry. Not built, and not to be.
+
 A host publishes a **service descriptor** to the room: an entry carrying the service's nonce (and so its
 name), its ports and how to reach it, readable by **exactly those members of that room that are in the
 host's ring**.
@@ -849,6 +864,38 @@ most dangerous omission in the first draft, and it is. The rule:
   plainly rather than implying an upgrade closes the hole for everyone.
 
 M17.13 covers this, and it is the one item that must ship in the same release as M17.7 rather than after it.
+
+### 12. Names are this machine's own words (fourth revision, 2026-09-24)
+
+`ssh nas.family.vox` reaches **the node this machine calls `nas`**, through **the room this machine calls
+`family`**:
+
+- **`nas`** is the petname this node gave that identity in its trust keyring when it trusted it
+  (`vox trust add <fp> --name nas`, changed with `vox trust rename`). Only trusted identities have names,
+  so a node that is not trusted cannot be named at all — and untrusting a node takes its name away.
+- **`family`** is this machine's local name for the room, the one given when it was created or joined.
+  A room's id works in its place (`nas.<room-id>.vox`).
+- Both are lowercased and anything a DNS label cannot hold becomes `-`, so `My NAS` is `my-nas`.
+
+The name resolves to **that member**, and the tunnel goes to that member's services in that room. So any
+member's services are reachable, not only the room creator's, and the same node reached through two rooms
+has two names. Nothing is published, registered or global: two machines may call the same node different
+things, or different nodes the same thing, and neither is wrong.
+
+**Refusals say why**, because the words are this machine's own and saying which one failed discloses
+nothing: no room called that (listing this machine's rooms), no trusted node called that, a trusted node
+that is not a member of that room, or a name that matches more than one room or node. Only the SOCKS reply
+code reaches the tool; the sentence goes to the operator.
+
+**Surfaces.** `vox up` with no room runs the proxy inside the node already holding the profile (`vox
+daemon`) and resolves names against every room it holds, as they are when each connection asks — so a room
+joined or a node renamed a moment ago resolves. `vox forward <node>.<room>.vox <service> [<local>]` resolves
+the same way. The control socket gains two additive requests (resolve, and up).
+
+**Kept:** `<room-id>.vox` still resolves to a `vox serve` room's creator (decision 4's form), so nothing
+already written stops working. **Accepted:** a tool configured for plain `socks5` asks the system resolver
+about a `.vox` name first, which leaks the name (PRD-001 R21).
+
 ## Non-goals
 
 - **No new authentication scheme for the service being carried.** Vox routes and authorizes *reach*; the
@@ -1187,12 +1234,12 @@ New work, in dependency order:
   defect: the rotation does empty the audience, and since M17.7 the dial gate does not consult the
   evaluator at all — reach is the host's keyring intersected with the room's author set. What the fold
   governs is **readability**, which is ADR-007's older and separate promise, and it holds.
-- **M17.9 — the name.** `H("vox service name v1" ‖ host_composite_pk ‖ nonce)` in base32; nonce minted per
+- **M17.9 — the name. WITHDRAWN (fourth revision): superseded by decision 12; never built.** `H("vox service name v1" ‖ host_composite_pk ‖ nonce)` in base32; nonce minted per
   (host, room) on first serve, reused for further ports, retired with the last one; persisted in the profile.
   `node::resolver` resolves name → descriptor across rooms. Gate: a name survives a restart, two ports share
   one name, a second room yields a different name, a retired-then-reserved service gets a *new* name, and a
   name for a service this client holds no openable descriptor for does not resolve at all.
-- **M17.10 — the descriptor.** A content entry per (service, room) carrying nonce, ports, host identity, room
+- **M17.10 — the descriptor. WITHDRAWN (fourth revision): superseded by decision 12; never built.** A content entry per (service, room) carrying nonce, ports, host identity, room
   and a monotonic `version`, republished on every trigger in decision 9. Gate: an approved reader lists the
   service by name without being told it; a **newly** approved reader does too, without waiting for anything
   (the trigger `chain_id` misses); an unapproved member of the same room cannot determine the name, the
@@ -1259,7 +1306,8 @@ New work, in dependency order:
   - **Not covered:** a *room-level* `Revoke` of a **trusted** identity, because M17.14 makes that refuse
     outright (`Fault::StillTrusted`) — "revoked here but still trusted" is not a state the model has, so
     there is no path by which it could remove a reacher. `Untrust` is the act that means it.
-- **M17.12 — the validation contract.** The descriptor binds name, host, room, ports and version; the client
+- **M17.12 — the validation contract. WITHDRAWN (fourth revision): there is no descriptor to validate;
+  never built.** The descriptor binds name, host, room, ports and version; the client
   authenticates the transport peer as that named host before carrying a byte; the resolver holds
   `name → (channel, host, port)` and the tunnel request carries the port as its tag. Gate: a descriptor
   copied verbatim into another room does not resolve there; two hosts serving `:22` in one room are reached
@@ -1297,6 +1345,14 @@ New work, in dependency order:
   Gate: a key trusted, used to read, then removed **cannot read a message published after the removal**, in
   every shared room, while a third identity that stays trusted reads it throughout. Independent of the
   service work; service reach is already cut at the dial gate.
+
+- **M17.18 — local names (decision 12). DONE 2026-09-24.** `node::resolver` (`<node>.<room>.vox` from the
+  keyring's petnames and the rooms' local names), `vox up` across every room over the control socket, `vox
+  forward <name>`, `vox trust rename`. Proved by `crates/vox-tui/tests/naming_proof.rs`, the shipped binary
+  against three real nodes: `nas.family.vox` reaches bob and `laptop.family.vox` reaches carol in a room bob
+  created; `laptop.work.vox` reaches carol through a second room; an unknown room, an unknown node, a node not
+  in that room and an ambiguous name are each refused with the reason; an untrusted node has no name.
+  Mutation (every name resolved to the room's creator, the old model): `laptop.family.vox` answers as bob.
 
 M17.6 must land first and alone: it closes both the admission hole and the auto-consent hole, and M17.7's
 gate is meaningless until it has. M17.7 and M17.13 ship together. M17.9 blocks M17.10 and M17.12. M17.11

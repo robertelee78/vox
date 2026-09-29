@@ -16,7 +16,7 @@
 //! - **Consent visibility**: who can read whom, from the single-writer consent
 //!   timeline ([`Evaluator::can_read`], [`Evaluator::readers_of`]).
 //! - **Effective channel policy**: the latest history/TTL from policy-updates over
-//!   genesis, with `deniability_mode` pinned to genesis ([`Evaluator::policy`]).
+//!   genesis ([`Evaluator::policy`]).
 //!
 //! ## One causal relation + one canonical order (the unifying construction)
 //! There is a **single** causal relation (`Causality`), used identically for the
@@ -310,7 +310,7 @@ impl Evaluator {
         self.root_admin
     }
 
-    /// The effective channel policy (history/ttl from updates; deniability pinned).
+    /// The effective channel policy (history/ttl from updates).
     #[must_use]
     pub fn policy(&self) -> ChannelPolicy {
         self.policy
@@ -728,7 +728,7 @@ impl<'a> Resolver<'a> {
 
     /// Resolve the effective channel policy: fold in-effect policy-updates whose
     /// author holds `policy` in the update's STRICT past, over the canonical order,
-    /// taking the latest history/ttl. `deniability_mode` is genesis-immutable.
+    /// taking the latest history/ttl.
     fn resolve_policy(&mut self, genesis: &Genesis) -> Result<ChannelPolicy> {
         let mut policy = genesis.body.policy;
         let order: Vec<&GovEntry> = self.causality.order.clone();

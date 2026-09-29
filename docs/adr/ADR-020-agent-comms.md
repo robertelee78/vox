@@ -497,6 +497,33 @@ Measured: a broadcast fan-out delivered 1024 events in 125 µs without blocking,
 The IPC socket **MUST** be a Unix domain socket with `0600` permissions (ctm's precedent, ADR-009 of
 that project). Each client **MUST** have its own cursor.
 
+*Protocol 6 (ADR-022 M22.5)* adds the app API to the same socket: a connection whose first request is
+`AppListen`, `AppAccept` or `AppOpen` becomes a listener registration or a splice of one app stream
+for its whole life. The requests are additive; nothing earlier changed shape.
+
+*Status (PRD-001 R35, R38).* The socket also answers a status request (tag 2301, additive), with the
+node's report as JSON: rooms with each member's last-seen and last-sync time and the room's last
+completed sync; peers with their path (`direct` or `relayed`, and which relay) and RTT; tunnels
+served and dialed; datagram and app counters; and the lines that need attention — a room with
+other members and no completed sync in 10 minutes, a trusted member that was connected and no
+longer is. `vox status` prints it (`--json` verbatim). `vox daemon --metrics <loopback addr>` serves
+the same report as Prometheus text and refuses a non-loopback address, as `vox forward` does,
+because the counters name every peer and room the node talks to. Proved by
+`crates/vox-tui/tests/ops_status_proof.rs`. Not knowable yet, and said so in the report: whether a
+room has an always-on member (not recorded until ADR-023), and whether a direct path was dialled
+or hole-punched (the ladder does not keep which rung won).
+
+*Notifications (PRD-001 R37).* A running `vox daemon` checks its own status every 5 s and raises a
+desktop notification when an unhealthy condition **starts** and when it **clears** — never again
+while it holds. Each condition carries a stable key (`peer-unreachable:<room>:<peer>`,
+`room-stale:<room>`) so continuing is told apart from starting; the stale-sync rule counts from the
+node's start when a room has not synced yet, so a daemon does not alarm on every start. Delivery:
+`VOX_NOTIFY_COMMAND <title> <body>` when set, else `osascript` on macOS, `notify-send` on Linux when
+installed, and always a line on the daemon's stderr. `notify = off` in the profile's `config` file
+turns it off. Proved by `crates/vox-tui/tests/notify_proof.rs` through the command override; the
+`osascript` and `notify-send` paths are not exercised by any gate, since no test can see a desktop.
+**Phone push is out of scope:** it needs a push service to send through, and Vox runs none.
+
 ### 8. The agent-facing surface is a CLI plus a skill
 
 Agents **MUST** be served by CLI verbs — `vox room post` (JSON on stdin, so no shell-quoting hazard),
@@ -605,6 +632,29 @@ since the service path has no reason to care how large the file is.
 Confidentiality needs no step of its own. The decider's habit of `gpg`-encrypting a file before
 sending it is unnecessary here: the overlay supplies confidentiality and the peer is a pinned key
 with consent-bound reach.
+
+*`vox share` (PRD-001 R18, built 2026-09-25).* The pull model, over HTTP so any tool can collect:
+`vox share <room> <file|dir> [--count N] [--for 10m]` serves the file on a room-bound service whose
+port is derived from the content hash and is its service tag, and announces name, size, SHA-256,
+tag and `http: true` in the `file` envelope. A folder is served as one deterministic tar (sorted,
+zero timestamps), so it has one hash. The receiver pulls with `curl --socks5-hostname <proxy>
+http://<name>.<room>.vox:<port>/<file>` through `vox up`, or with `vox room get`, which now:
+- lands the file in the downloads directory unless `--dir` or `--out` says otherwise: the
+  profile's `downloads` file, else `downloads = <dir>` in its `config`, else `~/Downloads`;
+- takes only the last component of the sender's name, strips leading dots and characters a
+  filesystem treats specially, and adds ` (1)`, ` (2)`… rather than overwrite anything;
+- writes to a hidden `.part` file and links it into place only after the hash and size verify,
+  so no file that looks complete exists until it is, and nothing that exists is replaced.
+
+(In v0.3.0, `vox room get` is D4's (a6db9c3), which does all of the above; `vox share` adds the
+HTTP fetch and the `config` key.)
+
+The share stops after `--count` completed fetches, after `--for`, or on ^C. Proved by
+`crates/vox-tui/tests/share_proof.rs`: curl through `vox up` gets identical bytes; `vox room get`
+lands them in the downloads directory; an untrusted member's curl and `vox room get` both get
+nothing and neither counts as a fetch; the share ends itself after `--count 2`; a folder arrives as a
+valid tar. Mutation-checked: an HTTP-unaware `get`, a get that ignores the downloads directory, a
+`--count` that never ends, and a host whose reach gate is removed each turn it red.
 
 **Nobody is granted anything, and that is a consequence rather than a convenience.** Reach is gated
 on the *offering* node's trust keyring together with authorship of the bound room; reading the

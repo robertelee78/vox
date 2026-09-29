@@ -8,26 +8,33 @@
 //!
 //! ## Fields (ADR-008, exact order — pinned by [`EntrySkeleton::canonical_body`])
 //! `{ author_id, seq, prev_hash, lipmaa_backlink, channelID, epoch, algo_ids,
-//!    payload_hash, payload_len, end_of_feed_flag }`, a 10-element canonical-CBOR
-//! array (ADR-008 §"Canonical serialization"). `seq` is the per-author sequence,
+//!    payload_hash, payload_len, end_of_feed_flag, claimed_ms, seen }`, a 12-element
+//! canonical-CBOR array (ADR-008 §"Canonical serialization"). `seq` is the per-author sequence,
 //! strictly monotonic from 1. `prev_hash` is the SHA-256 of the seq−1 entry's
 //! canonical bytes; `lipmaa_backlink` is the SHA-256 of the entry at the Bamboo
 //! `lipmaa(seq)` predecessor ([`crate::log::feed`]). The genesis entry (seq 1)
 //! carries all-zero `prev_hash` and `lipmaa_backlink` — there is no predecessor.
 //!
+//! `claimed_ms` and `seen` are the room's one order (ADR-023 decision 1, PRD-001 R13).
+//! `seen` names the heads of **other** authors' feeds the author had applied when it
+//! wrote the entry, so the log is a causal DAG across authors rather than parallel
+//! chains; `claimed_ms` is the author's clock, which only breaks ties between entries
+//! that did not see each other ([`crate::log::dag`]). Both sit in the signed skeleton,
+//! not in the encrypted payload, because the order must be computable by a node that
+//! cannot read an entry: a node without an author's key, or holding a pruned skeleton,
+//! still has to place that entry, or every entry after it lands somewhere else than it
+//! does on a node that can read it.
+//!
 //! ## Authenticator (per entry TYPE, ADR-008 §"Per-entry-type authentication")
 //! The authenticator is computed over `vox/log-entry/v1 ‖ canonical_body`
 //! ([`crate::wire::signing_input`]). Governance/control entries are **always**
 //! composite Ed25519+ML-DSA root-signed; message-content entries are
-//! composite-signed in attributable channels and carry the ADR-009 deniable
-//! authenticator in deniable channels. The entry wire carries an **authenticator-
-//! type discriminant** so composite vs deniable is distinguishable and
-//! forward-compatible. M5 builds the **attributable (composite) path fully** and
-//! the **deniable wire seam** ([`Authenticator::Deniable`]) — the deniable
-//! *crypto* is M7 (ADR-009), so [`Entry::verify`] returns a clear boundary error
-//! ([`Error::DeniableVerificationUnavailable`]) for a deniable authenticator
-//! rather than faking verification. Because the authenticator commits to
-//! `payload_hash`, the skeleton verifies whether or not the payload is retained.
+//! composite-signed too: every entry is attributable. The entry wire carries an
+//! **authenticator-type discriminant**, and composite (`1`) is the only value accepted.
+//! Type `2` was the ADR-009 deniable authenticator; deniable rooms were removed
+//! (PRD-001 R43), so an entry carrying it is refused like any unknown type. Because the
+//! authenticator commits to `payload_hash`, the skeleton verifies whether or not the
+//! payload is retained.
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -40,11 +47,10 @@ use crate::wire::{frame, parse_frame, signing_input, StructTag};
 /// `lipmaa_backlink` (there is no predecessor to hash).
 pub const ZERO_HASH: Digest32 = [0u8; DIGEST_LEN];
 
-/// Hard upper bound on a deniable authenticator's serialized length (bytes),
-/// enforced **before** allocation so a hostile `auth_type = Deniable` frame with
-/// a huge declared length cannot force a large copy (ADR-008 anti-abuse). The
-/// composite signature is fixed-length ([`COMPOSITE_SIG_LEN`]); the deniable
-/// authenticator (ADR-009/M7) is bounded generously here and tightened by M7.
+/// Hard upper bound on an authenticator's serialized length (bytes), enforced
+/// **before** allocation so a hostile frame with a huge declared length cannot force a
+/// large copy (ADR-008 anti-abuse). The composite signature is fixed-length
+/// ([`COMPOSITE_SIG_LEN`]); this bound is checked before the length is compared.
 pub const MAX_AUTHENTICATOR_LEN: usize = 8 * 1024;
 
 /// Hard upper bound on a retained payload body (bytes) accepted from a single
@@ -54,10 +60,19 @@ pub const MAX_AUTHENTICATOR_LEN: usize = 8 * 1024;
 /// how many an author may write: a room's history has no size limit (PRD-001 R1).
 pub const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
+/// At most this many hashes in an entry's `seen` (ADR-023 decision 1). Enforced at
+/// decode, before the hashes are read, and by the author when it picks them.
+pub const MAX_SEEN: usize = 16;
+
+/// The number of elements in the canonical skeleton array.
+const SKELETON_ARITY: usize = 12;
+
 /// Wire discriminant for [`Authenticator::Composite`] (attributable).
 const AUTH_TYPE_COMPOSITE: u64 = 1;
-/// Wire discriminant for [`Authenticator::Deniable`] (ADR-009/M7; non-attributable).
-const AUTH_TYPE_DENIABLE: u64 = 2;
+
+/// Wire discriminant for [`Authenticator::Dropped`]: no signature bytes follow (an empty
+/// byte string). `0`, not the removed deniable type `2`, which stays refused.
+const AUTH_TYPE_DROPPED: u64 = 0;
 
 /// The kind of entry, which fixes how it is authenticated (ADR-008
 /// §"Per-entry-type authentication"). Authentication is chosen by entry TYPE,
@@ -66,67 +81,54 @@ const AUTH_TYPE_DENIABLE: u64 = 2;
 #[non_exhaustive]
 pub enum EntryKind {
     /// Governance/control: genesis, admin delegations, consent grants/revocations,
-    /// policy/passphrase-rotation, deniable-mode DGKA/DSKE setup. **Always**
+    /// policy/passphrase-rotation. **Always**
     /// root-composite-signed, in every channel (ADR-008). Two validly-signed
     /// conflicting governance entries are a self-authenticating fork proof.
     Governance,
-    /// Message content. In an attributable channel this is root-composite-signed;
-    /// in a deniable channel it carries the ADR-009 forgeable authenticator (M7),
-    /// in which case a conflict is *not* self-authenticating.
+    /// Message content, root-composite-signed like governance.
     Content,
+    /// An author's checkpoint on its own feed (ADR-023 decision 3,
+    /// [`crate::log::checkpoint`]). Control, not governance: it grants nothing, so it never
+    /// reaches the ADR-007 evaluator, and like governance it is never pruned.
+    Checkpoint,
 }
 
 /// The authenticator over an entry's signing input.
 ///
-/// M5 ships the [`Authenticator::Composite`] (attributable) variant in full and
-/// the [`Authenticator::Deniable`] **wire seam** (opaque bytes; ADR-009 crypto is
-/// M7). The enum (rather than always a [`CompositeSignature`]) is what lets the
-/// fork logic distinguish a *self-authenticating* conflict (composite) from a
-/// *forgeable* one (deniable) directly from the authenticator type — no caller
-/// hint — and lets the wire carry a forward-compatible type discriminant.
+/// An enum rather than a bare [`CompositeSignature`] because the wire carries a type
+/// discriminant; composite is the only type there is.
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum Authenticator {
     /// A composite Ed25519+ML-DSA-65 root signature (ADR-002). Attributable: it
     /// genuinely incriminates the author on a fork. Boxed because the composite
-    /// signature is multi-kilobyte while the deniable variant is small, so the
-    /// enum stays compact (clippy `large_enum_variant`).
+    /// signature is multi-kilobyte.
     Composite(Box<CompositeSignature>),
-    /// The ADR-009 **deniable** content authenticator (M7). Held opaquely in M5:
-    /// the bytes round-trip on the wire and are classified non-attributable, but
-    /// M5 does not verify them (the construction is M7). Verification is delegated
-    /// to a [`DeniableVerifier`]; without one, [`Entry::verify`] returns
-    /// [`Error::DeniableVerificationUnavailable`] (an honest boundary, not a stub).
-    Deniable(Vec<u8>),
+    /// The signature was **dropped under a checkpoint** (ADR-023 decision 3): the entry's
+    /// body expired, and its author's own signed checkpoint names a position at or above it.
+    /// Such an entry is authentic only through the hash chain — its hash is the `prev_hash`
+    /// (or checkpoint hash) of a signed entry above it — so it never verifies on its own
+    /// ([`Entry::verify`] refuses it) and the DAG accepts it only as a chain-authenticated
+    /// skeleton ([`crate::log::dag::Dag::accept`]).
+    Dropped,
 }
 
 impl Authenticator {
-    /// Whether this authenticator is attributable (a conflict under it is a
-    /// self-authenticating fork proof). Composite signatures are attributable; the
-    /// deniable authenticator (forgeable by any member, ADR-009) is not.
-    #[must_use]
-    pub fn is_attributable(&self) -> bool {
-        match self {
-            Authenticator::Composite(_) => true,
-            Authenticator::Deniable(_) => false,
-        }
-    }
-
     /// The wire type discriminant for this authenticator.
     fn type_id(&self) -> u64 {
         match self {
             Authenticator::Composite(_) => AUTH_TYPE_COMPOSITE,
-            Authenticator::Deniable(_) => AUTH_TYPE_DENIABLE,
+            Authenticator::Dropped => AUTH_TYPE_DROPPED,
         }
     }
 
     /// The serialized bytes of this authenticator: the composite signature's
-    /// fixed-length encoding, or the opaque deniable bytes verbatim.
+    /// fixed-length encoding.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Authenticator::Composite(sig) => sig.to_bytes().to_vec(),
-            Authenticator::Deniable(bytes) => bytes.clone(),
+            Authenticator::Dropped => Vec::new(),
         }
     }
 }
@@ -135,52 +137,15 @@ impl core::fmt::Debug for Authenticator {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Authenticator::Composite(_) => f.write_str("Authenticator::Composite(..)"),
-            Authenticator::Deniable(b) => write!(f, "Authenticator::Deniable({} bytes)", b.len()),
+            Authenticator::Dropped => f.write_str("Authenticator::Dropped"),
         }
-    }
-}
-
-/// The verification seam for the ADR-009 **deniable** content authenticator,
-/// implemented by milestone M7. M5 defines the trait so the entry verification
-/// path is type-complete and forward-compatible; M5 itself ships **no**
-/// implementation (the deniable construction is M7) — an [`Entry`] carrying a
-/// deniable authenticator therefore fails verification with
-/// [`Error::DeniableVerificationUnavailable`] until an M7 verifier is supplied.
-///
-/// This is the acyclic 009→008 coupling ADR-008 §Consequences describes: 008
-/// owns the *shape* of the check (the trait + the non-attributable classification
-/// + the alarm fork path); 009/M7 owns the *crypto*.
-pub trait DeniableVerifier {
-    /// Verify a deniable authenticator's `auth_bytes` for `skeleton`. The verifier
-    /// receives the **whole skeleton** (not just a flattened signing input) so it
-    /// can bind the check to the entry's exact `(channel_id, epoch, author_id)` —
-    /// the M7 verifier registers each member's per-epoch ephemeral verification key
-    /// under that triple, and an authenticator only verifies under the key for
-    /// *that* epoch (ADR-009: publishing an epoch's key makes only *that* epoch's
-    /// content forgeable, never a different/future epoch). The verifier derives the
-    /// signing input itself via [`EntrySkeleton::signing_input`]. Returns `Ok(())`
-    /// iff the (forgeable, but per-epoch-author-bound) authenticator is valid.
-    fn verify_deniable(&self, skeleton: &EntrySkeleton, auth_bytes: &[u8]) -> Result<()>;
-}
-
-/// A [`DeniableVerifier`] placeholder used only to name a concrete type for the
-/// `None` case of [`Entry::verify`] (which performs no deniable verification).
-/// Its method is never called — a `None::<&NoDeniableVerifier>` short-circuits to
-/// the boundary error — so it deliberately has no real implementation.
-enum NoDeniableVerifier {}
-
-impl DeniableVerifier for NoDeniableVerifier {
-    fn verify_deniable(&self, _: &EntrySkeleton, _: &[u8]) -> Result<()> {
-        // Unconstructible (empty enum): this arm is unreachable. Returning the
-        // boundary error keeps the function total without a panic.
-        Err(Error::DeniableVerificationUnavailable)
     }
 }
 
 /// The unsigned entry skeleton — every field except the authenticator.
 ///
 /// Held separately so [`EntrySkeleton::signing_input`] is the exact bytes the
-/// author signs and a verifier checks. The 10 fields are in the ADR-008 order.
+/// author signs and a verifier checks. The 12 fields are in the ADR-008 order.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EntrySkeleton {
     /// The author's identity fingerprint (ADR-002 `SHA-256(Ed25519 ‖ ML-DSA)`).
@@ -206,6 +171,16 @@ pub struct EntrySkeleton {
     /// Whether this entry terminates the feed (Bamboo end-of-feed marker): no
     /// entry at `seq + 1` may ever be authored.
     pub end_of_feed: bool,
+    /// The author's clock when it wrote the entry, **milliseconds** since the Unix
+    /// epoch. Only a tie-break between entries that did not see each other: it can
+    /// never place an entry ahead of anything in its `seen` or its own feed
+    /// ([`crate::log::dag`]). The same value the content envelope carries.
+    pub claimed_ms: u64,
+    /// The heads of other authors' feeds the author had applied when it wrote this
+    /// entry, at most [`MAX_SEEN`], strictly ascending (canonical: no duplicates, one
+    /// encoding). May name entries a receiving node does not hold yet; that never
+    /// blocks acceptance (ADR-023 decision 1).
+    pub seen: Vec<Digest32>,
 }
 
 impl core::fmt::Debug for EntrySkeleton {
@@ -217,21 +192,34 @@ impl core::fmt::Debug for EntrySkeleton {
             .field("epoch", &self.epoch)
             .field("payload_len", &self.payload_len)
             .field("end_of_feed", &self.end_of_feed)
+            .field("claimed_ms", &self.claimed_ms)
+            .field("seen", &self.seen.len())
             .finish_non_exhaustive()
     }
 }
 
 impl EntrySkeleton {
-    /// Canonical-CBOR body in the ADR-008 field order: a 10-element array
+    /// Canonical-CBOR body in the ADR-008 field order: a 12-element array
     /// `[author_id, seq, prev_hash, lipmaa_backlink, channelID, epoch,
-    ///   [sign_algo, aead_algo], payload_hash, payload_len, end_of_feed_flag]`.
+    ///   [sign_algo, aead_algo], payload_hash, payload_len, end_of_feed_flag,
+    ///   claimed_ms, [seen…]]`.
     /// `end_of_feed_flag` is a CBOR unsigned integer 0/1 (the codec has no bool;
     /// 0 and 1 are the canonical shortest forms).
     #[must_use]
     pub fn canonical_body(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(10)
-            .bytes(&self.author_id)
+        e.array(SKELETON_ARITY);
+        self.encode_fields(&mut e);
+        e.finish()
+    }
+
+    /// The 12 skeleton fields, in order, into `e`. The one encoder of them: the
+    /// canonical body (what is signed and hashed) and the wire frame (which inlines the
+    /// same fields ahead of the authenticator) both call it, so the two can never
+    /// disagree about a field — which would fail three layers away as "record
+    /// rejected", not here.
+    fn encode_fields(&self, e: &mut Encoder) {
+        e.bytes(&self.author_id)
             .uint(self.seq)
             .bytes(&self.prev_hash)
             .bytes(&self.lipmaa_backlink)
@@ -242,8 +230,12 @@ impl EntrySkeleton {
             .uint(u64::from(self.algo_ids[1]));
         e.bytes(&self.payload_hash)
             .uint(self.payload_len)
-            .uint(u64::from(self.end_of_feed));
-        e.finish()
+            .uint(u64::from(self.end_of_feed))
+            .uint(self.claimed_ms)
+            .array(self.seen.len());
+        for h in &self.seen {
+            e.bytes(h);
+        }
     }
 
     /// The signing/authentication input: `vox/log-entry/v1 ‖ canonical_body`
@@ -263,38 +255,50 @@ impl EntrySkeleton {
         sha256(&self.canonical_body())
     }
 
-    /// Decode a skeleton from its 10-element canonical body, validating arity,
-    /// digest lengths, the algo-id registry membership and classes, and the
-    /// end-of-feed flag domain (0 or 1 only).
-    fn from_canonical_body(body: &[u8]) -> Result<Self> {
-        let mut d = Decoder::new(body);
-        if d.array()? != 10 {
-            return Err(Error::MalformedBundle("log-entry arity"));
-        }
-        let author_id = take_digest(&mut d)?;
+    /// Decode the 12 skeleton fields from `d`, validating digest lengths, the
+    /// algo-id registry membership and classes, the end-of-feed flag domain (0 or 1
+    /// only), and `seen` (at most [`MAX_SEEN`], strictly ascending). The one decoder of
+    /// them, for the same reason [`Self::encode_fields`] is the one encoder.
+    fn decode_fields(d: &mut Decoder<'_>) -> Result<Self> {
+        let author_id = take_digest(d)?;
         let seq = d.uint()?;
         // Bound seq so the lipmaa power-of-three arithmetic stays overflow-free
         // (ADR-008; see `crate::log::feed::MAX_SEQ`).
         if seq > crate::log::feed::MAX_SEQ {
             return Err(Error::SizeLimitExceeded("log-entry seq exceeds MAX_SEQ"));
         }
-        let prev_hash = take_digest(&mut d)?;
-        let lipmaa_backlink = take_digest(&mut d)?;
-        let channel_id = take_digest(&mut d)?;
+        let prev_hash = take_digest(d)?;
+        let lipmaa_backlink = take_digest(d)?;
+        let channel_id = take_digest(d)?;
         let epoch = d.uint()?;
         if d.array()? != 2 {
             return Err(Error::MalformedBundle("log-entry algo_ids arity"));
         }
         let sign_algo = u16_from(d.uint()?)?;
         let aead_algo = u16_from(d.uint()?)?;
-        let payload_hash = take_digest(&mut d)?;
+        let payload_hash = take_digest(d)?;
         let payload_len = d.uint()?;
         let end_of_feed = match d.uint()? {
             0 => false,
             1 => true,
             _ => return Err(Error::MalformedBundle("log-entry end_of_feed flag")),
         };
-        d.finish()?;
+        let claimed_ms = d.uint()?;
+        // The count is checked before anything is read or allocated.
+        let n = d.array()?;
+        if n > MAX_SEEN {
+            return Err(Error::SizeLimitExceeded("log-entry seen"));
+        }
+        let mut seen: Vec<Digest32> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let h = take_digest(d)?;
+            // Strictly ascending: one encoding per set, so two honest authors listing
+            // the same heads sign the same bytes, and a duplicate cannot pad the list.
+            if seen.last().is_some_and(|last| *last >= h) {
+                return Err(Error::MalformedBundle("log-entry seen not canonical"));
+            }
+            seen.push(h);
+        }
 
         // Registry + class guards (ADR-003 type-confusion): the sign slot holds a
         // signature algo and the aead slot an AEAD algo.
@@ -324,6 +328,8 @@ impl EntrySkeleton {
             payload_hash,
             payload_len,
             end_of_feed,
+            claimed_ms,
+            seen,
         })
     }
 }
@@ -401,30 +407,6 @@ impl Entry {
         })
     }
 
-    /// Construct a **content** entry carrying an opaque ADR-009 *deniable*
-    /// authenticator (the M7 crypto produces `auth_bytes`; M5 only carries them).
-    /// The entry round-trips on the wire and is classified non-attributable; M5
-    /// does not verify it ([`Entry::verify`] returns
-    /// [`Error::DeniableVerificationUnavailable`] without an M7
-    /// [`DeniableVerifier`]). Rejects an over-limit authenticator before storing.
-    /// Governance entries MUST be composite, so this is content-only by contract.
-    pub fn with_deniable_authenticator(
-        skeleton: EntrySkeleton,
-        auth_bytes: Vec<u8>,
-        payload: Option<Vec<u8>>,
-    ) -> Result<Self> {
-        if auth_bytes.len() > MAX_AUTHENTICATOR_LEN {
-            return Err(Error::SizeLimitExceeded("log-entry authenticator"));
-        }
-        let entry = Self {
-            skeleton,
-            authenticator: Authenticator::Deniable(auth_bytes),
-            payload,
-        };
-        entry.verify_payload_binding()?;
-        Ok(entry)
-    }
-
     fn sign_skeleton(
         author_root: &dyn RootSigner,
         skeleton: &EntrySkeleton,
@@ -445,25 +427,7 @@ impl Entry {
     /// (c) any retained payload hashes to `payload_hash` and has `payload_len`
     /// bytes. Any mismatch is a hard failure. Render-gating (ADR-008) is *not*
     /// here: this verifies authorship/integrity; decryption/rendering is M4/M6.
-    ///
-    /// A **deniable** authenticator ([`Authenticator::Deniable`]) cannot be
-    /// verified by M5 (the construction is ADR-009/M7); this returns
-    /// [`Error::DeniableVerificationUnavailable`]. Use
-    /// [`Entry::verify_with_deniable`] with an M7 [`DeniableVerifier`] to verify
-    /// such an entry.
     pub fn verify(&self, author_root: &CompositePublicKey) -> Result<()> {
-        self.verify_with_deniable(author_root, None::<&NoDeniableVerifier>)
-    }
-
-    /// Verify as [`Entry::verify`], but verify a [`Authenticator::Deniable`]
-    /// authenticator with the supplied `deniable` verifier (M7/ADR-009) when one
-    /// is provided. A composite authenticator is verified against `author_root`
-    /// regardless of `deniable`.
-    pub fn verify_with_deniable<V: DeniableVerifier>(
-        &self,
-        author_root: &CompositePublicKey,
-        deniable: Option<&V>,
-    ) -> Result<()> {
         if author_root.fingerprint() != self.skeleton.author_id {
             return Err(Error::MalformedBundle(
                 "log-entry author_id != root fingerprint",
@@ -473,12 +437,11 @@ impl Entry {
             Authenticator::Composite(sig) => {
                 author_root.verify(&self.skeleton.signing_input(), sig)?;
             }
-            Authenticator::Deniable(bytes) => match deniable {
-                Some(v) => {
-                    v.verify_deniable(&self.skeleton, bytes)?;
-                }
-                None => return Err(Error::DeniableVerificationUnavailable),
-            },
+            Authenticator::Dropped => {
+                return Err(Error::MalformedBundle(
+                    "log-entry signature was dropped under a checkpoint",
+                ));
+            }
         }
         self.verify_payload_binding()
     }
@@ -507,6 +470,22 @@ impl Entry {
         self.payload.take().is_some()
     }
 
+    /// Whether the entry still carries its signature (it was not dropped under a checkpoint).
+    #[must_use]
+    pub fn is_signed(&self) -> bool {
+        !matches!(self.authenticator, Authenticator::Dropped)
+    }
+
+    /// Drop the signature (ADR-023 decision 3), keeping the skeleton — and so the entry's
+    /// hash and its links. Only a caller holding the author's checkpoint above it may: after
+    /// this the entry is authentic only through the hash chain. Returns whether a signature
+    /// was actually dropped.
+    pub fn drop_signature(&mut self) -> bool {
+        let had = self.is_signed();
+        self.authenticator = Authenticator::Dropped;
+        had
+    }
+
     /// The entry's hash (over the canonical body) — its DAG/Negentropy key.
     #[must_use]
     pub fn entry_hash(&self) -> Digest32 {
@@ -514,35 +493,27 @@ impl Entry {
     }
 
     /// Frame the entry for the wire/storage per ADR-008: `tag(2 BE) ‖
-    /// version(1) ‖ canonical_cbor_body`. The body is a flat CBOR array — the 10
-    /// skeleton fields, then `auth_type` (1 = composite, 2 = deniable),
+    /// version(1) ‖ canonical_cbor_body`. The body is a flat CBOR array — the 12
+    /// skeleton fields, then `auth_type` (1 = composite; 2 was the removed deniable type),
     /// `authenticator_bytes`, `payload_present` (0/1), and the payload byte string
     /// iff present. The skeleton fields are inlined (not a nested array) so the
     /// strict decoder reads them directly; a pruned entry omits the body but still
     /// carries the verifiable skeleton + typed authenticator.
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
-        let sk = &self.skeleton;
         let auth = self.authenticator.to_bytes();
         let has_payload = self.payload.is_some();
-        // 10 skeleton fields (algo_ids inner array counts as one element) +
+        // 12 skeleton fields (algo_ids and seen each count as one element) +
         // auth_type + authenticator + payload_present (+ payload).
-        let arity = if has_payload { 14 } else { 13 };
+        let arity = if has_payload {
+            SKELETON_ARITY + 4
+        } else {
+            SKELETON_ARITY + 3
+        };
         let mut e = Encoder::new();
-        e.array(arity)
-            .bytes(&sk.author_id)
-            .uint(sk.seq)
-            .bytes(&sk.prev_hash)
-            .bytes(&sk.lipmaa_backlink)
-            .bytes(&sk.channel_id)
-            .uint(sk.epoch)
-            .array(2)
-            .uint(u64::from(sk.algo_ids[0]))
-            .uint(u64::from(sk.algo_ids[1]));
-        e.bytes(&sk.payload_hash)
-            .uint(sk.payload_len)
-            .uint(u64::from(sk.end_of_feed))
-            .uint(self.authenticator.type_id())
+        e.array(arity);
+        self.skeleton.encode_fields(&mut e);
+        e.uint(self.authenticator.type_id())
             .bytes(&auth)
             .uint(u64::from(has_payload));
         if let Some(p) = &self.payload {
@@ -553,16 +524,16 @@ impl Entry {
 
     /// Parse a framed entry from the wire/storage. Rejects a wrong/unknown
     /// struct tag, unsupported version, arity, an unknown authenticator type, an
-    /// over-limit authenticator/payload length (rejected **before** allocation —
+    /// over-limit authenticator/payload/`seen` length (rejected **before** allocation —
     /// ADR-008 anti-abuse), or a malformed skeleton/authenticator/payload. Does
     /// NOT verify the signature — call [`Entry::verify`]. A retained payload, if
     /// present, is checked against the committed hash/len so a tampered body is
     /// rejected at parse.
     ///
-    /// The 10 skeleton fields are re-encoded into a body-only buffer and decoded
-    /// through the strict skeleton decoder (which enforces the algo classes), so
-    /// the reconstructed signing input is byte-identical to the author's — the
-    /// precondition for signature verification.
+    /// The skeleton fields go through the same strict decoder as the canonical body
+    /// (which enforces the algo classes and `seen`'s canonical form), so the
+    /// re-encoded signing input is byte-identical to the author's — the precondition
+    /// for signature verification.
     pub fn from_wire(bytes: &[u8]) -> Result<Self> {
         let parsed = parse_frame(bytes)?;
         if parsed.tag != StructTag::LogEntry {
@@ -570,28 +541,15 @@ impl Entry {
         }
         let mut d = Decoder::new(parsed.body);
         let arity = d.array()?;
-        if arity != 13 && arity != 14 {
+        if arity != SKELETON_ARITY + 3 && arity != SKELETON_ARITY + 4 {
             return Err(Error::MalformedBundle("log-entry wire arity"));
         }
-        let author_id = take_digest(&mut d)?;
-        let seq = d.uint()?;
-        let prev_hash = take_digest(&mut d)?;
-        let lipmaa_backlink = take_digest(&mut d)?;
-        let channel_id = take_digest(&mut d)?;
-        let epoch = d.uint()?;
-        if d.array()? != 2 {
-            return Err(Error::MalformedBundle("log-entry algo_ids arity"));
-        }
-        let sign_algo = d.uint()?;
-        let aead_algo = d.uint()?;
-        let payload_hash = take_digest(&mut d)?;
-        let payload_len = d.uint()?;
-        let end_of_feed = d.uint()?;
+        let skeleton = EntrySkeleton::decode_fields(&mut d)?;
         let auth_type = d.uint()?;
         let authenticator = decode_authenticator(&mut d, auth_type)?;
         let present = d.uint()?;
-        let payload = match (present, arity) {
-            (1, 14) => {
+        let payload = match (present, arity == SKELETON_ARITY + 4) {
+            (1, true) => {
                 // `d.bytes()` returns a BORROWED slice (length already bounded by
                 // the remaining input — no allocation yet). Check the *actual*
                 // byte-string length against the cap BEFORE `to_vec`, so a hostile
@@ -604,14 +562,14 @@ impl Entry {
                 // The actual byte-string length MUST equal the signed
                 // `payload_len`; otherwise the payload_hash/skeleton binding is
                 // inconsistent (the signature commits to `payload_len`).
-                if slice.len() as u64 != payload_len {
+                if slice.len() as u64 != skeleton.payload_len {
                     return Err(Error::MalformedBundle(
                         "log-entry payload length != signed payload_len",
                     ));
                 }
                 Some(slice.to_vec())
             }
-            (0, 13) => None,
+            (0, false) => None,
             _ => {
                 return Err(Error::MalformedBundle(
                     "log-entry payload presence mismatch",
@@ -619,22 +577,6 @@ impl Entry {
             }
         };
         d.finish()?;
-
-        // Rebuild the 10-field skeleton body and decode strictly (class checks,
-        // end_of_feed domain, digest lengths).
-        let mut be = Encoder::new();
-        be.array(10)
-            .bytes(&author_id)
-            .uint(seq)
-            .bytes(&prev_hash)
-            .bytes(&lipmaa_backlink)
-            .bytes(&channel_id)
-            .uint(epoch)
-            .array(2)
-            .uint(sign_algo)
-            .uint(aead_algo);
-        be.bytes(&payload_hash).uint(payload_len).uint(end_of_feed);
-        let skeleton = EntrySkeleton::from_canonical_body(&be.finish())?;
 
         let entry = Self {
             skeleton,
@@ -670,7 +612,7 @@ fn decode_authenticator(d: &mut Decoder<'_>, auth_type: u64) -> Result<Authentic
                 CompositeSignature::from_bytes(&auth_arr)?,
             )))
         }
-        AUTH_TYPE_DENIABLE => Ok(Authenticator::Deniable(auth_bytes.to_vec())),
+        AUTH_TYPE_DROPPED if auth_bytes.is_empty() => Ok(Authenticator::Dropped),
         _ => Err(Error::MalformedBundle(
             "log-entry unknown authenticator type",
         )),

@@ -28,6 +28,8 @@ const METHOD_NO_AUTH: u8 = 0x00;
 const METHOD_NONE: u8 = 0xFF;
 /// CONNECT command.
 const CMD_CONNECT: u8 = 0x01;
+/// `UDP ASSOCIATE` (RFC 1928 §4, §7).
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 /// Address type: IPv4.
 const ATYP_IP4: u8 = 0x01;
 /// Address type: domain name.
@@ -110,11 +112,36 @@ where
     }
 }
 
+/// What a client asked the proxy to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// `CONNECT`: carry one TCP connection.
+    Connect,
+    /// `UDP ASSOCIATE` (RFC 1928 §7): relay UDP datagrams for as long as this TCP
+    /// connection stays open.
+    UdpAssociate,
+}
+
 /// Read a CONNECT request after [`negotiate`], returning the requested target.
 ///
-/// Rejects a non-CONNECT command (replying `0x07`) and an unknown address type
+/// Rejects any other command (replying `0x07`) and an unknown address type
 /// (replying `0x08`).
 pub async fn read_connect<S>(stream: &mut S) -> Result<Target>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match read_request(stream, &[Command::Connect]).await? {
+        (Command::Connect, target) => Ok(target),
+        (Command::UdpAssociate, _) => Err(Error::MalformedTunnel("socks: unsupported command")),
+    }
+}
+
+/// Read a request after [`negotiate`], accepting only the commands in `accept`.
+///
+/// Rejects any other command (replying `0x07`) and an unknown address type (replying
+/// `0x08`). For `UDP ASSOCIATE` the target is the address the client *expects* to send
+/// from, which RFC 1928 allows to be all zeros.
+pub async fn read_request<S>(stream: &mut S, accept: &[Command]) -> Result<(Command, Target)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -126,10 +153,15 @@ where
     if head[0] != VER {
         return Err(Error::MalformedTunnel("socks: bad version"));
     }
-    if head[1] != CMD_CONNECT {
+    let command = match head[1] {
+        CMD_CONNECT => Some(Command::Connect),
+        CMD_UDP_ASSOCIATE => Some(Command::UdpAssociate),
+        _ => None,
+    };
+    let Some(command) = command.filter(|c| accept.contains(c)) else {
         let _ = write_reply(stream, Reply::CommandNotSupported, unspecified()).await;
         return Err(Error::MalformedTunnel("socks: unsupported command"));
-    }
+    };
     // head[2] is RSV (ignored). head[3] is ATYP.
     let target = match head[3] {
         ATYP_IP4 => {
@@ -164,7 +196,88 @@ where
             return Err(Error::MalformedTunnel("socks: unsupported address type"));
         }
     };
-    Ok(target)
+    Ok((command, target))
+}
+
+/// One datagram of a UDP association, as RFC 1928 §7 frames it between the client and
+/// the proxy's relay socket: `RSV(2) ‖ FRAG ‖ ATYP ‖ DST.ADDR ‖ DST.PORT ‖ DATA`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UdpDatagram<'a> {
+    /// The fragment number. Only `0`, a whole datagram, is ever carried: RFC 1928 lets a
+    /// proxy that does not reassemble drop anything else, and this one does.
+    pub frag: u8,
+    /// Where the client wants the datagram to go, or where a reply came from.
+    pub target: Target,
+    /// The payload.
+    pub data: &'a [u8],
+}
+
+/// Parse a client's UDP-association datagram. `None` if it is too short, its reserved
+/// bytes are not zero, or its address type is unknown.
+#[must_use]
+pub fn parse_udp(datagram: &[u8]) -> Option<UdpDatagram<'_>> {
+    let (&[r0, r1, frag, atyp], rest) = datagram.split_first_chunk::<4>()?;
+    if r0 != 0 || r1 != 0 {
+        return None;
+    }
+    let (target, rest) = match atyp {
+        ATYP_IP4 => {
+            let (a, rest) = rest.split_first_chunk::<4>()?;
+            let (p, rest) = rest.split_first_chunk::<2>()?;
+            let addr = SocketAddrV4::new(Ipv4Addr::from(*a), u16::from_be_bytes(*p));
+            (Target::Ip(SocketAddr::V4(addr)), rest)
+        }
+        ATYP_IP6 => {
+            let (a, rest) = rest.split_first_chunk::<16>()?;
+            let (p, rest) = rest.split_first_chunk::<2>()?;
+            let addr = SocketAddrV6::new(Ipv6Addr::from(*a), u16::from_be_bytes(*p), 0, 0);
+            (Target::Ip(SocketAddr::V6(addr)), rest)
+        }
+        ATYP_DOMAIN => {
+            let (&len, rest) = rest.split_first()?;
+            let len = usize::from(len);
+            if rest.len() < len + 2 {
+                return None;
+            }
+            let name = std::str::from_utf8(&rest[..len]).ok()?.to_owned();
+            let port = u16::from_be_bytes([rest[len], rest[len + 1]]);
+            (Target::Domain(name, port), &rest[len + 2..])
+        }
+        _ => return None,
+    };
+    Some(UdpDatagram {
+        frag,
+        target,
+        data: rest,
+    })
+}
+
+/// Frame `data` as an RFC 1928 §7 datagram from `source`, for the relay to send back to
+/// the client. `None` if a domain name is longer than [`MAX_DOMAIN_LEN`].
+#[must_use]
+pub fn encode_udp(source: &Target, data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = vec![0, 0, 0];
+    match source {
+        Target::Ip(SocketAddr::V4(v4)) => {
+            out.push(ATYP_IP4);
+            out.extend_from_slice(&v4.ip().octets());
+            out.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        Target::Ip(SocketAddr::V6(v6)) => {
+            out.push(ATYP_IP6);
+            out.extend_from_slice(&v6.ip().octets());
+            out.extend_from_slice(&v6.port().to_be_bytes());
+        }
+        Target::Domain(name, port) => {
+            let len = u8::try_from(name.len()).ok()?;
+            out.push(ATYP_DOMAIN);
+            out.push(len);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+    out.extend_from_slice(data);
+    Some(out)
 }
 
 /// Write a SOCKS5 reply with the given code and bound address.

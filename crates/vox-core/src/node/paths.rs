@@ -34,6 +34,13 @@ const SUN_PATH_BUDGET: usize = 100;
 /// configuration a person edits, not state the node owns — and it carries no secret: an
 /// anchor spec is a public identity and a public address.
 pub const ANCHORS_FILE: &str = "anchors";
+/// The profile's settings file in the config directory: `key = value` lines, `#`
+/// comments. Its first setting is `notify = off` (PRD-001 R37).
+pub const CONFIG_FILE: &str = "config";
+
+/// The node's retention policy file (ADR-023 decision 2), in the config directory.
+pub const RETENTION_FILE: &str = "retention";
+
 /// The download-directory file inside a profile's **config** directory (PRD-001 R18): one
 /// line naming where `vox room get` puts a collected file when no `--dir` or `--out` is
 /// given. A leading `~/` means the home directory. Absent, it is `~/Downloads`.
@@ -141,10 +148,23 @@ impl Paths {
         std::env::temp_dir().join(name)
     }
 
+    /// The settings file for this profile ([`CONFIG_FILE`]).
+    #[must_use]
+    pub fn config_file(&self) -> PathBuf {
+        self.config_dir.join(CONFIG_FILE)
+    }
+
     /// The anchors file for this profile ([`ANCHORS_FILE`]).
     #[must_use]
     pub fn anchors_file(&self) -> PathBuf {
         self.config_dir.join(ANCHORS_FILE)
+    }
+
+    /// The node's retention file for this profile ([`RETENTION_FILE`],
+    /// [`crate::node::retention::RetentionConfig`]).
+    #[must_use]
+    pub fn retention_file(&self) -> PathBuf {
+        self.config_dir.join(RETENTION_FILE)
     }
 
     /// The download-directory file for this profile ([`DOWNLOADS_FILE`]).

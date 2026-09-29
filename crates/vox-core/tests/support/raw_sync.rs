@@ -41,6 +41,9 @@ pub struct Yield {
     pub distinct: usize,
     /// The entries seen so far, by content hash, to count `distinct`.
     seen: std::collections::HashSet<[u8; 32]>,
+    /// Every `ENTRY` frame's wire bytes, in arrival order — so a gate can read what the
+    /// victim holds at a position (a skeleton, once its body is pruned).
+    pub wires: Vec<Vec<u8>>,
     /// Why the session ended, if not cleanly.
     pub ended: Option<String>,
 }
@@ -97,9 +100,22 @@ pub async fn endpoint_as_member(paths: &Paths, passphrase: &[u8]) -> VoxEndpoint
 /// Run one session over an already-open sync transport. Blocking: call from
 /// `spawn_blocking`. `sent_want` is signalled the moment the `WANT` is on the wire.
 pub fn session(
+    t: QuicStreamTransport,
+    ask: &Ask,
+    sent_want: Option<std::sync::mpsc::Sender<()>>,
+) -> Yield {
+    session_pushing(t, ask, sent_want, &[])
+}
+
+/// [`session`], but serving `push` — entry wire frames of the caller's choosing — in the
+/// serve phase, whatever the victim asked for. The drain phase applies whatever entries
+/// arrive, so this is how a gate hands a victim an entry it would never `WANT`: a second,
+/// conflicting entry for a position it already holds.
+pub fn session_pushing(
     mut t: QuicStreamTransport,
     ask: &Ask,
     sent_want: Option<std::sync::mpsc::Sender<()>>,
+    push: &[Vec<u8>],
 ) -> Yield {
     let mut y = Yield::default();
     if let Err(e) = t.send(&encode_hello(SYNC_MODE_FRONTIER)) {
@@ -158,6 +174,12 @@ pub fn session(
             return y;
         }
     }
+    for wire in push {
+        if let Err(e) = t.send(&vox_core::log::sync::encode_entry(wire)) {
+            y.ended = Some(format!("send ENTRY: {e:?}"));
+            return y;
+        }
+    }
     t.finish();
     loop {
         match t.recv() {
@@ -167,6 +189,7 @@ pub fn session(
                     if y.seen.insert(vox_core::hash::sha256(&wire)) {
                         y.distinct += 1;
                     }
+                    y.wires.push(wire);
                 }
                 other => {
                     y.ended = Some(format!("unexpected frame: {other:?}"));
@@ -180,6 +203,29 @@ pub fn session(
             }
         }
     }
+}
+
+/// Open a sync stream for `(channel_id, epoch)` on `conn` and run [`session_pushing`] on it.
+pub async fn ask_pushing(
+    conn: &VoxConnection,
+    channel_id: Digest32,
+    epoch: u64,
+    ask: Ask,
+    push: Vec<Vec<u8>>,
+) -> Yield {
+    let handle = tokio::runtime::Handle::current();
+    let t = match vox_core::node::syncstream::open_sync(conn, handle, &channel_id, epoch).await {
+        Ok(t) => t,
+        Err(e) => {
+            return Yield {
+                ended: Some(format!("open: {e:?}")),
+                ..Yield::default()
+            }
+        }
+    };
+    tokio::task::spawn_blocking(move || session_pushing(t, &ask, None, &push))
+        .await
+        .expect("the session thread")
 }
 
 /// Open a sync stream for `(channel_id, epoch)` on `conn` and run [`session`] on it.
