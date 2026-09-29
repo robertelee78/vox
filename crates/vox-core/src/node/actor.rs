@@ -2451,6 +2451,7 @@ impl Node {
                         net.manager().retire_expired();
                     }
                     self.retry_upgrades_if_due().await;
+                    self.maintain_prekeys();
                     self.renew_mappings_if_due();
                     self.adopt_anchored_from_board().await;
                     self.redial_anchors_if_due();
@@ -5017,8 +5018,10 @@ impl Node {
                     Some(s) => s,
                     None => match channel.skdm_for_consent(profile) {
                         Ok(s) => {
-                            self.consent_keys.insert(*channel_id, target, s.to_wire());
-                            if let Ok(signer) = profile.signer() {
+                            // Past the bound nothing is held (V210-77): the key goes now if
+                            // the member is reachable, and is taken again when it is.
+                            let held = self.consent_keys.insert(*channel_id, target, s.to_wire());
+                            if let (true, Ok(signer)) = (held, profile.signer()) {
                                 if let Err(e) = self.consent_keys.save(profile.store(), signer) {
                                     return Outcome::Failed(fault_of(&e));
                                 }
@@ -7344,6 +7347,40 @@ impl Node {
         self.consent_keys =
             crate::node::pending_consent::PendingConsents::load(profile.store(), signer)?;
         Ok(())
+    }
+
+    /// Keep the prekey ring up **while the node runs** (V210-77), not only at unlock: rotate the
+    /// signed prekey when its cadence is up, refill the one-time pool at its low-water mark,
+    /// and drop consumed one-time prekeys whose retention is over. A node up for weeks otherwise
+    /// ran out of one-time prekeys after 64 sessions and never rotated. Cheap when nothing is
+    /// due; a join holding the ring is left alone, and the next tick does it.
+    fn maintain_prekeys(&mut self) {
+        let now = self.now();
+        let (Some(profile), Some(ring)) = (self.profile.as_ref(), self.prekeys.as_ref()) else {
+            return;
+        };
+        let Ok(signer) = profile.signer() else {
+            return;
+        };
+        let Ok(mut ring) = ring.try_lock() else {
+            return;
+        };
+        let Ok(done) = ring.maintain(signer, now) else {
+            return;
+        };
+        if done.changed() {
+            // A failed save is not fatal: the ring is saved with the next consume, and
+            // maintained again at the next unlock.
+            let _ = prekeys::save(profile.store(), signer, &ring);
+        }
+        crate::node::status::SyncBook::note_prekeys(
+            &self.sync_book,
+            ring.one_time_len(),
+            ring.consumed_len(),
+            ring.signed_prekey_id(),
+            done.rotated,
+            done.one_time_added,
+        );
     }
 
     async fn lock_all(&mut self) {

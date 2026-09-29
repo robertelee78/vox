@@ -92,13 +92,33 @@ impl Profile {
         let backup = IdentityBackup::new(&root, dh.secret_bytes(), &self_seed, &openpgp_fpr)?;
         let vault = IdentityVault::seal(&backup, passphrase, argon2)?;
         let fingerprint = root.fingerprint();
-        // Persist: vault file first (0600, atomic), then the store with the public
-        // facts. A crash between the two leaves a vault without meta, which `open`
-        // repairs from the vault on the next unlock.
-        write_private_file(&paths.vault_file(), &vault.to_canonical_vec())?;
-        let store = std::sync::Arc::new(Store::open(&paths.store_file())?);
+        // Persist: the store with the public facts first, then the vault file (0600,
+        // atomic), which is what makes the profile exist. A failure anywhere before the
+        // vault leaves no identity, so creating again works; the other order left a vault
+        // whose store had no fingerprint, which neither opens nor can be created over.
+        //
+        // **A store with no vault beside it is moved aside, never adopted** (V210-77).
+        // Everything in it is sealed under the identity whose vault is gone, so the new one
+        // could not open it — its prekeys, keyring and rooms would refuse every unlock. It is
+        // kept, renamed, in case that vault turns up again.
+        let store_file = paths.store_file();
+        if store_file.exists() {
+            // Never over another one kept aside: a rename replaces what is there.
+            let mut aside = store_file.with_extension(format!("redb.orphaned-{now_secs}"));
+            let mut n = 1u32;
+            while aside.exists() {
+                aside = store_file.with_extension(format!("redb.orphaned-{now_secs}-{n}"));
+                n += 1;
+            }
+            std::fs::rename(&store_file, &aside).map_err(|e| Error::Path {
+                op: "move aside a store with no vault",
+                detail: format!("{} -> {}: {e}", store_file.display(), aside.display()),
+            })?;
+        }
+        let store = std::sync::Arc::new(Store::open(&store_file)?);
         store.put_meta(META_FINGERPRINT, &fingerprint)?;
         store.put_meta(META_CREATED, &now_secs.to_be_bytes())?;
+        write_private_file(&paths.vault_file(), &vault.to_canonical_vec())?;
         let signer = VaultRootSigner::from_backup(&backup)?;
         drop(backup);
         Ok(Self {

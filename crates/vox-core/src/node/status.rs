@@ -99,6 +99,24 @@ pub struct SyncBook {
     /// Records by others that taught this node's board something and were passed on
     /// (`NetEvent::BoardGrew`, #179): a member's routine refresh is not one.
     board_news: u64,
+    /// The prekey ring as the running node last maintained it (V210-77), or `None` while it
+    /// holds no ring.
+    prekeys: Option<PrekeyCounts>,
+}
+
+/// What the prekey ring holds, and what keeping it up has done since the node started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrekeyCounts {
+    /// One-time prekeys left to offer.
+    pub one_time: usize,
+    /// Consumed one-time prekeys still retained for a concurrent duplicate use.
+    pub consumed: usize,
+    /// The id of the signed prekey offered now.
+    pub signed_prekey: u64,
+    /// Signed-prekey rotations the running node made.
+    pub rotated: u64,
+    /// One-time prekeys the running node added.
+    pub refilled: u64,
 }
 
 /// The book as the actor and the handles share it.
@@ -134,6 +152,24 @@ impl SyncBook {
         book.lock()
             .unwrap_or_else(PoisonError::into_inner)
             .board_news += 1;
+    }
+
+    /// Record the ring as it stands after a maintenance that `rotated` and added `added`.
+    pub fn note_prekeys(
+        book: &SharedSyncBook,
+        one_time: usize,
+        consumed: usize,
+        signed_prekey: u64,
+        rotated: bool,
+        added: usize,
+    ) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        let c = b.prekeys.get_or_insert_with(PrekeyCounts::default);
+        c.one_time = one_time;
+        c.consumed = consumed;
+        c.signed_prekey = signed_prekey;
+        c.rotated += u64::from(rotated);
+        c.refilled += u64::try_from(added).unwrap_or(u64::MAX);
     }
 
     /// Count one reachability ladder run to `peer`.
@@ -212,9 +248,20 @@ impl SyncBook {
         }
         let _ = write!(
             s,
-            "],\"publish\":{{\"rounds\":{},\"board_news\":{}}}}}",
+            "],\"publish\":{{\"rounds\":{},\"board_news\":{}}},\"prekeys\":",
             b.publish_rounds, b.board_news
         );
+        match b.prekeys {
+            Some(p) => {
+                let _ = write!(
+                    s,
+                    "{{\"one_time\":{},\"consumed\":{},\"signed_prekey\":{},\"rotated\":{},\
+                     \"refilled\":{}}}}}",
+                    p.one_time, p.consumed, p.signed_prekey, p.rotated, p.refilled
+                );
+            }
+            None => s.push_str("null}"),
+        }
         s
     }
 }

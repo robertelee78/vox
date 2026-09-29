@@ -22,8 +22,71 @@
 //! whether the lock succeeded ([`SecretBuf::is_mlocked`]) so callers/tests can
 //! observe the posture, but a failed lock is **not** an error — refusing to hold
 //! a secret because it could not be pinned would be strictly worse for the user.
+//!
+//! ## Pins are counted per page
+//! `mlock` and `munlock` work on whole pages and do not nest: one `munlock` unpins a page
+//! however many `mlock`s covered it. Two small buffers routinely share a heap page, so a
+//! short-lived key's drop used to unpin the page a live key still sat on. Every page is
+//! therefore pinned once, by the first buffer on it, and unpinned only when the last one
+//! leaves (`PINNED`).
+
+use std::collections::BTreeMap;
+use std::sync::{Mutex, PoisonError};
 
 use zeroize::Zeroize;
+
+/// Every page this process has pinned: its address, how many live [`SecretBuf`]s lie on
+/// it, and the guard whose drop unpins it.
+static PINNED: Mutex<BTreeMap<usize, (usize, region::LockGuard)>> = Mutex::new(BTreeMap::new());
+
+/// The page-aligned addresses `[addr, addr + len)` touches. `len` is non-zero.
+fn pages(addr: usize, len: usize) -> impl Iterator<Item = usize> {
+    let size = region::page::size();
+    let first = addr & !(size - 1);
+    let last = (addr + len - 1) & !(size - 1);
+    (first..=last).step_by(size)
+}
+
+/// Pin every page under `[addr, addr + len)`, counting it. All or nothing: a page that
+/// cannot be pinned releases the ones this call counted, and the answer is `false`.
+fn pin(addr: usize, len: usize) -> bool {
+    let size = region::page::size();
+    let mut pinned = PINNED.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut counted = Vec::new();
+    for page in pages(addr, len) {
+        if let Some((n, _)) = pinned.get_mut(&page) {
+            *n += 1;
+        } else if let Ok(guard) = region::lock(page as *const u8, size) {
+            pinned.insert(page, (1, guard));
+        } else {
+            for page in counted {
+                release(&mut pinned, page);
+            }
+            return false;
+        }
+        counted.push(page);
+    }
+    true
+}
+
+/// Uncount every page under `[addr, addr + len)`; a page no buffer lies on any more is
+/// unpinned.
+fn unpin(addr: usize, len: usize) {
+    let mut pinned = PINNED.lock().unwrap_or_else(PoisonError::into_inner);
+    for page in pages(addr, len) {
+        release(&mut pinned, page);
+    }
+}
+
+fn release(pinned: &mut BTreeMap<usize, (usize, region::LockGuard)>, page: usize) {
+    if let Some((n, _)) = pinned.get_mut(&page) {
+        *n -= 1;
+        if *n == 0 {
+            // The guard unpins the page as it drops.
+            pinned.remove(&page);
+        }
+    }
+}
 
 /// A heap buffer of secret bytes that is best-effort `mlock`-ed and always
 /// zeroized on drop.
@@ -31,15 +94,15 @@ use zeroize::Zeroize;
 /// The bytes live in a boxed slice (a stable heap address, so the `mlock` covers
 /// the actual storage and is not invalidated by a `Vec` realloc — the buffer is
 /// fixed-length for its whole life). On drop the bytes are zeroized first, then
-/// the `region` guard unlocks; on [`SecretBuf::lock_now`] the same zeroization
-/// happens eagerly for app-lock.
+/// its pages are uncounted, and unpinned if no other buffer lies on them; on
+/// [`SecretBuf::lock_now`] the same happens eagerly for app-lock.
 pub struct SecretBuf {
     /// The secret storage. Boxed so its address is stable for the lifetime of the
     /// `mlock`. `Option` only so [`Drop`]/`lock_now` can zeroize-then-take.
     bytes: Box<[u8]>,
-    /// The live `region` lock guard, if `mlock` succeeded. Dropping it unlocks.
-    /// `None` means the fallback path (zeroize-only, not pinned).
-    guard: Option<region::LockGuard>,
+    /// Whether this buffer's pages are counted in [`PINNED`]. `false` means the
+    /// fallback path (zeroize-only, not pinned).
+    pinned: bool,
 }
 
 impl SecretBuf {
@@ -55,15 +118,11 @@ impl SecretBuf {
     fn locked_with<F: FnOnce(&mut [u8])>(len: usize, fill: F) -> Self {
         // A zeroed allocation — no secret in it yet.
         let mut bytes: Box<[u8]> = vec![0u8; len].into_boxed_slice();
-        let guard = if bytes.is_empty() {
-            // `region::lock` rejects a zero-length region; nothing to pin.
-            None
-        } else {
-            region::lock(bytes.as_ptr(), bytes.len()).ok()
-        };
+        // A zero-length region has no page to pin.
+        let pinned = !bytes.is_empty() && pin(bytes.as_ptr() as usize, bytes.len());
         // Now that the page is (best-effort) pinned, write the secret into it.
         fill(&mut bytes);
-        Self { bytes, guard }
+        Self { bytes, pinned }
     }
 
     /// Wrap `data` in a best-effort-locked, zeroizing buffer, then zeroize the
@@ -114,7 +173,14 @@ impl SecretBuf {
     /// a `false` here is the defined zeroize-only fallback, not an error).
     #[must_use]
     pub fn is_mlocked(&self) -> bool {
-        self.guard.is_some()
+        self.pinned
+    }
+
+    /// Give this buffer's pins back, once.
+    fn release_pins(&mut self) {
+        if std::mem::take(&mut self.pinned) {
+            unpin(self.bytes.as_ptr() as usize, self.bytes.len());
+        }
     }
 
     /// Eagerly zeroize and unlock the buffer **now** (app-lock / idle / sleep,
@@ -124,17 +190,16 @@ impl SecretBuf {
     /// wait for `Drop`. Idempotent.
     pub fn lock_now(&mut self) {
         self.bytes.zeroize();
-        // Drop the region guard (unlock) by replacing it.
-        self.guard = None;
+        self.release_pins();
     }
 }
 
 impl Drop for SecretBuf {
     fn drop(&mut self) {
-        // Zeroize the contents *before* the guard unlocks, so the wipe happens
+        // Zeroize the contents *before* the pages are uncounted, so the wipe happens
         // while the page is still pinned (when it was pinned at all).
         self.bytes.zeroize();
-        // `guard` unlocks here as it drops.
+        self.release_pins();
     }
 }
 
