@@ -517,6 +517,9 @@ pub enum Fault {
     /// The change is the room admin's to make — a holder of the `policy` capability — and
     /// this identity is not one (PRD-001 R7: setting a room's retention).
     NotAdmin,
+    /// The room's stored log was written by vox before v0.3.0, whose message format changed;
+    /// v0.3.0 does not read it, and the room is made again (decider, 2026-09-29, #226).
+    RoomFromBeforeV030,
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }
@@ -598,6 +601,9 @@ impl Fault {
             }
             Fault::NotAdmin => {
                 "only the room's admin may change that, and this identity is not its admin\n       the admin is whoever created the room; ask them"
+            }
+            Fault::RoomFromBeforeV030 => {
+                "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and invite its members"
             }
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"

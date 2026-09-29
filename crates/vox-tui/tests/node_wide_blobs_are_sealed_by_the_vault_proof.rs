@@ -18,7 +18,9 @@
 //! 2. **Migration.** The **released v0.2.9 binary**, fetched and checked against its published
 //!    SHA-256, writes a profile. The attacker opens its keyring and prekey ring (the control that
 //!    the attacker's keys are the ones v0.2.9 used). The new binary then unlocks it: `vox trust
-//!    list` still names the trusted member, the room still reads, and the attacker now opens
+//!    list` still names the trusted member, the room is refused by name as one made before
+//!    v0.3.0 (whose format v0.3.0 does not read: the decider chose to make such rooms again,
+//!    2026-09-29, #226), and the attacker now opens
 //!    nothing.
 //! 3. **No way back.** On the migrated profile, the attacker plants a keyring sealed its way,
 //!    naming "mallory", and relabels the vault as version 1, which is what makes an unlock
@@ -39,7 +41,8 @@
 //! breaks (1); an unlock that does not migrate, or migrates without rewriting the store, breaks
 //! (2) and (2b); one that goes on when the rewrite fails breaks (2c); the vault's version left
 //! out of its AEAD, or a loader that falls back to the old key, breaks (3); the refusal reported
-//! as a wrong passphrase breaks (3a).
+//! as a wrong passphrase breaks (3a); a pre-v0.3.0 entry reported as a malformed one (an
+//! internal error) breaks (2).
 
 #![cfg(unix)]
 
@@ -533,15 +536,39 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         // the way a person running `vox daemon` does: a line with the room's passphrase.
         let with_room = tmp.path().join("idpass-with-room");
         std::fs::write(&with_room, format!("{IDENTITY}\n{room} room pass\n")).unwrap();
-        let _carol_d = daemon(&new, "carol", &carol, &spec, &with_room);
-        ok(&new, &carol, &["room", "read", &room], None)
+        let carol_d = daemon(&new, "carol", &carol, &spec, &with_room);
+        // v0.3.0 does not read a room written before it (ADR-023 decision 1; the decider chose
+        // "make it again", 2026-09-29, #226): the room line is refused **by that reason**, not
+        // as an internal error, and the room stays closed.
+        let said = |needle: &str| {
+            carol_d
+                .timed
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, l)| l.clone())
+                .filter(|l| l.contains(needle))
+                .collect::<Vec<_>>()
+        };
+        let deadline = Instant::now() + TIMEOUT;
+        while said("could not open that room").is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (read_ok, out, err) = vox_with(&new, &carol, &["room", "read", &room], None);
+        (
+            said("made by vox before v0.3.0").join(" | "),
+            said("a bug in vox").join(" | "),
+            read_ok,
+            format!("{out}{err}"),
+        )
     };
+    let (refused_by_name, called_a_bug, read_ok, read_said) = reads;
     println!(
         "[proof] after this build's first unlock: vault v{version_after}; the attacker opens \
          {theirs_after:?}; the vault's key opens {ours_after:?}; `trust list` names dave = {}; \
-         the room reads the v0.2.9 post = {}",
+         the v0.2.9 room is refused as made before v0.3.0: {refused_by_name:?}; called a bug: \
+         {called_a_bug:?}; `room read` succeeded = {read_ok}",
         listed.contains("dave"),
-        reads.contains("written by v0.2.9")
     );
     // What an adversary with the disk reads: the old seals must be gone from the files
     // themselves, not only from what the database considers live (redb is copy-on-write).
@@ -563,8 +590,9 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         "the migrated keyring lost dave: {listed}"
     );
     assert!(
-        reads.contains("written by v0.2.9"),
-        "the migrated profile cannot read its room: {reads}"
+        !refused_by_name.is_empty() && called_a_bug.is_empty() && !read_ok,
+        "a room written before v0.3.0 must be refused by that reason, never as a bug in vox, and \
+         stay closed (#226); `room read` said: {read_said}"
     );
     assert_eq!(
         ours_after.len(),
