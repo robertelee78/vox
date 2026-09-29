@@ -784,7 +784,7 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
     // at exactly the moment somebody is stuck.
     let advice = join_advice(match out {
         Outcome::Failed(fault) => Some(fault),
-        Outcome::Done => None,
+        Outcome::Done | Outcome::Bound(_) => None,
     });
 
     if said.is_empty() {
