@@ -30,12 +30,12 @@ use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
 use crate::hash::Digest32;
 use crate::identity::composite::{CompositePublicKey, RootSigner};
-use crate::log::dag::{AdmissionPolicy, Dag};
+use crate::log::dag::{AdmissionPolicy, Dag, ForkProof};
 use crate::log::entry::{Entry, EntryKind};
 use crate::log::sync::{frontier_session_peer, Transport};
 use crate::node::channel::{
-    authors_bytes, classify_payload, parse_authors, sync_failure, ChannelAuthors, SessionReport,
-    SyncFailure, SyncOutcome,
+    authors_bytes, classify_payload, forks_bytes, parse_authors, parse_forks, sync_failure,
+    ChannelAuthors, SessionReport, SyncFailure, SyncOutcome,
 };
 use crate::node::store::Store;
 
@@ -45,6 +45,17 @@ pub const ANCHOR_SEK_INFO: &[u8] = b"vox/anchor-log-sek/v1";
 
 /// The metadata segment's id within [`SegmentKind::AnchorMeta`].
 const SEG_META: u64 = 0;
+
+/// The fork-proof segment's id within [`SegmentKind::AnchorMeta`] (V210-66): what a member keeps
+/// in its own `SEG_FORKS`, kept by the anchor too. A restarted anchor rebuilt its DAG from stored
+/// entries, which hold one side of a fork only, and forgot every freeze: it took the
+/// equivocator's later entries again and served them on.
+///
+/// **Nothing new about the room is kept.** An anchor keeps nothing for a room it is not a member
+/// of beyond rendezvous and relay (the decider's direction); this is the small signed pair it
+/// already verified, in the anchor metadata it already keeps — two entries whose ciphertext it
+/// held anyway — so a freeze survives a restart. No content, no new class of room data.
+const SEG_FORKS: u64 = 1;
 
 /// Metadata encoding version.
 const META_VERSION: u64 = 1;
@@ -75,6 +86,8 @@ pub struct AnchorState {
     poisoned: bool,
     /// The copy's generation (ADR-025 D1): bumped by every entry persisted.
     gen: Arc<std::sync::atomic::AtomicU64>,
+    /// How many of the DAG's fork proofs are kept in `SEG_FORKS` (V210-66).
+    forks_kept: usize,
 }
 
 impl std::fmt::Debug for AnchorState {
@@ -115,6 +128,7 @@ impl AnchorState {
             sek,
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            forks_kept: 0,
         };
         state.rebuild_admission();
         state.persist_meta(store)?;
@@ -145,6 +159,7 @@ impl AnchorState {
             sek,
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            forks_kept: 0,
         };
         state.rebuild_admission();
         for (id, seg) in store.segments(channel_id, SegmentKind::AnchorLog)? {
@@ -166,7 +181,54 @@ impl AnchorState {
                 .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
             state.next_log_id = id.saturating_add(1);
         }
+        // The fork proofs this copy kept (V210-66), checked as a new one would be.
+        if let Some(seg) = store.get_segment(channel_id, SegmentKind::AnchorMeta, SEG_FORKS)? {
+            let bytes = open_segment(&state.sek, SegmentKind::AnchorMeta, SEG_FORKS, &seg)?;
+            for (existing, conflicting) in parse_forks(&bytes)? {
+                let author_id = existing.skeleton.author_id;
+                let Some(key) = state.authors.get(&author_id).cloned() else {
+                    continue;
+                };
+                let seq = existing.skeleton.seq;
+                state
+                    .dag
+                    .restore_fork(
+                        ForkProof {
+                            author_id,
+                            seq,
+                            existing,
+                            conflicting,
+                        },
+                        &key,
+                    )
+                    .map_err(|_| Error::MalformedAtRest("stored fork proof failed verification"))?;
+                state.forks_kept += 1;
+            }
+        }
         Ok(state)
+    }
+
+    /// Keep every fork proof the DAG holds in `SEG_FORKS`, if it holds more than are kept.
+    fn keep_forks(&mut self, store: &Store) -> Result<()> {
+        let proofs = self.dag.fork_proofs();
+        if proofs.len() <= self.forks_kept {
+            return Ok(());
+        }
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::AnchorMeta,
+            SEG_FORKS,
+            &forks_bytes(&proofs),
+        )?;
+        let kept = proofs.len();
+        if let Err(e) =
+            store.put_segment(&self.channel_id, SegmentKind::AnchorMeta, SEG_FORKS, &seg)
+        {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.forks_kept = kept;
+        Ok(())
     }
 
     /// The channelID.
@@ -197,6 +259,16 @@ impl AnchorState {
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// The members this copy holds back for equivocating (V210-66): each `(author, seq)`.
+    #[must_use]
+    pub fn equivocations(&self) -> Vec<(Digest32, u64)> {
+        self.dag
+            .fork_proofs()
+            .into_iter()
+            .map(|p| (p.author_id, p.seq))
+            .collect()
     }
 
     /// How many entries the anchor holds.
@@ -297,6 +369,8 @@ impl AnchorState {
         store: &Store,
         before: &BTreeMap<Digest32, u64>,
     ) -> Result<SyncOutcome> {
+        // A fork this sync recorded is kept before anything else (V210-66).
+        self.keep_forks(store)?;
         let mut arrived: Vec<Digest32> = Vec::new();
         for (author, head) in before {
             let Some(feed) = self.dag.feed(author) else {

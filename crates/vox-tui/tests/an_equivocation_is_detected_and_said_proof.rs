@@ -28,12 +28,17 @@
 //!   author, by the short id its rows use;
 //! - **held back**: eve's original posts again, and neither reads it, while a control message bob
 //!   posts reaches carol;
-//! - **kept**: with eve′ and frank′ stopped — so no sync can meet either fork again — carol's
-//!   daemon is restarted, and `vox status --json` still lists both.
+//! - **kept**: with **every other node stopped** — so nobody could show either fork again
+//!   (V210-66) — carol's daemon is restarted, and `vox status --json` still lists both;
+//! - **kept by the anchor**: the anchor, which said it holds eve and frank back, is restarted
+//!   alone and says both again (V210-66).
+//! - **in the TUI**: carol's real `vox tui`, in a pty, says both — each on its own line, by the
+//!   names carol gave them (V210-66).
 //!
 //! Mutations: the old `wants_for` (from past our head, no comparison of a shorter peer's head) —
 //! eve's fork is never listed; the `room read` notice removed; `keep_forks` doing nothing — the
-//! restarted carol lists neither.
+//! restarted carol lists neither; the anchor's `keep_forks` doing nothing — the restarted anchor
+//! says neither; the TUI drawing only the first — frank is never said.
 
 #![cfg(unix)]
 
@@ -42,6 +47,9 @@ mod world;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 
 use std::io::Write as _;
 use std::path::Path;
@@ -459,9 +467,26 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     }
     stop(eve);
 
-    // ---- kept: carol restarts with nobody left who could show her either fork again ------------
+    // ---- kept: every other node stops, so nobody could show either fork again (V210-66) ---------
+    // With a live peer holding the other side, a restarted node could meet the fork again and list
+    // it without having kept it (verifier-252). Here nobody is left to show it.
+    let anchor_holds = |said: &str, f: &str| {
+        said.lines()
+            .any(|l| l.contains(" board — ") && l.contains(&format!("holds {} back", short(f))))
+    };
+    let before = anchor.transcript();
+    for (name, f) in [("eve", &eve_fp), ("frank", &frank_fp)] {
+        assert!(
+            anchor_holds(&before, f),
+            "CANNOT MEASURE: the anchor never said it holds {name} back, so its restart proves \
+             nothing:\n{before}"
+        );
+    }
+    stop(bob);
+    stop(alice);
+    stop(anchor);
     stop(carol);
-    let _carol = daemon("carol", &carol_dir, &spec, &idpass);
+    let carol = daemon("carol", &carol_dir, &spec, &idpass);
     // Listed only once the room is open again, so an empty list is the room's, not a room not
     // yet reopened.
     assert!(
@@ -469,10 +494,66 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         "CANNOT MEASURE: carol's restarted daemon never reopened the room"
     );
     let after = listed(&carol_dir, &room_id);
-    eprintln!("[proof] carol, restarted, lists {after:?}");
+    eprintln!("[proof] carol, restarted alone, lists {after:?}");
     assert!(
         names(&after, &eve_fp) && names(&after, &frank_fp),
         "carol forgot an equivocation across a restart: she lists {after:?}"
     );
-    drop(alice);
+    stop(carol);
+
+    // ---- kept by the anchor too: it restarts alone, and says both again (V210-66) --------------
+    let mut anchor = VoxProc::spawn("anchor", &anchor_dir, &args(&["node", "--listen", &listen]));
+    let deadline = Instant::now() + REACH;
+    let mut said = String::new();
+    while Instant::now() < deadline {
+        said = anchor.transcript();
+        if anchor_holds(&said, &eve_fp) && anchor_holds(&said, &frank_fp) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    for (name, f) in [("eve", &eve_fp), ("frank", &frank_fp)] {
+        assert!(
+            anchor_holds(&said, f),
+            "the anchor forgot it holds {name} back across a restart:\n{said}"
+        );
+    }
+    stop(anchor);
+
+    // ---- the TUI says both, each on its own line, by carol's names for them (V210-66) ----------
+    // Carol's real `vox tui`, on her stopped profile, in a pty (`tests/pty/tui_equivocation.py`).
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_equivocation.py");
+    let (data, cfg) = (carol_dir.to_str().unwrap(), carol_dir.join("cfg"));
+    let out = pty_driver::run(
+        script,
+        &[
+            env!("CARGO_BIN_EXE_vox"),
+            "eq",
+            data,
+            cfg.to_str().unwrap(),
+            "eq",
+        ],
+    );
+    eprintln!(
+        "{}\n[proof] the TUI driver took {:?}; its last stage: {:?}",
+        out.stdout, out.took, out.stage
+    );
+    match out.code {
+        Some(0) => assert!(
+            out.stdout.contains("eq PASS"),
+            "exit 0 without PASS: {}",
+            out.stdout
+        ),
+        Some(2) => panic!("CANNOT MEASURE: the TUI apparatus failed: {}", out.stdout),
+        _ if !out.has_verdict("eq") => panic!(
+            "the TUI driver was stopped before it gave a verdict, at stage {:?} (exit {:?}): {}",
+            out.stage.as_deref().unwrap_or("(before its first stage)"),
+            out.code,
+            out.stdout
+        ),
+        _ => panic!(
+            "carol's TUI must say eve and frank are held back, each on its own line: {}",
+            out.stdout
+        ),
+    }
 }

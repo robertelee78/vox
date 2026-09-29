@@ -230,25 +230,23 @@ impl LiveCore {
                             body: Some(r.text.clone()),
                         })
                         .collect(),
+                    // **Every member held back, each on its own line** (V210-66): once one notice in
+                    // the one-line hint bar, where a second was cut off at the screen's edge.
+                    held_back: d
+                        .equivocations
+                        .iter()
+                        .map(|(author, seq)| {
+                            crate::ident::equivocation_notice(
+                                &crate::ident::member_name(&nv.trusted, author),
+                                *seq,
+                            )
+                        })
+                        .collect(),
                     reachability: Reachability::Offline,
                 })
         });
-        // A member held back for equivocating in the room on screen is said while the room is
-        // open (V210-63), by the name this operator gave them; another notice goes first.
-        let equivocation = self.active.and_then(|cid| {
-            nv.open_channels
-                .iter()
-                .find(|d| d.channel_id == cid)
-                .and_then(|d| d.equivocations.first())
-                .map(|(author, seq)| {
-                    crate::ident::equivocation_notice(
-                        &crate::ident::member_name(&nv.trusted, author),
-                        *seq,
-                    )
-                })
-        });
         ViewModel {
-            notice: self.notice.clone().or(equivocation),
+            notice: self.notice.clone(),
             channels,
             active,
             sync: SyncStatus::Idle,

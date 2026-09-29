@@ -1103,6 +1103,7 @@ impl NodeNet {
                             (r.author_id, addrs.collect())
                         })
                         .collect(),
+                    equivocations: Vec::new(),
                 }
             })
             .collect()

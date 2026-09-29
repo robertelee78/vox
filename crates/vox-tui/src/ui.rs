@@ -161,6 +161,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
     render_timeline(
         frame,
         body[0],
+        &channel.held_back,
         channel.timeline.as_slice(),
         focused(ui, Focus::Timeline),
     );
@@ -178,10 +179,22 @@ fn focused(ui: &UiState, pane: Focus) -> bool {
     ui.screen == Screen::Channel && ui.focus == pane && matches!(ui.mode, Mode::Normal)
 }
 
-fn render_timeline(frame: &mut Frame, area: Rect, timeline: &[MessageView], focus: bool) {
-    let lines: Vec<Line> = timeline
-        .iter()
-        .map(|m| {
+fn render_timeline(
+    frame: &mut Frame,
+    area: Rect,
+    held_back: &[String],
+    timeline: &[MessageView],
+    focus: bool,
+) {
+    // Who this room holds back for equivocating comes first, one line each (V210-66).
+    let notices = held_back.iter().map(|n| {
+        Line::from(Span::styled(
+            format!("! {n}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+    });
+    let lines: Vec<Line> = notices
+        .chain(timeline.iter().map(|m| {
             let body = m
                 .body
                 .clone()
@@ -193,7 +206,7 @@ fn render_timeline(frame: &mut Frame, area: Rect, timeline: &[MessageView], focu
                 ),
                 Span::raw(body),
             ])
-        })
+        }))
         .collect();
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
