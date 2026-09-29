@@ -1228,6 +1228,7 @@ fn event_loop(
     let mut was_locked: Option<bool> = None;
     loop {
         let vm = core.view();
+        ui.settle(&vm);
 
         // Onboarding / re-auth prompts: open once per transition, never on top of
         // another modal.
