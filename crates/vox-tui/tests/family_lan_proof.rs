@@ -80,6 +80,8 @@ use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vox_core::lan::packet::{ipv4_header_ok, ipv4_udp_ok, parse};
@@ -382,6 +384,11 @@ mod standin {
                         SendFlags::empty(),
                     )
                     .expect("hand the descriptor over");
+                    // As the helper does: hold our copy until `vox lan up` has its own
+                    // (it closes the connection). Dropped while in flight, macOS's
+                    // collector for descriptors in flight flushes it, and every write
+                    // into the interface fails with EINVAL.
+                    let _ = std::io::Read::read(&mut &stream, &mut [0u8; 1]);
                     drop(theirs);
                     let reader = ours.try_clone().expect("clone");
                     *me.end.lock().unwrap() = Some(ours);
@@ -473,6 +480,19 @@ impl Host {
         port_free(self.port);
         let allow = LISTED.to_string();
         let listen = format!("127.0.0.1:{}", self.port);
+        // While the interface is handed over, free local sockets as fast as possible, as a
+        // busy machine does: each free runs macOS's collector for descriptors in flight,
+        // so a descriptor left with no reference but the message is flushed every time
+        // rather than now and then.
+        let handing_over = Arc::new(AtomicBool::new(true));
+        let churn = {
+            let on = Arc::clone(&handing_over);
+            std::thread::spawn(move || {
+                while on.load(Ordering::Relaxed) {
+                    drop(std::os::unix::net::UnixDatagram::unbound());
+                }
+            })
+        };
         let mut p = VoxProc::spawn(
             &format!("lan {}", self.name),
             &self.dir,
@@ -497,6 +517,8 @@ impl Host {
         p.expect_within(SETUP, "vox lan up to come up", |l| {
             l.starts_with("vox lan up on ")
         });
+        handing_over.store(false, Ordering::Relaxed);
+        churn.join().expect("the socket churn");
         self.lan = Some(p);
         let _ = self.stats();
     }
