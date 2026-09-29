@@ -1032,14 +1032,17 @@ impl NodeArgs {
                  and `vox trust add <fingerprint>`"
             ))
         })?;
-        let passphrase = crate::tunnel_cli::identity_passphrase_for(
+        // Held only for the one unlock, and wiped when it goes: an anchor runs for months, and
+        // nothing it does after start needs the passphrase again.
+        let passphrase = zeroize::Zeroizing::new(crate::tunnel_cli::identity_passphrase_for(
             paths,
             self.identity_passphrase.clone(),
             self.identity_passphrase_file.clone(),
-        )?;
+        )?);
         profile
             .unlock(passphrase.as_bytes())
             .map_err(|e| refuse(format!("the identity did not unlock ({e})")))?;
+        drop(passphrase);
         let signer = profile
             .signer()
             .map_err(|e| refuse(format!("the identity did not unlock ({e})")))?;
