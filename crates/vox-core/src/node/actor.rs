@@ -1334,6 +1334,8 @@ struct Joiner {
     pow_params: Option<crate::join::pow::PowParams>,
     argon2: Argon2Profile,
     passphrase: Secret,
+    /// Where each step is announced as it begins: see [`NodeEvent::JoinStep`].
+    events: broadcast::Sender<NodeEvent>,
 }
 
 /// A caller's reply carried by a task that [`Node::lock_all`] may abort (V210-76): answered
@@ -1407,6 +1409,11 @@ impl JoinSteps {
 }
 
 impl Joiner {
+    /// Say which step the join has begun, so a join stopped part-way can name it (V210-85).
+    fn begin(&self, step: String) {
+        let _ = self.events.send(NodeEvent::JoinStep { step });
+    }
+
     /// Dial a peer, and tell the actor at once so it serves the connection's streams — the
     /// responder talks to us over it during the join itself.
     async fn dial(
@@ -1529,6 +1536,7 @@ impl Joiner {
         let parsed = &self.parsed;
         let net = Arc::clone(&self.net);
         let t = std::time::Instant::now();
+        self.begin(format!("reaching a board ({} route(s))", self.routes.len()));
         // **Which side was unreachable is part of the answer (#192).** A board that never answered,
         // or stopped answering while it was read, is `BoardUnreachable`; `Unreachable` below is
         // kept for a join whose board answered and whose members did not.
@@ -1538,6 +1546,10 @@ impl Joiner {
         };
         steps.took("board", t);
         let t = std::time::Instant::now();
+        self.begin(format!(
+            "reading the room from board {}",
+            crate::node::network::short_id(board.peer_id())
+        ));
         let fetched = net.fetch_channel(&board, &parsed.channel_id, 0).await;
         steps.took(
             if fetched.is_ok() {
@@ -1618,6 +1630,10 @@ impl Joiner {
             .to_wire()
         };
         let t = std::time::Instant::now();
+        self.begin(format!(
+            "announcing this joiner to board {}",
+            crate::node::network::short_id(board.peer_id())
+        ));
         let announced = announce(&board, &prejoin_wire).await;
         if announced.is_err() {
             steps.took("announce to the board (failed)", t);
@@ -1636,6 +1652,7 @@ impl Joiner {
             let short = crate::node::network::short_id(responder);
             if responder_endpoints.is_empty() && board.peer_id() != responder {
                 let t = std::time::Instant::now();
+                self.begin(format!("waiting for member {short} to publish an address"));
                 let mut polls = 0u32;
                 let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
                 while tokio::time::Instant::now() < deadline {
@@ -1673,6 +1690,7 @@ impl Joiner {
                 Arc::clone(&board)
             } else {
                 let t = std::time::Instant::now();
+                self.begin(format!("dialling member {short}"));
                 let dialled = self.dial(responder, &responder_endpoints, false).await;
                 steps.took(&format!("{short}: dial"), t);
                 match dialled {
@@ -1716,6 +1734,10 @@ impl Joiner {
             }
             let ik = crate::identity::keyagreement::X25519IdentityKey::from_secret_bytes(dh);
             let t = std::time::Instant::now();
+            self.begin(format!(
+                "the join exchange with member {short} (this machine's proof of work, then \
+                 the member's answer)"
+            ));
             let exchanged = net
                 .start_join(&conn, ctx, &self.passphrase, signer, &ik)
                 .await;
@@ -1771,6 +1793,7 @@ impl Joiner {
             self.argon2,
         );
         let t = std::time::Instant::now();
+        self.begin("sealing the room key under the passphrase".to_owned());
         let sealed = tokio::task::spawn_blocking(move || {
             let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
             sek.seal(&factor, &channel_id, &passphrase, argon2)
@@ -3876,6 +3899,10 @@ impl Node {
                             joined: true,
                             steps: won.steps.render(),
                         });
+                        let _ = self.event_tx.send(NodeEvent::JoinStep {
+                            step: "making the room here and publishing this member on its boards"
+                                .to_owned(),
+                        });
                         self.finish_join_channel(*parsed, local_name, passphrase, now, me, won)
                             .await
                     }
@@ -4999,6 +5026,7 @@ impl Node {
             pow_params: self.pow_params,
             argon2: self.argon2,
             passphrase: passphrase.clone(),
+            events: self.event_tx.clone(),
         };
         let tx = self.net_tx.clone();
         // **Tracked, so a lock aborts it** (V210-76). The joiner holds the vault signer, the
