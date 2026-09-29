@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 
 use vox_core::hash::Digest32;
 use vox_core::log::sync::{
-    decode_frame, encode_have, encode_hello, encode_want, SyncFrame, Transport, WantRange,
+    decode_frame, encode_have, encode_hello, encode_want, FeedFrontier, SyncFrame, Transport,
+    WantRange,
 };
 use vox_core::node::api::NodeView;
 use vox_core::node::paths::Paths;
@@ -46,6 +47,10 @@ pub struct Yield {
     pub wires: Vec<Vec<u8>>,
     /// Why the session ended, if not cleanly.
     pub ended: Option<String>,
+    /// The victim's `WANT`, as it asked it.
+    pub asked: Vec<WantRange>,
+    /// How many offered entries the victim asked for, and so were served.
+    pub served: usize,
 }
 
 /// The `WANT` to send: everything the victim lists, or a fixed hostile one.
@@ -104,18 +109,21 @@ pub fn session(
     ask: &Ask,
     sent_want: Option<std::sync::mpsc::Sender<()>>,
 ) -> Yield {
-    session_pushing(t, ask, sent_want, &[])
+    session_offering(t, ask, sent_want, &[])
 }
 
-/// [`session`], but serving `push` — entry wire frames of the caller's choosing — in the
-/// serve phase, whatever the victim asked for. The drain phase applies whatever entries
-/// arrive, so this is how a gate hands a victim an entry it would never `WANT`: a second,
-/// conflicting entry for a position it already holds.
-pub fn session_pushing(
+/// [`session`], but **offering** entries of the caller's choosing: each `(frontier, wire)` is
+/// listed in this peer's `HAVE` as that feed's head, and the entry is served only if the
+/// victim's `WANT` asks for its position. A victim refuses an entry it did not ask for as a
+/// protocol violation (ADR-025 P9), before its log ever sees it, so an offer is the only way an
+/// entry of the caller's choosing reaches the victim's log: a second, conflicting entry for a
+/// position it holds is asked for because the head it is offered as differs from its own
+/// (V210-63).
+pub fn session_offering(
     mut t: QuicStreamTransport,
     ask: &Ask,
     sent_want: Option<std::sync::mpsc::Sender<()>>,
-    push: &[Vec<u8>],
+    offer: &[(FeedFrontier, Vec<u8>)],
 ) -> Yield {
     let mut y = Yield::default();
     if let Err(e) = t.send(&encode_hello(SYNC_MODE_FRONTIER)) {
@@ -129,7 +137,8 @@ pub fn session_pushing(
             return y;
         }
     }
-    if let Err(e) = t.send(&encode_have(&[])) {
+    let heads: Vec<FeedFrontier> = offer.iter().map(|(f, _)| *f).collect();
+    if let Err(e) = t.send(&encode_have(&heads)) {
         y.ended = Some(format!("send HAVE: {e:?}"));
         return y;
     }
@@ -166,19 +175,32 @@ pub fn session_pushing(
     if let Some(tx) = sent_want {
         let _ = tx.send(());
     }
-    // The victim's WANT, then our (empty) serve, then FIN so its drain ends.
+    // The victim's WANT, then our serve (only what it asked for), then FIN so its drain ends.
     match t.recv() {
-        Ok(Some(f)) if matches!(decode_frame(&f), Ok(SyncFrame::Want(_))) => {}
+        Ok(Some(f)) => match decode_frame(&f) {
+            Ok(SyncFrame::Want(v)) => y.asked = v,
+            other => {
+                y.ended = Some(format!("no WANT: {other:?}"));
+                return y;
+            }
+        },
         other => {
             y.ended = Some(format!("no WANT: {other:?}"));
             return y;
         }
     }
-    for wire in push {
+    for (head, wire) in offer {
+        let wanted = y.asked.iter().any(|w| {
+            w.author_id == head.author_id && w.from_seq <= head.max_seq && head.max_seq <= w.to_seq
+        });
+        if !wanted {
+            continue;
+        }
         if let Err(e) = t.send(&vox_core::log::sync::encode_entry(wire)) {
             y.ended = Some(format!("send ENTRY: {e:?}"));
             return y;
         }
+        y.served += 1;
     }
     t.finish();
     loop {
@@ -205,13 +227,13 @@ pub fn session_pushing(
     }
 }
 
-/// Open a sync stream for `(channel_id, epoch)` on `conn` and run [`session_pushing`] on it.
-pub async fn ask_pushing(
+/// Open a sync stream for `(channel_id, epoch)` on `conn` and run [`session_offering`] on it.
+pub async fn ask_offering(
     conn: &VoxConnection,
     channel_id: Digest32,
     epoch: u64,
     ask: Ask,
-    push: Vec<Vec<u8>>,
+    offer: Vec<(FeedFrontier, Vec<u8>)>,
 ) -> Yield {
     let handle = tokio::runtime::Handle::current();
     let t = match vox_core::node::syncstream::open_sync(conn, handle, &channel_id, epoch).await {
@@ -223,7 +245,7 @@ pub async fn ask_pushing(
             }
         }
     };
-    tokio::task::spawn_blocking(move || session_pushing(t, &ask, None, &push))
+    tokio::task::spawn_blocking(move || session_offering(t, &ask, None, &offer))
         .await
         .expect("the session thread")
 }

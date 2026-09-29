@@ -510,9 +510,13 @@ async fn as_member(
 }
 
 /// As the room's author (whose node is stopped), connect to `victim` at `victim_at`, read the
-/// entry the victim holds at `seq` of the author's feed, and hand the victim a **second**
-/// entry for that position, signed by the author. Returns `(was the held entry's body pruned,
-/// was it still signed, how the push session ended)`.
+/// entry the victim holds at `seq` of the author's feed — waiting, up to 60 s, until whether it
+/// still carries its signature is `expect_signed` (a checkpoint takes time to reach it) — and
+/// **offer** the victim a second entry for that position, signed by the author, as the head of
+/// the author's feed. The victim asks for it because that head differs from its own (V210-63);
+/// an entry it did not ask for it would refuse as a protocol violation (ADR-025 P9) before its
+/// log saw it. Returns `(seq, was the held entry's body pruned, was it still signed, how many
+/// offered entries the victim asked for, how the session ended)`.
 fn equivocate(
     author: &Path,
     author_id: vox_core::hash::Digest32,
@@ -520,7 +524,8 @@ fn equivocate(
     victim_at: &str,
     channel_id: vox_core::hash::Digest32,
     seq: Option<u64>,
-) -> (u64, bool, bool, Option<String>) {
+    expect_signed: bool,
+) -> (u64, bool, bool, usize, Option<String>) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -548,30 +553,43 @@ fn equivocate(
         }
         let head = have.expect("the victim listed the author's feed");
         let seq = seq.unwrap_or(head - 4);
-        let mut held = None;
-        for _ in 0..40 {
-            let y = raw_sync::ask(
-                &conn,
-                channel_id,
-                0,
-                Ask::Ranges(vec![WantRange {
-                    author_id,
-                    from_seq: seq,
-                    to_seq: seq,
-                }]),
-                None,
-            )
-            .await;
-            if y.hello {
-                held = y.wires.first().cloned();
-                break;
+        let waiting = Instant::now();
+        let held = loop {
+            let mut held = None;
+            for _ in 0..40 {
+                let y = raw_sync::ask(
+                    &conn,
+                    channel_id,
+                    0,
+                    Ask::Ranges(vec![WantRange {
+                        author_id,
+                        from_seq: seq,
+                        to_seq: seq,
+                    }]),
+                    None,
+                )
+                .await;
+                if y.hello {
+                    held = y.wires.first().cloned();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        let held = Entry::from_wire(&held.expect("the victim served its entry at that position"))
-            .expect("a well-formed entry");
+            let held =
+                Entry::from_wire(&held.expect("the victim served its entry at that position"))
+                    .expect("a well-formed entry");
+            if held.is_signed() == expect_signed || waiting.elapsed() > Duration::from_secs(60) {
+                break held;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
         let pruned = held.payload.is_none();
         let signed = held.is_signed();
+        println!(
+            "R10: bob's entry at seq {seq} read signed={signed} after {:?} (waited for \
+             signed={expect_signed})",
+            waiting.elapsed()
+        );
         // The same position, a different body: an equivocation only the author could sign.
         let mut sk = held.skeleton.clone();
         let body = format!("a conflicting entry for seq {seq}");
@@ -579,18 +597,25 @@ fn equivocate(
         sk.payload_len = body.len() as u64;
         let conflicting =
             Entry::build_signed_skeleton_only(&*signer, sk).expect("sign the conflicting entry");
+        let head = vox_core::log::sync::FeedFrontier {
+            author_id,
+            max_seq: seq,
+            head_hash: conflicting.entry_hash(),
+        };
         let mut ended = Some("never answered".to_owned());
+        let mut served = 0;
         for _ in 0..40 {
-            let y = raw_sync::ask_pushing(
+            let y = raw_sync::ask_offering(
                 &conn,
                 channel_id,
                 0,
                 Ask::Ranges(vec![]),
-                vec![conflicting.to_wire()],
+                vec![(head, conflicting.to_wire())],
             )
             .await;
             if y.hello {
                 ended = y.ended;
+                served = y.served;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -598,7 +623,7 @@ fn equivocate(
         drop(conn);
         drop(ep);
         drop(profile);
-        (seq, pruned, signed, ended)
+        (seq, pruned, signed, served, ended)
     })
 }
 
@@ -664,8 +689,15 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     // Alice's node is stopped so the conflicting entry is signed with her own key, and started
     // again after: it finds bob and carol at the addresses it last reached them on.
     drop(alice_d.take());
-    let (seq, pruned, signed, ended) =
-        equivocate(&alice, alice_id, bob_id, &bob_at, channel_id, Some(5));
+    let (seq, pruned, signed, served, ended) = equivocate(
+        &alice,
+        alice_id,
+        bob_id,
+        &bob_at,
+        channel_id,
+        Some(5),
+        false,
+    );
     alice_d = Some(daemon(
         &alice,
         "alice-2",
@@ -675,7 +707,7 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     ));
     println!(
         "R10: below the checkpoint — bob held seq {seq} pruned={pruned} signed={signed}; the \
-         conflicting entry's session ended {ended:?}"
+         conflicting entry was asked for {served} time(s); its session ended {ended:?}"
     );
     assert!(
         pruned,
@@ -689,6 +721,11 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     // held side has shed its signature cannot freeze anyone in any case — it cannot incriminate —
     // so "bob still reads alice" is what both a refusal and a fork that proves nothing look like.
     // Only bob's count of entries refused below a checkpoint tells them apart.
+    assert_eq!(
+        served, 1,
+        "bob must ask for the conflicting entry offered as alice's head, once (V210-63): \
+         otherwise nothing reached his log to refuse"
+    );
     assert!(
         ended.is_none(),
         "a refused entry does not end the session (ADR-008): {ended:?}"
@@ -727,8 +764,8 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
         count(t, "b ") == 0
     });
     drop(alice_d.take());
-    let (seq, pruned, signed, ended) =
-        equivocate(&alice, alice_id, bob_id, &bob_at, channel_id, None);
+    let (seq, pruned, signed, served, ended) =
+        equivocate(&alice, alice_id, bob_id, &bob_at, channel_id, None, true);
     let _a = daemon(
         &alice,
         "alice-3",
@@ -738,7 +775,7 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     );
     println!(
         "R10: above the checkpoint — bob held seq {seq} pruned={pruned} signed={signed}; the \
-         conflicting entry's session ended {ended:?}"
+         conflicting entry was asked for {served} time(s); its session ended {ended:?}"
     );
     assert!(
         pruned,
@@ -747,6 +784,10 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     assert!(
         signed,
         "above the checkpoint the expired skeleton keeps its signature"
+    );
+    assert_eq!(
+        served, 1,
+        "bob must ask for the conflicting entry offered as alice's head, once (V210-63)"
     );
     assert!(
         ended.is_none(),
