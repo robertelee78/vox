@@ -334,8 +334,9 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
     // **The port is the service tag** (ADR-017 decision 4), so nothing here invents a name,
     // and the **host** decides whether the dial is allowed — this side claims nothing.
     let tag = port.to_string();
-    // `_carried` is held for the whole splice: see [`open_tunnel`].
-    let (send, recv, _carried) = match open_tunnel(dialer, &room.host, &room.channel_id, &tag).await
+    // `carried` is held for the whole splice (see [`open_tunnel`]), and credits the tunnel a
+    // receive window of its own on it.
+    let (send, recv, carried) = match open_tunnel(dialer, &room.host, &room.channel_id, &tag).await
     {
         Ok(streams) => streams,
         Err(why) => {
@@ -351,6 +352,7 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
         }
     };
     socks::write_reply(&mut stream, Reply::Succeeded, UNSPECIFIED).await?;
+    let _credit = carried.carry_tunnel();
     match crate::tunnel::session::splice(send, recv, stream).await {
         // The session was established and then cut by a decision. Report it; every other
         // ending is silent (M17.11).

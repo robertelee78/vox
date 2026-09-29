@@ -119,6 +119,10 @@ const MEMBER_REDIAL_SECS: u64 = 30;
 /// circuit's stream, which happens on the endpoint driver's next turn.
 const RELAYED_CLOSE_LEAD: Duration = Duration::from_millis(50);
 
+/// How long a stopping node waits for tunnels that finished their stream to have their last bytes
+/// acknowledged before it closes its connections (see `stop_network`).
+const STOP_ACK_BOUND: Duration = Duration::from_secs(5);
+
 /// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
@@ -2819,6 +2823,10 @@ impl Node {
     /// node presents no network identity at all.
     async fn stop_network(&mut self) {
         if let Some(net) = self.net.take() {
+            // **A finished tunnel's last bytes first.** A close drops what the peer has not yet
+            // acknowledged, so a node stopped right after a reply was finished cut it short at
+            // the far end (V210-81).
+            crate::tunnel::session::all_acknowledged(STOP_ACK_BOUND).await;
             // **Relayed connections first**, while the circuits their closes travel in still run,
             // then everything else. Closing them all at once closed each circuit's carrier in the
             // same instant, so a relayed peer never received the CONNECTION_CLOSE. It learned this
@@ -4244,7 +4252,6 @@ impl Node {
                         // better path appearing does not close it under a live session.
                         let carried = Arc::clone(&connection);
                         tokio::spawn(async move {
-                            let _carried = carried;
                             let refusals = events.clone();
                             let served = crate::node::tunnel::serve_reporting(
                                 peer,
@@ -4252,6 +4259,7 @@ impl Node {
                                 recv,
                                 snapshot,
                                 Some(events),
+                                Some(&carried),
                             )
                             .await;
                             // The result used to be dropped here, so a host refusing a member —

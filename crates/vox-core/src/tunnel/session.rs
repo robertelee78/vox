@@ -19,6 +19,7 @@
 //! topology.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use quinn::{RecvStream, SendStream};
 use tokio::net::TcpStream;
@@ -415,6 +416,43 @@ pub async fn splice(send: SendStream, recv: RecvStream, tcp: TcpStream) -> Resul
     splice_until(send, recv, tcp, std::future::pending()).await
 }
 
+/// How long a tunnel that has sent its last byte waits for the peer to acknowledge it.
+///
+/// Bounded because the peer may be gone: a connection that has died fails the wait long before
+/// this, and a peer that stays silent must not hold a finished tunnel for ever.
+pub const ACK_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Tunnels in this process that have finished their stream and are waiting for the peer to
+/// acknowledge the last bytes (see [`all_acknowledged`]).
+static FINISHING: AtomicUsize = AtomicUsize::new(0);
+
+/// One tunnel between its `finish` and the peer's acknowledgement of everything it sent.
+struct Finishing;
+
+impl Finishing {
+    fn start() -> Self {
+        FINISHING.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        FINISHING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Wait, up to `bound`, until no tunnel in this process is waiting for its last bytes to be
+/// acknowledged. A node calls this before it closes its connections: `finish` only queues the
+/// end of the stream, and a close drops whatever the peer has not acknowledged, so a node
+/// stopped just after a reply was finished cut that reply short at the far end (V210-81).
+pub async fn all_acknowledged(bound: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    while FINISHING.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// How one direction of a splice ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Leg {
@@ -446,6 +484,13 @@ async fn splice_until(
                 match tcp_r.read(&mut buf).await {
                     Ok(0) => {
                         let _ = send.finish();
+                        // **Acknowledged, not just queued.** `finish` hands the end of the
+                        // stream to quinn; the bytes before it may still be in flight. Held
+                        // until the peer has them, this task keeps its connection carried
+                        // (so a retired connection is not closed under it), and a node that
+                        // is stopping waits for it (`all_acknowledged`).
+                        let _finishing = Finishing::start();
+                        let _ = tokio::time::timeout(ACK_BOUND, send.stopped()).await;
                         return Leg::Clean;
                     }
                     Ok(n) => {

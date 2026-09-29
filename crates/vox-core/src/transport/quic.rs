@@ -192,14 +192,22 @@ const UDP_SOCKET_BUFFER: usize = 4 << 20;
 /// bandwidth-delay product of a 1 Gbit/s path at ~130 ms, or 10 Gbit/s at ~13 ms.
 pub const STREAM_WINDOW: u32 = 16 << 20;
 
-/// Flow-control credit a peer gets for the whole connection, across all its streams: what this
-/// node will buffer for one peer that sends and is not read.
+/// Flow-control credit a peer gets for the whole connection, across all its streams, **before
+/// any tunnel runs on it**: what this node will buffer for one peer that sends and is not read.
 ///
 /// quinn's default is unlimited, which is safe only while the per-stream window is small. At
 /// [`STREAM_WINDOW`] a peer may open quinn's default 100 concurrent bidirectional streams, so an
 /// unlimited connection window let one peer park 100 × 16 MiB = 1.6 GiB in this node's memory
-/// by writing into streams nobody reads. Two full stream windows keeps a single tunnel at full
-/// speed, and lets a second one run beside it.
+/// by writing into streams nobody reads.
+///
+/// **Each running tunnel adds its own [`STREAM_WINDOW`] on top** ([`VoxConnection::carry_tunnel`]).
+/// A tunnel whose local reader stops reading keeps a full stream window unread, and the
+/// connection's credit is shared: at a fixed two stream windows, two such tunnels held all of it,
+/// and the room's sync, pairwise keys and board records to that peer got none — a post waited out
+/// a 20 s frame timeout and failed (V210-81). With each tunnel bringing its own window, what the
+/// tunnels hold can never reach this base, so everything else keeps it. Only tunnels this node
+/// authorized, or opened for its own local application, are credited, so an unauthorized peer
+/// still gets exactly this.
 pub const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
 
 /// quinn's own path-MTU ceiling (`MtuDiscoveryConfig::default().upper_bound`): 1500-byte Ethernet
@@ -506,7 +514,7 @@ impl VoxEndpoint {
             .endpoint
             .connect_with(client_cfg, addr, "vox.invalid")
             .map_err(|_| Error::MalformedBundle("quic connect"))?;
-        let connection = connecting.await.map_err(|_| Error::SignatureInvalid)?; // handshake/auth failure
+        let connection = connecting.await.map_err(handshake_failed)?;
         finish_connection(connection, &verified, now_secs, via_circuit)
     }
 
@@ -596,11 +604,16 @@ impl VoxEndpoint {
         // beginning a handshake and never finishing it.
         let connecting = incoming
             .accept_with(Arc::new(server_cfg))
-            .map_err(|_| Error::SignatureInvalid)?;
+            .map_err(handshake_failed)?;
         let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
             .await
-            .map_err(|_| Error::SignatureInvalid)?
-            .map_err(|_| Error::SignatureInvalid)?;
+            .map_err(|_| {
+                Error::Handshake(format!(
+                    "the peer did not finish its handshake within {}s",
+                    HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(handshake_failed)?;
         let conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
 
         // Transport-layer admission, after authentication. A non-admitted peer is
@@ -622,6 +635,26 @@ impl VoxEndpoint {
     /// Clone the private key (rustls `PrivateKeyDer` is clone-by-method).
     fn clone_key(&self) -> rustls_pki_types::PrivateKeyDer<'static> {
         self.leaf_key.clone_key()
+    }
+}
+
+/// What a failed QUIC handshake is reported as: a failure of authentication as
+/// [`Error::SignatureInvalid`], anything else by its own cause ([`Error::Handshake`]).
+///
+/// Authentication happens inside TLS, so it fails as a TLS alert: a QUIC crypto error
+/// (`0x100`–`0x1ff`), raised here when the peer's certificate does not verify or names another
+/// identity, or received from a peer that refused ours. Everything else — a refusal, a close, a
+/// peer that never answered, this endpoint closing — is not about keys, and saying "signature
+/// verification failed" for it sent the operator after the wrong thing.
+fn handshake_failed(e: quinn::ConnectionError) -> Error {
+    use quinn::ConnectionError as C;
+    let tls = |code: quinn::TransportErrorCode| (0x100..0x200).contains(&u64::from(code));
+    match e {
+        C::TransportError(t) if tls(t.code) => Error::SignatureInvalid,
+        C::ConnectionClosed(c) if tls(c.error_code) => Error::SignatureInvalid,
+        C::TimedOut => Error::Handshake("the peer did not answer".to_owned()),
+        C::LocallyClosed => Error::Handshake("this node's endpoint is closing".to_owned()),
+        other => Error::Handshake(other.to_string()),
     }
 }
 
@@ -663,6 +696,7 @@ fn finish_connection(
         datagram_tx: Mutex::new(DatagramSender::new()),
         datagram_rx: Mutex::new(ReplayWindow::default()),
         datagrams_dropped: AtomicU64::new(0),
+        tunnels: Mutex::new(0),
     })
 }
 
@@ -737,12 +771,47 @@ pub struct VoxConnection {
     /// for observability ([`VoxConnection::datagrams_dropped`]); a rising count
     /// on a live connection is a replay signal worth surfacing.
     datagrams_dropped: AtomicU64,
+    /// Tunnels running on this connection, each credited a stream window of its own
+    /// ([`VoxConnection::carry_tunnel`]).
+    tunnels: Mutex<u32>,
+}
+
+/// A tunnel's share of its connection's receive window, held for as long as the tunnel runs
+/// (see [`CONNECTION_WINDOW`]). Dropping it gives the share back.
+#[must_use = "the credit lasts only as long as the guard is held"]
+pub struct TunnelCredit<'a>(&'a VoxConnection);
+
+impl Drop for TunnelCredit<'_> {
+    fn drop(&mut self) {
+        let mut n = lock(&self.0.tunnels);
+        *n = n.saturating_sub(1);
+        self.0.set_tunnel_window(*n);
+    }
 }
 
 /// The next [`VoxConnection::serial`].
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 impl VoxConnection {
+    /// Credit one more running tunnel with a stream window of its own on top of
+    /// [`CONNECTION_WINDOW`], for as long as the returned guard is held — so a tunnel whose
+    /// local reader has stopped cannot take the credit the room's other streams need.
+    ///
+    /// Take it only for a tunnel this node authorized or opened for its own application: the
+    /// credit is memory this node agrees to hold for that peer.
+    pub fn carry_tunnel(&self) -> TunnelCredit<'_> {
+        let mut n = lock(&self.tunnels);
+        *n = n.saturating_add(1);
+        self.set_tunnel_window(*n);
+        TunnelCredit(self)
+    }
+
+    fn set_tunnel_window(&self, tunnels: u32) {
+        let window = u64::from(CONNECTION_WINDOW) + u64::from(tunnels) * u64::from(STREAM_WINDOW);
+        self.connection
+            .set_receive_window(quinn::VarInt::from_u64(window).unwrap_or(quinn::VarInt::MAX));
+    }
+
     /// **A name for this connection that no other connection in this process is ever given.**
     ///
     /// quinn's `stable_id` is not one: it is the address of the connection's state, and a
