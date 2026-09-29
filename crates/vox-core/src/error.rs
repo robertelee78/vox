@@ -97,6 +97,17 @@ pub enum Error {
     #[error("malformed identity bundle: {0}")]
     MalformedBundle(&'static str),
 
+    /// A message on a node's control socket could not be decoded (#211). Its own variant, never
+    /// [`Self::MalformedBundle`]: a bad or unknown IPC frame said "malformed identity bundle", which
+    /// points at identity corruption.
+    #[error("malformed control-socket message: {0}")]
+    MalformedIpc(&'static str),
+
+    /// A client sent the node a request it does not know: most often a client from another vox
+    /// version (#211).
+    #[error("the node does not know this request (the client may be a different vox version)")]
+    UnknownIpcRequest,
+
     /// A received CPace public share or the derived shared point `K` was the
     /// group identity (ADR-005 CPace `scalar_mult_vfy` MUST-abort). The session
     /// is aborted: the peer either sent a degenerate share or no agreement
@@ -251,6 +262,22 @@ pub enum Error {
     #[error("peer unreachable — {0}")]
     LadderExhausted(String),
 
+    /// This node could not listen on a local address it was told to use.
+    ///
+    /// Carried whole rather than as a `&'static str`: "quic endpoint bind" was the only thing
+    /// the daemon could say when its `--listen` port was taken, and it reached the person as
+    /// `Failed(Internal)` — a bug report for what is an occupied port (PRD-001 R36).
+    #[error("cannot listen on {addr}: {reason}")]
+    LocalBind {
+        /// The address that could not be bound.
+        addr: std::net::SocketAddr,
+        /// Whether something else already holds it (the common case, and the one with an
+        /// obvious fix).
+        in_use: bool,
+        /// What the operating system said.
+        reason: String,
+    },
+
     /// A tunnel operation was refused by authorization (ADR-013): the requesting
     /// member holds no valid `dial:<service>` capability (or the host no
     /// `bind:<service>`), or the service is dark/unknown. Default-deny: the absence
@@ -350,4 +377,67 @@ pub enum Error {
         /// The underlying OS message.
         detail: String,
     },
+
+    /// Attaching to a node's control socket failed before any request: the connect, or
+    /// the node's greeting. Said in a person's words, because each one needs a different
+    /// remedy and they used to share one sentence (#191).
+    #[error("{0}")]
+    Ipc(IpcHandshake),
+
+    /// A sync session did not complete, carrying the ADR-008 coded reason (#202).
+    ///
+    /// **Not [`Self::MalformedGovernance`].** Every sync failure used to be wrapped in it, so a
+    /// peer's ordinary refusal of a colliding session read "malformed governance struct: sync
+    /// failed: transport", which points at data corruption and cannot be told apart from a path
+    /// that died.
+    #[error("sync failed: {0}")]
+    SyncFailed(crate::wire::WireError),
+
+    /// A sync session did not complete because **the peer refused** it, with this coded reason.
+    /// Kept apart from [`Self::SyncFailed`] and [`Self::SyncRejected`] so that a report can say
+    /// which end stopped the session (#202's follow-up: all three used to read the same).
+    #[error("sync failed: the peer refused: {0}")]
+    SyncRefused(crate::wire::WireError),
+
+    /// A sync session did not complete because **this node** refused what the peer sent, with
+    /// this coded reason: an entry the log would not accept, or a frame out of protocol.
+    #[error("sync failed: this node refused what the peer sent: {0}")]
+    SyncRejected(crate::wire::WireError),
+
+    /// The peer reset or stopped the stream with a coded reason (an ADR-008 [`WireError`]):
+    /// it refused, deliberately, and said why. Distinct from [`Self::Unreachable`], which is a
+    /// stream or connection that went away with nothing said.
+    ///
+    /// [`WireError`]: crate::wire::WireError
+    #[error("the peer refused: {0}")]
+    PeerRefused(crate::wire::WireError),
+}
+
+/// How an attach to a node's control socket failed ([`Error::Ipc`]).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum IpcHandshake {
+    /// The connect itself failed: nothing is listening on the socket.
+    #[error("nothing is listening on the control socket ({reason})")]
+    Unreachable {
+        /// The OS message.
+        reason: String,
+    },
+    /// Something accepted the connection and closed it without greeting.
+    #[error("the node closed the connection before greeting")]
+    ClosedBeforeHello,
+    /// The node greeted in another control protocol: the two are different vox versions.
+    #[error(
+        "the node speaks a different control protocol (this vox is protocol {mine}, the node is \
+         protocol {theirs}); update one of them"
+    )]
+    Protocol {
+        /// The protocol this vox speaks.
+        mine: u64,
+        /// The protocol the node greeted with.
+        theirs: u64,
+    },
+    /// What answered did not greet at all.
+    #[error("what answered on the control socket did not greet like a vox node")]
+    NotHello,
 }

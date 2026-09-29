@@ -259,7 +259,7 @@ pub fn refusal(room: &str, table: &VersionTable) -> AppError {
     for p in table.mismatched() {
         msg.push_str(&format!(
             "\n  worker {} session {} runs vox {}; required {}",
-            &b32_encode(&p.author)[..12],
+            crate::ident::author_id(&p.author),
             if p.session.is_empty() {
                 "(none)"
             } else {

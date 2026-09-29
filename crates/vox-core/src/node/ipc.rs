@@ -49,7 +49,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::cbor::{Decoder, Encoder};
-use crate::error::{Error, Result};
+use crate::error::{Error, IpcHandshake, Result};
 use crate::hash::Digest32;
 use crate::node::actor::{EventStream, EventStreamItem, NodeHandle};
 use crate::node::api::{MessageRow, NodeEvent};
@@ -70,9 +70,61 @@ pub const MAX_FRAME: usize = 256 * 1024;
 /// Half a frame, so an estimate that ran short would still fit.
 pub const ROWS_BUDGET: usize = MAX_FRAME / 2;
 
+/// The environment variable [`frame_limit`] reads. **Test-only.**
+pub const TEST_MAX_FRAME_ENV: &str = "VOX_TEST_MAX_FRAME";
+
+/// The smallest frame [`TEST_MAX_FRAME_ENV`] may set: half of it still carries the largest room
+/// or trusted-identity entry, so a listing still pages.
+pub const MIN_TEST_FRAME: usize = 4 * 1024;
+
+/// The largest frame accepted in force: [`MAX_FRAME`], or **lower**, read once from
+/// [`TEST_MAX_FRAME_ENV`]. **Test-only: for proofs; nothing in a real deployment sets it.**
+///
+/// #189's proof shows that `vox room list` and `vox trust list` name every entry past one frame,
+/// through the shipped binary. At the real 256 KiB frame that takes about 1,540 rooms, each
+/// sealed with production Argon2id, which does not fit a watchdog; the decider puts a node's
+/// realistic ceiling at a couple of hundred rooms. With a smaller frame, a couple of hundred
+/// rooms outgrow one, so a reply that is not paged fails exactly as the defect did ("ipc frame
+/// length"), and a paged one crosses several pages. It only ever lowers the limit, clamped to
+/// [`MIN_TEST_FRAME`]..=[`MAX_FRAME`]; unset, empty or unparsable is [`MAX_FRAME`]. Under it, a
+/// single row larger than half the frame (a long message) is refused, so a proof that sets it
+/// keeps its rows small.
+#[must_use]
+pub fn frame_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var(TEST_MAX_FRAME_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(MAX_FRAME, |n| n.clamp(MIN_TEST_FRAME, MAX_FRAME))
+    })
+}
+
+/// What one reply may carry in force: half of [`frame_limit`] ([`ROWS_BUDGET`] unless a proof
+/// lowered the frame).
+#[must_use]
+pub fn rows_budget() -> usize {
+    frame_limit() / 2
+}
+
 /// Everything a row carries besides its text — two 32-byte hashes, a timestamp and the
 /// CBOR around them — rounded up.
 pub const ROW_OVERHEAD: usize = 128;
+
+/// At most this many entries in one page of a `Rooms` or `Trusted` reply. Bytes bound
+/// a page too ([`ROWS_BUDGET`]); the count keeps pages small enough that a proof can
+/// show paging with a hundred entries rather than thousands.
+pub const PAGE_ENTRIES: usize = 64;
+
+/// Everything a `Rooms` or `Trusted` entry carries besides its name — a 32-byte id,
+/// a flag and the CBOR around them — rounded up.
+pub const ENTRY_OVERHEAD: usize = 64;
+
+// A page always carries at least one entry, so the largest entry must fit by itself.
+const _: () = assert!(
+    crate::node::channel::MAX_LOCAL_NAME_LEN + ENTRY_OVERHEAD <= ROWS_BUDGET
+        && crate::node::trust::MAX_PETNAME + ENTRY_OVERHEAD <= ROWS_BUDGET
+);
 
 // A reply always carries at least one row, so the largest row must fit a frame by itself.
 const _: () = assert!(crate::node::content::MAX_TEXT_LEN + ROW_OVERHEAD <= ROWS_BUDGET);
@@ -115,10 +167,20 @@ const T_STALLED: u64 = 1715;
 const T_PEER_UNREACHABLE: u64 = 1716;
 /// `NodeEvent::PublishRefused`. Additive, and deliberately away from the sequential range.
 const T_PUBLISH_REFUSED: u64 = 1717;
+/// `NodeEvent::PublishCured` (V210-51). Additive, away from both the sequential range and the tags
+/// the v0.3.0 line uses.
+const T_PUBLISH_CURED: u64 = 2091;
+/// `NodeEvent::ConnectionNote` (#229's diagnostics). Additive, beside `T_PUBLISH_CURED`.
+const T_CONNECTION_NOTE: u64 = 2092;
 /// [`NodeEvent::JoinSteps`]: where a join's time went.
 const T_JOIN_STEPS: u64 = 1718;
 /// `NodeEvent::KeyNotTaken`.
 const T_KEY_NOT_TAKEN: u64 = 1719;
+/// A sync session with a peer did not complete, and why (#202).
+const T_SYNC_FAILED: u64 = 1720;
+/// [`NodeEvent::RoomNotRemembered`] (#208). Additive, and far from the other additive tags so a
+/// concurrently-developed branch that takes 1721 does not collide with it.
+const T_ROOM_NOT_REMEMBERED: u64 = 2081;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -204,8 +266,12 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
-    /// Every room this node holds.
-    Rooms,
+    /// The rooms this node holds, in room-id order, after `after` — one page of them.
+    /// [`IpcClient::rooms`] asks for every page.
+    Rooms {
+        /// The last room of the previous page, or `None` for the first.
+        after: Option<Digest32>,
+    },
     /// Offer a local TCP endpoint as a room-bound service (ADR-013).
     AddService {
         /// The room.
@@ -290,6 +356,8 @@ pub enum Request {
     TrustList {
         /// The identity passphrase.
         identity_passphrase: String,
+        /// The last fingerprint of the previous page, or `None` for the first.
+        after: Option<Digest32>,
     },
 }
 
@@ -321,8 +389,10 @@ impl Request {
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
             }
-            Request::Rooms => {
-                e.array(1).uint(T_ROOMS_REQ);
+            Request::Rooms { after } => {
+                e.array(2)
+                    .uint(T_ROOMS_REQ)
+                    .bytes(after.as_ref().map_or(&[][..], |d| &d[..]));
             }
             Request::AddService {
                 channel_id,
@@ -402,8 +472,12 @@ impl Request {
             }
             Request::TrustList {
                 identity_passphrase,
+                after,
             } => {
-                e.array(2).uint(T_TRUST_LIST).text(identity_passphrase);
+                e.array(3)
+                    .uint(T_TRUST_LIST)
+                    .text(identity_passphrase)
+                    .bytes(after.as_ref().map_or(&[][..], |d| &d[..]));
             }
         }
         e.finish()
@@ -412,44 +486,40 @@ impl Request {
     /// Parse one request body.
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(b);
-        let n = d
-            .array()
-            .map_err(|_| Error::MalformedBundle("ipc request"))?;
+        let n = d.array().map_err(|_| Error::MalformedIpc("ipc request"))?;
         let tag = d
             .uint()
-            .map_err(|_| Error::MalformedBundle("ipc request tag"))?;
+            .map_err(|_| Error::MalformedIpc("ipc request tag"))?;
         match (tag, n) {
             (T_SUBSCRIBE, 1) => {
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Subscribe)
             }
             (T_POST, 3) => {
                 let channel_id = digest(&mut d)?;
                 let text = d
                     .text()
-                    .map_err(|_| Error::MalformedBundle("ipc post text"))?
+                    .map_err(|_| Error::MalformedIpc("ipc post text"))?
                     .to_owned();
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Post { channel_id, text })
             }
             (T_READ, 4) => {
                 let channel_id = digest(&mut d)?;
-                let cursor = d
-                    .bytes()
-                    .map_err(|_| Error::MalformedBundle("ipc cursor"))?;
+                let cursor = d.bytes().map_err(|_| Error::MalformedIpc("ipc cursor"))?;
                 let since = if cursor.is_empty() {
                     None
                 } else {
                     Some(
                         Digest32::try_from(cursor)
-                            .map_err(|_| Error::MalformedBundle("ipc cursor length"))?,
+                            .map_err(|_| Error::MalformedIpc("ipc cursor length"))?,
                     )
                 };
-                let limit = d.uint().map_err(|_| Error::MalformedBundle("ipc limit"))?;
+                let limit = d.uint().map_err(|_| Error::MalformedIpc("ipc limit"))?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Read {
                     channel_id,
                     since,
@@ -459,20 +529,30 @@ impl Request {
             (T_ROSTER, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
             }
+            // The unpaged form (no `after`), as any release before #189 sends it: read as the first
+            // page. Refused, a worker on an older release died at its first room lookup with
+            // "ipc request unknown tag" and never reached the version check that exists to refuse it
+            // by name (ADR-021 M21.1, work_version_proof).
             (T_ROOMS_REQ, 1) => {
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
-                Ok(Request::Rooms)
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Rooms { after: None })
+            }
+            (T_ROOMS_REQ, 2) => {
+                let after = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Rooms { after })
             }
             (T_TRUST, 4) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
                 let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Trust {
                     target,
                     petname,
@@ -483,18 +563,30 @@ impl Request {
                 let target = digest(&mut d)?;
                 let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Untrust {
                     target,
                     identity_passphrase,
                 })
             }
+            // The unpaged form, as for `Rooms` above.
             (T_TRUST_LIST, 2) => {
                 let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::TrustList {
                     identity_passphrase,
+                    after: None,
+                })
+            }
+            (T_TRUST_LIST, 3) => {
+                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                let after = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::TrustList {
+                    identity_passphrase,
+                    after,
                 })
             }
             (T_ADD_SERVICE, 4) => {
@@ -502,7 +594,7 @@ impl Request {
                 let service_tag = text(&mut d, "ipc service tag")?;
                 let local = text(&mut d, "ipc local address")?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::AddService {
                     channel_id,
                     service_tag,
@@ -513,7 +605,7 @@ impl Request {
                 let channel_id = digest(&mut d)?;
                 let service_tag = text(&mut d, "ipc service tag")?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::RemoveService {
                     channel_id,
                     service_tag,
@@ -525,7 +617,7 @@ impl Request {
                 let service_tag = text(&mut d, "ipc service tag")?;
                 let local = text(&mut d, "ipc local address")?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Forward {
                     channel_id,
                     host,
@@ -536,7 +628,7 @@ impl Request {
             (T_STOP_FORWARD, 2) => {
                 let local = text(&mut d, "ipc local address")?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::StopForward { local })
             }
             (T_JOIN, 4) => {
@@ -544,7 +636,7 @@ impl Request {
                 let local_name = text(&mut d, "ipc join name")?;
                 let passphrase = text(&mut d, "ipc join passphrase")?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Join {
                     link,
                     local_name,
@@ -555,7 +647,7 @@ impl Request {
                 let local_name = text(&mut d, "ipc create name")?;
                 let passphrase = text(&mut d, "ipc create passphrase")?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Create {
                     local_name,
                     passphrase,
@@ -564,10 +656,10 @@ impl Request {
             (T_INVITE, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
-                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
             }
-            _ => Err(Error::MalformedBundle("ipc request unknown tag")),
+            _ => Err(Error::UnknownIpcRequest),
         }
     }
 }
@@ -710,36 +802,41 @@ impl Frame {
     /// Parse one frame body.
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(b);
-        let n = d.array().map_err(|_| Error::MalformedBundle("ipc frame"))?;
-        let tag = d
-            .uint()
-            .map_err(|_| Error::MalformedBundle("ipc frame tag"))?;
+        let n = d.array().map_err(|_| Error::MalformedIpc("ipc frame"))?;
+        let tag = d.uint().map_err(|_| Error::MalformedIpc("ipc frame tag"))?;
         let out = decode_body(&mut d, tag, n)?;
         d.finish()
-            .map_err(|_| Error::MalformedBundle("ipc frame trailing"))?;
+            .map_err(|_| Error::MalformedIpc("ipc frame trailing"))?;
         Ok(out)
     }
 }
 
 fn digest(d: &mut Decoder<'_>) -> Result<Digest32> {
-    let b = d
-        .bytes()
-        .map_err(|_| Error::MalformedBundle("ipc digest"))?;
-    Digest32::try_from(b).map_err(|_| Error::MalformedBundle("ipc digest length"))
+    let b = d.bytes().map_err(|_| Error::MalformedIpc("ipc digest"))?;
+    Digest32::try_from(b).map_err(|_| Error::MalformedIpc("ipc digest length"))
+}
+
+/// A page cursor: empty bytes for "from the start", else a digest.
+fn optional_digest(d: &mut Decoder<'_>) -> Result<Option<Digest32>> {
+    let b = d.bytes().map_err(|_| Error::MalformedIpc("ipc cursor"))?;
+    if b.is_empty() {
+        return Ok(None);
+    }
+    Digest32::try_from(b)
+        .map(Some)
+        .map_err(|_| Error::MalformedIpc("ipc cursor length"))
 }
 
 /// A CBOR text string, named so a decode failure says which field it was.
 fn text(d: &mut Decoder<'_>, what: &'static str) -> Result<String> {
-    Ok(d.text()
-        .map_err(|_| Error::MalformedBundle(what))?
-        .to_owned())
+    Ok(d.text().map_err(|_| Error::MalformedIpc(what))?.to_owned())
 }
 
 fn addr(d: &mut Decoder<'_>) -> Result<std::net::SocketAddr> {
     d.text()
-        .map_err(|_| Error::MalformedBundle("ipc addr"))?
+        .map_err(|_| Error::MalformedIpc("ipc addr"))?
         .parse()
-        .map_err(|_| Error::MalformedBundle("ipc addr syntax"))
+        .map_err(|_| Error::MalformedIpc("ipc addr syntax"))
 }
 
 fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
@@ -820,8 +917,34 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .text(what)
                 .text(why);
         }
+        NodeEvent::PublishCured { channel_id, what } => {
+            e.array(3)
+                .uint(T_PUBLISH_CURED)
+                .bytes(channel_id)
+                .text(what);
+        }
+        NodeEvent::ConnectionNote { peer, note } => {
+            e.array(3).uint(T_CONNECTION_NOTE).bytes(peer).text(note);
+        }
+        NodeEvent::SyncFailed {
+            channel_id,
+            peer,
+            reason,
+        } => {
+            e.array(4)
+                .uint(T_SYNC_FAILED)
+                .bytes(channel_id)
+                .bytes(peer)
+                .text(reason);
+        }
         NodeEvent::JoinFailed { reason } => {
             e.array(2).uint(T_JOIN_FAILED).text(reason);
+        }
+        NodeEvent::RoomNotRemembered { channel_id, why } => {
+            e.array(3)
+                .uint(T_ROOM_NOT_REMEMBERED)
+                .bytes(channel_id)
+                .text(why);
         }
         NodeEvent::JoinSteps { joined, steps } => {
             e.array(3)
@@ -913,23 +1036,23 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
 fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
     let ev = match (tag, n) {
         (T_HELLO, 3) => {
-            let protocol = d.uint().map_err(|_| Error::MalformedBundle("ipc hello"))?;
+            let protocol = d.uint().map_err(|_| Error::MalformedIpc("ipc hello"))?;
             let fp = d
                 .bytes()
-                .map_err(|_| Error::MalformedBundle("ipc hello identity"))?;
+                .map_err(|_| Error::MalformedIpc("ipc hello identity"))?;
             let me = if fp.is_empty() {
                 None
             } else {
                 Some(
                     Digest32::try_from(fp)
-                        .map_err(|_| Error::MalformedBundle("ipc hello identity length"))?,
+                        .map_err(|_| Error::MalformedIpc("ipc hello identity length"))?,
                 )
             };
             return Ok(Frame::Hello { protocol, me });
         }
         (T_LAGGED, 2) => {
             return Ok(Frame::Lagged {
-                missed: d.uint().map_err(|_| Error::MalformedBundle("ipc lagged"))?,
+                missed: d.uint().map_err(|_| Error::MalformedIpc("ipc lagged"))?,
             })
         }
         (T_OK, 1) => return Ok(Frame::Ok),
@@ -937,34 +1060,32 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             return Ok(Frame::Error {
                 reason: d
                     .text()
-                    .map_err(|_| Error::MalformedBundle("ipc error reason"))?
+                    .map_err(|_| Error::MalformedIpc("ipc error reason"))?
                     .to_owned(),
             })
         }
         (T_ROWS, 2) => {
-            let n = d.array().map_err(|_| Error::MalformedBundle("ipc rows"))?;
+            let n = d.array().map_err(|_| Error::MalformedIpc("ipc rows"))?;
             let mut rows = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
-                let arity = d.array().map_err(|_| Error::MalformedBundle("ipc row"))?;
+                let arity = d.array().map_err(|_| Error::MalformedIpc("ipc row"))?;
                 if arity != 4 {
-                    return Err(Error::MalformedBundle("ipc row arity"));
+                    return Err(Error::MalformedIpc("ipc row arity"));
                 }
                 rows.push(MessageRow {
                     entry_hash: digest(d)?,
                     author: digest(d)?,
-                    created_millis: d.uint().map_err(|_| Error::MalformedBundle("ipc millis"))?,
+                    created_millis: d.uint().map_err(|_| Error::MalformedIpc("ipc millis"))?,
                     text: d
                         .text()
-                        .map_err(|_| Error::MalformedBundle("ipc text"))?
+                        .map_err(|_| Error::MalformedIpc("ipc text"))?
                         .to_owned(),
                 });
             }
             return Ok(Frame::Rows { rows });
         }
         (T_MEMBERS, 2) => {
-            let n = d
-                .array()
-                .map_err(|_| Error::MalformedBundle("ipc members"))?;
+            let n = d.array().map_err(|_| Error::MalformedIpc("ipc members"))?;
             let mut members = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 members.push(digest(d)?);
@@ -982,22 +1103,19 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             });
         }
         (T_ROOMS, 2) => {
-            let n = d.array().map_err(|_| Error::MalformedBundle("ipc rooms"))?;
+            let n = d.array().map_err(|_| Error::MalformedIpc("ipc rooms"))?;
             let mut rooms = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
-                let arity = d.array().map_err(|_| Error::MalformedBundle("ipc room"))?;
+                let arity = d.array().map_err(|_| Error::MalformedIpc("ipc room"))?;
                 if arity != 3 {
-                    return Err(Error::MalformedBundle("ipc room arity"));
+                    return Err(Error::MalformedIpc("ipc room arity"));
                 }
                 let id = digest(d)?;
                 let name = d
                     .text()
-                    .map_err(|_| Error::MalformedBundle("ipc room name"))?
+                    .map_err(|_| Error::MalformedIpc("ipc room name"))?
                     .to_owned();
-                let open = d
-                    .uint()
-                    .map_err(|_| Error::MalformedBundle("ipc room open"))?
-                    != 0;
+                let open = d.uint().map_err(|_| Error::MalformedIpc("ipc room open"))? != 0;
                 rooms.push((id, name, open));
             }
             return Ok(Frame::Rooms { rooms });
@@ -1005,19 +1123,19 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_TRUSTED, 2) => {
             let count = d
                 .array()
-                .map_err(|_| Error::MalformedBundle("ipc trusted array"))?;
+                .map_err(|_| Error::MalformedIpc("ipc trusted array"))?;
             let mut entries = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
                 let arity = d
                     .array()
-                    .map_err(|_| Error::MalformedBundle("ipc trusted row"))?;
+                    .map_err(|_| Error::MalformedIpc("ipc trusted row"))?;
                 if arity != 2 {
-                    return Err(Error::MalformedBundle("ipc trusted row arity"));
+                    return Err(Error::MalformedIpc("ipc trusted row arity"));
                 }
                 let id = digest(d)?;
                 let petname = d
                     .text()
-                    .map_err(|_| Error::MalformedBundle("ipc trusted petname"))?
+                    .map_err(|_| Error::MalformedIpc("ipc trusted petname"))?
                     .to_owned();
                 entries.push((id, petname));
             }
@@ -1027,10 +1145,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let channel_id = digest(d)?;
             let entry_hash = digest(d)?;
             let author = digest(d)?;
-            let created_millis = d.uint().map_err(|_| Error::MalformedBundle("ipc millis"))?;
+            let created_millis = d.uint().map_err(|_| Error::MalformedIpc("ipc millis"))?;
             let text = d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc text"))?
+                .map_err(|_| Error::MalformedIpc("ipc text"))?
                 .to_owned();
             NodeEvent::NewEntry {
                 channel_id,
@@ -1060,90 +1178,117 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             peer: digest(d)?,
             why: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc why"))?
+                .map_err(|_| Error::MalformedIpc("ipc why"))?
                 .to_owned(),
         },
         (T_SENDER_KEY, 4) => NodeEvent::SenderKeyReceived {
             channel_id: digest(d)?,
             peer: digest(d)?,
-            backfilled: d.uint().map_err(|_| Error::MalformedBundle("ipc n"))?,
+            backfilled: d.uint().map_err(|_| Error::MalformedIpc("ipc n"))?,
         },
         (T_FORWARDING, 5) => NodeEvent::Forwarding {
             channel_id: digest(d)?,
             host: digest(d)?,
             service_tag: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc tag"))?
+                .map_err(|_| Error::MalformedIpc("ipc tag"))?
                 .to_owned(),
             local: addr(d)?,
         },
         (T_STALLED, 3) => NodeEvent::Stalled {
             what: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc stall what"))?
+                .map_err(|_| Error::MalformedIpc("ipc stall what"))?
                 .to_owned(),
-            millis: d
-                .uint()
-                .map_err(|_| Error::MalformedBundle("ipc stall ms"))?,
+            millis: d.uint().map_err(|_| Error::MalformedIpc("ipc stall ms"))?,
+        },
+        (T_SYNC_FAILED, 4) => NodeEvent::SyncFailed {
+            channel_id: digest(d)?,
+            peer: digest(d)?,
+            reason: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc sync failed reason"))?
+                .to_owned(),
+        },
+        (T_ROOM_NOT_REMEMBERED, 3) => NodeEvent::RoomNotRemembered {
+            channel_id: digest(d)?,
+            why: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc room not remembered why"))?
+                .to_owned(),
+        },
+        (T_CONNECTION_NOTE, 3) => NodeEvent::ConnectionNote {
+            peer: digest(d)?,
+            note: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc connection note"))?
+                .to_owned(),
+        },
+        (T_PUBLISH_CURED, 3) => NodeEvent::PublishCured {
+            channel_id: digest(d)?,
+            what: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc publish cured what"))?
+                .to_owned(),
         },
         (T_PUBLISH_REFUSED, 4) => NodeEvent::PublishRefused {
             channel_id: digest(d)?,
             what: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc publish what"))?
+                .map_err(|_| Error::MalformedIpc("ipc publish what"))?
                 .to_owned(),
             why: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc publish why"))?
+                .map_err(|_| Error::MalformedIpc("ipc publish why"))?
                 .to_owned(),
         },
         (T_JOIN_STEPS, 3) => NodeEvent::JoinSteps {
             joined: match d.uint()? {
                 0 => false,
                 1 => true,
-                _ => return Err(Error::MalformedBundle("ipc join steps flag")),
+                _ => return Err(Error::MalformedIpc("ipc join steps flag")),
             },
             steps: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc join steps"))?
+                .map_err(|_| Error::MalformedIpc("ipc join steps"))?
                 .to_owned(),
         },
         (T_JOIN_FAILED, 2) => NodeEvent::JoinFailed {
             reason: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc join reason"))?
+                .map_err(|_| Error::MalformedIpc("ipc join reason"))?
                 .to_owned(),
         },
         (T_STILL_RELAYED, 3) => NodeEvent::StillRelayed {
             peer: digest(d)?,
             reason: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc relayed reason"))?
+                .map_err(|_| Error::MalformedIpc("ipc relayed reason"))?
                 .to_owned(),
         },
         (T_PROXY_REFUSED, 2) => NodeEvent::ProxyRefused {
             reason: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc proxy refusal reason"))?
+                .map_err(|_| Error::MalformedIpc("ipc proxy refusal reason"))?
                 .to_owned(),
         },
         (T_PEER_UNREACHABLE, 3) => NodeEvent::PeerUnreachable {
             peer: digest(d)?,
             why: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc unreachable reason"))?
+                .map_err(|_| Error::MalformedIpc("ipc unreachable reason"))?
                 .to_owned(),
         },
         (T_REACH_WITHDRAWN, 3) => NodeEvent::ReachWithdrawn {
             channel_id: digest(d)?,
-            port: u16::try_from(d.uint().map_err(|_| Error::MalformedBundle("ipc port"))?)
-                .map_err(|_| Error::MalformedBundle("ipc port range"))?,
+            port: u16::try_from(d.uint().map_err(|_| Error::MalformedIpc("ipc port"))?)
+                .map_err(|_| Error::MalformedIpc("ipc port range"))?,
         },
         (T_INVITE_LINK, 3) => NodeEvent::InviteLink {
             channel_id: digest(d)?,
             url: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc url"))?
+                .map_err(|_| Error::MalformedIpc("ipc url"))?
                 .to_owned(),
         },
         (T_JOINED, 3) => NodeEvent::Joined {
@@ -1157,37 +1302,31 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_REVOKED, 5) => NodeEvent::Revoked {
             channel_id: digest(d)?,
             target: digest(d)?,
-            generation: d.uint().map_err(|_| Error::MalformedBundle("ipc gen"))?,
-            rekeyed: d
-                .uint()
-                .map_err(|_| Error::MalformedBundle("ipc rekeyed"))?,
+            generation: d.uint().map_err(|_| Error::MalformedIpc("ipc gen"))?,
+            rekeyed: d.uint().map_err(|_| Error::MalformedIpc("ipc rekeyed"))?,
         },
         (T_TUNNEL_SERVED, 4) => NodeEvent::TunnelServed {
             channel_id: digest(d)?,
             client: digest(d)?,
             service_tag: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc tag"))?
+                .map_err(|_| Error::MalformedIpc("ipc tag"))?
                 .to_owned(),
         },
         (T_PROXY_UP, 4) => NodeEvent::ProxyUp {
             channel_id: digest(d)?,
             hostname: d
                 .text()
-                .map_err(|_| Error::MalformedBundle("ipc host"))?
+                .map_err(|_| Error::MalformedIpc("ipc host"))?
                 .to_owned(),
             bind: addr(d)?,
         },
         (T_SYNCED, 4) => NodeEvent::Synced {
             channel_id: digest(d)?,
-            applied: d
-                .uint()
-                .map_err(|_| Error::MalformedBundle("ipc applied"))?,
-            rendered: d
-                .uint()
-                .map_err(|_| Error::MalformedBundle("ipc rendered"))?,
+            applied: d.uint().map_err(|_| Error::MalformedIpc("ipc applied"))?,
+            rendered: d.uint().map_err(|_| Error::MalformedIpc("ipc rendered"))?,
         },
-        _ => return Err(Error::MalformedBundle("ipc frame unknown tag")),
+        _ => return Err(Error::MalformedIpc("ipc frame unknown tag")),
     };
     Ok(Frame::Event(ev))
 }
@@ -1200,10 +1339,10 @@ pub async fn write_frame(s: &mut UnixStream, body: &[u8]) -> Result<()> {
         u32::try_from(body.len()).map_err(|_| Error::SizeLimitExceeded("ipc frame length"))?;
     s.write_all(&len.to_be_bytes())
         .await
-        .map_err(|_| Error::MalformedBundle("ipc write len"))?;
+        .map_err(|_| Error::MalformedIpc("ipc write len"))?;
     s.write_all(body)
         .await
-        .map_err(|_| Error::MalformedBundle("ipc write body"))?;
+        .map_err(|_| Error::MalformedIpc("ipc write body"))?;
     Ok(())
 }
 
@@ -1214,16 +1353,16 @@ pub async fn read_frame(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
     match s.read_exact(&mut len_buf).await {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(_) => return Err(Error::MalformedBundle("ipc read len")),
+        Err(_) => return Err(Error::MalformedIpc("ipc read len")),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
+    if len > frame_limit() {
         return Err(Error::SizeLimitExceeded("ipc frame length"));
     }
     let mut body = vec![0u8; len];
     s.read_exact(&mut body)
         .await
-        .map_err(|_| Error::MalformedBundle("ipc read body"))?;
+        .map_err(|_| Error::MalformedIpc("ipc read body"))?;
     Ok(Some(body))
 }
 
@@ -1324,6 +1463,11 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         let Some(body) = read_frame(&mut stream).await? else {
             return Ok(());
         };
+        // ADR-025 S0b: `vox status --json`. Answered, and the connection serves on.
+        if crate::node::status::is_request(&body) {
+            crate::node::status::serve(&mut stream, handle.sync_book()).await?;
+            continue;
+        }
         let request = match Request::from_bytes(&body) {
             Ok(r) => r,
             Err(e) => {
@@ -1380,6 +1524,46 @@ async fn verify_operator(
     }
 }
 
+/// One page of a collection reply: entries in id order, strictly after `after`, at most
+/// [`PAGE_ENTRIES`] of them and at most [`ROWS_BUDGET`] bytes, and at least one while any
+/// remain.
+///
+/// **Every collection reply is paged** (V210-16). `Rooms` used to be the whole list in one
+/// frame, and the client refuses a frame over `MAX_FRAME`: past about 1,540 rooms at the
+/// longest local name, `vox room list` and every command that resolves a room by name
+/// stopped working, and rooms are unbounded. `Trusted` is bounded — the keyring holds at
+/// most `MAX_TRUSTED` (1,024) entries, about 100 KiB — and is paged the same way so that
+/// no collection reply depends on a cap elsewhere staying small.
+/// Ordering by id rather than by position means a page boundary survives a room being
+/// added or removed between pages: the next page starts at the first id past the cursor.
+fn page<T>(
+    mut items: Vec<T>,
+    after: Option<Digest32>,
+    key: impl Fn(&T) -> (Digest32, usize),
+) -> Vec<T> {
+    items.sort_by_key(|t| key(t).0);
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for t in items {
+        let (id, len) = key(&t);
+        if after.is_some_and(|a| id <= a) {
+            continue;
+        }
+        let cost = len + ENTRY_OVERHEAD;
+        if !out.is_empty() && (out.len() >= PAGE_ENTRIES || bytes + cost > rows_budget()) {
+            break;
+        }
+        bytes += cost;
+        out.push(t);
+    }
+    out
+}
+
+/// `text` on one line, so a detail line in a [`Frame::Error`] stays one line.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Answer one request against the node.
 ///
 /// Every failure comes back as [`Frame::Error`] rather than ending the
@@ -1407,7 +1591,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             },
         },
@@ -1424,16 +1608,19 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             },
         },
         Request::TrustList {
             identity_passphrase,
+            after,
         } => match verify_operator(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => Frame::Trusted {
-                entries: handle.view().trusted,
+                entries: page(handle.view().trusted, after, |(id, petname)| {
+                    (*id, petname.len())
+                }),
             },
         },
         Request::Post { channel_id, text } => {
@@ -1443,7 +1630,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1491,7 +1678,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     break;
                 }
                 let cost = r.text.len() + ROW_OVERHEAD;
-                if !rows.is_empty() && bytes + cost > ROWS_BUDGET {
+                if !rows.is_empty() && bytes + cost > rows_budget() {
                     break;
                 }
                 bytes += cost;
@@ -1499,6 +1686,10 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }
             Frame::Rows { rows }
         }
+        // **Not paged, and bounded by the product's scale.** A room is at most 500 members
+        // (PRD-001's family scale); a member is a 32-byte key, so a roster is ~17 KiB of a
+        // 256 KiB frame. A frame would hold ~7,700; paging this is owed only if that scale
+        // ever rises past a few thousand (V210-16).
         Request::Roster { channel_id } => {
             let view = handle.view();
             match view
@@ -1534,7 +1725,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1550,7 +1741,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         {
             crate::node::api::Outcome::Done => Frame::Ok,
             other => Frame::Error {
-                reason: format!("{other:?}"),
+                reason: other.to_string(),
             },
         },
         Request::Forward {
@@ -1564,9 +1755,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     reason: format!("not a local address: {local:?}"),
                 };
             };
-            // Subscribe **before** asking, so the `Forwarding` event cannot be
-            // emitted and missed between the command and the wait.
-            let mut events = handle.subscribe();
+            // The answer names the forward this request opened. Reading it from the event
+            // stream instead took *any* forward's `Forwarding`, so two requests at once could be
+            // handed the same address (see `Outcome::Bound`).
             match handle
                 .apply(crate::node::api::NodeCommand::Forward {
                     channel_id,
@@ -1576,35 +1767,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 })
                 .await
             {
-                crate::node::api::Outcome::Done => {}
-                other => {
-                    return Frame::Error {
-                        reason: format!("{other:?}"),
-                    }
-                }
-            }
-            let deadline = std::time::Duration::from_secs(10);
-            match tokio::time::timeout(deadline, async {
-                loop {
-                    match events.next().await {
-                        Some(EventStreamItem::Event(NodeEvent::Forwarding { local, .. })) => {
-                            return Some(local)
-                        }
-                        Some(_) => {}
-                        None => return None,
-                    }
-                }
-            })
-            .await
-            {
-                Ok(Some(bound)) => Frame::Bound {
+                crate::node::api::Outcome::Bound(bound) => Frame::Bound {
                     local: bound.to_string(),
                 },
-                Ok(None) => Frame::Error {
-                    reason: "the node stopped before the forward was bound".into(),
-                },
-                Err(_) => Frame::Error {
-                    reason: "the forward did not report a bound address".into(),
+                other => Frame::Error {
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1620,7 +1787,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
                 other => Frame::Error {
-                    reason: format!("{other:?}"),
+                    reason: other.to_string(),
                 },
             }
         }
@@ -1628,22 +1795,56 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             link,
             local_name,
             passphrase,
-        } => match handle
-            .apply(crate::node::api::NodeCommand::JoinChannel {
-                link,
-                local_name,
-                passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
-            })
-            .await
-        {
-            crate::node::api::Outcome::Done => Frame::Ok,
-            // The outcome is named, not reduced to "it failed". `Unreachable` and a
-            // refused passphrase call for completely different responses from whoever
-            // is holding the link, and this is the only place that knows which it was.
-            other => Frame::Error {
-                reason: format!("{other:?}"),
-            },
-        },
+        } => {
+            // Subscribe before asking: a failed join's steps and responders' reasons are raised
+            // as events just before the outcome is answered, and one emitted between the command
+            // and the wait would be lost.
+            let mut events = handle.subscribe();
+            match handle
+                .apply(crate::node::api::NodeCommand::JoinChannel {
+                    link,
+                    local_name,
+                    passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                // The outcome is named, not reduced to "it failed". `Unreachable` and a
+                // refused passphrase call for completely different responses from whoever
+                // is holding the link, and this is the only place that knows which it was.
+                // The fault's name, which `vox room join` turns into the same guidance `vox
+                // connect` gives (`tunnel_cli::join_advice`, V29-12).
+                //
+                // **And where it stopped (#192).** The join records each step it took and what
+                // each responder said; `vox room join` printed neither, so a red that happened
+                // once could not be placed. They follow the fault's name, one per line:
+                // `steps: …`, then `said: …`.
+                other => {
+                    let mut reason = format!("{other:?}");
+                    let (mut steps, mut said) = (None, None);
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while steps.is_none() || said.is_none() {
+                        match tokio::time::timeout_at(deadline, events.next()).await {
+                            Ok(Some(EventStreamItem::Event(NodeEvent::JoinSteps {
+                                joined: false,
+                                steps: s,
+                            }))) if steps.is_none() => steps = Some(s),
+                            Ok(Some(EventStreamItem::Event(NodeEvent::JoinFailed {
+                                reason: r,
+                            }))) if said.is_none() => said = Some(r),
+                            Ok(Some(_)) => {}
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                    for (label, text) in [("steps", steps), ("said", said)] {
+                        if let Some(text) = text.filter(|t| !t.is_empty()) {
+                            reason.push_str(&format!("\n{label}: {}", one_line(&text)));
+                        }
+                    }
+                    Frame::Error { reason }
+                }
+            }
+        }
         Request::Create {
             local_name,
             passphrase,
@@ -1656,7 +1857,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         {
             crate::node::api::Outcome::Done => Frame::Ok,
             other => Frame::Error {
-                reason: format!("{other:?}"),
+                reason: other.to_string(),
             },
         },
         Request::Invite { channel_id } => {
@@ -1670,7 +1871,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 crate::node::api::Outcome::Done => {}
                 other => {
                     return Frame::Error {
-                        reason: format!("{other:?}"),
+                        reason: other.to_string(),
                     }
                 }
             }
@@ -1697,20 +1898,21 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             }
         }
-        Request::Rooms => {
+        Request::Rooms { after } => {
             let view = handle.view();
+            let rooms = view
+                .channels
+                .iter()
+                .map(|c| {
+                    (
+                        c.channel_id,
+                        c.local_name.clone().unwrap_or_default(),
+                        c.open,
+                    )
+                })
+                .collect();
             Frame::Rooms {
-                rooms: view
-                    .channels
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.channel_id,
-                            c.local_name.clone().unwrap_or_default(),
-                            c.open,
-                        )
-                    })
-                    .collect(),
+                rooms: page(rooms, after, |(id, name, _)| (*id, name.len())),
             }
         }
     }
@@ -1757,17 +1959,23 @@ impl IpcClient {
     /// the connection into an event stream, after which no further request can be
     /// sent on it.
     pub async fn open(path: &Path) -> Result<Self> {
-        let mut stream = UnixStream::connect(path).await.map_err(|e| Error::Path {
-            op: "connect control socket",
-            detail: format!("{}: {e}", path.display()),
+        let mut stream = UnixStream::connect(path).await.map_err(|e| {
+            Error::Ipc(IpcHandshake::Unreachable {
+                reason: e.to_string(),
+            })
         })?;
         let Some(hello) = read_frame(&mut stream).await? else {
-            return Err(Error::MalformedBundle("ipc closed before hello"));
+            return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         let me = match Frame::from_bytes(&hello)? {
             Frame::Hello { protocol, me } if protocol == PROTOCOL_VERSION => me,
-            Frame::Hello { .. } => return Err(Error::MalformedBundle("ipc protocol version")),
-            _ => return Err(Error::MalformedBundle("ipc expected hello")),
+            Frame::Hello { protocol, .. } => {
+                return Err(Error::Ipc(IpcHandshake::Protocol {
+                    mine: PROTOCOL_VERSION,
+                    theirs: protocol,
+                }))
+            }
+            _ => return Err(Error::Ipc(IpcHandshake::NotHello)),
         };
         Ok(Self { stream, me })
     }
@@ -1780,7 +1988,7 @@ impl IpcClient {
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
         write_frame(&mut self.stream, &req.to_bytes()).await?;
         let Some(body) = read_frame(&mut self.stream).await? else {
-            return Err(Error::MalformedBundle("ipc closed before reply"));
+            return Err(Error::MalformedIpc("ipc closed before reply"));
         };
         Frame::from_bytes(&body)
     }
@@ -1813,8 +2021,69 @@ impl IpcClient {
                     let Some(last) = rows.last() else {
                         return Ok(Frame::Rows { rows: all });
                     };
+                    // A page that ends where the last one did would be asked for again
+                    // forever; a node that ignored the cursor is an error, not a hang.
+                    if cursor == Some(last.entry_hash) {
+                        return Err(Error::MalformedIpc("ipc rows page did not advance"));
+                    }
                     cursor = Some(last.entry_hash);
                     all.extend(rows);
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// Every room this node holds, however many pages that takes — as one
+    /// [`Frame::Rooms`], or the first reply that was not rooms (an error).
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn rooms(&mut self) -> Result<Frame> {
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            match self.request(&Request::Rooms { after }).await? {
+                Frame::Rooms { rooms } => {
+                    let Some(last) = rooms.last() else {
+                        return Ok(Frame::Rooms { rooms: all });
+                    };
+                    if after.is_some_and(|a| last.0 <= a) {
+                        return Err(Error::MalformedIpc("ipc rooms page did not advance"));
+                    }
+                    after = Some(last.0);
+                    all.extend(rooms);
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// The whole trust keyring, however many pages that takes — as one
+    /// [`Frame::Trusted`], or the first reply that was not (an error).
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn trusted(&mut self, identity_passphrase: &str) -> Result<Frame> {
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            match self
+                .request(&Request::TrustList {
+                    identity_passphrase: identity_passphrase.to_owned(),
+                    after,
+                })
+                .await?
+            {
+                Frame::Trusted { entries } => {
+                    let Some(last) = entries.last() else {
+                        return Ok(Frame::Trusted { entries: all });
+                    };
+                    if after.is_some_and(|a| last.0 <= a) {
+                        return Err(Error::MalformedIpc("ipc trusted page did not advance"));
+                    }
+                    after = Some(last.0);
+                    all.extend(entries);
                 }
                 other => return Ok(other),
             }
@@ -1828,9 +2097,9 @@ impl IpcClient {
             Frame::Ok => Ok(()),
             Frame::Error { reason } => {
                 let _ = reason;
-                Err(Error::MalformedBundle("ipc subscribe refused"))
+                Err(Error::MalformedIpc("ipc subscribe refused"))
             }
-            _ => Err(Error::MalformedBundle("ipc unexpected subscribe reply")),
+            _ => Err(Error::MalformedIpc("ipc unexpected subscribe reply")),
         }
     }
 

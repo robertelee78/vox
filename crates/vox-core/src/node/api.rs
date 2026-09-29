@@ -152,6 +152,10 @@ pub struct AnchoredChannel {
     /// Entries in the ciphertext copy of the log this node keeps for the channel
     /// (`None` when it keeps none — a client's board, or an anchor not yet caught up).
     pub entries: Option<u64>,
+    /// The address each member's live record on this board names, as the board would hand it to
+    /// any member asking where that member is (V210-51, #230): what `vox node` prints so an
+    /// operator — and a proof — can see which of a member's processes the board points at.
+    pub holding: Vec<(Digest32, Vec<String>)>,
 }
 
 /// A command from a client to the node.
@@ -389,8 +393,17 @@ pub enum Fault {
     ChannelNotOpen,
     /// An input exceeded its bound (name or text length).
     TooLong,
+    /// The trust keyring already holds its maximum number of identities
+    /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too
+    /// long, and "longer than this field allows" sent them looking at the petname.
+    KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
+    /// The identity passphrase was right, but something this identity sealed (its trust
+    /// keyring, pending consents or prekey ring) will not open under it: the data was altered,
+    /// or written by another identity. Not [`Fault::WrongPassphrase`], which sent a person to
+    /// retype a passphrase that had just been proved correct (V210-40).
+    SealedUnreadable,
     /// The node is shutting down.
     ShuttingDown,
     /// This node is not networked, or is locked, so it cannot reach anyone.
@@ -398,6 +411,26 @@ pub enum Fault {
     /// An invite link would not parse, or named a channel/anchor this node cannot
     /// use.
     BadLink,
+    /// A join reached a board, and the board has nothing for the room: either its host has not
+    /// published the room there yet (it is offline, or its publish has not landed), or the room id
+    /// in the address is wrong — a link carries no checksum, so a mistyped room id still parses.
+    /// The board cannot tell the two apart, so neither can this.
+    ///
+    /// **Not [`Fault::BadLink`].** This was reported as one, so a person whose host had simply
+    /// not reached the anchor yet was told the address would not parse and to check they had
+    /// copied all of it — the one thing that was not wrong. Measured on a relayed join: the
+    /// board was reached after 20s, held nothing for the room, and the advice pointed at the
+    /// address.
+    RoomNotOnBoard,
+    /// A join could not reach any board: every anchor it knew of (the link's, and this node's
+    /// own) failed to answer within the join's patience, or stopped answering while it read the
+    /// room. No member was asked anything.
+    ///
+    /// **Not [`Fault::Unreachable`].** A join reported both as one, and the CLI's words for it
+    /// said "every member the board knows is offline" — a claim about members, made when the
+    /// board itself was never reached (#192). The two need different fixes: an anchor that is
+    /// down, or a member that is.
+    BoardUnreachable,
     /// A peer could not be reached (no live endpoint, or the dial failed).
     Unreachable,
     /// The remote refused: a join was refused, or a record was rejected.
@@ -421,8 +454,104 @@ pub enum Fault {
     /// network can reach would hand that membership to whoever reaches the port
     /// (ADR-013; the same rule `vox up` enforces).
     NotLoopback,
+    /// A local address this node was asked to listen on is taken, or is not an address of
+    /// this machine: the node's `--listen` port, a `vox up --bind`, a forward's local port.
+    AddressInUse,
+    /// A join named a room this profile already holds.
+    AlreadyMember,
+    /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
+    /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
+    NotAServiceRoom,
     /// An internal invariant failed (a bug, never user input).
     Internal,
+}
+
+impl Fault {
+    /// What this fault means to a person, and what to do about it, in the house style: one
+    /// short line saying what happened, then indented lines saying what to do.
+    ///
+    // `Fault::KeyringFull`'s explanation names the cap in words; this holds them together.
+    const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
+
+    /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
+    /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,
+    /// `Failed(NotConsented)`: the name of an enum variant, not a cause. The token stays
+    /// machine-stable for code that matches on it; this is its reading for everyone else.
+    #[must_use]
+    pub fn explain(self) -> &'static str {
+        match self {
+            Fault::NoIdentity => {
+                "this profile has no identity yet\n       create one with `vox id` (or start `vox tui`)"
+            }
+            Fault::IdentityExists => "this profile already has an identity",
+            Fault::Locked => {
+                "the identity is locked\n       unlock it: pipe the identity passphrase to `vox daemon`, or run `vox tui`"
+            }
+            Fault::WrongPassphrase => "the passphrase is wrong",
+            Fault::UnknownChannel => {
+                "no such room in this profile\n       `vox room list` shows the rooms it holds"
+            }
+            Fault::ChannelNotOpen => {
+                "that room is not open on this node\n       open it with its passphrase: a line `<room> <passphrase>` to `vox daemon`, or in `vox tui`"
+            }
+            Fault::TooLong => "that is longer than this field allows",
+            Fault::KeyringFull => {
+                "your trust keyring is full (1,024 identities)\n       remove one with `vox trust remove <fingerprint>`, then add again"
+            }
+            Fault::Storage => {
+                "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
+            }
+            Fault::SealedUnreadable => {
+                "the identity passphrase is right, but this profile's trust keyring, pending \
+                 consents or prekey ring will not open under it\n       the store was altered, \
+                 or copied from another identity's profile"
+            }
+            Fault::ShuttingDown => "the node is shutting down",
+            Fault::NotNetworked => {
+                "this node is not on the network (it is locked, or was started without a listen address)"
+            }
+            Fault::BadLink => {
+                "that address will not parse, or names a room this node cannot use\n       check you copied the whole vox:// address"
+            }
+            Fault::RoomNotOnBoard => {
+                "the board holds nothing for that room\n       either its host has not published it there yet (the host must be online; then try again)\n       or the room part of the address is wrong: check it against the address you were sent"
+            }
+            Fault::BoardUnreachable => {
+                "the anchor could not be reached, so no member was asked\n       check that the anchor is running and that this node can reach its address"
+            }
+            Fault::Unreachable => {
+                "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
+            }
+            Fault::Refused => "the other side refused",
+            Fault::NotConsented => {
+                "there is nothing to withdraw: that identity was never trusted or consented to, or already is not"
+            }
+            Fault::StillTrusted => {
+                "that identity is in your trust keyring, so a per-room revoke would heal itself\n       run `vox trust remove <fingerprint>` instead"
+            }
+            Fault::NotLoopback => {
+                "a local port for Vox must be on loopback (127.0.0.1 or ::1)\n       anything else would hand this room's membership to whoever reaches the port"
+            }
+            Fault::AddressInUse => {
+                "a local address it needs is already in use, or is not an address of this machine\n       pick another port, or stop whatever holds it (`lsof -i :<port>` names it)"
+            }
+            Fault::AlreadyMember => {
+                "this profile already holds that room — there is nothing to join\n       `vox room list` shows it; open it with its passphrase if it is closed"
+            }
+            Fault::NotAServiceRoom => {
+                "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
+            }
+            Fault::Internal => {
+                "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.explain())
+    }
 }
 
 /// The result of a command.
@@ -430,6 +559,13 @@ pub enum Fault {
 pub enum Outcome {
     /// The command succeeded.
     Done,
+    /// A forward was bound, at this address: the answer to [`NodeCommand::Forward`] **names the
+    /// forward it opened**. It used to be `Done` alone, and a caller took the address from the
+    /// next `Forwarding` event, which is any forward's. Two `vox room get`s at once could then be
+    /// handed the same one; the first to finish stopped it, and the second, still connecting, was
+    /// refused (`connecting to the forward: Connection refused`), while the other forward was
+    /// never stopped at all.
+    Bound(std::net::SocketAddr),
     /// The command failed for the given reason.
     Failed(Fault),
 }
@@ -438,7 +574,17 @@ impl Outcome {
     /// Whether the command succeeded.
     #[must_use]
     pub fn is_done(self) -> bool {
-        matches!(self, Outcome::Done)
+        matches!(self, Outcome::Done | Outcome::Bound(_))
+    }
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Done => f.write_str("done"),
+            Outcome::Bound(local) => write!(f, "bound at {local}"),
+            Outcome::Failed(fault) => f.write_str(fault.explain()),
+        }
     }
 }
 
@@ -511,6 +657,29 @@ pub enum NodeEvent {
         /// The port that was being carried, which is the service tag.
         port: u16,
     },
+    /// A sync session with `peer` for `channel_id` did not complete, and why: the peer's coded
+    /// reason when it refused (a collision reads "the peer was busy syncing this room"), or the
+    /// transport's (#202, PRD-001 R36).
+    SyncFailed {
+        /// The room.
+        channel_id: Digest32,
+        /// The peer the session was with.
+        peer: Digest32,
+        /// What went wrong, in words.
+        reason: String,
+    },
+    /// A room is open, but it could not be added to the rooms this node reopens by itself
+    /// (#208), so it will be closed after a restart until it is opened again.
+    ///
+    /// Not a failure of the command that opened it: the room exists and is open, and saying
+    /// the command failed would leave a room in the store that its creator was told does not
+    /// exist.
+    RoomNotRemembered {
+        /// The room.
+        channel_id: Digest32,
+        /// Why it could not be remembered, in words.
+        why: String,
+    },
     /// This node was unable to answer anybody for a noticeable time, and what it was doing.
     ///
     /// The actor is the only writer of channel state, so whatever it awaits stops the node
@@ -542,6 +711,24 @@ pub enum NodeEvent {
         what: String,
         /// What the board said.
         why: String,
+    },
+    /// A board took one of this node's own records on a republish, after refusing it as stale
+    /// (V210-51, #230): the refusal happened, and was mended. Said once per refusal.
+    PublishCured {
+        /// The room the record was for.
+        channel_id: Digest32,
+        /// Which record it was, and which board (`our address (board …)`).
+        what: String,
+    },
+    /// What happened to a connection to `peer`, said so a failure that recurs names itself (#229,
+    /// after #232's CI reds): a newcomer that lost the one-connection-per-peer tie-break, a
+    /// retired connection closed, an anchor connection lost or redialled, a reach that waited for
+    /// another and what it did next. Diagnostics, never a decision.
+    ConnectionNote {
+        /// The peer the connection is to.
+        peer: Digest32,
+        /// What happened, for the operator.
+        note: String,
     },
     /// A join failed, with what each responder that was tried reported.
     ///

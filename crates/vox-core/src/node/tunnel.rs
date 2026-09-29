@@ -278,7 +278,11 @@ impl Forward {
         }
         let listener = TcpListener::bind(local)
             .await
-            .map_err(|_| Error::TunnelDenied("forward: cannot bind the local port"))?;
+            .map_err(|e| Error::LocalBind {
+                addr: local,
+                in_use: e.kind() == std::io::ErrorKind::AddrInUse,
+                reason: e.to_string(),
+            })?;
         let bound = listener
             .local_addr()
             .map_err(|_| Error::TunnelDenied("forward: bound port unknown"))?;

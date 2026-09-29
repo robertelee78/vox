@@ -12,6 +12,15 @@
 //! binary run as a separate process against each — because a claim is only useful
 //! if a *different agent* is bound by it, and a single-node test cannot show that.
 //!
+//! **Every participant is the shipped binary** (`support/room.rs`): an anchor (`vox node`),
+//! a `vox daemon` per agent, the room made with `vox room create|invite|join`, each agent
+//! admitted with `vox trust add`, and the room ready only once each has rendered a post by
+//! the other. Nothing in this process runs a node.
+//!
+//! **Mutation.** Let a claim take a resource somebody else already holds (the `Held` arm of
+//! `ClaimOp::Claim` in `vox-agentcomms/src/claim.rs` answering `true`, i.e. last claim wins)
+//! and this goes red at (2): bob's contested claim succeeds instead of failing.
+//!
 //! What it proves:
 //!
 //! 1. **Exactly one agent holds a contested resource.** Both claim it; the first
@@ -49,219 +58,36 @@
 
 #![cfg(unix)]
 
+#[path = "support/room.rs"]
+mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use std::process::{Command, Stdio};
+use support::{until, Worker};
 
-use vox_core::node::actor::{Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
-use vox_core::node::paths::Paths;
-
-const VOX: &str = env!("CARGO_BIN_EXE_vox");
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
-}
-
-/// One agent's view of the machine: a profile directory pair and a node.
-struct Agent {
-    /// The one session this agent speaks as.
-    session: String,
-    data: std::path::PathBuf,
-    cfg: std::path::PathBuf,
-    paths: Paths,
-    node: NodeHandle,
-}
-
-impl Agent {
-    /// Run `vox …` as this agent, against this agent's node.
-    fn vox(&self, args: &[&str]) -> (bool, String, String) {
-        let out = Command::new(VOX)
-            .args(args)
-            .env("VOX_DATA_DIR", &self.data)
-            .env("VOX_CONFIG_DIR", &self.cfg)
-            .env_remove("VOX_ROOM")
-            // Ownership is per session (ADR-021 §4): each agent here is one session,
-            // named after it, and a session inherited from the test's own harness must
-            // never leak in.
-            .env_remove("CLAUDE_CODE_SESSION_ID")
-            .env_remove("CODEX_THREAD_ID")
-            .env("VOX_SESSION", &self.session)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("spawn vox");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    }
-
-    fn fingerprint(&self) -> [u8; 32] {
-        self.node.view().identity.expect("identity").fingerprint
-    }
-}
-
-async fn agent(tmp: &tempfile::TempDir, name: &str) -> Agent {
-    let data = tmp.path().join(name).join("data");
-    let cfg = tmp.path().join(name).join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
-    let node = Node::spawn_networked(paths.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
-    assert!(node
-        .apply(NodeCommand::CreateIdentity {
-            passphrase: secret("identity passphrase"),
-        })
-        .await
-        .is_done());
-    assert!(
-        !node.view().listening.is_empty(),
-        "{name} listens once unlocked"
-    );
-    Agent {
-        session: name.to_owned(),
-        data,
-        cfg,
-        paths,
-        node,
-    }
-}
-
-async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) -> T {
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match h.next_event().await {
-                Some(e) => {
-                    if let Some(v) = f(e) {
-                        return v;
-                    }
-                }
-                None => panic!("event stream ended"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for an event")
-}
-
-/// Poll a command until its output satisfies `ok`, or fail with what it last said.
-///
-/// A claim posted on one node reaches the other through the log, so "has it arrived
-/// yet" is a real question with no synchronous answer.
-fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> String {
-    let deadline = std::time::Instant::now() + TIMEOUT;
-    let mut last = String::new();
-    while std::time::Instant::now() < deadline {
-        let (_, out, err) = who.vox(args);
-        last = format!("stdout={out:?} stderr={err:?}");
-        if ok(&out) {
-            return out;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-    panic!("timed out waiting for {what}; last saw {last}");
+/// `vox …` as this agent's one session, returning (ok, stdout, stderr).
+fn vox(w: &Worker, args: &[&str]) -> (bool, String, String) {
+    let o = w.vox(Some(&w.name), args);
+    (o.ok, o.stdout, o.stderr)
 }
 
 #[test]
-#[ignore = "two networked nodes with production Argon2id; CI runs it in release"]
+#[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
 fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
     watchdog::arm();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
-
-    // The bind guards must outlive the test: dropping one stops accepting and
-    // unlinks the socket path, and every `vox room` call would then be told there
-    // is no node running.
-    let (alice, bob, room, _alice_sock, _bob_sock, alice_short) = rt.block_on(async {
-        let alice = agent(&tmp, "alice").await;
-        let bob = agent(&tmp, "bob").await;
-        let alice_fp = alice.fingerprint();
-        let bob_fp = bob.fingerprint();
-
-        assert!(alice
-            .node
-            .apply(NodeCommand::CreateChannel {
-                local_name: "mission".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-        let cid = alice.node.view().channels[0].channel_id;
-
-        assert!(alice
-            .node
-            .apply(NodeCommand::Invite { channel_id: cid })
-            .await
-            .is_done());
-        let url = wait_for(&alice.node, |e| match e {
-            NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
-            _ => None,
-        })
-        .await;
-
-        assert!(bob
-            .node
-            .apply(NodeCommand::JoinChannel {
-                link: url,
-                local_name: "mission".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-
-        // Joining grants nothing (M17.6): each must admit the other to the ring
-        // before either can read what the other writes. That is the whole point of
-        // §3, and it means a work board is only shared between agents an operator
-        // deliberately introduced.
-        assert!(alice
-            .node
-            .apply(NodeCommand::Trust {
-                fingerprint: bob_fp,
-                petname: "bob".into(),
-            })
-            .await
-            .is_done());
-        assert!(bob
-            .node
-            .apply(NodeCommand::Trust {
-                fingerprint: alice_fp,
-                petname: "alice".into(),
-            })
-            .await
-            .is_done());
-
-        for (who, peer) in [(&alice, bob_fp), (&bob, alice_fp)] {
-            wait_for(&who.node, |e| match e {
-                NodeEvent::SenderKeyReceived {
-                    channel_id,
-                    peer: p,
-                    ..
-                } if channel_id == cid && p == peer => Some(()),
-                _ => None,
-            })
-            .await;
-        }
-
-        let alice_sock =
-            vox_core::node::ipc::bind(alice.node.clone(), &alice.paths).expect("alice socket");
-        let bob_sock = vox_core::node::ipc::bind(bob.node.clone(), &bob.paths).expect("bob socket");
-        let room = vox_core::node::link::b32_encode(&cid);
-        let alice_short: String = vox_core::node::link::b32_encode(&alice_fp)
-            .chars()
-            .take(12)
-            .collect();
-        (alice, bob, room, alice_sock, bob_sock, alice_short)
-    });
+    let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let (alice, bob) = (&r.workers[0], &r.workers[1]);
+    let room = r.id.clone();
+    let alice_short: String = alice.b32().chars().take(12).collect();
+    println!("[proof] room {room} ready: alice {alice_short}, bob each rendered the other");
 
     // ---- (1) and (2): both claim the same thing; exactly one wins ----
-    let (ok, out, err) = alice.vox(&["room", "claim", &room, "port-the-codec"]);
+    let (ok, out, err) = vox(alice, &["room", "claim", &room, "port-the-codec"]);
     assert!(ok, "alice's claim failed: {err}");
     assert!(
         out.contains("you hold port-the-codec"),
@@ -270,70 +96,84 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
 
     // Bob must see alice's claim before his own can lose to it.
     until(
-        &bob,
+        bob,
+        Some("bob"),
         "alice's claim to reach bob",
         &["room", "board", &room],
-        |o| o.contains("port-the-codec"),
+        |o| o.stdout.contains("port-the-codec"),
     );
 
-    let (ok, out, err) = bob.vox(&["room", "claim", &room, "port-the-codec"]);
+    let (ok, out, err) = vox(bob, &["room", "claim", &room, "port-the-codec"]);
     assert!(
         !ok,
         "a losing claim must fail, not succeed quietly: stdout={out:?}"
     );
     assert!(
-        err.contains("is held by"),
+        err.contains("is held by") && err.contains(&alice_short),
         "the loser must be told who holds it: {err:?}"
     );
 
     // ---- (3) the board agrees from both sides, and each knows its own ----
-    let alice_board = alice.vox(&["room", "board", &room]).1;
+    let alice_board = vox(alice, &["room", "board", &room]).1;
     assert!(
         alice_board.contains("port-the-codec") && alice_board.contains("(you)"),
         "alice must see the resource as hers: {alice_board:?}"
     );
-    let bob_board = bob.vox(&["room", "board", &room]).1;
+    let bob_board = vox(bob, &["room", "board", &room]).1;
     assert!(
         bob_board.contains("port-the-codec") && !bob_board.contains("(you)"),
         "bob must see it held by someone who is not him: {bob_board:?}"
     );
 
     // ---- (4) a release frees it, and the new claim succeeds ----
-    let (ok, _, err) = alice.vox(&["room", "release", &room, "port-the-codec"]);
+    let (ok, _, err) = vox(alice, &["room", "release", &room, "port-the-codec"]);
     assert!(ok, "alice could not release: {err}");
     // What a release guarantees is that **the releaser stops holding it** — not
     // that the resource is unowned, because bob's earlier losing claim may sort
     // after the release and acquire it. See the header.
     until(
-        &bob,
+        bob,
+        Some("bob"),
         "alice to stop holding the resource",
         &["room", "board", &room],
         |o| {
-            !o.lines()
+            !o.stdout
+                .lines()
                 .any(|l| l.starts_with("port-the-codec") && l.contains(&alice_short))
         },
     );
-    let (ok, out, err) = bob.vox(&["room", "claim", &room, "port-the-codec"]);
+    let (ok, out, err) = vox(bob, &["room", "claim", &room, "port-the-codec"]);
     assert!(ok, "bob should hold it once alice released: {err}");
     assert!(out.contains("you hold port-the-codec"), "{out:?}");
 
     // ---- (5) a lapsed ttl frees it with nobody acting ----
-    let (ok, out, err) = alice.vox(&["room", "claim", &room, "flaky-test", "--ttl", "2"]);
+    let (ok, out, err) = vox(alice, &["room", "claim", &room, "flaky-test", "--ttl", "2"]);
     assert!(ok, "alice's ttl claim failed: {err}");
     assert!(out.contains("you hold flaky-test"), "{out:?}");
     until(
-        &bob,
+        bob,
+        Some("bob"),
         "the ttl claim to reach bob",
         &["room", "board", &room],
-        |o| o.contains("flaky-test"),
+        |o| o.stdout.contains("flaky-test"),
+    );
+    // While the ttl runs, it binds bob like any claim.
+    let (ok, _, err) = vox(bob, &["room", "claim", &room, "flaky-test"]);
+    assert!(
+        !ok && err.contains("is held by"),
+        "a live ttl claim must still bind another agent: {err:?}"
     );
 
     // Nobody releases it. It lapses.
     std::thread::sleep(std::time::Duration::from_secs(3));
-    let (ok, out, err) = bob.vox(&["room", "claim", &room, "flaky-test"]);
+    let (ok, out, err) = vox(bob, &["room", "claim", &room, "flaky-test"]);
     assert!(
         ok,
         "a lapsed claim must free the resource with nobody acting: stdout={out:?} stderr={err:?}"
     );
     assert!(out.contains("you hold flaky-test"), "{out:?}");
+    println!(
+        "[proof] contested claim: 1 winner, loser refused naming the holder; release freed it; \
+         a 2s ttl bound bob while live and freed itself after 3s"
+    );
 }

@@ -31,13 +31,22 @@ const ROOM_PASS: &str = "channel passphrase";
 /// silently name a session. **This test process may itself be running inside Claude
 /// Code or Codex**, and a leaked `CLAUDE_CODE_SESSION_ID` would make every worker the
 /// same session — the exact defect these proofs exist to catch.
-pub const HARNESS_SESSION_VARS: [&str; 6] = [
+pub const HARNESS_SESSION_VARS: [&str; 10] = [
     "VOX_SESSION",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
     "CODEX_SESSION_ID",
     "VOX_ROOM",
     "VOX_AGENT_NAME",
+    // The harness's own wake endpoints. `vox agent hook` registers a session at whatever these
+    // name, so a proof run from inside a real Claude or OpenCode session registered the REAL
+    // session's socket in its temp profile, and an urgent test message then interrupted that
+    // live session (2026-09-26: "WEDGE-TEST" reached the coordinator's session). A proof that
+    // wants a wake endpoint sets its own.
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "OPENCODE_SERVER_URL",
+    "VOX_HARNESS",
 ];
 
 /// A child process killed and reaped when dropped, by its own handle — never by a name
@@ -92,6 +101,12 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// The pid of this worker's `vox daemon`, while it runs.
+    #[allow(dead_code)] // not every proof that includes this support module measures it
+    pub fn daemon_pid(&self) -> Option<u32> {
+        self.daemon.as_ref().map(|p| p.0.id())
+    }
+
     /// Run `vox …` as `session` of this worker (or with no session at all).
     pub fn vox(&self, session: Option<&str>, args: &[&str]) -> Out {
         self.vox_in(session, args, None)

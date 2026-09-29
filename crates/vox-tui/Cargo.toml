@@ -54,5 +54,20 @@ rustix.workspace = true
 # ADR-021 §6: a minted operation id is 128 bits of OS randomness.
 getrandom.workspace = true
 
-# No `[dev-dependencies]`: `tempfile` is a normal dependency above and is in scope for the
-# integration proofs too.
+# `tempfile` is a normal dependency above and is in scope for the integration proofs too.
+[dev-dependencies]
+# The at-rest floor proof re-derives the vault key the binary wrote, independently of
+# vox-core, with the ADR-010 floor parameters hard-coded in the test.
+argon2.workspace = true
+hkdf.workspace = true
+aes-gcm.workspace = true
+# The R41 link emulator sizes its own UDP sockets' buffers (std cannot): a link does not drop
+# packets at a 786 KB socket, and the emulator must not either.
+socket2.workspace = true
+# V210-49's proof plays the attacker who deletes one row of a stopped node's store: no vox command
+# can, so the test opens the file itself (never while a vox process holds it).
+redb.workspace = true
+# V210-62's proof plays a peer that opens a handshake with the host and never finishes it: no vox
+# command stops mid-handshake on purpose, so the test drives a QUIC client of its own.
+quinn.workspace = true
+rustls.workspace = true

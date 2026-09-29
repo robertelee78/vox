@@ -474,9 +474,23 @@ pub struct GetFileArgs {
     pub room: String,
     /// The file's name, or a prefix of its SHA-256, or its service tag.
     pub file: String,
-    /// Where to write it. Defaults to the announced name in the current directory.
+    /// The directory to put it in, under the sender's name made safe. Defaults to the
+    /// directory named in the profile's `downloads` config file, else `~/Downloads`.
+    #[arg(long, conflicts_with = "out")]
+    pub dir: Option<PathBuf>,
+    /// An exact path to write it to instead. Refused if something is already there.
     #[arg(long)]
     pub out: Option<PathBuf>,
+}
+
+/// `vox status`
+#[derive(Args, Debug, Clone)]
+pub struct StatusArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// Print the node's report as JSON, for machines.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `vox daemon`
@@ -1046,6 +1060,9 @@ enum Cmd {
     /// Unlike the TUI it does not lock on SIGHUP, which is the point. SIGINT and
     /// SIGTERM stop it.
     Daemon(DaemonArgs),
+    /// What the running node's sync is doing, per room and peer (ADR-025): sessions opened,
+    /// admitted, refused, completed, partial and failed, and any backoff.
+    Status(StatusArgs),
     /// Offer a local TCP port as a room-bound service, in one command (ADR-017).
     ///
     /// Creates a room, offers the port in it, and prints the address, the
@@ -1359,7 +1376,14 @@ pub fn run() -> ExitCode {
                     RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
                     RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
                     RoomCmd::Get(a) => {
-                        crate::room_cli::get_file(&paths, &a.room, &a.file, a.out.as_deref()).await
+                        crate::room_cli::get_file(
+                            &paths,
+                            &a.room,
+                            &a.file,
+                            a.dir.as_deref(),
+                            a.out.as_deref(),
+                        )
+                        .await
                     }
                 }
             });
@@ -1402,6 +1426,39 @@ pub fn run() -> ExitCode {
             ));
             // Always success: a hook that fails must not break the turn.
             ExitCode::SUCCESS
+        }
+        Cmd::Status(args) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(vox_core::node::status::request(&paths.socket_file())) {
+                Ok(json) => {
+                    if args.json {
+                        println!("{json}");
+                    } else {
+                        print!("{}", crate::status_cli::render(&json));
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("vox: no running node answered: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Cmd::Daemon(args) => {
             let paths = match args.profile.paths() {

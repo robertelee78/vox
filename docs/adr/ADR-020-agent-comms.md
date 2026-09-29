@@ -450,6 +450,15 @@ Constraints that follow from the evidence:
 - MCP **MUST NOT** be relied on for delivery. On both hosts it is pull-only; a server cannot push into
   model context, and Claude Code's Channels are a research preview with no delivery guarantee.
 
+**What the drain injects is attributed and bounded** (PRD-001 R19). Each message is one row,
+`[<entry> from <author>] …`, whose two fields come from the log, never from the text; every further
+line of the text is indented with `  | `, so no author can begin a line with `[` and put a row in
+another author's name — whatever the line break (`\n`, `\r`, U+2028 …). One turn injects at most 50
+messages and 16 KiB of text, and at most 2 KiB of any one message; what does not fit is **counted
+in a closing line** and delivered on the next turn, because the cursor moves only past what was
+shown. A cursor the node no longer holds restarts from the room's first message **and says so** in
+the injection; it used to do that silently, on any error.
+
 ### 7. The node MUST fan out to several local clients without any of them able to stall it
 
 Measured on `main` (`spike-1`): the actor emits every event with `event_tx.send(..).await` on a
@@ -567,6 +576,17 @@ and over Vox the address becomes a `.vox` name. So:
 - A receiver **MUST** verify the stream against that hash before using the file. This is the one
   thing the `nc` idiom never gave anyone: `cat | nc` **truncates silently** — the connection drops,
   the receiver gets a partial file and `nc` exits 0. The hash turns that into a loud failure.
+- **Where the file lands is the receiver's decision, never the sender's** (PRD-001 R18, D4). The
+  announced name is text another member wrote. `vox room get` **MUST** put the file in a download
+  directory — `--dir`, else the profile's `downloads` config file, else `~/Downloads` — under that
+  name reduced to a bare file name (no directory part, no leading dots, no control characters), or
+  at an exact `--out` path. It **MUST NOT** overwrite anything: a taken name gets ` (1)`, ` (2)` …,
+  and an existing `--out` is refused. The bytes go to a hidden `.part` file and are linked into place
+  only after the SHA-256 **and** the size match; a transfer that stalls (30 s per read), sends more
+  than it announced, or does not match leaves nothing behind and touches nothing that was there.
+  Before 2026-09-24 the name was used as the path as written — `../../x` and absolute paths were
+  honoured — the destination was truncated before a byte was verified, and a mismatch then
+  deleted it.
 - `StructTag::ChunkManifest` **remains reserved and unimplemented**. ADR-014's in-log chunking is
   chat's concern, not agent comms'.
 - **No new wire format.** No struct tag, no codec, nothing added to the CBOR field checklist.
@@ -807,6 +827,17 @@ Both unknowns are already spiked; neither remains open.
   written **after** emitting, so a crash re-delivers rather than skips; a quiet room emits nothing at
   all. Proved by `agent_hook_proof.rs` driving the real binary.
 
+  > **Correction, 2026-09-24 (PRD-001 D9).** The injection printed each message's text raw and
+  > unbounded, so a post holding a newline and a fake `[… from …]` row put words in another
+  > author's mouth, and a busy room or a lost cursor injected everything. Now attributed and
+  > bounded as §6 says. *Gate, met*: `agent_hook_proof` compares the whole injection of a message
+  > carrying forged rows after `\n`, `\r\n` and U+2028 **exactly** — one row, its true author, the
+  > forgeries on indented lines; 120 short messages arrive as 50 + 50 + 20 over three turns, in order,
+  > none twice; ten oversized ones inject 15.4 KB (7 shown, 3 counted); a lost cursor says so and
+  > shows 50 of 131. Mutation-checked: printing the text raw turns the exact comparison red;
+  > removing the message bound turns the 50/70 count red; moving the cursor past unshown messages
+  > turns turn two's count red (0 delivered).
+
   **Proved for the shape, not for the reading.** That proof states in its own header that it could
   not confirm a harness actually *shows the model* what it injects: the spike's API key returned 401,
   so no model ran. M19.5b closes that.
@@ -948,9 +979,16 @@ Both unknowns are already spiked; neither remains open.
   *Gate, met*: a 300 KB file crosses between two networked nodes with two identities, driven as real
   binaries, and arrives byte-for-byte. Then the offered file is **shortened on disk after it was
   announced**, so the sender serves fewer bytes than it signed for — exactly what a dropped
-  `cat | nc` does — and the collector refuses it, says why, and **removes the partial file** rather
-  than leaving something that looks complete. Asking for a file nobody offered says so rather than
-  hanging or writing an empty file.
+  `cat | nc` does — and the collector refuses it, says why, and leaves nothing that looks complete.
+  Asking for a file nobody offered says so rather than hanging or writing an empty file.
+
+  *Destination gate, met 2026-09-24* (PRD-001 D4, same proof): with no `--dir` or `--out` the file
+  lands in `~/Downloads`; a file already there keeps its bytes and the collected one becomes
+  `artifact (1).bin`; announcements naming `../../x` and an absolute path land as `x` and as the
+  bare file name inside the download directory and nowhere else; a short transfer onto a name that
+  exists leaves that file byte-identical and the directory listing unchanged; an existing `--out`
+  is refused. Mutation-checked: using the announced name as the path (the old handling) and
+  renaming over a taken name each turn it red.
 
   This needed the control socket extended (**protocol 3**): `AddService`, `RemoveService`,
   `Forward`, `StopForward`, `Grant`, and a `Frame::Bound` because a forward asked for port 0 is

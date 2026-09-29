@@ -282,9 +282,7 @@ fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
     cfg.receive_window(quinn::VarInt::from_u32(CONNECTION_WINDOW));
     // Cubic, restarted after the connection idles: a tunnel's transfer must not inherit the
     // congestion history of an older one on the same long-lived connection (PRD-001 R41).
-    cfg.congestion_controller_factory(Arc::new(
-        crate::transport::congestion::IdleRestartConfig::default(),
-    ));
+    cfg.congestion_controller_factory(Arc::new(crate::transport::congestion::IdleRestartConfig));
     Arc::new(cfg)
 }
 
@@ -315,8 +313,11 @@ impl VoxEndpoint {
     /// its own verifier output slot), so `bind` itself only stores the local leaf
     /// + the provider's supported-signature algorithms.
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
-        let socket = std::net::UdpSocket::bind(addr)
-            .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
+        let socket = std::net::UdpSocket::bind(addr).map_err(|e| Error::LocalBind {
+            addr,
+            in_use: e.kind() == std::io::ErrorKind::AddrInUse,
+            reason: e.to_string(),
+        })?;
         let effective = {
             let sock = socket2::SockRef::from(&socket);
             let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
@@ -497,6 +498,8 @@ impl VoxEndpoint {
         let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
         client_cfg.transport_config(transport_config(self.mtu_ceiling));
 
+        // Read before the first packet leaves: see [`VoxConnection::via_circuit`].
+        let via_circuit = self.mux.is_circuit(addr);
         // The SNI server name is unused for authentication (we authenticate by the
         // Vox identity), but rustls requires a syntactically valid name.
         let connecting = self
@@ -504,7 +507,7 @@ impl VoxEndpoint {
             .connect_with(client_cfg, addr, "vox.invalid")
             .map_err(|_| Error::MalformedBundle("quic connect"))?;
         let connection = connecting.await.map_err(|_| Error::SignatureInvalid)?; // handshake/auth failure
-        finish_connection(connection, &verified, now_secs)
+        finish_connection(connection, &verified, now_secs, via_circuit)
     }
 
     /// Accept the next inbound connection, admitting **any authenticated Vox
@@ -574,6 +577,8 @@ impl VoxEndpoint {
         now_secs: u64,
         mut admission: Admission,
     ) -> Result<VoxConnection> {
+        // Read before this end answers anything: see [`VoxConnection::via_circuit`].
+        let via_circuit = self.mux.is_circuit(incoming.remote_address());
         // A fresh slot for THIS connection's verifier output. We install a
         // per-connection server config so the verifier writes into our slot.
         let verified = VerifiedPeer::new();
@@ -596,7 +601,7 @@ impl VoxEndpoint {
             .await
             .map_err(|_| Error::SignatureInvalid)?
             .map_err(|_| Error::SignatureInvalid)?;
-        let conn = finish_connection(connection, &verified, now_secs)?;
+        let conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
 
         // Transport-layer admission, after authentication. A non-admitted peer is
         // closed with the coded reason and rejected — indistinguishable on the wire
@@ -625,6 +630,7 @@ fn finish_connection(
     connection: Connection,
     verified: &VerifiedPeer,
     now_secs: u64,
+    via_circuit: bool,
 ) -> Result<VoxConnection> {
     // The verifier authenticated the peer during the handshake; its fingerprint is
     // in the slot. Absence means the handshake completed without our verifier
@@ -636,10 +642,24 @@ fn finish_connection(
     confirm_vox_alpn(&connection)?;
 
     let session = SessionEstablishment::new(peer_id, now_secs);
+    // The peer's leaf certificate is generated per endpoint — per process — and bound to the
+    // identity by a signature (`identity_cert`), so its digest says which *process* of the
+    // identity this connection is to (V210-57).
+    let peer_process = connection
+        .peer_identity()
+        .and_then(|any| {
+            any.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+        .and_then(|chain| chain.first().map(|leaf| crate::hash::sha256(leaf.as_ref())))
+        .ok_or(Error::SignatureInvalid)?;
     Ok(VoxConnection {
+        serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
         connection,
         peer_id,
+        peer_process,
         session,
+        via_circuit,
         datagram_tx: Mutex::new(DatagramSender::new()),
         datagram_rx: Mutex::new(ReplayWindow::default()),
         datagrams_dropped: AtomicU64::new(0),
@@ -699,9 +719,16 @@ fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
 /// every datagram returned by [`VoxConnection::recv_datagram`] has passed the
 /// window.
 pub struct VoxConnection {
+    /// This connection's name in this process, never given to another (see [`Self::serial`]).
+    serial: u64,
     connection: Connection,
     peer_id: Digest32,
+    /// Which process of `peer_id` this connection is to: the digest of its per-process leaf
+    /// certificate (see [`Self::peer_process`]).
+    peer_process: Digest32,
     session: SessionEstablishment,
+    /// Whether this connection was set up over a relay circuit (see [`Self::via_circuit`]).
+    via_circuit: bool,
     /// Outbound datagram sequence numbers (monotonic, saturating).
     datagram_tx: Mutex<DatagramSender>,
     /// Inbound sliding anti-replay window.
@@ -712,11 +739,54 @@ pub struct VoxConnection {
     datagrams_dropped: AtomicU64,
 }
 
+/// The next [`VoxConnection::serial`].
+static NEXT_SERIAL: AtomicU64 = AtomicU64::new(0);
+
 impl VoxConnection {
+    /// **A name for this connection that no other connection in this process is ever given.**
+    ///
+    /// quinn's `stable_id` is not one: it is the address of the connection's state, and a
+    /// connection allocated after another was freed can be given the same address. Anything
+    /// that remembers connections past their lifetime — which have a stream loop, when each
+    /// was last heard — keys on this instead.
+    #[must_use]
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
     /// The authenticated peer identity fingerprint.
     #[must_use]
     pub fn peer_id(&self) -> Digest32 {
         self.peer_id
+    }
+
+    /// Which **process** of the peer's identity this connection is to: the digest of the
+    /// peer's leaf certificate, whose key is generated per endpoint and so per process, and is
+    /// bound to the identity by the identity's signature (ADR-011). Two connections to one
+    /// identity with different values are to two processes of it; one profile is held by one
+    /// process at a time, and an identity is one device's (V210-57).
+    #[must_use]
+    pub fn peer_process(&self) -> Digest32 {
+        self.peer_process
+    }
+
+    /// Whether this connection was **set up over a relay circuit** (ADR-012 rung 4) — a fact
+    /// about the connection, fixed when it was made, and the same at both ends: a circuit is a
+    /// circuit at the dialler's socket and at the acceptor's.
+    ///
+    /// It is recorded rather than asked of the mux later because the mux's answer changes. The
+    /// mux holds one circuit per peer, so a second circuit to the same peer detaches the first,
+    /// and from then on the first connection's address is in nobody's table: asked afresh, it
+    /// looked like a **direct** connection. It is the opposite — a relayed connection with no
+    /// relay under it, which can send nothing — and it won the tie-break against the live
+    /// circuit on "better path" at both ends (V29-15).
+    ///
+    /// Read from the table before this end sends its first packet. A circuit detached before
+    /// then leaves nothing to carry the handshake, so a connection that completes was on a
+    /// circuit exactly when this says so.
+    #[must_use]
+    pub fn via_circuit(&self) -> bool {
+        self.via_circuit
     }
 
     /// The recorded session-establishment entry (tag `0x0011`) for this session,

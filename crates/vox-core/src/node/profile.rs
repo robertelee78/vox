@@ -24,7 +24,7 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 use crate::atrest::sek::Argon2Profile;
-use crate::atrest::vault::{IdentityVault, VaultRootSigner};
+use crate::atrest::vault::{IdentityVault, VaultRootSigner, VAULT_VERSION};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::backup::{IdentityBackup, SelfSeed};
@@ -153,7 +153,8 @@ impl Profile {
         if self.unlocked.is_some() {
             return Ok(());
         }
-        let signer = self.vault.unlock_signer(passphrase)?;
+        let backup = self.vault.unlock(passphrase)?;
+        let signer = VaultRootSigner::from_backup(&backup)?;
         if signer.fingerprint() != self.fingerprint {
             // The vault and the store disagree about who this is: refuse rather
             // than silently adopt either.
@@ -161,7 +162,35 @@ impl Profile {
         }
         // Only now, with the passphrase proved, may the profile be written.
         self.store.make_writable()?;
+        if self.vault.version < VAULT_VERSION {
+            self.migrate_vault(&backup, &signer, passphrase)?;
+        }
+        drop(backup);
         self.unlocked = Some(Arc::new(signer));
+        Ok(())
+    }
+
+    /// Bring a version-1 vault's profile up to version 2 (V210-40, #214): re-seal the node-wide
+    /// blobs from `self_seed`, rewrite the store into a fresh file so no page of the old seals
+    /// survives in it, **then** rewrite the vault, whose version is bound into its AEAD.
+    /// In that order a crash between the two is repaired by the next unlock (see
+    /// [`crate::node::seal_migration`]); in the other order it would strand the blobs under
+    /// legacy keys that a v2 vault never tries.
+    fn migrate_vault(
+        &mut self,
+        backup: &IdentityBackup,
+        signer: &VaultRootSigner,
+        passphrase: &[u8],
+    ) -> Result<()> {
+        crate::node::seal_migration::migrate_to_vault_seals(&self.store, signer)?;
+        // The old seals are still in the file's replaced pages until it is rewritten. Before the
+        // vault moves to v2: a crash after the rewrite leaves a v1 vault, whose next unlock
+        // repeats both; a crash after the vault would leave the old pages for good.
+        self.store.rewrite_fresh()?;
+        let profile = Argon2Profile::from_id(self.vault.profile_id)?;
+        let vault = IdentityVault::seal_with_salt(backup, passphrase, profile, &self.vault.salt)?;
+        write_private_file(&self.paths.vault_file(), &vault.to_canonical_vec())?;
+        self.vault = vault;
         Ok(())
     }
 
@@ -177,11 +206,18 @@ impl Profile {
     /// [`Error::AtRestUnlockFailed`] for a wrong passphrase or a tampered vault, and
     /// [`Error::Profile`] if the vault and the store disagree about the identity.
     pub fn verify_passphrase(&self, passphrase: &[u8]) -> Result<()> {
-        let signer = self.vault.unlock_signer(passphrase)?;
-        if signer.fingerprint() != self.fingerprint {
-            return Err(Error::Profile("vault identity does not match the store"));
+        self.passphrase_verifier().verify(passphrase)
+    }
+
+    /// What [`Profile::verify_passphrase`] needs, owned, so the check can run on a
+    /// blocking thread: it is production Argon2id, and on the node's actor it stalled every
+    /// post, read and sync on the node for as long as it took (V210-26).
+    #[must_use]
+    pub fn passphrase_verifier(&self) -> PassphraseVerifier {
+        PassphraseVerifier {
+            vault: self.vault.clone(),
+            fingerprint: self.fingerprint,
         }
-        Ok(())
     }
 
     /// Lock: drop the unlocked identity (its secrets zeroize on drop). Idempotent.
@@ -272,5 +308,27 @@ impl Profile {
     #[must_use]
     pub fn paths(&self) -> &Paths {
         &self.paths
+    }
+}
+
+/// An owned passphrase check (see [`Profile::passphrase_verifier`]).
+#[derive(Clone)]
+pub struct PassphraseVerifier {
+    vault: IdentityVault,
+    fingerprint: Digest32,
+}
+
+impl PassphraseVerifier {
+    /// Whether `passphrase` unlocks this identity's vault, and the vault is this identity.
+    ///
+    /// # Errors
+    /// [`Error::AtRestUnlockFailed`] for a wrong passphrase or a tampered vault, and
+    /// [`Error::Profile`] if the vault and the store disagree about the identity.
+    pub fn verify(&self, passphrase: &[u8]) -> Result<()> {
+        let signer = self.vault.unlock_signer(passphrase)?;
+        if signer.fingerprint() != self.fingerprint {
+            return Err(Error::Profile("vault identity does not match the store"));
+        }
+        Ok(())
     }
 }

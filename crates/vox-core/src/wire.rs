@@ -288,6 +288,36 @@ pub enum WireError {
     /// diagnosed as speaking the wrong version (ADR-008, ADR-016 M15.2c).
     #[error("transport failed")]
     TransportFailed = 0x09,
+    /// `0x0A` — this end closed the connection because the peer **stopped answering**: a
+    /// liveness probe went unanswered, or nothing arrived for `SILENCE_IS_DEATH` (ADR-012,
+    /// #40). The connection is presumed to lead to a process that no longer exists — a peer
+    /// that crashed and restarted — so the close is bookkeeping, and nothing about the peer's
+    /// identity or its frames was wrong. Before this code existed these closes carried
+    /// `0x05` (authenticator invalid), which any log or live peer would read as an
+    /// authentication failure.
+    #[error("no answer to a liveness probe")]
+    Unresponsive = 0x0A,
+    /// `0x0B` — refused because this end's own session for the same room is running: most often
+    /// with the very peer that asked, because both ends pushed on the same event (a
+    /// **collision**, the commonest failure between two live members, which the push retry
+    /// resolves), otherwise with another peer. Nothing about the peer, its frames or the path was
+    /// wrong. Sent only to a room peer. Before this code existed such a refusal carried `0x05`
+    /// (authenticator invalid), and the initiator, which never read the code, reported it as a
+    /// transport failure wrapped in a governance error (#202).
+    #[error("the peer was busy syncing this room")]
+    SessionBusy = 0x0B,
+    /// `0x0C` — refused because the peer does not know this node as a member of the room **yet**:
+    /// it holds only this node's pre-join record, because the member records that admit it have
+    /// not reached it (#217). The commonest case is a member that has just joined and syncs with an
+    /// anchor before the member that admitted it has mirrored its bundle there. It clears by itself
+    /// within seconds, and the push retry resolves it.
+    ///
+    /// Sent **only to a pending joiner**, which already holds the room's invitation, so it learns
+    /// nothing it did not know; a stranger is still refused with the uninformative `0x05`. Before
+    /// this code existed this refusal carried `0x05`, and a member that had just joined reported
+    /// "sync failed: authenticator invalid" — an integrity failure — for a record still in flight.
+    #[error("the peer does not know this node as a member of the room yet")]
+    NotYetMember = 0x0C,
 }
 
 impl WireError {
@@ -308,6 +338,9 @@ impl WireError {
             0x07 => Some(WireError::SyncModeUnsupported),
             0x08 => Some(WireError::EpochMismatch),
             0x09 => Some(WireError::TransportFailed),
+            0x0A => Some(WireError::Unresponsive),
+            0x0B => Some(WireError::SessionBusy),
+            0x0C => Some(WireError::NotYetMember),
             _ => None,
         }
     }

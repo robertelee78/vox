@@ -307,10 +307,53 @@ pub struct NodeNet {
     observed: Mutex<BTreeMap<Digest32, Multiaddr>>,
     /// What this node is relaying for others (ADR-012 rung 4), so the caps hold.
     circuits: Arc<CircuitLedger>,
+    /// The peers a [`NodeNet::reach`] is under way to, each with what its waiters are woken by.
+    /// **One ladder per peer at a time.** Two at once each raced a circuit through the same
+    /// relay, and the far end keeps one circuit per peer: attaching the second closed the
+    /// first, whose handshake then waited out its full attempt (10 s). Measured on the v0.3.0
+    /// merge, where a reopened room dialled its members beside a `vox forward`: cold relayed
+    /// connections of 10.8 s instead of about 260 ms (#226).
+    reaching: Mutex<HashMap<Digest32, Arc<tokio::sync::Notify>>>,
+    /// Where each ladder run is counted for `vox status --json`, once the node has one.
+    status: Mutex<Option<crate::node::status::SharedSyncBook>>,
     service: RendezvousService,
     membership: SharedMembership,
     policy: SharedPolicy,
     clock: Clock,
+}
+
+/// Ends a [`NodeNet::reach`]'s ownership of its peer: the entry goes, and every waiter wakes.
+struct ReachOwner<'a> {
+    reaching: &'a Mutex<HashMap<Digest32, Arc<tokio::sync::Notify>>>,
+    peer: Digest32,
+    /// Where a cancelled ladder is said (#229's diagnostics).
+    manager: &'a ConnectionManager,
+    /// Set when the ladder ran to its end; dropped unset, it was cancelled mid-way.
+    finished: bool,
+    started: std::time::Instant,
+}
+
+impl Drop for ReachOwner<'_> {
+    fn drop(&mut self) {
+        let woken = lock(self.reaching).remove(&self.peer);
+        if !self.finished {
+            self.manager.note(
+                self.peer,
+                format!(
+                    "a reach was cancelled {} ms into its ladder; {} waiting for it",
+                    self.started.elapsed().as_millis(),
+                    if woken.is_some() {
+                        "any reach"
+                    } else {
+                        "nothing"
+                    }
+                ),
+            );
+        }
+        if let Some(woken) = woken {
+            woken.notify_waiters();
+        }
+    }
 }
 
 impl std::fmt::Debug for NodeNet {
@@ -323,6 +366,11 @@ impl std::fmt::Debug for NodeNet {
 }
 
 impl NodeNet {
+    /// Count this node's reachability ladders in `book` (`vox status --json`'s `reach`).
+    pub fn count_ladders_in(&self, book: crate::node::status::SharedSyncBook) {
+        *lock(&self.status) = Some(book);
+    }
+
     /// Build the surface over a bound endpoint. The board it serves is fresh
     /// in-memory state (an anchor that persists a board is M15).
     #[must_use]
@@ -338,6 +386,8 @@ impl NodeNet {
             advertised: Mutex::new(None),
             observed: Mutex::new(BTreeMap::new()),
             circuits: Arc::new(CircuitLedger::default()),
+            reaching: Mutex::new(HashMap::new()),
+            status: Mutex::new(None),
             service,
             membership,
             policy: SharedPolicy::new(),
@@ -481,8 +531,9 @@ impl NodeNet {
         peer: Digest32,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
         let (kind, mut send, mut recv) = accept_typed_on(conn).await?;
-        if !PeerPolicy::allows(self.classify(&peer), kind) {
-            crate::node::net::refuse_stream(&mut send, &mut recv);
+        let class = self.classify(&peer);
+        if !PeerPolicy::allows(class, kind) {
+            crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
             return Err(crate::error::Error::StreamRefused(
                 "peer may not open this stream kind",
             ));
@@ -597,9 +648,11 @@ impl NodeNet {
                 //
                 // `ask_observed` returns a `Result` and its callers tolerate failure,
                 // falling back to local endpoints.
+                //
+                // Asked of the connection, not the mux table: a circuit the table has since
+                // detached still left a synthetic address here (V29-15).
                 let remote = conn.quinn().remote_address();
-                let observed =
-                    (!self.manager.endpoint().is_circuit(remote)).then(|| Multiaddr::from(remote));
+                let observed = (!conn.via_circuit()).then(|| Multiaddr::from(remote));
                 let manager = Arc::clone(&self.manager);
                 match coordstream::serve_coord(
                     peer,
@@ -722,13 +775,86 @@ impl NodeNet {
     /// Exhausting every attempt is [`Error::Unreachable`]; the *last* helper's error is
     /// kept rather than a flattened one, because a peer that will not relay, one that
     /// cannot reach the target and a target that never answered are worth telling apart.
+    ///
+    /// **One ladder per peer at a time.** A reach that finds another under way to the same peer
+    /// waits for it and takes the connection it produced; only if it produced none does this one
+    /// run its own.
     pub async fn reach(
+        &self,
+        peer: Digest32,
+        endpoints: &EndpointList,
+    ) -> Result<Arc<VoxConnection>> {
+        loop {
+            if let Some(conn) = self.manager.existing(&peer) {
+                return Ok(conn);
+            }
+            let under_way = {
+                let mut reaching = lock(&self.reaching);
+                match reaching.get(&peer) {
+                    Some(woken) => Some(Arc::clone(woken)),
+                    None => {
+                        reaching.insert(peer, Arc::new(tokio::sync::Notify::new()));
+                        None
+                    }
+                }
+            };
+            let Some(woken) = under_way else {
+                // This call owns the ladder. The guard clears the entry and wakes every waiter
+                // however this ends, a cancelled caller included, so nobody waits for ever.
+                let mut owner = ReachOwner {
+                    reaching: &self.reaching,
+                    peer,
+                    manager: &self.manager,
+                    finished: false,
+                    started: std::time::Instant::now(),
+                };
+                let result = self.reach_ladder(peer, endpoints).await;
+                owner.finished = true;
+                return result;
+            };
+            let notified = woken.notified();
+            tokio::pin!(notified);
+            // Registered before looking again, so a ladder that ends in between still wakes it.
+            notified.as_mut().enable();
+            if lock(&self.reaching)
+                .get(&peer)
+                .is_some_and(|w| Arc::ptr_eq(w, &woken))
+            {
+                let waited = std::time::Instant::now();
+                notified.await;
+                let ms = waited.elapsed().as_millis();
+                // Said only after a wait worth noting (#229's diagnostics). A ladder that fails at
+                // once — nobody to relay through — is said by its own "could not reach", and every
+                // waiter repeating it drowned the log (seen on #243's anchor-restart proof).
+                let found = self.manager.existing(&peer).is_some();
+                if ms >= 250 {
+                    self.manager.note(
+                        peer,
+                        if found {
+                            format!("a reach waited {ms} ms for another under way, and took its connection")
+                        } else {
+                            format!(
+                                "a reach waited {ms} ms for another under way, which found no \
+                                 connection; it dials again"
+                            )
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// [`NodeNet::reach`]'s ladder itself, run by one caller per peer at a time.
+    async fn reach_ladder(
         &self,
         peer: Digest32,
         endpoints: &EndpointList,
     ) -> Result<Arc<VoxConnection>> {
         if let Some(conn) = self.manager.existing(&peer) {
             return Ok(conn);
+        }
+        if let Some(book) = lock(&self.status).as_ref() {
+            crate::node::status::SyncBook::note_ladder(book, peer);
         }
         // Each rung is spawned with the label it will be reported under, because a rung
         // that fails is only actionable if the operator knows *which* rung it was: a
@@ -773,7 +899,7 @@ impl NodeNet {
         let mut why: Vec<String> = Vec::with_capacity(set.len());
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok((_, Ok(conn))) => return Ok(self.manager.adopt(conn)),
+                Ok((_, Ok(conn))) => return Ok(self.manager.adopt(conn).await),
                 Ok((rung, Err(e))) => why.push(format!("{rung}: {e}")),
                 Err(_) => why.push("a rung was cancelled".to_owned()),
             }
@@ -851,7 +977,7 @@ impl NodeNet {
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok(Ok(conn)) => {
-                    let filed = self.manager.adopt(conn);
+                    let filed = self.manager.adopt(conn).await;
                     // `adopt` keeps the better of the two; only a real replacement is an
                     // upgrade.
                     if !std::ptr::eq(Arc::as_ptr(&filed), current.as_ptr()) {
@@ -901,7 +1027,7 @@ impl NodeNet {
         let conn =
             coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
                 .await?;
-        Ok(self.manager.adopt(conn))
+        Ok(self.manager.adopt(conn).await)
     }
 
     /// Rung 4 on its own: ask `relay` to carry a circuit to `peer` and dial `peer`
@@ -914,7 +1040,7 @@ impl NodeNet {
     ) -> Result<Arc<VoxConnection>> {
         let conn = circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now())
             .await?;
-        Ok(self.manager.adopt(conn))
+        Ok(self.manager.adopt(conn).await)
     }
 
     /// The responder's side of rung 3, on a session a coordinator relayed here: run the
@@ -932,7 +1058,7 @@ impl NodeNet {
         let conn =
             coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
                 .await?;
-        Ok(self.manager.adopt(conn))
+        Ok(self.manager.adopt(conn).await)
     }
 
     /// What this node's board anchors: every channel it holds a genesis for, with
@@ -969,6 +1095,14 @@ impl NodeNet {
                     members: members.len(),
                     pending: guard.current_prejoins(&channel_id, now).len(),
                     entries: None,
+                    holding: guard
+                        .current_members(&channel_id, 0, now)
+                        .iter()
+                        .map(|r| {
+                            let addrs = r.endpoints.addrs().iter().map(ToString::to_string);
+                            (r.author_id, addrs.collect())
+                        })
+                        .collect(),
                 }
             })
             .collect()
@@ -1093,6 +1227,41 @@ impl NodeNet {
                 .current_members(channel_id, epoch, now)
                 .into_iter()
                 .filter(|r| r.author_id != me)
+                .map(RendezvousRecord::to_wire),
+        );
+        out
+    }
+
+    /// This node's board's live records for `(channel, epoch)` whose **author** the given peer
+    /// board holds no record of the same kind for — bundles first, then address records, in the
+    /// order `board_records` explains. Includes this node's own. What a member offers a peer's
+    /// board during a sync, so the peer learns of a member that joined through this node without
+    /// waiting to read this node's board itself.
+    #[must_use]
+    pub fn board_records_missing_from(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+        peer: &crate::nat::service::RecordSet,
+    ) -> Vec<Vec<u8>> {
+        let now = self.now();
+        let has_bundle: std::collections::BTreeSet<Digest32> =
+            peer.bundles.iter().map(|b| b.author_id).collect();
+        let has_address: std::collections::BTreeSet<Digest32> =
+            peer.members.iter().map(|m| m.author_id).collect();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut out: Vec<Vec<u8>> = guard
+            .current_bundles(channel_id, epoch, now)
+            .into_iter()
+            .filter(|r| !has_bundle.contains(&r.author_id))
+            .map(MemberBundleRecord::to_wire)
+            .collect();
+        out.extend(
+            guard
+                .current_members(channel_id, epoch, now)
+                .into_iter()
+                .filter(|r| !has_address.contains(&r.author_id))
                 .map(RendezvousRecord::to_wire),
         );
         out

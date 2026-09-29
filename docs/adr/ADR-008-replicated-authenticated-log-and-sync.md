@@ -137,7 +137,10 @@ surfaced — never silently downgraded — by **closing the QUIC stream (or conn
 application error code**: `0x01` protocol-version-unsupported, `0x02` suite-below-floor (ADR-003),
 `0x03` unknown-struct-tag, `0x04` unknown-algo-id, `0x05` authenticator-invalid, `0x06` **reserved**
 (was quota-exceeded; the quota was removed 2026-09-24 and the code is never reused), `0x07` sync-mode-unsupported, `0x08` epoch-mismatch, `0x09` transport-failed (the peer went away or the
-stream reset — nothing about the protocol was wrong; added 2026-09-20, see Implementation notes). The peer logs the coded reason and surfaces it
+stream reset — nothing about the protocol was wrong; added 2026-09-20, see Implementation notes), `0x0A`
+unresponsive (this end closed a connection whose peer stopped answering — an unanswered liveness probe
+or `SILENCE_IS_DEATH`, ADR-012 #40; nothing about the peer's identity or frames was wrong, which is why it
+is not `0x05`). The peer logs the coded reason and surfaces it
 (ADR-014). This is the single wire-error contract referenced by ADR-003/ADR-011.
 
 **Per-entry-type authentication (binding — resolves the deniable/governance split).** Authentication

@@ -115,7 +115,7 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let told = drain(alice, r, "s1");
     assert!(
         told.contains("You no longer hold `taken`: your claim lapsed, and it is now held by")
-            && told.contains(&format!("{}/b1", &bob_fp[..12])),
+            && told.contains(&format!("{}/b1", &bob_fp[..26])),
         "a claim someone else now holds must name the holder: {told:?}"
     );
 
@@ -159,7 +159,7 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     assert!(
         told.contains(
             "You no longer hold `reserved`: your claim lapsed, and it is now reserved for"
-        ) && told.contains(&format!("{}/s9", &alice_fp[..12])),
+        ) && told.contains(&format!("{}/s9", &alice_fp[..26])),
         "a lapsed claim now reserved by a handoff must say so and name the recipient: {told:?}"
     );
 

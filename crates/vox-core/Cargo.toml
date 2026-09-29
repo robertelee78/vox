@@ -45,9 +45,14 @@ redb.workspace = true
 # OpenPGP v4 fingerprint of the native root (ADR-002 §GPG).
 sha1.workspace = true
 
-[dev-dependencies]
-hex.workspace = true
-tempfile.workspace = true
+[features]
+# **A deliberately misbehaving sync sender, for ADR-025's P9 and P10 proofs only.** No shipped build
+# enables it: release.yml builds `--bin vox` with the default features, and refuses an artifact that
+# carries the mutant's marker (scripts/package-release.sh). CI and the local release gate build it
+# into its own target directory with `scripts/build-mutant-sender.sh` and name it to the proofs by
+# `VOX_MUTANT_SENDER`; the mode is chosen per daemon by `VOX_MUTANT_SENDER_MODE`
+# (see `log::sync::mutant`).
+mutant-sender = []
 
 [lints.rust]
 unsafe_code = "forbid"

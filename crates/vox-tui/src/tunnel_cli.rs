@@ -191,7 +191,7 @@ pub async fn open_profile(
     };
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot open this profile's identity: {out:?}"
+            "cannot open this profile's identity: {out}"
         )));
     }
     Ok(node)
@@ -220,7 +220,7 @@ async fn open_room(
         .await;
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot unlock this profile: {out:?}"
+            "cannot unlock this profile: {out}"
         )));
     }
     let known: Vec<Digest32> = node.view().channels.iter().map(|c| c.channel_id).collect();
@@ -235,7 +235,7 @@ async fn open_room(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot open that room: {out:?}")));
+        return Err(AppError::Usage(format!("cannot open that room: {out}")));
     }
     Ok((node, channel_id))
 }
@@ -255,9 +255,7 @@ pub async fn service_add(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!(
-            "cannot offer {tag:?}: {out:?} — you need bind:{tag} in this room"
-        )));
+        return Err(AppError::Usage(format!("cannot offer {tag:?}: {out}")));
     }
     println!(
         "vox: offering {tag:?} at {local} in room {}",
@@ -348,7 +346,15 @@ pub async fn forward(
     // never blocked for more than one attempt.
     let deadline = Instant::now() + vox_core::node::up::HOST_PATIENCE;
     let mut said = false;
+    // **How long reaching the host took, said** (PRD-001 R42, #167). Counted from the first
+    // attempt — after this node has unlocked and opened the room, the two Argon2id steps a person
+    // waits for at the prompt — to the attempt that got through, every retry included: that is
+    // the wait R42 bounds ("a first connection to a peer, including NAT traversal, under 2 s"),
+    // and without it a slow first connection was indistinguishable from a slow unlock.
+    let first_attempt = Instant::now();
+    let mut attempts = 0u32;
     let out = loop {
+        attempts += 1;
         let out = node
             .apply(NodeCommand::Forward {
                 channel_id,
@@ -357,7 +363,13 @@ pub async fn forward(
                 local,
             })
             .await;
-        if out.is_done() || Instant::now() >= deadline {
+        // Only a missing path is worth waiting out. A port in use, a closed room or a
+        // non-loopback address is this machine's to fix, and five minutes of "waiting for a
+        // path" hid it (PRD-001 R36).
+        if out.is_done()
+            || Instant::now() >= deadline
+            || !matches!(out, Outcome::Failed(Fault::Unreachable))
+        {
             break out;
         }
         // Drain whatever the node has to say about the attempt that just failed, so a person
@@ -370,7 +382,7 @@ pub async fn forward(
         if !said {
             eprintln!(
                 "vox: {} is not reachable yet — waiting for a path (up to {:?})",
-                short(&host),
+                crate::ident::author_id(&host),
                 vox_core::node::up::HOST_PATIENCE
             );
             said = true;
@@ -384,14 +396,23 @@ pub async fn forward(
         // and cannot be granted — `vox grant`, the only thing that issued it, is
         // withdrawn too. What actually decides is the host's keyring, and the host is
         // the only one who can change it.
+        if !matches!(out, Outcome::Failed(Fault::Unreachable | Fault::Refused)) {
+            return Err(AppError::Usage(format!("cannot forward to {local}: {out}")));
+        }
         return Err(AppError::Usage(format!(
-            "cannot forward: {out:?}\n       Two things it could be: {} is not reachable \
+            "cannot forward: {out}\n       Two things it could be: {} is not reachable \
              right now, or they have not run `vox trust add` on you.\n       Reach is \
              the HOST's decision (ADR-017 decision 3) — there is nothing you can grant \
              yourself.",
-            short(&host)
+            crate::ident::author_id(&host)
         )));
     }
+    eprintln!(
+        "vox: reached {} in {} ms ({attempts} attempt{})",
+        crate::ident::author_id(&host),
+        first_attempt.elapsed().as_millis(),
+        if attempts == 1 { "" } else { "s" }
+    );
     // The bound port comes back as an event, since port 0 is resolved by the OS.
     let bound = loop {
         match node.next_event().await {
@@ -400,7 +421,10 @@ pub async fn forward(
             None => return Err(AppError::Usage("the node stopped".into())),
         }
     };
-    println!("vox: {bound} → {tag:?} on {}", short(&host));
+    println!(
+        "vox: {bound} → {tag:?} on {}",
+        crate::ident::author_id(&host)
+    );
     println!("     e.g.  ssh -p {} user@{}", bound.port(), bound.ip());
     println!("     Ctrl-C to stop");
     // Keep reading events while forwarding, so a connection the host refused or cut says
@@ -471,9 +495,7 @@ pub async fn serve(
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!(
-            "cannot serve port {port}: {out:?}"
-        )));
+        return Err(AppError::Usage(format!("cannot serve port {port}: {out}")));
     }
     let channel_id = node
         .view()
@@ -485,7 +507,7 @@ pub async fn serve(
 
     let out = node.apply(NodeCommand::Invite { channel_id }).await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot mint an address: {out:?}")));
+        return Err(AppError::Usage(format!("cannot mint an address: {out}")));
     }
     let url = loop {
         match node.next_event().await {
@@ -524,10 +546,10 @@ pub async fn serve(
             _ = tokio::signal::ctrl_c() => break,
             event = node.next_event() => match event {
                 Some(NodeEvent::TunnelServed { client, service_tag, .. }) => {
-                    println!("vox: {} reached {service_tag:?}", short(&client));
+                    println!("vox: {} reached {service_tag:?}", crate::ident::author_id(&client));
                 }
                 Some(NodeEvent::PeerJoined { peer, .. }) => {
-                    println!("vox: {} joined", short(&peer));
+                    println!("vox: {} joined", crate::ident::author_id(&peer));
                 }
                 Some(ref other) => say_if_it_explains_a_failure(other),
                 None => return Err(AppError::Usage("the node stopped".into())),
@@ -585,7 +607,7 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     let out = node.apply(NodeCommand::Up { channel_id, bind }).await;
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot bring the proxy up: {out:?} — is the room a `vox serve` room, and is its host reachable?"
+            "cannot bring the proxy up on {bind}: {out}"
         )));
     }
     let (hostname, bound) = loop {
@@ -640,10 +662,19 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
 pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
     match ev {
         NodeEvent::PeerUnreachable { peer, why } => {
-            eprintln!("vox: could not reach {} — {why}", short(peer));
+            eprintln!(
+                "vox: could not reach {} — {why}",
+                crate::ident::author_id(peer)
+            );
         }
         NodeEvent::JoinFailed { reason } => {
             eprintln!("vox: a join did not complete — {reason}");
+        }
+        NodeEvent::RoomNotRemembered { channel_id, why } => {
+            eprintln!(
+                "vox: room {} is open, but will not reopen by itself after a restart — {why}",
+                short(channel_id)
+            );
         }
         NodeEvent::JoinSteps { joined, steps } => {
             eprintln!(
@@ -668,18 +699,44 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         } => {
             eprintln!(
                 "vox: {} did not take our key for room {} — {why}; it is sent again",
-                short(peer),
+                crate::ident::author_id(peer),
                 short(channel_id)
             );
         }
         NodeEvent::StillRelayed { peer, reason } => {
-            eprintln!("vox: still relayed to {} — {reason}", short(peer));
+            eprintln!(
+                "vox: still relayed to {} — {reason}",
+                crate::ident::author_id(peer)
+            );
         }
         NodeEvent::ProxyRefused { reason } => {
             eprintln!("vox: tunnel refused or cut — {reason}");
         }
+        NodeEvent::SyncFailed {
+            channel_id,
+            peer,
+            reason,
+        } => {
+            eprintln!(
+                "vox: sync of room {} with {} did not complete — {reason}",
+                short(channel_id),
+                crate::ident::author_id(peer)
+            );
+        }
         NodeEvent::Stalled { what, millis } => {
             eprintln!("vox: busy {millis}ms — {what} — nobody could be answered");
+        }
+        NodeEvent::PublishCured { channel_id, what } => {
+            eprintln!(
+                "vox: {what} for room {} was taken on a republish, after the board refused it as stale",
+                short(channel_id)
+            );
+        }
+        NodeEvent::ConnectionNote { peer, note } => {
+            eprintln!(
+                "vox: connection to {} — {note}",
+                crate::ident::author_id(peer)
+            );
         }
         _ => {}
     }
@@ -712,7 +769,10 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
                 break;
             }
             NodeEvent::PeerUnreachable { peer, why } => {
-                said.push(format!("could not reach {} — {why}", short(&peer)));
+                said.push(format!(
+                    "could not reach {} — {why}",
+                    crate::ident::author_id(&peer)
+                ));
             }
             ref other => say_if_it_explains_a_failure(other),
         }
@@ -724,7 +784,7 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
     // at exactly the moment somebody is stuck.
     let advice = join_advice(match out {
         Outcome::Failed(fault) => Some(fault),
-        Outcome::Done => None,
+        Outcome::Done | Outcome::Bound(_) => None,
     });
 
     if said.is_empty() {
@@ -749,13 +809,29 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::BadLink) => {
             "that address will not parse, or names a room this node cannot use\n       this one IS the address — check you copied all of it"
         }
+        // **Do not claim the address is fine here.** A board with nothing for the room cannot tell
+        // "its host has not published it yet" from "that room does not exist": an invite link
+        // carries no checksum, so a room id with one mistyped character still parses, reaches the
+        // board, and finds nothing. The first version of this advice said "the address is fine",
+        // the same false confidence `Unreachable` below refuses about the passphrase. Name both
+        // causes and what settles each.
+        Some(Fault::RoomNotOnBoard) => {
+            "either its host has not published the room there yet (the host must be online; then run this again)\n       or the room part of the address is wrong: check it against the address you were sent"
+        }
         // **Do not claim the passphrase is fine here.** Nobody answered, so nobody
         // checked it — a wrong passphrase against an offline room reaches exactly this
         // branch. The first version of this fix said "NOT the address or the
         // passphrase", which is the same false confidence as the sentence it replaced,
         // pointed the other way. Say what was and was not established.
+        //
+        // **And say which side was unreachable (#192).** One sentence covered both, and it said
+        // "every member the board knows is offline" when the board itself had never answered: a
+        // claim about members, made with no word from the board about any of them.
+        Some(Fault::BoardUnreachable) => {
+            "the anchor could not be reached, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the anchor is running (`vox node`) and that this node can reach its address"
+        }
         Some(Fault::Unreachable) => {
-            "nobody who can answer for this room could be reached\n       so your passphrase was never checked — this is not a verdict on it\n       every member the board knows is offline: ask one to come online, or check\n       `vox node` on the anchor shows more than `1m` for this room"
+            "the anchor answered, but no member it knows could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online, or check `vox node` on the anchor shows more than `1m` for this room"
         }
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
         // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
@@ -772,24 +848,43 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::Locked | Fault::NoIdentity) => {
             "this profile has no unlocked identity, so there is nobody to join as\n       run `vox id` to make one"
         }
+        // Joining a room this node already holds used to say `Failed(IdentityExists)`.
+        Some(Fault::AlreadyMember) => Fault::AlreadyMember.explain(),
         _ => "the node did not say why, which is itself worth reporting",
     }
 }
 
 /// The fault named in a daemon's reply to a join (`"Failed(Refused)"`), for the verbs that reach
-/// the node over its control socket, where only the outcome's name crosses the wire.
+/// the node over its control socket, where only the outcome's name crosses the wire. The name is
+/// the reply's first line; a failed join's steps follow it (see [`join_detail`]).
 pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
-    let name = reason.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
+    let first = reason.lines().next().unwrap_or_default();
+    let name = first.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
     Some(match name {
         "WrongPassphrase" => Fault::WrongPassphrase,
         "BadLink" => Fault::BadLink,
+        "RoomNotOnBoard" => Fault::RoomNotOnBoard,
+        "BoardUnreachable" => Fault::BoardUnreachable,
         "Unreachable" => Fault::Unreachable,
         "Refused" => Fault::Refused,
         "NotNetworked" => Fault::NotNetworked,
         "Locked" => Fault::Locked,
         "NoIdentity" => Fault::NoIdentity,
+        "AlreadyMember" => Fault::AlreadyMember,
         _ => return None,
     })
+}
+
+/// What a daemon's reply to a failed join says after the fault's name: its `steps: …` and
+/// `said: …` lines, each indented under the advice as the house style indents a second line.
+/// Empty when the reply carried none.
+pub(crate) fn join_detail(reason: &str) -> String {
+    reason
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| format!("\n       {}", l.trim()))
+        .collect()
 }
 
 /// [`short`], reachable from the other CLI modules that report a peer.
@@ -917,7 +1012,7 @@ pub async fn trust_add(
         .await;
     if !out.is_done() {
         return Err(AppError::Usage(format!(
-            "cannot trust that identity: {out:?}"
+            "cannot trust that identity: {out}"
         )));
     }
     println!("vox: trusting {} as {petname:?}", short(&target));
@@ -941,9 +1036,15 @@ pub async fn trust_remove(node: &NodeHandle, fingerprint: &str) -> Result<(), Ap
         })
         .await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!(
-            "cannot stop trusting that identity: {out:?}"
-        )));
+        // `NotConsented` from `Untrust` has one meaning: the identity is not in the ring.
+        return Err(AppError::Usage(match out {
+            Outcome::Failed(Fault::NotConsented) => format!(
+                "{} is not in your trust keyring, so there is nothing to remove\n       \
+                 `vox trust list` shows who is",
+                short(&target)
+            ),
+            other => format!("cannot stop trusting that identity: {other}"),
+        }));
     }
     println!("vox: no longer trusting {}", short(&target));
     println!("     it reads nothing you write from now on, in any room you share");

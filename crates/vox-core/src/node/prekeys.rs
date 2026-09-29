@@ -26,22 +26,24 @@
 //!   when that channel is closed.
 //!
 //! So the ring is a [`SegmentKind::PrekeyRing`] segment in the profile store,
-//! sealed under a key derived from the **identity factor alone**:
+//! sealed under a key derived from the vault's **`self_seed`**:
 //!
 //! ```text
-//! ring_channel = SHA-256("vox/prekey-ring-pseudo-channel/v1")   // reserved, not a real channelID
-//! factor_id    = HKDF-SHA-256(id_proof(ring_channel), info = "vox/sek-id/v1")   // ADR-010
-//! ring_key     = HKDF-SHA-256(factor_id,              info = "vox/prekey-ring-sek/v1")
+//! ring_key = HKDF-SHA-256(self_seed, info = "vox/prekey-ring-sek/v2")
 //! ```
 //!
-//! This is **single-factor by design**, and it is not a weakening: the identity
-//! factor requires the unlocked identity domain, which requires the identity
+//! This is single-factor by design: `self_seed` is released only by the identity
 //! passphrase, so the ring is gated by exactly the same secret as the root it
-//! belongs to — and, like every SEK, it is derived without ever reading raw
-//! private-key bytes (it works with a delegated `gpg-agent`/Enclave signer). It is
-//! also non-circular for the same reason per-channel SEKs are: the identity domain
-//! unlocks first. A second, extra HKDF step keeps `ring_key` domain-separated from
-//! anything else that consumes `factor_id`.
+//! belongs to, and it is non-circular because the identity domain unlocks first.
+//!
+//! **It used to be the identity factor,** `HKDF(HKDF(id_proof(ring_channel)))`, on the
+//! reasoning that computing `id_proof` requires the unlocked identity. That holds
+//! classically and fails against a quantum adversary: `id_proof` is an Ed25519
+//! signature, and Ed25519's private key falls to such an adversary from the public key
+//! alone. With the disk, that adversary opened the ring, whose ML-KEM prekey secrets
+//! undo the post-quantum half of every handshake recorded against them (V210-40, #214).
+//! A version-1 vault's ring is re-sealed once, on its first unlock
+//! ([`crate::node::seal_migration`]).
 //!
 //! ## Consuming a one-time prekey (ADR-002 one-shot + ADR-004 serverless semantics)
 //! [`PrekeyRing::use_one_time`] moves the prekey out of the pool into a bounded
@@ -73,12 +75,9 @@
 //! survives in a copy, and [`save`] **must** be called after a consume: until it
 //! is, a crash would re-offer the prekey on the next start (a test pins this).
 
-use hkdf::Hkdf;
-use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::atrest::idfactor::{IdentityFactor, SignatureIdentityFactor, FACTOR_ID_LEN};
-use crate::atrest::sek::{Sek, SEK_LEN};
+use crate::atrest::sek::Sek;
 use crate::atrest::store::{open_segment, seal_segment, SegmentKind};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -95,7 +94,11 @@ use crate::node::store::Store;
 pub const PREKEY_RING_CHANNEL_DOMAIN: &str = "vox/prekey-ring-pseudo-channel/v1";
 
 /// HKDF `info` separating the ring key from every other `factor_id` consumer.
-pub const PREKEY_RING_SEK_INFO: &[u8] = b"vox/prekey-ring-sek/v1";
+pub const PREKEY_RING_SEK_INFO: &[u8] = b"vox/prekey-ring-sek/v2";
+
+/// The label a version-1 vault's ring was sealed under, over the identity factor (migration
+/// only; see [`crate::atrest::seal::legacy`]).
+pub const LEGACY_PREKEY_RING_SEK_INFO: &[u8] = b"vox/prekey-ring-sek/v1";
 
 /// The ring's segment id within its pseudo-channel (one segment, latest-wins).
 pub const SEG_PREKEY_RING: u64 = 1;
@@ -129,16 +132,14 @@ pub fn ring_channel() -> Digest32 {
     sha256(PREKEY_RING_CHANNEL_DOMAIN.as_bytes())
 }
 
-/// Derive the ring's sealing key from the identity factor (see the module docs).
-fn ring_sek(signer: &dyn RootSigner) -> Result<Sek> {
-    let factor = SignatureIdentityFactor::new(signer);
-    let channel = ring_channel();
-    let factor_id: Zeroizing<[u8; FACTOR_ID_LEN]> = factor.factor_id(&channel)?;
-    let hk = Hkdf::<Sha256>::new(None, factor_id.as_ref());
-    let mut key = Zeroizing::new([0u8; SEK_LEN]);
-    hk.expand(PREKEY_RING_SEK_INFO, key.as_mut())
-        .map_err(|_| Error::Argon2Failed)?;
-    Ok(Sek::from_bytes(key))
+/// The ring's sealing key, from the vault's `self_seed` (see the module docs).
+pub fn ring_sek(signer: &dyn RootSigner) -> Result<Sek> {
+    crate::atrest::seal::sek(signer, PREKEY_RING_SEK_INFO)
+}
+
+/// The key a version-1 vault's ring was sealed under (migration only).
+pub fn legacy_ring_sek(signer: &dyn RootSigner) -> Result<Sek> {
+    crate::atrest::seal::legacy::sek(signer, &ring_channel(), LEGACY_PREKEY_RING_SEK_INFO)
 }
 
 /// What [`PrekeyRing::maintain`] did.

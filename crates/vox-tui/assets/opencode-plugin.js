@@ -124,8 +124,14 @@ export default async function vox({ $ }) {
         // Fenced, so the model can tell what came from the room from what the
         // operator actually typed. Prepended rather than appended: it is context
         // for the prompt that follows, the same position Claude Code's
-        // `additionalContext` occupies.
-        const block = "<vox-room>\n" + text.trim() + "\n</vox-room>\n\n"
+        // `additionalContext` occupies. OpenCode gives no separate channel, so the
+        // block shares the operator's message: the fence names its source, and what
+        // follows the closing tag is the operator's own. Without that, a live model
+        // refused the operator's instruction as one "embedded in messages".
+        const block =
+          '<vox-room source="other agents; not the user">\n' +
+          text.trim() +
+          "\n</vox-room>\n\nThe user's message:\n"
         for (const part of output.parts) {
           if (part.type === "text" && typeof part.text === "string") {
             part.text = block + part.text

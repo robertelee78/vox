@@ -201,6 +201,8 @@ pub enum Event {
 pub enum UiError {
     /// Wrong channel passphrase on join.
     WrongPassphrase,
+    /// The identity opened, but what it sealed in the store would not (V210-40).
+    SealedUnreadable,
     /// Join proof-of-work is still being computed (Equihash delay).
     JoinPowDelay,
     /// Join proof-of-possession / identity mismatch.
@@ -227,6 +229,8 @@ pub enum UiError {
     ChannelNotOpen,
     /// An input exceeded its bound (name or message length).
     TooLong,
+    /// The trust keyring holds its maximum number of identities.
+    KeyringFull,
     /// Persisting to the store failed; reopen the channel.
     Storage,
     /// This action needs the network milestone (M14) — not available yet.
@@ -239,6 +243,10 @@ pub enum UiError {
     NotConsented,
     /// This client is not networked, or is locked, so it cannot reach anyone.
     NotNetworked,
+    /// A local address the node needs (its listen port) is already in use.
+    AddressInUse,
+    /// A join named a room this profile already holds.
+    AlreadyMember,
     /// An unexpected internal error (never carries detail).
     Internal,
 }
@@ -260,6 +268,9 @@ impl UiError {
     pub fn message(self) -> &'static str {
         match self {
             UiError::WrongPassphrase => "wrong passphrase",
+            UiError::SealedUnreadable => {
+                "passphrase right, but this profile's keyring or prekeys will not open — altered, or another identity's"
+            }
             UiError::JoinPowDelay => "join proof-of-work in progress…",
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — both must be online (or run your node)",
@@ -273,11 +284,14 @@ impl UiError {
             UiError::Locked => "locked — :unlock",
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",
+            UiError::KeyringFull => "your trust keyring is full (1,024) — remove one first",
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",
+            UiError::AddressInUse => "a local port it needs is in use — pick another --listen",
+            UiError::AlreadyMember => "you already hold that room — it is in your list",
             UiError::Internal => "internal error",
         }
     }

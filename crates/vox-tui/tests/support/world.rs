@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
@@ -27,12 +27,32 @@ pub struct VoxProc {
     pub child: Child,
     pub lines: mpsc::Receiver<String>,
     pub seen: Vec<String>,
+    /// Every stderr line with **when it was read**, so a proof's red can say when each thing
+    /// the product noticed happened, not only that it did.
+    pub timed: Arc<Mutex<Vec<(Instant, String)>>>,
 }
 
 impl VoxProc {
     pub fn spawn(name: &str, data: &Path, args: &[String]) -> Self {
-        let mut child = Command::new(VOX)
+        Self::spawn_env(name, data, args, &[])
+    }
+
+    /// [`VoxProc::spawn`] with extra environment, for the proofs' test-only knobs.
+    pub fn spawn_env(name: &str, data: &Path, args: &[String], env: &[(&str, &str)]) -> Self {
+        Self::spawn_exe(Path::new(VOX), name, data, args, env)
+    }
+
+    /// [`VoxProc::spawn_env`] with another `vox` binary (a previous release, for a migration).
+    pub fn spawn_exe(
+        exe: &Path,
+        name: &str,
+        data: &Path,
+        args: &[String],
+        env: &[(&str, &str)],
+    ) -> Self {
+        let mut child = Command::new(exe)
             .args(args)
+            .envs(env.iter().copied())
             .env("VOX_DATA_DIR", data)
             .env("VOX_CONFIG_DIR", data.join("cfg"))
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
@@ -46,6 +66,8 @@ impl VoxProc {
         let out = child.stdout.take().expect("stdout");
         let err = child.stderr.take().expect("stderr");
         let tx_err = tx.clone();
+        let timed = Arc::new(Mutex::new(Vec::new()));
+        let timed_err = Arc::clone(&timed);
         std::thread::spawn(move || {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 if tx.send(line).is_err() {
@@ -57,6 +79,10 @@ impl VoxProc {
         // rather than a failure (ADR-018 §6).
         std::thread::spawn(move || {
             for line in BufReader::new(err).lines().map_while(Result::ok) {
+                timed_err
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((Instant::now(), line.clone()));
                 if tx_err.send(format!("! {line}")).is_err() {
                     break;
                 }
@@ -67,6 +93,7 @@ impl VoxProc {
             child,
             lines: rx,
             seen: Vec::new(),
+            timed,
         }
     }
 
@@ -116,6 +143,22 @@ impl VoxProc {
             self.seen.push(line);
         }
         self.seen.join("\n")
+    }
+
+    /// Every stderr line so far, each with its time relative to `t0` in seconds.
+    pub fn said_since(&self, t0: Instant) -> Vec<String> {
+        self.timed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(at, l)| {
+                let (sign, d) = match at.checked_duration_since(t0) {
+                    Some(d) => ("+", d),
+                    None => ("-", t0.duration_since(*at)),
+                };
+                format!("[{sign}{:.3}s] {l}", d.as_secs_f64())
+            })
+            .collect()
     }
 
     pub fn expect_line(&mut self, what: &str, pred: impl Fn(&str) -> bool) -> String {

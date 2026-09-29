@@ -20,12 +20,23 @@
 //! a path that may have changed. That is what the transfer would have had on a connection of its
 //! own. RFC 5681 §4.1 also restarts after idle, but keeps the old slow-start threshold, which
 //! would leave exactly the plateau measured above.
+//!
+//! # Why a Vox Cubic, with HyStart++
+//! quinn's Cubic leaves slow start only on loss. Each transfer starts in slow start (above), so on a
+//! long path the window doubled until the queues overflowed: measured through the shipped binary
+//! on GitHub's macOS runner, an emulated 1 Gbit/s, 50 ms path (bandwidth-delay product 6.25 MB)
+//! saw the window reach 42-58 MB and the round trip climb to 110-240 ms, and the transfer then paid
+//! for the burst of losses. R41 WAN on that runner: 61-106% of raw from one run to the next. The
+//! kernels' own TCP (the raw arm) leaves slow start when the round trip rises (HyStart), and so
+//! does this one now: `VoxCubic` is quinn 0.11's Cubic, ported unchanged outside slow start, with
+//! HyStart++ (RFC 9406) deciding when slow start ends. quinn's `Controller` trait cannot end its
+//! own Cubic's slow start from outside, which is why the Cubic is ours; quinn itself is untouched.
 
 use std::any::Any;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics, CubicConfig};
+use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 use quinn_proto::RttEstimator;
 
 /// How long a connection must have sent nothing before its next send starts from a fresh
@@ -38,17 +49,14 @@ pub const IDLE_RESTART: Duration = Duration::from_secs(1);
 /// restarted between two flights of the same transfer.
 const IDLE_RTTS: u32 = 4;
 
-/// Builds `IdleRestart` controllers around quinn's Cubic.
+/// Builds `IdleRestart` controllers around `VoxCubic`.
 #[derive(Debug, Default)]
-pub struct IdleRestartConfig {
-    cubic: Arc<CubicConfig>,
-}
+pub struct IdleRestartConfig;
 
 impl ControllerFactory for IdleRestartConfig {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         Box::new(IdleRestart {
-            inner: Arc::clone(&self.cubic).build(now, current_mtu),
-            factory: Arc::clone(&self.cubic),
+            inner: Box::new(VoxCubic::new(now, current_mtu)),
             mtu: current_mtu,
             last_sent: None,
             srtt: Duration::ZERO,
@@ -59,7 +67,6 @@ impl ControllerFactory for IdleRestartConfig {
 /// Cubic, rebuilt from scratch when the connection goes idle. See the module docs.
 struct IdleRestart {
     inner: Box<dyn Controller>,
-    factory: Arc<CubicConfig>,
     mtu: u16,
     last_sent: Option<Instant>,
     srtt: Duration,
@@ -72,7 +79,7 @@ impl Controller for IdleRestart {
             .last_sent
             .is_some_and(|t| now.saturating_duration_since(t) > idle)
         {
-            self.inner = Arc::clone(&self.factory).build(now, self.mtu);
+            self.inner = Box::new(VoxCubic::new(now, self.mtu));
         }
         self.last_sent = Some(now);
         self.inner.on_sent(now, bytes, last_packet_number);
@@ -128,7 +135,6 @@ impl Controller for IdleRestart {
     fn clone_box(&self) -> Box<dyn Controller> {
         Box::new(Self {
             inner: self.inner.clone_box(),
-            factory: Arc::clone(&self.factory),
             mtu: self.mtu,
             last_sent: self.last_sent,
             srtt: self.srtt,
@@ -137,6 +143,304 @@ impl Controller for IdleRestart {
 
     fn initial_window(&self) -> u64 {
         self.inner.initial_window()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+// ---- VoxCubic: quinn 0.11's Cubic with HyStart++ -----------------------------------------------
+//
+// The Cubic arithmetic below is quinn-proto 0.11.18's `congestion/cubic.rs` (MIT OR Apache-2.0),
+// ported unchanged: RFC 8312's constants and equations, in bytes. What is Vox's is when slow start
+// ends (HyStart++, RFC 9406, below).
+
+/// RFC 8312 §5: the multiplicative decrease.
+const BETA_CUBIC: f64 = 0.7;
+/// RFC 8312 §5: the cubic scaling constant.
+const C: f64 = 0.4;
+/// quinn's default initial window: 14,720 bytes clamped to 2-10 base datagrams (1200 bytes).
+const INITIAL_WINDOW: u64 = 12_000;
+
+// RFC 9406 §4.3 recommended values.
+/// The fewest round-trip samples in a round before a delay increase is judged.
+const N_RTT_SAMPLE: u32 = 8;
+/// The delay increase that ends slow start, as a share of the last round's minimum RTT…
+const MIN_RTT_DIVISOR: u32 = 8;
+/// …but never below this…
+const MIN_RTT_THRESH: Duration = Duration::from_millis(4);
+/// …nor above this.
+const MAX_RTT_THRESH: Duration = Duration::from_millis(16);
+/// Conservative Slow Start grows the window at this fraction of slow start's rate…
+const CSS_GROWTH_DIVISOR: u64 = 4;
+/// …for this many rounds, unless the delay falls back (a spurious exit).
+const CSS_ROUNDS: u32 = 5;
+
+/// Where HyStart++ has the connection: slow start, Conservative Slow Start, or done (congestion
+/// avoidance, which is Cubic's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    SlowStart,
+    Css { baseline: Duration, rounds: u32 },
+    Done,
+}
+
+/// Cubic's state across the connection (RFC 8312 §4).
+#[derive(Debug, Default, Clone)]
+struct CubicState {
+    k: f64,
+    w_max: f64,
+    cwnd_inc: u64,
+}
+
+impl CubicState {
+    // K = cbrt(w_max * (1 - beta_cubic) / C)  (RFC 8312 Eq. 2)
+    fn cubic_k(&self, mtu: u64) -> f64 {
+        let w_max = self.w_max / mtu as f64;
+        (w_max * (1.0 - BETA_CUBIC) / C).cbrt()
+    }
+    // W_cubic(t) = C * (t - K)^3 + w_max  (Eq. 1)
+    fn w_cubic(&self, t: Duration, mtu: u64) -> f64 {
+        let w_max = self.w_max / mtu as f64;
+        (C * (t.as_secs_f64() - self.k).powi(3) + w_max) * mtu as f64
+    }
+    // W_est(t) = w_max * beta + 3 * (1 - beta) / (1 + beta) * (t / RTT)  (Eq. 4)
+    fn w_est(&self, t: Duration, rtt: Duration, mtu: u64) -> f64 {
+        let w_max = self.w_max / mtu as f64;
+        (w_max * BETA_CUBIC
+            + 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC) * t.as_secs_f64() / rtt.as_secs_f64())
+            * mtu as f64
+    }
+}
+
+/// quinn's Cubic, with slow start ended by HyStart++ (RFC 9406) as well as by loss.
+///
+/// Rounds are counted in packet numbers: a round ends when a packet sent after it began is
+/// acknowledged. Each acknowledgement's round-trip sample is its own `now - sent`. Once a round has
+/// [`N_RTT_SAMPLE`] samples and its minimum exceeds the previous round's by the threshold, slow
+/// start gives way to Conservative Slow Start (a quarter of the growth). A later round whose
+/// minimum is back under the baseline was a false alarm, and slow start resumes; after
+/// [`CSS_ROUNDS`] rounds without that, the window becomes the slow-start threshold and Cubic's
+/// congestion avoidance takes over. Loss in either phase is Cubic's ordinary reduction. quinn
+/// paces, so RFC 9406's burst limit `L` is unlimited.
+#[derive(Debug, Clone)]
+pub(crate) struct VoxCubic {
+    window: u64,
+    ssthresh: u64,
+    recovery_start_time: Option<Instant>,
+    state: CubicState,
+    mtu: u64,
+    phase: Phase,
+    last_sent_pn: u64,
+    round_end_pn: Option<u64>,
+    last_round_min: Option<Duration>,
+    round_min: Option<Duration>,
+    round_samples: u32,
+}
+
+impl VoxCubic {
+    pub(crate) fn new(_now: Instant, current_mtu: u16) -> Self {
+        Self {
+            window: INITIAL_WINDOW,
+            ssthresh: u64::MAX,
+            recovery_start_time: None,
+            state: CubicState::default(),
+            mtu: u64::from(current_mtu),
+            phase: Phase::SlowStart,
+            last_sent_pn: 0,
+            round_end_pn: None,
+            last_round_min: None,
+            round_min: None,
+            round_samples: 0,
+        }
+    }
+
+    fn minimum_window(&self) -> u64 {
+        2 * self.mtu
+    }
+
+    /// RFC 9406 §4.2: the delay rise that ends slow start, from the last round's minimum RTT.
+    fn rtt_thresh(last_round_min: Duration) -> Duration {
+        (last_round_min / MIN_RTT_DIVISOR).clamp(MIN_RTT_THRESH, MAX_RTT_THRESH)
+    }
+
+    /// A round has ended: roll the minimums, and move Conservative Slow Start on a round.
+    fn end_round(&mut self) {
+        if let Phase::Css { baseline, rounds } = self.phase {
+            let rounds = rounds + 1;
+            if rounds >= CSS_ROUNDS {
+                // RFC 9406 §4.2: CSS confirmed; congestion avoidance from here.
+                self.ssthresh = self.window;
+                self.phase = Phase::Done;
+            } else {
+                self.phase = Phase::Css { baseline, rounds };
+            }
+        }
+        self.last_round_min = self.round_min.or(self.last_round_min);
+        self.round_min = None;
+        self.round_samples = 0;
+        self.round_end_pn = Some(self.last_sent_pn);
+    }
+
+    /// One round-trip sample while the window is below the slow-start threshold.
+    fn hystart_sample(&mut self, sample: Duration) {
+        self.round_min = Some(self.round_min.map_or(sample, |m| m.min(sample)));
+        self.round_samples = self.round_samples.saturating_add(1);
+        if self.round_samples < N_RTT_SAMPLE {
+            return;
+        }
+        let (Some(current), Some(last)) = (self.round_min, self.last_round_min) else {
+            return;
+        };
+        match self.phase {
+            Phase::SlowStart if current >= last + Self::rtt_thresh(last) => {
+                self.phase = Phase::Css {
+                    baseline: current,
+                    rounds: 0,
+                };
+            }
+            Phase::Css { baseline, .. } if current < baseline => {
+                // RFC 9406 §4.2: the rise was spurious; back to slow start.
+                self.phase = Phase::SlowStart;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Controller for VoxCubic {
+    fn on_sent(&mut self, _now: Instant, _bytes: u64, last_packet_number: u64) {
+        self.last_sent_pn = last_packet_number;
+        if self.round_end_pn.is_none() {
+            self.round_end_pn = Some(last_packet_number);
+        }
+    }
+
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        if app_limited
+            || self
+                .recovery_start_time
+                .is_some_and(|recovery_start_time| sent <= recovery_start_time)
+        {
+            return;
+        }
+
+        if self.window < self.ssthresh {
+            if self.phase != Phase::Done {
+                self.hystart_sample(now.saturating_duration_since(sent));
+            }
+            // Slow start, or a quarter of it in Conservative Slow Start (RFC 9406 §4.2).
+            self.window += match self.phase {
+                Phase::Css { .. } => bytes / CSS_GROWTH_DIVISOR,
+                _ => bytes,
+            };
+        } else {
+            let ca_start_time = match self.recovery_start_time {
+                Some(t) => t,
+                None => {
+                    self.recovery_start_time = Some(now);
+                    self.state.w_max = self.window as f64;
+                    self.state.k = 0.0;
+                    now
+                }
+            };
+            let t = now - ca_start_time;
+            let w_cubic = self.state.w_cubic(t + rtt.get(), self.mtu);
+            let w_est = self.state.w_est(t, rtt.get(), self.mtu);
+            let mut cubic_cwnd = self.window;
+            if w_cubic < w_est {
+                cubic_cwnd = cubic_cwnd.max(w_est as u64);
+            } else if cubic_cwnd < w_cubic as u64 {
+                let cubic_inc = (w_cubic - cubic_cwnd as f64) / cubic_cwnd as f64 * self.mtu as f64;
+                cubic_cwnd = cubic_cwnd.saturating_add(cubic_inc as u64);
+            }
+            self.state.cwnd_inc += cubic_cwnd - self.window;
+            if self.state.cwnd_inc >= self.mtu {
+                self.window += self.mtu;
+                self.state.cwnd_inc = 0;
+            }
+        }
+    }
+
+    fn on_end_acks(
+        &mut self,
+        _now: Instant,
+        _in_flight: u64,
+        _app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+    ) {
+        if let (Some(acked), Some(end)) = (largest_packet_num_acked, self.round_end_pn) {
+            if acked >= end {
+                self.end_round();
+            }
+        }
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+        if self
+            .recovery_start_time
+            .is_some_and(|recovery_start_time| sent <= recovery_start_time)
+        {
+            return;
+        }
+        // Loss ends HyStart++ whatever its phase: from here it is Cubic's.
+        self.phase = Phase::Done;
+        self.recovery_start_time = Some(now);
+        let window = self.window as f64;
+        self.state.w_max = if window < self.state.w_max {
+            window * (1.0 + BETA_CUBIC) / 2.0
+        } else {
+            window
+        };
+        self.ssthresh = ((window * BETA_CUBIC) as u64).max(self.minimum_window());
+        self.window = self.ssthresh;
+        self.state.k = self.state.cubic_k(self.mtu);
+        self.state.cwnd_inc = (self.state.cwnd_inc as f64 * BETA_CUBIC) as u64;
+        if is_persistent_congestion {
+            self.recovery_start_time = None;
+            self.state.w_max = self.window as f64;
+            self.ssthresh = ((self.window as f64 * BETA_CUBIC) as u64).max(self.minimum_window());
+            self.state.cwnd_inc = 0;
+            self.window = self.minimum_window();
+        }
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.mtu = u64::from(new_mtu);
+        self.window = self.window.max(self.minimum_window());
+    }
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn metrics(&self) -> ControllerMetrics {
+        let mut m = ControllerMetrics::default();
+        m.congestion_window = self.window;
+        m.ssthresh = Some(self.ssthresh);
+        m
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        INITIAL_WINDOW
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {

@@ -20,6 +20,9 @@
 //! model login inside the isolated `CODEX_HOME`, and this proof does not take the
 //! operator's credentials. Trust is Codex's own gate, reported by Codex's own API.
 
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
+
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -131,6 +134,7 @@ fn vox_trust(home: &Path) -> (bool, String) {
 #[test]
 #[ignore = "drives the installed Codex's app-server; run where Codex is installed"]
 fn vox_trusts_its_own_codex_hook_and_nothing_else() {
+    watchdog::arm();
     assert!(
         codex_present(),
         "this proof needs `codex` on PATH — an absent Codex is not a pass"

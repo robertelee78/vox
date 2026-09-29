@@ -314,6 +314,7 @@ pub fn run_node(
         let mut last_state: (usize, usize, usize) = (usize::MAX, 0, 0);
         // What the board actually holds per room, reported when it changes. See below.
         let mut last_board: Vec<String> = Vec::new();
+        let mut last_holding: Vec<String> = Vec::new();
         let mut stalls = node.subscribe();
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
@@ -395,6 +396,29 @@ pub fn run_node(
                         println!("vox node: board — {}", board.join(", "));
                         last_board = board;
                     }
+                    // **Where the board points each member** (V210-51, #230): the address its live
+                    // record names, which is what this board hands anyone asking where that member
+                    // is. A process that restarts publishes a new one; a board still naming the old
+                    // process's address sends every dial to a socket nobody holds, and nothing else
+                    // an operator can read says so. On change, like the rest.
+                    let holding: Vec<String> = view
+                        .anchoring
+                        .iter()
+                        .flat_map(|a| {
+                            a.holding.iter().map(|(member, addrs)| {
+                                format!(
+                                    "{} holding {} for {}",
+                                    crate::tunnel_cli::short_id_of(&a.channel_id),
+                                    addrs.join(" "),
+                                    crate::ident::author_id(member)
+                                )
+                            })
+                        })
+                        .collect();
+                    for line in holding.iter().filter(|l| !last_holding.contains(*l)) {
+                        println!("vox node: board — {line}");
+                    }
+                    last_holding = holding;
                     // Drained without blocking: this arm also has an anchors file to
                     // write, and a status line nobody reads is better than a tick nobody
                     // reaches.
@@ -417,7 +441,7 @@ pub fn run_node(
                                 vox_core::node::api::NodeEvent::PeerUnreachable { peer, why } => {
                                     eprintln!(
                                         "vox node: could not reach {} — {why}",
-                                        crate::tunnel_cli::short_id_of(&peer)
+                                        crate::ident::author_id(&peer)
                                     );
                                 }
                                 vox_core::node::api::NodeEvent::JoinFailed { reason } => {
@@ -446,14 +470,20 @@ pub fn run_node(
                                 } => {
                                     eprintln!(
                                         "vox node: {} did not take our key for room {} — {why}; it is sent again",
-                                        crate::tunnel_cli::short_id_of(&peer),
+                                        crate::ident::author_id(&peer),
                                         crate::tunnel_cli::short_id_of(&channel_id)
                                     );
                                 }
                                 vox_core::node::api::NodeEvent::StillRelayed { peer, reason } => {
                                     eprintln!(
                                         "vox node: still relayed to {} — {reason}",
-                                        crate::tunnel_cli::short_id_of(&peer)
+                                        crate::ident::author_id(&peer)
+                                    );
+                                }
+                                vox_core::node::api::NodeEvent::ConnectionNote { peer, note } => {
+                                    eprintln!(
+                                        "vox node: connection to {} — {note}",
+                                        crate::ident::author_id(&peer)
                                     );
                                 }
                                 vox_core::node::api::NodeEvent::Synced {
@@ -706,7 +736,16 @@ pub fn run_daemon(
                      `vox daemon` is the identity passphrase; lines after it open rooms."
                         .to_owned()
                 }
-                other => format!("could not unlock this profile's identity: {other:?}"),
+                // Unlocking also brings the node onto the network, so a `--listen` port that
+                // is taken fails here. It said `Failed(Internal)` — a bug report for an
+                // occupied port (PRD-001 R36).
+                Outcome::Failed(Fault::AddressInUse) => format!(
+                    "cannot listen on {listen}: something else already holds that UDP port\n\
+                     \x20      Pick another with --listen, or stop whatever holds it \
+                     (`lsof -i :{}` names it).",
+                    listen.port()
+                ),
+                other => format!("could not unlock this profile's identity: {other}"),
             }));
         }
         // Then the second lock. `vox room post|read|board` all need the room OPEN,
@@ -796,7 +835,7 @@ pub fn run_daemon(
                 // An operator who mistyped one passphrase wants the other rooms served and
                 // a line telling them which one failed — not a process that refuses to
                 // start.
-                eprintln!("vox daemon: could not open that room: {outcome:?}");
+                eprintln!("vox daemon: could not open that room: {outcome}");
                 continue;
             }
             // Neither form opened anything. Nothing to undo — a room this did not open

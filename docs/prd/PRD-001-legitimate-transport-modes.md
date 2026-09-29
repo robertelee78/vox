@@ -147,6 +147,21 @@ friction for this audience can be fixed later.
     WAN-like RTT, 10 Gbit/s, and a lossy Wi-Fi-like link.
   - Vox **must** reach at least about 90% of raw at 1 Gbit/s; the other ratios are reported.
   - Loopback speed is tracked as a raw-efficiency figure, not the bar.
+- **R41a.** A Vox **node running inside a virtual machine must not throttle the network either**, in every role a
+  node takes: a daemon hosting services, an anchor, and a relay carrying other nodes' circuits. Added by the
+  decider on 2026-09-26: *"we will need to solve vm stuffs at some point"*, *"I imagine a lot of users will use
+  like opencode inside a vm"* *"and need it to be a node"*. It is **not** a v0.2.10 release blocker (the
+  decider's decision). R41 WAN blocks on real hardware (the Ubuntu runner and a real Mac); on GitHub's macOS
+  VM runner it is report-only until this requirement is met.
+  - Evidence that it does not hold today (vox, 2026-09-26): on GitHub's `macos-26-arm64` runner (a 3-core
+    M1 VM), the same code measures R41 WAN at 29–106% of raw from run to run, against 98–103% on a real Mac
+    and about 95% on Ubuntu. The low runs show tens of thousands of kernel "dropped due to full socket
+    buffers" (`netstat -s -p udp`) at moderate windows (10.6 MB, with 0 emulator drops), and RTT 59–172 ms
+    on a 50 ms path. That means the VM stalls its receiving processes.
+  - Leads, none measured yet: Vox's socket buffers raised to `kern.ipc.maxsockbuf` (6 MiB there);
+    receive-side batching (quinn-udp GRO/`recvmmsg` on macOS); fewer threads per process.
+  - The gate is R41's arms run with the Vox node **inside a VM**, and with that node as a relay, an anchor
+    and a service host, not only as a client.
 - **R42.** A first connection to a peer, including NAT traversal, **must** complete in **under 2 s**.
 
 ### 3.11 Removals

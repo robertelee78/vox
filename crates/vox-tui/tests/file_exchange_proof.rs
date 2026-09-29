@@ -25,26 +25,29 @@
 //!    receiver that kept those bytes would reproduce that failure with extra steps.
 //! 4. **Asking for something nobody offered says so**, rather than hanging or
 //!    producing an empty file.
+//! 5. **Where the file lands is the receiver's decision** (PRD-001 R18, D4). It goes to
+//!    `~/Downloads` by default; a file already there is never overwritten; and an
+//!    announcement naming `../../x` or an absolute path — text another member wrote —
+//!    lands as a bare name inside the download directory, never where it points. A failed
+//!    transfer leaves nothing behind and never touches a file that was already there,
+//!    which the old code did twice over: `File::create` truncated it before a byte was
+//!    verified, and the mismatch path then deleted it.
 
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-
 use std::sync::{Arc, Mutex};
-use vox_core::node::actor::{Node, NodeHandle};
-use vox_core::node::api::{NodeCommand, NodeEvent, Secret};
-
-use vox_core::node::paths::Paths;
+use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-fn secret(s: &str) -> Secret {
-    Secret::new(s.as_bytes().to_vec())
-}
+const ID_PASS: &str = "identity passphrase";
+const ROOM_PASS: &str = "channel passphrase";
 
 /// A long-running child, killed however the test ends, with its pipes drained.
 struct Running(Child, Arc<Mutex<String>>);
@@ -92,20 +95,77 @@ fn drain(stream: Option<impl std::io::Read + Send + 'static>, into: &Arc<Mutex<S
     });
 }
 
+/// One member: a profile and, once started, its real `vox daemon`.
 struct Agent {
-    data: std::path::PathBuf,
-    cfg: std::path::PathBuf,
-    paths: Paths,
-    node: NodeHandle,
+    data: PathBuf,
+    cfg: PathBuf,
+    pass: PathBuf,
+    daemon: Option<Running>,
 }
 
 impl Agent {
+    /// `vox` with `stdin` on its standard input.
+    fn vox_with(&self, args: &[&str], stdin: &str) -> (bool, String, String) {
+        let mut child = Command::new(VOX)
+            .args(args)
+            .env("VOX_DATA_DIR", &self.data)
+            .env("VOX_CONFIG_DIR", &self.cfg)
+            .env_remove("VOX_ROOM")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vox");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn id_pass(&self) -> &str {
+        self.pass.to_str().unwrap()
+    }
+
     fn vox(&self, args: &[&str]) -> (bool, String, String) {
         let out = Command::new(VOX)
             .args(args)
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
             .env_remove("VOX_ROOM")
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn vox");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// `vox` as a person runs it from a shell: with a home directory of its own (so the
+    /// `~/Downloads` default is observable) and from a working directory of its own (so a
+    /// relative path the sender wrote would resolve somewhere this proof can look).
+    fn vox_at(
+        &self,
+        args: &[&str],
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+    ) -> (bool, String, String) {
+        let out = Command::new(VOX)
+            .args(args)
+            .env("VOX_DATA_DIR", &self.data)
+            .env("VOX_CONFIG_DIR", &self.cfg)
+            .env("HOME", home)
+            .env_remove("VOX_ROOM")
+            .current_dir(cwd)
             .stdin(Stdio::null())
             .output()
             .expect("spawn vox");
@@ -136,40 +196,71 @@ impl Agent {
     }
 }
 
-async fn agent(tmp: &tempfile::TempDir, name: &str) -> Agent {
+/// A member as a person sets one up: `vox id`, then a real `vox daemon` on loopback, reaching
+/// the anchor at `spec`.
+fn agent(tmp: &tempfile::TempDir, name: &str, spec: &str) -> Agent {
     let data = tmp.path().join(name).join("data");
     let cfg = tmp.path().join(name).join("cfg");
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
-    let node = Node::spawn_networked(paths.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
-    assert!(node
-        .apply(NodeCommand::CreateIdentity {
-            passphrase: secret("identity passphrase"),
-        })
-        .await
-        .is_done());
-    Agent {
+    std::fs::create_dir_all(&cfg).unwrap();
+    let pass = tmp.path().join(format!("{name}.pass"));
+    std::fs::write(&pass, ID_PASS).unwrap();
+    let mut a = Agent {
         data,
         cfg,
-        paths,
-        node,
+        pass,
+        daemon: None,
+    };
+    let (ok, _, err) = a.vox(&["id", "--identity-passphrase-file", a.id_pass()]);
+    assert!(ok, "{name}: vox id: {err}");
+    a.daemon = Some(a.spawn(&[
+        "daemon",
+        "--listen",
+        "127.0.0.1:0",
+        "--anchor",
+        spec,
+        "--passphrase-file",
+        a.id_pass(),
+    ]));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !a.vox(&["room", "list"]).0 {
+        assert!(Instant::now() < deadline, "{name}'s daemon never answered");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    a
+}
+
+/// A real `vox node` anchor on loopback, and the `--anchor` spec it prints.
+fn anchor(tmp: &tempfile::TempDir) -> (Running, String) {
+    let dir = tmp.path().join("anchor");
+    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    let a = Agent {
+        data: dir.join("data"),
+        cfg: dir.join("cfg"),
+        pass: PathBuf::new(),
+        daemon: None,
+    };
+    let node = a.spawn(&["node", "--listen", "127.0.0.1:0"]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let said = node.1.lock().unwrap().clone();
+        if let Some(spec) = said
+            .split_whitespace()
+            .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
+        {
+            return (node, spec.to_owned());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the anchor never printed its spec"
+        );
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
-async fn wait_for<T>(h: &NodeHandle, mut f: impl FnMut(NodeEvent) -> Option<T>) -> T {
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match h.next_event().await {
-                Some(e) => {
-                    if let Some(v) = f(e) {
-                        return v;
-                    }
-                }
-                None => panic!("event stream ended"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for an event")
+fn fingerprint(a: &Agent) -> String {
+    let (ok, out, err) = a.vox(&["id", "--identity-passphrase-file", a.id_pass()]);
+    assert!(ok, "vox id: {err}");
+    out.trim().to_owned()
 }
 
 fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> String {
@@ -190,11 +281,6 @@ fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> S
 #[ignore = "two networked nodes and real child processes; CI runs it in release"]
 fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     watchdog::arm();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
 
     // Big enough to cross several 64 KiB reads, so a truncation is possible at all.
@@ -202,71 +288,65 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     let source = tmp.path().join("artifact.bin");
     std::fs::write(&source, &payload).unwrap();
 
-    let (alice, bob, room, _a_sock, _b_sock) = rt.block_on(async {
-        let alice = agent(&tmp, "alice").await;
-        let bob = agent(&tmp, "bob").await;
-        let alice_fp = alice.node.view().identity.unwrap().fingerprint;
-        let bob_fp = bob.node.view().identity.unwrap().fingerprint;
-
-        assert!(alice
-            .node
-            .apply(NodeCommand::CreateChannel {
-                local_name: "mission".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-        let cid = alice.node.view().channels[0].channel_id;
-        assert!(alice
-            .node
-            .apply(NodeCommand::Invite { channel_id: cid })
-            .await
-            .is_done());
-        let url = wait_for(&alice.node, |e| match e {
-            NodeEvent::InviteLink { channel_id, url } if channel_id == cid => Some(url),
-            _ => None,
-        })
-        .await;
-        assert!(bob
-            .node
-            .apply(NodeCommand::JoinChannel {
-                link: url,
-                local_name: "mission".into(),
-                passphrase: secret("channel passphrase"),
-            })
-            .await
-            .is_done());
-
-        // Joining grants nothing: each admits the other before either can read what
-        // the other writes, which is also what makes the announcement's audience and
-        // the transfer's audience the same set.
-        for (who, peer, name) in [(&alice, bob_fp, "bob"), (&bob, alice_fp, "alice")] {
-            assert!(who
-                .node
-                .apply(NodeCommand::Trust {
-                    fingerprint: peer,
-                    petname: name.into(),
-                })
-                .await
-                .is_done());
+    let (_anchor, spec) = anchor(&tmp);
+    let alice = agent(&tmp, "alice", &spec);
+    let bob = agent(&tmp, "bob", &spec);
+    // Joining grants nothing: each admits the other before either can read what the other
+    // writes, which is also what makes the announcement's audience and the transfer's audience
+    // the same set.
+    let (alice_fp, bob_fp) = (fingerprint(&alice), fingerprint(&bob));
+    for (who, peer, name) in [(&alice, &bob_fp, "bob"), (&bob, &alice_fp, "alice")] {
+        let (ok, _, err) = who.vox(&[
+            "trust",
+            "add",
+            peer,
+            "--name",
+            name,
+            "--identity-passphrase-file",
+            who.id_pass(),
+        ]);
+        assert!(ok, "trust {name}: {err}");
+    }
+    let (ok, _, err) = alice.vox_with(&["room", "create", "--name", "mission"], ROOM_PASS);
+    assert!(ok, "vox room create: {err}");
+    let label = alice
+        .vox(&["room", "list"])
+        .1
+        .split_whitespace()
+        .next()
+        .expect("a room")
+        .to_owned();
+    let (ok, link, err) = alice.vox(&["room", "invite", &label]);
+    assert!(ok, "vox room invite: {err}");
+    let link = link.trim().to_owned();
+    let room = link
+        .strip_prefix("vox://")
+        .and_then(|l| l.split('?').next())
+        .expect("an invite link naming the room")
+        .to_owned();
+    let mut joined = false;
+    for _ in 0..6 {
+        if bob
+            .vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS)
+            .0
+        {
+            joined = true;
+            break;
         }
-        for (who, peer) in [(&alice, bob_fp), (&bob, alice_fp)] {
-            wait_for(&who.node, |e| match e {
-                NodeEvent::SenderKeyReceived {
-                    channel_id,
-                    peer: p,
-                    ..
-                } if channel_id == cid && p == peer => Some(()),
-                _ => None,
-            })
-            .await;
-        }
-
-        let a_sock = vox_core::node::ipc::bind(alice.node.clone(), &alice.paths).expect("alice");
-        let b_sock = vox_core::node::ipc::bind(bob.node.clone(), &bob.paths).expect("bob");
-        let room = vox_core::node::link::b32_encode(&cid);
-        (alice, bob, room, a_sock, b_sock)
-    });
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    assert!(joined, "bob never joined");
+    // Each reads the other before the transfer: keys have flowed both ways.
+    for (who, other, word) in [(&alice, &bob, "warm-bob"), (&bob, &alice, "warm-alice")] {
+        let (ok, _, err) = other.vox(&["room", "post", &room, word]);
+        assert!(ok, "post: {err}");
+        until(
+            who,
+            "each to read the other",
+            &["room", "read", &room],
+            |o| o.contains(word),
+        );
+    }
 
     // ---- (4) nothing offered yet: asking says so ----
     let (ok, _, err) = bob.vox(&["room", "get", &room, "artifact.bin"]);
@@ -308,6 +388,107 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     assert!(
         got == payload,
         "the collected bytes differ from what was sent"
+    );
+
+    // ---- (5) where it lands is the receiver's decision, never the sender's (PRD-001 D4) ----
+    //
+    // A home directory and a working directory of bob's own, three levels deep, so that a
+    // sender-chosen `../../x` would resolve to `work/x` — somewhere this proof can look.
+    let home = tmp.path().join("home");
+    let downloads = home.join("Downloads");
+    let cwd = tmp.path().join("work").join("a").join("b");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&downloads).unwrap();
+    // Where `../../x` would land if honoured — resolved against the working directory (the
+    // old code) or against the download directory (a join without sanitising).
+    let escaped = tmp.path().join("work").join("x");
+    let escaped_from_downloads = tmp.path().join("x");
+    let absolute = tmp.path().join("absolute-target.bin");
+
+    // (5a) the default is ~/Downloads, and a file already there is never overwritten: the
+    // collected one takes the next free name and the old bytes stay exactly as they were.
+    let precious = b"bob's own artifact.bin, which nobody may overwrite".to_vec();
+    std::fs::write(downloads.join("artifact.bin"), &precious).unwrap();
+    let (ok, out, err) = bob.vox_at(&["room", "get", &room, "artifact.bin"], &home, &cwd);
+    assert!(
+        ok,
+        "collecting into ~/Downloads: stdout={out:?} stderr={err:?}"
+    );
+    let now = std::fs::read(downloads.join("artifact.bin")).unwrap_or_default();
+    assert!(
+        now == precious,
+        "a file already in the download directory must be untouched — it holds {} bytes, it held {}",
+        now.len(),
+        precious.len()
+    );
+    assert!(
+        std::fs::read(downloads.join("artifact (1).bin")).is_ok_and(|b| b == payload),
+        "the collected file must land beside it under the next free name: {out:?}"
+    );
+
+    // (5b) a hostile sender: announcements naming a path outside the download directory,
+    // relative and absolute, for bytes that are genuinely on offer (the same service, size
+    // and hash as the real offer), so the only thing wrong with them is the name.
+    let sha = {
+        use sha2::{Digest as _, Sha256};
+        Sha256::digest(&payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let tag = format!("file-{}", &sha[..16]);
+    for (hostile, lands_as) in [
+        ("../../x", "x"),
+        (absolute.to_str().unwrap(), "absolute-target.bin"),
+    ] {
+        let forged = serde_json::json!({
+            "v": 1,
+            "type": "file",
+            "body": "offering something",
+            "data": { "name": hostile, "size": payload.len(), "sha256": sha, "tag": tag },
+        })
+        .to_string();
+        let (ok, _, err) = alice.vox(&["room", "post", &room, &forged]);
+        assert!(ok, "alice announces {hostile:?}: {err}");
+        until(
+            &bob,
+            "the hostile announcement to reach bob",
+            &["room", "read", &room],
+            |o| o.contains(hostile),
+        );
+        let (ok, out, err) = bob.vox_at(&["room", "get", &room, hostile], &home, &cwd);
+        assert!(ok, "collecting {hostile:?}: stdout={out:?} stderr={err:?}");
+        assert!(
+            !escaped.exists() && !escaped_from_downloads.exists() && !absolute.exists(),
+            "a sender-chosen name {hostile:?} must never place a file outside the download \
+             directory (escaped via cwd: {}, via the download dir: {}, absolute: {})",
+            escaped.exists(),
+            escaped_from_downloads.exists(),
+            absolute.exists()
+        );
+        assert!(
+            std::fs::read(downloads.join(lands_as)).is_ok_and(|b| b == payload),
+            "{hostile:?} must land in the download directory as {lands_as:?}: {out:?}"
+        );
+    }
+    let listed = |dir: &std::path::Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listed(&downloads);
+    assert_eq!(
+        before,
+        [
+            "absolute-target.bin",
+            "artifact (1).bin",
+            "artifact.bin",
+            "x"
+        ],
+        "exactly the four files, and no leftover `.part`"
     );
 
     // ---- (3) a real truncation is refused, and the partial file is removed ----
@@ -353,5 +534,58 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     assert!(
         !bad.exists(),
         "the partial file must be removed, not left looking complete"
+    );
+
+    // (3b) the same short transfer into the download directory, where a file of that name
+    // already exists: refused, nothing new is left behind, and — the old code's worst case —
+    // the file that was already there is neither truncated nor deleted.
+    let theirs = b"bob's own flaky.bin, which a failed transfer must not touch".to_vec();
+    std::fs::write(downloads.join("flaky.bin"), &theirs).unwrap();
+    let before = listed(&downloads);
+    let (ok, out, err) = bob.vox_at(&["room", "get", &room, "flaky.bin"], &home, &cwd);
+    assert!(!ok, "a short transfer must be refused: stdout={out:?}");
+    assert!(
+        err.contains("does not match what was announced"),
+        "it must say why: {err:?}"
+    );
+    let now = std::fs::read(downloads.join("flaky.bin")).unwrap_or_default();
+    assert!(
+        now == theirs,
+        "a failed transfer must not truncate or delete the file already there — it holds {} bytes, it held {}",
+        now.len(),
+        theirs.len()
+    );
+    assert_eq!(
+        listed(&downloads),
+        before,
+        "a failed transfer must leave nothing behind — no partial, no `.part`"
+    );
+
+    // (3c) an explicit --out that already exists is refused before a byte moves.
+    let (ok, _, err) = bob.vox_at(
+        &[
+            "room",
+            "get",
+            &room,
+            "artifact.bin",
+            "--out",
+            downloads.join("flaky.bin").to_str().unwrap(),
+        ],
+        &home,
+        &cwd,
+    );
+    assert!(!ok, "--out onto an existing file must be refused");
+    assert!(err.contains("never overwrites"), "it must say why: {err:?}");
+    let now = std::fs::read(downloads.join("flaky.bin")).unwrap_or_default();
+    assert!(
+        now == theirs,
+        "--out must not touch the file it refused — it holds {} bytes, it held {}",
+        now.len(),
+        theirs.len()
+    );
+    eprintln!(
+        "downloads after every case: {} files, {:?}",
+        listed(&downloads).len(),
+        listed(&downloads)
     );
 }

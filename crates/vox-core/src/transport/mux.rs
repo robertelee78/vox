@@ -117,6 +117,9 @@ pub struct MuxSocket {
     /// this is the only way to get from a peer to its circuit.
     by_peer: Mutex<HashMap<Digest32, SocketAddr>>,
     inbox: Mutex<Inbox>,
+    /// Whether the socket underneath is IPv6, and so what family a circuit's datagrams must be
+    /// handed up in (see [`Self::as_seen`]).
+    ipv6: bool,
 }
 
 #[derive(Default)]
@@ -197,7 +200,9 @@ impl MuxSocket {
     /// Wrap a socket. Everything not addressed to a circuit passes straight through.
     #[must_use]
     pub fn new(inner: Arc<dyn AsyncUdpSocket>) -> Arc<Self> {
+        let ipv6 = inner.local_addr().is_ok_and(|a| a.is_ipv6());
         Arc::new(Self {
+            ipv6,
             inner,
             circuits: Mutex::new(HashMap::new()),
             by_peer: Mutex::new(HashMap::new()),
@@ -270,7 +275,25 @@ impl MuxSocket {
         self.circuits.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// A circuit's address as quinn on this socket knows it.
+    ///
+    /// **In the socket's own family.** A circuit address is IPv4, and on an IPv6 socket quinn dials
+    /// it as the IPv4-mapped `::ffff:a.b.c.d` and records *that* as the connection's remote. A
+    /// datagram handed up from the plain IPv4 address is then from an address the connection has
+    /// never seen, and a QUIC client discards it — so every handshake over a circuit from a node on
+    /// an IPv6 socket (`[::1]`, or the dual-stack `[::]`) timed out, and the relay rung was dead
+    /// for it.
+    fn as_seen(&self, addr: SocketAddr) -> SocketAddr {
+        match addr {
+            SocketAddr::V4(v4) if self.ipv6 => {
+                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            other => other,
+        }
+    }
+
     fn deliver(&self, from: SocketAddr, datagram: Vec<u8>) {
+        let from = self.as_seen(from);
         let waker = {
             let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
             if inbox.queue.len() >= INBOX_LIMIT {

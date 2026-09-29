@@ -22,6 +22,7 @@ use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 
+use vox_core::error::{Error, IpcHandshake};
 use vox_core::hash::Digest32;
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::{b32_decode, b32_encode, B32_DIGEST_LEN};
@@ -53,18 +54,32 @@ async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
             paths.socket_file().display()
         )));
     }
-    IpcClient::open(&sock).await.map_err(|_| {
-        AppError::Usage(format!(
-            "a control socket exists at {} but nothing answered — the node may have \
-             stopped without cleaning up. Starting a node again replaces it.",
-            sock.display()
-        ))
+    // Each way an attach fails needs a different remedy, so each gets its own sentence
+    // (#191): they were one, "nothing answered — the node may have stopped", which is true
+    // only of a stale socket, and the actual error was thrown away.
+    IpcClient::open(&sock).await.map_err(|e| {
+        let at = sock.display();
+        AppError::Usage(match e {
+            Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
+                "a control socket exists at {at} but nothing is listening on it ({reason}) — \
+                 the node may have stopped without cleaning up. Starting a node again replaces it."
+            ),
+            Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => format!(
+                "a control socket exists at {at}, but {h}: it may be shutting down. Try again, \
+                 or start one with `vox daemon`."
+            ),
+            Error::Ipc(h) => format!("{h}. Socket: {at}"),
+            other => format!(
+                "a control socket exists at {at} but nothing answered ({other}) — the node may \
+                 have stopped without cleaning up. Starting a node again replaces it."
+            ),
+        })
     })
 }
 
 /// Ask the node for its rooms, as `(id, local name, open)`.
 async fn rooms_of(client: &mut IpcClient) -> Result<Vec<(Digest32, String, bool)>, AppError> {
-    match client.request(&Request::Rooms).await {
+    match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => Ok(rooms),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
@@ -151,10 +166,19 @@ async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Digest32, AppEr
     }
     let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
     let id = resolve_prefix(prefix, &ids)?;
+    // A closed room's name is sealed in its manifest, so a node that has not opened it does
+    // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
+    // Named by the id the operator typed a prefix of, and by its name only when there is one.
     if let Some((_, name, false)) = rooms.iter().find(|(r, _, _)| *r == id) {
+        let which = if name.is_empty() {
+            format!("room {}", b32_encode(&id))
+        } else {
+            format!("room {name:?} ({})", b32_encode(&id))
+        };
         return Err(AppError::Usage(format!(
-            "room {name:?} is not open on this node, so there is nothing to read or \
-             post — open it in `vox tui`, or start the node with it open"
+            "{which} is closed on this node, so there is nothing to read or post. A daemon \
+             reopens every room it held open, so this one was closed in `vox tui` or did not \
+             reopen. Open it in `vox tui`, or give `vox daemon` a line with its passphrase"
         )));
     }
     Ok(id)
@@ -626,7 +650,12 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
             c => text.push(c),
         }
     }
-    format!("{} {} {}", id(&r.entry_hash), short(&r.author), text)
+    format!(
+        "{} {} {}",
+        id(&r.entry_hash),
+        crate::ident::author_id(&r.author),
+        text
+    )
 }
 
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
@@ -1085,7 +1114,7 @@ fn report(
 }
 
 fn who(o: &Owner) -> String {
-    format!("{}/{}", &claim::b32(&o.author)[..12], o.session)
+    format!("{}/{}", crate::ident::author_id(&o.author), o.session)
 }
 
 fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, AppError> {
@@ -1164,7 +1193,7 @@ pub async fn claim_resource(
             false,
             format!(
                 "{resource} is reserved by a handoff for {}{} — you did not get it",
-                &claim::b32(to_fp)[..12],
+                &crate::ident::author_id(to_fp),
                 to_session
                     .as_ref()
                     .map(|s| format!("/{s}"))
@@ -1301,7 +1330,7 @@ pub async fn handoff_resource(
         opts,
         claim::HANDOFF,
         data,
-        format!("handing {resource} to {}", &claim::b32(&to_fp)[..12]),
+        format!("handing {resource} to {}", crate::ident::author_id(&to_fp)),
     )
     .await?;
     let (ok, said) = match (&done.outcome, done.posting.after.fold.resources.get(resource)) {
@@ -1309,7 +1338,7 @@ pub async fn handoff_resource(
             true,
             format!(
                 "{resource} is reserved for {}{} until {}; it completes when that session claims it",
-                &claim::b32(&to_fp)[..12],
+                &crate::ident::author_id(&to_fp),
                 to_session.map(|s| format!("/{s}")).unwrap_or_default(),
                 millis_as_time(*deadline_millis)
             ),
@@ -1542,7 +1571,7 @@ pub async fn board(
             } => format!(
                 "{resource}\tpending handoff from {} to {}{}{} (lapses in {}s)",
                 who(from),
-                &claim::b32(to_fp)[..12],
+                &crate::ident::author_id(to_fp),
                 to_session
                     .as_ref()
                     .map(|s| format!("/{s}"))
@@ -1751,14 +1780,30 @@ struct Offer {
 
 /// `vox room get` — collect an offered file and verify it.
 ///
+/// **Where it lands is the receiver's decision, never the sender's** (PRD-001 R18, D4). The
+/// offer's `name` is text another member wrote, and it used to become the path as written:
+/// `../../.ssh/authorized_keys` or `/etc/…` was honoured, `File::create` truncated whatever was
+/// there before a single byte was verified, and a mismatch then *deleted* it. Now:
+///
+/// - the file goes into a download directory — `--dir`, else the profile's `downloads` config
+///   file, else `~/Downloads` — under the sender's name reduced to a bare file name
+///   ([`safe_file_name`]); `--out` names an exact path instead;
+/// - **nothing that exists is ever overwritten**: a taken name gets a ` (1)`, ` (2)` … suffix,
+///   and an `--out` that exists is refused;
+/// - the bytes go to a hidden `.part` file beside it, and only a transfer whose SHA-256 and size
+///   match the announcement is linked into place; anything else removes the `.part` and nothing
+///   else.
+///
 /// # Errors
-/// If the node cannot be reached, the room is unknown, no matching offer exists,
-/// the transfer cannot be established, or **the bytes do not match the announced
-/// hash**, in which case the partial file is removed.
+/// If the node cannot be reached, the room is unknown, no matching offer exists, the
+/// destination is unusable, the transfer cannot be established, stalls, sends more than was
+/// announced, or **does not match the announced hash** — in every one of which nothing is left
+/// behind and nothing that was there before is touched.
 pub async fn get_file(
     paths: &Paths,
     room: &str,
     selector: &str,
+    dir: Option<&std::path::Path>,
     out: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
@@ -1800,7 +1845,28 @@ pub async fn get_file(
             ))
         })?;
 
-    let dest = out.map_or_else(|| std::path::PathBuf::from(&offer.name), Path::to_owned);
+    let dest = match out {
+        Some(exact) => {
+            if exact.symlink_metadata().is_ok() {
+                return Err(AppError::Usage(format!(
+                    "{} already exists; `vox room get` never overwrites a file — choose \
+                     another --out, or leave it out to use the download directory",
+                    exact.display()
+                )));
+            }
+            Destination::Exact(exact.to_owned())
+        }
+        None => {
+            let dir = match dir {
+                Some(d) => d.to_owned(),
+                None => download_dir(paths)?,
+            };
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                AppError::Usage(format!("cannot use {} for downloads: {e}", dir.display()))
+            })?;
+            Destination::Into(dir, safe_file_name(&offer.name))
+        }
+    };
 
     let bound = match client
         .request(&Request::Forward {
@@ -1831,50 +1897,231 @@ pub async fn get_file(
     result
 }
 
-/// Stream the offered bytes to `dest`, verifying as we go.
-async fn collect(bound: &str, dest: &std::path::Path, offer: &Offer) -> Result<(), AppError> {
+/// Where a collected file is to land.
+enum Destination {
+    /// Into this directory, under this (already safe) name or the first free variant of it.
+    Into(std::path::PathBuf, String),
+    /// Exactly here, and only if nothing is.
+    Exact(std::path::PathBuf),
+}
+
+impl Destination {
+    /// The directory the `.part` file goes in: beside the destination, so the final step is
+    /// a link on one filesystem and never a copy.
+    fn dir(&self) -> std::path::PathBuf {
+        match self {
+            Destination::Into(dir, _) => dir.clone(),
+            Destination::Exact(p) => p
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .map_or_else(|| std::path::PathBuf::from("."), Path::to_owned),
+        }
+    }
+
+    /// A name for the `.part` file.
+    fn stem(&self) -> String {
+        match self {
+            Destination::Into(_, name) => name.clone(),
+            Destination::Exact(p) => p.file_name().map_or_else(
+                || "download".to_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+        }
+    }
+}
+
+/// The directory a collected file goes in when `--dir` and `--out` are both absent: the
+/// profile's `downloads` config file if it names one, else `~/Downloads`.
+fn download_dir(paths: &Paths) -> Result<std::path::PathBuf, AppError> {
+    let home = || {
+        std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                AppError::Usage("HOME is not set, so there is no ~/Downloads; pass --dir".into())
+            })
+    };
+    if let Ok(text) = std::fs::read_to_string(paths.downloads_file()) {
+        if let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
+            return Ok(match line.strip_prefix("~/") {
+                Some(rest) => home()?.join(rest),
+                None => std::path::PathBuf::from(line),
+            });
+        }
+    }
+    Ok(home()?.join("Downloads"))
+}
+
+/// The sender's file name reduced to a **bare file name** that cannot leave the directory it
+/// is put in.
+///
+/// Everything up to the last `/` or `\` is dropped, so `../../x`, `/etc/passwd` and
+/// `..\\x` all become their last component. Control characters go, leading dots go (no
+/// `..`, and no file hidden from a listing by a name somebody else chose), and the result is
+/// cut to 200 bytes. Whatever is left empty becomes `download`.
+#[must_use]
+pub fn safe_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = last.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim().trim_start_matches('.').trim();
+    let mut out = String::new();
+    for c in trimmed.chars() {
+        if out.len() + c.len_utf8() > 200 {
+            break;
+        }
+        out.push(c);
+    }
+    if out.is_empty() {
+        "download".to_owned()
+    } else {
+        out
+    }
+}
+
+/// `name`, then `name (1)`, `name (2)` … with the number before the extension.
+fn numbered(name: &str, n: usize) -> String {
+    if n == 0 {
+        return name.to_owned();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
+    }
+}
+
+/// How long one read of the transfer may wait before the transfer is abandoned. A sender
+/// that has gone quiet must not hold the collector for ever.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Stream the offered bytes to a `.part` file beside `dest`, verify them, and only then link
+/// them into place under a name nothing else holds.
+async fn collect(bound: &str, dest: &Destination, offer: &Offer) -> Result<(), AppError> {
+    let dir = dest.dir();
+    // `create_new`, so the temporary file is never somebody else's either.
+    let (part, file) = (0..1000)
+        .find_map(|n| {
+            let p = dir.join(format!(".{}.{}-{n}.part", dest.stem(), std::process::id()));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&p)
+                .ok()
+                .map(|f| (p, f))
+        })
+        .ok_or_else(|| {
+            AppError::Usage(format!(
+                "cannot create a temporary file in {}",
+                dir.display()
+            ))
+        })?;
+    let result = receive(bound, file, offer).await;
+    let total = match result {
+        Ok(total) => total,
+        Err(e) => {
+            // **Only the `.part` is removed.** It is the one file this collector created;
+            // whatever was in the directory before is not its to delete.
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+    };
+    let placed = place(&part, dest);
+    let _ = std::fs::remove_file(&part);
+    let placed = placed?;
+    println!("vox: {} ({total} bytes) verified", placed.display());
+    Ok(())
+}
+
+/// Link a verified `.part` into place without replacing anything.
+///
+/// A hard link fails if the name is taken, which makes "is it free" and "take it" one step
+/// — a rename would silently replace whatever appeared in between.
+fn place(part: &Path, dest: &Destination) -> Result<std::path::PathBuf, AppError> {
+    match dest {
+        Destination::Exact(p) => std::fs::hard_link(part, p)
+            .map(|()| p.clone())
+            .map_err(|e| {
+                AppError::Usage(format!(
+                    "cannot put the file at {}: {e}; nothing was overwritten",
+                    p.display()
+                ))
+            }),
+        Destination::Into(dir, name) => {
+            for n in 0..1000 {
+                let candidate = dir.join(numbered(name, n));
+                match std::fs::hard_link(part, &candidate) {
+                    Ok(()) => return Ok(candidate),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => {
+                        return Err(AppError::Usage(format!(
+                            "cannot put the file at {}: {e}",
+                            candidate.display()
+                        )))
+                    }
+                }
+            }
+            Err(AppError::Usage(format!(
+                "every name from {name} to {} is taken in {}",
+                numbered(name, 999),
+                dir.display()
+            )))
+        }
+    }
+}
+
+/// Read the transfer into `file`, refusing more bytes than were announced, a stall, and any
+/// result whose SHA-256 is not the announced one. Returns the byte count.
+async fn receive(bound: &str, mut file: std::fs::File, offer: &Offer) -> Result<u64, AppError> {
     use sha2::{Digest as _, Sha256};
     use tokio::io::AsyncReadExt as _;
 
-    let mut sock = tokio::net::TcpStream::connect(bound)
+    let mut sock = tokio::time::timeout(READ_TIMEOUT, tokio::net::TcpStream::connect(bound))
         .await
+        .map_err(|_| AppError::Usage("the forward did not answer".into()))?
         .map_err(|e| AppError::Usage(format!("connecting to the forward: {e}")))?;
-    let mut file = std::fs::File::create(dest)
-        .map_err(|e| AppError::Usage(format!("creating {}: {e}", dest.display())))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
     loop {
-        let n = sock
-            .read(&mut buf)
+        let n = tokio::time::timeout(READ_TIMEOUT, sock.read(&mut buf))
             .await
+            .map_err(|_| {
+                AppError::Usage(format!(
+                    "the transfer stalled for {}s after {total} of {} bytes; nothing was kept",
+                    READ_TIMEOUT.as_secs(),
+                    offer.size
+                ))
+            })?
             .map_err(|e| AppError::Usage(format!("reading the transfer: {e}")))?;
         if n == 0 {
             break;
         }
+        total += n as u64;
+        if total > offer.size {
+            return Err(AppError::Usage(format!(
+                "the sender sent more than the {} bytes it announced; nothing was kept",
+                offer.size
+            )));
+        }
         hasher.update(&buf[..n]);
         std::io::Write::write_all(&mut file, &buf[..n])
-            .map_err(|e| AppError::Usage(format!("writing {}: {e}", dest.display())))?;
-        total += n as u64;
+            .map_err(|e| AppError::Usage(format!("writing the download: {e}")))?;
     }
-    std::io::Write::flush(&mut file)
-        .map_err(|e| AppError::Usage(format!("flushing {}: {e}", dest.display())))?;
+    file.sync_all()
+        .map_err(|e| AppError::Usage(format!("flushing the download: {e}")))?;
     drop(file);
 
     let got = hex(&hasher.finalize());
-    if got != offer.sha256 {
-        // **The partial file is removed.** `cat | nc` truncating silently is the
-        // classic way this idiom bites; leaving a file that looks complete and is
-        // not would reproduce exactly that failure with extra steps.
-        let _ = std::fs::remove_file(dest);
+    if got != offer.sha256 || total != offer.size {
+        // **Nothing is kept.** `cat | nc` truncating silently is the classic way this idiom
+        // bites; a file that looks complete and is not would reproduce exactly that failure
+        // with extra steps. The caller removes the `.part`, which is all there is.
         return Err(AppError::Usage(format!(
             "the transfer does not match what was announced — expected sha256 {} over {} bytes, \
-             got {got} over {total}. The partial file was removed.",
+             got {got} over {total}. Nothing was kept.",
             offer.sha256, offer.size
         )));
     }
-    println!("vox: {} ({total} bytes) verified", dest.display());
-    Ok(())
+    Ok(total)
 }
 
 /// Read a passphrase from stdin, stripping exactly one trailing newline.
@@ -1933,8 +2180,9 @@ pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), App
         Ok(Frame::Error { reason }) => Err(AppError::Usage(
             match crate::tunnel_cli::fault_named(&reason) {
                 Some(fault) => format!(
-                    "cannot join: {}",
-                    crate::tunnel_cli::join_advice(Some(fault))
+                    "cannot join: {}{}",
+                    crate::tunnel_cli::join_advice(Some(fault)),
+                    crate::tunnel_cli::join_detail(&reason)
                 ),
                 None => format!("cannot join: {reason}"),
             },
@@ -2027,7 +2275,10 @@ pub async fn trust_add(
         .await
     {
         Ok(Frame::Ok) => {
-            println!("vox: trusting {} as {petname:?}", short(&target));
+            println!(
+                "vox: trusting {} as {petname:?}",
+                crate::ident::author_id(&target)
+            );
             println!("     it may now read what you write in every room you share — now and later");
             println!("     and reach every service you bind to a room you are both in");
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
@@ -2054,7 +2305,10 @@ pub async fn trust_remove(
         .await
     {
         Ok(Frame::Ok) => {
-            println!("vox: no longer trusting {}", short(&target));
+            println!(
+                "vox: no longer trusting {}",
+                crate::ident::author_id(&target)
+            );
             println!("     your sender key is rotated and everyone still trusted is re-keyed");
             Ok(())
         }
@@ -2067,12 +2321,7 @@ pub async fn trust_remove(
 /// `vox trust list`, asked of the running node.
 pub async fn trust_list(paths: &Paths, identity_passphrase: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client
-        .request(&Request::TrustList {
-            identity_passphrase: identity_passphrase.to_owned(),
-        })
-        .await
-    {
+    match client.trusted(identity_passphrase).await {
         Ok(Frame::Trusted { entries }) => {
             if entries.is_empty() {
                 println!("no trusted identities");
