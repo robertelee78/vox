@@ -3649,6 +3649,21 @@ impl ChannelState {
         let payload = msg.to_wire();
         #[cfg(feature = "mutant-sender")]
         let payload = crate::log::sync::mutant::authored(payload);
+        #[cfg(feature = "mutant-sender")]
+        let payload = if crate::log::sync::mutant::misbound() {
+            let skdm = self.skdm_for_consent(profile)?;
+            crate::governance::membership::issue_consent_grant(
+                signer,
+                &self.channel_id,
+                self.epoch + 7,
+                me,
+                &skdm,
+                self.genesis.body.policy.history_mode,
+            )?
+            .to_wire()
+        } else {
+            payload
+        };
 
         let skeleton = self.next_skeleton(&me, &payload);
         let entry = Entry::build_signed(signer, skeleton, payload)?;

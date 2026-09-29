@@ -17,6 +17,14 @@
 //! 3. Bob's daemon restarts and still holds the room, with Alice's post in it;
 //! 4. nothing was set aside when it reopened: the entry was refused before it was stored.
 //!
+//! ## A governance entry that does not bind to itself ([`a_misbound_governance_entry_is_refused_and_the_room_syncs_on`])
+//! Mallory runs as `author-misbound`: what she posts is a real consent grant, signed, whose body
+//! names an epoch 7 past the entry's own. It classifies as governance and does not bind (the
+//! issue's first case: a governance body with the wrong channel or epoch). Asserted as for the
+//! unclassifiable entry: Alice's next post reaches Bob, none of Bob's sessions failed with the
+//! binding's reason, and after a restart the room is open with nothing set aside. Arm and mode by
+//! the verifier (vox-0e-ver74).
+//!
 //! ## A payload stripped in transit ([`a_stripped_payload_is_refused_and_the_real_entry_arrives`])
 //! Mallory runs as `strip-payload`: she serves every entry without its payload. The signature
 //! covers the skeleton only, so the stripped entry verifies; it used to be taken as held, filling
@@ -44,7 +52,9 @@
 //!   sync is poisoned;
 //! - no refusal of a withheld payload: arm 2 goes red at (2), Bob holds an empty copy and never asks
 //!   again;
-//! - no report of a lost message: arm 3 goes red.
+//! - no report of a lost message: arm 3 goes red;
+//! - no binding check before holding (`unclassifiable` answering `None` for governance): the
+//!   misbound arm goes red, the entry was stored.
 
 #![cfg(unix)]
 
@@ -359,5 +369,93 @@ fn a_message_lost_to_the_old_row_ids_is_reported() {
         hers.len() - kept,
         "bob lost {} of alice's posts to the old row ids; vox status reports {lost:?}",
         hers.len() - kept
+    );
+}
+
+#[test]
+#[ignore = "real daemons against the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
+fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
+    const MODE: &str = "author-misbound";
+    watchdog::arm();
+    let sender = mutant_sender();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (_anchor, spec) = anchor(root);
+    let alice = Member::new(root, "alice");
+    let bob = Member::new(root, "bob");
+    let mallory = Member::new(root, "mallory");
+    for (a, b) in [(&alice, &bob), (&alice, &mallory), (&bob, &mallory)] {
+        a.trust(b);
+        b.trust(a);
+    }
+    let _alice_d = alice.daemon(Some(&spec));
+    let bob_d = bob.daemon(Some(&spec));
+    let mallory_d = mallory.daemon_mutant(&sender, MODE, Some(&spec));
+    let room = alice.create("hostile");
+    let link = alice.invite(&room);
+    bob.join(&link, "hostile");
+    mallory.join(&link, "hostile");
+    let first = "alice, before mallory posts";
+    alice.post(&room, first);
+    assert!(
+        arrives(&bob, &room, first).is_some(),
+        "CANNOT MEASURE: alice's first post never reached bob, before anything hostile"
+    );
+
+    let since = refused(&bob, None);
+    mallory.post(&room, "whatever mallory typed");
+    // From whichever peer served it first: Mallory, or the anchor holding it for her.
+    let refused = refused_by(&bob, None, since);
+    assert!(
+        announced(&mallory_d, MODE),
+        "CANNOT MEASURE: mallory's daemon never announced {MODE:?}:\n{}",
+        mallory_d.transcript()
+    );
+    let after = "alice, after mallory's entry";
+    alice.post(&room, after);
+    let took = arrives(&bob, &room, after);
+    println!(
+        "[proof] misbound: bob refused {refused} entr(ies); alice's next post reached him: \
+         {took:?}"
+    );
+    assert!(
+        took.is_some(),
+        "alice's post made after mallory's misbound governance entry never reached bob within \
+         {ARRIVES_WITHIN:?}: the room's sync stopped\nbob's status: {}\nbob:\n{}",
+        bob.status(),
+        bob_d.transcript()
+    );
+    // A refusal is not a failed session: before, it ended bob's session with the refusal as its
+    // reason and poisoned the room's sync until a reopen, and alice's post came only when she
+    // pushed it again. The reason is hard-coded here.
+    let poisoned: Vec<String> = failures(&bob.status())
+        .into_iter()
+        .filter(|f| f.contains("disagrees with log entry"))
+        .collect();
+    assert!(
+        poisoned.is_empty(),
+        "mallory's misbound governance entry failed bob's sync sessions: {poisoned:?}"
+    );
+    assert!(
+        refused >= 1,
+        "CANNOT MEASURE: bob never refused mallory's entry (it never reached him)\nbob's status: {}",
+        bob.status()
+    );
+
+    // ---- bob restarts: the room is held again, whole, and nothing hostile was stored --------
+    drop(bob_d);
+    let _bob_d = bob.daemon(Some(&spec));
+    let reopened = arrives(&bob, &room, after);
+    let aside = set_aside(&bob);
+    println!("[proof] misbound: after a restart bob reads it: {reopened:?}; set aside: {aside:?}");
+    assert!(
+        reopened.is_some(),
+        "after a restart bob's room is not open, or has lost alice's post\nbob's status: {}",
+        bob.status()
+    );
+    assert!(
+        aside.is_empty(),
+        "mallory's misbound governance entry was stored before it was refused: the reopen set aside \
+         {aside:?}"
     );
 }

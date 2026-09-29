@@ -1302,6 +1302,8 @@ where
 ///   its signature intact;
 /// - `author-unclassifiable` (V210-74): what it posts is a signed entry whose payload is neither a
 ///   governance body nor a sender-key message;
+/// - `author-misbound` (V210-74): what it posts is a signed consent grant whose body names an
+///   epoch 7 past the entry's own, so it classifies as governance and does not bind;
 /// - `old-row-ids` (V210-74): a room it reopens resumes its row ids from the log rows alone, as
 ///   before V210-73, so its own store gets the collision that lost received messages.
 ///
@@ -1322,6 +1324,7 @@ pub mod mutant {
         StripPayload,
         AuthorUnclassifiable,
         OldRowIds,
+        AuthorMisbound,
     }
 
     fn mode() -> Mode {
@@ -1334,6 +1337,7 @@ pub mod mutant {
                 "strip-payload" => Mode::StripPayload,
                 "author-unclassifiable" => Mode::AuthorUnclassifiable,
                 "old-row-ids" => Mode::OldRowIds,
+                "author-misbound" => Mode::AuthorMisbound,
                 _ => Mode::Correct,
             };
             eprintln!(
@@ -1380,7 +1384,9 @@ pub mod mutant {
     /// The entries to serve, given what the peer asked for and what is served unasked.
     pub(super) fn serve(asked: Vec<Vec<u8>>, unasked: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         match mode() {
-            Mode::Correct | Mode::AuthorUnclassifiable | Mode::OldRowIds => asked,
+            Mode::Correct | Mode::AuthorUnclassifiable | Mode::OldRowIds | Mode::AuthorMisbound => {
+                asked
+            }
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
             Mode::StripPayload => asked
@@ -1394,6 +1400,13 @@ pub mod mutant {
                 })
                 .collect(),
         }
+    }
+
+    /// Whether what this build posts is a governance body bound to another epoch
+    /// (`author-misbound`): a signed consent grant whose body epoch is the entry's own plus 7.
+    #[must_use]
+    pub fn misbound() -> bool {
+        mode() == Mode::AuthorMisbound
     }
 
     /// Whether a reopened room resumes its row ids from the log rows alone (`old-row-ids`).
