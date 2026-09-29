@@ -233,8 +233,22 @@ impl LiveCore {
                     reachability: Reachability::Offline,
                 })
         });
+        // A member held back for equivocating in the room on screen is said while the room is
+        // open (V210-63), by the name this operator gave them; another notice goes first.
+        let equivocation = self.active.and_then(|cid| {
+            nv.open_channels
+                .iter()
+                .find(|d| d.channel_id == cid)
+                .and_then(|d| d.equivocations.first())
+                .map(|(author, seq)| {
+                    crate::ident::equivocation_notice(
+                        &crate::ident::member_name(&nv.trusted, author),
+                        *seq,
+                    )
+                })
+        });
         ViewModel {
-            notice: self.notice.clone(),
+            notice: self.notice.clone().or(equivocation),
             channels,
             active,
             sync: SyncStatus::Idle,

@@ -679,7 +679,18 @@ pub async fn read(
     };
     if !json {
         let rows = coord::read_all(&mut client, channel_id, since).await?;
+        let held_back = equivocations_in(paths, &channel_id).await;
         let mut out = std::io::stdout().lock();
+        // **A member held back for equivocating is said first** (V210-63), by the same short id
+        // the rows below use: the keyring's names need the identity passphrase, which reading a
+        // room does not ask for. `vox status --json` carries the same, in full, for agents.
+        for (author, seq) in &held_back {
+            let _ = writeln!(
+                out,
+                "! {}",
+                crate::ident::equivocation_notice(&crate::ident::author_id(author), *seq)
+            );
+        }
         let take = if limit == 0 {
             rows.len()
         } else {
@@ -708,6 +719,30 @@ pub async fn read(
         let _ = writeln!(out, "{}", row_json(&room_key, r, &ops, None));
     }
     Ok(())
+}
+
+/// The members the node holds back for equivocating in `room` (V210-63), from `vox status`.
+/// Empty when the node does not say: the rows are still worth printing.
+async fn equivocations_in(paths: &Paths, room: &Digest32) -> Vec<(Digest32, u64)> {
+    let Ok(json) = vox_core::node::status::request(&paths.socket_file()).await else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return Vec::new();
+    };
+    let room = vox_core::node::link::b32_encode(room);
+    v["equivocations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["room"].as_str() == Some(room.as_str()))
+        .filter_map(|e| {
+            let author =
+                vox_core::node::link::b32_decode(e["author"].as_str()?, "equivocating author")
+                    .ok()?;
+            Some((author, e["position"].as_u64()?))
+        })
+        .collect()
 }
 
 /// `vox room roster` — who is in the room.

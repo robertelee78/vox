@@ -229,6 +229,58 @@ impl Dag {
         self.frozen.get(author)
     }
 
+    /// Every recorded fork proof, in author order: what a node says about equivocation, and
+    /// what it keeps so a restart does not forget it (V210-63).
+    #[must_use]
+    pub fn fork_proofs(&self) -> Vec<&ForkProof> {
+        let mut proofs: Vec<&ForkProof> = self.frozen.values().collect();
+        proofs.sort_unstable_by_key(|p| p.author_id);
+        proofs
+    }
+
+    /// Freeze an author again from a fork proof this node kept (V210-63): after a restart the
+    /// DAG is rebuilt from the stored entries, which hold only one side of the fork.
+    ///
+    /// **The proof is checked, not trusted**, as a new one would be: both entries by
+    /// `proof.author_id` at `proof.seq`, different, attributable, and each verified against
+    /// `author_root`. Anything else is refused and freezes nothing.
+    ///
+    /// # Errors
+    /// [`Rejected::Verification`] if either entry fails to verify; [`Rejected::Fork`] with a
+    /// deniable outcome if the pair is not a proof.
+    pub fn restore_fork(
+        &mut self,
+        proof: ForkProof,
+        author_root: &CompositePublicKey,
+    ) -> std::result::Result<(), Rejected> {
+        let same_place =
+            |e: &Entry| e.skeleton.author_id == proof.author_id && e.skeleton.seq == proof.seq;
+        let not_a_proof = || {
+            Rejected::Fork(ForkOutcome::DeniableAlarm {
+                author_id: proof.author_id,
+                seq: proof.seq,
+            })
+        };
+        if !same_place(&proof.existing)
+            || !same_place(&proof.conflicting)
+            || proof.existing.entry_hash() == proof.conflicting.entry_hash()
+            || !proof.existing.authenticator.is_attributable()
+            || !proof.conflicting.authenticator.is_attributable()
+        {
+            return Err(not_a_proof());
+        }
+        proof
+            .existing
+            .verify(author_root)
+            .map_err(Rejected::Verification)?;
+        proof
+            .conflicting
+            .verify(author_root)
+            .map_err(Rejected::Verification)?;
+        self.frozen.insert(proof.author_id, proof);
+        Ok(())
+    }
+
     /// Look up a stored entry by its 32-byte hash (the Negentropy key).
     #[must_use]
     pub fn get_by_hash(&self, hash: &Digest32) -> Option<&Entry> {

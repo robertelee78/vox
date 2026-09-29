@@ -77,6 +77,9 @@ pub struct ChannelDetail {
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
+    /// The members this node holds back for equivocating in this room (V210-63): each
+    /// `(author, seq)` at which two different messages signed by that author were seen.
+    pub equivocations: Vec<(Digest32, u64)>,
 }
 
 /// The node's latest-wins view (published over a `watch`).

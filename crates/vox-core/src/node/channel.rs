@@ -62,7 +62,7 @@ use crate::group::state::{ReceiverChain, SenderChain};
 use crate::group::wire::GROUP_MSG_SIGN_DOMAIN;
 use crate::hash::{sha256, Digest32};
 use crate::identity::composite::{CompositePublicKey, RootSigner};
-use crate::log::dag::{AdmissionPolicy, Dag};
+use crate::log::dag::{AdmissionPolicy, Dag, ForkProof};
 use crate::log::entry::{Entry, EntryKind, EntrySkeleton, ZERO_HASH};
 use crate::log::feed::lipmaa;
 use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
@@ -137,6 +137,52 @@ const SEG_ENTITLED: u64 = 10;
 /// consent-order stamp, value and order id ([`crate::node::consent_order`], V210-49), so a
 /// mark from a withdrawn decision, or from a deleted counter's, can never date a later one.
 const SEG_TRUST_MARKS: u64 = 11;
+
+/// The fork-proof segment id within [`SegmentKind::KeyMaterial`] (V210-63): every attributable
+/// fork proof this room's DAG has recorded, as the pair of entries. The DAG is rebuilt from the
+/// stored entries on open, and those hold only one side of a fork; without this a restart forgot
+/// every freeze, and took the equivocator's messages again until a sync met the fork again.
+const SEG_FORKS: u64 = 12;
+
+/// Encoding version of [`SEG_FORKS`].
+const FORKS_VERSION: u64 = 1;
+
+fn forks_bytes(proofs: &[&ForkProof]) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(FORKS_VERSION).array(proofs.len());
+    for p in proofs {
+        e.array(2)
+            .bytes(&p.existing.to_wire())
+            .bytes(&p.conflicting.to_wire());
+    }
+    e.finish()
+}
+
+fn parse_forks(bytes: &[u8]) -> Result<Vec<(Entry, Entry)>> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 {
+        return Err(Error::MalformedAtRest("fork proofs arity"));
+    }
+    if d.uint()? != FORKS_VERSION {
+        return Err(Error::MalformedAtRest("fork proofs version"));
+    }
+    let n = d.array()?;
+    // At most one proof per author: a frozen author's later entries are refused.
+    if n > MAX_AUTHORS {
+        return Err(Error::SizeLimitExceeded("fork proofs"));
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        if d.array()? != 2 {
+            return Err(Error::MalformedAtRest("fork proof arity"));
+        }
+        let existing = Entry::from_wire(d.bytes()?)?;
+        let conflicting = Entry::from_wire(d.bytes()?)?;
+        out.push((existing, conflicting));
+    }
+    d.finish()?;
+    Ok(out)
+}
 
 /// At-rest version of the entitlement segment.
 const POSITIONS_VERSION: u64 = 1;
@@ -401,6 +447,9 @@ pub struct ChannelState {
     authors: BTreeMap<Digest32, CompositePublicKey>,
     admission: AdmissionPolicy,
     dag: Dag,
+    /// How many of the DAG's fork proofs are kept in `SEG_FORKS` (V210-63). A sync that records
+    /// another makes the DAG hold more than this, and the room keeps them all again.
+    forks_kept: usize,
     /// The channel's ADR-007 authority. Shared, because a tunnel serving task must
     /// keep asking it after the actor has moved on (ADR-013, M16.1).
     evaluator: Arc<Evaluator>,
@@ -1064,6 +1113,7 @@ impl ChannelState {
             authors,
             admission,
             dag: Dag::new(),
+            forks_kept: 0,
             evaluator,
             sender,
             next_log_id: 1,
@@ -1179,6 +1229,33 @@ impl ChannelState {
             dag.accept(entry, kind, &key, &admission)
                 .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
             next_log_id = id.saturating_add(1);
+        }
+
+        // The fork proofs this room kept (V210-63), each checked as a new one would be: a proof
+        // that does not verify is a tampered store, as a stored entry that fails acceptance is.
+        let mut forks_kept = 0usize;
+        if let Some(seg) = store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_FORKS)? {
+            let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_FORKS, &seg)?;
+            for (existing, conflicting) in parse_forks(&bytes)? {
+                let author_id = existing.skeleton.author_id;
+                // An author no longer in the room has no key to check it with, and its entries
+                // are refused anyway.
+                let Some(key) = authors.get(&author_id) else {
+                    continue;
+                };
+                let seq = existing.skeleton.seq;
+                dag.restore_fork(
+                    ForkProof {
+                        author_id,
+                        seq,
+                        existing,
+                        conflicting,
+                    },
+                    key,
+                )
+                .map_err(|_| Error::MalformedAtRest("stored fork proof failed verification"))?;
+                forks_kept += 1;
+            }
         }
 
         // Timeline from the sealed plaintext cache, render-gated by the DAG.
@@ -1298,6 +1375,7 @@ impl ChannelState {
             authors,
             admission,
             dag,
+            forks_kept,
             evaluator,
             sender,
             next_log_id,
@@ -1525,6 +1603,7 @@ impl ChannelState {
             authors,
             admission,
             dag: Dag::new(),
+            forks_kept: 0,
             evaluator,
             sender,
             next_log_id: 1,
@@ -2577,6 +2656,40 @@ impl ChannelState {
         Ok(())
     }
 
+    /// Keep every fork proof the DAG holds in `SEG_FORKS`, if it holds more than are kept.
+    fn keep_forks(&mut self, store: &Store) -> Result<()> {
+        let proofs = self.dag.fork_proofs();
+        if proofs.len() <= self.forks_kept {
+            return Ok(());
+        }
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_FORKS,
+            &forks_bytes(&proofs),
+        )?;
+        let kept = proofs.len();
+        if let Err(e) =
+            store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_FORKS, &seg)
+        {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.forks_kept = kept;
+        Ok(())
+    }
+
+    /// The members this room holds back for equivocating (V210-63): each `(author, seq)` where
+    /// two different messages signed by that author were seen, in author order.
+    #[must_use]
+    pub fn equivocations(&self) -> Vec<(Digest32, u64)> {
+        self.dag
+            .fork_proofs()
+            .into_iter()
+            .map(|p| (p.author_id, p.seq))
+            .collect()
+    }
+
     fn persist_history(&mut self, store: &Store) -> Result<()> {
         let seg = seal_segment(
             &self.sek,
@@ -2759,6 +2872,9 @@ impl ChannelState {
         before: &BTreeMap<Digest32, u64>,
         now_secs: u64,
     ) -> Result<SyncOutcome> {
+        // A fork this sync recorded is kept before anything else, so a restart does not forget it
+        // (V210-63).
+        self.keep_forks(store)?;
         let mut arrived: Vec<(Digest32, Digest32, Vec<u8>)> = Vec::new();
         for (author, head) in before {
             let Some(feed) = self.dag.feed(author) else {
