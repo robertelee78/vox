@@ -200,9 +200,13 @@ fn echo_listener(d: &Daemon, room: &str, label: &str, limit: Option<usize>) -> P
 #[test]
 #[ignore = "builds the xcframework, compiles Swift, runs a real daemon; CI runs it in release on macOS"]
 fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
-    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
+    // Built before the watchdog is armed: the build is four release compiles of the whole
+    // workspace plus the bindings, ten minutes on a CI runner, and the 600 s budget bounds a hung
+    // *proof*, not cargo (#257: the watchdog killed aws-lc-sys's build script mid-compile). The
+    // CI job's own timeout still bounds a build that never ends.
     let harness = build_harness(&tmp.path().join("build"));
+    watchdog::arm();
 
     // The daemon's identity, made by `vox id` as a person setting up a profile would,
     // then the profile handed to a real `vox daemon`.
