@@ -12,7 +12,8 @@
 //!    naming that worker, "no version", and the required version — and the claim is
 //!    never posted;
 //! 2. **unknown** and **different** — a stamp that is not a version (`banana`) and one
-//!    that is another version (`0.2.9`) are each refused and named;
+//!    that is another version (this build's patch + 1, `another_version`) are each
+//!    refused and named;
 //! 3. `post --work` is refused the same way, `board --json` says `refused` with the
 //!    table, and the drain hook tells the session plainly;
 //! 4. **plain conversation survives** a refusal, so the operator can still talk;
