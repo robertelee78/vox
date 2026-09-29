@@ -1396,6 +1396,19 @@ impl Drop for IpcServer {
     }
 }
 
+/// How long a client waits for a node to greet it, and for `vox status` to be answered. Both are
+/// served off the actor the moment they are asked, so a node that takes this long is not busy: it
+/// is suspended or stuck, and waiting longer only hides that.
+pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The error for a node that did not answer within [`ANSWER_WITHIN`].
+#[must_use]
+pub fn silent() -> Error {
+    Error::Ipc(IpcHandshake::Silent {
+        secs: ANSWER_WITHIN.as_secs(),
+    })
+}
+
 /// Bind the control socket at `path` and serve `handle`'s event stream to every
 /// client that connects.
 ///
@@ -1652,10 +1665,18 @@ async fn verify_operator(
         .await
     {
         crate::node::api::Outcome::Done => Ok(()),
-        _ => Err(Frame::Error {
-            reason: "the identity passphrase does not match; the trust keyring is only \
-                     editable by whoever holds it"
-                .to_owned(),
+        crate::node::api::Outcome::Failed(crate::node::api::Fault::WrongPassphrase) => {
+            Err(Frame::Error {
+                reason: "the identity passphrase does not match; the trust keyring is only \
+                         editable by whoever holds it"
+                    .to_owned(),
+            })
+        }
+        // Only a wrong passphrase is one. A node with no identity, or shutting down, or a check
+        // that failed inside, was reported as a mistyped passphrase, and the person retyped a
+        // right one (V210-83).
+        other => Err(Frame::Error {
+            reason: other.to_string(),
         }),
     }
 }
@@ -2139,8 +2160,17 @@ impl IpcClient {
     /// the connection into an event stream, after which no further request can be
     /// sent on it.
     pub async fn open(path: &Path) -> Result<Self> {
-        let mut stream = connect_own(path).await?;
-        let Some(hello) = read_frame(&mut stream).await? else {
+        // **Bounded** (V210-83): a node greets the moment it accepts, off its actor, and one
+        // that does not is suspended or stuck. Every verb that attaches waited for ever on it.
+        // The bound covers `connect_own` too, so the owner and peer checks (#263) stay first.
+        let (stream, hello) = tokio::time::timeout(ANSWER_WITHIN, async {
+            let mut stream = connect_own(path).await?;
+            let hello = read_frame(&mut stream).await?;
+            Ok::<_, Error>((stream, hello))
+        })
+        .await
+        .map_err(|_| silent())??;
+        let Some(hello) = hello else {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         let me = match Frame::from_bytes(&hello)? {

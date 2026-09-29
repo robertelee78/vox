@@ -446,4 +446,14 @@ pub enum IpcHandshake {
         /// What was found instead.
         detail: String,
     },
+    /// The node took the connection and then said nothing: it is suspended, or stuck. Waiting
+    /// on it was forever (V210-83), since a suspended process's socket still accepts.
+    #[error(
+        "the node took the connection but did not answer within {secs} s: it may be suspended \
+         (Ctrl-Z, SIGSTOP) or stuck. Resume it, or stop it and start it again"
+    )]
+    Silent {
+        /// How long it was given.
+        secs: u64,
+    },
 }

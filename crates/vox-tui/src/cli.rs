@@ -166,6 +166,17 @@ where
     }
 }
 
+/// The profile's control socket path, or `None` having said why there is none.
+fn socket_of(profile: &ProfileArgs) -> Option<std::path::PathBuf> {
+    match profile.paths() {
+        Ok(p) => Some(p.socket_file()),
+        Err(e) => {
+            eprintln!("vox: {e}");
+            None
+        }
+    }
+}
+
 /// The shape the room-*making* verbs share (`vox serve`, `vox connect`): resolve the
 /// profile, unlock the identity — creating it on first use — and run the verb.
 ///
@@ -1245,12 +1256,18 @@ pub fn run() -> ExitCode {
             }
         }
         Cmd::Serve(args) => {
+            let Some(socket) = socket_of(&args.profile) else {
+                return ExitCode::FAILURE;
+            };
             let a = args.clone();
             run_new_room_verb(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, anchors| async move {
+                    // Only the verbs that keep running serve the socket: `vox id` and the trust
+                    // verbs share this path and are done in a moment (V210-83, #263).
+                    let _control = crate::tunnel_cli::serve_control_socket(&node, socket)?;
                     crate::tunnel_cli::serve(&node, &anchors, &a.name, a.port, a.at).await
                 },
             )
@@ -1266,12 +1283,16 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            let Some(socket) = socket_of(&args.profile) else {
+                return ExitCode::FAILURE;
+            };
             let a = args.clone();
             run_new_room_verb(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
+                    let _control = crate::tunnel_cli::serve_control_socket(&node, socket)?;
                     crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp).await
                 },
             )

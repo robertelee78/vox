@@ -1609,6 +1609,9 @@ impl Joiner {
                     Ok(c) => {
                         if let Err(e) = announce(&c, &prejoin_wire).await {
                             last_fault = fault_of(&e);
+                            // Said, as a failed dial is: a join that failed here reported no
+                            // reason at all (V210-83).
+                            why.push(format!("{short}: announce: {e}"));
                             if !worth_another_responder(last_fault) {
                                 return Err(JoinerLost {
                                     fault: last_fault,
@@ -1669,6 +1672,7 @@ impl Joiner {
                 }
                 Err(e) => {
                     last_fault = fault_of(&e);
+                    why.push(format!("{short}: exchange: {e}"));
                     if !worth_another_responder(last_fault) {
                         return Err(JoinerLost {
                             fault: last_fault,
@@ -2634,7 +2638,7 @@ impl Node {
                 if self.forwards.remove(&local).is_some() {
                     Outcome::Done
                 } else {
-                    Outcome::Failed(Fault::UnknownChannel)
+                    Outcome::Failed(Fault::NoSuchForward)
                 }
             }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
@@ -7923,7 +7927,7 @@ impl Node {
                 self.refresh_reachers().await;
                 Outcome::Done
             }
-            Ok(false) => Outcome::Failed(Fault::UnknownChannel),
+            Ok(false) => Outcome::Failed(Fault::NotOffered),
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
     }
