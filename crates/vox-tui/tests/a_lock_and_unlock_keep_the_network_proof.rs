@@ -40,12 +40,13 @@ const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
 /// How late the old network says it stopped (the test-only knob).
-const STOPPED_DELAY_MS: u64 = 15_000;
+const STOPPED_DELAY_MS: u64 = 40_000;
 /// The unlock must be done this soon after the lock, or the old network's word lands before the
-/// new network exists and the race is not staged.
-const UNLOCK_BEFORE_MS: u64 = 12_000;
+/// new network exists and the race is not staged. Wide, because the unlock is production Argon2id:
+/// about 1 s in release, and 13.6–16.0 s measured in debug on a busy machine.
+const UNLOCK_BEFORE_MS: u64 = 35_000;
 /// The join starts this long after the lock: past the old network's word, with room to spare.
-const HOLD_SECS: u64 = 20;
+const HOLD_SECS: u64 = 45;
 
 /// A `vox daemon`, killed by its own PID when dropped.
 struct Daemon(Child);
