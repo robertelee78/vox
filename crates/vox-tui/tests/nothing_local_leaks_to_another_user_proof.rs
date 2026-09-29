@@ -9,6 +9,9 @@
 //!    Staged: alice offers a file, the offer is killed with each signal, bob asks for it, and
 //!    alice's own daemon says why it refused bob. "no such service is offered in that room" is
 //!    the withdrawn offer; "the local service did not accept the connection" is the leaked one.
+//!    And **two offers of the same file are two offers**: their tags were the content's, so
+//!    ending one withdrew the other while it still ran. Staged: two `room send`s of one file,
+//!    the first ended by SIGTERM, and bob collects the file whole by the second's tag.
 //! 2. **An offer is never persisted.** It was: a daemon that stopped while an offer ran came
 //!    back offering its port. Staged: alice's daemon is stopped with an offer live, and
 //!    `vox service list` reads alice's store; a `vox service add` afterwards is the control
@@ -41,8 +44,8 @@
 //! review, and the directory being `0700` is what (4) asserts.
 //!
 //! Mutations, each red for its own reason: (1) the daemon not releasing what a closed
-//! connection held; (2) an offer over the control socket persisted; (3) the same as (1), for
-//! the forward; (4) the old flat `<tmp>/vox-<hex>.sock` fallback; (5) the client's owner check
+//! connection held, and an offer's tag being its content's alone (the twin case); (2) an
+//! offer over the control socket persisted; (3) the same as (1), for the forward; (4) the old flat `<tmp>/vox-<hex>.sock` fallback; (5) the client's owner check
 //! removed; (6) the accept loop returning on its first error; (7) the rc written `0644` over
 //! the path; (8) `--passphrase` accepted.
 
@@ -446,6 +449,56 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         withdrawn += 1;
     }
     eprintln!("[proof] offers withdrawn after SIGTERM/SIGHUP/SIGKILL: {withdrawn} of 3");
+
+    // ---- (1b) two offers of the same file: ending one leaves the other serving ----
+    let twin = tmp.path().join("twin.bin");
+    let twin_bytes: Vec<u8> = (0..65_536u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(&twin, &twin_bytes).unwrap();
+    let mut first = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let first_said = first.wait_for("vox: offering", Duration::from_secs(60));
+    // Collected by the second offer's own tag, so the get asks for exactly the offer that is
+    // still running.
+    until(
+        &bob,
+        "the first twin offer to reach bob",
+        &["room", "read", &room],
+        |o| o.contains("twin.bin"),
+    );
+    let second = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let second_said = second.wait_for("vox: offering", Duration::from_secs(60));
+    let tag_of = |said: &str| {
+        said.split_whitespace()
+            .find(|w| w.starts_with("file-"))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (t1, t2) = (tag_of(&first_said), tag_of(&second_said));
+    eprintln!("[proof] twin offers of one file: tags {t1} and {t2}");
+    until(
+        &bob,
+        "the second twin offer to reach bob",
+        &["room", "read", &room, "--json"],
+        |o| o.contains(&t2),
+    );
+    signal(first.pid(), "TERM");
+    assert!(
+        first.exited_within(Duration::from_secs(10)).is_some(),
+        "CANNOT MEASURE: the first twin offer did not end on SIGTERM"
+    );
+    let got = tmp.path().join("twin-got.bin");
+    let (ok, stdout, stderr) =
+        bob.vox(&["room", "get", &room, &t2, "--out", got.to_str().unwrap()]);
+    let collected = std::fs::read(&got).ok();
+    eprintln!(
+        "[proof] get after the first twin ended: ok={ok}, {} bytes of 65536",
+        collected.as_ref().map_or(0, Vec::len)
+    );
+    assert!(
+        ok && collected.as_deref() == Some(&twin_bytes[..]),
+        "ending one offer of a file withdrew another offer of the same file that was still \
+         running (tags {t1} and {t2}): {stdout} {stderr}"
+    );
+    drop(second);
 
     // ---- (3) a get ended by SIGTERM, SIGHUP or SIGKILL closes its forward ----
     let Some(_) = listening(bob_daemon.pid()) else {

@@ -3620,6 +3620,11 @@ impl Node {
                     && !self.channels.contains_key(&channel_id)
                     && self.profile.as_ref().is_some_and(Profile::is_unlocked);
                 if wanted {
+                    crate::node::status::SyncBook::note_set_aside(
+                        &self.sync_book,
+                        channel_id,
+                        channel.set_aside(),
+                    );
                     self.channels
                         .insert(channel_id, Arc::new(tokio::sync::Mutex::new(*channel)));
                     self.mark_decisions_on_open(&channel_id).await;
@@ -6473,6 +6478,7 @@ impl Node {
         let o = &report.out;
         let progress = o.progress();
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
+            c.refused += u64::try_from(o.refused).unwrap_or(u64::MAX);
             match &report.fail {
                 None if o.complete => c.completed += 1,
                 None => c.partial += 1,
@@ -7825,6 +7831,11 @@ impl Node {
         };
         match ChannelState::open(profile, channel_id, passphrase, now) {
             Ok(ch) => {
+                crate::node::status::SyncBook::note_set_aside(
+                    &self.sync_book,
+                    *channel_id,
+                    ch.set_aside(),
+                );
                 self.remember_or_say(&ch);
                 self.channels
                     .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
