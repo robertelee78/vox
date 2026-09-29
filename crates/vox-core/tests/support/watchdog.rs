@@ -54,6 +54,15 @@
 //! like that is how the 21-hour processes above began. So before it aborts, the watchdog
 //! kills every descendant of this process, found by parent pid, deepest first.
 //!
+//! ## Why it dumps the test's children too, before it kills them
+//! Every real-binary proof spends its time waiting on `vox` child processes, so the test
+//! process's own stacks show only that it is waiting: the process that is actually stuck is a
+//! `vox daemon` it started. The first version sampled the test process alone and then killed the
+//! children, so the one dump a hang produced held no evidence of the cause (V210-36, #213). So
+//! each live descendant is dumped the same way, named by pid and command line, **before** any is
+//! killed — a dead process has no stacks to show. The descendants' dumps share one bound,
+//! [`DESCENDANTS_PATIENCE`], so a tree of many processes cannot undo the watchdog's own bound.
+//!
 //! The budget is deliberately generous: it is not a performance assertion, it is the line past
 //! which "slow" is no longer a credible explanation. Override with `VOX_TEST_WATCHDOG_SECS`,
 //! and `VOX_TEST_WATCHDOG_SECS=0` disables it — for attaching a debugger, which is the one
@@ -70,6 +79,10 @@ const DEFAULT_BUDGET: Duration = Duration::from_secs(600);
 /// How long the stack dump may take before the abort goes ahead without it. Symbolicating a
 /// large test binary is the slow part; a dump that itself hangs must not undo the bound.
 const DUMP_PATIENCE: Duration = Duration::from_secs(90);
+
+/// How long the descendants' dumps may take between them. Past it the rest are named but not
+/// dumped, and the kill goes ahead.
+const DESCENDANTS_PATIENCE: Duration = Duration::from_secs(180);
 
 static ARMED: Once = Once::new();
 
@@ -131,14 +144,14 @@ pub fn arm() {
     });
 }
 
-/// Kill every descendant of this process, deepest first, and say how many. Found with `ps`,
-/// which macOS and Linux both have, so the support code needs no platform crate.
-fn kill_descendants() -> usize {
+/// Every descendant of this process, parents before children. Found with `ps`, which macOS and
+/// Linux both have, so the support code needs no platform crate.
+fn descendants() -> Vec<u32> {
     let Ok(out) = std::process::Command::new("ps")
         .args(["-A", "-o", "pid=,ppid="])
         .output()
     else {
-        return 0;
+        return Vec::new();
     };
     let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -160,9 +173,14 @@ fn kill_descendants() -> usize {
         );
         i += 1;
     }
-    let mine = std::process::id();
+    found.remove(0);
+    found
+}
+
+/// Kill `pids`, deepest first (they come parents first), and say how many.
+fn kill_descendants(pids: &[u32]) -> usize {
     let mut killed = 0;
-    for pid in found.iter().rev().filter(|p| **p != mine) {
+    for pid in pids.iter().rev() {
         let ok = std::process::Command::new("kill")
             .args(["-KILL", &pid.to_string()])
             .status()
@@ -192,19 +210,48 @@ fn fire(elapsed: Duration, budget: Duration) -> ! {
          \n\
          Every thread's stack follows. The spinning thread is the one whose frames\n\
          are not a wait (a condvar, kevent/epoll, a sleep) and carry nearly every\n\
-         sample; a deadlock shows as threads parked in a mutex's lock. SIGABRT\n\
+         sample; a deadlock shows as threads parked in a mutex's lock. Then each\n\
+         process this test started, under its pid and command line: in a proof\n\
+         that drives `vox`, the hung one is usually there, not here. SIGABRT\n\
          follows too, so on macOS ~/Library/Logs/DiagnosticReports keeps a copy.\n\
          \n\
          To hold it open for a debugger instead: VOX_TEST_WATCHDOG_SECS=0\n\
          ===========================================================\n"
     ));
-    dump_threads();
+    dump_threads(std::process::id());
+    // Found once, before any diagnostic runs: `ps` and `sample` are children of this process too,
+    // and are waited for, so they are never in the list.
+    let children = descendants();
+    dump_descendants(&children);
     say("==================== vox test watchdog: end of thread dump; aborting ====================\n");
-    let killed = kill_descendants();
+    let killed = kill_descendants(&children);
     say(&format!(
         "vox test watchdog: killed {killed} descendant process(es) before aborting\n"
     ));
     std::process::abort();
+}
+
+/// Dump every descendant's threads, each under a header naming its pid and command line, within
+/// [`DESCENDANTS_PATIENCE`] between them.
+fn dump_descendants(pids: &[u32]) {
+    let deadline = Instant::now() + DESCENDANTS_PATIENCE;
+    for pid in pids {
+        let command = Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default();
+        say(&format!(
+            "\n==================== vox test watchdog: descendant {pid}: {command} ====================\n"
+        ));
+        if Instant::now() >= deadline {
+            say(&format!(
+                "(not dumped: the descendants' dumps already took {DESCENDANTS_PATIENCE:?})\n"
+            ));
+            continue;
+        }
+        dump_threads(*pid);
+    }
 }
 
 /// Write straight to file descriptor 2. `eprintln!` from this thread lands in libtest's capture
@@ -216,8 +263,8 @@ fn say(text: &str) {
 }
 
 #[cfg(target_os = "macos")]
-fn dump_threads() {
-    let pid = std::process::id().to_string();
+fn dump_threads(pid: u32) {
+    let pid = pid.to_string();
     // Per-thread state and CPU, then a sampled call graph of every thread.
     run_bounded(Command::new("/bin/ps").args(["-M", "-p", &pid]));
     // `-file /dev/stdout`: into the log, and not also a stray report in /tmp for every abort.
@@ -231,10 +278,14 @@ fn dump_threads() {
 }
 
 #[cfg(target_os = "linux")]
-fn dump_threads() {
-    let before = census();
+fn dump_threads(pid: u32) {
+    let before = census(pid);
     std::thread::sleep(Duration::from_secs(1));
-    let after = census();
+    let after = census(pid);
+    if after.is_empty() {
+        say(&format!("(no threads to show: process {pid} is gone)\n"));
+        return;
+    }
     let mut out = String::from("threads (tid, state, CPU ticks in the last second, name):\n");
     for (tid, state, ticks, name) in &after {
         let was = before
@@ -247,7 +298,7 @@ fn dump_threads() {
         ));
     }
     say(&out);
-    let pid = std::process::id().to_string();
+    let pid = pid.to_string();
     // Where gdb is installed and the kernel's ptrace policy lets a child attach to its parent.
     run_bounded(Command::new("gdb").args([
         "-p",
@@ -260,15 +311,15 @@ fn dump_threads() {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn dump_threads() {
+fn dump_threads(_pid: u32) {
     say("(no thread dump on this platform)\n");
 }
 
-/// `(tid, state, utime + stime, name)` for every thread of this process.
+/// `(tid, state, utime + stime, name)` for every thread of process `pid`.
 #[cfg(target_os = "linux")]
-fn census() -> Vec<(u64, char, u64, String)> {
+fn census(pid: u32) -> Vec<(u64, char, u64, String)> {
     let mut threads = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+    let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
         return threads;
     };
     for entry in dir.flatten() {
