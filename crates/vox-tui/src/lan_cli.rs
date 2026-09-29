@@ -361,9 +361,13 @@ mod mac {
         let result = rt.block_on(async move {
             listener.set_nonblocking(true)?;
             let listener = tokio::net::UnixListener::from_std(listener)?;
+            // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
+            // lands in the same turn as another arm (see `app::run_node`).
+            let interrupted = tokio::signal::ctrl_c();
+            tokio::pin!(interrupted);
             loop {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => break,
+                    _ = &mut interrupted => break,
                     a = listener.accept() => {
                         let (stream, _) = a?;
                         let stream = stream.into_std()?;
@@ -580,9 +584,13 @@ mod mac {
         let mut linked: Vec<Digest32> = Vec::new();
         let mut moved_said = false;
         let mut tick = tokio::time::interval(Duration::from_millis(500));
+        // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
+        // lands in the same turn as another arm (see `app::run_node`).
+        let interrupted = tokio::signal::ctrl_c();
+        tokio::pin!(interrupted);
         loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => break,
+                _ = &mut interrupted => break,
                 _ = tick.tick() => {
                     let s = lan.stats();
                     for m in s.links.iter().filter(|m| !linked.contains(m)) {

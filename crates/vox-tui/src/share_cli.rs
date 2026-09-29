@@ -245,6 +245,10 @@ pub async fn share(
         }
     };
     tokio::pin!(deadline);
+    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
+    // lands in the same turn as another arm (see `app::run_node`).
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -264,7 +268,7 @@ pub async fn share(
                 }
             }
             () = &mut deadline => break,
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut interrupted => break,
         }
     }
     println!(
