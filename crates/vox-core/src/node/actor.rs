@@ -7825,7 +7825,7 @@ impl Node {
                     service_tag,
                     local: bound,
                 });
-                Outcome::Done
+                Outcome::Bound(bound)
             }
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
