@@ -562,6 +562,13 @@ impl std::fmt::Display for Fault {
 pub enum Outcome {
     /// The command succeeded.
     Done,
+    /// A forward was bound, at this address: the answer to [`NodeCommand::Forward`] **names the
+    /// forward it opened**. It used to be `Done` alone, and a caller took the address from the
+    /// next `Forwarding` event, which is any forward's. Two `vox room get`s at once could then be
+    /// handed the same one; the first to finish stopped it, and the second, still connecting, was
+    /// refused (`connecting to the forward: Connection refused`), while the other forward was
+    /// never stopped at all.
+    Bound(std::net::SocketAddr),
     /// The command failed for the given reason.
     Failed(Fault),
 }
@@ -570,7 +577,7 @@ impl Outcome {
     /// Whether the command succeeded.
     #[must_use]
     pub fn is_done(self) -> bool {
-        matches!(self, Outcome::Done)
+        matches!(self, Outcome::Done | Outcome::Bound(_))
     }
 }
 
@@ -578,6 +585,7 @@ impl std::fmt::Display for Outcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Outcome::Done => f.write_str("done"),
+            Outcome::Bound(local) => write!(f, "bound at {local}"),
             Outcome::Failed(fault) => f.write_str(fault.explain()),
         }
     }

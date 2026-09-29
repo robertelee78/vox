@@ -1204,6 +1204,10 @@ const STALE_REFUSAL_GRACE: u64 = 5;
 /// steps, and few enough that a real refusal stops being retried.
 const STALE_REPUBLISH_TRIES: u32 = 3;
 
+/// How far the first republish after a stale refusal moves this process's record `seq` floor
+/// past its clock, in milliseconds; each later try doubles it (see `NetEvent::PublishDone`).
+const STALE_SEQ_STEP_MS: u64 = 2_000;
+
 /// Whether a publish outcome is one of this node's **own** records refused by the board as stale.
 fn own_stale_refusal(kind: &str, why: &Option<String>) -> bool {
     matches!(kind, "our address" | "our member bundle")
@@ -1285,8 +1289,10 @@ struct JoinSteps(Vec<String>);
 
 impl JoinSteps {
     fn took(&mut self, what: &str, since: std::time::Instant) {
-        self.0
-            .push(format!("{what} {:.2}s", since.elapsed().as_secs_f64()));
+        self.lasted(what, since.elapsed());
+    }
+    fn lasted(&mut self, what: &str, d: std::time::Duration) {
+        self.0.push(format!("{what} {:.2}s", d.as_secs_f64()));
     }
     fn note(&mut self, what: String) {
         self.0.push(what);
@@ -1609,7 +1615,19 @@ impl Joiner {
             let exchanged = net
                 .start_join(&conn, ctx, &self.passphrase, signer, &ik)
                 .await;
-            steps.took(&format!("{short}: exchange (incl. solve)"), t);
+            // **The solve apart from the rest** (V210-62): the proof of work is this machine's
+            // own CPU and random in length by design, the rest is waiting on the responder. One
+            // number for both left a slow join unexplained (CI: 13.3 s, which was which?).
+            match &exchanged {
+                Ok(o) => {
+                    steps.lasted(&format!("{short}: solve"), o.solved_in);
+                    steps.lasted(
+                        &format!("{short}: exchange"),
+                        t.elapsed().saturating_sub(o.solved_in),
+                    );
+                }
+                Err(_) => steps.took(&format!("{short}: exchange (incl. solve)"), t),
+            }
             match exchanged {
                 Ok(o) => {
                     joined_outcome = Some((o, responder, conn));
@@ -1870,10 +1888,18 @@ pub struct Node {
     /// channel's own (production `(200,9)`); tests reduce them so the debug suite
     /// does not grind, exactly as they reduce the Argon2 profile.
     pow_params: Option<crate::join::pow::PowParams>,
-    /// Connections (by quinn's stable id) that already have a stream loop, so adopting
+    /// Connections (by [`VoxConnection::serial`]) that already have a stream loop, so adopting
     /// one twice does not start a second. Keyed by connection, not by peer: an upgrade
     /// gives a peer a second connection that needs its own loop (M15.1b).
-    stream_loops: std::collections::BTreeSet<usize>,
+    ///
+    /// **Not by quinn's stable id**, which it was: that is the address of the connection's
+    /// state, reused once a closed connection is freed. A new connection that landed at a dead
+    /// one's address was taken to have a loop already, nothing read the streams the peer opened
+    /// on it, and a tunnel request sent there waited unanswered until the connection was closed
+    /// a minute later (#243's CI red on dd78874: `vox up`'s first punched request, 61.9 s).
+    /// Each entry keeps its connection weakly, so entries for connections that are gone are
+    /// dropped and the map is as small as the set of live ones.
+    stream_loops: std::collections::BTreeMap<u64, std::sync::Weak<VoxConnection>>,
     /// The gateway port mapping in force, if one was granted. Held so it can be
     /// renewed before its lifetime elapses (RFC 6886/6887 put renewal on the client).
     port_mappings: Vec<crate::nat::portmap::PortMapping>,
@@ -1891,6 +1917,8 @@ pub struct Node {
     /// The anchors this node held a connection to at the last look, so losing one is said when
     /// it happens, not only when it is next redialled (#229's diagnostics).
     anchors_up: BTreeSet<Digest32>,
+    /// Peers a room's sync is dialling right now (`reach_for_sync`), so one is not dialled twice.
+    sync_dials: BTreeSet<Digest32>,
     /// When the granted mappings must be renewed (unix seconds), or `None` when there
     /// is nothing to renew. A mapping a gateway grants for two hours outlives no
     /// long-running node by itself: it is re-requested at half its lifetime, the
@@ -2175,12 +2203,13 @@ impl Node {
             anchored: BTreeMap::new(),
             forwards: BTreeMap::new(),
             pow_params,
-            stream_loops: std::collections::BTreeSet::new(),
+            stream_loops: std::collections::BTreeMap::new(),
             port_mappings: Vec::new(),
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeSet::new(),
+            sync_dials: BTreeSet::new(),
             renew_mappings_at: None,
             ports: BTreeMap::new(),
             port_queue: crate::node::ports::Queue::default(),
@@ -3543,6 +3572,7 @@ impl Node {
                 board,
             } => {
                 let peer = conn.peer_id();
+                self.sync_dials.remove(&peer);
                 self.adopt_connection(Arc::clone(&conn));
                 if let Some(net) = self.net.as_ref().map(Arc::clone) {
                     if crate::node::net::path_class(net.manager().endpoint(), &conn)
@@ -3718,6 +3748,36 @@ impl Node {
                         .get(&peer)
                         .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
                     self.anchor_backoff.insert(peer, (self.now() + wait, wait));
+                    if let Some(net) = self.net.as_ref() {
+                        net.manager().note(
+                            peer,
+                            format!(
+                                "dialling this anchor failed ({why}); the next try is in {wait}s"
+                            ),
+                        );
+                    }
+                }
+                self.sync_dials.remove(&peer);
+                // A member no reach could get to: its ports that have no connection back off as
+                // Unreachable (ADR-025 D5), so the scheduler does not ask again at once (#246).
+                let unconnected = self
+                    .net
+                    .as_ref()
+                    .is_some_and(|n| n.manager().existing(&peer).is_none());
+                if unconnected {
+                    let rooms: Vec<Digest32> = self
+                        .ports
+                        .keys()
+                        .filter(|(_, p)| *p == peer)
+                        .map(|(r, _)| *r)
+                        .collect();
+                    for room in rooms {
+                        self.enter_backoff(
+                            room,
+                            peer,
+                            crate::node::status::BackoffKind::Unreachable,
+                        );
+                    }
                 }
                 self.answer_pending_consents(
                     |_, target| *target == peer,
@@ -3734,6 +3794,12 @@ impl Node {
                 // The backoff is kept until the connection has lasted (`ANCHOR_FLAP_SECS`): one
                 // superseded at once is a flap, not a success.
                 self.anchor_connected_at.insert(peer, self.now());
+                // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
+                // whose forward said it dialled and then nothing).
+                if let Some(net) = self.net.as_ref() {
+                    net.manager()
+                        .note(peer, "connected to this anchor".to_owned());
+                }
                 self.anchor_ids.insert(peer);
                 self.adopt_connection(Arc::clone(&conn));
                 self.refresh_network_view().await;
@@ -3846,6 +3912,21 @@ impl Node {
                     // the republish goes, so the waves are a second apart and there are three.
                     let tries = self.stale_retries.get(&key).copied().unwrap_or(0);
                     if tries < STALE_REPUBLISH_TRIES && self.republish_pending.insert(key) {
+                        // **And the `seq` floor moves on, not only the clock** (V210-61). A board
+                        // wants a later `seq` as well as a later second, and `seq` is floored by
+                        // this process's millisecond clock: waiting a second per try let a process
+                        // whose clock is behind its predecessor's catch up by one second a try, so
+                        // three tries cured a lag of about three seconds and no more. #230's own
+                        // proof, staged 2.5 s behind, was cured on its last try in 57 of 60 samples
+                        // on integrate dd78874, and now and then not at all: the node then said a
+                        // board "would not take our address" and the board kept the dead process's.
+                        // Each armed republish moves the floor 2, 4, then 8 s past where it is, so
+                        // three tries cover a lag of more than 15 s. `seq` is only compared, never
+                        // bounded by a board, and it stays this process's own and increasing.
+                        let floor = (self.millis_clock)();
+                        let ahead = STALE_SEQ_STEP_MS << tries.min(8);
+                        let entry = self.record_seq.entry(channel_id).or_insert(0);
+                        *entry = (*entry).max(floor).saturating_add(ahead);
                         let past_the_second = 1_000 - (self.millis_clock)() % 1_000 + 50;
                         let tx = self.net_tx.clone();
                         tokio::spawn(async move {
@@ -4370,7 +4451,11 @@ impl Node {
     fn adopt_connection(&mut self, conn: Arc<VoxConnection>) {
         let peer = conn.peer_id();
         if let Some(net) = self.net.as_ref().map(Arc::clone) {
-            if self.stream_loops.insert(conn.quinn().stable_id()) {
+            self.stream_loops.retain(|_, held| held.strong_count() > 0);
+            if let std::collections::btree_map::Entry::Vacant(e) =
+                self.stream_loops.entry(conn.serial())
+            {
+                e.insert(Arc::downgrade(&conn));
                 spawn_stream_loop(net, conn, self.net_tx.clone());
             }
         }
@@ -5740,6 +5825,35 @@ impl Node {
                 self.port_queue.remove(&room, &peer);
             }
         }
+        // **A port with no connection reaches its peer** (ADR-025 D2, V210-58 #246). A port runs
+        // only over a connection that exists, and nothing else dials a member for sync: members are
+        // dialled for key work, and through the board's anchor. So a member whose connection was
+        // dropped — silent past `SILENCE_IS_DEATH` (30 s), a laptop lid, a frozen process — was
+        // never synced with again once the anchor was gone too: two members with a backlog each
+        // for the other sat for 150 s with neither dialling (CI run 36452063803). One reach per
+        // peer at a time, off the actor, paced by the port's own backoff: a failed reach backs the
+        // peer's ports off as Unreachable (`NetEvent::ReachFailed`, 200 ms doubling to 8 s). Not
+        // `reach_member`'s 30 s spacing for key work: with it, two members who each tried the other
+        // while the other was away could not try again for up to 30 s after both were back (#246's
+        // proof: 1 run in 2 still unsynced 10 s after).
+        let lacking: std::collections::BTreeMap<Digest32, Digest32> = self
+            .ports
+            .iter()
+            .filter(|(key, port)| {
+                port.out.is_none()
+                    && port.needs()
+                    && !port.backing_off(now)
+                    && !self.publishing.contains(*key)
+                    && self
+                        .net
+                        .as_ref()
+                        .is_some_and(|n| n.manager().existing(&key.1).is_none())
+            })
+            .map(|((room, peer), _)| (*peer, *room))
+            .collect();
+        for (peer, room) in lacking {
+            self.reach_for_sync(&room, peer);
+        }
         let mut ran = false;
         loop {
             let slots = Arc::clone(&self.slots);
@@ -6816,6 +6930,51 @@ impl Node {
         None
     }
 
+    /// Reach `peer` for a room's sync (ADR-025 D2, #246): one dial at a time per peer, off the
+    /// actor, reporting `Dialed` (a new connection, which clears the port's backoff) or
+    /// `ReachFailed` (which backs it off). Unlike [`Self::reach_member`] it keeps no spacing of its
+    /// own: the port's backoff paces it.
+    ///
+    /// **Not an anchor.** An anchor has its own dial (`redial_anchors_if_due`, V210-57): paced by
+    /// its own backoff, and announced as `AnchorConnected`, which records when it connected and
+    /// publishes this node's records to it. A sync reach to an anchor would be a second dial
+    /// that bypasses both, and its failure would advance the anchor's backoff as well as the
+    /// port's. When the anchor path reconnects it, the new connection syncs like any other.
+    fn reach_for_sync(&mut self, channel_id: &Digest32, peer: Digest32) {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        if self.anchors.nodes().iter().any(|a| a.id == peer) {
+            return;
+        }
+        if net.manager().existing(&peer).is_some() || !self.sync_dials.insert(peer) {
+            return;
+        }
+        let endpoints = net.board_endpoints(channel_id, &peer);
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            match net.reach(peer, &endpoints).await {
+                Ok(conn) => {
+                    let _ = tx
+                        .send(NetEvent::Dialed {
+                            conn,
+                            endpoints,
+                            board: false,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(NetEvent::ReachFailed {
+                            peer,
+                            why: e.to_string(),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
     /// The pairwise session for `(channel, target)`, opening one from that member's
     /// **bundle record** if none exists.
     ///
@@ -7700,7 +7859,7 @@ impl Node {
                     service_tag,
                     local: bound,
                 });
-                Outcome::Done
+                Outcome::Bound(bound)
             }
             Err(e) => Outcome::Failed(fault_of(&e)),
         }

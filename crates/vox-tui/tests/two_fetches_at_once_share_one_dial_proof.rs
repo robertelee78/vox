@@ -365,6 +365,7 @@ fn two_fetches_at_once_share_one_dial() {
     let mut extra: Vec<String> = Vec::new();
     let mut extra_circuits: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
+    let mut left_listening: Vec<String> = Vec::new();
     for cycle in 0..CYCLES {
         // A fresh daemon for bob: no connection to alice to reuse.
         drop(bob.daemon.take());
@@ -398,6 +399,16 @@ fn two_fetches_at_once_share_one_dial() {
             .into_iter()
             .flatten()
             .find(|r| r["peer"].as_str() == Some(alice_fp.as_str()));
+        // **Each get gets its own forward, and stops it** (#249). Two gets at once were each
+        // answered with whichever forward bound first, so both used one and the other was never
+        // stopped: bob's daemon went on listening on a port nothing would ever connect to (and,
+        // when the first get stopped the shared one while the second was still connecting, the
+        // second was refused). With both gets done, bob's daemon listens on no TCP port.
+        let listening = tcp_listeners(bob.daemon.as_ref().expect("bob's daemon").0.id());
+        eprintln!("[proof] cycle {cycle}: bob's daemon listens on {listening:?} after both gets");
+        if !listening.is_empty() {
+            left_listening.push(format!("cycle {cycle}: {listening:?}"));
+        }
         let ladders = row.and_then(|r| r["ladders"].as_u64()).unwrap_or(0);
         let circuits = row.and_then(|r| r["circuits"].as_u64()).unwrap_or(0);
         eprintln!(
@@ -422,6 +433,12 @@ fn two_fetches_at_once_share_one_dial() {
         "CANNOT PROVE: the anchor carried no circuit, so the path was not relayed"
     );
     assert!(
+        left_listening.is_empty(),
+        "each get must be given its own forward and stop it — bob's daemon was left listening \
+         after both gets were done:\n{}",
+        left_listening.join("\n")
+    );
+    assert!(
         failed.is_empty(),
         "fetches started together must all succeed — a reach lost its circuit to another reach to \
          the same peer:\n{}",
@@ -441,4 +458,26 @@ fn two_fetches_at_once_share_one_dial() {
         "fetches started together took longer than {FETCH_WITHIN:?} — a reach lost its circuit to \
          another reach to the same peer: {slow:?}"
     );
+}
+
+/// The TCP ports `pid` is listening on, as `lsof` reports them: what a forward leaves behind.
+fn tcp_listeners(pid: u32) -> Vec<String> {
+    let out = Command::new("lsof")
+        .args([
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-P",
+            "-n",
+            "-F",
+            "n",
+        ])
+        .output()
+        .expect("run lsof");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix('n').map(str::to_owned))
+        .collect()
 }

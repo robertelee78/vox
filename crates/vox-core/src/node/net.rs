@@ -292,6 +292,15 @@ fn tie_key(conn: &VoxConnection) -> [u8; 16] {
     key
 }
 
+/// The first four bytes of [`tie_key`], in hex: **the same connection's name at both ends**, so
+/// two ends' notes can be read against each other, and the tie-break each end made can be seen.
+fn conn_tag(conn: &VoxConnection) -> String {
+    tie_key(conn)[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// How long a connection displaced by a better one stays open before it is closed:
 /// long enough for anything in flight on it — a join exchange, a sync session (whose
 /// frames are bounded at 20 s) — to finish, because the peer's streams do not move.
@@ -390,9 +399,11 @@ pub struct ConnectionManager {
     /// Connections a better path displaced, with the time each may be closed. They
     /// keep serving what is already on them; nothing new is opened on them.
     retiring: Mutex<Vec<(Arc<VoxConnection>, u64)>>,
-    /// Per connection (by quinn's stable id): how many datagrams it had received when last
-    /// sampled, and when that count last moved. The evidence [`SILENCE_IS_DEATH`] reads.
-    heard: Mutex<HashMap<usize, (u64, Instant)>>,
+    /// Per connection (by [`VoxConnection::serial`]): how many datagrams it had received when
+    /// last sampled, and when that count last moved. The evidence [`SILENCE_IS_DEATH`] reads.
+    /// Not keyed by quinn's stable id, which a new connection can reuse from a freed one and
+    /// so inherit its silence.
+    heard: Mutex<HashMap<u64, (u64, Instant)>>,
     retire_grace_secs: u64,
     clock: Clock,
     /// Where [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote)s go,
@@ -492,9 +503,7 @@ impl ConnectionManager {
         let received = conn.quinn().stats().udp_rx.datagrams;
         let now = Instant::now();
         let mut heard = lock(&self.heard);
-        let entry = heard
-            .entry(conn.quinn().stable_id())
-            .or_insert((received, now));
+        let entry = heard.entry(conn.serial()).or_insert((received, now));
         if entry.0 != received {
             *entry = (received, now);
         }
@@ -609,10 +618,10 @@ impl ConnectionManager {
             }
         }
         // Forget connections that are gone, so the table is bounded by what is held.
-        let present: HashSet<usize> = peers
+        let present: HashSet<u64> = peers
             .iter()
-            .map(|(_, c)| c.quinn().stable_id())
-            .chain(retired.iter().map(|c| c.quinn().stable_id()))
+            .map(|(_, c)| c.serial())
+            .chain(retired.iter().map(|c| c.serial()))
             .collect();
         lock(&self.heard).retain(|id, _| present.contains(id));
         changed
@@ -898,8 +907,10 @@ impl ConnectionManager {
                 self.note(
                     peer,
                     format!(
-                        "a new connection replaced the one held, which was dead (silent {silent}s \
-                         or its circuit gone) and is closed"
+                        "a new connection {} replaced the one held {}, which was dead (silent \
+                         {silent}s or its circuit gone) and is closed",
+                        conn_tag(&conn),
+                        conn_tag(existing)
                     ),
                 );
             } else if is_live(existing) {
@@ -918,8 +929,11 @@ impl ConnectionManager {
                         self.note(
                             peer,
                             format!(
-                                "a new connection lost the tie-break to the one held (last heard \
-                                 {heard}s ago, {held_class:?} against {new_class:?}) and was closed"
+                                "a new connection {} lost the tie-break to the one held {} (last \
+                                 heard {heard}s ago, {held_class:?} against {new_class:?}) and was \
+                                 closed",
+                                conn_tag(&conn),
+                                conn_tag(&existing)
                             ),
                         );
                         return Filed {
@@ -933,9 +947,11 @@ impl ConnectionManager {
                     self.note(
                         peer,
                         format!(
-                            "a new connection lost the tie-break to the one held (last heard \
+                            "a new connection {} lost the tie-break to the one held {} (last heard \
                              {heard}s ago, {held_class:?} against {new_class:?}); retired, closed \
                              in {}s unless still carried",
+                            conn_tag(&retired),
+                            conn_tag(&existing),
                             self.retire_grace_secs
                         ),
                     );
@@ -945,12 +961,14 @@ impl ConnectionManager {
                     };
                 }
                 let retire_at = (self.clock)().saturating_add(self.retire_grace_secs);
-                lock(&self.retiring).push((existing, retire_at));
+                lock(&self.retiring).push((Arc::clone(&existing), retire_at));
                 self.note(
                     peer,
                     format!(
-                        "a new connection ({new_class:?}) displaced the one held (last heard \
-                         {heard}s ago, {held_class:?}); the old one is retired"
+                        "a new connection {} ({new_class:?}) displaced the one held {} (last \
+                         heard {heard}s ago, {held_class:?}); the old one is retired",
+                        conn_tag(&conn),
+                        conn_tag(&existing)
                     ),
                 );
             }
@@ -998,7 +1016,7 @@ impl ConnectionManager {
                 conn.close(WireError::AuthenticatorInvalid);
                 self.note(
                     conn.peer_id(),
-                    format!("a retired connection was closed: {why}"),
+                    format!("a retired connection {} was closed: {why}", conn_tag(conn)),
                 );
                 false
             } else {

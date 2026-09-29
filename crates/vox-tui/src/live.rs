@@ -97,7 +97,7 @@ impl LiveCore {
 
     fn send(&self, cmd: NodeCommand) -> CommandStatus {
         match self.rt.block_on(self.node.apply(cmd)) {
-            Outcome::Done => CommandStatus::Done,
+            Outcome::Done | Outcome::Bound(_) => CommandStatus::Done,
             Outcome::Failed(f) => CommandStatus::Failed(ui_error(f)),
         }
     }

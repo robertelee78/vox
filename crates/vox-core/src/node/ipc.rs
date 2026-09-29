@@ -1765,9 +1765,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     reason: format!("not a local address: {local:?}"),
                 };
             };
-            // Subscribe **before** asking, so the `Forwarding` event cannot be
-            // emitted and missed between the command and the wait.
-            let mut events = handle.subscribe();
+            // The answer names the forward this request opened. Reading it from the event
+            // stream instead took *any* forward's `Forwarding`, so two requests at once could be
+            // handed the same address (see `Outcome::Bound`).
             match handle
                 .apply(crate::node::api::NodeCommand::Forward {
                     channel_id,
@@ -1777,35 +1777,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 })
                 .await
             {
-                crate::node::api::Outcome::Done => {}
-                other => {
-                    return Frame::Error {
-                        reason: other.to_string(),
-                    }
-                }
-            }
-            let deadline = std::time::Duration::from_secs(10);
-            match tokio::time::timeout(deadline, async {
-                loop {
-                    match events.next().await {
-                        Some(EventStreamItem::Event(NodeEvent::Forwarding { local, .. })) => {
-                            return Some(local)
-                        }
-                        Some(_) => {}
-                        None => return None,
-                    }
-                }
-            })
-            .await
-            {
-                Ok(Some(bound)) => Frame::Bound {
+                crate::node::api::Outcome::Bound(bound) => Frame::Bound {
                     local: bound.to_string(),
                 },
-                Ok(None) => Frame::Error {
-                    reason: "the node stopped before the forward was bound".into(),
-                },
-                Err(_) => Frame::Error {
-                    reason: "the forward did not report a bound address".into(),
+                other => Frame::Error {
+                    reason: other.to_string(),
                 },
             }
         }
