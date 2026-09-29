@@ -11,8 +11,8 @@
 //!
 //! This is that reproduction as a proof: one host, then two `vox connect`s back to back, with
 //! no trust, no malice and no waiting in between. Both must get in, and **the host must answer
-//! them promptly**: the time each joiner spent waiting on the host — its `dial` and `exchange`
-//! steps, read from the joiner's own `join got in — …` line — is bounded, not the whole join.
+//! them promptly**: the time each joiner spent waiting on others — every step of its own
+//! `join got in — …` line but its `solve` and `seal` (V210-65) — is bounded, not the whole join.
 //!
 //! **Not the whole join** (V210-62). The whole join includes the joiner's own proof of work,
 //! which is its own CPU and random in length by design (ADR-005), and its own Argon2id. Bounded
@@ -50,31 +50,38 @@ use std::time::{Duration, Instant};
 
 use world::{echo_service, VoxProc, World};
 
-/// How long a joiner may wait **on the host** (its `dial` and `exchange` steps). Well under the
-/// 30 s handshake bound whose serialisation this proves gone, and well over the fraction of a
-/// second an answering host takes, so it separates the two shapes with room on both sides.
-const PROMPT: Duration = Duration::from_secs(12);
+/// How long a joiner may wait on **everything but its own work**: every step of its join except
+/// its proof-of-work `solve` and its local `seal` (V210-65). An answering host keeps that to tens
+/// of milliseconds (measured 10–40 ms, under load too); a deaf one holds a dial for its whole 10 s
+/// attempt. At 5 s the bound itself goes red on a host that is slow but under the dial attempt,
+/// where 12 s never could (V210-62's verifier).
+const PROMPT: Duration = Duration::from_secs(5);
 
-/// The time a joiner spent waiting on the host, from its own `join got in — …` line: the sum of
-/// its `dial` and `exchange` steps. `None` when the line is missing or names neither step, which
-/// is a proof that cannot measure, not a pass.
-fn waited_on_host(stderr: &str) -> Option<Duration> {
+/// The time a joiner spent waiting on others, from its own `join got in — …` line: every step but
+/// its `solve` and `seal`. **Every step, not only `dial` and `exchange`** (V210-65): the host
+/// serves the room's board too, so a host slow to take handshakes delayed the joiner's `board`
+/// step, which the sum left out — a mutant that held each inbound handshake 6 s waited
+/// `board 6.01s` and passed. `None` when the line is missing or lacks its `board`, `dial` or
+/// `exchange` step, which is a proof that cannot measure, not a pass.
+fn waited_on_others(stderr: &str) -> Option<Duration> {
     let line = stderr.lines().find(|l| l.contains("join got in — "))?;
     let steps = line.split("join got in — ").nth(1)?;
     let mut total = Duration::ZERO;
-    let mut seen = 0;
+    let (mut board, mut dial, mut exchange) = (false, false, false);
     for step in steps.split(", ") {
         let Some((name, secs)) = step.rsplit_once(' ') else {
             continue;
         };
-        if !(name.ends_with(": dial") || name.ends_with(": exchange")) {
+        if name.ends_with(": solve") || name == "seal" {
             continue;
         }
+        board |= name == "board";
+        dial |= name.ends_with(": dial");
+        exchange |= name.ends_with(": exchange");
         let secs: f64 = secs.strip_suffix('s')?.parse().ok()?;
         total += Duration::from_secs_f64(secs);
-        seen += 1;
     }
-    (seen >= 2).then_some(total)
+    (board && dial && exchange).then_some(total)
 }
 
 #[test]
@@ -115,18 +122,23 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
         "a third joiner straight after the second must get in; after {t3:?}:\n\
          stdout:\n{out3}\nstderr:\n{err3}"
     );
-    let (Some(h2), Some(h3)) = (waited_on_host(&err2), waited_on_host(&err3)) else {
+    let (Some(h2), Some(h3)) = (waited_on_others(&err2), waited_on_others(&err3)) else {
         panic!(
-            "CANNOT MEASURE: a joiner did not say its dial and exchange steps\n---- the second \
+            "CANNOT MEASURE: a joiner did not say its board, dial and exchange steps\n---- the second \
              joiner ----\n{err2}\n---- the third joiner ----\n{err3}"
         );
     };
-    eprintln!("[test] waited on the host: second {h2:?}, third {h3:?} (bound {PROMPT:?})");
+    eprintln!("[test] waited on others: second {h2:?}, third {h3:?} (bound {PROMPT:?})");
+    for (who, err) in [("second", &err2), ("third", &err3)] {
+        if let Some(l) = err.lines().find(|l| l.contains("join got in — ")) {
+            eprintln!("[test] {who} joiner's steps: {l}");
+        }
+    }
     // A slow join says what it waited on: the joiners' own step lines, and what the host noticed.
     let host_said = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();
     assert!(
         h2 < PROMPT && h3 < PROMPT,
-        "back-to-back joiners must each wait under {PROMPT:?} on the host; they waited {h2:?} and \
+        "back-to-back joiners must each wait under {PROMPT:?} on others; they waited {h2:?} and \
          {h3:?} (whole joins {t2:?} and {t3:?})\n---- the second joiner ----\n{err2}\n---- the \
          third joiner ----\n{err3}\n---- the host ----\n{host_said}"
     );
