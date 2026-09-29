@@ -1762,6 +1762,10 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
     println!("     Ctrl-C stops the offer; the announcement stays on the log");
 
     let path = path.to_owned();
+    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
+    // lands in the same turn as another arm (see `app::run_node`).
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -1787,7 +1791,7 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
                     let _ = sock.flush().await;
                 });
             }
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut interrupted => break,
         }
     }
     println!("vox: no longer offering {tag}");
