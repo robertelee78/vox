@@ -105,6 +105,34 @@ fn published_vox() -> Option<std::path::PathBuf> {
     Some(bin)
 }
 
+/// A version that is valid and is **not** this build's: its patch number plus one. Hard-coded,
+/// it stopped being different the day the tree was at that version: on 0.2.9 a hello stamped
+/// "0.2.9" matches, coordination is rightly allowed, and the proof waited for a refusal that
+/// could not come (CI 869d8f0).
+fn another_version() -> String {
+    let mut parts = VERSION
+        .split('.')
+        .map(|p| p.parse::<u64>().expect("a numeric version"));
+    let (major, minor, patch) = (
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+    );
+    format!("{major}.{minor}.{}", patch + 1)
+}
+
+/// How a refusal names a worker's stamp: `runs vox "banana"` for one that is not a version,
+/// `runs vox 0.2.11` for another version. Matched as that phrase, never as the bare stamp: every
+/// refusal also says `required <this version>`, so a bare "0.2.9" matched any refusal on a 0.2.9
+/// tree, and the proof passed on a stale one without testing the version at all.
+fn runs(stamp: &str, is_version: bool) -> String {
+    if is_version {
+        format!("runs vox {stamp}")
+    } else {
+        format!("runs vox {stamp:?}")
+    }
+}
+
 fn refused_naming(o: &Out, who: &Worker, what: &str) {
     assert_eq!(o.code, Some(3), "a version refusal must exit 3: {o:?}");
     for needle in [&who.b32()[..12], what, &format!("required {VERSION}")] {
@@ -246,10 +274,14 @@ fn a_worker_on_another_version_is_refused_by_name() {
     assert!(o.ok, "plain conversation must never be refused: {o:?}");
 
     // ---- (2) unknown, then different ----
-    for (stamp, named) in [("banana", "banana"), ("0.2.9", "0.2.9")] {
+    let other = another_version();
+    for (stamp, named) in [
+        ("banana".to_owned(), runs("banana", false)),
+        (other.clone(), runs(&other, true)),
+    ] {
         let hello = serde_json::json!({
             "v": 1, "type": "hello", "from": "b-foreign", "body": "a foreign worker",
-            "data": { "vox": stamp, "op": format!("op-foreign-{}", stamp.replace('.', "-")) }
+            "data": { "vox": &stamp, "op": format!("op-foreign-{}", stamp.replace('.', "-")) }
         })
         .to_string();
         rt.block_on(post_raw(bob, room.cid, &hello));
@@ -258,9 +290,9 @@ fn a_worker_on_another_version_is_refused_by_name() {
             Some("a1"),
             "alice to see the foreign stamp",
             &["room", "claim", r, "new-work"],
-            |o: &Out| o.code == Some(3) && o.stderr.contains(named),
+            |o: &Out| o.code == Some(3) && o.stderr.contains(&named),
         );
-        refused_naming(&o, bob, named);
+        refused_naming(&o, bob, &named);
     }
 
     // ---- (5) recovery: the stale worker runs the current binary ----
