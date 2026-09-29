@@ -1325,7 +1325,7 @@ impl NodeNet {
             endpoints,
             seq,
             now,
-            crate::nat::store::MAX_TTL_SECS,
+            crate::nat::store::own_record_ttl_secs(),
         )?;
         let bundle = MemberBundleRecord::build(
             signer,

@@ -1956,6 +1956,9 @@ pub struct Node {
     /// long-running node by itself: it is re-requested at half its lifetime, the
     /// interval RFC 6887 §11.2.1 recommends.
     renew_mappings_at: Option<u64>,
+    /// When each open room's own records are next renewed on this node's board and its anchors
+    /// (V210-68, #258): half their lifetime after the last round that signed them.
+    records_renew_at: BTreeMap<Digest32, u64>,
     /// ADR-025's sync ports, one per `(room, peer)`: see `node::ports`.
     ports: BTreeMap<(Digest32, Digest32), crate::node::ports::Port>,
     /// Ports waiting for an outbound slot (ADR-025 D6).
@@ -2250,6 +2253,7 @@ impl Node {
             anchors_up: BTreeSet::new(),
             sync_dials: BTreeSet::new(),
             renew_mappings_at: None,
+            records_renew_at: BTreeMap::new(),
             ports: BTreeMap::new(),
             port_queue: crate::node::ports::Queue::default(),
             slots: Arc::new(std::sync::Mutex::new(crate::node::ports::Slots::default())),
@@ -2452,6 +2456,7 @@ impl Node {
                     }
                     self.retry_upgrades_if_due().await;
                     self.renew_mappings_if_due();
+                    self.renew_records_if_due().await;
                     self.adopt_anchored_from_board().await;
                     self.redial_anchors_if_due();
                     // A rotation's re-keys go out as the remaining consenters become
@@ -2898,6 +2903,7 @@ impl Node {
         let Ok((address, bundle)) = records else {
             return;
         };
+        self.arm_record_renewal(channel_id);
         // **Bounded, and it stops at the first dead stream.** Each put waits for the board's answer,
         // which a live board gives in milliseconds, but a connection that died without saying so waits
         // out the full frame patience (`SYNC_FRAME_TIMEOUT`, 20s) *per put*, and every one of those
@@ -3488,6 +3494,8 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
+        // Armed before the round rather than after it: the records are signed below.
+        self.arm_record_renewal(channel_id);
         let seq = self.next_record_seq(channel_id);
         let stamp = self.record_timestamp(channel_id);
         let Some(profile) = self.profile.as_ref() else {
@@ -5705,6 +5713,44 @@ impl Node {
     /// The re-request runs on its own task (it talks to a gateway) and lands back as
     /// [`NetEvent::AddressesDiscovered`], which republishes the address records too —
     /// a renewal that came back with a *different* external port must be advertised.
+    /// Renew each open room's own records when half their lifetime has passed (V210-68, #258).
+    ///
+    /// A node's address record lives two hours on a board ([`crate::nat::store::MAX_TTL_SECS`]),
+    /// and nothing renewed it on a schedule: a round went out only when something happened (the
+    /// room opened, a join, a board learned news, a sync applied a governance entry). Until #179 a
+    /// round also went out after every sync that brought messages, which renewed it by accident;
+    /// an idle room lost its record after two hours either way, and then a joiner or a restarted
+    /// member that finds this node through the board did not find it. So, whatever the traffic,
+    /// a round goes out at half the lifetime: to this node's own board and every anchor. It is
+    /// armed by every round that signs the records ([`Self::arm_record_renewal`]), so a node that
+    /// published for another reason is not asked again sooner: at most one renewal per room per
+    /// half-lifetime.
+    async fn renew_records_if_due(&mut self) {
+        let now = self.now();
+        let due: Vec<Digest32> = self
+            .records_renew_at
+            .iter()
+            .filter(|(room, at)| **at <= now && self.channels.contains_key(*room))
+            .map(|(room, _)| *room)
+            .collect();
+        for room in due {
+            self.records_renew_at.remove(&room);
+            self.publish_channel_locally(&room).await;
+            self.publish_channel_to_anchors(&room).await;
+        }
+        // A room closed since it was armed is not renewed.
+        let open = &self.channels;
+        self.records_renew_at
+            .retain(|room, _| open.contains_key(room));
+    }
+
+    /// Arm `room`'s next renewal at half its records' lifetime from now.
+    fn arm_record_renewal(&mut self, room: &Digest32) {
+        let half = crate::nat::store::own_record_ttl_secs() / 2;
+        self.records_renew_at
+            .insert(*room, self.now().saturating_add(half.max(1)));
+    }
+
     fn renew_mappings_if_due(&mut self) {
         let Some(due) = self.renew_mappings_at else {
             return;
