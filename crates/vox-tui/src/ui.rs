@@ -14,7 +14,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::state::{Focus, Mode, Prompt, Screen, UiState};
@@ -59,11 +59,11 @@ fn reachability_label(r: Reachability) -> &'static str {
     }
 }
 
-fn sync_label(s: SyncStatus) -> &'static str {
+fn sync_label(s: SyncStatus) -> String {
     match s {
-        SyncStatus::Idle => "idle",
-        SyncStatus::Syncing => "syncing…",
-        SyncStatus::Synced => "synced",
+        SyncStatus::Idle => "idle — no peer connected".to_owned(),
+        SyncStatus::Connected(1) => "connected to 1 peer".to_owned(),
+        SyncStatus::Connected(n) => format!("connected to {n} peers"),
     }
 }
 
@@ -163,6 +163,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
         body[0],
         &channel.held_back,
         channel.timeline.as_slice(),
+        ui.timeline_scroll,
         focused(ui, Focus::Timeline),
     );
     render_composer(frame, body[1], &ui.composer, focused(ui, Focus::Composer));
@@ -184,6 +185,7 @@ fn render_timeline(
     area: Rect,
     held_back: &[String],
     timeline: &[MessageView],
+    scroll: usize,
     focus: bool,
 ) {
     // Who this room holds back for equivocating comes first, one line each (V210-66).
@@ -208,10 +210,58 @@ fn render_timeline(
             ])
         }))
         .collect();
-    let p = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(pane_block("Timeline", focus));
+    // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
+    // top, a room that outgrew the pane hid every new message below its bottom edge. The lines
+    // are wrapped here, not by the widget, so the count the window is taken from is the count
+    // drawn; only as many as the window reaches back are.
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let height = usize::from(area.height.saturating_sub(2));
+    let want = height.saturating_add(scroll);
+    let mut rows: Vec<Line> = Vec::new();
+    for l in lines.into_iter().rev() {
+        rows.extend(wrap(l, width).into_iter().rev());
+        if rows.len() >= want {
+            break;
+        }
+    }
+    rows.reverse();
+    let bottom = rows
+        .len()
+        .saturating_sub(scroll.min(rows.len().saturating_sub(height)));
+    let shown: Vec<Line> = rows[bottom.saturating_sub(height)..bottom].to_vec();
+    let title = if scroll > 0 && rows.len() > height {
+        "Timeline (scrolled — End: newest)"
+    } else {
+        "Timeline"
+    };
+    let p = Paragraph::new(shown).block(pane_block(title, focus));
     frame.render_widget(p, area);
+}
+
+/// `line` broken into rows of at most `width` display columns, its styles kept.
+fn wrap(line: Line<'_>, width: usize) -> Vec<Line<'_>> {
+    let mut rows = Vec::new();
+    let mut row = Line::default();
+    let mut used = 0;
+    for span in line.spans {
+        let mut piece = String::new();
+        for ch in span.content.chars() {
+            let w = Span::raw(&*ch.encode_utf8(&mut [0; 4])).width();
+            if used + w > width && used > 0 {
+                row.spans
+                    .push(Span::styled(std::mem::take(&mut piece), span.style));
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            piece.push(ch);
+            used += w;
+        }
+        if !piece.is_empty() {
+            row.spans.push(Span::styled(piece, span.style));
+        }
+    }
+    rows.push(row);
+    rows
 }
 
 fn render_composer(frame: &mut Frame, area: Rect, text: &str, focus: bool) {
@@ -230,14 +280,18 @@ fn render_members(
     frame: &mut Frame,
     area: Rect,
     members: &[MemberView],
-    selected: usize,
+    selected: Option<vox_core::hash::Digest32>,
     focus: bool,
 ) {
     let items: Vec<ListItem> = members
         .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let marker = if i == selected && focus { "▶ " } else { "  " };
+        .map(|m| {
+            // The marker is on the member a command would act on: the same identity (V210-82).
+            let marker = if selected == Some(m.id) && focus {
+                "▶ "
+            } else {
+                "  "
+            };
             // Always glyph + label, never colour-only (a11y).
             ListItem::new(vec![
                 Line::from(format!("{marker}{}", m.nickname)),
@@ -290,7 +344,7 @@ fn render_hint_bar(frame: &mut Frame, area: Rect, ui: &UiState, vm: &ViewModel) 
             " ↑/↓ select · Enter open · :new <name> · :join · :unlock · :lock · Ctrl-C quit"
         }
         Screen::Channel => {
-            " Tab switch pane · Enter send · :invite · :consent grant · : command · Esc back"
+            " Tab switch pane · Enter send · PgUp/PgDn scroll · :invite · :consent grant · : command · Esc back"
         }
     };
     frame.render_widget(Paragraph::new(hint), area);

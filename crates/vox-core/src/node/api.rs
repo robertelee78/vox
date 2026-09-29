@@ -80,6 +80,9 @@ pub struct ChannelDetail {
     /// The members this node holds back for equivocating in this room (V210-63): each
     /// `(author, seq)` at which two different messages signed by that author were seen.
     pub equivocations: Vec<(Digest32, u64)>,
+    /// Who this identity consents to reading it here (ADR-007), in fingerprint order. Read off
+    /// the log, so a revocation takes one out; what a client shows as consent (V210-82).
+    pub consented: Vec<Digest32>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -122,6 +125,9 @@ pub struct NodeView {
     /// is an anchor doing nothing at all, and without this nobody could see that from
     /// outside — which is how one sat wedged for an hour looking healthy.
     pub connected: usize,
+    /// Those peers, in fingerprint order: which of a room's members this node reaches now
+    /// (V210-82).
+    pub connected_peers: Vec<Digest32>,
     /// Every channel this node's **board** holds a genesis for — the channels it
     /// anchors, whether or not it is a member — in channelID order. What an anchor
     /// can say about itself: which rooms it serves and how many members it knows of

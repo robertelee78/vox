@@ -2321,6 +2321,13 @@ impl ChannelState {
             .contains(target)
     }
 
+    /// Everyone this identity consents to reading it here, off the log like
+    /// [`has_consented`](Self::has_consented).
+    #[must_use]
+    pub fn consented(&self) -> BTreeSet<Digest32> {
+        MembershipView::new(&self.evaluator).readers_of(&self.me())
+    }
+
     /// The admitted authors in `trusted` this identity has **not yet consented
     /// to** — who auto-consent still owes a first key release (ADR-020 §3).
     ///
