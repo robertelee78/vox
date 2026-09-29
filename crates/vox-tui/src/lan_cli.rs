@@ -309,6 +309,17 @@ mod mac {
             SendFlags::empty(),
         )
         .map_err(|e| format!("handing over {name}: {e}"))?;
+        // Keep our copy until `vox lan up` has taken its own, which it shows by closing
+        // the connection. A descriptor whose only reference is a message in flight is,
+        // to macOS's collector for such descriptors (run whenever any local socket is
+        // freed, as this connection is next), unreachable: it flushes the socket's
+        // receive side for good, and the interface is deaf to everything the machine
+        // sends into it while still able to deliver out of it.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .map_err(|e| e.to_string())?;
+        let _ = std::io::Read::read(&mut &*stream, &mut [0u8; 1]);
+        drop(fd);
         Ok(format!("{name} for uid {uid}: {}", done.join("; ")))
     }
 
