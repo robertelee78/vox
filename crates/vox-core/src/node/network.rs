@@ -423,6 +423,21 @@ impl NodeNet {
         self.service.on_admitted(hook);
     }
 
+    /// Keep a board for any room a peer gives this node the genesis of — an anchor's job,
+    /// and no other node's. Set before this is shared, like [`Self::on_board_growth`]; see
+    /// [`crate::nat::service::RendezvousService::serve_any_room`].
+    pub fn serve_any_room(&mut self, on: bool) {
+        self.service.serve_any_room(on);
+    }
+
+    /// Drop every expired record from this node's board. The store bounds its buckets by
+    /// pruning when one fills, but a board nobody publishes to again kept every record it
+    /// ever took, served nothing from them and freed nothing (V210-70); the tick calls this.
+    pub fn prune_board(&self) -> usize {
+        let now = self.now();
+        lock(self.service.store()).prune_expired(now)
+    }
+
     /// The connection manager (one connection per peer).
     #[must_use]
     pub fn manager(&self) -> &Arc<ConnectionManager> {
@@ -625,6 +640,58 @@ impl NodeNet {
         })
     }
 
+    /// Whether this node will carry a relay — a coord session or a circuit — between `a` and
+    /// `b`: a configured anchor on either end (an anchor introduces whoever it carries), or a
+    /// room this node holds or anchors that **both** belong to (V210-70).
+    ///
+    /// Being classed a member was enough, and a member of *any* room this node serves is a
+    /// member: a peer in one room could have this node open a circuit to, or coordinate a hole
+    /// punch with, a member of another it had no business reaching — learning that member's
+    /// address and steering its dials. On an anchor that is anybody, since an anchor keeps a
+    /// board for any room a peer gives it. A relay is for reaching somebody in a room you share.
+    #[must_use]
+    pub fn relays_between(&self, a: &Digest32, b: &Digest32) -> bool {
+        if self.classify(a) == PeerClass::Anchor || self.classify(b) == PeerClass::Anchor {
+            return true;
+        }
+        let of_a = self.rooms_of(a);
+        self.rooms_of(b).iter().any(|room| of_a.contains(room))
+    }
+
+    /// The rooms this node holds or anchors that `peer` is known in: as an admitted member,
+    /// the creator a genesis on the board names, the author of a live member record, or a
+    /// joiner with a live pre-join.
+    fn rooms_of(&self, peer: &Digest32) -> std::collections::BTreeSet<Digest32> {
+        use crate::nat::service::MembershipOracle as _;
+        let mut rooms: std::collections::BTreeSet<Digest32> = self
+            .membership
+            .channels()
+            .into_iter()
+            .filter(|(cid, epoch)| self.membership.member_key(cid, *epoch, peer).is_some())
+            .map(|(cid, _)| cid)
+            .collect();
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        for cid in guard.channels_with_genesis() {
+            let known = guard
+                .genesis(&cid)
+                .is_some_and(|g| g.body.creator_pubkey.fingerprint() == *peer)
+                || guard
+                    .current_members(&cid, 0, now)
+                    .iter()
+                    .any(|r| r.author_id == *peer)
+                || guard
+                    .current_prejoins(&cid, now)
+                    .iter()
+                    .any(|r| r.asserted_id() == *peer);
+            if known {
+                rooms.insert(cid);
+            }
+        }
+        rooms
+    }
+
     /// [`NodeNet::accept_stream`] against an explicit policy snapshot (for callers
     /// that maintain their own view; the node uses [`NodeNet::accept_stream`]).
     pub async fn accept_stream_with(
@@ -680,6 +747,7 @@ impl NodeNet {
                     peer,
                     observed,
                     &|p| self.classify(p),
+                    &|a, b| self.relays_between(a, b),
                     send,
                     recv,
                     move |p| manager.existing(p),
@@ -704,6 +772,7 @@ impl NodeNet {
                 circuitstream::serve_circuit(
                     conn,
                     &|p| self.classify(p),
+                    &|a, b| self.relays_between(a, b),
                     send,
                     recv,
                     move |p| manager.existing(p),
@@ -1221,11 +1290,14 @@ impl NodeNet {
     /// **Bundles first, and the order is load-bearing — do not sort or merge these.**
     ///
     /// On an anchor, a newcomer's *address* record has no way in on its own: the
-    /// `MemberRecord` arm of `RendezvousService::put` has no vouch fallback, so it is
+    /// `MemberRecord` arm of `RendezvousService::put` has no witness fallback, so it is
     /// refused outright unless the anchor can already resolve the author's key. The
     /// *bundle* arm does have one, and a bundle carries the author's key. So a member
     /// mirroring a newcomer onward gets the address record admitted only because the
-    /// vouched bundle went up first and taught the board that key.
+    /// witnessed bundle went up first and taught the board that key.
+    ///
+    /// Among the bundles, **a witness before the members it witnessed** (`chain_order`):
+    /// a board takes a joiner's bundle only once it knows the key that signed its witness.
     ///
     /// Reverse these two, collect them into one sorted vector, or emit them
     /// concurrently, and every mirrored address record is silently refused — the
@@ -1237,9 +1309,10 @@ impl NodeNet {
         let me = self.local_id();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
-        // 1. Bundles, which carry the author's key and can be vouched for.
-        let mut out: Vec<Vec<u8>> = guard
-            .current_bundles(channel_id, epoch, now)
+        // 1. Bundles, which carry the author's key and the evidence it belongs here.
+        let mut bundles = guard.current_bundles(channel_id, epoch, now);
+        bundles.sort_by_key(|r| chain_order(r));
+        let mut out: Vec<Vec<u8>> = bundles
             .into_iter()
             .filter(|r| r.author_id != me)
             .map(MemberBundleRecord::to_wire)
@@ -1274,8 +1347,9 @@ impl NodeNet {
             peer.members.iter().map(|m| m.author_id).collect();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut out: Vec<Vec<u8>> = guard
-            .current_bundles(channel_id, epoch, now)
+        let mut bundles = guard.current_bundles(channel_id, epoch, now);
+        bundles.sort_by_key(|r| chain_order(r));
+        let mut out: Vec<Vec<u8>> = bundles
             .into_iter()
             .filter(|r| !has_bundle.contains(&r.author_id))
             .map(MemberBundleRecord::to_wire)
@@ -1299,8 +1373,8 @@ impl NodeNet {
         // A local publish: this node is its own publisher, and it is a member of
         // every channel it publishes to.
         let me = self.local_id();
-        let responses = self.service.handle(
-            Some(&me),
+        let responses = self.service.handle_local(
+            &me,
             &RendezvousRequest::Put {
                 record: record.to_vec(),
             },
@@ -1312,6 +1386,31 @@ impl NodeNet {
             }
             _ => Err(crate::error::Error::MalformedRendezvous(
                 "local publish: unexpected response",
+            )),
+        }
+    }
+
+    /// Put back on this node's board the genesis of a room it **anchors** but does not hold.
+    /// Unlike [`Self::publish_local`] it is not pinned: an anchor keeps a board for any room a
+    /// peer brings it, so the rooms it anchors are rooms strangers can bring, and they stay
+    /// inside the bound on geneses taken from peers (`nat::store::MAX_GENESIS_CHANNELS`) across
+    /// a restart as they were before it.
+    pub fn publish_anchored(&self, genesis: &[u8]) -> Result<()> {
+        use crate::nat::service::{RendezvousRequest, RendezvousResponse};
+        let me = self.local_id();
+        let responses = self.service.handle(
+            Some(&me),
+            &RendezvousRequest::Put {
+                record: genesis.to_vec(),
+            },
+        );
+        match responses.first() {
+            Some(RendezvousResponse::Accepted) => Ok(()),
+            Some(RendezvousResponse::Rejected(r)) => {
+                Err(crate::error::Error::RendezvousRejected(r.as_str()))
+            }
+            _ => Err(crate::error::Error::MalformedRendezvous(
+                "anchored publish: unexpected response",
             )),
         }
     }
@@ -1476,6 +1575,17 @@ impl NodeNet {
         let res = client.get(channel_id, epoch, RecordKinds::ALL).await;
         client.finish();
         res
+    }
+}
+
+/// Where a bundle record goes in a batch sent to a board: the creator first, then each
+/// joiner by the time it was witnessed. A member can only witness after it joined, so this
+/// puts every witness ahead of the members it admitted, and a board that takes a bundle only
+/// on a witness it can already check (V210-70) takes a whole batch in one pass.
+fn chain_order(record: &MemberBundleRecord) -> (u8, u64) {
+    match record.admission.witness() {
+        None => (0, 0),
+        Some(w) => (1, w.timestamp),
     }
 }
 
