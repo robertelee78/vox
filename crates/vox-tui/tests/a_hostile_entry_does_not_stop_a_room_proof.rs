@@ -23,8 +23,9 @@
 //! its position with nothing: never logged, never rendered, never asked for again. Staging: Bob is
 //! stopped (SIGSTOP), Alice posts, Mallory gets it; Alice is stopped and Bob resumed, so Bob's only
 //! copy is Mallory's. Asserted:
-//! 1. Bob refused Mallory's copy (else CANNOT MEASURE: he never got it from her);
-//! 2. once Alice is back, Bob reads her post;
+//! 1. Bob reads Alice's posts, the first one included (Mallory may serve that one too);
+//! 2. once Alice is back, Bob reads the post he first got from Mallory, and he refused her copy
+//!    (precondition, else CANNOT MEASURE: Bob had a session with Mallory while Alice was stopped);
 //! 3. and still does after his daemon restarts.
 //!
 //! ## A message lost before V210-73 is reported ([`a_message_lost_to_the_old_row_ids_is_reported`])
@@ -154,13 +155,9 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
         bob.status(),
         bob_d.transcript()
     );
-    assert!(
-        refused >= 1,
-        "CANNOT MEASURE: bob never refused mallory's entry (it never reached him)\nbob's status: {}",
-        bob.status()
-    );
     // A refusal is not a failed session: before, it ended bob's session with the refusal as its
-    // reason and poisoned the room's sync until a reopen. The reason is hard-coded here.
+    // reason and poisoned the room's sync until a reopen, and alice's post came only when she
+    // pushed it again. The reason is hard-coded here.
     let poisoned: Vec<String> = failures(&bob.status())
         .into_iter()
         .filter(|f| f.contains("neither a group message nor a governance struct"))
@@ -168,6 +165,11 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
     assert!(
         poisoned.is_empty(),
         "mallory's unclassifiable entry failed bob's sync sessions: {poisoned:?}"
+    );
+    assert!(
+        refused >= 1,
+        "CANNOT MEASURE: bob never refused mallory's entry (it never reached him)\nbob's status: {}",
+        bob.status()
     );
 
     // ---- bob restarts: the room is held again, whole, and nothing hostile was stored --------
@@ -216,11 +218,22 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     let warm = "alice, while everyone is up";
     alice.post(&room, warm);
     assert!(
-        arrives(&bob, &room, warm).is_some() && arrives(&mallory, &room, warm).is_some(),
-        "CANNOT MEASURE: alice's first post did not reach both, before anything was stopped"
+        arrives(&mallory, &room, warm).is_some(),
+        "CANNOT MEASURE: alice's first post never reached mallory"
+    );
+    // Not a precondition: bob may take this one from mallory too, stripped.
+    assert!(
+        arrives(&bob, &room, warm).is_some(),
+        "bob never read alice's first post: he holds an empty copy\nbob's status: {}",
+        bob.status()
     );
 
     // ---- bob's only copy of alice's post is mallory's --------------------------------------
+    let sessions = |m: &Member| {
+        let st = bob.status();
+        counter(&st, "opened", Some(&m.fp)) + counter(&st, "admitted", Some(&m.fp))
+    };
+    let with_mallory = sessions(&mallory);
     bob_d.signal("-STOP");
     let post = "alice, while bob was away";
     alice.post(&room, post);
@@ -232,15 +245,15 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
         "CANNOT MEASURE: mallory never had alice's post, so bob could not get it from her"
     );
     let refused = refused_by(&bob, Some(&mallory));
+    let served = sessions(&mallory).saturating_sub(with_mallory);
     assert!(
         announced(&mallory_d, MODE),
         "CANNOT MEASURE: mallory's daemon never announced {MODE:?}:\n{}",
         mallory_d.transcript()
     );
     assert!(
-        refused >= 1,
-        "CANNOT MEASURE: bob never refused a stripped entry from mallory (he never got one)\n\
-         bob's status: {}",
+        served >= 1,
+        "CANNOT MEASURE: bob had no session with mallory while alice was stopped\nbob's status: {}",
         bob.status()
     );
 
@@ -250,9 +263,13 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     println!("[proof] stripped: bob refused {refused} entr(ies) from mallory; alice's post reached him: {took:?}");
     assert!(
         took.is_some(),
-        "bob never read alice's post after refusing mallory's stripped copy: he holds an empty \
-         one\nbob's status: {}",
+        "bob never read alice's post after mallory served it stripped: he holds an empty one\n\
+         bob's status: {}",
         bob.status()
+    );
+    assert!(
+        refused >= 1,
+        "bob had {served} session(s) with mallory while alice was stopped and refused nothing"
     );
     drop(bob_d);
     let _bob_d = bob.daemon(Some(&spec));
