@@ -307,6 +307,26 @@ impl OriginKeyStore {
         out
     }
 
+    /// The oldest generation `author` minted for `(channel_id, epoch)` that was created at or
+    /// after `cutoff` (Unix seconds); `None` when every retained one is older. What a bounded
+    /// hold (PRD-001 R14) keeps from.
+    #[must_use]
+    pub fn oldest_created_since(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+        author: &Digest32,
+        cutoff: u64,
+    ) -> Option<u64> {
+        self.records
+            .iter()
+            .filter(|((c, e, _), r)| {
+                c == channel_id && *e == epoch && &r.author_id == author && r.created_at >= cutoff
+            })
+            .map(|((_, _, chain_id), _)| *chain_id)
+            .min()
+    }
+
     /// Derive the chain key at `iteration` for a retained generation by ratcheting
     /// the origin forward (one-way; cannot go backward). Bounded by
     /// [`MAX_SKIP`] iterations of derivation to avoid an unbounded loop on a

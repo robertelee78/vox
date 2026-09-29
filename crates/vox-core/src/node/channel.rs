@@ -213,6 +213,11 @@ const MARKS_VERSION: u64 = 2;
 /// A trust mark: the decision's stamp, and where this identity's sender key stood at it.
 type TrustMark = (Stamp, u64, u64);
 
+/// How long a superseded generation of this identity's sender key is kept for a trusted
+/// identity that has not joined, in a room kept forever (PRD-001 R14): 30 days. A room with a
+/// retention keeps it for that instead ([`ChannelState::unjoined_hold_secs`]).
+pub const UNJOINED_HOLD_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// At-rest version of the delivery-ledger segment.
 const DELIVERED_VERSION: u64 = 1;
 /// Services encoding version.
@@ -2277,23 +2282,59 @@ impl ChannelState {
     /// one this identity has not consented to yet — whether or not it has joined — the first
     /// one for a trusted identity with no mark here (trusted before the room existed), and
     /// every history floor still owed. `None`: nothing older than the live one is needed.
+    ///
+    /// **What is kept for someone who has not joined is kept for a while, not forever** (PRD-001
+    /// R14, decider 2026-09-28): for the room's retention when it has one, otherwise
+    /// [`UNJOINED_HOLD_SECS`]. A generation created before `now_secs` less that hold goes even
+    /// though a trusted identity never came to collect it; one that joins later reads what is
+    /// still held. History floors owed to members who have joined are not bounded here.
     #[must_use]
-    pub fn oldest_generation_needed(&self, trusted: &BTreeSet<Digest32>) -> Option<u64> {
+    pub fn oldest_generation_needed(
+        &self,
+        trusted: &BTreeSet<Digest32>,
+        now_secs: u64,
+    ) -> Option<u64> {
         let me = self.me();
+        let unjoined = |id: &Digest32| *id != me && !self.entitled.contains_key(id);
         // A trusted identity with **no mark here** was trusted before this room existed, so every
-        // generation of the room is after its decision and all of them are its (`history_plan`):
-        // nothing may go until it is consented to.
-        if trusted.iter().any(|id| {
-            *id != me && !self.entitled.contains_key(id) && !self.trust_marks.contains_key(id)
-        }) {
-            return Some(0);
-        }
-        let pending = self
-            .trust_marks
+        // generation of the room is after its decision and all of them are its (`history_plan`).
+        let waiting = if trusted
             .iter()
-            .filter(|(id, _)| trusted.contains(*id) && !self.entitled.contains_key(*id))
-            .map(|(_, (_, chain_id, _))| *chain_id);
-        pending.chain(self.history.values().copied()).min()
+            .any(|id| unjoined(id) && !self.trust_marks.contains_key(id))
+        {
+            Some(0)
+        } else {
+            self.trust_marks
+                .iter()
+                .filter(|(id, _)| trusted.contains(*id) && unjoined(id))
+                .map(|(_, (_, chain_id, _))| *chain_id)
+                .min()
+        };
+        // The hold: nothing older than it is kept for a waiting identity. No generation inside it
+        // means none is kept for them at all.
+        let waiting = waiting.map(|floor| {
+            let cutoff = now_secs.saturating_sub(self.unjoined_hold_secs());
+            let young = self
+                .origins
+                .oldest_created_since(&self.channel_id, self.epoch, &me, cutoff)
+                .unwrap_or(u64::MAX);
+            floor.max(young)
+        });
+        waiting
+            .into_iter()
+            .chain(self.history.values().copied())
+            .min()
+    }
+
+    /// How long a superseded generation is kept for a trusted identity that has not joined:
+    /// the retention this node applies to the room, or [`UNJOINED_HOLD_SECS`] when that is
+    /// forever. A message past retention is gone, so the key to it has nothing left to open.
+    #[must_use]
+    pub fn unjoined_hold_secs(&self) -> u64 {
+        match self.effective_retention() {
+            0 => UNJOINED_HOLD_SECS,
+            secs => secs,
+        }
     }
 
     /// Delete every superseded generation's origin key (ADR-023 decision 4, PRD-001
