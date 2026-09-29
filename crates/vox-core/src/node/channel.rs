@@ -470,6 +470,10 @@ pub struct ChannelState {
     next_log_id: u64,
     /// Stored entries set aside when the room opened (V210-74): each as `author#seq: why`.
     set_aside: Vec<String>,
+    /// A receiver chain advanced in memory since the chains were last written (V210-74): a decrypt
+    /// uses its message key up even when what it opened does not render, so a pass that rendered
+    /// nothing must write the chains too, or a restart could derive that key again.
+    chains_advanced: bool,
     timeline: Vec<Rendered>,
     /// Accepted governance entries (consent grants and the rest) in acceptance
     /// order — the evaluator's input, rebuilt from the log on open (M14.5).
@@ -1132,6 +1136,7 @@ impl ChannelState {
             sender,
             next_log_id: 1,
             set_aside: Vec::new(),
+            chains_advanced: false,
             timeline: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
@@ -1501,6 +1506,7 @@ impl ChannelState {
             sender,
             next_log_id,
             set_aside,
+            chains_advanced: false,
             timeline,
             gov_entries,
             receivers,
@@ -1730,6 +1736,7 @@ impl ChannelState {
             sender,
             next_log_id: 1,
             set_aside: Vec::new(),
+            chains_advanced: false,
             timeline: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
@@ -3134,7 +3141,7 @@ impl ChannelState {
         let committed = match write_failed {
             Some(e) => Err(e),
             None => (|| -> Result<()> {
-                if !rendered_rows.is_empty() {
+                if !rendered_rows.is_empty() || self.chains_advanced {
                     self.queue_receivers(&mut batch)?;
                 }
                 batch.commit()
@@ -3144,6 +3151,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        self.chains_advanced = false;
         // Only now, after the commit: `SessionRoom::apply` reports `stored` from the generation,
         // and ADR-025 credits the peer from it, so it must count exactly the rows now durable —
         // none when the write failed (the room is poisoned above), and a refused pass's rows too.
@@ -3290,7 +3298,7 @@ impl ChannelState {
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
             rows = self.backfill_newly_readable_into(&mut batch, could_read, &BTreeSet::new())?;
-            if rows.is_empty() {
+            if rows.is_empty() && !self.chains_advanced {
                 return Ok(());
             }
             self.queue_receivers(&mut batch)?;
@@ -3300,6 +3308,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        self.chains_advanced = false;
         let rendered = rows.len();
         self.timeline.extend(rows);
         Ok(rendered)
@@ -3333,7 +3342,7 @@ impl ChannelState {
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
             rows = self.backfill_into(&mut batch, author, &BTreeSet::new())?;
-            if rows.is_empty() {
+            if rows.is_empty() && !self.chains_advanced {
                 return Ok(());
             }
             self.queue_receivers(&mut batch)?;
@@ -3343,6 +3352,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        self.chains_advanced = false;
         let rendered = rows.len();
         self.timeline.extend(rows);
         Ok(rendered)
@@ -3453,6 +3463,7 @@ impl ChannelState {
             Ok(p) => Zeroizing::new(p),
             Err(_) => return Ok(None),
         };
+        self.chains_advanced = true;
         // **Skipped, not propagated** — matching the three `Ok(false)` paths above it.
         //
         // An entry this node cannot render is one entry it cannot show, and every other reason for
