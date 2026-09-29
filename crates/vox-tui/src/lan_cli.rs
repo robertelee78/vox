@@ -92,6 +92,8 @@ impl DeviceRequest {
         Ok(Self { v4, v6 })
     }
 
+    /// Only the macOS helper configures an interface from it.
+    #[cfg(target_os = "macos")]
     fn subnet_v4(&self) -> Option<String> {
         self.v4.map(|a| {
             let o = a.octets();
@@ -99,6 +101,8 @@ impl DeviceRequest {
         })
     }
 
+    /// Only the macOS helper configures an interface from it.
+    #[cfg(target_os = "macos")]
     fn prefix_v6(&self) -> String {
         let mut o = self.v6.octets();
         o[8..].fill(0);
