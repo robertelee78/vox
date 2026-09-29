@@ -271,9 +271,18 @@ pub async fn serve(
 
 /// Ask the node listening on `path` for its status, as JSON.
 ///
+/// **Bounded by [`ANSWER_WITHIN`](crate::node::ipc::ANSWER_WITHIN)** (V210-83): a suspended node's
+/// socket still accepts, and `vox status` against one waited for ever.
+///
 /// # Errors
-/// If the node cannot be reached or answers something else.
+/// If the node cannot be reached, does not answer in time, or answers something else.
 pub async fn request(path: &Path) -> Result<String> {
+    tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, ask(path))
+        .await
+        .map_err(|_| crate::node::ipc::silent())?
+}
+
+async fn ask(path: &Path) -> Result<String> {
     let mut stream = UnixStream::connect(path).await.map_err(|e| Error::Path {
         op: "connect control socket",
         detail: format!("{}: {e}", path.display()),

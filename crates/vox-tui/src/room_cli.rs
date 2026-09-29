@@ -885,7 +885,22 @@ pub async fn tail(
                 true
             }
             Ok(Some(_)) => false,
-            Ok(None) => return Ok(()), // the node stopped
+            // **The node stopping is a failure, not the end of the room** (V210-83). It exited 0
+            // here, so a supervisor restarting a tail on failure never did, and a script read a
+            // stream that had silently stopped as one that had finished.
+            Ok(None) => {
+                return Err(AppError::Usage(match last {
+                    Some(h) => format!(
+                        "the node stopped, so this tail stopped with it\n       start the node \
+                         again, then resume with `vox room tail {room} --since {}`",
+                        b32_encode(&h)
+                    ),
+                    None => format!(
+                        "the node stopped, so this tail stopped with it\n       start the node \
+                         again, then run `vox room tail {room}`"
+                    ),
+                }))
+            }
             Err(e) => return Err(AppError::Usage(e.to_string())),
         };
         if reread {
@@ -1302,7 +1317,10 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
             println!("vox: no longer offering {tag:?}; its live sessions were cut");
             Ok(())
         }
-        Ok(Frame::Error { .. }) => Err(AppError::Usage(format!("{tag:?} was not offered here"))),
+        // The node's reason, as `vox service remove` without a daemon gives it (V210-83).
+        Ok(Frame::Error { reason }) => {
+            Err(AppError::Usage(format!("cannot remove {tag:?}: {reason}")))
+        }
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }

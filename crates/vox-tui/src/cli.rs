@@ -221,7 +221,9 @@ where
     let listen = profile.listen;
     let anchors_for_body = anchors.clone();
     let outcome = rt.block_on(async move {
+        let socket = paths.socket_file();
         let node = crate::tunnel_cli::open_profile(paths, listen, anchors, &identity).await?;
+        let _control = crate::tunnel_cli::serve_control_socket(&node, socket)?;
         body(node, anchors_for_body).await
     });
     match outcome {
