@@ -268,7 +268,7 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::UnknownChannel | Fault::ChannelNotOpen => UiError::ChannelNotOpen,
         Fault::TooLong => UiError::TooLong,
         Fault::KeyringFull => UiError::KeyringFull,
-        Fault::Storage => UiError::Storage,
+        Fault::Storage | Fault::IdentityFileUnwritable => UiError::Storage,
         Fault::SealedUnreadable => UiError::SealedUnreadable,
         Fault::ShuttingDown | Fault::Internal => UiError::Internal,
         // A link that will not parse is malformed input, not a network failure.

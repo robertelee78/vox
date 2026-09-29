@@ -11,7 +11,8 @@
 //!
 //! The store is now written first and the vault last, so a failure leaves no identity; and a store
 //! with no vault beside it is moved aside (kept, renamed `store.redb.orphaned-<secs>`), never
-//! adopted. Two stagings, each a profile directory as a person could leave it:
+//! adopted; a failed attempt removes the store it made and puts back one it moved aside. Three
+//! stagings, each a profile directory as a person could leave it:
 //!
 //! 1. **The store cannot be opened** where `vox id` makes it: a directory stands at `store.redb`.
 //!    `vox id` must leave a usable identity within two tries — one that `vox id` opens again and a
@@ -19,11 +20,19 @@
 //! 2. **A leftover store**: an identity made, then its `vault.cbor` removed. `vox id` must make a
 //!    new identity that a daemon unlocks, whose ring `vox status --json` names, and the old store
 //!    must be kept aside.
+//! 3. **The vault cannot be written** (a directory stands at `vault.tmp`, so the store is written
+//!    and the vault is not): `vox id` must name the identity file, not the store, and leave
+//!    nothing behind — no store, nothing kept aside — in a fresh profile; over a leftover store it
+//!    must put that store back where it was, byte for byte. Once the obstacle is gone, `vox id`
+//!    succeeds.
 //!
-//! Mutation that must turn both red: `vox id` opens whatever stands at `store.redb` (no move
-//! aside). **On review only**: the order of the writes. No staging through the binary fails the
-//! store's first write without something already at its path, which the move aside clears; the
-//! order is what keeps any other failure there from leaving a vault behind.
+//! Mutations that must turn it red: `vox id` opens whatever stands at `store.redb` (no move
+//! aside: 1 and 2); a failed vault write reported as the store's (3); a failed attempt leaving its
+//! store behind (3).
+//!
+//! **On review only**: the order of the writes. No staging through the binary fails the store's
+//! first write without something already at its path, which the move aside clears; the order is
+//! what keeps any other failure there from leaving a vault behind.
 
 #![cfg(unix)]
 
@@ -241,4 +250,87 @@ fn an_identity_made_over_a_leftover_store_unlocks() {
         "a daemon must unlock the identity made where a vault was gone: {what}"
     );
     assert_eq!(aside, 1, "the old store must be kept aside, not deleted");
+}
+
+#[test]
+#[ignore = "real binaries and production Argon2id; the release gate runs it"]
+fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // (a) a fresh profile: the store is written, then the vault cannot be.
+    let p = Profile::new(tmp.path(), "novault");
+    std::fs::create_dir_all(p.dir().join("vault.tmp")).unwrap();
+    for attempt in 1..=2 {
+        let o = p.vox(&["id"]);
+        let store = p.dir().join("store.redb").exists();
+        let aside = p.kept_aside();
+        eprintln!(
+            "[proof] vault unwritable, vox id try {attempt}: ok={} store left {store}, kept aside \
+             {aside}: {}",
+            o.ok,
+            o.stderr.trim()
+        );
+        assert!(
+            !o.ok,
+            "CANNOT MEASURE: vox id made an identity with vault.tmp a directory"
+        );
+        assert!(
+            o.stderr.contains("identity file (vault.cbor)") && !o.stderr.contains("store"),
+            "a vault that cannot be written must be named as the identity file, not the store: {}",
+            o.stderr.trim()
+        );
+        assert!(
+            !store && aside == 0,
+            "a failed `vox id` must leave nothing behind (store left {store}, kept aside {aside})"
+        );
+    }
+    std::fs::remove_dir(p.dir().join("vault.tmp")).unwrap();
+    let o = p.vox(&["id"]);
+    let aside = p.kept_aside();
+    eprintln!(
+        "[proof] obstacle removed: vox id ok={} {}; kept aside {aside}",
+        o.ok,
+        o.stdout.trim()
+    );
+    assert!(
+        o.ok && aside == 0,
+        "the retry must make the identity and keep nothing aside"
+    );
+
+    // (b) a leftover store: a failed attempt puts it back where it was, untouched.
+    let q = Profile::new(tmp.path(), "leftover-then-fail");
+    let first = q.vox(&["id"]);
+    assert!(
+        first.ok,
+        "CANNOT MEASURE: the first vox id: {}",
+        first.stderr
+    );
+    std::fs::remove_file(q.dir().join("vault.cbor")).unwrap();
+    let before = std::fs::read(q.dir().join("store.redb")).unwrap();
+    std::fs::create_dir_all(q.dir().join("vault.tmp")).unwrap();
+    let o = q.vox(&["id"]);
+    let back = std::fs::read(q.dir().join("store.redb")).ok();
+    let aside = q.kept_aside();
+    eprintln!(
+        "[proof] leftover store, vault unwritable: ok={}; the leftover back in place: {}; kept \
+         aside {aside}",
+        o.ok,
+        back.as_deref() == Some(&before[..])
+    );
+    assert!(
+        !o.ok && back.as_deref() == Some(&before[..]) && aside == 0,
+        "a failed `vox id` must put the leftover store back where it was, byte for byte"
+    );
+    std::fs::remove_dir(q.dir().join("vault.tmp")).unwrap();
+    let o = q.vox(&["id"]);
+    let aside = q.kept_aside();
+    eprintln!(
+        "[proof] obstacle removed: vox id ok={}; kept aside {aside}",
+        o.ok
+    );
+    assert!(
+        o.ok && aside == 1,
+        "the retry must make the identity and keep the leftover store aside, once"
+    );
 }
