@@ -13,7 +13,10 @@
 //!    ending one withdrew the other while it still ran. Staged: two `room send`s of one file,
 //!    the first ended by SIGTERM, and bob collects the file whole by the second's tag. And a
 //!    get **by name** is not hidden by a newer offer that has ended: a third offer is announced
-//!    and ended, and `vox room get twin.bin` still collects the file through the second.
+//!    and ended, and `vox room get twin.bin` still collects the file through the second. The
+//!    fallback is only ever the same file from the same member: a newer `twin.bin` with other
+//!    content is offered and ended, and the get by name must fail, leave nothing, and name the
+//!    live file of that name with how to collect it exactly (by its hash).
 //! 2. **An offer is never persisted.** It was: a daemon that stopped while an offer ran came
 //!    back offering its port. Staged: alice's daemon is stopped with an offer live, and
 //!    `vox service list` reads alice's store; a `vox service add` afterwards is the control
@@ -46,8 +49,8 @@
 //! review, and the directory being `0700` is what (4) asserts.
 //!
 //! Mutations, each red for its own reason: (1) the daemon not releasing what a closed
-//! connection held, an offer's tag being its content's alone, and a get trying only the newest
-//! matching offer (the twin cases); (2) an offer over the control socket persisted; (3) the
+//! connection held, an offer's tag being its content's alone, a get trying only the newest
+//! matching offer, and a get falling back to a different file of that name (the twin cases); (2) an offer over the control socket persisted; (3) the
 //! same as (1), for the forward; (4) the old flat `<tmp>/vox-<hex>.sock` fallback; (5) the
 //! client's owner check removed; (6) the accept loop returning on its first error; (7) the rc
 //! written `0644` over the path; (8) `--passphrase` accepted.
@@ -536,6 +539,59 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         ok && collected.as_deref() == Some(&twin_bytes[..]),
         "a get by name failed on the newest offer, which had ended, although an older offer of \
          the same file was still served: {stdout} {stderr}"
+    );
+
+    // ---- (1d) the negative control: a different file of the same name is never the fallback ----
+    // A newer `twin.bin` with other content is offered and ended. The only live offer by that
+    // name is then the older one, which is a different file: the get by name must fail, leave
+    // nothing behind, and say how to ask for the other file exactly.
+    let other_dir = tmp.path().join("other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let other_twin = other_dir.join("twin.bin");
+    std::fs::write(&other_twin, vec![0x5au8; 65_536]).unwrap();
+    let mut different = alice.spawn(&["room", "send", &room, other_twin.to_str().unwrap()]);
+    let t4 = tag_of(&different.wait_for("vox: offering", Duration::from_secs(60)));
+    assert!(
+        t4.len() > 21 && t4[..21] != t2[..21],
+        "CANNOT MEASURE: the different twin has the same content hash ({t4} vs {t2})"
+    );
+    until(
+        &bob,
+        "the different twin offer to reach bob",
+        &["room", "read", &room, "--json"],
+        |o| o.contains(&t4),
+    );
+    signal(different.pid(), "TERM");
+    assert!(
+        different.exited_within(Duration::from_secs(10)).is_some(),
+        "CANNOT MEASURE: the different twin offer did not end on SIGTERM"
+    );
+    let wrong = tmp.path().join("twin-wrong.bin");
+    let (ok, stdout, stderr) = bob.vox(&[
+        "room",
+        "get",
+        &room,
+        "twin.bin",
+        "--out",
+        wrong.to_str().unwrap(),
+    ]);
+    let left = std::fs::read(&wrong).ok();
+    eprintln!(
+        "[proof] get by name with the newest ({t4}, other content) ended and only {t2} live: \
+         ok={ok}, file left: {} bytes; said: {}",
+        left.as_ref().map_or(0, Vec::len),
+        stderr.trim()
+    );
+    assert!(
+        !ok && left.is_none(),
+        "a get by name fell back to a DIFFERENT file that only shares the name \
+         ({} bytes collected): {stdout} {stderr}",
+        left.as_ref().map_or(0, Vec::len)
+    );
+    assert!(
+        stderr.contains("a different file also matches")
+            && stderr.contains(&format!("vox room get {room} {}", &t2[5..21])),
+        "the refusal must say a different file matches, and how to get it exactly: {stderr}"
     );
     drop(second);
 

@@ -1876,8 +1876,14 @@ pub async fn get_file(
     // Newest first: re-offering a file supersedes. But **an offer that has ended does not
     // hide one that is still served** (V210-84): each offer has a tag of its own, so the newest
     // match may be one whose `vox room send` has stopped while an older offer of the same file
-    // still runs. Each match is tried in turn, newest first, until one is collected.
+    // still runs. So the older offers are tried in turn — but only those of **the same file
+    // from the same member** as the newest match: same author, same SHA-256. A fallback to
+    // anything else would hand over a different file that only shares a name.
     let mut offers: Vec<Offer> = Vec::new();
+    // Older matches that are a different file (or from another member), named in the error by
+    // hash, which is how to ask for exactly that file (a tag names one offer, which may be the
+    // one that ended).
+    let mut others: Vec<Offer> = Vec::new();
     for r in rows.iter().rev() {
         let Ok(env) = Envelope::parse(&r.text) else {
             continue;
@@ -1896,14 +1902,24 @@ pub async fn get_file(
             continue;
         };
         let matches = name == selector || sha256.starts_with(selector) || tag == selector;
-        if matches && !offers.iter().any(|o| o.author == r.author && o.tag == tag) {
-            offers.push(Offer {
-                author: r.author,
-                name,
-                size,
-                sha256,
-                tag,
-            });
+        if !matches || offers.iter().any(|o| o.author == r.author && o.tag == tag) {
+            continue;
+        }
+        let offer = Offer {
+            author: r.author,
+            name,
+            size,
+            sha256,
+            tag,
+        };
+        match offers.first() {
+            Some(newest) if newest.author != offer.author || newest.sha256 != offer.sha256 => {
+                if !others.iter().any(|o| o.sha256 == offer.sha256) {
+                    others.push(offer);
+                }
+                continue;
+            }
+            _ => offers.push(offer),
         }
         // Each try that is not served costs a dial; this many is past any real case of one
         // file offered again while an older offer of it still runs.
@@ -1941,15 +1957,31 @@ pub async fn get_file(
             "no offer matching {selector:?} was tried"
         )));
     };
-    Err(if tried > 1 {
-        AppError::Usage(format!(
+    if tried == 1 && others.is_empty() {
+        return Err(e);
+    }
+    let mut said = if tried > 1 {
+        format!(
             "{e} (and {} older offer{} of it could not be collected either)",
             tried - 1,
             if tried > 2 { "s" } else { "" }
-        ))
+        )
     } else {
-        e
-    })
+        e.to_string()
+    };
+    // Say that a different file answers to the same selector, and how to ask for exactly it,
+    // rather than silently collecting it instead.
+    for o in &others {
+        use std::fmt::Write as _;
+        let short = &o.sha256[..o.sha256.len().min(16)];
+        let _ = write!(
+            said,
+            "\n       a different file also matches {selector:?}: {} ({} bytes, sha256 {short}) \
+             — collect exactly it with `vox room get {room} {short}`",
+            o.name, o.size
+        );
+    }
+    Err(AppError::Usage(said))
 }
 
 /// The most matching offers `vox room get` tries, newest first (V210-84).
