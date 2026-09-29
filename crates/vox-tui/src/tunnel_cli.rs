@@ -440,9 +440,13 @@ pub async fn forward(
     // Keep reading events while forwarding, so a connection the host refused or cut says
     // why here (PRD-001 R23). The application only ever sees its socket reset; waiting on
     // Ctrl-C alone left the reason in a queue nobody read.
+    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
+    // lands in the same turn as another arm (see `app::run_node`).
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut interrupted => break,
             ev = node.next_event() => match ev {
                 Some(ref ev) => say_if_it_explains_a_failure(ev),
                 None => break,
@@ -593,9 +597,13 @@ pub async fn serve(
 
     // Until interrupted: report who reaches the service. The service itself cannot say
     // — every Vox client arrives at it from loopback (ADR-017 decision 6).
+    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
+    // lands in the same turn as another arm (see `app::run_node`).
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut interrupted => break,
             event = node.next_event() => match event {
                 Some(NodeEvent::TunnelServed { client, service_tag, .. }) => {
                     println!("vox: {} reached {service_tag:?}", crate::ident::author_id(&client));
@@ -684,9 +692,13 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     // reach says so (ADR-017 M17.11). Without this the proxy stays up and silent and the
     // person sees only `ssh` dying, which reads as a network fault and invites a retry that
     // cannot succeed.
+    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
+    // lands in the same turn as another arm (see `app::run_node`).
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut interrupted => break,
             ev = node.next_event() => match ev {
                 Some(NodeEvent::ReachWithdrawn { port, .. }) => {
                     println!("vox: the host withdrew access to port {port} — that session was cut");
@@ -1108,9 +1120,13 @@ pub async fn up_all(paths: &Paths, bind: SocketAddr) -> Result<(), AppError> {
     println!("then:  ssh user@<node>.<room>.vox   (the names you gave them: `vox trust list`)");
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     println!("Ctrl-C to stop");
+    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
+    // lands in the same turn as another arm (see `app::run_node`).
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut interrupted => break,
             note = up.next_note() => match note {
                 Some(note) => eprintln!("vox: {note}"),
                 None => {
