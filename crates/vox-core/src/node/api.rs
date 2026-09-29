@@ -445,6 +445,11 @@ pub enum Fault {
     Unreachable,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
+    /// A consent named a member this node has not admitted to the room (yet): it holds no
+    /// verified key for them, so it cannot know it would release to the right party. Not
+    /// [`Fault::UnknownChannel`], which said "no such room" about a room this node holds
+    /// (V210-78).
+    NotAdmitted,
     /// There is no consent to withdraw: the target was never consented to, or the
     /// consent has already been revoked (ADR-007 — consent is single-writer, so this
     /// is a settled fact, not a race).
@@ -533,6 +538,9 @@ impl Fault {
                 "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
             }
             Fault::Refused => "the other side refused",
+            Fault::NotAdmitted => {
+                "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
+            }
             Fault::NotConsented => {
                 "there is nothing to withdraw: that identity was never trusted or consented to, or already is not"
             }
