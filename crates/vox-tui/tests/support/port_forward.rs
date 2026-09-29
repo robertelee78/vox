@@ -242,8 +242,8 @@ impl ForwardedWorld {
             &args(&[
                 "connect",
                 &address,
-                "--passphrase",
-                &passphrase,
+                "--passphrase-file",
+                &crate::world::room_pass_file(&guest_dir, &passphrase),
                 "--anchor",
                 &anchor.v6_spec,
                 "--listen",
@@ -282,15 +282,15 @@ impl ForwardedWorld {
     /// Start the guest's `vox up` on `[::1]`; returns it, the SOCKS address it bound, and when it
     /// said so — the earliest moment a person could ask it for anything.
     pub fn up(&self, name: &str) -> (crate::world::VoxProc, SocketAddr, Instant) {
-        use crate::world::{args, VoxProc};
+        use crate::world::{args, room_pass_file, VoxProc};
         let mut up = VoxProc::spawn(
             name,
             &self.guest_dir,
             &args(&[
                 "up",
                 &self.room,
-                "--passphrase",
-                &self.passphrase,
+                "--passphrase-file",
+                &room_pass_file(&self.guest_dir, &self.passphrase),
                 "--bind",
                 "127.0.0.1:0",
                 "--anchor",

@@ -168,21 +168,55 @@ fn block_body(shell: Shell, install_dir: &Path, completion_dir: &Path) -> String
     }
 }
 
-/// Write `bytes` to `path` atomically, with `mode`.
+/// Write `bytes` to `path` atomically, with exactly `mode`.
+///
+/// The temporary file is created afresh (a leftover one, or a symlink planted at its name,
+/// is removed rather than written through) and set to `mode` before any byte is written, so
+/// the umask cannot widen it and nothing reads it at another mode.
 fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let tmp = path.with_extension("vox-partial");
-    {
+    let _ = fs::remove_file(&tmp);
+    let written = (|| {
         let mut f = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
+            .create_new(true)
+            .mode(mode & 0o600)
             .open(&tmp)?;
+        f.set_permissions(fs::Permissions::from_mode(mode))?;
         f.write_all(bytes)?;
-        f.sync_all()?;
+        f.sync_all()
+    })();
+    if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, path)
+    Ok(())
+}
+
+/// Rewrite the rc file `rc` with `bytes`, **as it was**: through its symlink, and at its mode.
+///
+/// A person's rc file is often a symlink into a dotfiles repository, and often `0600`. It
+/// was replaced by a plain `0644` file (V210-72): the symlink was cut, so the dotfiles copy
+/// silently stopped being the one the shell reads, and a private rc became readable by
+/// every local user. So the file the link resolves to is the one rewritten, and it keeps
+/// its mode; a new rc file is `0644`, like the shell's own.
+fn write_rc(rc: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let target = match fs::canonicalize(rc) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => rc.to_path_buf(),
+        Err(e) => return Err(e),
+    };
+    let mode = match fs::metadata(&target) {
+        Ok(m) => m.permissions().mode() & 0o7777,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0o644,
+        Err(e) => return Err(e),
+    };
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_atomic(&target, bytes, mode)
 }
 
 /// Insert or replace the managed block in `rc`. Returns whether the file changed.
@@ -223,10 +257,7 @@ fn upsert_block(rc: &Path, block: &str, create: bool) -> std::io::Result<bool> {
     if updated == existing {
         return Ok(false);
     }
-    if let Some(parent) = rc.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_atomic(rc, updated.as_bytes(), 0o644)?;
+    write_rc(rc, updated.as_bytes())?;
     Ok(true)
 }
 
@@ -255,7 +286,7 @@ fn remove_block(rc: &Path) -> std::io::Result<bool> {
     if updated == existing {
         return Ok(false);
     }
-    write_atomic(rc, updated.as_bytes(), 0o644)?;
+    write_rc(rc, updated.as_bytes())?;
     Ok(true)
 }
 

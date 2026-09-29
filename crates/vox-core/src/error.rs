@@ -440,4 +440,10 @@ pub enum IpcHandshake {
     /// What answered did not greet at all.
     #[error("what answered on the control socket did not greet like a vox node")]
     NotHello,
+    /// The socket, or the process serving it, is not this user's: nothing is sent to it.
+    #[error("refusing the control socket: {detail}")]
+    NotYours {
+        /// What was found instead.
+        detail: String,
+    },
 }

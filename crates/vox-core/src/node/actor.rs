@@ -2603,7 +2603,11 @@ impl Node {
                 channel_id,
                 service_tag,
                 local,
-            } => self.add_service(&channel_id, &service_tag, local).await,
+                persist,
+            } => {
+                self.add_service(&channel_id, &service_tag, local, persist)
+                    .await
+            }
             NodeCommand::RemoveService {
                 channel_id,
                 service_tag,
@@ -7537,7 +7541,7 @@ impl Node {
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
         let id = channel.channel_id();
-        if let Err(e) = channel.add_service(profile.store(), profile, &tag, endpoint) {
+        if let Err(e) = channel.add_service(profile.store(), profile, &tag, endpoint, true) {
             // Drop the room rather than keep a half-made one. Nothing outside this
             // function has seen it: it is not in `self.channels` and has not been
             // published, so forgetting it here is the whole of the rollback.
@@ -7738,6 +7742,7 @@ impl Node {
         channel_id: &Digest32,
         service_tag: &str,
         local: std::net::SocketAddr,
+        persist: bool,
     ) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -7747,7 +7752,7 @@ impl Node {
         };
         let outcome = {
             let mut channel = shared.lock().await;
-            channel.add_service(profile.store(), profile, service_tag, local)
+            channel.add_service(profile.store(), profile, service_tag, local, persist)
         };
         match outcome {
             Ok(_) => {

@@ -347,6 +347,9 @@ pub enum NodeCommand {
         service_tag: String,
         /// The local address the service listens on.
         local: std::net::SocketAddr,
+        /// Whether the offer outlives this node's run. `false` for an offer that lasts
+        /// only as long as the process that made it (`vox room send`, V210-72).
+        persist: bool,
     },
     /// Stop offering a service.
     RemoveService {
