@@ -25,6 +25,11 @@
 //!    **signer's**: carol posting an envelope whose `from` says `alice` wakes bob with a row
 //!    from carol, never from alice. (Case 1 alone could not tell: alice posts as session
 //!    `alice-s`, so a wake naming the envelope's `from` would already differ from `alice`.)
+//!    **And a post by the daemon's own node wakes too**: `vox room post` on bob's daemon is an
+//!    append by that node (`SendText`), announced as `NewEntry` — a path of its own in the
+//!    wake loop, apart from the sweep that finds other members' posts. Bob posts three urgent
+//!    messages to a second session of his, `bob-s2`, and each wakes it with a row naming bob;
+//!    a non-urgent post to it wakes nothing.
 //! 2. **An ended session's registration is forgotten**: one whose socket no longer listens is
 //!    removed at the first wake that finds it gone, and the live one is kept.
 //! 3. **A reply spends a hop, and a message with none left wakes nobody.** An urgent reply
@@ -313,6 +318,77 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         &mut failures,
         posed_row.contains(" from carol] ") && !posed_row.contains("alice"),
         format!("(1) the wake must name the signer, carol, not the envelope's `from`: {posed:?}"),
+    );
+
+    // A post by bob's own node, through `NewEntry` rather than the sweep: a second session of
+    // bob's, addressed as `bob2`, at a socket of its own.
+    let sock2 = tmp.path().join("session2.sock");
+    let inbox2 = listen(&sock2);
+    let sock2_s = sock2.to_string_lossy().into_owned();
+    hook(
+        bob,
+        &[
+            ("CLAUDE_CODE_MESSAGING_SOCKET", sock2_s.as_str()),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "s2-token"),
+            ("VOX_AGENT_NAME", "bob2"),
+        ],
+        &["agent", "hook", "--room", r],
+        Some(r#"{"session_id":"bob-s2","hook_event_name":"UserPromptSubmit"}"#),
+    );
+    assert_eq!(
+        registered(bob, "bob-s2"),
+        Some(("claude".to_owned(), sock2_s.clone())),
+        "CANNOT MEASURE: bob-s2 must be registered at the test's own socket"
+    );
+    post(
+        bob,
+        "bob-s",
+        r,
+        &["--type", "ask", "--to", "bob2"],
+        "OWN-NOT-URGENT",
+    );
+    for n in 1..=3 {
+        post(
+            bob,
+            "bob-s",
+            r,
+            &["--type", "ask", "--to", "bob2", "--urgent"],
+            &format!("OWN-URGENT-{n}"),
+        );
+    }
+    // Ten seconds past the last post: five sweeps, long enough for a wrong wake to show.
+    let own = collect(&inbox2, Duration::from_secs(10), |_| false);
+    let own: Vec<String> = own.iter().map(|f| content(f)).collect();
+    let bob_row = format!(" from {}", &bob.b32()[..26]);
+    let own_woken = (1..=3)
+        .filter(|n| {
+            own.iter().any(|c| {
+                c.lines().any(|l| {
+                    l.starts_with('[')
+                        && l.contains(&bob_row)
+                        && l.contains(&format!("OWN-URGENT-{n}"))
+                })
+            })
+        })
+        .count();
+    let own_quiet = !own.iter().any(|c| c.contains("OWN-NOT-URGENT"));
+    println!(
+        "[proof] (1) bob's own posts to bob-s2: {own_woken}/3 urgent woke it with a row naming \
+         bob, the non-urgent one stayed quiet {own_quiet}"
+    );
+    check(
+        &mut failures,
+        own_woken == 3,
+        format!(
+            "(1) each urgent post by bob's own node must wake bob-s2 with a row naming bob \
+             ({own_woken}/3): {own:?}; bob's daemon:\n{}",
+            daemon_err()
+        ),
+    );
+    check(
+        &mut failures,
+        own_quiet,
+        format!("(1) a non-urgent post by bob's own node must not wake bob-s2: {own:?}"),
     );
 
     // Bob's daemon tried the ended session for the same message; give it its deadline.
