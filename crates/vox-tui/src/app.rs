@@ -318,6 +318,14 @@ pub fn run_node(
         let mut last_held: Vec<String> = Vec::new();
         let mut stalls = node.subscribe();
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
+        // **One Ctrl-C listener for the whole loop, not one per turn.** A listener sees only
+        // signals that arrive after it starts listening, and one made inside the `select!` is
+        // dropped whenever the tick wins. A SIGINT delivered in the same turn as a tick — an
+        // anchor descheduled past a tick on a loaded box, then signalled — went to a listener
+        // that was then dropped, and the anchor served on, deaf to Ctrl-C: 13 of 20 anchors
+        // stopped for 1.2 s and signalled never exited.
+        let interrupted = tokio::signal::ctrl_c();
+        tokio::pin!(interrupted);
         loop {
             tokio::select! {
                 _ = ticks.tick() => {
@@ -534,7 +542,7 @@ pub fn run_node(
                         }
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = &mut interrupted => {
                     println!("vox node: shutting down");
                     let _ = node.apply(NodeCommand::Shutdown).await;
                     break;
