@@ -1323,8 +1323,15 @@ impl ChannelState {
         }
 
         // Timeline from the sealed plaintext cache, render-gated by the DAG.
+        //
+        // A cache row takes its id from the same counter as the log (a received message's row is
+        // the id after its entry's), so the counter resumes past the highest of **both** (V210-73).
+        // Resumed from the log alone, the first post after a restart took the id of the last
+        // received message's cache row, and its own cache row overwrote that one: the message
+        // was gone from the room at the next restart.
         let mut timeline = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::PlaintextCache)? {
+            next_log_id = next_log_id.max(id.saturating_add(1));
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
             let rendered = parse_cache(&row)?;
             if dag.contains(&rendered.entry_hash) {
