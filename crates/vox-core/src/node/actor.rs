@@ -9608,6 +9608,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such channel in this profile") => Fault::UnknownChannel,
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,
+        Error::LogFormatBeforeV030 => Fault::RoomFromBeforeV030,
         Error::AtRestLocked => Fault::Locked,
         // Before the general size arm: a full keyring is not an input that was too long.
         Error::SizeLimitExceeded("trusted identities") => Fault::KeyringFull,
