@@ -30,13 +30,14 @@
 //!   per-member rendezvous revocation, is how the swarm sheds a party (ADR-012).
 //! - **Anti-spam capacity.** Pre-join records (whose `asserted_id` is unbounded —
 //!   anyone may assert an identity) are capped per channel at
-//!   [`MAX_PREJOIN_PER_CHANNEL`]; member buckets are bounded by
+//!   [`MAX_PREJOIN_PER_CHANNEL`], a full bucket evicting the oldest arrival rather
+//!   than refusing the newest; member buckets are bounded by
 //!   [`MAX_AUTHORS_PER_BUCKET`] as defense in depth.
 //!
 //! All time is caller-supplied `now` (epoch-seconds): the store is deterministic
 //! and has no ambient clock, which keeps it unit-testable and side-effect-free.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
@@ -70,7 +71,8 @@ pub const MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
 /// Maximum distinct pre-join `asserted_id`s retained per channel (anti-spam: a
 /// pre-join author is unauthenticated-as-member, so the count is otherwise
 /// unbounded). PoW join tokens (ADR-005) are the upstream gate; this bounds store
-/// memory regardless.
+/// memory regardless. At the bound the oldest arrival makes way for the newest, so a
+/// flood cannot keep a real joiner off the board.
 pub const MAX_PREJOIN_PER_CHANNEL: usize = 256;
 
 /// Maximum distinct member authors retained per `(channel, epoch)` bucket. Member
@@ -78,10 +80,15 @@ pub const MAX_PREJOIN_PER_CHANNEL: usize = 256;
 /// permissive membership lookup.
 pub const MAX_AUTHORS_PER_BUCKET: usize = 1024;
 
-/// Maximum distinct channels whose **genesis** this store retains (M14.7b). A
-/// genesis is immutable and self-validating (its hash *is* the channelID), so it
-/// needs no TTL and no author check — only a bound, so an unknown peer cannot grow
-/// the board without limit by inventing channels.
+/// Maximum distinct channels whose **genesis** this store retains on a peer's word
+/// (M14.7b). A genesis is immutable and self-validating (its hash *is* the channelID),
+/// so it needs no TTL and no author check — only a bound, so an unknown peer cannot
+/// grow the board without limit by inventing channels.
+///
+/// **The node's own rooms are not counted against it** (V210-70). A genesis this node
+/// filed itself — a room it holds, or one it anchors — is *pinned*: it is never refused
+/// for want of room and never displaced, so no quantity of geneses from peers can stop
+/// a node serving the rooms it is there for.
 pub const MAX_GENESIS_CHANNELS: usize = 4096;
 
 /// The expiry instant of a member record (epoch-seconds).
@@ -200,12 +207,18 @@ pub struct RendezvousStore {
     members: HashMap<(Digest32, u64), HashMap<Digest32, RendezvousRecord>>,
     /// `(channelID, epoch)` → (`author_id` → current member bundle record).
     bundles: HashMap<(Digest32, u64), HashMap<Digest32, MemberBundleRecord>>,
-    /// `channelID` → (`asserted_id` → current pre-join record).
-    prejoins: HashMap<Digest32, HashMap<Digest32, PreJoinRecord>>,
+    /// `channelID` → (`asserted_id` → (arrival order, current pre-join record)).
+    prejoins: HashMap<Digest32, HashMap<Digest32, (u64, PreJoinRecord)>>,
+    /// The next pre-join arrival number: what a full bucket evicts by (see
+    /// [`RendezvousStore::accept_prejoin`]).
+    prejoin_arrivals: u64,
     /// `channelID` → that channel's genesis (ADR-007: a cold-joining node fetches
     /// the genesis from the rendezvous and accepts it only if its hash equals the
     /// channelID it joined with).
     genesis: HashMap<Digest32, Genesis>,
+    /// The channels whose genesis this node filed itself — its own rooms and the ones it
+    /// anchors. Never displaced and not counted against [`MAX_GENESIS_CHANNELS`].
+    pinned: HashSet<Digest32>,
 }
 
 impl RendezvousStore {
@@ -353,26 +366,42 @@ impl RendezvousStore {
     /// the genesis is immutable and **self-validating** — its hash *is* the
     /// channelID, so a wrong or forged genesis cannot be filed under a channelID
     /// anyone asked for, and a reader re-checks the hash against the channelID it
-    /// joined with regardless. Anyone may therefore publish it (a joiner that has
-    /// one, an anchor restoring its store), which is exactly what makes a cold join
-    /// possible when no member is online. Re-publishing the same genesis is a no-op;
-    /// the only bound is [`MAX_GENESIS_CHANNELS`].
-    pub fn accept_genesis(&mut self, genesis: Genesis) -> Result<()> {
+    /// joined with regardless. Re-publishing the same genesis is a no-op.
+    ///
+    /// `pinned` says the node filed it itself (a room it holds or anchors): such a
+    /// genesis is always taken and never counted against [`MAX_GENESIS_CHANNELS`], and
+    /// pinning one the board already holds from a peer takes it out of that count.
+    /// Whether a board takes an unpinned genesis at all is the service's decision, not
+    /// the store's (see `RendezvousService::serve_any_room`).
+    pub fn accept_genesis(&mut self, genesis: Genesis, pinned: bool) -> Result<()> {
         genesis.verify()?;
         let channel_id = genesis.channel_id();
         if let Some(existing) = self.genesis.get(&channel_id) {
             // Two different genesis structures cannot share a channelID unless
             // SHA-256 collided; keep the one already verified and filed.
             if existing.to_wire() == genesis.to_wire() {
+                if pinned {
+                    self.pinned.insert(channel_id);
+                }
                 return Ok(());
             }
             return Err(Error::RendezvousRejected("genesis already present"));
         }
-        if self.genesis.len() >= MAX_GENESIS_CHANNELS {
+        if !pinned && self.genesis.len() - self.pinned.len() >= MAX_GENESIS_CHANNELS {
             return Err(Error::RendezvousRejected("genesis board at capacity"));
         }
         self.genesis.insert(channel_id, genesis);
+        if pinned {
+            self.pinned.insert(channel_id);
+        }
         Ok(())
+    }
+
+    /// Whether this node filed `channel_id`'s genesis itself (see
+    /// [`RendezvousStore::accept_genesis`]).
+    #[must_use]
+    pub fn genesis_pinned(&self, channel_id: &Digest32) -> bool {
+        self.pinned.contains(channel_id)
     }
 
     /// The stored genesis for `channel_id`, if any.
@@ -424,7 +453,7 @@ impl RendezvousStore {
         let bucket = self.prejoins.entry(record.channel_id).or_default();
 
         // 3. Freshness vs the current record for this asserted identity.
-        if let Some(cur) = bucket.get(&asserted_id) {
+        if let Some((_, cur)) = bucket.get(&asserted_id) {
             if same_prejoin_claim(cur, &record)
                 && within_refresh_floor(record.timestamp, cur.timestamp)
             {
@@ -432,14 +461,29 @@ impl RendezvousStore {
             }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
         } else if bucket.len() >= MAX_PREJOIN_PER_CHANNEL {
-            bucket.retain(|_, r| now < prejoin_expiry(r));
+            bucket.retain(|_, (_, r)| now < prejoin_expiry(r));
+            // **A full bucket makes room; it never turns the newcomer away** (V210-70). A
+            // pre-join needs nothing but a key, so refusing at capacity let anyone who knew a
+            // room's name fill its 256 slots and refuse every real joiner for the two hours the
+            // records live. The one that arrived longest ago goes instead — by arrival here, not
+            // by the record's own timestamp, which its author chooses. A joiner announces itself
+            // and opens its join at once, so the record it just put is the one a flood would
+            // have to outpace, not one already sitting here.
             if bucket.len() >= MAX_PREJOIN_PER_CHANNEL {
-                return Err(Error::RendezvousRejected("pre-join channel at capacity"));
+                if let Some(oldest) = bucket
+                    .iter()
+                    .min_by_key(|(_, (arrived, _))| *arrived)
+                    .map(|(id, _)| *id)
+                {
+                    bucket.remove(&oldest);
+                }
             }
         }
 
         // 4. Admit.
-        bucket.insert(asserted_id, record);
+        let arrived = self.prejoin_arrivals;
+        self.prejoin_arrivals = self.prejoin_arrivals.wrapping_add(1);
+        bucket.insert(asserted_id, (arrived, record));
         Ok(())
     }
 
@@ -513,7 +557,12 @@ impl RendezvousStore {
     pub fn current_prejoins(&self, channel_id: &Digest32, now: u64) -> Vec<&PreJoinRecord> {
         self.prejoins
             .get(channel_id)
-            .map(|b| b.values().filter(|r| now < prejoin_expiry(r)).collect())
+            .map(|b| {
+                b.values()
+                    .map(|(_, r)| r)
+                    .filter(|r| now < prejoin_expiry(r))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -536,7 +585,7 @@ impl RendezvousStore {
         self.bundles.retain(|_, b| !b.is_empty());
         for bucket in self.prejoins.values_mut() {
             let before = bucket.len();
-            bucket.retain(|_, r| now < prejoin_expiry(r));
+            bucket.retain(|_, (_, r)| now < prejoin_expiry(r));
             removed += before - bucket.len();
         }
         self.prejoins.retain(|_, b| !b.is_empty());
