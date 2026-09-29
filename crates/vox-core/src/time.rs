@@ -57,6 +57,31 @@ pub fn system_millis_clock() -> MillisClock {
     })
 }
 
+/// [`system_clock`], shifted by [`TEST_CLOCK_SKEW_ENV`] in whole seconds (rounded down).
+/// **Test-only: for proofs; nothing in a real deployment sets it.**
+///
+/// **Both clocks move** (V210-64): a real clock step moves the seconds a record is stamped with as
+/// well as the milliseconds that floor its `seq`, and a board refuses a record that is behind on
+/// either. Moving only the milliseconds proved half the cure.
+#[must_use]
+pub fn clock_with_test_skew() -> Clock {
+    let skew = test_skew_ms();
+    let system = system_clock();
+    if skew == 0 {
+        return system;
+    }
+    let secs = skew.div_euclid(1000);
+    Arc::new(move || system().saturating_add_signed(secs))
+}
+
+/// The signed skew [`TEST_CLOCK_SKEW_ENV`] names, in milliseconds; zero when unset or unparsable.
+fn test_skew_ms() -> i64 {
+    std::env::var(TEST_CLOCK_SKEW_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// The environment variable [`millis_clock_with_test_skew`] reads. **Test-only.**
 pub const TEST_CLOCK_SKEW_ENV: &str = "VOX_TEST_CLOCK_SKEW_MS";
 
@@ -65,18 +90,14 @@ pub const TEST_CLOCK_SKEW_ENV: &str = "VOX_TEST_CLOCK_SKEW_MS";
 ///
 /// It lets a proof drive the shipped binary with a node whose millisecond clock is wrong, which
 /// a proof that pinned the clock inside the process could not: that would not be the binary a
-/// person runs. Only the millisecond clock moves — the one that stamps a message's claimed time
-/// and floors a board record's `seq` — never the seconds [`Clock`], which feeds record and session
-/// lifetimes. Ported from the v0.3.0 line (c065a37) for #230's proof, which starts a node a moment
+/// person runs. The node's seconds [`Clock`] moves with it ([`clock_with_test_skew`], V210-64), as
+/// both do in a real clock step. Ported from the v0.3.0 line (c065a37) for #230's proof, which starts a node a moment
 /// behind so its first record is refused as stale, deterministically.
 ///
 /// Unset, empty or unparsable is no skew: an operator who never heard of it gets the system clock.
 #[must_use]
 pub fn millis_clock_with_test_skew() -> MillisClock {
-    let skew: i64 = std::env::var(TEST_CLOCK_SKEW_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
+    let skew = test_skew_ms();
     let system = system_millis_clock();
     if skew == 0 {
         return system;

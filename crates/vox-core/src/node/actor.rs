@@ -412,7 +412,7 @@ impl NodeConfig {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            clock: system_clock(),
+            clock: crate::time::clock_with_test_skew(),
             millis_clock: crate::time::millis_clock_with_test_skew(),
             argon2: Argon2Profile::default(),
             bind: None,
@@ -1206,6 +1206,12 @@ const STALE_REPUBLISH_TRIES: u32 = 3;
 /// How far the first republish after a stale refusal moves this process's record `seq` floor
 /// past its clock, in milliseconds; each later try doubles it (see `NetEvent::PublishDone`).
 const STALE_SEQ_STEP_MS: u64 = 2_000;
+
+/// How far ahead of this process's clock a stale republish may carry its record's `seq` and
+/// `timestamp` floors, in milliseconds (V210-64). Enough for three tries' steps; bounded, so two
+/// live processes of one identity refusing each other in turn cannot drive the floors ever further
+/// ahead — each only ever reaches this, and a real conflict is said, not outrun.
+const STALE_AHEAD_MAX_MS: u64 = 16_000;
 
 /// Whether a publish outcome is one of this node's **own** records refused by the board as stale.
 fn own_stale_refusal(kind: &str, why: &Option<String>) -> bool {
@@ -2049,6 +2055,10 @@ pub struct Node {
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012), across restarts too: see `next_record_seq`.
     record_seq: BTreeMap<Digest32, u64>,
+    /// Per channel: the earliest `timestamp` this process's next records may carry (V210-64). Moved
+    /// forward, like `record_seq`, by a stale refusal; `record_timestamp` is the later of it and
+    /// the clock.
+    record_ts_floor: BTreeMap<Digest32, u64>,
     /// Pairwise ADR-004 sessions, keyed by `(channel, peer)` — a session is bound to
     /// a `(channelID, epoch)`, so one peer may have several. In memory for this
     /// process only: persisting ratchet state is not part of M14, so a restart
@@ -2243,6 +2253,7 @@ impl Node {
             fresh_details: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
             record_seq: BTreeMap::new(),
+            record_ts_floor: BTreeMap::new(),
             sessions: BTreeMap::new(),
             initiated: BTreeMap::new(),
             accepted_hello: BTreeMap::new(),
@@ -2829,6 +2840,7 @@ impl Node {
             return;
         };
         let seq = self.next_record_seq(channel_id);
+        let stamp = self.record_timestamp(channel_id);
         // The admission goes out with the bundle: a node that cannot say how it became
         // a member publishes nothing, rather than publishing an unevidenced key (M17.6).
         let (genesis_wire, epoch, admission) = match self.channels.get(channel_id) {
@@ -2850,7 +2862,7 @@ impl Node {
                 return;
             };
             let ring = ring.lock().await;
-            net.own_records(signer, channel_id, epoch, &ring, seq, admission)
+            net.own_records(signer, channel_id, epoch, &ring, seq, stamp, admission)
         };
         let Ok((address, bundle)) = records else {
             return;
@@ -3093,6 +3105,13 @@ impl Node {
     /// new address. vox-bc's causal-order proof measured it: the second joiner, restarted, logged
     /// `a board would not take our address … the board holds a newer record from that author`,
     /// and failed 5 of 9. The clock is what survives a restart without a store write per publish.
+    /// The `timestamp` for this process's next records in `channel_id`: the clock, or later if a
+    /// stale refusal moved the floor past it (V210-64).
+    fn record_timestamp(&self, channel_id: &Digest32) -> u64 {
+        self.now()
+            .max(self.record_ts_floor.get(channel_id).copied().unwrap_or(0))
+    }
+
     fn next_record_seq(&mut self, channel_id: &Digest32) -> u64 {
         let floor = (self.millis_clock)();
         let entry = self.record_seq.entry(*channel_id).or_insert(0);
@@ -3393,6 +3412,7 @@ impl Node {
             return;
         };
         let seq = self.next_record_seq(channel_id);
+        let stamp = self.record_timestamp(channel_id);
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
@@ -3409,9 +3429,15 @@ impl Node {
         let Some(admission) = channel.own_admission().cloned() else {
             return;
         };
-        if let Ok((address, bundle)) =
-            net.own_records(signer, channel_id, channel.epoch(), &ring, seq, admission)
-        {
+        if let Ok((address, bundle)) = net.own_records(
+            signer,
+            channel_id,
+            channel.epoch(),
+            &ring,
+            seq,
+            stamp,
+            admission,
+        ) {
             let _ = net.publish_local(&address.to_wire());
             let _ = net.publish_local(&bundle.to_wire());
         }
@@ -3922,10 +3948,25 @@ impl Node {
                         // Each armed republish moves the floor 2, 4, then 8 s past where it is, so
                         // three tries cover a lag of more than 15 s. `seq` is only compared, never
                         // bounded by a board, and it stays this process's own and increasing.
-                        let floor = (self.millis_clock)();
+                        //
+                        // **And the `timestamp` floor with it** (V210-64): a board wants a later
+                        // second too, and a real clock step moves both clocks. **Both capped** at
+                        // `STALE_AHEAD_MAX_MS` past the clock, and never moved back.
+                        let clock_ms = (self.millis_clock)();
                         let ahead = STALE_SEQ_STEP_MS << tries.min(8);
+                        let cap = clock_ms.saturating_add(STALE_AHEAD_MAX_MS);
                         let entry = self.record_seq.entry(channel_id).or_insert(0);
-                        *entry = (*entry).max(floor).saturating_add(ahead);
+                        *entry = (*entry)
+                            .max(clock_ms)
+                            .saturating_add(ahead)
+                            .min((*entry).max(cap));
+                        let now = self.now();
+                        let ts_cap = now.saturating_add(STALE_AHEAD_MAX_MS / 1_000);
+                        let stamp = self.record_ts_floor.entry(channel_id).or_insert(0);
+                        *stamp = (*stamp)
+                            .max(now)
+                            .saturating_add(ahead / 1_000)
+                            .min((*stamp).max(ts_cap));
                         let past_the_second = 1_000 - (self.millis_clock)() % 1_000 + 50;
                         let tx = self.net_tx.clone();
                         tokio::spawn(async move {
