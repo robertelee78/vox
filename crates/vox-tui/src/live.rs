@@ -239,12 +239,19 @@ impl LiveCore {
             nv.open_channels
                 .iter()
                 .find(|d| d.channel_id == cid)
-                .and_then(|d| d.equivocations.first())
-                .map(|(author, seq)| {
-                    crate::ident::equivocation_notice(
-                        &crate::ident::member_name(&nv.trusted, author),
-                        *seq,
-                    )
+                // **Every one, not the first** (V210-66): two members equivocating are two notices.
+                .filter(|d| !d.equivocations.is_empty())
+                .map(|d| {
+                    d.equivocations
+                        .iter()
+                        .map(|(author, seq)| {
+                            crate::ident::equivocation_notice(
+                                &crate::ident::member_name(&nv.trusted, author),
+                                *seq,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 })
         });
         ViewModel {

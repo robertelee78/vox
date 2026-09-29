@@ -147,7 +147,7 @@ const SEG_FORKS: u64 = 12;
 /// Encoding version of [`SEG_FORKS`].
 const FORKS_VERSION: u64 = 1;
 
-fn forks_bytes(proofs: &[&ForkProof]) -> Vec<u8> {
+pub(crate) fn forks_bytes(proofs: &[&ForkProof]) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(2).uint(FORKS_VERSION).array(proofs.len());
     for p in proofs {
@@ -158,7 +158,7 @@ fn forks_bytes(proofs: &[&ForkProof]) -> Vec<u8> {
     e.finish()
 }
 
-fn parse_forks(bytes: &[u8]) -> Result<Vec<(Entry, Entry)>> {
+pub(crate) fn parse_forks(bytes: &[u8]) -> Result<Vec<(Entry, Entry)>> {
     let mut d = Decoder::new(bytes);
     if d.array()? != 2 {
         return Err(Error::MalformedAtRest("fork proofs arity"));

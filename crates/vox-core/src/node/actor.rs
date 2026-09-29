@@ -8096,14 +8096,18 @@ impl Node {
             .unwrap_or_default();
         for a in &mut anchoring {
             if let Some(state) = self.anchored.get(&a.channel_id) {
-                a.entries = match by(deadline, state).await {
-                    Some(st) => Some(st.entries() as u64),
-                    None => prev
-                        .anchoring
-                        .iter()
-                        .find(|p| p.channel_id == a.channel_id)
-                        .and_then(|p| p.entries),
-                };
+                let earlier = prev.anchoring.iter().find(|p| p.channel_id == a.channel_id);
+                match by(deadline, state).await {
+                    Some(st) => {
+                        a.entries = Some(st.entries() as u64);
+                        a.equivocations = st.equivocations();
+                    }
+                    None => {
+                        a.entries = earlier.and_then(|p| p.entries);
+                        a.equivocations =
+                            earlier.map(|p| p.equivocations.clone()).unwrap_or_default();
+                    }
+                }
             }
         }
         // Each open room's lock is taken once, for both its summary and its detail.

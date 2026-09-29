@@ -315,6 +315,7 @@ pub fn run_node(
         // What the board actually holds per room, reported when it changes. See below.
         let mut last_board: Vec<String> = Vec::new();
         let mut last_holding: Vec<String> = Vec::new();
+        let mut last_held: Vec<String> = Vec::new();
         let mut stalls = node.subscribe();
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
@@ -419,6 +420,29 @@ pub fn run_node(
                         println!("vox node: board — {line}");
                     }
                     last_holding = holding;
+                    // **Who this anchor's copy holds back for equivocating** (V210-66): said on
+                    // change, and again after a restart, since the freeze is kept.
+                    let held: Vec<String> = view
+                        .anchoring
+                        .iter()
+                        .flat_map(|a| {
+                            a.equivocations.iter().map(|(author, seq)| {
+                                format!(
+                                    "{} holds {} back: {}",
+                                    crate::tunnel_cli::short_id_of(&a.channel_id),
+                                    crate::ident::author_id(author),
+                                    crate::ident::equivocation_notice(
+                                        &crate::ident::author_id(author),
+                                        *seq
+                                    )
+                                )
+                            })
+                        })
+                        .collect();
+                    for line in held.iter().filter(|l| !last_held.contains(*l)) {
+                        println!("vox node: board — {line}");
+                    }
+                    last_held = held;
                     // Drained without blocking: this arm also has an anchors file to
                     // write, and a status line nobody reads is better than a tick nobody
                     // reaches.
