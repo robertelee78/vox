@@ -2927,6 +2927,7 @@ impl Node {
             self.publish_again.insert((*channel_id, board_id));
             return;
         }
+        crate::node::status::SyncBook::note_publish_round(&self.sync_book);
         let conn = Arc::clone(conn);
         let tx = self.net_tx.clone();
         let cid = *channel_id;
@@ -3814,6 +3815,7 @@ impl Node {
                 // an anchor receiving a mirror does not mirror it onward and this cannot ring
                 // around a ring of anchors.
                 if self.channels.contains_key(&channel_id) {
+                    crate::node::status::SyncBook::note_board_news(&self.sync_book);
                     self.publish_channel_to_anchors(&channel_id).await;
                     self.note_new_members(&channel_id).await;
                 }
@@ -4167,6 +4169,15 @@ impl Node {
                     // paying a publish per sync for it is not.
                     if o.applied > 0 {
                         self.note_local_append(&channel_id);
+                    }
+                    // **And only when it could change who reaches whom** (#179): an admission is a
+                    // governance entry. A session that brought ordinary messages changed neither
+                    // who may reach whom nor what this node's records say, yet it re-signed and
+                    // re-sent them to every anchor on the actor: with two members posting, dozens
+                    // of rounds a second, each signing on the single writer a local post queues
+                    // behind. Records mirrored onto this board come through `BoardGrew`, which
+                    // fires for news.
+                    if o.governance > 0 {
                         self.refresh_reachers().await;
                         self.publish_channel_to_anchors(&channel_id).await;
                     }

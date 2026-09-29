@@ -229,13 +229,18 @@ impl RendezvousStore {
     ///   future-dated, over-long TTL, bucket full);
     /// - [`Error::MalformedRendezvous`] if the resolved key does not match the
     ///   record's signature/author binding;
-    /// - `Ok(())` on admission (the record becomes the current one for its author).
+    /// - `Ok(learned)` on admission (the record becomes the current one for its author), where
+    ///   `learned` says whether the board **learned something**: an author it held nothing for,
+    ///   or a claim that differs from the one it held. A member's routine refresh of the claim
+    ///   the board already holds is `false`, and that is what keeps a republish from looking like
+    ///   news: every node told of news republishes, so a refresh counted as news made two members'
+    ///   boards wake each other about a hundred times a second (#179).
     pub fn accept_member(
         &mut self,
         record: RendezvousRecord,
         resolve_member: impl FnOnce(&Digest32) -> Option<CompositePublicKey>,
         now: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // 1. Member-only: resolve the author's authenticated membership key. No key
         //    for this author_id ⇒ not a channel member ⇒ rejected.
         let author_pubkey = resolve_member(&record.author_id)
@@ -256,25 +261,28 @@ impl RendezvousStore {
         let bucket = self.members.entry(bucket_key).or_default();
 
         // 4. Freshness vs the current record for this author (if any).
-        if let Some(cur) = bucket.get(&record.author_id) {
-            if same_member_claim(cur, &record)
-                && within_refresh_floor(record.timestamp, cur.timestamp)
-            {
-                return Ok(()); // already held: see `check_replacement`
+        let learned = if let Some(cur) = bucket.get(&record.author_id) {
+            let same = same_member_claim(cur, &record);
+            if same && within_refresh_floor(record.timestamp, cur.timestamp) {
+                return Ok(false); // already held: see `check_replacement`
             }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
-        } else if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
-            // New author would exceed the bucket cap: only admit if pruning expired
-            // entries frees room.
-            bucket.retain(|_, r| now < member_expiry(r));
+            !same
+        } else {
             if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
-                return Err(Error::RendezvousRejected("member bucket at capacity"));
+                // New author would exceed the bucket cap: only admit if pruning expired
+                // entries frees room.
+                bucket.retain(|_, r| now < member_expiry(r));
+                if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
+                    return Err(Error::RendezvousRejected("member bucket at capacity"));
+                }
             }
-        }
+            true
+        };
 
         // 5. Admit: replace the author's current record (one current per author).
         bucket.insert(record.author_id, record);
-        Ok(())
+        Ok(learned)
     }
 
     /// Admit (or refresh) a **member bundle** record (ADR-016 M14), enforcing the
@@ -289,12 +297,14 @@ impl RendezvousStore {
     /// [`RendezvousStore::accept_member`]; the resolved key must be the bundle's
     /// root (checked by [`MemberBundleRecord::verify`]), so a member cannot
     /// publish another identity's prekeys under its own name.
+    ///
+    /// Returns `Ok(learned)` as [`RendezvousStore::accept_member`] does.
     pub fn accept_bundle(
         &mut self,
         record: MemberBundleRecord,
         resolve_member: impl FnOnce(&Digest32) -> Option<CompositePublicKey>,
         now: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // 1. Member-only.
         let author_pubkey = resolve_member(&record.author_id)
             .ok_or(Error::RendezvousRejected("author is not a channel member"))?;
@@ -315,23 +325,26 @@ impl RendezvousStore {
         let bucket = self.bundles.entry(bucket_key).or_default();
 
         // 4. Freshness vs the current bundle for this author (if any).
-        if let Some(cur) = bucket.get(&record.author_id) {
-            if same_bundle_claim(cur, &record)
-                && within_refresh_floor(record.timestamp, cur.timestamp)
-            {
-                return Ok(()); // already held: see `check_replacement`
+        let learned = if let Some(cur) = bucket.get(&record.author_id) {
+            let same = same_bundle_claim(cur, &record);
+            if same && within_refresh_floor(record.timestamp, cur.timestamp) {
+                return Ok(false); // already held: see `check_replacement`
             }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
-        } else if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
-            bucket.retain(|_, r| now < bundle_expiry(r));
+            !same
+        } else {
             if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
-                return Err(Error::RendezvousRejected("bundle bucket at capacity"));
+                bucket.retain(|_, r| now < bundle_expiry(r));
+                if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
+                    return Err(Error::RendezvousRejected("bundle bucket at capacity"));
+                }
             }
-        }
+            true
+        };
 
         // 5. Admit: one current bundle per author.
         bucket.insert(record.author_id, record);
-        Ok(())
+        Ok(learned)
     }
 
     /// Admit a channel's **genesis** (ADR-007 §Genesis; M14.7b).
