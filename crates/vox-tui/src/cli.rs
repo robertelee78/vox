@@ -20,7 +20,7 @@ use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::node::link::{merge_anchor_spec, merge_anchors_file};
 use vox_core::node::paths::{Paths, DEFAULT_PROFILE};
 
-use crate::app::{run_live, run_node};
+use crate::app::{run_live, run_node, AppError};
 
 /// Profile selection shared by the interactive commands.
 #[derive(Args, Debug, Clone)]
@@ -864,6 +864,98 @@ pub struct IdentityArgs {
     pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
+/// Which rooms `vox node` serves (`--serve`).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Serve {
+    /// Any room published to this anchor.
+    Anyone,
+    /// Only rooms made by someone in this profile's `vox trust` list.
+    Trusted,
+}
+
+/// `vox node`
+#[derive(Args, Debug, Clone)]
+pub struct NodeArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// Which rooms this anchor serves: `anyone` (the default) serves any room published to
+    /// it; `trusted` serves only rooms made by someone in this profile's `vox trust` list.
+    /// `trusted` needs this profile's identity passphrase (`--identity-passphrase-file` or
+    /// `VOX_IDENTITY_PASSPHRASE`) to read that list, and reads it once at start. Without the
+    /// flag, the `serve` file in the config directory (`anyone` or `trusted`) decides.
+    #[arg(long, env = "VOX_SERVE", value_enum)]
+    pub serve: Option<Serve>,
+    /// **Refused**, as for every verb: a command line is world-readable while the process
+    /// runs. Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`, or let it prompt.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line). Only `--serve trusted`
+    /// needs it: the trust list is sealed under this profile's identity.
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
+}
+
+impl NodeArgs {
+    /// The `--serve` choice: the flag (or `VOX_SERVE`), else the config directory's `serve`
+    /// file, else `anyone`. A `serve` file that says anything else is refused, not guessed at.
+    fn serve(&self, paths: &Paths) -> Result<Serve, AppError> {
+        if let Some(serve) = self.serve {
+            return Ok(serve);
+        }
+        let path = paths.serve_file();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Serve::Anyone),
+            Err(e) => return Err(AppError::Usage(format!("reading {}: {e}", path.display()))),
+        };
+        match text.lines().map(str::trim).find(|l| !l.is_empty()) {
+            None | Some("anyone") => Ok(Serve::Anyone),
+            Some("trusted") => Ok(Serve::Trusted),
+            Some(other) => Err(AppError::Usage(format!(
+                "{} says {other:?}; it must say `anyone` or `trusted`",
+                path.display()
+            ))),
+        }
+    }
+
+    /// For `--serve trusted`, the creators whose rooms this anchor serves: the profile's
+    /// `vox trust` list, read once with the identity passphrase. `None` for `anyone`.
+    fn serve_only(
+        &self,
+        paths: &Paths,
+    ) -> Result<Option<std::collections::BTreeSet<vox_core::hash::Digest32>>, AppError> {
+        if self.serve(paths)? == Serve::Anyone {
+            return Ok(None);
+        }
+        let refuse = |why: String| {
+            AppError::Usage(format!(
+                "--serve trusted: {why}. It serves only rooms made by someone in this profile's \
+                 `vox trust` list, so it will not start without it"
+            ))
+        };
+        let mut profile = vox_core::node::profile::Profile::open(paths.clone()).map_err(|e| {
+            refuse(format!(
+                "this profile has no `vox trust` list to read ({e}); make one with `vox id` \
+                 and `vox trust add <fingerprint>`"
+            ))
+        })?;
+        let passphrase = crate::tunnel_cli::identity_passphrase_for(
+            paths,
+            self.identity_passphrase.clone(),
+            self.identity_passphrase_file.clone(),
+        )?;
+        profile
+            .unlock(passphrase.as_bytes())
+            .map_err(|e| refuse(format!("the identity did not unlock ({e})")))?;
+        let signer = profile
+            .signer()
+            .map_err(|e| refuse(format!("the identity did not unlock ({e})")))?;
+        let keyring = vox_core::node::trust::Keyring::load(profile.store(), signer)
+            .map_err(|e| refuse(format!("the trust list did not open ({e})")))?;
+        Ok(Some(keyring.trusted()))
+    }
+}
+
 /// `vox trust`
 #[derive(Subcommand)]
 enum TrustCmd {
@@ -1040,7 +1132,7 @@ enum Cmd {
     /// hole punches and carries circuits for your rooms. It holds no room and can
     /// read nothing; its identity is a key file in the profile directory, created on
     /// first run. Prints the `<fingerprint>@<multiaddr>` to give clients as `--anchor`.
-    Node(ProfileArgs),
+    Node(NodeArgs),
     /// Run this profile's node without a terminal, so agent sessions can attach
     /// (ADR-020 §12).
     ///
@@ -1201,7 +1293,8 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        Cmd::Node(args) => {
+        Cmd::Node(node_args) => {
+            let args = &node_args.profile;
             let paths = match args.paths() {
                 Ok(p) => p,
                 Err(e) => {
@@ -1216,7 +1309,14 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match run_node(paths, args.listen, anchors) {
+            let serve_only = match node_args.serve_only(&paths) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("vox node: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match run_node(paths, args.listen, anchors, serve_only) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox node: {e}");
