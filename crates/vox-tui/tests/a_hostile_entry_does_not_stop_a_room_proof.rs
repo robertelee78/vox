@@ -21,8 +21,8 @@
 //! Mallory runs as `strip-payload`: she serves every entry without its payload. The signature
 //! covers the skeleton only, so the stripped entry verifies; it used to be taken as held, filling
 //! its position with nothing: never logged, never rendered, never asked for again. Staging: Bob is
-//! stopped (SIGSTOP), Alice posts, Mallory gets it; Alice is stopped and Bob resumed, so Bob's only
-//! copy is Mallory's. Asserted:
+//! stopped (SIGSTOP), Alice posts, Mallory gets it; Alice and the anchor (which holds the room's
+//! entries too) are stopped and Bob resumed, so Bob's only copy is Mallory's. Asserted:
 //! 1. Bob reads Alice's posts, the first one included (Mallory may serve that one too);
 //! 2. once Alice is back, Bob reads the post he first got from Mallory, and he refused her copy
 //!    (precondition, else CANNOT MEASURE: Bob had a session with Mallory while Alice was stopped);
@@ -205,7 +205,7 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     let sender = mutant_sender();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let (_anchor, spec) = anchor(root);
+    let (anchor_d, spec) = anchor(root);
     let alice = Member::new(root, "alice");
     let bob = Member::new(root, "bob");
     let mallory = Member::new(root, "mallory");
@@ -245,7 +245,9 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     let post = "alice, while bob was away";
     alice.post(&room, post);
     let held = arrives(&mallory, &room, post);
+    // The anchor holds the room's entries too, and would serve bob the whole one.
     alice_d.signal("-STOP");
+    anchor_d.signal("-STOP");
     bob_d.signal("-CONT");
     assert!(
         held.is_some(),
@@ -266,6 +268,7 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
 
     // ---- alice comes back: bob gets her post whole ------------------------------------------
     alice_d.signal("-CONT");
+    anchor_d.signal("-CONT");
     let took = arrives(&bob, &room, post);
     println!("[proof] stripped: bob refused {refused} entr(ies) from mallory; alice's post reached him: {took:?}");
     assert!(
