@@ -33,8 +33,8 @@
 //! address for the guest.
 //!
 //! Mutations: `NetEvent::RepublishTo` does nothing; the republish sent at once instead of past the
-//! second; no republish at all (cap 0); the `seq` floor left where the clock puts it (V210-61) —
-//! each red.
+//! second; no republish at all (cap 0); the `seq` floor left where the clock puts it (V210-61); the
+//! `timestamp` floor left where the clock puts it (V210-64) — each red.
 
 #![cfg(unix)]
 
@@ -54,7 +54,9 @@ use world::{args, vox_once, VoxProc};
 
 /// Cold forwards, one after another.
 const SAMPLES: usize = 5;
-/// How far behind B's millisecond clock runs: **further than waiting can cure** (V210-61). At
+/// How far behind B's clocks run — **both**, the milliseconds that floor `seq` and the seconds a
+/// record is stamped with, as in a real clock step (V210-64) — **further than waiting can cure**
+/// (V210-61). At
 /// -2500 ms the cure came on the last of the three tries in 57 of 60 samples on integrate dd78874,
 /// and now and then not at all, because each try only waited a second for the clock. Five
 /// seconds is out of reach of three such waits, so this stage is red unless each republish also

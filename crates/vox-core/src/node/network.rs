@@ -1300,6 +1300,10 @@ impl NodeNet {
     /// channel, or a member signed a witness for its join. A bundle record cannot be
     /// built without one, which is the point: a key with no evidence behind it has no
     /// business on a board.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per published field; grouping them would hide what is sent"
+    )]
     pub fn own_records(
         &self,
         signer: &dyn RootSigner,
@@ -1307,9 +1311,11 @@ impl NodeNet {
         epoch: u64,
         ring: &PrekeyRing,
         seq: u64,
+        timestamp: u64,
         admission: Admission,
     ) -> Result<(RendezvousRecord, MemberBundleRecord)> {
-        let now = self.now();
+        // The caller's, not the clock's: after a stale refusal it may be past the clock (V210-64).
+        let now = timestamp;
         let endpoints = self.local_endpoints()?;
         let address = RendezvousRecord::build(
             signer,
@@ -1362,7 +1368,7 @@ impl NodeNet {
         admission: Admission,
     ) -> Result<()> {
         let (address, bundle) =
-            self.own_records(signer, channel_id, epoch, ring, seq, admission)?;
+            self.own_records(signer, channel_id, epoch, ring, seq, self.now(), admission)?;
         let mut client = RendezvousClient::open(conn).await?;
         let res = async {
             client.put(&address.to_wire()).await?;
