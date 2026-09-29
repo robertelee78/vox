@@ -138,10 +138,14 @@ impl Profile {
         });
         // **A failed attempt leaves nothing behind** (V210-77): the store it made holds only
         // the public facts of an identity that never existed, so it is removed, and a store it
-        // moved aside goes back where it was, for the next attempt to move aside again.
+        // moved aside goes back where it was, for the next attempt to move aside again. So is
+        // the vault, if the failure came after its rename (the directory would not flush): a
+        // vault left beside a removed or restored store is a profile that opens as nobody. It
+        // is this attempt's own — creating refuses a profile that already has one.
         let store = match made {
             Ok(store) => store,
             Err(e) => {
+                let _ = std::fs::remove_file(paths.vault_file());
                 let _ = std::fs::remove_file(&store_file);
                 if let Some(from) = aside {
                     let _ = std::fs::rename(&from, &store_file);

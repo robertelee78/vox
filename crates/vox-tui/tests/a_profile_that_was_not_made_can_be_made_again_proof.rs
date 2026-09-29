@@ -11,7 +11,7 @@
 //!
 //! The store is now written first and the vault last, so a failure leaves no identity; and a store
 //! with no vault beside it is moved aside (kept, renamed `store.redb.orphaned-<secs>`), never
-//! adopted; a failed attempt removes the store it made and puts back one it moved aside. Three
+//! adopted; a failed attempt removes the store it made and puts back one it moved aside. Four
 //! stagings, each a profile directory as a person could leave it:
 //!
 //! 1. **The store cannot be opened** where `vox id` makes it: a directory stands at `store.redb`.
@@ -25,10 +25,17 @@
 //!    nothing behind — no store, nothing kept aside — in a fresh profile; over a leftover store it
 //!    must put that store back where it was, byte for byte. Once the obstacle is gone, `vox id`
 //!    succeeds.
+//! 4. **The vault lands but its directory will not flush** (macOS): `vox id` runs under the
+//!    test interposer with `VOX_INTERPOSE_FAIL_DIR_SYNC` naming the profile directory, so the
+//!    vault's rename succeeds and the flush of the directory after it fails with `EIO`. The
+//!    recorded calls must show exactly that (else CANNOT MEASURE). `vox id` must leave nothing —
+//!    no vault, no store, nothing kept aside — or, over a leftover store, that store back in
+//!    place byte for byte and no vault; and the next `vox id` must make an identity a daemon
+//!    unlocks.
 //!
 //! Mutations that must turn it red: `vox id` opens whatever stands at `store.redb` (no move
 //! aside: 1 and 2); a failed vault write reported as the store's (3); a failed attempt leaving its
-//! store behind (3).
+//! store behind (3); a failed attempt leaving the vault it renamed into place (4).
 //!
 //! **On review only**: the order of the writes. No staging through the binary fails the store's
 //! first write without something already at its path, which the move aside clears; the order is
@@ -38,6 +45,10 @@
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[cfg(target_os = "macos")]
+#[path = "support/syscalls.rs"]
+mod syscalls;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -332,5 +343,132 @@ fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
     assert!(
         o.ok && aside == 1,
         "the retry must make the identity and keep the leftover store aside, once"
+    );
+}
+
+/// `vox id` under the test interposer, with every flush of `dir` failing with `EIO`. Returns
+/// success, stderr, and whether the vault's rename landed and a flush of `dir` failed after it.
+#[cfg(target_os = "macos")]
+fn id_with_the_directory_unflushable(p: &Profile) -> (bool, String, bool) {
+    let dir = std::fs::canonicalize(p.dir()).expect("the profile directory");
+    let log = p.data.join(format!("interpose-{}.tsv", std::process::id()));
+    let out = p
+        .command(&["id"])
+        .env("DYLD_INSERT_LIBRARIES", syscalls::interposer())
+        .env("VOX_INTERPOSE_LOG", &log)
+        .env("VOX_INTERPOSE_FAIL_DIR_SYNC", &dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vox id under the interposer");
+    let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
+    let _ = std::fs::remove_file(&log);
+    let vault = dir.join("vault.cbor");
+    let landed = events.iter().position(|e| {
+        matches!(&e.call, syscalls::Call::Rename { to, .. } if syscalls::norm(to) == vault)
+            && e.ret == 0
+    });
+    let staged = landed.is_some_and(|at| {
+        events[at..].iter().any(|e| {
+            matches!(&e.call, syscalls::Call::Sync { path, .. } if *path == dir) && e.errno == 5
+        })
+    });
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        staged,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "real binaries, production Argon2id and the test interposer; the release gate runs it"]
+fn a_vault_whose_directory_will_not_flush_leaves_nothing() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // (a) a fresh profile.
+    let p = Profile::new(tmp.path(), "noflush");
+    std::fs::create_dir_all(p.dir()).unwrap();
+    let (ok, said, staged) = id_with_the_directory_unflushable(&p);
+    let (vault, store, aside) = (
+        p.dir().join("vault.cbor").exists(),
+        p.dir().join("store.redb").exists(),
+        p.kept_aside(),
+    );
+    eprintln!(
+        "[proof] vault renamed, directory flush EIO: staged {staged}; vox id ok={ok}; vault left \
+         {vault}, store left {store}, kept aside {aside}: {}",
+        said.trim()
+    );
+    assert!(
+        staged,
+        "CANNOT MEASURE: the vault's rename did not land before a failed flush of the directory"
+    );
+    assert!(
+        !ok,
+        "CANNOT MEASURE: vox id succeeded with its directory unflushable"
+    );
+    assert!(
+        !vault && !store && aside == 0,
+        "a failed `vox id` must leave nothing behind, the vault included (vault left {vault}, \
+         store left {store}, kept aside {aside})"
+    );
+    let o = p.vox(&["id"]);
+    let again = p.vox(&["id"]);
+    let (answers, what) = p.daemon_answers();
+    eprintln!(
+        "[proof] then vox id ok={} {}; again ok={}; its daemon answers: {answers}",
+        o.ok,
+        o.stdout.trim(),
+        again.ok
+    );
+    assert!(
+        o.ok && again.ok && again.stdout.trim() == o.stdout.trim() && answers,
+        "the next `vox id` must make an identity that opens again and a daemon unlocks: {}{} {what}",
+        o.stderr,
+        again.stderr
+    );
+
+    // (b) over a leftover store.
+    let q = Profile::new(tmp.path(), "noflush-leftover");
+    let first = q.vox(&["id"]);
+    assert!(
+        first.ok,
+        "CANNOT MEASURE: the first vox id: {}",
+        first.stderr
+    );
+    std::fs::remove_file(q.dir().join("vault.cbor")).unwrap();
+    let before = std::fs::read(q.dir().join("store.redb")).unwrap();
+    let (ok, said, staged) = id_with_the_directory_unflushable(&q);
+    let vault = q.dir().join("vault.cbor").exists();
+    let back = std::fs::read(q.dir().join("store.redb")).ok();
+    let aside = q.kept_aside();
+    eprintln!(
+        "[proof] leftover store, directory flush EIO: staged {staged}; vox id ok={ok}; vault left \
+         {vault}; the leftover back in place: {}; kept aside {aside}: {}",
+        back.as_deref() == Some(&before[..]),
+        said.trim()
+    );
+    assert!(
+        staged && !ok,
+        "CANNOT MEASURE: the leftover staging did not fail after the vault's rename"
+    );
+    assert!(
+        !vault && back.as_deref() == Some(&before[..]) && aside == 0,
+        "a failed `vox id` over a leftover store must leave no vault and that store back in place \
+         (vault left {vault}, kept aside {aside})"
+    );
+    let o = q.vox(&["id"]);
+    let (answers, what) = q.daemon_answers();
+    eprintln!(
+        "[proof] then vox id ok={}; its daemon answers: {answers}; kept aside {}",
+        o.ok,
+        q.kept_aside()
+    );
+    assert!(
+        o.ok && answers && q.kept_aside() == 1,
+        "the next `vox id` must make an identity a daemon unlocks, the leftover kept aside once: \
+         {} {what}",
+        o.stderr
     );
 }
