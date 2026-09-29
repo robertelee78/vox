@@ -20,7 +20,11 @@
 //! And while everyone was idle, Alice's node renewed, and not in a storm: its publish rounds
 //! (`vox status --json`) are at least one per lifetime and at most two per half-lifetime.
 //!
-//! Mutation: no scheduled renewal, and Carol cannot get in (the records expired).
+//! Carol's daemon names each step of her join; the board must have held a member's address when
+//! she asked (no `address poll`: she did not have to wait for anyone to publish again).
+//!
+//! Mutation: no scheduled renewal. The records lapse; Carol's join polls the board for about
+//! twenty seconds until a member's own traffic brings one back, and Alice's rounds fall to 0–1.
 
 #![cfg(unix)]
 
@@ -196,23 +200,43 @@ fn an_idle_node_stays_findable_on_its_board() {
         !anchor_only.contains(&format!("a={alice_fp}&b=")),
         "CANNOT MEASURE: Alice's endpoint is still in the address: {anchor_only}"
     );
-    let _carol = daemon("carol", &carol_dir, &spec, &idpass);
+    let carol = daemon("carol", &carol_dir, &spec, &idpass);
     let t = Instant::now();
     let (joined, out, err) = vox_in(
         &carol_dir,
         &["room", "join", &anchor_only, "--name", "quiet"],
         "room pass",
     );
+    let took = t.elapsed();
+    // Her daemon's own account of the join: `vox: join got in — board …, fetch …, <responder>:
+    // …`. A responder whose address the board no longer holds shows up as `address poll ×N`: the
+    // join waited for the responder to publish again, which is the lapse, however it ended.
+    let said = carol.said_since(t);
+    for l in &said {
+        println!("[carol] {l}");
+    }
+    let steps = said
+        .iter()
+        .find_map(|l| l.split("vox: join got in — ").nth(1))
+        .map(str::to_owned);
     println!(
         "[proof] idle {}s ({LIFETIMES} lifetimes of {TTL}s): alice's node renewed with {renewed} \
          publish round(s); carol, with only the anchor's address, joined = {joined} in {:.1?}",
         idle.as_secs(),
-        t.elapsed()
+        took
     );
     assert!(
         joined,
         "a node idle for {LIFETIMES} record lifetimes was not findable on its anchor's board: \
          {out}{err}"
+    );
+    let steps = steps.unwrap_or_else(|| {
+        panic!("CANNOT MEASURE: carol's daemon printed no `join got in` line: {said:#?}")
+    });
+    assert!(
+        !steps.contains("address poll"),
+        "after {LIFETIMES} idle lifetimes the anchor's board no longer held a member's address: \
+         carol's join had to wait for one — {steps}"
     );
     // At half the lifetime to one anchor: about two rounds a lifetime. At least one a lifetime,
     // or the records would have lapsed; at most twice the schedule, or it is a storm.
