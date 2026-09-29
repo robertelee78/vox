@@ -15,8 +15,8 @@
 //! the circuit is the only path — see `support/relay.rs`):
 //!
 //! 1. **Stopped mid-join by SIGTERM**: exit status 143 — not death by the signal — and stderr says
-//!    `stopped by SIGTERM after …s`, that the room was not joined, and the step it was waiting in,
-//!    naming the host as the member it waited for. The host is SIGSTOPped the moment the guest's
+//!    `stopped by SIGTERM after …s`, that the room was not joined, and the join step it was waiting
+//!    in — naming the host, when that step waits on a member. The host is SIGSTOPped the moment the guest's
 //!    pre-join record reaches the board, so the join is left waiting on it: for its dial, or for
 //!    its answer to the proof of work. A join that ended before it could be stopped is CANNOT
 //!    MEASURE, never a pass. **And it ends when it says so**, within [`STOPS_WITHIN`] of the
@@ -83,6 +83,18 @@ const PROFILE: &str = if cfg!(debug_assertions) {
 } else {
     "release"
 };
+
+/// The steps a join announces as it begins them, as `vox connect` names them when it is stopped.
+const JOIN_STEPS: [&str; 8] = [
+    "reaching a board",
+    "reading the room from board ",
+    "announcing this joiner to board ",
+    "waiting for member ",
+    "dialling member ",
+    "the join exchange with member ",
+    "sealing the room key",
+    "making the room here",
+];
 
 /// How a `vox connect` ended.
 struct Ended {
@@ -243,15 +255,41 @@ fn stopped_mid_join(w: &mut RelayWorld, host: u32, sig: &str, name: &str, code: 
         format!("stopped by {name} after "),
         "the room was not joined".to_owned(),
         "it had waited ".to_owned(),
-        format!("member {host12}"),
     ] {
         assert!(
             e.stderr.contains(&want),
             "{case}: stderr does not say {want:?} — it must say how long it ran, that the room \
-             was not joined, and the step it was waiting in (for the host, {host12}).\n{}",
+             was not joined, and the step it was waiting in.\n{}",
             e.describe()
         );
     }
+    // Which step the stop lands in depends on how far the join got before the host stopped — a
+    // member step, or the room being made after the host had answered — but it is always one of the
+    // join's own, never the verb's fallback ("the node to take the join"). A step that waits on a
+    // member names it.
+    let waited = e
+        .stderr
+        .split("it had waited ")
+        .nth(1)
+        .and_then(|l| l.lines().next())
+        .and_then(|l| l.split_once(" for "))
+        .map(|(_, step)| step)
+        .unwrap_or_default();
+    let step = JOIN_STEPS
+        .iter()
+        .find(|s| waited.starts_with(*s))
+        .unwrap_or_else(|| {
+            panic!(
+                "{case}: the step it waited in, {waited:?}, is not one of the join's own steps.\n{}",
+                e.describe()
+            )
+        });
+    assert!(
+        !waited.contains("member ") || waited.contains(&format!("member {host12}")),
+        "{case}: it waited on a member, but not the host {host12}.\n{}",
+        e.describe()
+    );
+    eprintln!("[proof] ({PROFILE}) {name}: stopped in the step {step:?}");
     e
 }
 
