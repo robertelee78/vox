@@ -276,10 +276,16 @@ impl Drop for CircuitSlot {
 /// circuit runs: that is what marks those connections as carrying, so a retired one is
 /// not closed under a live circuit. `connected` resolves a fingerprint to a live
 /// connection (the relay's own peer table); `endpoint` is where a circuit terminating
-/// here is attached.
+/// here is attached. `shares_room` says whether two peers share a room this node serves: a
+/// relay is only ever carried between them (see `NodeNet::relays_between`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each is a separate authority the relay consults; bundling them would hide which"
+)]
 pub async fn serve_circuit<F>(
     carrier: &Arc<VoxConnection>,
     classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
+    shares_room: &(dyn Fn(&Digest32, &Digest32) -> bool + Sync),
     mut send: SendStream,
     mut recv: RecvStream,
     connected: F,
@@ -292,7 +298,10 @@ where
     let peer = carrier.peer_id();
     match opening_answer(&mut recv).await? {
         CircuitFrame::Open { peer: target } => {
-            if !relays_for(classify(&peer)) || !relays_for(classify(&target)) {
+            if !relays_for(classify(&peer))
+                || !relays_for(classify(&target))
+                || !shares_room(&peer, &target)
+            {
                 refuse(&mut send, CircuitRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused(
                     "circuit: peer may not ask for a relay",
