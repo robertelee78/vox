@@ -2785,6 +2785,7 @@ impl Node {
                         // Connections a better path displaced are closed once their
                         // grace is up (M15.1b).
                         net.manager().retire_expired();
+                        net.prune_board();
                     }
                     self.retry_upgrades_if_due().await;
                     self.maintain_prekeys();
@@ -3106,6 +3107,8 @@ impl Node {
             }
         });
         let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
+        // Only an anchor keeps a board for a room it does not hold (V210-70).
+        net.serve_any_room(self.anchor_logs);
         net.count_ladders_in(Arc::clone(&self.sync_book));
         net.manager().report_to(self.event_tx.clone());
         // **A record landing on this node's board is an event, not something to notice later.**
@@ -3671,7 +3674,7 @@ impl Node {
                 continue;
             };
             if let Ok(state) = crate::node::anchor::AnchorState::open(&store, sek, &cid) {
-                let _ = net.publish_local(&state.genesis().to_wire());
+                let _ = net.publish_anchored(&state.genesis().to_wire());
                 self.anchored
                     .insert(cid, Arc::new(tokio::sync::Mutex::new(state)));
             }

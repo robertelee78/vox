@@ -297,12 +297,14 @@ pub enum CoordInbound {
 ///
 /// `observed` is the source address this node sees for the connection the stream came
 /// in on — the answer to `WHOAMI`. `policy` classifies both the peer and any peer it
-/// names, and `connected` resolves a fingerprint to a live connection (the
-/// coordinator's own peer table).
+/// names, `shares_room` says whether the two share a room this node serves (a relay is
+/// only ever between them — see `NodeNet::relays_between`), and `connected` resolves a
+/// fingerprint to a live connection (the coordinator's own peer table).
 pub async fn serve_coord<F>(
     peer: Digest32,
     observed: Option<Multiaddr>,
     classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
+    shares_room: &(dyn Fn(&Digest32, &Digest32) -> bool + Sync),
     mut send: SendStream,
     mut recv: RecvStream,
     connected: F,
@@ -329,7 +331,10 @@ where
         CoordFrame::Relay { peer: target } => {
             // Both ends must be peers this node relays for: a member may not make it
             // open a coord stream to an identity it knows nothing about.
-            if !relays_for(classify(&peer)) || !relays_for(classify(&target)) {
+            if !relays_for(classify(&peer))
+                || !relays_for(classify(&target))
+                || !shares_room(&peer, &target)
+            {
                 refuse(&mut send, CoordRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused("coord: peer may not ask for a relay"));
             }
