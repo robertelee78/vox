@@ -755,9 +755,12 @@ fn an_accept_error_does_not_end_the_control_socket() {
 
     // Connect until one is never greeted: the daemon is out of descriptors and its accept fails.
     let mut held = Vec::new();
-    let (mut greeted, mut ungreeted) = (0usize, 0usize);
+    let (mut greeted, mut ungreeted, mut refused) = (0usize, 0usize, 0usize);
     for _ in 0..120 {
+        // A refused connect after an ungreeted one is the old defect showing already: the
+        // accept loop has ended and dropped the listener. It stops the loading, not the proof.
         let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) else {
+            refused += 1;
             break;
         };
         s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
@@ -773,9 +776,12 @@ fn an_accept_error_does_not_end_the_control_socket() {
             break;
         }
     }
-    eprintln!("[proof] connections greeted before the limit: {greeted}; ungreeted: {ungreeted}");
+    eprintln!(
+        "[proof] connections greeted before the limit: {greeted}; ungreeted (accept failed): \
+         {ungreeted}; refused: {refused}"
+    );
     assert!(
-        ungreeted >= 3,
+        ungreeted >= 1,
         "CANNOT MEASURE: {greeted} connections were all greeted; the daemon never ran out of \
          descriptors"
     );
