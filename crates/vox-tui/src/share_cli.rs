@@ -281,7 +281,7 @@ pub async fn share(
 }
 
 /// Answer one HTTP request with the file. Whatever the path, the answer is the share:
-/// there is one thing here. Returns whether every byte went out.
+/// there is one thing here. Returns whether the receiver took every byte.
 async fn serve_one(mut sock: tokio::net::TcpStream, file: &Path, name: &str, size: u64) -> bool {
     // Read the request head (bounded) so a client that sends one gets a well-formed
     // exchange; the path is not interpreted.
@@ -323,5 +323,20 @@ async fn serve_one(mut sock: tokio::net::TcpStream, file: &Path, name: &str, siz
         }
     }
     let _ = sock.shutdown().await;
-    sent == size
+    if sent != size {
+        return false;
+    }
+    // **Written is not delivered.** The last write lands in this node's socket buffers, not
+    // at the receiver, and a fetch counted here used to end the share — whose
+    // `RemoveService` then cut the very session still carrying those bytes (PRD-001 R22),
+    // leaving the receiver short. The far end closing is what says it has everything: it
+    // reaches this socket only once the receiver has read the stream's end and closed its
+    // own side. A reset instead means it did not.
+    loop {
+        match sock.read(&mut buf).await {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
 }

@@ -382,3 +382,123 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     }
     drop((folder_share, share, alice, bob, mallory, anchor));
 }
+
+/// The last fetch reaches its receiver whole, however slowly it reads.
+///
+/// A share used to count a fetch when its last byte entered the local socket, and ending on
+/// that count removed the service — which cuts every session carried on it (PRD-001 R22),
+/// the one still delivering those bytes included. A fast `vox room get` usually outran the
+/// cut. Here it cannot: the file is larger than a stream's flow-control window (16 MiB), and
+/// the receiver reads at 2 MB/s, so when the last byte leaves the share megabytes are still
+/// waiting on the host for the receiver to make room — and the red does not depend on timing.
+#[test]
+#[ignore = "an anchor, two vox daemons and real child processes; CI runs it in release"]
+fn the_last_fetch_is_delivered_before_the_share_ends() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let payload: Vec<u8> = (0..24_000_000u32)
+        .map(|i| (i.wrapping_mul(131) >> 5) as u8)
+        .collect();
+    let file = tmp.path().join("big.bin");
+    std::fs::write(&file, &payload).unwrap();
+
+    let anchor_dir = tmp.path().join("anchor");
+    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    let mut anchor = VoxProc::spawn(
+        "anchor",
+        &anchor_dir,
+        &args(&["node", "--listen", "127.0.0.1:0"]),
+    );
+    let spec = anchor
+        .expect_line("an --anchor spec", |l| {
+            l.trim_start().contains("@/ip4/127.0.0.1/udp/")
+        })
+        .trim()
+        .to_owned();
+    let mut alice = member(tmp.path(), "alice");
+    let mut bob = member(tmp.path(), "bob");
+    alice.trust(&bob, "bob");
+    bob.trust(&alice, "alice");
+    for m in [&mut alice, &mut bob] {
+        m.start(&spec);
+    }
+    let (ok, out, err) = vox(
+        &alice.dir,
+        &["room", "create", "--name", "files"],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(ok, "vox room create: {out}{err}");
+    let (_, list, _) = vox(&alice.dir, &["room", "list"], None);
+    let room = list
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some("files"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("files is not listed: {list}"))
+        .to_owned();
+    let (ok, link, err) = vox(&alice.dir, &["room", "invite", &room], None);
+    assert!(ok, "vox room invite: {err}");
+    let (ok, out, err) = vox(
+        &bob.dir,
+        &["room", "join", link.trim(), "--name", "files"],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(ok, "bob joins files: {out}{err}");
+
+    let mut share = VoxProc::spawn(
+        "alice share",
+        &alice.dir,
+        &args(&["share", &room, file.to_str().unwrap(), "--count", "1"]),
+    );
+    let line = share.expect_within(TIMEOUT, "the share's port", |l| {
+        l.starts_with("vox: sharing ")
+    });
+    let port: u16 = line
+        .split("on port ")
+        .nth(1)
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no port in {line:?}"));
+    let (_bob_up, bob_proxy) = bob.up();
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "--fail",
+            "--max-time",
+            "60",
+            "--limit-rate",
+            "2M",
+            "--socks5-hostname",
+            &bob_proxy.to_string(),
+            &format!("http://alice.files.vox:{port}/big.bin"),
+        ])
+        .output()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    let mut ended = None;
+    while Instant::now() < until {
+        if let Ok(Some(s)) = share.child.try_wait() {
+            ended = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let share_said = share.transcript();
+    eprintln!(
+        "slow curl: exit {:?}, {} of {} bytes, sha {} (sent {})\nshare ended {ended:?}; it \
+         said:\n{share_said}",
+        out.status.code(),
+        out.stdout.len(),
+        payload.len(),
+        sha(&out.stdout),
+        sha(&payload),
+    );
+    assert!(
+        out.status.success() && sha(&out.stdout) == sha(&payload),
+        "the last fetch must arrive whole before the share ends"
+    );
+    assert!(
+        ended.is_some_and(|s| s.success()) && share_said.contains("fetched 1 time(s)"),
+        "the share must still stop by itself after --count 1"
+    );
+    drop((share, alice, bob, anchor));
+}
