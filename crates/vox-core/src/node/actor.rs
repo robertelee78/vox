@@ -505,6 +505,14 @@ const ANCHOR_REDIAL_SECS: u64 = 30;
 /// [`ANCHOR_REDIAL_SECS`].
 const ANCHOR_FLAP_SECS: u64 = 10;
 
+/// The first wait before a port-mapping renewal that got nothing back is tried again (V210-75),
+/// doubling to [`MAPPING_RETRY_MAX_SECS`]. A gateway that is restarting, or a request lost on
+/// the way, must not end renewal for the life of the node.
+const MAPPING_RETRY_SECS: u64 = 15;
+
+/// The longest wait between retries of a failed port-mapping renewal.
+const MAPPING_RETRY_MAX_SECS: u64 = 600;
+
 /// What a sync session runs against: a member's channel, or an anchor's copy.
 enum SessionTarget {
     Channel(SharedChannel),
@@ -1916,6 +1924,12 @@ pub struct Node {
     /// anchors of each open channel. The peer policy is rebuilt from channel
     /// membership whenever channels change, and these are carried into it.
     anchor_ids: std::collections::BTreeSet<Digest32>,
+    /// Each open room's own anchors, as the room recorded them when it was created, opened or
+    /// joined: redialled after a loss like the configured set (V210-75). A room joined from an
+    /// invite often has no anchor but the one its link named, and a node that dialled that
+    /// anchor once and never again lost its board and its relay the first time the anchor
+    /// restarted. Entries for rooms no longer open are ignored and dropped at the next redial.
+    room_anchors: BTreeMap<Digest32, BootstrapSet>,
     /// An override for the ADR-005 PoW parameters a join binds. `None` means the
     /// channel's own (production `(200,9)`); tests reduce them so the debug suite
     /// does not grind, exactly as they reduce the Argon2 profile.
@@ -1956,6 +1970,9 @@ pub struct Node {
     /// long-running node by itself: it is re-requested at half its lifetime, the
     /// interval RFC 6887 §11.2.1 recommends.
     renew_mappings_at: Option<u64>,
+    /// The wait set after the last renewal that got no mapping back, or 0 when the last one
+    /// succeeded (V210-75): doubles from [`MAPPING_RETRY_SECS`] to [`MAPPING_RETRY_MAX_SECS`].
+    mapping_retry_secs: u64,
     /// ADR-025's sync ports, one per `(room, peer)`: see `node::ports`.
     ports: BTreeMap<(Digest32, Digest32), crate::node::ports::Port>,
     /// Ports waiting for an outbound slot (ADR-025 D6).
@@ -2235,6 +2252,7 @@ impl Node {
             net_tx,
             bind,
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
+            room_anchors: BTreeMap::new(),
             anchors,
             headless,
             anchor_logs,
@@ -2250,6 +2268,7 @@ impl Node {
             anchors_up: BTreeSet::new(),
             sync_dials: BTreeSet::new(),
             renew_mappings_at: None,
+            mapping_retry_secs: 0,
             ports: BTreeMap::new(),
             port_queue: crate::node::ports::Queue::default(),
             slots: Arc::new(std::sync::Mutex::new(crate::node::ports::Slots::default())),
@@ -3309,6 +3328,33 @@ impl Node {
         Ok(())
     }
 
+    /// Every anchor this node keeps a connection to: the configured set first, then each open
+    /// room's own that is not configured (V210-75). One identity appears once, at the
+    /// addresses the configured set gives it if it is there.
+    fn kept_anchors(&self) -> Vec<BootstrapNode> {
+        let mut all: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
+        for (room, set) in &self.room_anchors {
+            if !self.channels.contains_key(room) {
+                continue;
+            }
+            for n in set.nodes() {
+                if !all.iter().any(|a| a.id == n.id) {
+                    all.push(n.clone());
+                }
+            }
+        }
+        all
+    }
+
+    /// Whether `peer` is one of [`Self::kept_anchors`].
+    fn is_kept_anchor(&self, peer: &Digest32) -> bool {
+        self.anchors.get(peer).is_some()
+            || self
+                .room_anchors
+                .iter()
+                .any(|(room, set)| self.channels.contains_key(room) && set.get(peer).is_some())
+    }
+
     /// Dial any configured or learned anchor this node is not connected to. Runs on
     /// the tick: an anchor that restarted, or a link that dropped, is re-established on the
     /// next tick, and only one that keeps failing is backed off (V210-57).
@@ -3317,7 +3363,9 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        let known: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
+        let open = &self.channels;
+        self.room_anchors.retain(|room, _| open.contains_key(room));
+        let known: Vec<BootstrapNode> = self.kept_anchors();
         let up: BTreeSet<Digest32> = known
             .iter()
             .map(|a| a.id)
@@ -3434,7 +3482,7 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let anchors = {
+        let (anchors, own) = {
             let mut channel = shared.lock().await;
             if let Some(profile) = self.profile.as_ref() {
                 let mut add = self.anchors.clone();
@@ -3443,8 +3491,17 @@ impl Node {
                 }
                 let _ = channel.add_anchors(profile.store(), &add);
             }
-            channel.anchors().clone()
+            // A link names the member who issued it too, last; a member is reached at the
+            // addresses its board record gives, not kept like an anchor at the link's.
+            let mut own = BootstrapSet::new();
+            for n in channel.anchors().nodes() {
+                if !channel.is_author(&n.id) {
+                    let _ = own.add(n.clone());
+                }
+            }
+            (channel.anchors().clone(), own)
         };
+        self.room_anchors.insert(*channel_id, own);
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
@@ -3834,8 +3891,21 @@ impl Node {
             NetEvent::AddressesDiscovered { mappings } => {
                 // Re-publish every open channel's records: the addresses in them were
                 // composed before discovery and may name only loopback.
-                self.renew_mappings_at = renew_at(self.now(), &mappings);
-                self.port_mappings = mappings;
+                if mappings.is_empty() && !self.port_mappings.is_empty() {
+                    // **A renewal that got nothing back is tried again** (V210-75). Taken as
+                    // "no gateway" it left `renew_at` nothing to schedule, so one lost reply
+                    // ended renewal for good and the mapping expired under a running node. The
+                    // mappings held are kept: the next try renews them, and a stop still
+                    // deletes a permanent one.
+                    let wait = (self.mapping_retry_secs * 2)
+                        .clamp(MAPPING_RETRY_SECS, MAPPING_RETRY_MAX_SECS);
+                    self.mapping_retry_secs = wait;
+                    self.renew_mappings_at = Some(self.now() + wait);
+                } else {
+                    self.mapping_retry_secs = 0;
+                    self.renew_mappings_at = renew_at(self.now(), &mappings);
+                    self.port_mappings = mappings;
+                }
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
                     self.publish_channel_locally(&channel_id).await;
@@ -3844,8 +3914,9 @@ impl Node {
             }
             NetEvent::ReachFailed { peer, why } => {
                 // An anchor that failed to connect waits before its next dial, doubling to
-                // `ANCHOR_REDIAL_SECS` (V210-57).
-                if self.anchors.nodes().iter().any(|a| a.id == peer) {
+                // `ANCHOR_REDIAL_SECS` (V210-57), a room's own as well as a configured one
+                // (V210-75).
+                if self.is_kept_anchor(&peer) {
                     let wait = self
                         .anchor_backoff
                         .get(&peer)
@@ -7088,7 +7159,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        if self.anchors.nodes().iter().any(|a| a.id == peer) {
+        if self.is_kept_anchor(&peer) {
             return;
         }
         if net.manager().existing(&peer).is_some() || !self.sync_dials.insert(peer) {

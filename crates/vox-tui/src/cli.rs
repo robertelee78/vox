@@ -68,7 +68,10 @@ impl ProfileArgs {
         // who adds one on the command line almost never means "and forget the one I
         // configured". `vox node` writes its own spec into that file, so a client on the
         // same machine as its anchor needs no flag at all, which was the whole point.
-        merge_anchors_file(&mut set, &self.paths()?.anchors_file())?;
+        // A line that cannot be used is skipped and said, and the others still count (V210-75).
+        for skipped in merge_anchors_file(&mut set, &self.paths()?.anchors_file())? {
+            eprintln!("vox: {skipped}");
+        }
         for spec in &self.anchors {
             if spec.trim().is_empty() {
                 continue;
