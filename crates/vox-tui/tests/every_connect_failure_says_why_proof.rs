@@ -28,14 +28,20 @@
 //! 4. **Refused** (a wrong room passphrase, checked by the live host): exit status 1, `cannot join:
 //!    …`, the refusal, and the steps. The refusal is the host's own answer over the circuit, so it
 //!    is also the control: this world's joins reach the host and are answered.
+//! 5. **A join that times out on its host** (SIGSTOPped as in 1, and left to run out): exit status
+//!    1, and the reason names the host and the step that did not complete — its dial, or the join
+//!    exchange. The exchange's timeout used to name nobody: the join ended on advice about members
+//!    that could not be reached, for one that had been reached and then went quiet.
 //!
 //! In every one, stderr is non-empty and the exit is a status, never a signal. Cases 1 and 4 share
-//! one world and 2 and 3 another, as two tests that run side by side. Each prints its counts.
+//! one world, 2 and 3 another and 5 a third, as three tests that run side by side. Each prints its
+//! counts.
 //!
 //! **Mutations that must turn it red:** the verb runner printing nothing for an error; `vox
 //! connect` not taking SIGINT/SIGTERM (cases 1 and 2 die by the signal); the joiner not announcing
-//! its steps (cases 1 and 2 name no member); a stop that waits for the runtime's blocking work
-//! (cases 1 and 2 outlive [`STOPS_WITHIN`] in a debug build, where the solve is long).
+//! its steps (cases 1 and 2 name no member); the exchange's timeout naming nobody (case 5); a stop
+//! that waits for the runtime's blocking work (cases 1 and 2 outlive [`STOPS_WITHIN`] in a debug
+//! build, where the solve is long).
 //!
 //! `#[ignore]`d: production Argon2id and a real PoW. Run it in release.
 
@@ -276,6 +282,22 @@ fn a_connect_stopped_by_sigterm_or_refused_says_why() {
 
     let (c, t0) = start_connect(&w, "not-the-room-passphrase");
     let e = finish(c, t0, FAILS_WITHIN);
+    // The host checks the passphrase only after the joiner's proof of work, and gives up on a solve
+    // that outlasts its patience: in a debug build on a loaded machine the solve alone has taken
+    // 185 s. Then the passphrase was never checked, and the refusal cannot be measured — the
+    // product still said why, which `failed_join` holds it to either way.
+    if !e.stderr.contains("refused") && e.stderr.contains(": the join exchange: ") {
+        failed_join(
+            &e,
+            "refused (a wrong passphrase)",
+            &[": exchange (incl. solve) "],
+        );
+        panic!(
+            "CANNOT MEASURE (refused): the host gave up on the join exchange before it checked the \
+             passphrase — the proof of work outlasted its patience.\n{}",
+            e.describe()
+        );
+    }
     failed_join(&e, "refused (a wrong passphrase)", &["refused"]);
     eprintln!(
         "[proof] ({PROFILE}) refused: status {} in {:.1}s",
@@ -307,4 +329,49 @@ fn a_connect_stopped_by_sigint_or_left_without_its_host_says_why() {
         e.took.as_secs_f64()
     );
     eprintln!("[proof] ({PROFILE}) 2/2 failures said why (SIGINT, the host gone)");
+}
+
+#[test]
+#[ignore = "production Argon2id + a real PoW, a relayed world of real `vox` processes; run in release"]
+fn a_relayed_join_that_times_out_names_its_host_and_the_step() {
+    watchdog::arm();
+    let mut w = RelayWorld::new(Split::Families);
+    let host = w.host.as_ref().expect("a host").child.id();
+    let host12 = w.host_fp[..12].to_owned();
+    until_published(&mut w);
+    let (connect, t0) = start_connect(&w, &w.passphrase.clone());
+    until_announced(&mut w);
+    signal(host, "-STOP");
+    let e = finish(connect, t0, FAILS_WITHIN);
+    failed_join(&e, "timed out on the host", &[]);
+    let reason = e
+        .stderr
+        .lines()
+        .find(|l| l.starts_with("vox: cannot join: "))
+        .unwrap_or_default();
+    assert!(
+        reason.contains(&host12),
+        "timed out on the host: the reason does not name the host {host12}, the member the join \
+         waited on.\n{}",
+        e.describe()
+    );
+    let step = [
+        format!("{host12}: exchange (incl. solve) "),
+        format!("{host12}: dial "),
+    ]
+    .into_iter()
+    .find(|s| e.stderr.contains(s.as_str()))
+    .unwrap_or_else(|| {
+        panic!(
+            "timed out on the host: the steps do not name the host's dial or join exchange as the \
+             one that did not complete.\n{}",
+            e.describe()
+        )
+    });
+    signal(host, "-CONT");
+    eprintln!(
+        "[proof] ({PROFILE}) timed out on the host: status {} in {:.1}s, step {step:?}",
+        e.status,
+        e.took.as_secs_f64()
+    );
 }
