@@ -467,8 +467,12 @@ pub struct ChannelState {
     /// The anchors this channel is published to (M15.1), persisted in `SEG_ANCHORS`.
     anchors: BootstrapSet,
     /// The services this node offers in this channel (ADR-013 Bind config, M16.1),
-    /// persisted in `SEG_SERVICES`.
+    /// persisted in `SEG_SERVICES` — except those in `transient`.
     services: BTreeMap<String, SocketAddr>,
+    /// The tags in `services` that live only as long as whatever offered them (V210-72): a
+    /// `vox room send` offer, withdrawn when its process goes. Never persisted, so a node
+    /// that stops while one runs does not come back offering a port nobody serves any more.
+    transient: BTreeSet<String>,
     /// How **this node** came to be a member here (M17.6), persisted in
     /// `SEG_ADMISSION`: it created the channel, or a member witnessed its join. Needed
     /// whenever this node publishes its own bundle record, which is every time it
@@ -1122,6 +1126,7 @@ impl ChannelState {
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
+            transient: BTreeSet::new(),
             // This node made the channel, so the genesis names it and nothing else needs
             // to (M17.6).
             own_admission: Some(Admission::Creator),
@@ -1391,6 +1396,7 @@ impl ChannelState {
             receivers,
             anchors,
             services,
+            transient: BTreeSet::new(),
             own_admission,
             origins,
             delivered,
@@ -1619,6 +1625,7 @@ impl ChannelState {
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
+            transient: BTreeSet::new(),
             // Set by the caller from the join witness the responder signed (M17.6).
             own_admission: None,
             origins,
@@ -1828,7 +1835,8 @@ impl ChannelState {
     }
 
     /// Offer `service_tag` at `local`, persisted under the channel's SEK so a restart
-    /// still serves it. Replacing an existing tag's address is allowed (that is how a
+    /// still serves it — unless `persist` is false, when it lasts only until it is removed
+    /// or this node stops. Replacing an existing tag's address is allowed (that is how a
     /// service moves); the caller must hold `bind:<tag>` in this channel, which is
     /// checked here — a host cannot offer what the log does not let it offer.
     ///
@@ -1839,6 +1847,7 @@ impl ChannelState {
         profile: &Profile,
         service_tag: &str,
         local: SocketAddr,
+        persist: bool,
     ) -> Result<bool> {
         if service_tag.is_empty() || service_tag.len() > crate::tunnel::session::MAX_SERVICE_TAG_LEN
         {
@@ -1860,6 +1869,11 @@ impl ChannelState {
             return Err(Error::SizeLimitExceeded("channel services"));
         }
         self.services.insert(service_tag.to_owned(), local);
+        if persist {
+            self.transient.remove(service_tag);
+        } else {
+            self.transient.insert(service_tag.to_owned());
+        }
         self.persist_services(store)?;
         Ok(fresh)
     }
@@ -1869,6 +1883,7 @@ impl ChannelState {
         if self.services.remove(service_tag).is_none() {
             return Ok(false);
         }
+        self.transient.remove(service_tag);
         self.persist_services(store)?;
         Ok(true)
     }
@@ -1909,7 +1924,14 @@ impl ChannelState {
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_SERVICES,
-            &services_bytes(&self.services),
+            &services_bytes(
+                &self
+                    .services
+                    .iter()
+                    .filter(|(tag, _)| !self.transient.contains(*tag))
+                    .map(|(tag, at)| (tag.clone(), *at))
+                    .collect(),
+            ),
         )?;
         if let Err(e) = store.put_segment(
             &self.channel_id,

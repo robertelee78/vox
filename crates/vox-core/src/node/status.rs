@@ -274,10 +274,7 @@ pub async fn serve(
 /// # Errors
 /// If the node cannot be reached or answers something else.
 pub async fn request(path: &Path) -> Result<String> {
-    let mut stream = UnixStream::connect(path).await.map_err(|e| Error::Path {
-        op: "connect control socket",
-        detail: format!("{}: {e}", path.display()),
-    })?;
+    let mut stream = crate::node::ipc::connect_own(path).await?;
     let Some(hello) = read_frame(&mut stream).await? else {
         return Err(Error::MalformedBundle("ipc closed before hello"));
     };
