@@ -14,24 +14,28 @@
 //! What must hold, each through the anchor's circuit (the host on IPv4, the guest on `[::1]`, so
 //! the circuit is the only path — see `support/relay.rs`):
 //!
-//! 1. **Stopped mid-join by SIGTERM** (the host SIGSTOPped, so the join waits on it): exit status
-//!    143 — not death by the signal — and stderr says `stopped by SIGTERM after …s`, that the room
-//!    was not joined, and the step it was waiting in, naming the host as the member it waited for.
+//! 1. **Stopped mid-join by SIGTERM**: exit status 143 — not death by the signal — and stderr says
+//!    `stopped by SIGTERM after …s`, that the room was not joined, and the step it was waiting in,
+//!    naming the host as the member it waited for. The host is SIGSTOPped the moment the guest's
+//!    pre-join record reaches the board, so the join is left waiting on it: for its dial, or for
+//!    its answer to the proof of work. A join that ended before it could be stopped is CANNOT
+//!    MEASURE, never a pass. **And it ends when it says so**, within [`STOPS_WITHIN`] of the
+//!    signal: the first version printed its reason at once and then lived on in a debug build until
+//!    the proof of work it had abandoned finished, past 15 s.
 //! 2. **Stopped mid-join by SIGINT** (Ctrl-C): the same, with 130.
 //! 3. **The host gone** (SIGKILLed): exit status 1, `cannot join: …`, and the join's steps with the
 //!    one that failed — the host's dial — and how long each took.
 //! 4. **Refused** (a wrong room passphrase, checked by the live host): exit status 1, `cannot join:
-//!    …`, the refusal, and the steps.
-//! 5. **The control**: the right passphrase joins — status 0, `joined.` — so the four above are the
-//!    product's answers about a world that works, not a world that never could.
+//!    …`, the refusal, and the steps. The refusal is the host's own answer over the circuit, so it
+//!    is also the control: this world's joins reach the host and are answered.
 //!
-//! In every one, stderr is non-empty and the exit is a status, never a signal. Cases 1, 4 and 5
-//! share one world and 2 and 3 another, as two tests that run side by side. Each prints its
-//! counts.
+//! In every one, stderr is non-empty and the exit is a status, never a signal. Cases 1 and 4 share
+//! one world and 2 and 3 another, as two tests that run side by side. Each prints its counts.
 //!
-//! **Mutations that must turn it red:** the verb runner printing nothing for an error (every case
-//! but the control); `vox connect` not taking SIGINT/SIGTERM (cases 1 and 2 die by the signal);
-//! the joiner not announcing its steps (cases 1 and 2 name no member).
+//! **Mutations that must turn it red:** the verb runner printing nothing for an error; `vox
+//! connect` not taking SIGINT/SIGTERM (cases 1 and 2 die by the signal); the joiner not announcing
+//! its steps (cases 1 and 2 name no member); a stop that waits for the runtime's blocking work
+//! (cases 1 and 2 outlive [`STOPS_WITHIN`] in a debug build, where the solve is long).
 //!
 //! `#[ignore]`d: production Argon2id and a real PoW. Run it in release.
 
@@ -58,12 +62,13 @@ use world::{args, VoxProc};
 /// a dial's timeout and a proof of work, with room for a loaded machine.
 const FAILS_WITHIN: Duration = Duration::from_secs(300);
 
-/// A `vox connect` sent SIGINT or SIGTERM must have ended, and said so, by then.
-const STOPS_WITHIN: Duration = Duration::from_secs(15);
+/// A `vox connect` sent SIGINT or SIGTERM must have ended, and said so, by then — whatever it was
+/// doing, a proof of work included.
+const STOPS_WITHIN: Duration = Duration::from_secs(10);
 
 /// How long the join is left waiting on the stopped host before it is stopped itself: well inside
-/// the 10 s its dial to the host takes to give up (measured: `dial 10.00s`), so the stop lands
-/// mid-join and not after a failure of its own.
+/// the 10 s its dial to the host takes to give up (measured: `dial 10.00s`) and the 30 s it waits
+/// for a frame, so the stop lands mid-join and not after a failure of its own.
 const LEFT_WAITING: Duration = Duration::from_secs(2);
 
 /// The build profile, named in every count line.
@@ -202,11 +207,20 @@ fn assert_said_why(e: &Ended, case: &str, code: i32) {
     );
 }
 
-/// Cases 1 and 2: stopped by `sig` while the host is SIGSTOPped.
-fn stopped_mid_join(w: &mut RelayWorld, sig: &str, name: &str, code: i32) -> Ended {
-    let (connect, t0) = start_connect(w, &w.passphrase.clone());
+/// Cases 1 and 2: stopped by `sig` while the join waits on the host, SIGSTOPped once the guest has
+/// announced itself. The host is left stopped.
+fn stopped_mid_join(w: &mut RelayWorld, host: u32, sig: &str, name: &str, code: i32) -> Ended {
+    until_published(w);
+    let (mut connect, t0) = start_connect(w, &w.passphrase.clone());
     until_announced(w);
+    signal(host, "-STOP");
     std::thread::sleep(LEFT_WAITING);
+    if let Ok(Some(status)) = connect.child.try_wait() {
+        panic!(
+            "CANNOT MEASURE ({name}): the join ended ({status}) before it could be stopped mid-way.\n{}",
+            connect.transcript()
+        );
+    }
     signal(connect.child.id(), sig);
     let sent = Instant::now();
     let e = finish(connect, t0, STOPS_WITHIN);
@@ -254,12 +268,10 @@ fn failed_join(e: &Ended, case: &str, also: &[&str]) {
 #[ignore = "production Argon2id + a real PoW, a relayed world of real `vox` processes; run in release"]
 fn a_connect_stopped_by_sigterm_or_refused_says_why() {
     watchdog::arm();
-    // SIGTERM mid-join, then a refusal, then the control.
+    // SIGTERM mid-join, then a refusal.
     let mut w = RelayWorld::new(Split::Families);
     let host = w.host.as_ref().expect("a host").child.id();
-    until_published(&mut w);
-    signal(host, "-STOP");
-    stopped_mid_join(&mut w, "-TERM", "SIGTERM", 143);
+    stopped_mid_join(&mut w, host, "-TERM", "SIGTERM", 143);
     signal(host, "-CONT");
 
     let (c, t0) = start_connect(&w, "not-the-room-passphrase");
@@ -270,20 +282,7 @@ fn a_connect_stopped_by_sigterm_or_refused_says_why() {
         e.status,
         e.took.as_secs_f64()
     );
-
-    let (c, t0) = start_connect(&w, &w.passphrase.clone());
-    let e = finish(c, t0, FAILS_WITHIN);
-    assert!(
-        e.status.success() && e.stdout.contains("joined."),
-        "CANNOT MEASURE: the control — the right passphrase, the host running — did not join, so \
-         this world could not have been joined at all.\n{}",
-        e.describe()
-    );
-    eprintln!(
-        "[proof] ({PROFILE}) control: joined in {:.1}s",
-        e.took.as_secs_f64()
-    );
-    eprintln!("[proof] ({PROFILE}) 2/2 failures said why (SIGTERM, refused); the control joined");
+    eprintln!("[proof] ({PROFILE}) 2/2 failures said why (SIGTERM, refused)");
 }
 
 #[test]
@@ -294,9 +293,7 @@ fn a_connect_stopped_by_sigint_or_left_without_its_host_says_why() {
     let mut w = RelayWorld::new(Split::Families);
     let host = w.host.as_ref().expect("a host").child.id();
     let host12 = w.host_fp[..12].to_owned();
-    until_published(&mut w);
-    signal(host, "-STOP");
-    stopped_mid_join(&mut w, "-INT", "SIGINT", 130);
+    stopped_mid_join(&mut w, host, "-INT", "SIGINT", 130);
     drop(w.host.take());
     eprintln!("[test] host pid {host} killed and reaped");
 

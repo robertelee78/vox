@@ -251,22 +251,33 @@ where
         let node = crate::tunnel_cli::open_profile(paths, listen, anchors, &identity).await?;
         body(node, anchors_for_body).await
     };
-    let outcome = rt.block_on(async move {
+    let (outcome, stopped) = rt.block_on(async move {
         match waiting {
-            None => work.await,
+            None => (work.await, false),
             Some(waiting) => tokio::select! {
-                done = work => done,
-                signal = crate::tunnel_cli::a_stop_signal() => Err(waiting.stopped_by(signal)),
+                done = work => (done, false),
+                signal = crate::tunnel_cli::a_stop_signal() => {
+                    (Err(waiting.stopped_by(signal)), true)
+                }
             },
         }
     });
-    match outcome {
+    let code = match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("vox: {e}");
             e.exit_code()
         }
+    };
+    // **A stop is not a wait for the work it abandoned.** Dropping the runtime waits for its
+    // blocking threads, and one of them can be the join's proof of work: measured, a stopped
+    // `vox connect` printed why at once and then stayed alive past 15 s in a debug build,
+    // until the solve it no longer wanted finished. Nothing it was doing is kept either way —
+    // the store commits atomically, and survives a kill as it must.
+    if stopped {
+        rt.shutdown_background();
     }
+    code
 }
 
 /// Whether a node is already serving this profile.
