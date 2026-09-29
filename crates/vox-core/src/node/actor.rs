@@ -3096,6 +3096,13 @@ impl Node {
         }
     }
 
+    /// The `timestamp` for this process's next records in `channel_id`: the clock, or later if a
+    /// stale refusal moved the floor past it (V210-64).
+    fn record_timestamp(&self, channel_id: &Digest32) -> u64 {
+        self.now()
+            .max(self.record_ts_floor.get(channel_id).copied().unwrap_or(0))
+    }
+
     /// The next board-record sequence number for `channel_id`: strictly above the last one this
     /// process used, and never below the clock in milliseconds.
     ///
@@ -3106,13 +3113,6 @@ impl Node {
     /// new address. vox-bc's causal-order proof measured it: the second joiner, restarted, logged
     /// `a board would not take our address … the board holds a newer record from that author`,
     /// and failed 5 of 9. The clock is what survives a restart without a store write per publish.
-    /// The `timestamp` for this process's next records in `channel_id`: the clock, or later if a
-    /// stale refusal moved the floor past it (V210-64).
-    fn record_timestamp(&self, channel_id: &Digest32) -> u64 {
-        self.now()
-            .max(self.record_ts_floor.get(channel_id).copied().unwrap_or(0))
-    }
-
     fn next_record_seq(&mut self, channel_id: &Digest32) -> u64 {
         let floor = (self.millis_clock)();
         let entry = self.record_seq.entry(*channel_id).or_insert(0);
