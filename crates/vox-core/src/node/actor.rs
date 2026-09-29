@@ -5790,6 +5790,7 @@ impl Node {
             .filter(|fp| self.trust.history(fp) == crate::node::trust::HistoryGrant::Full)
             .collect();
         let trusted: BTreeSet<Digest32> = self.trust.trusted().into_iter().collect();
+        let now_secs = self.now();
         for shared in self.channels.values() {
             // A room mid-session is skipped, not waited for; the next tick comes round.
             let Ok(mut channel) = shared.try_lock() else {
@@ -5799,7 +5800,7 @@ impl Node {
                 continue;
             }
             let keep_from = channel
-                .oldest_generation_needed(&trusted)
+                .oldest_generation_needed(&trusted, now_secs)
                 .unwrap_or(u64::MAX);
             let _ = channel.prune_superseded_origins(&store, keep_from);
         }
