@@ -3,8 +3,8 @@
 //! drain hook `vox agent hook`, plus — for what a model is actually shown — a live OpenCode
 //! server and a real model turn.
 //!
-//! **Every Vox participant is the shipped binary** (`support/room.rs`): an anchor, alice's
-//! and bob's `vox daemon`, the room made with `vox room create|invite|join`, each trusting
+//! **Every Vox participant is the shipped binary** (`support/room.rs`): an anchor, alice's,
+//! bob's and carol's `vox daemon`, the room made with `vox room create|invite|join`, each trusting
 //! the other under its worker name with `vox trust add`. Two things are not `vox`, because no
 //! `vox` command plays a harness session: a stand-in for Claude Code's messaging socket that
 //! records what bob's daemon writes to it, and `opencode serve`, the real harness, whose own
@@ -21,7 +21,10 @@
 //!    operator row, across `\n` and U+2028, reaches bob's session as a message that says it
 //!    comes from the room and not from the person the agent works for, names alice — the
 //!    keyring's petname, from the log's signing key — and carries every forged line behind the
-//!    continuation prefix, so exactly one line begins with `[`.
+//!    continuation prefix, so exactly one line begins with `[`. And the name is the
+//!    **signer's**: carol posting an envelope whose `from` says `alice` wakes bob with a row
+//!    from carol, never from alice. (Case 1 alone could not tell: alice posts as session
+//!    `alice-s`, so a wake naming the envelope's `from` would already differ from `alice`.)
 //! 2. **An ended session's registration is forgotten**: one whose socket no longer listens is
 //!    removed at the first wake that finds it gone, and the live one is kept.
 //! 3. **A reply spends a hop, and a message with none left wakes nobody.** An urgent reply
@@ -186,8 +189,8 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         .build()
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
-    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
-    let (alice, bob) = (&room.workers[0], &room.workers[1]);
+    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob", "carol"]));
+    let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
     let r = room.id.as_str();
     let daemon_err =
         || std::fs::read_to_string(tmp.path().join("bob.daemon.err")).unwrap_or_default();
@@ -286,6 +289,32 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
              line(s) begin with '[', {continued}/2 forged rows continued): {wake:?}"
         ),
     );
+    // The name is the signer's: carol posts an envelope that says it is from alice.
+    let posing = r#"{"v":1,"from":"alice","type":"ask","to":["bob"],"urgent":true,"body":"POSING-AS-ALICE"}"#;
+    let o = carol.vox_in(Some("carol-s"), &["room", "post", r, "-"], Some(posing));
+    assert!(o.ok, "carol could not post: {o:?}");
+    let got = collect(&inbox, Duration::from_secs(60), |g| {
+        g.iter().any(|f| f.contains("POSING-AS-ALICE"))
+    });
+    let posed = got
+        .iter()
+        .map(|f| content(f))
+        .find(|c| c.contains("POSING-AS-ALICE"))
+        .unwrap_or_else(|| {
+            panic!(
+                "CANNOT MEASURE: bob's session was never woken for carol's message; got \
+                 {got:?}; bob's daemon:\n{}",
+                daemon_err()
+            )
+        });
+    let posed_row = posed.lines().find(|l| l.starts_with('[')).unwrap_or("");
+    println!("[proof] (1) carol posing as alice: the wake's row {posed_row:?}");
+    check(
+        &mut failures,
+        posed_row.contains(" from carol] ") && !posed_row.contains("alice"),
+        format!("(1) the wake must name the signer, carol, not the envelope's `from`: {posed:?}"),
+    );
+
     // Bob's daemon tried the ended session for the same message; give it its deadline.
     let deadline = Instant::now() + Duration::from_secs(15);
     while registered(bob, "session-dead").is_some() && Instant::now() < deadline {
