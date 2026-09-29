@@ -78,6 +78,8 @@ const PAYLOAD: usize = 16 * 1024;
 
 struct NatWorld {
     _tmp: tempfile::TempDir,
+    /// When the world began: the zero the host's and anchor's notes are timed from.
+    started: Instant,
     nats: TwoNats,
     _anchor: VoxProc,
     _host: VoxProc,
@@ -90,6 +92,7 @@ struct NatWorld {
 
 impl NatWorld {
     fn new(kind: Kind) -> Self {
+        let started = Instant::now();
         let tmp = tempfile::tempdir().unwrap();
         let (anchor_dir, host_dir, guest_dir) = (
             tmp.path().join("anchor"),
@@ -182,6 +185,7 @@ impl NatWorld {
         eprintln!("[proof] {kind:?}: the guest joined in {:?}", t0.elapsed());
         Self {
             _tmp: tmp,
+            started,
             nats,
             _anchor: anchor,
             _host: host,
@@ -317,7 +321,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         drop(up);
     }
 
-    let w = NatWorld::new(Kind::PortRestrictedCone);
+    let mut w = NatWorld::new(Kind::PortRestrictedCone);
     let mut any = Vec::new();
     let mut punched = Vec::new();
     let mut first_over_circuit = 0usize;
@@ -338,9 +342,21 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
             first_over_circuit += 1;
         }
         let mut direct_at = first_direct.then_some(answered);
+        // Every request that took longer than the target, and what it came back with: a late
+        // sample then says whether it was one request that hung or many that went the long way.
+        let mut slow = Vec::new();
         while direct_at.is_none() && answered.duration_since(ready) < GIVE_UP * 2 {
             std::thread::sleep(Duration::from_millis(20));
-            if request(&w, proxy, &payload) == Some(true) {
+            let asked = Instant::now();
+            let got = request(&w, proxy, &payload);
+            if asked.elapsed() >= TARGET {
+                slow.push(format!(
+                    "a request asked at +{:.3}s took {:?} and came back {got:?}",
+                    asked.duration_since(ready).as_secs_f64(),
+                    asked.elapsed()
+                ));
+            }
+            if got == Some(true) {
                 direct_at = Some(Instant::now());
             } else if Instant::now().duration_since(ready) >= GIVE_UP {
                 break;
@@ -409,8 +425,19 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
                     e.len
                 );
             }
-            for l in up.transcript().lines().filter(|l| l.starts_with("! ")) {
-                eprintln!("[proof]   up said: {l}");
+        }
+        // A sample that never punched, or punched late, says what its `vox up` noticed (#243's
+        // CI red on dd78874: sample 0 punched after 61.9 s, and nothing said why).
+        if d >= TARGET {
+            eprintln!(
+                "[proof]   sample {i} was ready at +{:.3}s (times below: from its ready)",
+                ready.duration_since(w.started).as_secs_f64()
+            );
+            for l in &slow {
+                eprintln!("[proof]   {l}");
+            }
+            for l in up.said_since(ready) {
+                eprintln!("[proof]   up-{i} said: {l}");
             }
         }
         if direct_at.is_some() {
@@ -441,6 +468,14 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
     let punched_max = stats("on the punched path", &punched);
     let over_any = any.iter().filter(|d| **d >= TARGET).count();
     let over_punched = punched.iter().filter(|d| **d >= TARGET).count();
+    if never > 0 || over_any > 0 || over_punched > 0 {
+        for (who, p) in [("host", &mut w._host), ("anchor", &mut w._anchor)] {
+            eprintln!("[proof]   times below: from the proof's start");
+            for l in p.said_since(w.started) {
+                eprintln!("[proof]   {who} said: {l}");
+            }
+        }
+    }
     assert!(
         never == 0 && over_any == 0 && over_punched == 0,
         "R42 punch: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \

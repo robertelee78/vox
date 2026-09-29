@@ -1869,10 +1869,18 @@ pub struct Node {
     /// channel's own (production `(200,9)`); tests reduce them so the debug suite
     /// does not grind, exactly as they reduce the Argon2 profile.
     pow_params: Option<crate::join::pow::PowParams>,
-    /// Connections (by quinn's stable id) that already have a stream loop, so adopting
+    /// Connections (by [`VoxConnection::serial`]) that already have a stream loop, so adopting
     /// one twice does not start a second. Keyed by connection, not by peer: an upgrade
     /// gives a peer a second connection that needs its own loop (M15.1b).
-    stream_loops: std::collections::BTreeSet<usize>,
+    ///
+    /// **Not by quinn's stable id**, which it was: that is the address of the connection's
+    /// state, reused once a closed connection is freed. A new connection that landed at a dead
+    /// one's address was taken to have a loop already, nothing read the streams the peer opened
+    /// on it, and a tunnel request sent there waited unanswered until the connection was closed
+    /// a minute later (#243's CI red on dd78874: `vox up`'s first punched request, 61.9 s).
+    /// Each entry keeps its connection weakly, so entries for connections that are gone are
+    /// dropped and the map is as small as the set of live ones.
+    stream_loops: std::collections::BTreeMap<u64, std::sync::Weak<VoxConnection>>,
     /// The gateway port mapping in force, if one was granted. Held so it can be
     /// renewed before its lifetime elapses (RFC 6886/6887 put renewal on the client).
     port_mappings: Vec<crate::nat::portmap::PortMapping>,
@@ -2174,7 +2182,7 @@ impl Node {
             anchored: BTreeMap::new(),
             forwards: BTreeMap::new(),
             pow_params,
-            stream_loops: std::collections::BTreeSet::new(),
+            stream_loops: std::collections::BTreeMap::new(),
             port_mappings: Vec::new(),
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
@@ -3717,6 +3725,14 @@ impl Node {
                         .get(&peer)
                         .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
                     self.anchor_backoff.insert(peer, (self.now() + wait, wait));
+                    if let Some(net) = self.net.as_ref() {
+                        net.manager().note(
+                            peer,
+                            format!(
+                                "dialling this anchor failed ({why}); the next try is in {wait}s"
+                            ),
+                        );
+                    }
                 }
                 self.answer_pending_consents(
                     |_, target| *target == peer,
@@ -3733,6 +3749,12 @@ impl Node {
                 // The backoff is kept until the connection has lasted (`ANCHOR_FLAP_SECS`): one
                 // superseded at once is a flap, not a success.
                 self.anchor_connected_at.insert(peer, self.now());
+                // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
+                // whose forward said it dialled and then nothing).
+                if let Some(net) = self.net.as_ref() {
+                    net.manager()
+                        .note(peer, "connected to this anchor".to_owned());
+                }
                 self.anchor_ids.insert(peer);
                 self.adopt_connection(Arc::clone(&conn));
                 self.refresh_network_view().await;
@@ -4369,7 +4391,11 @@ impl Node {
     fn adopt_connection(&mut self, conn: Arc<VoxConnection>) {
         let peer = conn.peer_id();
         if let Some(net) = self.net.as_ref().map(Arc::clone) {
-            if self.stream_loops.insert(conn.quinn().stable_id()) {
+            self.stream_loops.retain(|_, held| held.strong_count() > 0);
+            if let std::collections::btree_map::Entry::Vacant(e) =
+                self.stream_loops.entry(conn.serial())
+            {
+                e.insert(Arc::downgrade(&conn));
                 spawn_stream_loop(net, conn, self.net_tx.clone());
             }
         }
