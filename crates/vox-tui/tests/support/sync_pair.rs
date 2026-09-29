@@ -393,6 +393,7 @@ impl Reader {
         match self.rt.block_on(self.client.request(&Request::Read {
             channel_id: room,
             since: None,
+            after: None,
             limit: 0,
         })) {
             Ok(Frame::Rows { rows }) => rows.into_iter().map(|r| r.text).collect(),

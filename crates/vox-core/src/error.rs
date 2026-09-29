@@ -134,15 +134,6 @@ pub enum Error {
     #[error("join proof-of-work invalid")]
     JoinPowInvalid,
 
-    /// A log entry carried the ADR-009 *deniable* content authenticator, whose
-    /// verification is provided by milestone M7 (ADR-009) — not implemented in M5.
-    /// This is an honest capability boundary, not a stub: M5 builds the wire seam
-    /// (the entry round-trips and is classified non-attributable) and the
-    /// composite path fully, and refuses to *claim* a deniable verification it
-    /// does not perform (ADR-008 §"build coupling with ADR-009").
-    #[error("deniable authenticator verification is provided by M7 (ADR-009)")]
-    DeniableVerificationUnavailable,
-
     /// A framed structure exceeded a hard size limit before any allocation
     /// proportional to attacker-declared counts/lengths was performed (ADR-008
     /// anti-abuse: a declared length is never trusted ahead of the bytes behind it).
@@ -160,8 +151,8 @@ pub enum Error {
     /// A governance struct (genesis record, admin-delegation cert, consent
     /// grant/revocation, admin-delegation revocation, policy update) was
     /// structurally malformed on parse — bad arity, an out-of-domain enum, a
-    /// wrong-length digest/key, or a field forbidden by its schema (e.g. a
-    /// policy-update carrying `deniability_mode`). Carries a static reason
+    /// wrong-length digest/key, a field forbidden by its schema, or a genesis
+    /// asking for a removed deniable room. Carries a static reason
     /// (ADR-007).
     #[error("malformed governance struct: {0}")]
     MalformedGovernance(&'static str),
@@ -183,6 +174,13 @@ pub enum Error {
     /// wrong (the at-rest analogue of [`Error::JoinProofFailed`]).
     #[error("at-rest unlock failed (wrong factor or tampered ciphertext)")]
     AtRestUnlockFailed,
+
+    /// A log entry in the shape vox wrote **before v0.3.0**: its skeleton has no `seen` and no
+    /// causal time (ADR-023 decision 1). v0.3.0 does not read them; the decider chose that
+    /// such a room is made again (2026-09-29, #226). Its own variant so a person is told that,
+    /// not "an internal error".
+    #[error("a log entry written by vox before v0.3.0, whose message format changed")]
+    LogFormatBeforeV030,
 
     /// A SEK-backed operation (segment seal/open, re-wrap) was attempted after the
     /// app was **locked** (ADR-010 §"App-lock and memory hygiene"): the SEK was
@@ -377,6 +375,12 @@ pub enum Error {
         /// The underlying OS message.
         detail: String,
     },
+
+    /// A node refused an app-API request over its control socket (ADR-022 decision 7),
+    /// carrying the node's own reason — `no-listener`, not in the keyring, and so on —
+    /// because the program asking has no other way to learn it.
+    #[error("{0}")]
+    AppRefused(String),
 
     /// Attaching to a node's control socket failed before any request: the connect, or
     /// the node's greeting. Said in a person's words, because each one needs a different

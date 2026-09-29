@@ -1,4 +1,18 @@
-//! Resolving `.vox` names on this machine (ADR-017 decisions 4 and 5, M17.3).
+//! Resolving `.vox` names on this machine (ADR-017 decisions 4, 5 and 7; PRD-001 R20).
+//!
+//! ## Local names: `<node>.<room>.vox` (ADR-017 decision 7)
+//! `ssh nas.family.vox` reaches the node **this machine** calls `nas` — the petname it was
+//! given in this node's trust keyring when it was trusted — through the room **this
+//! machine** calls `family`, its local room name. Both halves are this machine's own
+//! words: nothing is published, nothing is global, and the same node reached through two
+//! rooms has two names. The name resolves to *that member*, so a service any member of a
+//! room offers is reachable, not only the creator's.
+//!
+//! A name that matches nothing, or more than one thing, is refused with a sentence
+//! saying which — this machine's own names, so saying so discloses nothing. Only trusted
+//! nodes have names, so a node that is not trusted cannot be named.
+//!
+//! The older form below, `<room-id>.vox` for a room's creator, still resolves.
 //!
 //! `ssh user@<52-char-base32>.vox` reaches the local SOCKS proxy with the **name**, not
 //! an address (`socks5h`: the proxy resolves it). This module is what the proxy resolves
@@ -37,98 +51,229 @@
 //! which "requires OS support for transparent proxies, such as BSDs' pf or Linux's
 //! IPTables". Vox takes the first, which is Tor's own documented default — and under it a
 //! `.vox` name never goes near a resolver, because SOCKS5 carries the hostname itself.
-//! The derived overlay address ([`ServiceRoom::addr`]) is kept because it is the stable
-//! identifier for a host on the overlay (ADR-013), not because anything resolves to it.
+//! (A client misconfigured for plain `socks5` will ask the system resolver about a `.vox`
+//! name first; that leak is accepted, PRD-001 R21.)
 
 use std::collections::BTreeMap;
-use std::net::Ipv6Addr;
 
 use crate::governance::genesis::Genesis;
 use crate::hash::Digest32;
-use crate::node::link::channel_of_hostname;
-use crate::tunnel::addr::overlay_addr;
+use crate::node::link::{b32_decode, b32_encode, channel_of_hostname};
 
-/// A room that has a `.vox` name: the room itself, and the member its name resolves to.
+/// Where a `.vox` name leads: the room whose gate applies, and the member to reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceRoom {
     /// The room.
     pub channel_id: Digest32,
-    /// The member hosting it — the genesis creator (see the module docs).
+    /// The member to dial: the one the name names, or for `<room-id>.vox` the genesis
+    /// creator (see the module docs).
     pub host: Digest32,
-    /// The host's ADR-013 identity-derived overlay address, which is what the name
-    /// resolves to and what the interface routes.
-    pub addr: Ipv6Addr,
 }
 
-/// The `.vox` names this machine can resolve, and the reverse map the interface needs.
+/// One room this machine holds, as naming needs it.
+#[derive(Debug, Clone, Default)]
+struct NamedRoom {
+    /// This machine's local name for it, as a DNS label.
+    label: String,
+    /// Its current members.
+    members: Vec<Digest32>,
+}
+
+/// The `.vox` names this machine can resolve.
 ///
-/// Built from the rooms a node holds; it is a snapshot, so a room joined afterwards is
-/// not resolvable until the next one is taken. That is deliberate — the resolver must
-/// never reach back into live channel state while answering an untrusted datagram.
+/// A snapshot, taken from the node when a name is asked for: it never reaches back into
+/// live channel state while answering.
 #[derive(Debug, Clone, Default)]
 pub struct VoxResolver {
+    /// `<room-id>.vox`: rooms with a genesis service grant, to their creator.
     by_channel: BTreeMap<Digest32, ServiceRoom>,
-    by_addr: BTreeMap<Ipv6Addr, ServiceRoom>,
+    /// `<node>.<room>.vox`: every room this machine holds, by id.
+    rooms: BTreeMap<Digest32, NamedRoom>,
+    /// Trusted identities and this machine's name for each, as a DNS label.
+    names: BTreeMap<Digest32, String>,
+}
+
+/// A petname or room name as a DNS label: lowercase, with spaces and anything else a
+/// label cannot hold turned into `-`, so `My NAS` is `my-nas.family.vox`.
+#[must_use]
+pub fn label_of(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_owned()
 }
 
 impl VoxResolver {
-    /// An empty resolver: every name is `NXDOMAIN`.
+    /// An empty resolver: every name is refused.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Add a room by its genesis, if it is a service room.
+    /// Add a room by its genesis, for the `<room-id>.vox` form, if it is a service room.
     ///
     /// Returns whether it was added. A room whose genesis carries no service grant is
-    /// **not** added: its host is not determined by the genesis, so there is no name to
-    /// give it (see the module docs).
+    /// **not** added: its host is not determined by the genesis, so that form has nothing
+    /// to name. Its members are still named by the `<node>.<room>.vox` form.
     pub fn insert(&mut self, genesis: &Genesis) -> bool {
         if genesis.body.service_grant.is_empty() {
             return false;
         }
-        let key = genesis.creator_pubkey();
         let room = ServiceRoom {
             channel_id: genesis.channel_id(),
-            host: key.fingerprint(),
-            addr: overlay_addr(&key.to_bytes()),
+            host: genesis.creator_pubkey().fingerprint(),
         };
         self.by_channel.insert(room.channel_id, room);
-        self.by_addr.insert(room.addr, room);
         true
     }
 
-    /// The room a `.vox` hostname names, or `None` for a name this machine cannot
-    /// resolve — a malformed one, or a room it has not joined.
-    ///
-    /// The whole room rather than just an address, because that is what a dial needs: the
-    /// channel to claim a capability in and the member to dial.
+    /// Add a room this machine holds, under its local name, with its members.
+    pub fn add_room(&mut self, channel_id: Digest32, local_name: &str, members: &[Digest32]) {
+        self.rooms.insert(
+            channel_id,
+            NamedRoom {
+                label: label_of(local_name),
+                members: members.to_vec(),
+            },
+        );
+    }
+
+    /// Name a trusted identity, as this node's keyring does.
+    pub fn name(&mut self, fingerprint: Digest32, petname: &str) {
+        self.names.insert(fingerprint, label_of(petname));
+    }
+
+    /// The room a `<room-id>.vox` hostname names, or `None`.
     #[must_use]
     pub fn resolve(&self, hostname: &str) -> Option<&ServiceRoom> {
         let channel_id = channel_of_hostname(hostname).ok()?;
         self.by_channel.get(&channel_id)
     }
 
-    /// The room an overlay address belongs to — the lookup the interface performs when
-    /// a packet arrives for one of these addresses.
-    #[must_use]
-    pub fn route(&self, addr: &Ipv6Addr) -> Option<&ServiceRoom> {
-        self.by_addr.get(addr)
+    /// Resolve either form, or say why not.
+    ///
+    /// # Errors
+    /// A sentence for this machine's operator: which part of the name matched nothing,
+    /// or matched more than one thing.
+    pub fn lookup(&self, hostname: &str) -> Result<ServiceRoom, String> {
+        let host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+        let Some(labels) = host.strip_suffix(".vox") else {
+            return Err(format!("{hostname} is not a .vox name"));
+        };
+        match labels.split('.').collect::<Vec<_>>().as_slice() {
+            [room_id] => {
+                let channel_id = b32_decode(room_id, "vox hostname").map_err(|_| {
+                    format!(
+                        "{hostname}: name a node as <node>.<room>.vox — `{room_id}` alone is \
+                         neither a room id nor a node"
+                    )
+                })?;
+                self.by_channel.get(&channel_id).copied().ok_or_else(|| {
+                    format!(
+                        "{hostname}: that room id is not a room on this machine with a host of \
+                         its own; name the member instead, as <node>.<room>.vox"
+                    )
+                })
+            }
+            [node, room] => {
+                let channel_id = self.room(room)?;
+                let host = self.node(node, room, &channel_id)?;
+                Ok(ServiceRoom { channel_id, host })
+            }
+            _ => Err(format!("{hostname}: a .vox name is <node>.<room>.vox")),
+        }
     }
 
-    /// Every address this resolver answers for, which is the set the interface must
-    /// accept packets for.
-    pub fn addresses(&self) -> impl Iterator<Item = &Ipv6Addr> {
-        self.by_addr.keys()
+    fn room(&self, label: &str) -> Result<Digest32, String> {
+        // A room id works in the room's place, for a room with no usable local name.
+        if let Ok(id) = b32_decode(label, "vox room") {
+            if self.rooms.contains_key(&id) {
+                return Ok(id);
+            }
+        }
+        let hits: Vec<Digest32> = self
+            .rooms
+            .iter()
+            .filter(|(_, r)| r.label == label)
+            .map(|(id, _)| *id)
+            .collect();
+        match hits.as_slice() {
+            [one] => Ok(*one),
+            [] => {
+                let known: Vec<&str> = self.rooms.values().map(|r| r.label.as_str()).collect();
+                Err(format!(
+                    "no room on this machine is called `{label}` (its rooms: {})",
+                    if known.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        known.join(", ")
+                    }
+                ))
+            }
+            many => Err(format!(
+                "`{label}` is the name of {} rooms on this machine; use one's id instead \
+                 (`vox room list`)",
+                many.len()
+            )),
+        }
     }
 
-    /// How many rooms have a name here.
+    fn node(
+        &self,
+        label: &str,
+        room_label: &str,
+        channel_id: &Digest32,
+    ) -> Result<Digest32, String> {
+        let named: Vec<Digest32> = self
+            .names
+            .iter()
+            .filter(|(_, n)| n.as_str() == label)
+            .map(|(fp, _)| *fp)
+            .collect();
+        if named.is_empty() {
+            return Err(format!(
+                "no node you trust is called `{label}` — only trusted nodes have names here \
+                 (`vox trust add <fingerprint> --name {label}`)"
+            ));
+        }
+        let members = self
+            .rooms
+            .get(channel_id)
+            .map(|r| r.members.as_slice())
+            .unwrap_or_default();
+        let hits: Vec<Digest32> = named
+            .into_iter()
+            .filter(|fp| members.contains(fp))
+            .collect();
+        match hits.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(format!(
+                "`{label}` is a node you trust, but not a member of `{room_label}`"
+            )),
+            many => Err(format!(
+                "`{label}` names {} nodes you trust in `{room_label}`; rename one \
+                 (`vox trust rename <fingerprint> <name>`): {}",
+                many.len(),
+                many.iter()
+                    .map(|fp| b32_encode(fp).chars().take(12).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// How many rooms have a `<room-id>.vox` name here.
     #[must_use]
     pub fn len(&self) -> usize {
         self.by_channel.len()
     }
 
-    /// Whether no room has a name here.
+    /// Whether no room has a `<room-id>.vox` name here.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_channel.is_empty()

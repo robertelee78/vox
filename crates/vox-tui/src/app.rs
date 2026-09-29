@@ -318,6 +318,14 @@ pub fn run_node(
         let mut last_held: Vec<String> = Vec::new();
         let mut stalls = node.subscribe();
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
+        // **One Ctrl-C listener for the whole loop, not one per turn.** A listener sees only
+        // signals that arrive after it starts listening, and one made inside the `select!` is
+        // dropped whenever the tick wins. A SIGINT delivered in the same turn as a tick — an
+        // anchor descheduled past a tick on a loaded box, then signalled — went to a listener
+        // that was then dropped, and the anchor served on, deaf to Ctrl-C: 13 of 20 anchors
+        // stopped for 1.2 s and signalled never exited.
+        let interrupted = tokio::signal::ctrl_c();
+        tokio::pin!(interrupted);
         loop {
             tokio::select! {
                 _ = ticks.tick() => {
@@ -534,7 +542,7 @@ pub fn run_node(
                         }
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = &mut interrupted => {
                     println!("vox node: shutting down");
                     let _ = node.apply(NodeCommand::Shutdown).await;
                     break;
@@ -659,8 +667,20 @@ pub fn run_daemon(
     anchors: vox_core::nat::bootstrap::BootstrapSet,
     anchor_specs: Vec<String>,
     passphrase_file: Option<std::path::PathBuf>,
+    metrics: Option<std::net::SocketAddr>,
 ) -> Result<(), AppError> {
     use std::io::Read as _;
+
+    // Refused before anything is read or unlocked: a metrics endpoint the network can
+    // reach names every peer and room this node talks to (PRD-001 R38).
+    if let Some(addr) = metrics {
+        if !addr.ip().is_loopback() {
+            return Err(AppError::Usage(format!(
+                "--metrics {addr}: the metrics endpoint binds loopback only (127.0.0.1 or \
+                 ::1); it names every peer and room this node talks to"
+            )));
+        }
+    }
 
     let raw = match &passphrase_file {
         Some(path) => std::fs::read_to_string(path)
@@ -936,10 +956,26 @@ pub fn run_daemon(
         });
     }
 
+    if let Some(addr) = metrics {
+        let listener = rt
+            .block_on(vox_core::node::status::bind_metrics(addr))
+            .map_err(|e| AppError::Usage(e.to_string()))?;
+        let bound = listener.local_addr().map_err(AppError::Io)?;
+        rt.spawn(vox_core::node::status::serve_metrics(
+            listener,
+            node.clone(),
+        ));
+        println!("vox daemon: metrics http://{bound}/metrics");
+    }
+
     // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
     let _ipc = rt
         .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
         .map_err(|e| AppError::Usage(format!("control socket: {e}")))?;
+
+    // Tell the operator when `vox status` would flag something, and when it clears
+    // (PRD-001 R37). Off with `notify = off` in the profile's config file.
+    rt.spawn(crate::notify::watch(node.clone(), paths.clone()));
 
     let fp = node
         .view()

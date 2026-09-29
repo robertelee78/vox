@@ -37,6 +37,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check each commit in this push or pull request
+        # The workflow's `-D warnings` is the tip's business (build-test runs clippy); this job asks
+        # whether each commit builds. Inherited, one historical commit's warning on one platform
+        # failed every later push that carried it (v0.3.0's merge, #257).
+        env:
+          RUSTFLAGS: ""
         run: |
           set -eu
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -61,8 +66,8 @@ jobs:
           for c in $commits; do
             echo "::group::$c $(git log -1 --format=%s "$c")"
             git checkout --quiet --detach "$c"
-            # RUSTFLAGS is not set here: a commit that builds with warnings still builds,
-            # and clippy/fmt are the tip's business. This asks one question only.
+            # RUSTFLAGS is cleared for this step (above): a commit that builds with warnings still
+            # builds, and clippy/fmt are the tip's business. This asks one question only.
             cargo check --workspace --all-targets
             echo "::endgroup::"
           done
@@ -113,6 +118,11 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/pyte"
           "$RUNNER_TEMP/pyte/bin/pip" install --quiet pyte==0.8.2
           echo "VOX_PYTE_PATH=$("$RUNNER_TEMP/pyte/bin/python" -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
+      - name: Install the Apple targets the Swift FFI proof builds its xcframework for
+        if: runner.os == 'macOS'
+        # scripts/build-xcframework.sh refuses without all four (PRD-001 R30/R31's proof went red
+        # on the runner, not on a Mac that had them: #257).
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin x86_64-apple-darwin
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Format check
@@ -153,6 +163,19 @@ jobs:
           path=$(scripts/build-mutant-sender.sh)
           echo "VOX_MUTANT_SENDER=$path" >> "$GITHUB_ENV"
       - name: Real-parameter gates (release)
+        # Two causal_order_proof proofs are excluded here, **for a cause that is not the order**:
+        # `three_members_one_offline_for_a_while_show_one_order` (ADR-023 M23.2 proof 1), excluded
+        # from 2026-09-25. On v0.2.8 the second joiner of three daemons is cut off from the first
+        # post onward in about half of runs: 5 red of 9 with M23.2, and 1 of 4 on 3cac220 without it.
+        # In each of the four reds whose logs were captured, the second joiner's restarted daemon logs
+        # "the board holds a newer record from that author". Whenever the three converged, their
+        # orders were identical. The order is proven in the blocking set by `one_order_gate` (three
+        # in-process nodes) and by proof 2 through the daemons. This exclusion is to be removed when
+        # the v0.2.9 connectivity defect is fixed.
+        # `a_late_arrival_after_a_restart_is_marked`, for the same cause, V29-23 (#104): a restarted
+        # daemon's board record restarts its sequence and is refused, so its peer never receives what
+        # it held (2 of 5 runs). The frozen-daemon variant, in the blocking set, carries the
+        # late-arrival claim meanwhile.
         run: |
           cargo test --release --workspace --no-fail-fast -- --ignored \
             --skip r40_ --skip r41_

@@ -17,7 +17,7 @@
 //! samples refused in two runs). So each sample is a pair of processes of the guest's identity:
 //! **A**, a plain `vox forward` whose address the anchor is seen to hold, then killed; and **B**, a
 //! `vox forward` started at once with its millisecond clock [`SKEW_MS`] behind
-//! (`VOX_TEST_CLOCK_SKEW_MS`, test-only, inert when unset — the clock that floors a record's
+//! (`VOX_TEST_CLOCK_STEP_MS`, test-only, inert when unset — the clock that floors a record's
 //! `seq`). B publishes about a second after A (kill, unlock, bind), so its first record is at or
 //! below A's: refused as stale. Its republishes, a second apart, each move its `seq` floor further
 //! past its clock (V210-61) until one passes A's. A fixed predecessor per sample keeps every sample alike; one skew across a chain
@@ -83,7 +83,9 @@ fn free_udp_port() -> u16 {
 fn spawn_forward(w: &RelayWorld, port: u16, skew: Option<&str>) -> VoxProc {
     let listen = format!("127.0.0.1:{port}");
     let env: Vec<(&str, &str)> = skew
-        .map(|s| vec![("VOX_TEST_CLOCK_SKEW_MS", s)])
+        // A whole clock step, both clocks (V210-64): `VOX_TEST_CLOCK_SKEW_MS` moves the
+        // millisecond clock only, and would prove half the cure.
+        .map(|s| vec![("VOX_TEST_CLOCK_STEP_MS", s)])
         .unwrap_or_default();
     VoxProc::spawn_env(
         "forward",

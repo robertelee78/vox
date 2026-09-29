@@ -281,6 +281,16 @@ pub enum Inbound {
         /// The stream's receive half.
         recv: RecvStream,
     },
+    /// An app stream (ADR-022 decision 7): its `AppOpen` has not been read yet, and its
+    /// gate — this node's keyring and the room's authors — is `node::app`'s to run.
+    App {
+        /// The authenticated peer.
+        peer: Digest32,
+        /// The stream's send half.
+        send: SendStream,
+        /// The stream's receive half.
+        recv: RecvStream,
+    },
     /// A stream kind with no handler yet. The stream is dropped (reset), never
     /// silently left open. Every kind ADR-011 defines is served today; this remains
     /// for a kind a newer peer knows and this node does not.
@@ -692,6 +702,7 @@ impl NodeNet {
                 Ok(Inbound::ServedCircuit { peer })
             }
             StreamKind::Tunnel => Ok(Inbound::Tunnel { peer, send, recv }),
+            StreamKind::App => Ok(Inbound::App { peer, send, recv }),
         }
     }
 
@@ -1107,6 +1118,27 @@ impl NodeNet {
                 }
             })
             .collect()
+    }
+
+    /// [`NodeNet::board_endpoints`] from whichever room's board has a live record for
+    /// `member` — for a dial that names a member but not a room (`vox up` across every
+    /// room, PRD-001 R20).
+    #[must_use]
+    pub fn board_endpoints_any(&self, member: &Digest32) -> EndpointList {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .channels_with_genesis()
+            .iter()
+            .find_map(|cid| {
+                guard
+                    .current_members(cid, 0, now)
+                    .into_iter()
+                    .find(|r| r.author_id == *member)
+                    .map(|r| r.endpoints.clone())
+            })
+            .unwrap_or_default()
     }
 
     /// The endpoints this node's board advertises for `member` in `channel_id` — the

@@ -59,6 +59,12 @@ pub struct MessageRow {
     pub created_millis: u64,
     /// The text.
     pub text: String,
+    /// When this node rendered it, as a number that only grows; local, and not the
+    /// room's order ([`crate::node::channel::Rendered::arrival`]).
+    pub arrival: u64,
+    /// It took its place above a row this node had already shown: it arrived late
+    /// (ADR-023 decision 1).
+    pub late: bool,
 }
 
 /// An open channel's full state for display.
@@ -74,12 +80,19 @@ pub struct ChannelDetail {
     pub members: Vec<Digest32>,
     /// The render-gated timeline, oldest first.
     pub timeline: Vec<MessageRow>,
+    /// Every entry this node holds for the channel, readable or not, in the room's one
+    /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
+    /// sequence restricted to rendered rows.
+    pub order: Vec<(Digest32, u64)>,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
     /// The members this node holds back for equivocating in this room (V210-63): each
     /// `(author, seq)` at which two different messages signed by that author were seen.
     pub equivocations: Vec<(Digest32, u64)>,
+    /// The room's genesis creator: the host its `.vox` name reaches (ADR-017), which is
+    /// what `vox forward <name>.vox …` dials.
+    pub creator: Digest32,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -280,6 +293,26 @@ pub enum NodeCommand {
         /// What this node will call it. Local; nothing is registered.
         petname: String,
     },
+    /// Rename an identity already trusted, keeping its history grant (PRD-001 R12). Fails
+    /// with [`Fault::NotConsented`] for an identity that is not trusted.
+    Rename {
+        /// The trusted identity.
+        fingerprint: Digest32,
+        /// Its new petname.
+        petname: String,
+    },
+    /// [`NodeCommand::Trust`], choosing what each consent releases of **this node's own**
+    /// messages (PRD-001 R12): [`HistoryGrant::Now`](crate::node::trust::HistoryGrant),
+    /// the default, or `Full` — every generation of this node's sender key still held,
+    /// at its origin, so the newcomer reads what was written before the approval too.
+    TrustWith {
+        /// The identity to trust.
+        fingerprint: Digest32,
+        /// What this node will call it. Local; nothing is registered.
+        petname: String,
+        /// What its consents release.
+        history: crate::node::trust::HistoryGrant,
+    },
     /// Stop trusting an identity node-wide, and **change the lock** (ADR-020 §3).
     ///
     /// Removes the ring entry, then rotates this identity's sender key and re-keys
@@ -316,6 +349,9 @@ pub enum NodeCommand {
         /// The service's port, which is also its tag (ADR-017: the port names the
         /// service).
         port: u16,
+        /// Whether the service is UDP: served as `udp/<port>` rather than `<port>`
+        /// (ADR-022 decision 6). The room's `.vox` name is the same either way.
+        udp: bool,
         /// The local endpoint to carry connections to. Defaults to
         /// `127.0.0.1:<port>` — the same port, which is the case worth optimising.
         at: Option<std::net::SocketAddr>,
@@ -371,6 +407,15 @@ pub enum NodeCommand {
     StopForward {
         /// The local address the forward is listening on.
         local: std::net::SocketAddr,
+    },
+    /// Set a room's retention (PRD-001 R7, ADR-023 decision 2): `ttl` seconds, `0` for
+    /// forever, as an ADR-007 policy-update. Only the room's admin may; it applies to what is
+    /// already stored.
+    SetRetention {
+        /// The channel.
+        channel_id: Digest32,
+        /// Seconds a message body is kept; `0` keeps it forever.
+        ttl: u64,
     },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).
@@ -469,6 +514,12 @@ pub enum Fault {
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
     /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
     NotAServiceRoom,
+    /// The change is the room admin's to make — a holder of the `policy` capability — and
+    /// this identity is not one (PRD-001 R7: setting a room's retention).
+    NotAdmin,
+    /// The room's stored log was written by vox before v0.3.0, whose message format changed;
+    /// v0.3.0 does not read it, and the room is made again (decider, 2026-09-29, #226).
+    RoomFromBeforeV030,
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }
@@ -547,6 +598,12 @@ impl Fault {
             }
             Fault::NotAServiceRoom => {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
+            }
+            Fault::NotAdmin => {
+                "only the room's admin may change that, and this identity is not its admin\n       the admin is whoever created the room; ask them"
+            }
+            Fault::RoomFromBeforeV030 => {
+                "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and invite its members"
             }
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"

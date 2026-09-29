@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use relay::{Anchor, Split};
-use vox_core::node::ipc::{Frame, IpcClient, Request};
+use vox_core::node::ipc::{Frame, IpcClient};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
@@ -273,11 +273,7 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
         other => panic!("rooms: {other:?}"),
     };
     let readable = |reader: &mut IpcClient, text: &str| -> bool {
-        match rt.block_on(reader.request(&Request::Read {
-            channel_id,
-            since: None,
-            limit: 0,
-        })) {
+        match rt.block_on(reader.read_rows(channel_id, None)) {
             Ok(Frame::Rows { rows }) => rows.iter().any(|r| r.text == text),
             _ => false,
         }
