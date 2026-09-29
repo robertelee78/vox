@@ -10,15 +10,17 @@
 //! entries in once, verifies each signature once, and computes the closure in O(N^2).
 //!
 //! **Staging.** Every node is the real `vox` binary, set up as a person sets it up: an anchor
-//! (`vox node`), a host `vox daemon` that creates a room, a member that joins it, and the two
-//! trusting each other with `vox trust add`. The host then changes its mind [`CYCLES`] times —
-//! `vox trust remove` and `vox trust add` — each of which puts a consent revocation or a consent
-//! grant on the room's log. Only then does a newcomer, already trusted by the host, join with
-//! `vox room join`.
+//! (`vox node`), a host `vox daemon` that creates a room, and [`MEMBERS`] members that join it,
+//! each trusting the host and trusted by it with `vox trust add`. Each member then changes its mind
+//! [`CYCLES`] times — `vox trust remove` and `vox trust add` of the host — each of which puts a
+//! consent revocation or a consent grant on the room's log. The members do so at the same time:
+//! every trust change costs one production Argon2id check of the operator's passphrase, so one
+//! node making all of them took minutes on a busy machine. Only then does a newcomer, already
+//! trusted by the host, join with `vox room join`.
 //!
 //! **Asserted.**
-//! 1. The history exists: at least [`MIN_ENTRIES`] of the host's trust changes succeeded (each is
-//!    one governance entry). Fewer is `CANNOT MEASURE`.
+//! 1. The history exists: at least [`MIN_ENTRIES`] of the members' trust changes succeeded (each
+//!    is one governance entry). Fewer is `CANNOT MEASURE`.
 //! 2. After its join returns, the newcomer's `vox room read` shows a post the host made after the
 //!    join **within [`READ_BOUND`]** — which needs the newcomer to have synced and folded the
 //!    whole governance history (the host's consent to it is the last of it).
@@ -44,9 +46,11 @@ use std::time::{Duration, Instant};
 
 use world::{args, vox_once, VoxProc, IDENTITY, VOX};
 
-/// How many times the host withdraws and restores its trust in the member: two governance
-/// entries each.
-const CYCLES: usize = 150;
+/// Members making trust changes at the same time.
+const MEMBERS: usize = 6;
+/// How many times each member withdraws and restores its trust in the host: two governance
+/// entries each, so 300 in all.
+const CYCLES: usize = 25;
 /// Governance entries the history must hold for the measurement to mean anything.
 const MIN_ENTRIES: usize = 280;
 /// From the newcomer's `vox room join` returning to its read showing the host's post. Measured:
@@ -176,8 +180,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         std::fs::create_dir_all(d.join("cfg")).unwrap();
         d
     };
-    let (anchor_dir, host_dir, member_dir, newcomer_dir) =
-        (dir("anchor"), dir("host"), dir("member"), dir("newcomer"));
+    let (anchor_dir, host_dir, newcomer_dir) = (dir("anchor"), dir("host"), dir("newcomer"));
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
 
@@ -194,10 +197,20 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         .unwrap()
         .to_owned();
     let host_fp = fingerprint(&host_dir);
-    let member_fp = fingerprint(&member_dir);
     let newcomer_fp = fingerprint(&newcomer_dir);
+    let members: Vec<(String, std::path::PathBuf, String)> = (1..=MEMBERS)
+        .map(|i| {
+            let name = format!("member{i}");
+            let d = dir(&name);
+            let fp = fingerprint(&d);
+            (name, d, fp)
+        })
+        .collect();
     let _host = daemon("host", &host_dir, &spec, &pass_file);
-    let _member = daemon("member", &member_dir, &spec, &pass_file);
+    let _members: Vec<VoxProc> = members
+        .iter()
+        .map(|(name, d, _)| daemon(name, d, &spec, &pass_file))
+        .collect();
 
     let (ok, out, err) = vox_in(&host_dir, &["room", "create", "--name", "team"], ROOM_PASS);
     assert!(ok, "CANNOT MEASURE: room create: {out}\n{err}");
@@ -221,17 +234,21 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
             ok
         })
     };
-    assert!(
-        join(&member_dir, "member"),
-        "CANNOT MEASURE: the member could not join"
-    );
-    assert!(
-        trust(&member_dir, "add", &host_fp, "host"),
-        "CANNOT MEASURE: the member could not trust the host"
-    );
-    assert!(
-        trust(&host_dir, "add", &member_fp, "member"),
-        "CANNOT MEASURE: the host could not trust the member"
+    let t_setup = Instant::now();
+    for (name, d, fp) in &members {
+        assert!(join(d, name), "CANNOT MEASURE: {name} could not join");
+        assert!(
+            trust(d, "add", &host_fp, "host"),
+            "CANNOT MEASURE: {name} could not trust the host"
+        );
+        assert!(
+            trust(&host_dir, "add", fp, name),
+            "CANNOT MEASURE: the host could not trust {name}"
+        );
+    }
+    println!(
+        "[proof] {MEMBERS} members joined and trusted in {:?}",
+        t_setup.elapsed()
     );
     let (ok, _, err) = vox_once(&host_dir, &args(&["room", "post", &prefix, "hello"]));
     assert!(ok, "CANNOT MEASURE: first post: {err}");
@@ -247,29 +264,38 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         })
         .expect("CANNOT MEASURE: the host's read names its room");
 
-    // ---- the governance history: the host changes its mind, again and again -------------
+    // ---- the governance history: every member changes its mind, again and again --------
     let t_hist = Instant::now();
-    let mut entries = 0usize;
-    for i in 1..=CYCLES {
-        if trust(&host_dir, "remove", &member_fp, "member") {
-            entries += 1;
-        } else {
-            eprintln!("[proof] cycle {i}: trust remove refused");
-        }
-        if trust(&host_dir, "add", &member_fp, "member") {
-            entries += 1;
-        } else {
-            eprintln!("[proof] cycle {i}: trust add refused");
-        }
-    }
+    let entries: usize = std::thread::scope(|scope| {
+        let flips: Vec<_> = members
+            .iter()
+            .map(|(name, d, _)| {
+                let host_fp = &host_fp;
+                scope.spawn(move || {
+                    let mut made = 0usize;
+                    for i in 1..=CYCLES {
+                        for verb in ["remove", "add"] {
+                            if trust(d, verb, host_fp, "host") {
+                                made += 1;
+                            } else {
+                                eprintln!("[proof] {name} cycle {i}: trust {verb} refused");
+                            }
+                        }
+                    }
+                    made
+                })
+            })
+            .collect();
+        flips.into_iter().map(|t| t.join().unwrap()).sum()
+    });
     println!(
-        "[proof] history: {entries} trust changes by the host in {:?}",
+        "[proof] history: {entries} trust changes by {MEMBERS} members in {:?}",
         t_hist.elapsed()
     );
     assert!(
         entries >= MIN_ENTRIES,
         "CANNOT MEASURE: only {entries} of {} trust changes succeeded (need {MIN_ENTRIES})",
-        CYCLES * 2
+        MEMBERS * CYCLES * 2
     );
 
     // ---- the newcomer, trusted by the host before it joins ------------------------------
