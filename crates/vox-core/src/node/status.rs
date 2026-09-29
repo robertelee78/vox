@@ -93,6 +93,12 @@ pub struct SyncBook {
     /// dial that found no connection to reuse and no other reach to the same peer under way to
     /// wait on (V210-53, #232). What no person can see directly — two dials where one would do.
     ladders: BTreeMap<Digest32, u64>,
+    /// Publish rounds this node started (one per `(room, board)` round that went out): what no
+    /// person can see directly, and what a storm of rounds looks like (#179).
+    publish_rounds: u64,
+    /// Records by others that taught this node's board something and were passed on
+    /// (`NetEvent::BoardGrew`, #179): a member's routine refresh is not one.
+    board_news: u64,
 }
 
 /// The book as the actor and the handles share it.
@@ -114,6 +120,20 @@ impl SyncBook {
     ) {
         let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
         f(b.ports.entry((room, peer)).or_default());
+    }
+
+    /// Count one publish round started.
+    pub fn note_publish_round(book: &SharedSyncBook) {
+        book.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .publish_rounds += 1;
+    }
+
+    /// Count one record of news on this node's board, passed on.
+    pub fn note_board_news(book: &SharedSyncBook) {
+        book.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .board_news += 1;
     }
 
     /// Count one reachability ladder run to `peer`.
@@ -190,7 +210,11 @@ impl SyncBook {
                 b32_encode(author),
             );
         }
-        s.push_str("]}");
+        let _ = write!(
+            s,
+            "],\"publish\":{{\"rounds\":{},\"board_news\":{}}}}}",
+            b.publish_rounds, b.board_news
+        );
         s
     }
 }
