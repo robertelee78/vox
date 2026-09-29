@@ -336,6 +336,37 @@ pub struct RecordSet {
     pub genesis: Option<Genesis>,
 }
 
+/// Which rooms a board keeps for a peer that brings their genesis — the rooms it will
+/// **anchor** (see [`RendezvousService::serve_rooms`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AnchorRooms {
+    /// None: this node is not an anchor. It keeps the boards of the rooms it holds, which it
+    /// files itself, and takes no room from a peer.
+    #[default]
+    Held,
+    /// Any room brought to it (`vox node --serve anyone`, the default for an anchor).
+    Anyone,
+    /// Only rooms whose genesis names one of these creators (`vox node --serve trusted`: the
+    /// anchor profile's `vox trust` list).
+    CreatedBy(std::collections::BTreeSet<Digest32>),
+}
+
+impl AnchorRooms {
+    /// **May this node anchor the room `genesis` founds?** The one predicate both the board's
+    /// genesis acceptance and the node's adoption of a room go through, so the two cannot
+    /// disagree about which rooms this node serves.
+    #[must_use]
+    pub fn may_anchor(&self, genesis: &Genesis) -> bool {
+        match self {
+            Self::Held => false,
+            Self::Anyone => true,
+            Self::CreatedBy(creators) => {
+                creators.contains(&genesis.body.creator_pubkey.fingerprint())
+            }
+        }
+    }
+}
+
 /// Told a channelID when a member-kind record **from a peer** is admitted to this board.
 ///
 /// A plain closure rather than a typed sender because `nat` must not depend on `node`: the
@@ -351,8 +382,8 @@ pub struct RendezvousService {
     clock: Clock,
     /// See [`RendezvousService::on_admitted`].
     admitted: Option<AdmittedHook>,
-    /// See [`RendezvousService::serve_any_room`].
-    any_room: bool,
+    /// See [`RendezvousService::serve_rooms`].
+    rooms: AnchorRooms,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -372,13 +403,13 @@ impl RendezvousService {
             oracle,
             clock,
             admitted: None,
-            any_room: false,
+            rooms: AnchorRooms::Held,
         }
     }
 
-    /// Take a genesis from a peer for a room this node does not hold — what an **anchor**
-    /// is for (`vox node`: a member points `--anchor` at it and it keeps that room's
-    /// board). Off by default, and off for every node that is not an anchor.
+    /// Which rooms this board keeps when a peer brings their genesis — what an **anchor** is
+    /// for (`vox node`: a member points `--anchor` at it and it keeps that room's board).
+    /// [`AnchorRooms::Held`] by default, and for every node that is not an anchor.
     ///
     /// A board that took any peer's genesis made that genesis's creator a member here
     /// (`node::network::classify`), and a genesis is something anybody can mint: an
@@ -386,8 +417,14 @@ impl RendezvousService {
     /// every stream a member can, relay through this node, and list its room in this
     /// node's status. A node that holds rooms files their geneses itself (see
     /// [`RendezvousService::handle_local`]); a peer never needs to give it one.
-    pub fn serve_any_room(&mut self, on: bool) {
-        self.any_room = on;
+    pub fn serve_rooms(&mut self, rooms: AnchorRooms) {
+        self.rooms = rooms;
+    }
+
+    /// Whether this node may anchor the room `genesis` founds (see [`AnchorRooms::may_anchor`]).
+    #[must_use]
+    pub fn may_anchor(&self, genesis: &Genesis) -> bool {
+        self.rooms.may_anchor(genesis)
     }
 
     /// Be told when a record by an author **other than this node** is admitted.
@@ -616,13 +653,16 @@ impl RendezvousService {
             }
             // Self-validating: its hash is the channelID, so no author check is
             // needed or possible (ADR-007; see `accept_genesis`). Whether this board takes
-            // it is another matter: only its own rooms, unless it is an anchor (see
-            // `serve_any_room`), and a genesis it already holds is always a no-op.
+            // it is another matter: only its own rooms, or a room it may anchor (see
+            // `serve_rooms`), and a genesis it already holds is always a no-op.
             StructTag::GenesisRecord => {
                 let genesis =
                     Genesis::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
                 let mut store = lock(&self.store);
-                if !local && !self.any_room && store.genesis(&genesis.channel_id()).is_none() {
+                if !local
+                    && store.genesis(&genesis.channel_id()).is_none()
+                    && !self.rooms.may_anchor(&genesis)
+                {
                     return Err(RejectReason::Policy);
                 }
                 store.accept_genesis(genesis, local)

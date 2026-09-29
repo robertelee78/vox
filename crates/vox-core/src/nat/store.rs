@@ -411,7 +411,7 @@ impl RendezvousStore {
     /// genesis is always taken and never counted against [`MAX_GENESIS_CHANNELS`], and
     /// pinning one the board already holds from a peer takes it out of that count.
     /// Whether a board takes an unpinned genesis at all is the service's decision, not
-    /// the store's (see `RendezvousService::serve_any_room`).
+    /// the store's (see `RendezvousService::serve_rooms`).
     pub fn accept_genesis(&mut self, genesis: Genesis, pinned: bool) -> Result<()> {
         genesis.verify()?;
         let channel_id = genesis.channel_id();

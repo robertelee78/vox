@@ -276,6 +276,13 @@ on a host whose only addresses are private (a LAN), and an anchors file whose ev
 stops `vox serve`, `connect`, `up`, `forward`, `daemon` and the TUI instead of carrying on without
 one.
 
+By default an anchor serves any room published to it, and relays only between members of the same
+room. To serve only rooms made by people you trust, give the anchor's profile an identity and a
+trust list (`vox id`, then `vox trust add <fingerprint>` for each) and run
+`vox node --serve trusted` with that identity's passphrase (`--identity-passphrase-file` or
+`VOX_IDENTITY_PASSPHRASE`). A `serve` file in the config directory holding `anyone` or `trusted`
+sets the same thing without the flag. The list is read once at start.
+
 ## Building
 
 A pure-Rust Cargo workspace. No C or C++ of its own; the one ecosystem-forced native crypto is

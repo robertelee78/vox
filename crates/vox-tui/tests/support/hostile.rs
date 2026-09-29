@@ -215,7 +215,14 @@ pub fn profile_dir(root: &Path, name: &str) -> PathBuf {
 
 /// Start `vox node` and return it with its `--anchor` spec.
 pub fn anchor(data: &Path, listen: &str) -> (VoxProc, String) {
-    let mut p = VoxProc::spawn("anchor", data, &args(&["node", "--listen", listen]));
+    anchor_with(data, listen, &[])
+}
+
+/// [`anchor`] with extra `vox node` arguments (e.g. `--serve trusted`).
+pub fn anchor_with(data: &Path, listen: &str, extra: &[&str]) -> (VoxProc, String) {
+    let mut argv = vec!["node", "--listen", listen];
+    argv.extend_from_slice(extra);
+    let mut p = VoxProc::spawn("anchor", data, &args(&argv));
     let spec = p
         .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
         .split_whitespace()
