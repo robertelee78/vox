@@ -1880,9 +1880,9 @@ pub async fn get_file(
     // from the same member** as the newest match: same author, same SHA-256. A fallback to
     // anything else would hand over a different file that only shares a name.
     let mut offers: Vec<Offer> = Vec::new();
-    // Older matches that are a different file (or from another member), named in the error by
-    // hash, which is how to ask for exactly that file (a tag names one offer, which may be the
-    // one that ended).
+    // Older matches outside that group — a different file, or the same file from another
+    // member. Never collected in its place; if the get fails, the live ones are named in the
+    // error by their exact tag, which selects exactly that offer.
     let mut others: Vec<Offer> = Vec::new();
     for r in rows.iter().rev() {
         let Ok(env) = Envelope::parse(&r.text) else {
@@ -1914,7 +1914,7 @@ pub async fn get_file(
         };
         match offers.first() {
             Some(newest) if newest.author != offer.author || newest.sha256 != offer.sha256 => {
-                if !others.iter().any(|o| o.sha256 == offer.sha256) {
+                if others.len() < MAX_OFFERS_TRIED {
                     others.push(offer);
                 }
                 continue;
@@ -1957,7 +1957,23 @@ pub async fn get_file(
             "no offer matching {selector:?} was tried"
         )));
     };
-    if tried == 1 && others.is_empty() {
+    // The other matches that are still served, newest first, one per member and file: a
+    // suggestion that names an ended offer, or that a selector would redirect to the ended
+    // newest match, is a command that fails.
+    let newest = &offers[0];
+    let mut live: Vec<&Offer> = Vec::new();
+    for o in &others {
+        if live
+            .iter()
+            .any(|l| l.author == o.author && l.sha256 == o.sha256)
+        {
+            continue;
+        }
+        if offer_is_live(&mut client, channel_id, o).await {
+            live.push(o);
+        }
+    }
+    if tried == 1 && live.is_empty() {
         return Err(e);
     }
     let mut said = if tried > 1 {
@@ -1969,19 +1985,58 @@ pub async fn get_file(
     } else {
         e.to_string()
     };
-    // Say that a different file answers to the same selector, and how to ask for exactly it,
+    // Say what else answers to the selector and is served, and how to ask for exactly it,
     // rather than silently collecting it instead.
-    for o in &others {
+    for o in live {
         use std::fmt::Write as _;
         let short = &o.sha256[..o.sha256.len().min(16)];
-        let _ = write!(
-            said,
-            "\n       a different file also matches {selector:?}: {} ({} bytes, sha256 {short}) \
-             — collect exactly it with `vox room get {room} {short}`",
-            o.name, o.size
-        );
+        let who = crate::ident::author_id(&o.author);
+        if o.sha256 == newest.sha256 {
+            let _ = write!(
+                said,
+                "\n       the same file is also offered by {who}: `vox room get {room} {}`",
+                o.tag
+            );
+        } else {
+            let _ = write!(
+                said,
+                "\n       a different file also matches {selector:?}: {} ({} bytes, sha256 \
+                 {short}, offered by {who}) — collect exactly it with `vox room get {room} {}`",
+                o.name, o.size, o.tag
+            );
+        }
     }
     Err(AppError::Usage(said))
+}
+
+/// Whether `offer` is still served: forwarded to, it sends its first byte. An ended offer is
+/// refused by its host and the connection closes without one. An empty file sends nothing
+/// either way, so one is taken as served when the connection is accepted and ends cleanly.
+async fn offer_is_live(client: &mut IpcClient, channel_id: Digest32, offer: &Offer) -> bool {
+    use tokio::io::AsyncReadExt as _;
+    const PROBE: std::time::Duration = std::time::Duration::from_secs(10);
+    let Ok(Frame::Bound { local }) = client
+        .request(&Request::Forward {
+            channel_id,
+            host: offer.author,
+            service_tag: offer.tag.clone(),
+            local: "127.0.0.1:0".into(),
+        })
+        .await
+    else {
+        return false;
+    };
+    let answered = async {
+        let mut sock = tokio::net::TcpStream::connect(&local).await.ok()?;
+        let mut byte = [0u8; 1];
+        sock.read(&mut byte).await.ok()
+    };
+    let live = match tokio::time::timeout(PROBE, answered).await {
+        Ok(Some(n)) => n > 0 || offer.size == 0,
+        _ => false,
+    };
+    let _ = client.request(&Request::StopForward { local }).await;
+    live
 }
 
 /// The most matching offers `vox room get` tries, newest first (V210-84).

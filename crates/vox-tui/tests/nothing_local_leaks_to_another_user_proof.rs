@@ -15,8 +15,12 @@
 //!    get **by name** is not hidden by a newer offer that has ended: a third offer is announced
 //!    and ended, and `vox room get twin.bin` still collects the file through the second. The
 //!    fallback is only ever the same file from the same member: a newer `twin.bin` with other
-//!    content is offered and ended, and the get by name must fail, leave nothing, and name the
-//!    live file of that name with how to collect it exactly (by its hash).
+//!    content is offered and ended, and the get by name must fail, leave nothing, and name only
+//!    the live offers of that name, each by its exact tag; every suggested command is run and
+//!    must collect the right bytes. The verifier's arms (v1, v2) add a third member, carol:
+//!    alice's newest offer ends while bob's copy of the same file runs, carol's get by name
+//!    fails rather than taking another member's offer, and the refusal names bob's copy as the
+//!    same file with a command that collects it.
 //! 2. **An offer is never persisted.** It was: a daemon that stopped while an offer ran came
 //!    back offering its port. Staged: alice's daemon is stopped with an offer live, and
 //!    `vox service list` reads alice's store; a `vox service add` afterwards is the control
@@ -309,6 +313,34 @@ fn until(who: &Profile, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) {
     panic!("CANNOT MEASURE: timed out waiting for {what}; last saw {last}");
 }
 
+/// Run, as `who`, every `vox room get …` a refusal suggests (each in backticks), into `dir`, and
+/// return how many collected exactly `want`. Panics on one that does not: a suggested command
+/// that fails is the defect.
+fn run_suggestions(who: &Profile, said: &str, dir: &Path, want: &[u8]) -> usize {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut ran = 0usize;
+    for (i, cmd) in said.split('`').skip(1).step_by(2).enumerate() {
+        let Some(args) = cmd.strip_prefix("vox ") else {
+            continue;
+        };
+        let mut args: Vec<&str> = args.split_whitespace().collect();
+        if args.first() != Some(&"room") {
+            continue;
+        }
+        let out = dir.join(format!("{i}.bin"));
+        args.extend(["--out", out.to_str().unwrap()]);
+        let (ok, stdout, stderr) = who.vox(&args);
+        let got = std::fs::read(&out).ok();
+        assert!(
+            ok && got.as_deref() == Some(want),
+            "the suggested `{cmd}` did not collect the named file ({} bytes): {stdout} {stderr}",
+            got.as_ref().map_or(0, Vec::len)
+        );
+        ran += 1;
+    }
+    ran
+}
+
 /// The TCP ports `pid` listens on, by `lsof`; `None` if `lsof` cannot be run.
 fn listening(pid: u32) -> Option<std::collections::BTreeSet<String>> {
     let out = Command::new("lsof")
@@ -470,7 +502,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         &["room", "read", &room],
         |o| o.contains("twin.bin"),
     );
-    let second = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let mut second = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
     let second_said = second.wait_for("vox: offering", Duration::from_secs(60));
     let tag_of = |said: &str| {
         said.split_whitespace()
@@ -590,8 +622,168 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     );
     assert!(
         stderr.contains("a different file also matches")
-            && stderr.contains(&format!("vox room get {room} {}", &t2[5..21])),
-        "the refusal must say a different file matches, and how to get it exactly: {stderr}"
+            && stderr.contains(&format!("vox room get {room} {t2}")),
+        "the refusal must say a different file matches, and name its live offer exactly: {stderr}"
+    );
+    for dead in [&t1, &t3, &t4] {
+        assert!(
+            !stderr.contains(dead.as_str()) || stderr.contains(&format!("the offer {dead} of")),
+            "the refusal suggests an offer that has ended ({dead}): {stderr}"
+        );
+    }
+    let ran = run_suggestions(&bob, &stderr, &tmp.path().join("sugg-1d"), &twin_bytes);
+    eprintln!("[proof] (1d) suggested commands run and collected the right bytes: {ran}");
+    assert!(
+        ran >= 1,
+        "CANNOT MEASURE: (1d) suggested no command: {stderr}"
+    );
+
+    // ---- (verifier v1) the command the refusal suggests collects exactly the named file ----
+    let sug = t2[5..21].to_owned();
+    let exact = tmp.path().join("twin-exact.bin");
+    let (ok, _o, se) = bob.vox(&["room", "get", &room, &sug, "--out", exact.to_str().unwrap()]);
+    let got = std::fs::read(&exact).ok();
+    eprintln!(
+        "[verifier] v1 suggested `vox room get <room> {sug}`: ok={ok}, {} bytes, equals A: {}; said: {}",
+        got.as_ref().map_or(0, Vec::len),
+        got.as_deref() == Some(&twin_bytes[..]),
+        se.trim()
+    );
+    let v1 = ok && got.as_deref() == Some(&twin_bytes[..]);
+
+    // ---- (verifier v2) a same-sha offer from ANOTHER member is not the fallback; carol collects ----
+    signal(second.pid(), "TERM");
+    assert!(
+        second.exited_within(Duration::from_secs(10)).is_some(),
+        "CANNOT MEASURE: second did not end"
+    );
+    let carol = Profile::new(&tmp.path().join("carol"), &[]);
+    let carol_fp = carol.id();
+    let (_carol_daemon, _) = carol.daemon(Some(&spec));
+    for (who, peer, name) in [
+        (&alice, &carol_fp, "carol"),
+        (&bob, &carol_fp, "carol"),
+        (&carol, &alice_fp, "alice"),
+        (&carol, &bob_fp, "bob"),
+    ] {
+        let (ok, _, err) = who.vox(&[
+            "trust",
+            "add",
+            peer,
+            "--name",
+            name,
+            "--identity-passphrase-file",
+            who.p(),
+        ]);
+        assert!(ok, "trust {name}: {err}");
+    }
+    let mut cj = String::from("never tried");
+    for _ in 0..6 {
+        let (ok, _, err) = carol.run(
+            &["room", "join", &link, "--name", "mission"],
+            ROOM_PASS,
+            Duration::from_secs(120),
+        );
+        if ok {
+            cj.clear();
+            break;
+        }
+        cj = err;
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    assert!(cj.is_empty(), "CANNOT MEASURE: carol never joined: {cj}");
+    for (other, word) in [(&alice, "warm-c-alice"), (&bob, "warm-c-bob")] {
+        let (ok, _, err) = other.vox(&["room", "post", &room, word]);
+        assert!(ok, "post: {err}");
+        until(
+            &carol,
+            "carol to read alice and bob",
+            &["room", "read", &room],
+            |o| o.contains(word),
+        );
+    }
+    let bobs = bob.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let tb = tag_of(&bobs.wait_for("vox: offering", Duration::from_secs(60)));
+    until(
+        &carol,
+        "bob's twin offer to reach carol",
+        &["room", "read", &room, "--json"],
+        |o| o.contains(&tb),
+    );
+    // control: carol CAN collect bob's offer by its exact tag
+    let ctl = tmp.path().join("twin-ctl.bin");
+    let (okc, _o, sec) = carol.vox(&["room", "get", &room, &tb, "--out", ctl.to_str().unwrap()]);
+    eprintln!(
+        "[verifier] v2 control: carol gets bob's {tb} by tag: ok={okc}; said: {}",
+        sec.trim()
+    );
+    assert!(
+        okc && std::fs::read(&ctl).ok().as_deref() == Some(&twin_bytes[..]),
+        "CANNOT MEASURE: carol cannot collect bob's offer by tag"
+    );
+    let mut newest = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let tn = tag_of(&newest.wait_for("vox: offering", Duration::from_secs(60)));
+    until(
+        &carol,
+        "alice's newest twin to reach carol",
+        &["room", "read", &room, "--json"],
+        |o| o.contains(&tn),
+    );
+    signal(newest.pid(), "TERM");
+    assert!(
+        newest.exited_within(Duration::from_secs(10)).is_some(),
+        "CANNOT MEASURE: newest did not end"
+    );
+    let cross = tmp.path().join("twin-cross.bin");
+    let (ok2, _o, se2) = carol.vox(&[
+        "room",
+        "get",
+        &room,
+        "twin.bin",
+        "--out",
+        cross.to_str().unwrap(),
+    ]);
+    let got2 = std::fs::read(&cross).ok();
+    eprintln!(
+        "[verifier] v2 newest {tn} (alice, A) ended, bob's {tb} (A, same sha) live: ok={ok2}, file left: {} bytes; said: {}",
+        got2.as_ref().map_or(0, Vec::len),
+        se2.trim()
+    );
+    let v2 = !ok2 && got2.is_none();
+    let exact2 = tmp.path().join("twin-cross-exact.bin");
+    let (ok3, _o, se3) = carol.vox(&[
+        "room",
+        "get",
+        &room,
+        &sug,
+        "--out",
+        exact2.to_str().unwrap(),
+    ]);
+    eprintln!(
+        "[verifier] v2b the suggested sha command in that state: ok={ok3}, {} bytes; said: {}",
+        std::fs::read(&exact2).map_or(0, |b| b.len()),
+        se3.trim()
+    );
+    // Every command the v2 refusal suggests is run as carol, and must collect bob's copy.
+    assert!(
+        se2.contains("the same file is also offered by"),
+        "v2: bob's live copy of the same file must be named as the same file: {se2}"
+    );
+    assert!(
+        !se2.contains("a different file also matches"),
+        "v2: only the same file is served, yet the refusal names a different one: {se2}"
+    );
+    let ran2 = run_suggestions(&carol, &se2, &tmp.path().join("sugg-v2"), &twin_bytes);
+    eprintln!("[proof] (v2) suggested commands run and collected the right bytes: {ran2}");
+    assert!(ran2 >= 1, "CANNOT MEASURE: v2 suggested no command: {se2}");
+    drop(bobs);
+    assert!(
+        v1,
+        "v1: the suggested command did not collect exactly the named file"
+    );
+    assert!(
+        v2,
+        "v2: a same-sha offer from another member was used as the fallback"
     );
     drop(second);
 
