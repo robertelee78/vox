@@ -10,6 +10,13 @@
 //! 3 s watchdog. The inner test starts a real `vox node` as its child, and a second one as a
 //! grandchild (under `sh`, so the kill has to recurse), writes both pids, and hangs. After the
 //! watchdog has aborted it, both pids must be gone.
+//!
+//! **V210-36 (#213) — and the dump shows the child, not only the test.** A real-binary proof's
+//! test process only waits; the stuck process is a `vox` it started. So the child `vox node` is
+//! stopped (SIGSTOP) to stand in for a hung daemon, and the watchdog's output must hold that
+//! pid's own thread stacks, under a header naming its pid and command line, **before** it says
+//! what it killed. Mutation: kill the descendants before dumping them, and the child's section
+//! holds no stacks — red.
 
 #![cfg(unix)]
 
@@ -61,6 +68,13 @@ fn inner_a_hung_gate_with_children() {
         .env("VOX_CONFIG_DIR", dir.join("grand-cfg"))
         .spawn()
         .expect("spawn sh");
+    // The stand-in for a hung daemon: let it get past start-up, then stop it where it is.
+    std::thread::sleep(Duration::from_secs(1));
+    let stopped = Command::new("kill")
+        .args(["-STOP", &child.id().to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(stopped, "could not stop the child vox node");
     std::fs::write(dir.join("child.pid"), child.id().to_string()).unwrap();
     std::fs::write(dir.join("sh.pid"), sh.id().to_string()).unwrap();
     std::fs::write(dir.join("ready"), "").unwrap();
@@ -149,5 +163,44 @@ fn a_watchdog_abort_leaves_nothing_running() {
     assert!(
         said.contains("killed") && said.contains("descendant"),
         "the watchdog must say what it killed: {said}"
+    );
+
+    // ---- V210-36: the hung child's own stacks are in the dump, before the kill ----
+    let child = pids[0].1;
+    let header = format!("vox test watchdog: descendant {child}: ");
+    let at = said.find(&header).unwrap_or_else(|| {
+        panic!("the dump never names the hung child (pid {child}) — only the test process was dumped:\n{said}")
+    });
+    let line_end = said[at..].find('\n').map_or(said.len(), |n| at + n);
+    assert!(
+        said[at..line_end].contains("vox") && said[at..line_end].contains("node"),
+        "the child's header must carry its command line: {:?}",
+        &said[at..line_end]
+    );
+    // Its section runs to the next header, or to the end of the dump.
+    let section_end = said[line_end..]
+        .find("====================")
+        .map_or(said.len(), |n| line_end + n);
+    let section = &said[line_end..section_end];
+    // The platform's evidence of stacks for THAT pid: `sample`'s call graph on macOS, the
+    // per-thread census on Linux.
+    let stacks = if cfg!(target_os = "macos") {
+        "Call graph:"
+    } else {
+        "threads (tid"
+    };
+    assert!(
+        section.contains(stacks),
+        "the hung child's section holds no thread stacks ({stacks:?} missing) — dumped after it \
+         was killed, or not at all:\n{section}"
+    );
+    let killed_at = said.find("killed ").expect("the kill line");
+    assert!(
+        at < killed_at,
+        "the child must be dumped before the descendants are killed"
+    );
+    eprintln!(
+        "[proof] the hung child {child} was dumped before the kill ({} bytes of stacks)",
+        section.len()
     );
 }
