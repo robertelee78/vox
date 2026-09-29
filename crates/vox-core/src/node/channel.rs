@@ -2195,7 +2195,11 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        // As every other append: its page is found again when a checkpoint sheds its signature,
+        // and its ports need a session at once (ADR-025 D2), not at the periodic sync.
+        self.log_ids.insert(entry_hash, id);
         self.next_log_id = id.saturating_add(1);
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(entry_hash)
     }
 
