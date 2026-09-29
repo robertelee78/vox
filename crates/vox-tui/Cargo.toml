@@ -67,3 +67,7 @@ socket2.workspace = true
 # V210-49's proof plays the attacker who deletes one row of a stopped node's store: no vox command
 # can, so the test opens the file itself (never while a vox process holds it).
 redb.workspace = true
+# V210-62's proof plays a peer that opens a handshake with the host and never finishes it: no vox
+# command stops mid-handshake on purpose, so the test drives a QUIC client of its own.
+quinn.workspace = true
+rustls.workspace = true

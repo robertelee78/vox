@@ -411,6 +411,11 @@ pub struct JoinOutcome {
     /// `true` when the one-time prekey had already been consumed (the session's
     /// forward-secrecy bonus is downgraded, never its confidentiality).
     pub last_resort_grade: bool,
+    /// How long **this side** spent solving the proof of work: the joiner's own CPU, on its own
+    /// machine, and random in length by design (ADR-005). Zero on the responder. Said apart from
+    /// the rest of the exchange, so a slow join shows whether it waited on the responder or on
+    /// its own grind (V210-62).
+    pub solved_in: std::time::Duration,
 }
 
 impl std::fmt::Debug for JoinOutcome {
@@ -508,6 +513,7 @@ pub async fn run_initiator(
             ik,
         )
     };
+    let grinding = std::time::Instant::now();
     let (initiator, token, share) = if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
     {
@@ -515,6 +521,7 @@ pub async fn run_initiator(
     } else {
         grind()?
     };
+    let solved_in = grinding.elapsed();
     send_frame(
         &mut send,
         &JoinFrame::Solve {
@@ -585,6 +592,7 @@ pub async fn run_initiator(
         peer,
         witness,
         last_resort_grade: false,
+        solved_in,
     })
 }
 
@@ -851,5 +859,6 @@ async fn responder_exchange(
         peer,
         witness,
         last_resort_grade,
+        solved_in: std::time::Duration::ZERO,
     })
 }

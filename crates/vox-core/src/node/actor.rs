@@ -1284,8 +1284,10 @@ struct JoinSteps(Vec<String>);
 
 impl JoinSteps {
     fn took(&mut self, what: &str, since: std::time::Instant) {
-        self.0
-            .push(format!("{what} {:.2}s", since.elapsed().as_secs_f64()));
+        self.lasted(what, since.elapsed());
+    }
+    fn lasted(&mut self, what: &str, d: std::time::Duration) {
+        self.0.push(format!("{what} {:.2}s", d.as_secs_f64()));
     }
     fn note(&mut self, what: String) {
         self.0.push(what);
@@ -1608,7 +1610,19 @@ impl Joiner {
             let exchanged = net
                 .start_join(&conn, ctx, &self.passphrase, signer, &ik)
                 .await;
-            steps.took(&format!("{short}: exchange (incl. solve)"), t);
+            // **The solve apart from the rest** (V210-62): the proof of work is this machine's
+            // own CPU and random in length by design, the rest is waiting on the responder. One
+            // number for both left a slow join unexplained (CI: 13.3 s, which was which?).
+            match &exchanged {
+                Ok(o) => {
+                    steps.lasted(&format!("{short}: solve"), o.solved_in);
+                    steps.lasted(
+                        &format!("{short}: exchange"),
+                        t.elapsed().saturating_sub(o.solved_in),
+                    );
+                }
+                Err(_) => steps.took(&format!("{short}: exchange (incl. solve)"), t),
+            }
             match exchanged {
                 Ok(o) => {
                     joined_outcome = Some((o, responder, conn));
