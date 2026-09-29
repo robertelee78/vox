@@ -191,6 +191,10 @@ const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
 /// How long a delivered sender key may go unanswered before it is counted as not taken and sent
 /// again. See `pairwise_stream::refused`.
 const KEY_DELIVERY_PATIENCE: Duration = Duration::from_secs(30);
+/// How late a delivered key's answer may be before the connection it went out on is probed. A live
+/// member answers in milliseconds; a probe of one that is merely slow costs a byte and closes
+/// nothing. See `watch_delivery`.
+const KEY_ANSWER_BEFORE_PROBE: Duration = Duration::from_secs(1);
 
 /// How often a peer reached over a relay is retried for a direct path.
 ///
@@ -5311,7 +5315,7 @@ impl Node {
         let chain_id = skdm.body.chain_id;
         // The consent is a fact once decided; whether the key landed is learnt off the actor, and
         // it is recorded as delivered only then (V210-88).
-        self.watch_delivery(sent, *channel_id, target, chain_id, false);
+        self.watch_delivery(sent, &conn, *channel_id, target, chain_id, false);
         if history_owed {
             // At once rather than on the tick: the connection and session are live now.
             let _ = self.deliver_rekeys_for(channel_id, asked).await;
@@ -5861,7 +5865,14 @@ impl Node {
                 }
                 // Each key's own generation: a refusal re-owes exactly what was refused, and it is
                 // recorded as delivered only once taken (V210-88).
-                self.watch_delivery(sent, *channel_id, target, key.body.chain_id, owes_history);
+                self.watch_delivery(
+                    sent,
+                    &conn,
+                    *channel_id,
+                    target,
+                    key.body.chain_id,
+                    owes_history,
+                );
                 watched += 1;
             }
             if owes_history && watched > 0 {
@@ -7276,16 +7287,28 @@ impl Node {
         }
     }
 
-    /// Learn, off the actor, whether the key just written to `target` was taken; if it was not,
-    /// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
+    /// Learn, off the actor, whether the key just written to `target` on `conn` was taken; if it
+    /// was not, `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
     ///
     /// **Taken is when it is delivered** (V210-88): `NetEvent::SkdmTaken` records generation
     /// `chain_id` as `target`'s, and a `history` key counts towards the batch it belongs to, whose
     /// history is recorded once all of it was taken. Until then the key is only in flight, which
     /// is kept in memory, so a crash leaves it owed and the restarted node sends it again.
+    ///
+    /// **An unanswered key asks whether anyone is there.** A member that restarted leaves this
+    /// node holding a connection to its dead process, which counts as live until it has been
+    /// silent for `SILENCE_IS_DEATH`, and nothing replaces it unless the new process happens to
+    /// dial this node — which it has no reason to do when the room's traffic reaches it through
+    /// an anchor. A key sent on it (a rotation's re-key, a consent) waited out that 30 s before it
+    /// was counted not taken, and then its backoff: a joiner's rotation reached its restarted
+    /// responder after 31.1–79.1 s (V210-78's proof, V210-80). So once the answer is
+    /// [`KEY_ANSWER_BEFORE_PROBE`] late, the connection is probed; a dead one is closed, which
+    /// ends this wait at once, and the key is owed again and goes to whatever process is there
+    /// now. A live one answers the probe from its transport however busy it is, and is left be.
     fn watch_delivery(
         &mut self,
         sent: quinn::RecvStream,
+        conn: &Arc<crate::transport::quic::VoxConnection>,
         channel_id: Digest32,
         target: Digest32,
         chain_id: u64,
@@ -7295,26 +7318,39 @@ impl Node {
         let session = self.session_serial.get(&(channel_id, target)).copied();
         let epoch = self.delivery_epoch;
         let tx = self.net_tx.clone();
+        let manager = self.net.as_ref().map(|n| Arc::clone(n.manager()));
+        // Weakly: this watch must not count as a user of the connection (see `spawn_stream_loop`).
+        let carrier = Arc::downgrade(conn);
         tokio::spawn(async move {
-            let event =
-                match crate::node::pairwise_stream::refused(sent, KEY_DELIVERY_PATIENCE).await {
-                    Some(why) => NetEvent::SkdmRefused {
-                        channel_id,
-                        peer: target,
-                        chain_id,
-                        why,
-                        session,
-                        history,
-                        epoch,
-                    },
-                    None => NetEvent::SkdmTaken {
-                        channel_id,
-                        peer: target,
-                        chain_id,
-                        history,
-                        epoch,
-                    },
-                };
+            let answer = crate::node::pairwise_stream::refused(sent, KEY_DELIVERY_PATIENCE);
+            tokio::pin!(answer);
+            let refused = tokio::select! {
+                why = &mut answer => why,
+                () = tokio::time::sleep(KEY_ANSWER_BEFORE_PROBE) => {
+                    if let (Some(manager), Some(conn)) = (manager, carrier.upgrade()) {
+                        manager.close_if_unanswered(&conn).await;
+                    }
+                    answer.await
+                }
+            };
+            let event = match refused {
+                Some(why) => NetEvent::SkdmRefused {
+                    channel_id,
+                    peer: target,
+                    chain_id,
+                    why,
+                    session,
+                    history,
+                    epoch,
+                },
+                None => NetEvent::SkdmTaken {
+                    channel_id,
+                    peer: target,
+                    chain_id,
+                    history,
+                    epoch,
+                },
+            };
             let _ = tx.send(event).await;
         });
     }
