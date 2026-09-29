@@ -118,6 +118,11 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/pyte"
           "$RUNNER_TEMP/pyte/bin/pip" install --quiet pyte==0.8.2
           echo "VOX_PYTE_PATH=$("$RUNNER_TEMP/pyte/bin/python" -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
+      - name: Install the Apple targets the Swift FFI proof builds its xcframework for
+        if: runner.os == 'macOS'
+        # scripts/build-xcframework.sh refuses without all four (PRD-001 R30/R31's proof went red
+        # on the runner, not on a Mac that had them: #257).
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin x86_64-apple-darwin
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Format check
