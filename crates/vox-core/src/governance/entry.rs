@@ -194,16 +194,34 @@ impl GovEntry {
     ) -> Result<Self> {
         // 1. The M5 entry must verify (signature + payload binding + author match).
         entry.verify(author_root)?;
-        // 2. The framed governance struct lives in the retained payload.
-        let payload = entry.payload.as_deref().ok_or(Error::MalformedGovernance(
-            "governance entry payload pruned",
-        ))?;
         // 3a. Bind to the expected channel at the log layer.
         if &entry.skeleton.channel_id != expected_channel {
             return Err(Error::MalformedGovernance(
                 "governance entry channelID mismatch",
             ));
         }
+        let body = Self::body_bound_to(entry)?;
+        // 4. Recompute coordinates from the verified, signed skeleton.
+        Ok(Self {
+            body,
+            entry_hash: entry.entry_hash(),
+            author_id: entry.skeleton.author_id,
+            seq: entry.skeleton.seq,
+            causal_predecessors,
+        })
+    }
+
+    /// The governance body `entry` carries, if it decodes and binds to the entry's own signed
+    /// channel and epoch: the checks of [`GovEntry::from_verified_log_entry`] that need no key,
+    /// so sync can refuse an entry that would fail them before it is held (V210-74).
+    ///
+    /// # Errors
+    /// The payload is absent, is not a governance body, or names another channel or epoch.
+    pub fn body_bound_to(entry: &Entry) -> Result<GovBody> {
+        // 2. The framed governance struct lives in the retained payload.
+        let payload = entry.payload.as_deref().ok_or(Error::MalformedGovernance(
+            "governance entry payload pruned",
+        ))?;
         // 3b. Decode the payload as a governance body and bind BOTH its channelID
         //     AND its epoch to the signed log skeleton — the (channelID, epoch)
         //     binding must cover both axes, so a body's self-asserted epoch cannot
@@ -221,13 +239,6 @@ impl GovEntry {
                 "governance body epoch disagrees with log entry",
             ));
         }
-        // 4. Recompute coordinates from the verified, signed skeleton.
-        Ok(Self {
-            body,
-            entry_hash: entry.entry_hash(),
-            author_id: entry.skeleton.author_id,
-            seq: entry.skeleton.seq,
-            causal_predecessors,
-        })
+        Ok(body)
     }
 }

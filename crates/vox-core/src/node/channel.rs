@@ -293,6 +293,15 @@ impl AuthorResolver for ChannelAuthors {
             .and_then(|p| classify_payload(p).ok())
             .unwrap_or(EntryKind::Content)
     }
+
+    fn unclassifiable(&self, entry: &Entry) -> Option<Error> {
+        let payload = entry.payload.as_deref()?;
+        match classify_payload(payload) {
+            Err(e) => Some(e),
+            Ok(EntryKind::Governance) => GovEntry::body_bound_to(entry).err(),
+            Ok(EntryKind::Content) => None,
+        }
+    }
 }
 
 /// What one [`ChannelState::sync_over`] session did.
@@ -304,6 +313,8 @@ pub struct SyncOutcome {
     pub governance: usize,
     /// How many of those were decrypted and rendered into the timeline.
     pub rendered: usize,
+    /// Entries refused rather than held (V210-74): by sync before they were held, or after.
+    pub refused: usize,
     /// Whether every position this side asked for was filled (ADR-025 D3): `false` for a serve the
     /// peer bounded, which ends cleanly but leaves the rest owed.
     pub complete: bool,
@@ -395,6 +406,7 @@ impl SessionReport {
         out.filled_any = s.filled_any;
         out.unadmitted = s.unadmitted;
         out.frozen = s.frozen;
+        out.refused += s.refused;
         out.gen_have = s.gen_have;
         out.gen_end = s.gen_end;
         let fail = match fatal {
@@ -456,6 +468,8 @@ pub struct ChannelState {
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
+    /// Stored entries set aside when the room opened (V210-74): each as `author#seq: why`.
+    set_aside: Vec<String>,
     timeline: Vec<Rendered>,
     /// Accepted governance entries (consent grants and the rest) in acceptance
     /// order — the evaluator's input, rebuilt from the log on open (M14.5).
@@ -1117,6 +1131,7 @@ impl ChannelState {
             evaluator,
             sender,
             next_log_id: 1,
+            set_aside: Vec::new(),
             timeline: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
@@ -1203,32 +1218,81 @@ impl ChannelState {
         // Rebuild the DAG: every stored entry re-passes the acceptance predicate,
         // classified by its payload so governance entries are not re-admitted as
         // content.
+        //
+        // **What a hostile peer got onto disk before V210-74 does not keep the room shut.** An entry
+        // its author signed that cannot be classified, or whose governance body does not bind to
+        // it, is set aside and reported, and still taken as a link in its author's feed so the
+        // author's later entries link. An entry held without its predecessor (a payload stripped
+        // in transit was held and never logged) is retried once the rest is in, and set aside only
+        // if it still does not link: sync then fetches the missing ones again. Anything else that
+        // fails acceptance is a tampered store, and the room does not open.
         let mut dag = Dag::new();
         let mut next_log_id = 1u64;
         let mut gov_entries = Vec::new();
+        let mut set_aside = Vec::new();
+        let mut unlinked = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::LogDb)? {
+            next_log_id = id.saturating_add(1);
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
             let entry = Entry::from_wire(&wire)?;
             let key = authors
                 .get(&entry.skeleton.author_id)
                 .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?
                 .clone();
-            let payload = entry
-                .payload
-                .as_deref()
-                .ok_or(Error::MalformedAtRest("stored entry payload pruned"))?;
-            let kind = classify_payload(payload)?;
-            if kind == EntryKind::Governance {
-                gov_entries.push(GovEntry::from_verified_log_entry(
-                    &entry,
-                    &key,
-                    channel_id,
-                    Default::default(),
-                )?);
+            let at = format!(
+                "{}#{}",
+                crate::node::link::b32_encode(&entry.skeleton.author_id)
+                    .chars()
+                    .take(12)
+                    .collect::<String>(),
+                entry.skeleton.seq
+            );
+            let Some(payload) = entry.payload.as_deref() else {
+                set_aside.push(format!("{at}: held without its payload"));
+                continue;
+            };
+            let kind = match classify_payload(payload) {
+                Ok(EntryKind::Governance) => {
+                    match GovEntry::from_verified_log_entry(
+                        &entry,
+                        &key,
+                        channel_id,
+                        Default::default(),
+                    ) {
+                        Ok(gov) => {
+                            gov_entries.push(gov);
+                            EntryKind::Governance
+                        }
+                        Err(e) => {
+                            set_aside.push(format!("{at}: {e}"));
+                            EntryKind::Content
+                        }
+                    }
+                }
+                Ok(kind) => kind,
+                Err(e) => {
+                    set_aside.push(format!("{at}: {e}"));
+                    EntryKind::Content
+                }
+            };
+            match dag.accept(entry.clone(), kind, &key, &admission) {
+                Ok(_) => {}
+                Err(crate::log::dag::Rejected::Feed(_)) => unlinked.push((at, entry, kind, key)),
+                Err(_) => return Err(Error::MalformedAtRest("stored entry failed acceptance")),
             }
-            dag.accept(entry, kind, &key, &admission)
-                .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
-            next_log_id = id.saturating_add(1);
+        }
+        // Retried until a pass links nothing more: a predecessor logged later links then.
+        loop {
+            let before = unlinked.len();
+            unlinked.retain(|(_, entry, kind, key)| {
+                dag.accept(entry.clone(), *kind, key, &admission).is_err()
+            });
+            if unlinked.len() == before {
+                break;
+            }
+        }
+        for (at, ..) in unlinked {
+            set_aside.push(format!("{at}: an earlier entry of its author is missing"));
         }
 
         // The fork proofs this room kept (V210-63), each checked as a new one would be: a proof
@@ -1379,6 +1443,7 @@ impl ChannelState {
             evaluator,
             sender,
             next_log_id,
+            set_aside,
             timeline,
             gov_entries,
             receivers,
@@ -1607,6 +1672,7 @@ impl ChannelState {
             evaluator,
             sender,
             next_log_id: 1,
+            set_aside: Vec::new(),
             timeline: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
@@ -2792,6 +2858,12 @@ impl ChannelState {
         self.gov_entries.iter().map(|g| g.entry_hash).collect()
     }
 
+    /// The stored entries set aside when this room opened (V210-74), each as `author#seq: why`.
+    #[must_use]
+    pub fn set_aside(&self) -> &[String] {
+        &self.set_aside
+    }
+
     /// The resolver ADR-008 sync needs: this channel's admitted authors and the
     /// entry classification for `kind_for`.
     #[must_use]
@@ -2900,12 +2972,12 @@ impl ChannelState {
         // **One durable commit for the whole batch** (see `render_content_into`).
         //
         // Two kinds of failure, kept apart as they were when each entry committed on its own:
-        // - an entry this node refuses (an unadmitted author, bad governance) stops the pass
-        //   **without** poisoning the room: what came before it is still committed and rendered,
-        //   and the refusal is returned after that;
+        // - an entry this node refuses (bad governance) is counted and the pass goes on, **without**
+        //   poisoning the room (V210-74): the entries after it are already held, so stopping left
+        //   them in memory and not on disk, and a refusal reported as an error poisoned the room's
+        //   sync. Sync refuses what cannot be classified before it is held, so this is what is left;
         // - a failed write poisons the room, because memory has advanced past what is on disk.
         let mut rendered_rows: Vec<Rendered> = Vec::new();
-        let mut refused: Option<Error> = None;
         let mut batch = match store.batch() {
             Ok(b) => b,
             Err(e) => {
@@ -2965,12 +3037,18 @@ impl ChannelState {
                     if let Some(gov) = gov {
                         let could_read = self.readable_authors();
                         self.gov_entries.push(gov);
-                        self.evaluator = Arc::new(refuse!(Self::build_evaluator(
+                        // A fold that fails takes the entry back out, or every later rebuild
+                        // failed on it too.
+                        let built = Self::build_evaluator(
                             &self.genesis,
                             &self.authors,
                             &self.gov_entries,
                             now_secs,
-                        )));
+                        );
+                        if built.is_err() {
+                            self.gov_entries.pop();
+                        }
+                        self.evaluator = Arc::new(refuse!(built));
                         out.governance += 1;
                         // Into this pass's batch, never a batch of its own: a second write
                         // transaction opened while this one is open blocks forever (redb).
@@ -2989,10 +3067,7 @@ impl ChannelState {
                 })();
             match step {
                 Ok(Ok(rows)) => rendered_rows.extend(rows),
-                Ok(Err(refusal)) => {
-                    refused = Some(refusal);
-                    break;
-                }
+                Ok(Err(_refusal)) => out.refused += 1,
                 Err(e) => {
                     write_failed = Some(e);
                     break;
@@ -3019,9 +3094,7 @@ impl ChannelState {
             .fetch_add(logged, std::sync::atomic::Ordering::Relaxed);
         out.rendered += rendered_rows.len();
         self.timeline.extend(rendered_rows);
-        if let Some(refusal) = refused {
-            return Err(refusal);
-        }
+
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
         Ok(out)
@@ -3506,6 +3579,8 @@ impl ChannelState {
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
         let payload = msg.to_wire();
+        #[cfg(feature = "mutant-sender")]
+        let payload = crate::log::sync::mutant::authored(payload);
 
         let skeleton = self.next_skeleton(&me, &payload);
         let entry = Entry::build_signed(signer, skeleton, payload)?;

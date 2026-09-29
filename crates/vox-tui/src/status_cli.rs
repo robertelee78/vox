@@ -14,10 +14,38 @@ pub fn render(json: &str) -> String {
         .and_then(|s| s.as_array())
         .cloned()
         .unwrap_or_default();
-    if rows.is_empty() {
-        return "no sync sessions yet\n".to_owned();
-    }
     let mut out = String::new();
+    // Stored entries a room set aside when it opened (V210-74): said first, whatever else there is.
+    for r in v
+        .get("set_aside")
+        .and_then(|s| s.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let room: String = r
+            .get("room")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .chars()
+            .take(12)
+            .collect();
+        for e in r
+            .get("entries")
+            .and_then(|x| x.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let _ = writeln!(
+                out,
+                "room {room}: a stored entry was set aside when it opened — {}",
+                e.as_str().unwrap_or("?")
+            );
+        }
+    }
+    if rows.is_empty() {
+        out.push_str("no sync sessions yet\n");
+        return out;
+    }
     for r in rows {
         let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_owned();
         let n = |k: &str| r.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -25,7 +53,7 @@ pub fn render(json: &str) -> String {
         let _ = write!(
             out,
             "room {} peer {}: opened {} admitted {} completed {} partial {} failed {} busy-refused {} \
-             stale {} skipped {} queued {}",
+             stale {} refused {} skipped {} queued {}",
             short(s("room")),
             short(s("peer")),
             n("opened"),
@@ -35,6 +63,7 @@ pub fn render(json: &str) -> String {
             n("failed"),
             n("busy_refused"),
             n("stale"),
+            n("refused"),
             n("skipped_at_cap"),
             n("queued"),
         );

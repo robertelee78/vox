@@ -77,6 +77,9 @@ pub struct PortCounters {
     pub last_failure: Option<String>,
     /// Results that arrived for an attempt already retired (ADR-025 D1a).
     pub stale: u64,
+    /// Entries this peer served that were refused rather than held (V210-74): without their
+    /// payload, past a position not held, or signed but unclassifiable.
+    pub refused: u64,
     /// Sessions that were due but skipped because every outbound slot was taken.
     pub skipped_at_cap: u64,
     /// Times a port waited in the outbound queue for a slot (ADR-025 D6).
@@ -99,6 +102,8 @@ pub struct SyncBook {
     /// Records by others that taught this node's board something and were passed on
     /// (`NetEvent::BoardGrew`, #179): a member's routine refresh is not one.
     board_news: u64,
+    /// Each open room's stored entries set aside when it opened (V210-74), as `author#seq: why`.
+    set_aside: BTreeMap<Digest32, Vec<String>>,
 }
 
 /// The book as the actor and the handles share it.
@@ -129,6 +134,16 @@ impl SyncBook {
             .publish_rounds += 1;
     }
 
+    /// What `room` set aside when it opened (V210-74); nothing, and the room is not listed.
+    pub fn note_set_aside(book: &SharedSyncBook, room: Digest32, entries: &[String]) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.is_empty() {
+            b.set_aside.remove(&room);
+        } else {
+            b.set_aside.insert(room, entries.to_vec());
+        }
+    }
+
     /// Count one record of news on this node's board, passed on.
     pub fn note_board_news(book: &SharedSyncBook) {
         book.lock()
@@ -156,7 +171,7 @@ impl SyncBook {
                 s,
                 "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
                  \"completed\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\"stale\":{},\
-                 \"skipped_at_cap\":{},\"queued\":{},\"backoff\":{}}}",
+                 \"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{}}}",
                 b32_encode(room),
                 b32_encode(peer),
                 c.opened,
@@ -169,6 +184,7 @@ impl SyncBook {
                     .as_deref()
                     .map_or_else(|| "null".to_owned(), json_string),
                 c.stale,
+                c.refused,
                 c.skipped_at_cap,
                 c.queued,
                 c.backoff.map_or_else(
@@ -212,9 +228,22 @@ impl SyncBook {
         }
         let _ = write!(
             s,
-            "],\"publish\":{{\"rounds\":{},\"board_news\":{}}}}}",
+            "],\"publish\":{{\"rounds\":{},\"board_news\":{}}},\"set_aside\":[",
             b.publish_rounds, b.board_news
         );
+        for (i, (room, entries)) in b.set_aside.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let list: Vec<String> = entries.iter().map(|e| json_string(e)).collect();
+            let _ = write!(
+                s,
+                "{{\"room\":\"{}\",\"entries\":[{}]}}",
+                b32_encode(room),
+                list.join(",")
+            );
+        }
+        s.push_str("]}");
         s
     }
 }
