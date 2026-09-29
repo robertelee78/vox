@@ -244,6 +244,8 @@ pub enum UiError {
     Refused,
     /// There is no consent to withdraw from that member.
     NotConsented,
+    /// A consent named a member this node has not admitted to the room yet.
+    NotAdmitted,
     /// This client is not networked, or is locked, so it cannot reach anyone.
     NotNetworked,
     /// A local address the node needs (its listen port) is already in use.
@@ -290,6 +292,7 @@ impl UiError {
             UiError::KeyringFull => "your trust keyring is full (1,024) — remove one first",
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
+            UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",

@@ -278,6 +278,7 @@ pub fn ui_error(f: Fault) -> UiError {
             UiError::Unreachable
         }
         Fault::Refused => UiError::Refused,
+        Fault::NotAdmitted => UiError::NotAdmitted,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
         Fault::AddressInUse => UiError::AddressInUse,
