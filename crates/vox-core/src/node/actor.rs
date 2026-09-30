@@ -617,6 +617,9 @@ enum NetEvent {
     /// anyone holding a valid identity and a `.vox` name — see the comment in
     /// `spawn_stream_loop`.
     JoinRequest {
+        /// The connection the join arrived on, held until the exchange ends: see
+        /// `Node::answer_inbound_join`.
+        conn: Arc<VoxConnection>,
         /// The authenticated peer.
         peer: Digest32,
         /// The channel it asked to join.
@@ -1035,6 +1038,7 @@ fn spawn_stream_loop(
                 Ok(Inbound::Join { peer, send, recv }) => {
                     failures = 0;
                     let tx = tx.clone();
+                    let conn = Arc::clone(&conn);
                     tokio::spawn(async move {
                         let mut recv = recv;
                         let Ok((channel_id, epoch)) =
@@ -1045,6 +1049,7 @@ fn spawn_stream_loop(
                         };
                         let _ = tx
                             .send(NetEvent::JoinRequest {
+                                conn,
                                 peer,
                                 channel_id,
                                 epoch,
@@ -1717,6 +1722,11 @@ impl Joiner {
                 }
                 Err(e) => {
                     last_fault = fault_of(&e);
+                    // Why this member did not take us, when this side knows: its patience ran out
+                    // on our grind (V210-87). The fault alone cannot carry the two numbers.
+                    if last_fault == Fault::SolveTooSlow {
+                        why.push(format!("{short}: {e}"));
+                    }
                     if !worth_another_responder(last_fault) {
                         return Err(JoinerLost {
                             fault: last_fault,
@@ -1787,6 +1797,9 @@ const fn worth_another_responder(fault: Fault) -> bool {
             | Fault::NotNetworked
             | Fault::IdentityExists
             | Fault::AlreadyMember
+            // This device's speed, against a wait every member derives the same way: another
+            // member would cost another grind as long and end the same (V210-87).
+            | Fault::SolveTooSlow
     )
 }
 
@@ -3795,13 +3808,14 @@ impl Node {
                 }
             }
             NetEvent::JoinRequest {
+                conn,
                 peer,
                 channel_id,
                 epoch,
                 send,
                 recv,
             } => {
-                self.answer_inbound_join(peer, channel_id, epoch, send, recv)
+                self.answer_inbound_join(conn, peer, channel_id, epoch, send, recv)
                     .await;
             }
             NetEvent::JoinAnswered {
@@ -4496,8 +4510,16 @@ impl Node {
     /// reachable.
     ///
     /// See [`JOINS_IN_FLIGHT`] for the cap and why a join past it is refused rather than queued.
+    ///
+    /// **The exchange holds its connection** (V210-87). A connection displaced by a better path is
+    /// retired, and closed once its grace is up unless something still holds it — a sync, a tunnel.
+    /// A join held only its streams, so it did not count: a relayed dial displaced by a direct one
+    /// was closed under a joiner still grinding its proof of work, and the join failed with
+    /// `closed by the peer` whenever the grind outlasted the 60s grace. Measured through the real
+    /// binaries: the unoptimized build grinds 22–194s, and a slow device is the same.
     async fn answer_inbound_join(
         &mut self,
+        conn: Arc<VoxConnection>,
         peer: Digest32,
         channel_id: Digest32,
         epoch: u64,
@@ -4590,6 +4612,7 @@ impl Node {
         let admit_tx = self.net_tx.clone();
         self.join_tasks.spawn(async move {
             let _slot = slot;
+            let _carried = conn;
             let outcome = net
                 .answer_join(
                     peer,
@@ -8867,6 +8890,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::MalformedLink(_) | Error::MalformedAnchor(_) => Fault::BadLink,
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
+        Error::JoinSolveTooSlow { .. } => Fault::SolveTooSlow,
         Error::Path {
             op: crate::node::profile::VAULT_WRITE,
             ..
