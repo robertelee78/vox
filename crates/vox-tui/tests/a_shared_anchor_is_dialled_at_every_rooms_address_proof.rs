@@ -304,7 +304,11 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
         .map(|p| format!("/ip4/127.0.0.1/udp/{p}"))
         .collect();
     let stale_link = with_anchor_at(&invite(&first), &anchor_id, &dead);
-    let good_link = with_anchor_at(&invite(&second), &anchor_id, &[real_addr.clone()]);
+    let good_link = with_anchor_at(
+        &invite(&second),
+        &anchor_id,
+        std::slice::from_ref(&real_addr),
+    );
     assert!(
         dead.iter().all(|a| stale_link.contains(a)) && !stale_link.contains(&real_addr),
         "CANNOT MEASURE: the stale link does not name the anchor at the eight dead ports only: \
