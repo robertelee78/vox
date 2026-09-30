@@ -567,6 +567,12 @@ const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5)
 /// How long one wake may take before it is abandoned.
 const WAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Whether `text` is an envelope that could interrupt anyone at all: urgent and addressed.
+/// Checked before the node's view is copied, so the common message costs no copy.
+fn may_wake(text: &str) -> bool {
+    vox_agentcomms::envelope::Envelope::parse(text).is_ok_and(|e| e.urgent && !e.to.is_empty())
+}
+
 /// The interrupt decision for one entry that just landed in `channel_id`: wake every
 /// session registered for that room that this message both addresses and marks urgent
 /// (ADR-020 §6), while it has hops left (§9). Everything else waits for the session's
@@ -1053,7 +1059,9 @@ pub fn run_daemon(
                             crate::tunnel_cli::say_if_it_explains_a_failure(&ev);
                             match ev {
                                 vox_core::node::api::NodeEvent::NewEntry { channel_id, row } => {
-                                    if seen.insert(row.entry_hash) {
+                                    // The view — every open room's timeline — is copied only
+                                    // for a message that could interrupt someone.
+                                    if seen.insert(row.entry_hash) && may_wake(&row.text) {
                                         judge(&paths, &node.view(), &channel_id, &row).await;
                                     }
                                     false
@@ -1068,19 +1076,16 @@ pub fn run_daemon(
                 };
                 if sweep {
                     let view = node.view();
-                    let fresh: Vec<(vox_core::hash::Digest32, vox_core::node::api::MessageRow)> =
-                        view.open_channels
-                            .iter()
-                            .flat_map(|d| {
-                                d.timeline
-                                    .iter()
-                                    .filter(|r| !seen.contains(&r.entry_hash))
-                                    .map(move |r| (d.channel_id, r.clone()))
-                            })
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .filter(|(_, r)| seen.insert(r.entry_hash))
-                            .collect();
+                    // Every unseen row is marked seen; only one that could interrupt
+                    // someone is copied out to be judged.
+                    let mut fresh = Vec::new();
+                    for d in &view.open_channels {
+                        for r in &d.timeline {
+                            if seen.insert(r.entry_hash) && may_wake(&r.text) {
+                                fresh.push((d.channel_id, r.clone()));
+                            }
+                        }
+                    }
                     for (cid, row) in fresh {
                         judge(&paths, &view, &cid, &row).await;
                     }

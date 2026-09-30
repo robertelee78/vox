@@ -32,6 +32,12 @@
 //!   is the destination's content event just as a write is. `copy_file_range` is Linux's and
 //!   this library is macOS-only (dyld interposing), so it is not recorded.
 //!
+//! ## One injected failure
+//! With `VOX_INTERPOSE_FAIL_DIR_SYNC` set to a directory's path, as the kernel names it, every
+//! `F_FULLFSYNC`, `F_BARRIERFSYNC` or `fsync` of that directory fails with `EIO` without being made
+//! (and is recorded with that outcome). It stages what no userspace test can otherwise: a rename
+//! that lands whose directory will not flush (V210-77). Unset, nothing is injected.
+//!
 //! Paths are as the call named them (for `open` and `rename`) or as the kernel reports them (for a
 //! descriptor), so a reader compares them after canonicalising the directory.
 //!
@@ -58,6 +64,7 @@ const F_FULLFSYNC: c_int = 51;
 const F_BARRIERFSYNC: c_int = 85;
 const AT_FDCWD: c_int = -2;
 const MAXPATHLEN: usize = 1024;
+const EIO: c_int = 5;
 
 extern "C" {
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
@@ -218,6 +225,20 @@ fn at_path(dirfd: c_int, path: *const c_char) -> String {
     format!("{}/{p}", fd_path(dirfd))
 }
 
+/// Whether a flush of `path` is to fail with `EIO` (`VOX_INTERPOSE_FAIL_DIR_SYNC`).
+fn fail_flush_of(path: &str) -> bool {
+    // SAFETY: getenv is called with a NUL-terminated name; the value it returns is read once.
+    let target = unsafe { getenv(c"VOX_INTERPOSE_FAIL_DIR_SYNC".as_ptr()) };
+    !target.is_null() && text(target) == path
+}
+
+/// Fail as the call would have with `EIO`.
+fn injected_eio() -> c_int {
+    // SAFETY: __error returns this thread's errno slot.
+    unsafe { *__error() = EIO };
+    -1
+}
+
 // ---- hooks --------------------------------------------------------------------------------
 
 #[no_mangle]
@@ -260,7 +281,11 @@ pub unsafe extern "C" fn vti_fcntl_hook(fd: c_int, cmd: c_int, arg: c_ulong) -> 
     // The path is taken before the call: after it, nothing about the descriptor has changed.
     let flushing = cmd == F_FULLFSYNC || cmd == F_BARRIERFSYNC;
     let path = if flushing { fd_path(fd) } else { String::new() };
-    let r = fcntl(fd, cmd, arg);
+    let r = if flushing && fail_flush_of(&path) {
+        injected_eio()
+    } else {
+        fcntl(fd, cmd, arg)
+    };
     if flushing {
         let (ret, errno) = outcome(r);
         let how = if cmd == F_FULLFSYNC {
@@ -276,7 +301,11 @@ pub unsafe extern "C" fn vti_fcntl_hook(fd: c_int, cmd: c_int, arg: c_ulong) -> 
 #[no_mangle]
 pub unsafe extern "C" fn vti_fsync(fd: c_int) -> c_int {
     let path = fd_path(fd);
-    let r = fsync(fd);
+    let r = if fail_flush_of(&path) {
+        injected_eio()
+    } else {
+        fsync(fd)
+    };
     let (ret, errno) = outcome(r);
     record(&["sync", &path, "fsync", &ret, &errno]);
     r

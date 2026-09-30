@@ -21,7 +21,7 @@
 //! ```
 //!
 //! Mutation: resume the counter from the log rows alone (take the cache rows out of the reopen's
-//! id scan) and Bob's last read is missing one of Alice's posts: its cache row was overwritten.
+//! id scan) and Bob's last read is missing Alice's third post, the one received last.
 
 #![cfg(unix)]
 
