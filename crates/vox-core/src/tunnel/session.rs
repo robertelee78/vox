@@ -550,13 +550,13 @@ async fn splice_until(
             let code = quinn::VarInt::from_u32(TUNNEL_ABORT_CODE);
             let _ = send.reset(code);
             let _ = recv.stop(code);
-            abort_local(&tcp);
+            abort_after_drain(tcp).await;
             Err(Error::MalformedTunnel("tunnel splice aborted"))
         }
         Some(Leg::Withdrawn) => {
             let _ = recv.stop(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
             let _ = send.reset(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
-            abort_local(&tcp);
+            abort_after_drain(tcp).await;
             Err(Error::TunnelRevoked(
                 "the host withdrew access to this service",
             ))
@@ -567,10 +567,39 @@ async fn splice_until(
             let code = quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE);
             let _ = send.reset(code);
             let _ = recv.stop(code);
-            abort_local(&tcp);
+            abort_after_drain(tcp).await;
             Err(Error::TunnelRevoked("withdrawn mid-session"))
         }
     }
+}
+
+/// How long a deliberate cut waits for the bytes already queued toward the local application
+/// to be read before it resets the connection (see `abort_after_drain`).
+pub const DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reset `tcp` once the bytes queued toward the local application have left it, or after
+/// [`DRAIN_BOUND`].
+///
+/// **An RST sent over queued bytes can be lost.** On macOS loopback a zero-linger close of a
+/// socket that still holds unsent data, while the application is reading it, lost the reset in
+/// 33–62 of 100 runs (a reader at full speed and a slow one): the application was left with an
+/// ESTABLISHED socket that never delivered another byte, and a cut Vox made on purpose — reach
+/// withdrawn, a service removed — read as a hang (V210-81). With the queue empty first, 400 of
+/// 400 were reset.
+///
+/// The queue is not readable without `unsafe` (macOS `SO_NWRITE`), so it is watched instead: with
+/// the send buffer shrunk to 2048 bytes — the kernel's write low-water mark — the socket reports
+/// writable only once nothing is queued. It is registered afresh, so that report reflects the
+/// socket now rather than a readiness remembered from an earlier write. The zero linger is set
+/// first, so any path out of here resets.
+async fn abort_after_drain(tcp: TcpStream) {
+    abort_local(&tcp);
+    let _ = socket2::SockRef::from(&tcp).set_send_buffer_size(2048);
+    let Ok(std) = tcp.into_std() else { return };
+    let Ok(tcp) = TcpStream::from_std(std) else {
+        return;
+    };
+    let _ = tokio::time::timeout(DRAIN_BOUND, tcp.writable()).await;
 }
 
 /// Make the imminent drop of `tcp` an RST rather than a FIN.
