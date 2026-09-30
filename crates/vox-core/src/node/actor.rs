@@ -154,6 +154,7 @@ fn detail_of(ch: &ChannelState) -> ChannelDetail {
             .map(|(tag, addr)| (tag.clone(), *addr))
             .collect(),
         equivocations: ch.equivocations(),
+        consented: ch.consented().into_iter().collect(),
     }
 }
 
@@ -8566,6 +8567,7 @@ impl Node {
             trusted: self.trust_rows(),
             relayed_peers: Vec::new(),
             connected: 0,
+            connected_peers: Vec::new(),
             relaying: 0,
         });
     }
@@ -8692,6 +8694,7 @@ impl Node {
             });
         }
         let (relayed_peers, relaying) = self.path_view();
+        let connected_peers = self.connected_peers();
         let view = NodeView {
             identity,
             locked,
@@ -8713,10 +8716,8 @@ impl Node {
             trusted: self.trust_rows(),
             relayed_peers,
             relaying,
-            connected: self
-                .net
-                .as_ref()
-                .map_or(0, |net| net.manager().peers().len()),
+            connected: connected_peers.len(),
+            connected_peers,
         };
         (view, read)
     }
@@ -8725,14 +8726,22 @@ impl Node {
     /// the connection manager holds.
     fn paths_moved(&self) -> bool {
         let (relayed_peers, relaying) = self.path_view();
-        let connected = self
-            .net
-            .as_ref()
-            .map_or(0, |net| net.manager().peers().len());
+        let connected_peers = self.connected_peers();
         let shown = self.view_tx.borrow();
         shown.relayed_peers != relayed_peers
             || shown.relaying != relaying
-            || shown.connected != connected
+            || shown.connected_peers != connected_peers
+    }
+
+    /// The peers the connection manager holds a connection to, in fingerprint order.
+    fn connected_peers(&self) -> Vec<Digest32> {
+        let mut peers = self
+            .net
+            .as_ref()
+            .map_or_else(Vec::new, |net| net.manager().peers());
+        peers.sort_unstable();
+        peers.dedup();
+        peers
     }
 
     /// Which peers are reached through a relay, and how many circuits this node carries for

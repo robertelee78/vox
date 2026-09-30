@@ -1273,6 +1273,7 @@ fn event_loop(
     let mut was_locked: Option<bool> = None;
     loop {
         let vm = core.view();
+        ui.settle(&vm);
 
         // Onboarding / re-auth prompts: open once per transition, never on top of
         // another modal.
@@ -1285,7 +1286,7 @@ fn event_loop(
         }
         was_locked = Some(vm.locked);
 
-        io.draw(&mut |f| render(f, &vm, &ui))?;
+        io.draw(&mut |f| render(f, &vm, &mut ui))?;
 
         // Idle lock (ADR-015): lock the node after IDLE_LOCK_SECS without input.
         let now = clock();
