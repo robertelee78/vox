@@ -699,12 +699,19 @@ enum NetEvent {
         /// The wakeup's identity; a stale one is ignored.
         timer: u64,
     },
-    /// A sender key written to `peer` was taken: any backoff on re-sending to it ends.
+    /// A sender key written to `peer` was taken: it is recorded as delivered (V210-88), and any
+    /// backoff on re-sending to it ends.
     SkdmTaken {
         /// The room.
         channel_id: Digest32,
         /// The member that took it.
         peer: Digest32,
+        /// The generation it took.
+        chain_id: u64,
+        /// Whether it was one of the keys of the history `peer` was owed.
+        history: bool,
+        /// The [`Node::delivery_epoch`] its watcher started in.
+        epoch: u64,
     },
     /// A sender key written to `peer` was not taken (see `pairwise_stream::refused`): it is owed
     /// again, and the tick re-sends it.
@@ -719,6 +726,10 @@ enum NetEvent {
         why: String,
         /// The serial of the session the key was sealed under (V210-78).
         session: Option<u64>,
+        /// Whether it was one of the keys of the history `peer` was owed.
+        history: bool,
+        /// The [`Node::delivery_epoch`] its watcher started in.
+        epoch: u64,
     },
     /// A publish round to a board ended (see `publish_channel_to_anchor`).
     PublishDone {
@@ -1348,6 +1359,26 @@ struct Joiner {
     pow_params: Option<crate::join::pow::PowParams>,
     argon2: Argon2Profile,
     passphrase: Secret,
+}
+
+/// A caller's reply carried by a task that [`Node::lock_all`] may abort (V210-76): answered
+/// `Locked` if the task is dropped before it hands the reply on, so the caller is told what
+/// happened rather than that the node went away.
+struct AnsweredIfAborted(Option<oneshot::Sender<Outcome>>);
+
+impl AnsweredIfAborted {
+    /// The reply, for the task to pass on now that it was not aborted.
+    fn into_reply(mut self) -> Option<oneshot::Sender<Outcome>> {
+        self.0.take()
+    }
+}
+
+impl Drop for AnsweredIfAborted {
+    fn drop(&mut self) {
+        if let Some(reply) = self.0.take() {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+        }
+    }
 }
 
 /// A join that got in: what the actor needs to make the room.
@@ -2106,7 +2137,8 @@ pub struct Node {
     join_slots: Arc<tokio::sync::Semaphore>,
     /// Slots for identity-passphrase checks; see [`VERIFIES_IN_FLIGHT`].
     verify_slots: Arc<tokio::sync::Semaphore>,
-    /// The join exchanges running right now.
+    /// The join exchanges running right now, both sides of them, and the room creations sealing
+    /// their key (V210-76).
     ///
     /// Tracked rather than detached for one reason: each holds an `Arc<VaultRootSigner>`, and
     /// ADR-015 says a locked node holds no identity secrets. [`Node::lock_all`] aborts this set,
@@ -2178,6 +2210,18 @@ pub struct Node {
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
     key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
+    /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
+    /// key cut off by a crash is owed again after the restart; see [`Node::watch_delivery`].
+    keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
+    /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
+    /// whether the batch fell short (a key refused, or not all of it written). The history is
+    /// recorded as delivered only once every key of a whole batch was taken (V210-88).
+    history_in_flight: BTreeMap<(Digest32, Digest32), (u32, bool)>,
+    /// Which delivery watchers are current (V210-88): bumped when the node locks, which forgets
+    /// what is in flight. A watcher started before carries the old value, and its answer arriving
+    /// after an unlock does not count towards what is in flight now: it could otherwise complete a
+    /// new history batch before that batch's own keys were taken.
+    delivery_epoch: u64,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012), across restarts too: see `next_record_seq`.
     record_seq: BTreeMap<Digest32, u64>,
@@ -2389,6 +2433,9 @@ impl Node {
             pending_consents: Vec::new(),
             fresh_details: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
+            keys_in_flight: BTreeMap::new(),
+            history_in_flight: BTreeMap::new(),
+            delivery_epoch: 0,
             record_seq: BTreeMap::new(),
             record_ts_floor: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -4145,7 +4192,16 @@ impl Node {
                 chain_id,
                 why,
                 session,
+                history,
+                epoch,
             } => {
+                // A watcher from before a lock: what it answered is no longer in flight.
+                if epoch == self.delivery_epoch {
+                    self.key_landed(channel_id, peer);
+                    if history {
+                        self.history_landed(channel_id, peer, false);
+                    }
+                }
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
@@ -4332,8 +4388,33 @@ impl Node {
                     }
                 }
             }
-            NetEvent::SkdmTaken { channel_id, peer } => {
+            NetEvent::SkdmTaken {
+                channel_id,
+                peer,
+                chain_id,
+                history,
+                epoch,
+            } => {
                 self.key_backoff.remove(&(channel_id, peer));
+                // The key was taken, and is recorded so whenever it answered. What is in flight,
+                // and so a whole history batch, is counted only by a watcher of this epoch.
+                let fresh = epoch == self.delivery_epoch;
+                if fresh {
+                    self.key_landed(channel_id, peer);
+                }
+                let whole_history = fresh && history && self.history_landed(channel_id, peer, true);
+                let (Some(profile), Some(shared)) = (
+                    self.profile.as_ref(),
+                    self.channels.get(&channel_id).map(Arc::clone),
+                ) else {
+                    return;
+                };
+                // A failed write leaves the key owed, and it is sent again: never the other way.
+                let mut channel = shared.lock().await;
+                let _ = channel.note_delivered(profile.store(), peer, chain_id);
+                if whole_history {
+                    let _ = channel.note_history_delivered(profile.store(), &peer);
+                }
             }
             NetEvent::RoomStored { channel_id } => {
                 // A worker persisted entries: the room's generation moved, and its ports are
@@ -5045,8 +5126,16 @@ impl Node {
             passphrase: passphrase.clone(),
         };
         let tx = self.net_tx.clone();
-        tokio::spawn(async move {
+        // **Tracked, so a lock aborts it** (V210-76). The joiner holds the vault signer, the
+        // prekey ring and the room passphrase, and signs with them for as long as the join runs;
+        // detached, it went on joining for tens of seconds after the node locked.
+        let reply = AnsweredIfAborted(Some(reply));
+        self.reap_join_tasks();
+        self.join_tasks.spawn(async move {
             let result = job.run().await;
+            let Some(reply) = reply.into_reply() else {
+                return;
+            };
             let _ = tx
                 .send(NetEvent::JoinerDone {
                     reply,
@@ -5332,17 +5421,11 @@ impl Node {
                 .as_ref()
                 .and_then(|p| p.first().copied())
                 .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
-            if let Err(e) = channel.issue_consent(profile, target, &skdm, entitled_from, now) {
-                return Outcome::Failed(fault_of(&e));
-            }
-            // The generations before the live one that the decision covers (V210-45).
-            if entitled_from.0 < skdm.body.chain_id {
-                if let Err(e) = channel.owe_history(profile.store(), target, entitled_from.0) {
-                    return Outcome::Failed(fault_of(&e));
-                }
-                true
-            } else {
-                false
+            // The generations before the live one that the decision covers (V210-45) are owed
+            // in the grant's own transaction.
+            match channel.issue_consent(profile, target, &skdm, entitled_from, now) {
+                Ok((_, history_owed)) => history_owed,
+                Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
         // The grant is on the log now, and a reader renders nothing without it: pushed at once,
@@ -5351,8 +5434,9 @@ impl Node {
         // The generation delivered is the key's own: a key taken before a rotation is the older
         // one, and a refusal must re-owe exactly that (V210-30).
         let chain_id = skdm.body.chain_id;
-        // The consent is a fact once decided; whether the key landed is learnt off the actor.
-        self.watch_delivery(sent, *channel_id, target, chain_id);
+        // The consent is a fact once decided; whether the key landed is learnt off the actor, and
+        // it is recorded as delivered only then (V210-88).
+        self.watch_delivery(sent, *channel_id, target, chain_id, false);
         if history_owed {
             // At once rather than on the tick: the connection and session are live now.
             let _ = self.deliver_rekeys_for(channel_id, asked).await;
@@ -5807,7 +5891,7 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return 0;
         };
-        let (owed, generation, skdm, mut history) = {
+        let (owed, skdm, mut history) = {
             let channel = shared.lock().await;
             let owed = channel.owed_rekeys();
             let history_owed = channel.owed_history();
@@ -5833,7 +5917,7 @@ impl Node {
                     skdm.insert(*target, s);
                 }
             }
-            (owed, channel.sender_generation(), skdm, history)
+            (owed, skdm, history)
         };
         let mut delivered = 0u64;
         let now_secs = self.now();
@@ -5845,6 +5929,16 @@ impl Node {
                     .key_backoff
                     .get(&(*channel_id, target))
                     .is_some_and(|(_, until)| now_secs < *until)
+            {
+                continue;
+            }
+            // **A key still in flight is not sent again** (V210-88): nothing is recorded as
+            // delivered until the member takes it, so until it answers it stays owed here. A
+            // history batch waits for the one in flight; history itself is not held back by a
+            // single key, since a consent's own key is in flight when its history is sent.
+            let pair = (*channel_id, target);
+            if self.history_in_flight.contains_key(&pair)
+                || (!history.contains_key(&target) && self.keys_in_flight.contains_key(&pair))
             {
                 continue;
             }
@@ -5868,6 +5962,7 @@ impl Node {
             };
             let mut all_sent = true;
             let mut hello_left = hello.as_ref();
+            let mut watched = 0u32;
             for key in keys {
                 let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
                     all_sent = false;
@@ -5889,31 +5984,48 @@ impl Node {
                 if hello.is_some() {
                     self.hello_delivered(channel_id, target);
                 }
-                // Each key's own generation: a refusal re-owes exactly what was refused.
-                self.watch_delivery(sent, *channel_id, target, key.body.chain_id);
+                // Each key's own generation: a refusal re-owes exactly what was refused, and it is
+                // recorded as delivered only once taken (V210-88).
+                self.watch_delivery(sent, *channel_id, target, key.body.chain_id, owes_history);
+                watched += 1;
             }
-            if !all_sent {
-                continue;
+            if owes_history && watched > 0 {
+                // Answers are handled on this actor, after this returns: none is lost.
+                self.history_in_flight.insert(pair, (watched, !all_sent));
             }
-            // Recorded only after the bytes went out, so a failed delivery stays owed.
-            let noted = {
-                let Some(profile) = self.profile.as_ref() else {
-                    return delivered;
-                };
-                let mut channel = shared.lock().await;
-                let history_noted = if owes_history {
-                    channel.note_history_delivered(profile.store(), &target)
-                } else {
-                    Ok(())
-                };
-                history_noted
-                    .and_then(|()| channel.note_delivered(profile.store(), target, generation))
-            };
-            if noted.is_ok() {
+            if all_sent {
                 delivered += 1;
             }
         }
         delivered
+    }
+
+    /// A key watched by [`Self::watch_delivery`] was answered, taken or not: one fewer in flight.
+    fn key_landed(&mut self, channel_id: Digest32, peer: Digest32) {
+        let key = (channel_id, peer);
+        if let Some(n) = self.keys_in_flight.get_mut(&key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.keys_in_flight.remove(&key);
+            }
+        }
+    }
+
+    /// A key of the history batch in flight to `peer` was answered. Returns whether that was the
+    /// last one and every key of the whole batch was taken, so the history is delivered.
+    fn history_landed(&mut self, channel_id: Digest32, peer: Digest32, taken: bool) -> bool {
+        let key = (channel_id, peer);
+        let Some((left, short)) = self.history_in_flight.get_mut(&key) else {
+            return false;
+        };
+        *left = left.saturating_sub(1);
+        *short |= !taken;
+        if *left > 0 {
+            return false;
+        }
+        let whole = !*short;
+        self.history_in_flight.remove(&key);
+        whole
     }
 
     /// **A member this node has just learned of is passed on at once**, like a local append.
@@ -7371,14 +7483,22 @@ impl Node {
 
     /// Learn, off the actor, whether the key just written to `target` was taken; if it was not,
     /// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
+    ///
+    /// **Taken is when it is delivered** (V210-88): `NetEvent::SkdmTaken` records generation
+    /// `chain_id` as `target`'s, and a `history` key counts towards the batch it belongs to, whose
+    /// history is recorded once all of it was taken. Until then the key is only in flight, which
+    /// is kept in memory, so a crash leaves it owed and the restarted node sends it again.
     fn watch_delivery(
-        &self,
+        &mut self,
         sent: quinn::RecvStream,
         channel_id: Digest32,
         target: Digest32,
         chain_id: u64,
+        history: bool,
     ) {
+        *self.keys_in_flight.entry((channel_id, target)).or_default() += 1;
         let session = self.session_serial.get(&(channel_id, target)).copied();
+        let epoch = self.delivery_epoch;
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
             let event =
@@ -7389,10 +7509,15 @@ impl Node {
                         chain_id,
                         why,
                         session,
+                        history,
+                        epoch,
                     },
                     None => NetEvent::SkdmTaken {
                         channel_id,
                         peer: target,
+                        chain_id,
+                        history,
+                        epoch,
                     },
                 };
             let _ = tx.send(event).await;
@@ -7787,6 +7912,15 @@ impl Node {
             task.abort();
         }
         self.reopening.clear();
+        // An aborted joiner never reports back, so nothing is being joined any more, and what was
+        // held for the join goes with the network.
+        self.joining.clear();
+        self.held_pairwise.clear();
+        // Keys still in flight stay owed, and are sent again after the next unlock (V210-88).
+        self.keys_in_flight.clear();
+        // And the watchers still running answer for what is no longer in flight.
+        self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
+        self.history_in_flight.clear();
         // The unlock they wait on did happen; what it reopened is locked again with the rest.
         for reply in std::mem::take(&mut self.unlock_waiters) {
             let _ = reply.send(Outcome::Done);
@@ -7801,6 +7935,9 @@ impl Node {
         // and says who this operator talks to. A locked node holds neither, and it
         // is re-opened on the next unlock (ADR-020 §3).
         self.trust = crate::node::trust::Keyring::new();
+        // The sender keys held for consents not yet delivered are room secrets: dropped, and
+        // zeroized as they go (V210-76). They are reloaded, sealed, at the next unlock.
+        self.consent_keys = crate::node::pending_consent::PendingConsents::default();
         // Pairwise sessions hold ratchet key material: drop them with everything else
         // (their secrets zeroize on drop).
         self.sessions.clear();
@@ -7910,7 +8047,11 @@ impl Node {
         let tx = self.net_tx.clone();
         let channel_id = genesis.channel_id();
         let seal_passphrase = passphrase.clone();
-        tokio::spawn(async move {
+        // Tracked, so a lock aborts it: it holds the signer (V210-76). The seal itself runs on a
+        // blocking thread, which cannot be interrupted; its result is dropped with the task.
+        let reply = AnsweredIfAborted(Some(reply));
+        self.reap_join_tasks();
+        self.join_tasks.spawn(async move {
             let sealed = tokio::task::spawn_blocking(move || {
                 let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
                 sek.seal(&factor, &channel_id, &seal_passphrase, argon2)
@@ -7918,6 +8059,9 @@ impl Node {
             })
             .await
             .unwrap_or(Err(Error::Argon2Failed));
+            let Some(reply) = reply.into_reply() else {
+                return;
+            };
             let _ = tx
                 .send(NetEvent::ChannelSealed {
                     reply,

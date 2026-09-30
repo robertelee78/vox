@@ -2117,6 +2117,10 @@ impl ChannelState {
     /// `entitled_from` is the earliest `(chain_id, iteration)` this consent releases to
     /// `target` (V210-45): the delivered key's own position, or earlier when history
     /// is owed too. It is recorded, and no later release to `target` starts before it.
+    ///
+    /// **It records nothing as delivered** (V210-88): the key is `delivered` only once `target`
+    /// has taken it, which [`Self::note_delivered`] records when it says so. Returns the grant, and
+    /// whether the consent owes `target` history, the generations before the key's own.
     pub fn issue_consent(
         &mut self,
         profile: &Profile,
@@ -2124,7 +2128,7 @@ impl ChannelState {
         delivered_skdm: &Skdm,
         entitled_from: (u64, u64),
         now_secs: u64,
-    ) -> Result<ConsentGrant> {
+    ) -> Result<(ConsentGrant, bool)> {
         let signer = profile.signer()?;
         let grant = issue_consent_grant(
             signer,
@@ -2134,24 +2138,56 @@ impl ChannelState {
             delivered_skdm,
             self.genesis.body.policy.history_mode,
         )?;
-        self.append_governance(profile, &grant.to_wire(), now_secs)?;
-        // The grant is the record that `target` holds the generation it was given; the ledger
-        // is how a later rotation knows it has not yet been given the next one. The generation
-        // is the delivered key's own, not the current one: a key taken when consent was decided
-        // and delivered after a rotation is the older generation, and the rotation still owes
-        // this member the new one (V210-30).
-        self.delivered.insert(target, delivered_skdm.body.chain_id);
-        self.persist_delivered(profile.store())?;
+        // **Not `delivered` yet** (V210-88). Recorded here, in the grant's transaction, a crash
+        // after the commit and before `target` took the key left a node that believed it had
+        // delivered a key the member never held: nothing owed it again, and the member read
+        // nothing from this identity for good. Until it is taken, the consenter is owed a re-key
+        // like any other, which releases from its entitlement, committed below with the grant.
+        //
         // An entitlement already held (an earlier consent never revoked) stands: both were
         // decided, and the earlier one released what it released.
-        let from = self
-            .entitled
+        let mut entitled = self.entitled.clone();
+        let from = entitled
             .get(&target)
             .map_or(entitled_from, |e| (*e).min(entitled_from));
-        if self.entitled.insert(target, from) != Some(from) {
-            self.persist_entitled(profile.store())?;
+        entitled.insert(target, from);
+        // The generations before the key's own that the decision covers (V210-45), owed as
+        // history: in the same transaction, or a crash between the two lost them.
+        // As `owe_history`: only generations before the live one, and the oldest floor stands.
+        let floor = entitled_from.0;
+        let history_owed = floor < delivered_skdm.body.chain_id && floor < self.sender.chain_id();
+        let mut history = self.history.clone();
+        let history_changed = history_owed && history.get(&target).is_none_or(|f| *f > floor);
+        if history_changed {
+            history.insert(target, floor);
         }
-        Ok(grant)
+        // **One transaction** with the grant (V210-76). Written one after another, a crash after
+        // the grant left no `entitled` row, so the re-key it was owed released the live
+        // generation from its origin: the posts sealed before the consent.
+        let mut rows = vec![(
+            SEG_ENTITLED,
+            seal_segment(
+                &self.sek,
+                SegmentKind::KeyMaterial,
+                SEG_ENTITLED,
+                &positions_bytes(&entitled),
+            )?,
+        )];
+        if history_changed {
+            rows.push((
+                SEG_HISTORY,
+                seal_segment(
+                    &self.sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_HISTORY,
+                    &delivered_bytes(&history),
+                )?,
+            ));
+        }
+        self.append_governance_with(profile, &grant.to_wire(), now_secs, &rows)?;
+        self.entitled = entitled;
+        self.history = history;
+        Ok((grant, history_owed))
     }
 
     /// Whether this identity's sender key has reached its scheduled-rotation bound
@@ -2273,8 +2309,8 @@ impl ChannelState {
         }
     }
 
-    /// Record that `target` has been delivered generation `chain_id` of this
-    /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
+    /// Record that `target` refused generation `chain_id` of this identity's sender key, so it
+    /// is [`owed`](ChannelState::owed_rekeys) again. A later generation it did take stays recorded.
     pub fn note_undelivered(
         &mut self,
         store: &Store,
@@ -2893,6 +2929,18 @@ impl ChannelState {
         payload: &[u8],
         now_secs: u64,
     ) -> Result<Digest32> {
+        self.append_governance_with(profile, payload, now_secs, &[])
+    }
+
+    /// [`Self::append_governance`], committing `rows` — sealed `KeyMaterial` segments by id — in
+    /// the same transaction as the entry, so neither is ever on disk without the other.
+    fn append_governance_with(
+        &mut self,
+        profile: &Profile,
+        payload: &[u8],
+        now_secs: u64,
+        rows: &[(u64, SealedSegment)],
+    ) -> Result<Digest32> {
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
@@ -2917,11 +2965,14 @@ impl ChannelState {
         self.dag
             .accept(entry, EntryKind::Governance, &key, &self.admission)
             .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
-        if let Err(e) =
-            profile
-                .store()
-                .put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)
-        {
+        let written = profile.store().batch().and_then(|mut batch| {
+            batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
+            for (row, seg) in rows {
+                batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, *row, seg)?;
+            }
+            batch.commit()
+        });
+        if let Err(e) = written {
             self.poisoned = true;
             return Err(e);
         }
