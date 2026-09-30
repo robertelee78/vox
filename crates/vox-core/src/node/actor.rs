@@ -1679,6 +1679,9 @@ impl Joiner {
                     Ok(c) => {
                         if let Err(e) = announce(&c, &prejoin_wire).await {
                             last_fault = fault_of(&e);
+                            // Said, as a failed dial is: a join that failed here reported no
+                            // reason at all (V210-83).
+                            why.push(format!("{short}: announce: {e}"));
                             if !worth_another_responder(last_fault) {
                                 return Err(JoinerLost {
                                     fault: last_fault,
@@ -1740,9 +1743,12 @@ impl Joiner {
                 Err(e) => {
                     last_fault = fault_of(&e);
                     // Why this member did not take us, when this side knows: its patience ran out
-                    // on our grind (V210-87). The fault alone cannot carry the two numbers.
+                    // on our grind (V210-87), which the fault alone cannot carry the numbers of;
+                    // or anything else the exchange met, which was left unsaid (V210-83).
                     if last_fault == Fault::SolveTooSlow {
                         why.push(format!("{short}: {e}"));
+                    } else {
+                        why.push(format!("{short}: exchange: {e}"));
                     }
                     if !worth_another_responder(last_fault) {
                         return Err(JoinerLost {
@@ -2453,6 +2459,12 @@ impl Node {
                     let shutdown = matches!(command, NodeCommand::Shutdown);
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
+                    // Proof the actor is taking commands (V210-83): it changes nothing, so nothing
+                    // is published or scheduled for it.
+                    if matches!(command, NodeCommand::Ping) {
+                        let _ = reply.send(Outcome::Done);
+                        continue;
+                    }
                     // **Answered off the actor.** Checking the identity passphrase is production
                     // Argon2id, and every `vox trust add/list/remove` asks for it. Inline, it held
                     // the actor for ~0.3 s per command, and nothing on the node — posts, reads,
@@ -2735,11 +2747,11 @@ impl Node {
                 if self.forwards.remove(&local).is_some() {
                     Outcome::Done
                 } else {
-                    Outcome::Failed(Fault::UnknownChannel)
+                    Outcome::Failed(Fault::NoSuchForward)
                 }
             }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
-            NodeCommand::Shutdown => Outcome::Done,
+            NodeCommand::Shutdown | NodeCommand::Ping => Outcome::Done,
         }
     }
 
@@ -8152,7 +8164,7 @@ impl Node {
                 self.refresh_reachers().await;
                 Outcome::Done
             }
-            Ok(false) => Outcome::Failed(Fault::UnknownChannel),
+            Ok(false) => Outcome::Failed(Fault::NotOffered),
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
     }
