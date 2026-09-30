@@ -55,15 +55,17 @@ const IDENTITY: &str = "identity passphrase for the prekey ring proof";
 const ROOM_PASS: &str = "room passphrase for the prekey ring proof";
 
 /// How long after the ring is made its signed prekey falls due, on the skewed clock: long enough
-/// for `vox id` and the daemon's unlock to finish first, short enough to wait for.
-const LEAD: u64 = 45;
+/// for `vox id` and the daemon's unlock to finish first, short enough to wait for. 45 s was not
+/// enough on a loaded box: a daemon took 45.6 s to answer, and the rotation came at its unlock.
+const LEAD: u64 = 120;
 /// Seven days, the signed prekey's cadence (ADR-002 §2), written out rather than read from the
 /// product so a changed cadence goes red.
 const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
 /// How long, from the daemon answering, the rotation may take: the lead, and the tick.
-const ROTATE_WITHIN: Duration = Duration::from_secs(120);
-/// Stage 2's lead: time for the host to start and make a room before its rotation.
-const WINDOW_LEAD: u64 = 15;
+const ROTATE_WITHIN: Duration = Duration::from_secs(240);
+/// Stage 2's lead: time for the host to start and make a room before its rotation (15 s was
+/// not enough in a debug build).
+const WINDOW_LEAD: u64 = 60;
 /// How long before the host's rotation falls due the guest starts to join.
 const JOIN_BEFORE_DUE: Duration = Duration::from_millis(2500);
 /// Stage 2's attempts, each stopping the guest a little later into its join.
