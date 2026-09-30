@@ -453,6 +453,13 @@ pub trait AuthorResolver {
     fn kind_for(&self, _entry: &Entry) -> EntryKind {
         EntryKind::Content
     }
+
+    /// Why this entry, whose payload is present, cannot be held in this room, if it cannot: its
+    /// payload is neither kind, or a governance body that does not bind to the entry (V210-74).
+    /// The default refuses nothing.
+    fn unclassifiable(&self, _entry: &Entry) -> Option<Error> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -937,6 +944,17 @@ pub enum EntryClass {
     /// (ADR-025): the entry is refused, the rest of the batch is applied, and the port asks again
     /// once it has learned the room's members.
     Unadmitted,
+    /// Arrived without its payload (V210-74). The signature covers the skeleton only, so a peer
+    /// serving the entry can strip it; held, it would fill its position with nothing to log or
+    /// read. Never taken, and still owed: an honest peer serves it whole.
+    Withheld,
+    /// Past a position this side does not hold yet, in an author's feed (V210-74): after a
+    /// withheld entry in the same batch, say. Not taken, and still owed.
+    Unlinked,
+    /// A signed entry that cannot be classified (V210-74), or anything after it in its author's
+    /// feed. Refused before anything is stored, and the author's feed is closed here from that
+    /// position on: the author signed it, so no peer can serve a better one. Fills its position.
+    Refused,
 }
 
 impl EntryClass {
@@ -944,7 +962,7 @@ impl EntryClass {
     /// it is still owed once its author is admitted.
     #[must_use]
     pub fn fills(self) -> bool {
-        !matches!(self, Self::Unadmitted)
+        !matches!(self, Self::Unadmitted | Self::Withheld | Self::Unlinked)
     }
 }
 
@@ -998,6 +1016,8 @@ pub struct RoomSession {
     pub unadmitted: usize,
     /// Entries refused because their author is frozen.
     pub frozen: usize,
+    /// Entries refused as unheld (V210-74): withheld, unlinked, or unclassifiable.
+    pub refused: usize,
     /// Forks recorded.
     pub forks: usize,
     /// The room's generation read with this side's `HAVE` (`None` if the session failed before).
@@ -1211,6 +1231,9 @@ where
                 EntryClass::Unadmitted => out.unadmitted += 1,
                 EntryClass::Frozen => out.frozen += 1,
                 EntryClass::ForkHandled => out.forks += 1,
+                EntryClass::Withheld | EntryClass::Unlinked | EntryClass::Refused => {
+                    out.refused += 1;
+                }
                 EntryClass::Stored | EntryClass::Duplicate => {}
             }
             if class.fills() {
@@ -1275,6 +1298,15 @@ where
 /// - `serve-unasked` (P9): its `HAVE` hides the newest entry of every feed (it advertises
 ///   `max_seq - 1` and that entry's hash), and it serves the hidden entries on every session anyway.
 ///
+/// - `strip-payload` (V210-74): it serves every entry with its payload stripped, the skeleton and
+///   its signature intact;
+/// - `author-unclassifiable` (V210-74): what it posts is a signed entry whose payload is neither a
+///   governance body nor a sender-key message;
+/// - `author-misbound` (V210-74): what it posts is a signed consent grant whose body names an
+///   epoch 7 past the entry's own, so it classifies as governance and does not bind;
+/// - `old-row-ids` (V210-74): a room it reopens resumes its row ids from the log rows alone, as
+///   before V210-73, so its own store gets the collision that lost received messages.
+///
 /// Any other value, or none, sends correctly. The first session announces the build and the mode
 /// on stderr, [`MARKER`](mutant::MARKER), which the proofs require before they measure anything.
 #[cfg(feature = "mutant-sender")]
@@ -1289,6 +1321,10 @@ pub mod mutant {
         Correct,
         ServeNothing,
         ServeUnasked,
+        StripPayload,
+        AuthorUnclassifiable,
+        OldRowIds,
+        AuthorMisbound,
     }
 
     fn mode() -> Mode {
@@ -1298,6 +1334,10 @@ pub mod mutant {
             let mode = match named.as_str() {
                 "serve-nothing" => Mode::ServeNothing,
                 "serve-unasked" => Mode::ServeUnasked,
+                "strip-payload" => Mode::StripPayload,
+                "author-unclassifiable" => Mode::AuthorUnclassifiable,
+                "old-row-ids" => Mode::OldRowIds,
+                "author-misbound" => Mode::AuthorMisbound,
                 _ => Mode::Correct,
             };
             eprintln!(
@@ -1344,9 +1384,45 @@ pub mod mutant {
     /// The entries to serve, given what the peer asked for and what is served unasked.
     pub(super) fn serve(asked: Vec<Vec<u8>>, unasked: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         match mode() {
-            Mode::Correct => asked,
+            Mode::Correct | Mode::AuthorUnclassifiable | Mode::OldRowIds | Mode::AuthorMisbound => {
+                asked
+            }
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
+            Mode::StripPayload => asked
+                .into_iter()
+                .map(|w| match Entry::from_wire(&w) {
+                    Ok(mut e) => {
+                        e.prune_payload();
+                        e.to_wire()
+                    }
+                    Err(_) => w,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether what this build posts is a governance body bound to another epoch
+    /// (`author-misbound`): a signed consent grant whose body epoch is the entry's own plus 7.
+    #[must_use]
+    pub fn misbound() -> bool {
+        mode() == Mode::AuthorMisbound
+    }
+
+    /// Whether a reopened room resumes its row ids from the log rows alone (`old-row-ids`).
+    #[must_use]
+    pub fn old_row_ids() -> bool {
+        mode() == Mode::OldRowIds
+    }
+
+    /// The payload this build signs in place of `payload` when it posts: in
+    /// `author-unclassifiable`, bytes that are neither kind; otherwise `payload` itself.
+    #[must_use]
+    pub fn authored(payload: Vec<u8>) -> Vec<u8> {
+        if mode() == Mode::AuthorUnclassifiable {
+            b"VOX-MUTANT-SENDER: neither a governance body nor a sender-key message".to_vec()
+        } else {
+            payload
         }
     }
 }
@@ -1366,6 +1442,31 @@ pub fn apply_entry_classified<R: AuthorResolver>(
     let Some(key) = resolver.key_for(&entry.skeleton.author_id) else {
         return Ok(EntryClass::Unadmitted);
     };
+    // **What is taken is what can be held** (V210-74). Each of these was taken before, then never
+    // logged or refused only after it was logged: the room's sync stopped, and it did not open
+    // again after a restart.
+    let (author, seq) = (entry.skeleton.author_id, entry.skeleton.seq);
+    if dag.refused_from(&author).is_some_and(|from| seq >= from) {
+        return Ok(EntryClass::Refused);
+    }
+    if entry.payload.is_none() {
+        return Ok(EntryClass::Withheld);
+    }
+    let head = dag.feed(&author).map_or(0, |f| f.max_seq());
+    if seq > head.saturating_add(1) {
+        return Ok(EntryClass::Unlinked);
+    }
+    // Only the author can be held to an entry that verifies under its key, in a room and epoch
+    // it is admitted to, at the next position of its feed: then no peer can serve a better one.
+    // Anything else goes to the DAG, which refuses it for what it is.
+    if seq == head.saturating_add(1)
+        && admission.is_admitted(&entry.skeleton.channel_id, entry.skeleton.epoch, &author)
+        && resolver.unclassifiable(&entry).is_some()
+        && entry.verify(&key).is_ok()
+    {
+        dag.refuse_from(author, seq);
+        return Ok(EntryClass::Refused);
+    }
     let kind = resolver.kind_for(&entry);
     match dag.accept(entry, kind, &key, admission) {
         Ok(_) => Ok(EntryClass::Stored),
@@ -1410,6 +1511,13 @@ pub fn apply_staged_classified<R: AuthorResolver>(
 pub fn wants_for_unfrozen(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
     let mut wants = wants_for(dag, remote);
     wants.retain(|w| !dag.is_frozen(&w.author_id));
+    // A feed closed here from a position on is not asked for from there (V210-74).
+    for w in &mut wants {
+        if let Some(from) = dag.refused_from(&w.author_id) {
+            w.to_seq = w.to_seq.min(from.saturating_sub(1));
+        }
+    }
+    wants.retain(|w| w.from_seq <= w.to_seq);
     wants
 }
 

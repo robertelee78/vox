@@ -37,10 +37,12 @@
 
 use std::path::Path;
 
+use vox_agentcomms::envelope::{Envelope, DEFAULT_HOPS};
+use vox_core::node::api::MessageRow;
 use vox_core::node::paths::Paths;
 
 /// How one agent session can be woken.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     /// The harness's own session id — the cursor key, and the wake key.
     pub session: String,
@@ -121,30 +123,115 @@ pub fn registered(paths: &Paths) -> Vec<Session> {
         .collect()
 }
 
+/// Drop `session`'s registration, **if it is still the one that failed**.
+///
+/// A registration is rewritten every turn, but nothing ever removed one: a session that
+/// ended left its file behind for good, and every urgent message for its name was tried
+/// against it again (V210-79). The daemon calls this once a wake finds the session is
+/// gone — its socket or server no longer exists, or the server no longer knows the
+/// session. A registration rewritten since (the session resumed elsewhere) is kept.
+///
+/// Returns whether it was removed.
+pub fn forget(paths: &Paths, session: &Session) -> bool {
+    let path = paths.session_file(&session.session);
+    let still = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Session>(&b).ok())
+        .is_some_and(|now| now == *session);
+    still && std::fs::remove_file(&path).is_ok()
+}
+
+/// The hop budget `envelope` really has left, given the `rows` of its room (ADR-020 §9).
+///
+/// Its own `hops`, but never more than any message it replies to allows: a parent with
+/// `h` hops leaves its reply `h - 1`, a grandparent `h - 2`, and so on up the `re` chain.
+/// The chain is read from the log, so a sender that writes a fresh budget into a reply
+/// does not reset it; and a chain longer than [`DEFAULT_HOPS`] has none left whatever
+/// its members claim. A parent this room does not hold ends the walk.
+#[must_use]
+pub fn hops_left(envelope: &Envelope, rows: &[MessageRow]) -> u32 {
+    let mut left = envelope.hops;
+    let mut re = envelope.re.clone();
+    let mut depth: u32 = 0;
+    while let Some(parent) = re.as_deref().and_then(|h| find(rows, h)) {
+        depth += 1;
+        if depth > DEFAULT_HOPS {
+            return 0;
+        }
+        let Ok(p) = Envelope::parse(&parent.text) else {
+            break;
+        };
+        left = left.min(p.hops.saturating_sub(depth));
+        re = p.re;
+    }
+    left
+}
+
+/// The budget a reply to entry `re` starts with: its parent's less one (see [`hops_left`]),
+/// or the default when the room does not hold that entry.
+#[must_use]
+pub fn reply_hops(re: &str, rows: &[MessageRow]) -> u32 {
+    let mut reply = Envelope::new(vox_agentcomms::envelope::SAY, "");
+    reply.re = Some(re.to_owned());
+    hops_left(&reply, rows)
+}
+
+fn find<'a>(rows: &'a [MessageRow], re: &str) -> Option<&'a MessageRow> {
+    let hash = vox_core::node::link::b32_decode(re.trim(), "re").ok()?;
+    rows.iter().find(|r| r.entry_hash == hash)
+}
+
+/// Why a wake did not arrive.
+#[derive(Debug)]
+pub enum WakeError {
+    /// The session is gone: nothing listens at its endpoint any more, or its server no
+    /// longer knows it. Its registration can be forgotten.
+    Gone(String),
+    /// Anything else — including a harness with no wake path. The registration stays.
+    Failed(String),
+}
+
+impl std::fmt::Display for WakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WakeError::Gone(e) | WakeError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
 /// Wake one session with `text`.
 ///
 /// # Errors
 /// If the harness has no implemented wake path, or delivery fails.
-pub async fn wake(session: &Session, text: &str) -> Result<(), String> {
+pub async fn wake(session: &Session, text: &str) -> Result<(), WakeError> {
     match session.harness.as_str() {
         "claude" => wake_claude(Path::new(&session.endpoint), &session.token, text).await,
         "opencode" => wake_opencode(&session.endpoint, &session.session, text).await,
-        "codex" => Err(
+        "codex" => Err(WakeError::Failed(
             "codex sessions cannot be interrupted by this build; the message waits for the \
              session's next turn"
                 .into(),
-        ),
-        other => Err(format!("no wake path for harness {other:?}")),
+        )),
+        other => Err(WakeError::Failed(format!(
+            "no wake path for harness {other:?}"
+        ))),
     }
 }
 
 /// NDJSON over Claude Code's messaging socket: an `auth` frame, then a user
 /// message. Verified against a live session.
-async fn wake_claude(socket: &Path, token: &str, text: &str) -> Result<(), String> {
+async fn wake_claude(socket: &Path, token: &str, text: &str) -> Result<(), WakeError> {
     use tokio::io::AsyncWriteExt as _;
-    let mut stream = tokio::net::UnixStream::connect(socket)
-        .await
-        .map_err(|e| format!("connecting to the session socket: {e}"))?;
+    let mut stream = tokio::net::UnixStream::connect(socket).await.map_err(|e| {
+        let why = format!("connecting to the session socket: {e}");
+        // No socket file, or nobody listening on it: the session has ended.
+        match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                WakeError::Gone(why)
+            }
+            _ => WakeError::Failed(why),
+        }
+    })?;
     let auth = serde_json::json!({ "type": "auth", "token": token });
     let message = serde_json::json!({
         "type": "user",
@@ -154,16 +241,16 @@ async fn wake_claude(socket: &Path, token: &str, text: &str) -> Result<(), Strin
     stream
         .write_all(payload.as_bytes())
         .await
-        .map_err(|e| format!("writing to the session socket: {e}"))?;
+        .map_err(|e| WakeError::Failed(format!("writing to the session socket: {e}")))?;
     stream
         .flush()
         .await
-        .map_err(|e| format!("flushing the session socket: {e}"))?;
+        .map_err(|e| WakeError::Failed(format!("flushing the session socket: {e}")))?;
     Ok(())
 }
 
 /// OpenCode's `prompt_async`, which works mid-turn.
-async fn wake_opencode(base: &str, session: &str, text: &str) -> Result<(), String> {
+async fn wake_opencode(base: &str, session: &str, text: &str) -> Result<(), WakeError> {
     let url = format!(
         "{}/session/{session}/prompt_async",
         base.trim_end_matches('/')
@@ -181,10 +268,22 @@ async fn wake_opencode(base: &str, session: &str, text: &str) -> Result<(), Stri
         .body(body.to_string())
         .send()
         .await
-        .map_err(|e| format!("posting to {url}: {e}"))?;
-    if response.status().is_success() {
+        .map_err(|e| {
+            let why = format!("posting to {url}: {e}");
+            // Nothing listening at the server's address: that OpenCode has exited.
+            if e.is_connect() {
+                WakeError::Gone(why)
+            } else {
+                WakeError::Failed(why)
+            }
+        })?;
+    let status = response.status();
+    if status.is_success() {
         Ok(())
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        // The server is up and does not know this session.
+        Err(WakeError::Gone(format!("{url} answered {status}")))
     } else {
-        Err(format!("{url} answered {}", response.status()))
+        Err(WakeError::Failed(format!("{url} answered {status}")))
     }
 }

@@ -38,6 +38,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Write the room passphrase `pass` beside the profile at `dir`, for `--passphrase-file`: a
+/// room passphrase is never taken from argv or the environment (V210-72).
+fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let at = dir.join("room-passphrase");
+    std::fs::write(&at, pass).unwrap();
+    at.to_str().unwrap().to_owned()
+}
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
 
@@ -422,8 +430,8 @@ fn every_common_failure_names_its_cause() {
         &[
             "connect",
             &address,
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &room_pass_file(&guest_dir, &passphrase),
             "--anchor",
             &spec,
             "--listen",
@@ -442,8 +450,8 @@ fn every_common_failure_names_its_cause() {
         &[
             "up",
             &room,
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &room_pass_file(&guest_dir, &passphrase),
             "--bind",
             &busy_addr,
             "--anchor",
@@ -472,8 +480,8 @@ fn every_common_failure_names_its_cause() {
             &host_fp,
             &port,
             &busy_addr,
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &room_pass_file(&guest_dir, &passphrase),
             "--anchor",
             &spec,
             "--listen",
@@ -502,8 +510,8 @@ fn every_common_failure_names_its_cause() {
             &host_fp,
             &port,
             &local,
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &room_pass_file(&guest_dir, &passphrase),
             "--anchor",
             &spec,
             "--listen",

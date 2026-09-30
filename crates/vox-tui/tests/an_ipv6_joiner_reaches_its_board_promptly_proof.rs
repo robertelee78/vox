@@ -99,8 +99,8 @@ fn an_ipv6_only_joiner_reaches_its_board_within_two_seconds() {
         &args(&[
             "connect",
             &address,
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &world::room_pass_file(&guest_dir, &passphrase),
             "--anchor",
             &v6_spec,
             "--listen",
@@ -210,8 +210,8 @@ fn a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seco
         &args(&[
             "connect",
             &address,
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &world::room_pass_file(guest_dir, &passphrase),
             "--anchor",
             &own_spec,
             "--listen",

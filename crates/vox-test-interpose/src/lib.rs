@@ -32,8 +32,21 @@
 //!   is the destination's content event just as a write is. `copy_file_range` is Linux's and
 //!   this library is macOS-only (dyld interposing), so it is not recorded.
 //!
+//! ## One injected failure
+//! With `VOX_INTERPOSE_FAIL_DIR_SYNC` set to a directory's path, as the kernel names it, every
+//! `F_FULLFSYNC`, `F_BARRIERFSYNC` or `fsync` of that directory fails with `EIO` without being made
+//! (and is recorded with that outcome). It stages what no userspace test can otherwise: a rename
+//! that lands whose directory will not flush (V210-77). Unset, nothing is injected.
+//!
 //! Paths are as the call named them (for `open` and `rename`) or as the kernel reports them (for a
 //! descriptor), so a reader compares them after canonicalising the directory.
+//!
+//! ## Kill points
+//! With `VOX_INTERPOSE_KILL_ARM` naming a file, the process kills itself with `SIGKILL` right
+//! after the `N`th flush of a `store.redb` that returns while that file holds `N`: at a boundary
+//! between two of the store's transactions, the one place a crash can leave it (V210-76). Flushes
+//! are counted only while the file exists, so a proof arms it at the moment the operation under
+//! test starts, and sweeps `N`. The kill is recorded first: `kill path n`.
 //!
 //! ## Variadic calls
 //! `open`, `openat` and `fcntl` take their last argument variadically. On Apple arm64 a variadic
@@ -58,12 +71,16 @@ const F_FULLFSYNC: c_int = 51;
 const F_BARRIERFSYNC: c_int = 85;
 const AT_FDCWD: c_int = -2;
 const MAXPATHLEN: usize = 1024;
+const EIO: c_int = 5;
 
 extern "C" {
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn openat(fd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn fsync(fd: c_int) -> c_int;
+    fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
+    fn close(fd: c_int) -> c_int;
+    fn kill(pid: c_int, sig: c_int) -> c_int;
     fn rename(from: *const c_char, to: *const c_char) -> c_int;
     fn renameat(fromfd: c_int, from: *const c_char, tofd: c_int, to: *const c_char) -> c_int;
     fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
@@ -106,6 +123,10 @@ pub struct IoVec {
 // ---- the log ------------------------------------------------------------------------------
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
+/// Flushes of the store counted while a kill point was armed.
+static ARMED_SYNCS: AtomicU64 = AtomicU64::new(0);
+const O_RDONLY: c_int = 0;
+const SIGKILL: c_int = 9;
 /// The log's descriptor: -1 not yet opened, -2 no log wanted (or it would not open).
 static LOG_FD: AtomicI32 = AtomicI32::new(-1);
 
@@ -218,6 +239,61 @@ fn at_path(dirfd: c_int, path: *const c_char) -> String {
     format!("{}/{p}", fd_path(dirfd))
 }
 
+/// The kill point armed now: the number in the file `VOX_INTERPOSE_KILL_ARM` names, or 0.
+fn armed() -> u64 {
+    // SAFETY: getenv/open/read/close are called with valid arguments; this library's own calls
+    // are not interposed.
+    unsafe {
+        let path = getenv(c"VOX_INTERPOSE_KILL_ARM".as_ptr());
+        if path.is_null() {
+            return 0;
+        }
+        let fd = open(path, O_RDONLY | O_CLOEXEC);
+        if fd < 0 {
+            return 0;
+        }
+        let mut buf = [0u8; 32];
+        let n = read(fd, buf.as_mut_ptr(), buf.len());
+        close(fd);
+        let n = usize::try_from(n).unwrap_or(0);
+        std::str::from_utf8(&buf[..n])
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+/// After a flush of `path` returned: the kill point, if this is it. See the module docs.
+fn after_sync(path: &str, ret: c_int) {
+    if ret != 0 || !path.ends_with("/store.redb") {
+        return;
+    }
+    let n = armed();
+    if n == 0 {
+        return;
+    }
+    let k = ARMED_SYNCS.fetch_add(1, Ordering::AcqRel) + 1;
+    if k == n {
+        record(&["kill", path, &k.to_string()]);
+        // SAFETY: kill and getpid have no preconditions.
+        unsafe { kill(getpid(), SIGKILL) };
+    }
+}
+
+/// Whether a flush of `path` is to fail with `EIO` (`VOX_INTERPOSE_FAIL_DIR_SYNC`).
+fn fail_flush_of(path: &str) -> bool {
+    // SAFETY: getenv is called with a NUL-terminated name; the value it returns is read once.
+    let target = unsafe { getenv(c"VOX_INTERPOSE_FAIL_DIR_SYNC".as_ptr()) };
+    !target.is_null() && text(target) == path
+}
+
+/// Fail as the call would have with `EIO`.
+fn injected_eio() -> c_int {
+    // SAFETY: __error returns this thread's errno slot.
+    unsafe { *__error() = EIO };
+    -1
+}
+
 // ---- hooks --------------------------------------------------------------------------------
 
 #[no_mangle]
@@ -260,7 +336,11 @@ pub unsafe extern "C" fn vti_fcntl_hook(fd: c_int, cmd: c_int, arg: c_ulong) -> 
     // The path is taken before the call: after it, nothing about the descriptor has changed.
     let flushing = cmd == F_FULLFSYNC || cmd == F_BARRIERFSYNC;
     let path = if flushing { fd_path(fd) } else { String::new() };
-    let r = fcntl(fd, cmd, arg);
+    let r = if flushing && fail_flush_of(&path) {
+        injected_eio()
+    } else {
+        fcntl(fd, cmd, arg)
+    };
     if flushing {
         let (ret, errno) = outcome(r);
         let how = if cmd == F_FULLFSYNC {
@@ -269,6 +349,7 @@ pub unsafe extern "C" fn vti_fcntl_hook(fd: c_int, cmd: c_int, arg: c_ulong) -> 
             "F_BARRIERFSYNC"
         };
         record(&["sync", &path, how, &ret, &errno]);
+        after_sync(&path, r);
     }
     r
 }
@@ -276,9 +357,14 @@ pub unsafe extern "C" fn vti_fcntl_hook(fd: c_int, cmd: c_int, arg: c_ulong) -> 
 #[no_mangle]
 pub unsafe extern "C" fn vti_fsync(fd: c_int) -> c_int {
     let path = fd_path(fd);
-    let r = fsync(fd);
+    let r = if fail_flush_of(&path) {
+        injected_eio()
+    } else {
+        fsync(fd)
+    };
     let (ret, errno) = outcome(r);
     record(&["sync", &path, "fsync", &ret, &errno]);
+    after_sync(&path, r);
     r
 }
 
