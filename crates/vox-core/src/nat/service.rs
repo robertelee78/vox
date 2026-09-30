@@ -47,7 +47,9 @@ use crate::log::sync::wire_error_for;
 use crate::nat::record::{
     MemberBundleRecord, PreJoinRecord, RendezvousRecord, MAX_PREKEY_BUNDLE_BYTES,
 };
-use crate::nat::store::{RendezvousStore, Source, MAX_AUTHORS_PER_BUCKET, MAX_PREJOIN_PER_CHANNEL};
+use crate::nat::store::{
+    Credit, RendezvousStore, Source, MAX_AUTHORS_PER_BUCKET, MAX_PREJOIN_PER_CHANNEL,
+};
 use crate::time::Clock;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::{close_code, VoxConnection};
@@ -336,6 +338,19 @@ pub struct RecordSet {
     pub genesis: Option<Genesis>,
 }
 
+/// The credit a record from `source` earns its room (see [`Credit`]): authored when `publisher`,
+/// the peer that brought it, is its `author`.
+fn credit(
+    source: Option<Source>,
+    publisher: Option<&Digest32>,
+    author: &Digest32,
+) -> Option<Credit> {
+    source.map(|source| Credit {
+        source,
+        authored: publisher == Some(author),
+    })
+}
+
 /// Which rooms a board keeps for a peer that brings their genesis — the rooms it will
 /// **anchor** (see [`RendezvousService::serve_rooms`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -621,7 +636,7 @@ impl RendezvousService {
                 let key = self.known_key(&store, &cid, epoch, &author, now);
                 let res = store.accept_member(rec, |_| key.clone(), now);
                 if res.is_ok() {
-                    store.note_source(&cid, source);
+                    store.note_source(&cid, credit(source, publisher, &author));
                 }
                 res.map(|learned| {
                     if learned && publisher.is_some() {
@@ -639,7 +654,7 @@ impl RendezvousService {
                     .or_else(|| self.witnessed_key(&store, &rec, now));
                 let res = store.accept_bundle(rec, |_| key.clone(), now);
                 if res.is_ok() {
-                    store.note_source(&cid, source);
+                    store.note_source(&cid, credit(source, publisher, &author));
                 }
                 res.map(|learned| {
                     if learned && publisher.is_some() {
@@ -673,7 +688,8 @@ impl RendezvousService {
                 {
                     return Err(RejectReason::Policy);
                 }
-                store.accept_genesis(genesis, local, now, source)
+                let creator = genesis.creator_pubkey().fingerprint();
+                store.accept_genesis(genesis, local, now, credit(source, publisher, &creator))
             }
             _ => return Err(RejectReason::UnknownKind),
         };

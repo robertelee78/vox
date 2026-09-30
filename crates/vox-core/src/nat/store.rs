@@ -92,9 +92,9 @@ pub const MAX_AUTHORS_PER_BUCKET: usize = 1024;
 /// a node serving the rooms it is there for.
 pub const MAX_GENESIS_CHANNELS: usize = 4096;
 
-/// Most distinct sources a board credits one room to (see [`Source`]): a bound on memory. Only
-/// the room's members add to it — the first put of its genesis, and member records, which only a
-/// member can sign.
+/// Most distinct sources a board credits one room to of each kind, authored and delivered (see
+/// [`Credit`]): a bound on memory. Kept apart so strangers delivering a room's records cannot
+/// use up the slots its members' own networks need.
 pub const MAX_SOURCES_PER_ROOM: usize = 16;
 
 /// **Where a room's records came from**, so a full board can share itself fairly between the
@@ -104,13 +104,11 @@ pub const MAX_SOURCES_PER_ROOM: usize = 16;
 /// is usually given, because a host is commonly given far more than one /64: grouping less would
 /// let one machine appear as thousands of sources. Subscribers who share a /48 only share a count.
 ///
-/// A room is credited to the source that first published its genesis, and to every source that
-/// published a member address or bundle record for it — records only its members can sign, so a
-/// stranger cannot get itself credited with a room it is not in. A full board evicts from the
-/// source credited with the most rooms, so a stranger filling it from one network, or from a few,
-/// only ever displaces its own rooms, and a real room — live or long offline — is displaced only
-/// once no source holds more. A peer reached through a relay is known by identity, which is not
-/// free to multiply: a relay carries a circuit only between peers that share a room on it.
+/// A room is credited to the sources its records came from ([`Credit`]). A full board evicts from
+/// the source credited with the most rooms, so a stranger filling it from one network, or from a
+/// few, only ever displaces its own rooms, and a real room — live or long offline — is displaced
+/// only once no source holds more. A peer reached through a relay is known by identity, which is
+/// not free to multiply: a relay carries a circuit only between peers that share a room on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Source {
     /// An IPv4 address.
@@ -119,6 +117,38 @@ pub enum Source {
     V6([u8; 6]),
     /// A peer reached through a relay, by its fingerprint.
     Relayed(Digest32),
+}
+
+/// **A room's credit to a source** (V210-70): where one of its records came from, and whether the
+/// peer that brought it **wrote** it — its genesis's creator, or the member who signed an address
+/// or bundle record. Anyone can bring a record it did not write (a room's genesis and its members'
+/// records are served to anyone who asks), so a delivered credit counts only for a room nobody
+/// has brought a record of their own for: a stranger re-sending a real room's records does not
+/// get that room filed under its network, where it would be evicted with the stranger's own rooms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Credit {
+    /// Where the record came from.
+    pub source: Source,
+    /// Whether the peer that brought it is its author.
+    pub authored: bool,
+}
+
+/// The sources a room is credited to, by kind (see [`Credit`]).
+#[derive(Debug, Default)]
+struct Credits {
+    authored: BTreeSet<Source>,
+    delivered: BTreeSet<Source>,
+}
+
+impl Credits {
+    /// The sources that count: its authors' if it has any, else those that delivered it.
+    fn counted(&self) -> &BTreeSet<Source> {
+        if self.authored.is_empty() {
+            &self.delivered
+        } else {
+            &self.authored
+        }
+    }
 }
 
 impl Source {
@@ -273,7 +303,7 @@ pub struct RendezvousStore {
     /// The next genesis arrival number.
     genesis_arrivals: u64,
     /// `channelID` → the sources that published its genesis or a member record for it.
-    genesis_sources: HashMap<Digest32, BTreeSet<Source>>,
+    genesis_sources: HashMap<Digest32, Credits>,
 }
 
 impl RendezvousStore {
@@ -433,7 +463,7 @@ impl RendezvousStore {
         genesis: Genesis,
         pinned: bool,
         now: u64,
-        source: Option<Source>,
+        credit: Option<Credit>,
     ) -> Result<()> {
         genesis.verify()?;
         let channel_id = genesis.channel_id();
@@ -444,9 +474,7 @@ impl RendezvousStore {
                 if pinned {
                     self.pinned.insert(channel_id);
                 }
-                // No credit to `source`: a room's genesis is public, so anyone can put it
-                // again, and crediting that would let a stranger file a real room under its
-                // own network and have it evicted with its own rooms.
+                self.note_source(&channel_id, credit);
                 return Ok(());
             }
             return Err(Error::RendezvousRejected("genesis already present"));
@@ -462,9 +490,10 @@ impl RendezvousStore {
             // it mints them, and a real room's members can all be offline for longer than their
             // records last. So the board evicts from the source credited with the most rooms
             // ([`Source`]) — a flood from one network, or spread over a few, displaces only its
-            // own rooms — and among that source's rooms, the one credited to the fewest sources,
-            // then an empty one before a live one, the oldest first. Nobody is refused and nobody
-            // is limited: a source with the most rooms gives one up when the board is full.
+            // own rooms — and among that source's rooms, the one whose sources hold the most rooms
+            // between them, then an empty one before a live one, the oldest first. Nobody is
+            // refused and nobody is limited: a source with the most rooms gives one up when the
+            // board is full.
             let Some(evict) = self.eviction_candidate(now) else {
                 return Err(Error::RendezvousRejected("genesis board at capacity"));
             };
@@ -477,34 +506,45 @@ impl RendezvousStore {
         if pinned {
             self.pinned.insert(channel_id);
         }
-        self.note_source(&channel_id, source);
+        self.note_source(&channel_id, credit);
         Ok(())
     }
 
-    /// Credit `channel_id`'s room to `source`, if this board holds its genesis (see [`Source`]).
-    pub fn note_source(&mut self, channel_id: &Digest32, source: Option<Source>) {
-        let Some(source) = source else { return };
+    /// Credit `channel_id`'s room to where a record of it came from, if this board holds its
+    /// genesis (see [`Credit`]).
+    pub fn note_source(&mut self, channel_id: &Digest32, credit: Option<Credit>) {
+        let Some(credit) = credit else { return };
         if !self.genesis.contains_key(channel_id) {
             return;
         }
-        let set = self.genesis_sources.entry(*channel_id).or_default();
+        let credits = self.genesis_sources.entry(*channel_id).or_default();
+        let set = if credit.authored {
+            &mut credits.authored
+        } else {
+            &mut credits.delivered
+        };
         if set.len() < MAX_SOURCES_PER_ROOM {
-            set.insert(source);
+            set.insert(credit.source);
         }
     }
 
     /// The room a full board gives up for a new one: from the source credited with the most
-    /// unpinned rooms — rooms credited to nobody (the ones an anchor put back on its board after a
-    /// restart, before anyone published to them again) counting as one source of their own — the
-    /// one credited to the fewest sources, then one with no live member record before one with,
-    /// the oldest first.
+    /// unpinned rooms (counting [`Credits::counted`]) — rooms credited to nobody (the ones an
+    /// anchor put back on its board after a restart, before anyone published to them again)
+    /// counting as one source of their own — the one whose sources hold the most rooms between
+    /// them, then one with no live member record before one with, the oldest first.
     fn eviction_candidate(&self, now: u64) -> Option<Digest32> {
         let unpinned = || {
             self.genesis
                 .keys()
                 .filter(|cid| !self.pinned.contains(*cid))
         };
-        let sources_of = |cid: &Digest32| self.genesis_sources.get(cid).filter(|s| !s.is_empty());
+        let sources_of = |cid: &Digest32| {
+            self.genesis_sources
+                .get(cid)
+                .map(Credits::counted)
+                .filter(|s| !s.is_empty())
+        };
         let mut held: HashMap<Option<Source>, usize> = HashMap::new();
         for cid in unpinned() {
             match sources_of(cid) {
@@ -525,8 +565,17 @@ impl RendezvousStore {
                 _ => false,
             })
             .min_by_key(|cid| {
+                // How much giving it up relieves: the rooms held by every source it counts. A
+                // stranger's room is credited to every network the stranger floods from, so it
+                // outweighs a real room that shares only one of them.
+                let load: usize =
+                    sources_of(cid).map_or(held.get(&None).copied().unwrap_or(0), |s| {
+                        s.iter()
+                            .map(|src| held.get(&Some(*src)).copied().unwrap_or(0))
+                            .sum()
+                    });
                 (
-                    sources_of(cid).map_or(0, BTreeSet::len),
+                    std::cmp::Reverse(load),
                     live.contains(*cid),
                     self.genesis_arrived.get(*cid).copied().unwrap_or(0),
                 )
