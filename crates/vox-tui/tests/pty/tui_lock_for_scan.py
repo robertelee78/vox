@@ -12,7 +12,8 @@ locks it with `:lock` when the proof says so (V210-94). The proof talks to it th
   LOCKED on its status bar, with an empty passphrase prompt. The node publishes a locked view only
   once the lock is done, and a TUI still waiting on its unlock (a SIGHUP while rooms reopen) shows
   the prompt it was typed into, dots and all, until the node answers it. The cue holds
-  `said-locking` if the TUI showed "locking…" while it waited, else `silent`;
+  `said-locking` if the TUI showed "locking…" while it waited, else `silent`, then how many
+  seconds it waited;
 - the proof writes `stop`; this driver quits the TUI.
 
 `VOX_PTY_DYLD_INSERT=<path>` among the K=V becomes the TUI's `DYLD_INSERT_LIBRARIES`: named
@@ -45,8 +46,11 @@ env.update(EXTRA)
 
 
 def cue(name, text=None):
-    with open(os.path.join(CUE, name), "w") as f:
+    # Written beside and renamed into place, so the proof never reads a cue half written.
+    path = os.path.join(CUE, name)
+    with open(path + ".tmp", "w") as f:
         f.write(text if text is not None else f"{time.time():.3f}")
+    os.rename(path + ".tmp", path)
 
 
 def has_cue(name):
@@ -90,6 +94,7 @@ try:
         stage(":lock")
         tui.key(":lock\r", 0.05)
     said_locking = []
+    asked = time.time()
 
     def locked_now():
         b = bottom()
@@ -101,7 +106,8 @@ try:
         print(f"{TAG} APPARATUS: the TUI never showed itself locked ({how}):\n{tui.text()}")
         sys.exit(2)
     # Whether the TUI said "locking…" while it waited: the proof checks it for a typed `:lock`.
-    cue("locked", "said-locking" if said_locking else "silent")
+    waited = time.time() - asked
+    cue("locked", f"{'said-locking' if said_locking else 'silent'} {waited:.3f}")
     stage("wait for the stop cue")
     if not tui.until(lambda: has_cue("stop"), 240, 0.2):
         print(f"{TAG} APPARATUS: no stop cue")

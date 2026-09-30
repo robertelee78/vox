@@ -311,6 +311,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Reopened { .. } => "holding a room that reopened",
         NetEvent::ReopenGone { .. } => "forgetting a room that no longer exists",
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
+        NetEvent::LockSettled => "answering a lock that has settled",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped { .. } => "shutting the network down",
     }
@@ -800,6 +801,8 @@ enum NetEvent {
     /// The reopening has tried every room (#208). A room still marked as reopening would not
     /// open: it stays remembered, and closed. The unlock is answered now.
     ReopenFinished,
+    /// A lock has settled: nothing it stopped holds a secret any more (V210-94).
+    LockSettled,
     /// A forward's first dial finished (#215): bind the forward, or say why not, and answer the
     /// command.
     ForwardDialed {
@@ -2170,6 +2173,17 @@ pub struct Node {
     reopen_task: Option<tokio::task::JoinHandle<()>>,
     /// Unlock replies held until the reopening has finished (#208).
     unlock_waiters: Vec<oneshot::Sender<Outcome>>,
+    /// Locks begun whose settling — the wait for work still holding a secret — has not reported
+    /// back yet (`NetEvent::LockSettled`, V210-94). While any is, the node is *locking*: the
+    /// identity is already locked and refuses new work, but not every secret is gone yet.
+    locking: usize,
+    /// Lock replies held until the node has settled locked.
+    lock_waiters: Vec<oneshot::Sender<Outcome>>,
+    /// Whether a lock now settling found the node unlocked, so settling says `Locked`.
+    lock_was_unlocked: bool,
+    /// Unlocks asked for while locking, run once it has settled: an unlock in between would
+    /// start new work beside threads still holding the old secrets.
+    unlock_after_lock: Vec<(Secret, oneshot::Sender<Outcome>)>,
     /// The last `refresh_network_view` gave up on a busy room, so the view is behind and the tick
     /// rebuilds it. Atomic only because the refresh takes `&self`.
     view_stale: std::sync::atomic::AtomicBool,
@@ -2417,6 +2431,10 @@ impl Node {
             reopening: std::collections::BTreeSet::new(),
             reopen_task: None,
             unlock_waiters: Vec::new(),
+            locking: 0,
+            lock_waiters: Vec::new(),
+            lock_was_unlocked: false,
+            unlock_after_lock: Vec::new(),
             view_stale: std::sync::atomic::AtomicBool::new(false),
             held_pairwise: Vec::new(),
             board_authors: BTreeMap::new(),
@@ -2565,28 +2583,36 @@ impl Node {
                     // told `Done` — `vox daemon`, which then opens its control socket — must not
                     // find a room it held still closed.
                     if let NodeCommand::Unlock { passphrase } = command {
-                        let outcome = self.unlock(&passphrase).await;
+                        if self.locking > 0 {
+                            self.unlock_after_lock.push((passphrase, reply));
+                        } else {
+                            self.unlock_and_answer(&passphrase, reply).await;
+                        }
                         self.note_if_stalled(name, started);
                         self.publish().await;
-                        if outcome.is_done() && self.reopen_task.is_some() {
-                            self.unlock_waiters.push(reply);
-                        } else {
-                            let _ = reply.send(outcome);
-                        }
                         continue;
                     }
-                    let locking = matches!(command, NodeCommand::Lock);
-                    let outcome = self.handle(command).await;
-                    if locking {
+                    // **A lock is answered once it has settled, and the actor does not wait for
+                    // that** (V210-94, and V210-71's rule that nothing slow stalls the actor). The
+                    // lock itself — the identity, the rooms, the tasks, the network — happens now;
+                    // waiting for work still holding a secret happens on a task of its own, which
+                    // reports `NetEvent::LockSettled`. Meanwhile the node answers everyone else and
+                    // says it is locking.
+                    if matches!(command, NodeCommand::Lock) && self.headless.is_none() {
+                        drop(self.lock_all().await);
+                        self.lock_waiters.push(reply);
                         // What work finished just before the lock and queued for the actor — a
-                        // sealed room key and its passphrase, a joined room, a reopened room —
-                        // is handled now, before the lock is answered, and not on the next turn:
-                        // each is refused while locked and its secrets dropped, and until then
-                        // they sat in this queue after the node said it was locked (V210-94).
+                        // sealed room key and its passphrase, a joined room, a reopened room — is
+                        // handled now, not on a later turn: each is refused while locked and its
+                        // secrets dropped, and until then they sat in this queue after the lock.
                         while let Ok(event) = net_rx.try_recv() {
                             self.handle_net(event).await;
                         }
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
+                        continue;
                     }
+                    let outcome = self.handle(command).await;
                     self.note_if_stalled(name, started);
                     self.publish().await;
                     if shutdown {
@@ -2645,7 +2671,12 @@ impl Node {
         // Channel closed or shutdown: lock (wipe every SEK + the signer) and stop.
         let store = self.log_store();
         self.stop_network().await;
-        self.lock_all().await;
+        // Here the actor does wait for the lock to settle: it is stopping, and `Done` means gone.
+        let _ = self.lock_all().await.await;
+        for (_, reply) in std::mem::take(&mut self.unlock_after_lock) {
+            let _ = reply.send(Outcome::Failed(Fault::ShuttingDown));
+        }
+        self.settle_lock().await;
         self.publish().await;
         let _ = self.event_tx.send(NodeEvent::Shutdown);
         // **`Done` means gone.** `Shutdown` used to be answered before any of the above ran, and
@@ -2683,7 +2714,8 @@ impl Node {
                 if self.headless.is_some() {
                     return Outcome::Failed(Fault::NoIdentity);
                 }
-                self.lock_all().await;
+                // Not reached for a node with an identity: `run` answers its lock once it settles.
+                drop(self.lock_all().await);
                 Outcome::Done
             }
             NodeCommand::AddAnchors { anchors } => {
@@ -2863,7 +2895,7 @@ impl Node {
                 if let Err(e) = self.load_prekeys(now) {
                     // The identity is usable but the ring is not: lock again rather
                     // than run without key-agreement keys.
-                    self.lock_all().await;
+                    drop(self.lock_all().await);
                     // The passphrase was just proved by the vault, so a blob that will not open
                     // is not a wrong passphrase (V210-40).
                     return Outcome::Failed(match e {
@@ -2872,7 +2904,7 @@ impl Node {
                     });
                 }
                 if let Err(e) = self.start_network() {
-                    self.lock_all().await;
+                    drop(self.lock_all().await);
                     return Outcome::Failed(fault_of(&e));
                 }
                 let _ = self.event_tx.send(NodeEvent::Unlocked);
@@ -3799,6 +3831,7 @@ impl Node {
                 self.reopening.remove(&channel_id);
                 let _ = self.forget_open(&channel_id);
             }
+            NetEvent::LockSettled => self.settle_lock().await,
             NetEvent::ReopenFinished => {
                 self.reopening.clear();
                 self.reopen_task = None;
@@ -7676,23 +7709,27 @@ impl Node {
         );
     }
 
-    async fn lock_all(&mut self) {
+    /// Lock now, and settle off the actor.
+    ///
+    /// Everything the actor holds goes at once: the rooms' keys, the tasks holding the identity
+    /// (aborted), the network, the identity itself. What no abort reaches — a blocking thread
+    /// still holding a secret, an aborted task not yet polled — is waited for by a task of its
+    /// own, which then reports `NetEvent::LockSettled` (V210-94). The actor does not wait for it:
+    /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
+    /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
+    async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         let was_unlocked = self.profile.as_ref().is_some_and(Profile::is_unlocked);
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
-        // Abort the join exchanges first. Each holds an `Arc<VaultRootSigner>` and an
-        // `Arc` of the ring below, so locking while one runs would otherwise mean the
-        // secrets outlive the lock — for however long a joiner felt like waiting. Aborting
-        // drops both at the task's next await point, which is what makes ADR-015's
-        // lock/zeroize still true now that the exchange runs off the actor.
+        // Abort the join exchanges and the reopening (#208): each holds the identity or room keys.
+        // An aborted task drops what it holds only when it is next polled, so they are collected
+        // by the settling task below, not here.
         self.join_tasks.abort_all();
-        // The reopening holds room keys too: stopped, and nothing it opened is held (#208).
-        // Awaited, like the join tasks below: an aborted task drops what it holds only when it
-        // is next polled, not when `abort` returns (V210-94).
-        if let Some(task) = self.reopen_task.take() {
+        let aborted = std::mem::take(&mut self.join_tasks);
+        let reopening = self.reopen_task.take();
+        if let Some(task) = &reopening {
             task.abort();
-            let _ = task.await;
         }
         self.reopening.clear();
         // An aborted joiner never reports back, so nothing is being joined any more, and what was
@@ -7703,16 +7740,6 @@ impl Node {
         for reply in std::mem::take(&mut self.unlock_waiters) {
             let _ = reply.send(Outcome::Done);
         }
-        // Awaited, not polled: `try_join_next` collects only tasks that have already finished, and
-        // an aborted one drops its handles — the signer, the ring, the store — at its next await.
-        while self.join_tasks.join_next().await.is_some() {}
-        // And the blocking threads those tasks started, which no abort reaches: an Argon2id seal
-        // with the room passphrase, a passphrase check, a room being reopened with its key. Each
-        // holds the read side until it has finished and dropped what it was given, so taking the
-        // write side is waiting for the last of them — at most one derivation or one room's open
-        // (V210-94). Nothing new starts meanwhile: every one of them is started from a task
-        // aborted above, or from the actor, which is here.
-        drop(self.secret_work.write().await);
         // Drop the prekey ring: its secrets zeroize on drop, so a locked node holds
         // no key-agreement material (ADR-015 lock/zeroize).
         self.prekeys = None;
@@ -7736,8 +7763,63 @@ impl Node {
         if let Some(p) = self.profile.as_mut() {
             p.lock();
         }
-        if was_unlocked {
+        self.lock_was_unlocked |= was_unlocked;
+        self.locking += 1;
+        let (settled, on_settled) = oneshot::channel();
+        let secret_work = Arc::clone(&self.secret_work);
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let mut aborted = aborted;
+            if let Some(task) = reopening {
+                let _ = task.await;
+            }
+            while aborted.join_next().await.is_some() {}
+            // And the blocking threads those tasks started, which no abort reaches: an Argon2id
+            // seal with the room passphrase, a passphrase check, a room being reopened with its
+            // key. Each holds the read side until it has finished and dropped what it was given,
+            // so taking the write side is waiting for the last of them. Nothing new starts
+            // meanwhile: the identity is locked, and an unlock waits for this.
+            drop(secret_work.write().await);
+            let _ = settled.send(());
+            let _ = tx.send(NetEvent::LockSettled).await;
+        });
+        on_settled
+    }
+
+    /// A lock's settling reported back ([`Self::lock_all`]): once the last has, the node is
+    /// locked. Its lock commands are answered, `Locked` is said, and the unlocks asked for
+    /// meanwhile run.
+    async fn settle_lock(&mut self) {
+        self.locking = self.locking.saturating_sub(1);
+        if self.locking > 0 {
+            return;
+        }
+        // The view first: whoever is told the lock is done reads a locked view.
+        self.publish().await;
+        for reply in std::mem::take(&mut self.lock_waiters) {
+            let _ = reply.send(Outcome::Done);
+        }
+        if std::mem::take(&mut self.lock_was_unlocked) {
             let _ = self.event_tx.send(NodeEvent::Locked);
+        }
+        for (passphrase, reply) in std::mem::take(&mut self.unlock_after_lock) {
+            self.unlock_and_answer(&passphrase, reply).await;
+        }
+    }
+
+    /// Unlock, and answer `reply` — at once, or once the rooms it held are held again (#208):
+    /// they reopen off the actor so the node answers everyone meanwhile, but a caller told `Done`
+    /// — `vox daemon`, which then opens its control socket — must not find a room it held still
+    /// closed.
+    async fn unlock_and_answer(&mut self, passphrase: &Secret, reply: oneshot::Sender<Outcome>) {
+        let outcome = self.unlock(passphrase).await;
+        // The view first, as for every command: a caller told `Done` reads the view at once (the
+        // trust keyring, the rooms) and must find the unlock in it.
+        self.publish().await;
+        if outcome.is_done() && self.reopen_task.is_some() {
+            self.unlock_waiters.push(reply);
+        } else {
+            let _ = reply.send(outcome);
         }
     }
 
@@ -8522,7 +8604,8 @@ impl Node {
             fingerprint: p.fingerprint(),
             created: p.created(),
         });
-        let locked = !self.profile.as_ref().is_some_and(Profile::is_unlocked);
+        // Locked once the lock has settled; until then, locking (V210-94).
+        let locked = !self.profile.as_ref().is_some_and(Profile::is_unlocked) && self.locking == 0;
         let channels = self
             .profile
             .as_ref()
@@ -8548,6 +8631,7 @@ impl Node {
         self.view_tx.send_replace(NodeView {
             identity,
             locked,
+            locking: self.locking > 0,
             mlock_active: true,
             listening,
             anchoring: Vec::new(),
@@ -8595,7 +8679,8 @@ impl Node {
             fingerprint: p.fingerprint(),
             created: p.created(),
         });
-        let locked = !self.profile.as_ref().is_some_and(Profile::is_unlocked);
+        // Locked once the lock has settled; until then, locking (V210-94).
+        let locked = !self.profile.as_ref().is_some_and(Profile::is_unlocked) && self.locking == 0;
         let listening = self
             .net
             .as_ref()
@@ -8686,6 +8771,7 @@ impl Node {
         let view = NodeView {
             identity,
             locked,
+            locking: self.locking > 0,
             mlock_active,
             listening,
             channels,

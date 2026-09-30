@@ -1299,7 +1299,7 @@ fn event_loop(
 
         // Idle lock (ADR-015): lock the node after IDLE_LOCK_SECS without input.
         let now = clock();
-        if !vm.locked && vm.has_identity && idle_lock_due(last_input, now) {
+        if !vm.locked && !vm.locking && vm.has_identity && idle_lock_due(last_input, now) {
             say_locking(io, &vm, &mut ui)?;
             ui.status_message = Some(core.apply(Command::Lock).message());
             last_input = now;

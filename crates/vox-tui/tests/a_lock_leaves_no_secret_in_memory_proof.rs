@@ -38,6 +38,11 @@
 //! taking `secret_work`'s write side): measured, one copy of the passphrase left after the lock in
 //! each case, the lock answered in about 0.4 s instead of the 15 s the held thread takes.
 //!
+//! Also asserted, in the seal case: while the lock waits on the held seal, the node still
+//! answers — a `vox room create` asked 2 s into the lock is answered (refused: locked) within
+//! [`ANSWERS`] (V210-71). Mutation: the wait for the blocking threads back on the actor; measured
+//! below in the commit's evidence.
+//!
 //! Also asserted: a typed `:lock` that waits more than [`SAID_LOCKING_AFTER`] shows "locking…"
 //! meanwhile. Mutation: `say_locking` not called (`app.rs`); the TUI then looks frozen for the
 //! whole wait.
@@ -68,6 +73,8 @@ const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const DELAY_MS: &str = "15000";
 /// How long the work has to show up in memory once started.
 const SHOWS_UP: Duration = Duration::from_secs(60);
+/// A command asked of the node while its lock settles is answered within this.
+const ANSWERS: Duration = Duration::from_secs(5);
 /// A typed `:lock` that took longer than this must have shown "locking…" while it waited.
 const SAID_LOCKING_AFTER: Duration = Duration::from_secs(2);
 /// The scanner's mask (`crates/vox-test-interpose/src/scan.rs`).
@@ -276,21 +283,44 @@ impl Tui {
     /// locked; how long that took. A typed `:lock` that waits must have said "locking…" meanwhile:
     /// the TUI waits on the lock's answer, and looked frozen (V210-94).
     fn lock(&self, hup: bool) -> Duration {
-        let t0 = Instant::now();
+        let t0 = self.ask_lock(hup);
+        self.wait_locked(t0, hup)
+    }
+
+    /// Ask for the lock, without waiting for it; when it was asked.
+    fn ask_lock(&self, hup: bool) -> Instant {
         let how: &[u8] = if hup { b"hup" } else { b"key" };
         std::fs::write(self.cues.join("lock"), how).unwrap();
+        Instant::now()
+    }
+
+    /// Whether the TUI has shown itself locked yet.
+    fn is_locked(&self) -> bool {
+        self.cues.join("locked").exists()
+    }
+
+    /// Wait until the TUI shows itself locked; how long since the lock was asked for at `t0`.
+    fn wait_locked(&self, t0: Instant, hup: bool) -> Duration {
         assert!(
             cue(&self.cues.join("locked"), Duration::from_secs(150)),
             "CANNOT MEASURE: {}'s TUI never showed itself locked",
             self.tag
         );
         let took = t0.elapsed();
-        let said = std::fs::read_to_string(self.cues.join("locked")).unwrap_or_default();
-        println!("[proof] {}'s TUI while the lock ran: {said}", self.tag);
-        if !hup && took > SAID_LOCKING_AFTER {
+        let cue_text = std::fs::read_to_string(self.cues.join("locked")).unwrap_or_default();
+        let (said, waited) = cue_text.split_once(' ').unwrap_or((cue_text.as_str(), ""));
+        // How long the TUI itself waited, from `:lock` to showing itself locked: `took` also
+        // counts whatever the proof did in between.
+        let waited = Duration::from_secs_f64(waited.trim().parse().unwrap_or(0.0));
+        println!(
+            "[proof] {}'s TUI while the lock ran: {said}, for {waited:?}",
+            self.tag
+        );
+        if !hup && waited > SAID_LOCKING_AFTER {
             assert_eq!(
                 said, "said-locking",
-                "{}'s TUI waited {took:?} on :lock and never said it was locking: it looked frozen",
+                "{}'s TUI waited {waited:?} on :lock and never said it was locking: it looked \
+                 frozen",
                 self.tag
             );
         }
@@ -393,7 +423,35 @@ fn a_lock_waits_for_a_room_seal_and_leaves_no_passphrase() {
         .until_more("room", before.of("room"))
         .expect("CANNOT MEASURE: the room passphrase never showed up in the TUI's memory");
     still_running(&mut create, "vox room create");
-    let took = tui.lock(false);
+    let asked = tui.ask_lock(false);
+    // **The node answers while the lock settles** (V210-71): a command that goes through the
+    // node's actor, asked while the lock waits on the held seal, is answered within
+    // [`ANSWERS`], not once the lock is done.
+    std::thread::sleep(Duration::from_secs(2));
+    let probe_at = Instant::now();
+    let mut probe = start(
+        &bob,
+        &["room", "create", "--name", "probe"],
+        &identity,
+        Some("a probe passphrase\n"),
+    );
+    let probe_status = probe.0.wait().expect("the probe");
+    let probe_took = probe_at.elapsed();
+    let settled_first = tui.is_locked();
+    let took = tui.wait_locked(asked, false);
+    println!(
+        "[proof] seal: a `vox room create` asked 2 s into the lock answered in {probe_took:?} \
+         ({probe_status}); the lock had settled by then: {settled_first}"
+    );
+    assert!(
+        !settled_first,
+        "CANNOT MEASURE: the lock settled before the probe answered, so nothing was waited on"
+    );
+    assert!(
+        probe_took < ANSWERS,
+        "the node answered nobody while its lock settled: a command took {probe_took:?} (bound \
+         {ANSWERS:?}) — the actor waited for the lock"
+    );
     let after = scanner.scan();
     let answered = create.0.try_wait().expect("poll");
     println!("[proof] seal: vox room create after the lock: {answered:?}");

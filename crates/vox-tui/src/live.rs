@@ -251,6 +251,7 @@ impl LiveCore {
             active,
             sync: SyncStatus::Idle,
             locked: nv.locked,
+            locking: nv.locking,
             mlock_active: nv.mlock_active,
             has_identity: nv.identity.is_some(),
         }
