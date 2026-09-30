@@ -504,6 +504,17 @@ impl NodeConfig {
 /// for up to 30 s (CI run 36418572653: a first relayed connection in 30065 ms, 55 attempts).
 const ANCHOR_REDIAL_SECS: u64 = 30;
 
+/// The most addresses one dial of an anchor tries (V210-75): four rooms' worth of the
+/// [`MAX_ENDPOINTS`](crate::nat::multiaddr::MAX_ENDPOINTS) one room may name for it. An anchor
+/// no configuration names but several rooms share is dialled at the union of their addresses,
+/// taken a room at a time (each room's first, then each one's second, …) so every room's
+/// best address is in the first dial. Launched at the staggered-start interval (250 ms) they
+/// all start inside one per-candidate timeout (10 s). A union larger than this is walked a
+/// window at a time: each failed dial moves on to the next, so no room's address is left out
+/// for good — capping it at one room's eight, as it was, left a second room's working address
+/// undialled whenever the first room already named eight dead ones.
+const ANCHOR_DIAL_CANDIDATES: usize = 4 * crate::nat::multiaddr::MAX_ENDPOINTS;
+
 /// An anchor connection lost within this long of being made counts as a **failure** for the
 /// backoff, not as a loss to redial at once (V210-57): two live processes of one identity (a
 /// copied profile, an old binary) supersede each other at the anchor, and redialling each loss at
@@ -2012,6 +2023,10 @@ pub struct Node {
     /// starting up dialled each anchor from both its start and its first tick, and the
     /// duplicate lost a tie-break against the first on every start.
     anchor_dials: Arc<std::sync::Mutex<BTreeSet<Digest32>>>,
+    /// Per shared, unconfigured anchor whose rooms name more than [`ANCHOR_DIAL_CANDIDATES`]
+    /// addresses: where the next dial's window starts in their union (V210-75). Moved on by
+    /// each failed dial, dropped when one connects.
+    anchor_window: BTreeMap<Digest32, usize>,
     /// When each anchor's current connection was made (unix seconds), so one lost soon after is
     /// told from one lost after a while ([`ANCHOR_FLAP_SECS`]).
     anchor_connected_at: BTreeMap<Digest32, u64>,
@@ -2333,6 +2348,7 @@ impl Node {
             port_mappings: Vec::new(),
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
+            anchor_window: BTreeMap::new(),
             anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeSet::new(),
             sync_dials: BTreeSet::new(),
@@ -2899,7 +2915,7 @@ impl Node {
         // an anchor that is down must not hold up the ones that are not.
         let configured: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
         for anchor in configured {
-            self.dial_anchor(&net, anchor.id, anchor.endpoints.clone());
+            self.dial_anchor(&net, anchor.id, anchor.endpoints.direct_candidates());
         }
         // No membership refresh here: the network only starts when the identity
         // unlocks, and `lock_all` cleared every channel, so there is nothing to
@@ -3412,37 +3428,52 @@ impl Node {
         Ok(())
     }
 
-    /// Every anchor this node keeps a connection to: the configured set first, then each open
-    /// room's own that is not configured (V210-75). One identity appears once: at the addresses
-    /// the configured set gives it if it is there, and otherwise at **every** address the rooms
-    /// that share it name (up to the endpoint bound), so one room's stale address for it cannot
+    /// Every anchor this node keeps a connection to, with the addresses its next dial tries:
+    /// the configured set first, then each open room's own that is not configured (V210-75).
+    /// One identity appears once: at the addresses the configured set gives it if it is there,
+    /// and otherwise at the addresses **every** room that shares it names, a room at a time and
+    /// at most [`ANCHOR_DIAL_CANDIDATES`] per dial, so one room's stale addresses for it cannot
     /// pin the redial to where it no longer is.
-    fn kept_anchors(&self) -> Vec<BootstrapNode> {
-        let mut all: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
-        let configured = all.len();
+    fn kept_anchors(&self) -> Vec<(Digest32, Vec<std::net::SocketAddr>)> {
+        let mut all: Vec<(Digest32, Vec<std::net::SocketAddr>)> = self
+            .anchors
+            .nodes()
+            .iter()
+            .map(|n| (n.id, n.endpoints.direct_candidates()))
+            .collect();
+        // Each unconfigured anchor's addresses, one list per room that names it.
+        let mut shared: Vec<(Digest32, Vec<Vec<std::net::SocketAddr>>)> = Vec::new();
         for (room, set) in &self.room_anchors {
             if !self.channels.contains_key(room) {
                 continue;
             }
             for n in set.nodes() {
-                match all.iter().position(|a| a.id == n.id) {
-                    None => all.push(n.clone()),
-                    Some(at) if at >= configured => {
-                        let mut addrs = all[at].endpoints.addrs().to_vec();
-                        for a in n.endpoints.addrs() {
-                            if !addrs.contains(a)
-                                && addrs.len() < crate::nat::multiaddr::MAX_ENDPOINTS
-                            {
-                                addrs.push(*a);
-                            }
-                        }
-                        if let Ok(endpoints) = crate::nat::multiaddr::EndpointList::new(addrs) {
-                            all[at].endpoints = endpoints;
-                        }
-                    }
-                    Some(_) => {}
+                if all.iter().any(|(id, _)| *id == n.id) {
+                    continue;
+                }
+                let addrs = n.endpoints.direct_candidates();
+                match shared.iter_mut().find(|(id, _)| *id == n.id) {
+                    Some((_, rooms)) => rooms.push(addrs),
+                    None => shared.push((n.id, vec![addrs])),
                 }
             }
+        }
+        for (id, rooms) in shared {
+            let mut union: Vec<std::net::SocketAddr> = Vec::new();
+            let deepest = rooms.iter().map(Vec::len).max().unwrap_or(0);
+            for i in 0..deepest {
+                for a in rooms.iter().filter_map(|r| r.get(i)) {
+                    if !union.contains(a) {
+                        union.push(*a);
+                    }
+                }
+            }
+            if union.len() > ANCHOR_DIAL_CANDIDATES {
+                let from = self.anchor_window.get(&id).copied().unwrap_or(0) % union.len();
+                union.rotate_left(from);
+                union.truncate(ANCHOR_DIAL_CANDIDATES);
+            }
+            all.push((id, union));
         }
         all
     }
@@ -3466,10 +3497,10 @@ impl Node {
         };
         let open = &self.channels;
         self.room_anchors.retain(|room, _| open.contains_key(room));
-        let known: Vec<BootstrapNode> = self.kept_anchors();
+        let known = self.kept_anchors();
         let up: BTreeSet<Digest32> = known
             .iter()
-            .map(|a| a.id)
+            .map(|(id, _)| *id)
             .filter(|id| net.manager().holds(id))
             .collect();
         let lost: Vec<Digest32> = self.anchors_up.difference(&up).copied().collect();
@@ -3502,8 +3533,8 @@ impl Node {
             }
         }
         self.anchors_up = up;
-        for anchor in known {
-            if anchor.id == net.local_id() || self.anchors_up.contains(&anchor.id) {
+        for (id, candidates) in known {
+            if id == net.local_id() || self.anchors_up.contains(&id) {
                 continue;
             }
             // **On the next tick, not the next half-minute** (V210-57): an anchor is this node's
@@ -3511,16 +3542,16 @@ impl Node {
             // Only an anchor that keeps failing is backed off.
             if self
                 .anchor_backoff
-                .get(&anchor.id)
+                .get(&id)
                 .is_some_and(|(at, _)| now < *at)
             {
                 continue;
             }
             // Said only for a retry: a first dial, or one right after a loss (said above), is no news.
-            let waited = self.anchor_backoff.get(&anchor.id).map_or(0, |(_, w)| *w);
-            if self.dial_anchor(&net, anchor.id, anchor.endpoints.clone()) && waited > 0 {
+            let waited = self.anchor_backoff.get(&id).map_or(0, |(_, w)| *w);
+            if self.dial_anchor(&net, id, candidates) && waited > 0 {
                 net.manager().note(
-                    anchor.id,
+                    id,
                     format!("dialling this anchor again, {waited}s after it last failed"),
                 );
             }
@@ -3534,7 +3565,7 @@ impl Node {
         &mut self,
         net: &Arc<NodeNet>,
         id: Digest32,
-        endpoints: crate::nat::multiaddr::EndpointList,
+        candidates: Vec<std::net::SocketAddr>,
     ) -> bool {
         if id == net.local_id() || net.manager().existing(&id).is_some() {
             return false;
@@ -3553,7 +3584,7 @@ impl Node {
             Arc::clone(&self.anchor_dials),
         );
         tokio::spawn(async move {
-            let dialled = net.manager().connect(id, &endpoints).await;
+            let dialled = net.manager().connect_to(id, &candidates).await;
             dials
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3611,7 +3642,7 @@ impl Node {
                 continue;
             }
             self.anchor_ids.insert(anchor.id);
-            self.dial_anchor(&net, anchor.id, anchor.endpoints.clone());
+            self.dial_anchor(&net, anchor.id, anchor.endpoints.direct_candidates());
         }
     }
 
@@ -4029,6 +4060,10 @@ impl Node {
                 // `ANCHOR_REDIAL_SECS` (V210-57), a room's own as well as a configured one
                 // (V210-75).
                 if self.is_kept_anchor(&peer) {
+                    // A union too large for one dial tries its next window next time (V210-75).
+                    if self.anchors.get(&peer).is_none() {
+                        *self.anchor_window.entry(peer).or_insert(0) += ANCHOR_DIAL_CANDIDATES;
+                    }
                     let wait = self
                         .anchor_backoff
                         .get(&peer)
@@ -4080,6 +4115,7 @@ impl Node {
                 // The backoff is kept until the connection has lasted (`ANCHOR_FLAP_SECS`): one
                 // superseded at once is a flap, not a success.
                 self.anchor_connected_at.insert(peer, self.now());
+                self.anchor_window.remove(&peer);
                 // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
                 // whose forward said it dialled and then nothing).
                 if let Some(net) = self.net.as_ref() {

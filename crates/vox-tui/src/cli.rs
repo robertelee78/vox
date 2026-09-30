@@ -73,6 +73,27 @@ impl ProfileArgs {
         }
     }
 
+    /// The anchors a verb runs with, by whether it dials one (V210-75). A verb that needs an
+    /// anchor takes [`Self::anchor_set`] and refuses a file that names none; a verb that dials
+    /// none (`vox id`, `vox trust`, `vox service list`) says so and carries on with what is
+    /// usable, since a broken anchors file is no reason to withhold a fingerprint or a keyring.
+    ///
+    /// # Errors
+    /// What [`Self::anchor_set`] refuses, for [`AnchorUse::Needed`]; a malformed `--anchor`
+    /// either way.
+    pub fn anchors_for(&self, needs: AnchorUse) -> vox_core::error::Result<BootstrapSet> {
+        match needs {
+            AnchorUse::Needed => self.anchor_set(),
+            AnchorUse::NotNeeded => {
+                let (set, unusable) = self.anchor_set_lenient()?;
+                if let Some(e) = unusable {
+                    eprintln!("vox: {e}; this command dials no anchor, so it carries on");
+                }
+                Ok(set)
+            }
+        }
+    }
+
     /// [`Self::anchor_set`], and separately the refusal it would give when the anchors file
     /// names no usable anchor, for `vox node`, which runs anchorless and says so.
     pub fn anchor_set_lenient(
@@ -110,6 +131,25 @@ impl ProfileArgs {
     }
 }
 
+/// Whether a verb dials an anchor, which decides whether an anchors file that names no usable
+/// anchor stops it (V210-75).
+///
+/// - **Needed** — the verbs that reach the network through an anchor: `vox tui`, `vox daemon`,
+///   `vox serve`, `vox connect`, `vox up`, `vox forward`, `vox service add` and
+///   `vox service remove`.
+/// - **Not needed** — verbs that read or edit this profile only: `vox id` and `vox trust
+///   list/add/remove` (with no node running), and `vox service list`. `vox node` is an anchor
+///   and runs with none of its own.
+/// - Not asked at all: `vox room …`, `vox status`, `vox agent`, and `vox id`/`vox trust` with a
+///   node running talk to that node over its socket; the rest never touch the profile's network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorUse {
+    /// The verb dials an anchor: a file that names none refuses it.
+    Needed,
+    /// The verb dials none: a file that names none is said and ignored.
+    NotNeeded,
+}
+
 /// The room args of whichever `service` subcommand this is.
 fn sub_room(sub: &ServiceCmd) -> &RoomArgs {
     match sub {
@@ -121,7 +161,7 @@ fn sub_room(sub: &ServiceCmd) -> &RoomArgs {
 
 /// The shape every one-shot tunnel verb shares: resolve the profile, collect the two
 /// passphrases, open the room, run the verb, report.
-fn run_tunnel_verb<F, Fut>(room: RoomArgs, body: F) -> ExitCode
+fn run_tunnel_verb<F, Fut>(room: RoomArgs, needs: AnchorUse, body: F) -> ExitCode
 where
     F: FnOnce(vox_core::node::actor::NodeHandle, vox_core::hash::Digest32) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
@@ -133,7 +173,7 @@ where
             return ExitCode::FAILURE;
         }
     };
-    let anchors = match room.profile.anchor_set() {
+    let anchors = match room.profile.anchors_for(needs) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("vox: {e}");
@@ -205,6 +245,7 @@ where
 /// passphrase to collect up front.
 fn run_new_room_verb<F, Fut>(
     profile: ProfileArgs,
+    needs: AnchorUse,
     identity_passphrase: Option<String>,
     identity_passphrase_file: Option<std::path::PathBuf>,
     body: F,
@@ -220,7 +261,7 @@ where
             return ExitCode::FAILURE;
         }
     };
-    let anchors = match profile.anchor_set() {
+    let anchors = match profile.anchors_for(needs) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("vox: {e}");
@@ -1284,6 +1325,7 @@ pub fn run() -> ExitCode {
             let a = args.clone();
             run_new_room_verb(
                 args.profile.clone(),
+                AnchorUse::Needed,
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, anchors| async move {
@@ -1305,6 +1347,7 @@ pub fn run() -> ExitCode {
             let a = args.clone();
             run_new_room_verb(
                 args.profile.clone(),
+                AnchorUse::Needed,
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
@@ -1664,23 +1707,29 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
-            let sub = sub.clone();
-            async move {
-                match &sub {
-                    ServiceCmd::Add(a) => {
-                        crate::tunnel_cli::service_add(&node, cid, &a.tag, a.local).await
-                    }
-                    ServiceCmd::Remove(r) => {
-                        crate::tunnel_cli::service_remove(&node, cid, &r.tag).await
-                    }
-                    ServiceCmd::List(_) => {
-                        crate::tunnel_cli::service_list(&node, cid);
-                        Ok(())
+        Cmd::Service(sub) => {
+            let needs = match sub {
+                ServiceCmd::List(_) => AnchorUse::NotNeeded,
+                ServiceCmd::Add(_) | ServiceCmd::Remove(_) => AnchorUse::Needed,
+            };
+            run_tunnel_verb(sub_room(&sub).clone(), needs, move |node, cid| {
+                let sub = sub.clone();
+                async move {
+                    match &sub {
+                        ServiceCmd::Add(a) => {
+                            crate::tunnel_cli::service_add(&node, cid, &a.tag, a.local).await
+                        }
+                        ServiceCmd::Remove(r) => {
+                            crate::tunnel_cli::service_remove(&node, cid, &r.tag).await
+                        }
+                        ServiceCmd::List(_) => {
+                            crate::tunnel_cli::service_list(&node, cid);
+                            Ok(())
+                        }
                     }
                 }
-            }
-        }),
+            })
+        }
         // Ask the running node when there is one: a fingerprint is public, the hello
         // already carries it, and needing the profile to yourself to read your own name
         // was the most gratuitous case of the busy-profile problem.
@@ -1710,6 +1759,7 @@ pub fn run() -> ExitCode {
         }
         Cmd::Id(args) => run_new_room_verb(
             args.profile.clone(),
+            AnchorUse::NotNeeded,
             args.identity_passphrase.clone(),
             args.identity_passphrase_file.clone(),
             move |node, _anchors| async move {
@@ -1734,6 +1784,7 @@ pub fn run() -> ExitCode {
         Cmd::Trust(sub) if trust_over_socket(&sub) => run_trust_over_socket(sub),
         Cmd::Trust(TrustCmd::List(args)) => run_new_room_verb(
             args.profile.clone(),
+            AnchorUse::NotNeeded,
             args.identity_passphrase.clone(),
             args.identity_passphrase_file.clone(),
             move |node, _anchors| async move {
@@ -1753,6 +1804,7 @@ pub fn run() -> ExitCode {
             let a = args.clone();
             run_new_room_verb(
                 args.profile.clone(),
+                AnchorUse::NotNeeded,
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
@@ -1764,6 +1816,7 @@ pub fn run() -> ExitCode {
             let a = args.clone();
             run_new_room_verb(
                 args.profile.clone(),
+                AnchorUse::NotNeeded,
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
@@ -1773,15 +1826,21 @@ pub fn run() -> ExitCode {
         }
         Cmd::Up(args) => {
             let bind = args.bind;
-            run_tunnel_verb(args.room.clone(), move |node, cid| async move {
-                crate::tunnel_cli::up(&node, cid, bind).await
-            })
+            run_tunnel_verb(
+                args.room.clone(),
+                AnchorUse::Needed,
+                move |node, cid| async move { crate::tunnel_cli::up(&node, cid, bind).await },
+            )
         }
         Cmd::Forward(args) => {
             let a = args.clone();
-            run_tunnel_verb(args.room.clone(), move |node, cid| async move {
-                crate::tunnel_cli::forward(&node, cid, &a.host, &a.tag, a.local).await
-            })
+            run_tunnel_verb(
+                args.room.clone(),
+                AnchorUse::Needed,
+                move |node, cid| async move {
+                    crate::tunnel_cli::forward(&node, cid, &a.host, &a.tag, a.local).await
+                },
+            )
         }
         Cmd::ShellSetup { remove } => crate::shell::run(remove),
         Cmd::Update { check, rollback } => match crate::update::run(check, rollback) {

@@ -13,11 +13,19 @@
 //!   [`EXIT_WITHIN`], saying the file names no usable anchor, with the file's path, and naming
 //!   both skipped lines.
 //! - `vox node` must **keep running** for [`STAYS_UP`] and say it runs with no anchor of its own.
+//! - The verbs that dial no anchor must **work**, saying they carry on: `vox id` prints the
+//!   profile's fingerprint and exits 0, and `vox trust add`, `vox trust list` and
+//!   `vox trust remove` (no node running) add, show and remove a second profile's fingerprint.
+//!   Printing a fingerprint or editing a keyring needs no anchor, and a broken anchors file
+//!   withheld both.
 //! - The control: `vox daemon` with the same file and an `--anchor` it can use **starts** (it
 //!   answers `vox room list`), so the refusal is the file, not the verb.
 //!
-//! **Mutation that must turn it red:** `ProfileArgs::anchor_set` returns the empty set instead of
-//! the refusal (the candidate before this change): `vox daemon` keeps running.
+//! **Mutations that must turn it red:**
+//! - `ProfileArgs::anchor_set` returns the empty set instead of the refusal (the candidate
+//!   before this change): `vox daemon` keeps running.
+//! - `vox id` loads its anchors strictly again (`AnchorUse::Needed`, candidate 2): it refuses,
+//!   exit 1, and prints no fingerprint.
 
 #![cfg(unix)]
 
@@ -165,6 +173,49 @@ fn an_anchors_file_with_no_usable_anchor_is_refused() {
         );
         refused += 1;
     }
+
+    // ---- the verbs that dial no anchor work, and say they carry on -----------------------------
+    const CARRIES_ON: &str = "this command dials no anchor, so it carries on";
+    let (ok, out, err) = vox_once(&data, &args(&["id"]));
+    let printed = out.trim() == fp;
+    println!(
+        "[proof] vox id: exit ok {ok}; printed the fingerprint: {printed}; said it carries on: {}",
+        err.contains(CARRIES_ON)
+    );
+    assert!(
+        ok && printed && err.contains(CARRIES_ON) && err.contains("line 1 is skipped"),
+        "`vox id` dials no anchor: with an anchors file that names none it must print its \
+         fingerprint ({fp}), exit 0, and say it carries on; it exited ok={ok}, printed \
+         {out:?} and said:\n{err}"
+    );
+    let friend_dir = tmp.path().join("q");
+    std::fs::create_dir_all(friend_dir.join("cfg")).unwrap();
+    let (ok, friend, err) = vox_once(&friend_dir, &args(&["id"]));
+    let friend = friend.trim().to_owned();
+    assert!(
+        ok && friend.len() == 52,
+        "CANNOT MEASURE: a second profile's `vox id`: {friend:?} {err}"
+    );
+    let trust = |argv: &[&str]| {
+        let (ok, out, err) = vox_once(&data, &args(argv));
+        (ok && err.contains(CARRIES_ON), out, err)
+    };
+    let (added, _, add_err) = trust(&["trust", "add", &friend, "--name", "friend"]);
+    let (listed, list_out, list_err) = trust(&["trust", "list"]);
+    let listed = listed && list_out.contains(&friend);
+    let (removed, _, rm_err) = trust(&["trust", "remove", &friend]);
+    let (relisted, relist_out, relist_err) = trust(&["trust", "list"]);
+    let gone = relisted && !relist_out.contains(&friend);
+    println!(
+        "[proof] vox trust with the same file: add {added}, list shows it {listed}, remove \
+         {removed}, list no longer shows it {gone}"
+    );
+    assert!(
+        added && listed && removed && gone,
+        "`vox trust` dials no anchor: with an anchors file that names none, add, list and \
+         remove must work and say they carry on.\nadd: {add_err}\nlist: {list_out}{list_err}\n\
+         remove: {rm_err}\nlist again: {relist_out}{relist_err}"
+    );
 
     // ---- `vox node` runs anchorless, and says so ----------------------------------------------
     let node_dir = tmp.path().join("n");
