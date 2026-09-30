@@ -19,6 +19,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             consents to Carol (her row becomes "consented") and not to whoever took her place;
   delivers  the grant is the node's: a line Bob then posts from the composer reaches Carol's
             `vox room read` (a pane that only drew "consented" would pass `target`, not this);
+  revoke    `:consent revoke`, with Carol still selected and not first in the pane, takes her
+            back to "← in-only" and leaves Alice "↔ consented"; a line Bob then posts reaches
+            Alice's `vox room read` and not Carol's;
   reach     back on the channel list, the room reads "● online" while Bob's node is connected to
             its other members;
   unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline";
@@ -288,6 +291,30 @@ try:
     tui.key("b-after-grant\r", 1)
     got = until(lambda: "b-after-grant" in run("carol", "room", "read", room, "--limit", "500").stdout, 60, 1)
     claim("delivers", got, f"carol read bob's post after :consent grant within 60 s: {got}")
+
+    stage("revoke")
+    # Carol is still selected, and is not the pane's first member (Dave sorts in above her).
+    tui.key("\t", 0.5)  # composer -> members
+    if not label_of("carol")[1]: apparatus("the marker left carol before :consent revoke:\n" + "\n".join(pane()))
+    first = next((r.strip("│ ▶") for r in pane() if r.strip("│ ") and "Members" not in r), "")
+    tui.key(":consent revoke\r", 3)
+    back = tui.until(lambda: "in-only" in (label_of("carol")[0] or ""), 30, 1)
+    carol_label, alice_label = label_of("carol")[0] or "", label_of("alice")[0] or ""
+    panes_ok = back and "consented" in alice_label
+    leaked = None
+    if panes_ok:
+        # Then Bob posts again. Alice, still consented to, reads it, so it went out; Carol, who
+        # syncs from the same peers, must not, 10 s after Alice has.
+        tui.key("\t", 0.5)  # members -> timeline
+        tui.key("\t", 0.5)  # timeline -> composer
+        tui.key("b-after-revoke\r", 1)
+        if not until(lambda: "b-after-revoke" in run("alice", "room", "read", room, "--limit", "500").stdout, 60, 1):
+            apparatus("alice never read bob's post after the revoke, so carol not reading it shows nothing")
+        time.sleep(10)
+        leaked = "b-after-revoke" in run("carol", "room", "read", room, "--limit", "500").stdout
+    claim("revoke", panes_ok and leaked is False,
+          f"first in the pane: {first[:30]!r}; carol: {carol_label.strip()!r}; alice: "
+          f"{alice_label.strip()!r}; carol read bob's post after the revoke: {leaked}")
 
     stage("reach")
     tui.key("\x1b", 2)  # Esc back to the channel list

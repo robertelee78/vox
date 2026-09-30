@@ -3,7 +3,7 @@
 //!
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob and Carol
 //! (Alice and Bob trust each other, nobody trusts Carol), Alice posts 70 lines, and Bob's real
-//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks thirteen claims, each
+//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks fourteen claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -22,6 +22,9 @@
 //!   someone else);
 //! - `delivers`: the grant is the node's, not only the pane's: a line Bob then posts from the
 //!   composer reaches Carol's `vox room read`;
+//! - `revoke`: `:consent revoke`, with Carol still selected and not first in the pane, takes her
+//!   back to "← in-only" and leaves Alice "↔ consented"; a line Bob then posts reaches Alice's
+//!   `vox room read` and not Carol's (a revoke that acted on a position would take someone else);
 //! - `reach`: back on the channel list, the room reads "● online" while Bob's node is connected
 //!   to its other members (it said offline always);
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
@@ -36,7 +39,7 @@
 //! Each claim turns red against a product that restores its defect: the timeline drawn from the
 //! top, a scroll not clamped to the oldest line, `OutboundConsent::Granted` for everyone, the local
 //! verification mark, `SyncStatus` hard-coded (idle, or any one count), the member selected by
-//! index, or `Reachability` hard-coded either way. It passes only on the script's PASS with all 13
+//! index, or `Reachability` hard-coded either way. It passes only on the script's PASS with all 14
 //! claims ok; its
 //! apparatus failures (exit 2: `pyte` missing, a join or a precondition that did not happen, such
 //! as Dave's join not moving Carol) fail as CANNOT MEASURE, never as a pass.
@@ -70,7 +73,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (13 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (14 expected); the driver took {:?}; its last \
          stage: {:?}",
         claims.len(),
         out.took,
@@ -84,8 +87,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (13, 13),
-                "a PASS must rest on all 13 claims, each ok: {said}"
+                (14, 14),
+                "a PASS must rest on all 14 claims, each ok: {said}"
             );
         }
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
