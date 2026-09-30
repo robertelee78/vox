@@ -37,7 +37,8 @@
 //! All time is caller-supplied `now` (epoch-seconds): the store is deterministic
 //! and has no ambient clock, which keeps it unit-testable and side-effect-free.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::IpAddr;
 
 use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
@@ -90,6 +91,53 @@ pub const MAX_AUTHORS_PER_BUCKET: usize = 1024;
 /// for want of room and never displaced, so no quantity of geneses from peers can stop
 /// a node serving the rooms it is there for.
 pub const MAX_GENESIS_CHANNELS: usize = 4096;
+
+/// Most distinct sources a board credits one room to (see [`Source`]): a bound on memory. Only
+/// the room's members add to it — the first put of its genesis, and member records, which only a
+/// member can sign.
+pub const MAX_SOURCES_PER_ROOM: usize = 16;
+
+/// **Where a room's records came from**, so a full board can share itself fairly between the
+/// peers filling it (V210-70): the network a peer published from — an IPv4 address, or an IPv6
+/// address by its /48 — or, for a peer reached through a relay
+/// (whose address this node cannot see), its identity. A /48 rather than the /64 one subscriber
+/// is usually given, because a host is commonly given far more than one /64: grouping less would
+/// let one machine appear as thousands of sources. Subscribers who share a /48 only share a count.
+///
+/// A room is credited to the source that first published its genesis, and to every source that
+/// published a member address or bundle record for it — records only its members can sign, so a
+/// stranger cannot get itself credited with a room it is not in. A full board evicts from the
+/// source credited with the most rooms, so a stranger filling it from one network, or from a few,
+/// only ever displaces its own rooms, and a real room — live or long offline — is displaced only
+/// once no source holds more. A peer reached through a relay is known by identity, which is not
+/// free to multiply: a relay carries a circuit only between peers that share a room on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Source {
+    /// An IPv4 address.
+    V4([u8; 4]),
+    /// An IPv6 /48.
+    V6([u8; 6]),
+    /// A peer reached through a relay, by its fingerprint.
+    Relayed(Digest32),
+}
+
+impl Source {
+    /// The source for a peer seen at `ip` (an IPv4-mapped IPv6 address is its IPv4 address).
+    #[must_use]
+    pub fn of_addr(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Self::V4(v4.octets()),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => Self::V4(v4.octets()),
+                None => {
+                    let mut net = [0u8; 6];
+                    net.copy_from_slice(&v6.octets()[..6]);
+                    Self::V6(net)
+                }
+            },
+        }
+    }
+}
 
 /// The expiry instant of a member record (epoch-seconds).
 fn member_expiry(rec: &RendezvousRecord) -> u64 {
@@ -224,6 +272,8 @@ pub struct RendezvousStore {
     genesis_arrived: HashMap<Digest32, u64>,
     /// The next genesis arrival number.
     genesis_arrivals: u64,
+    /// `channelID` → the sources that published its genesis or a member record for it.
+    genesis_sources: HashMap<Digest32, BTreeSet<Source>>,
 }
 
 impl RendezvousStore {
@@ -378,7 +428,13 @@ impl RendezvousStore {
     /// pinning one the board already holds from a peer takes it out of that count.
     /// Whether a board takes an unpinned genesis at all is the service's decision, not
     /// the store's (see `RendezvousService::serve_rooms`).
-    pub fn accept_genesis(&mut self, genesis: Genesis, pinned: bool, now: u64) -> Result<()> {
+    pub fn accept_genesis(
+        &mut self,
+        genesis: Genesis,
+        pinned: bool,
+        now: u64,
+        source: Option<Source>,
+    ) -> Result<()> {
         genesis.verify()?;
         let channel_id = genesis.channel_id();
         if let Some(existing) = self.genesis.get(&channel_id) {
@@ -388,6 +444,9 @@ impl RendezvousStore {
                 if pinned {
                     self.pinned.insert(channel_id);
                 }
+                // No credit to `source`: a room's genesis is public, so anyone can put it
+                // again, and crediting that would let a stranger file a real room under its
+                // own network and have it evicted with its own rooms.
                 return Ok(());
             }
             return Err(Error::RendezvousRejected("genesis already present"));
@@ -396,12 +455,17 @@ impl RendezvousStore {
             // **A full board makes room; it does not turn a new room away** (V210-70). Refusing
             // let one stranger fill an anchor with 4096 rooms it minted over one connection, and
             // every room created after that could not be published there or joined through it —
-            // an anchor that serves any room published to it serving none. The room that goes is
-            // the one that arrived longest ago **with nobody in it**: no live member address or
-            // bundle record. A real room's members keep those records current, so rooms nobody
-            // publishes to are displaced before any room that is in use, and a flood of empty
-            // ones displaces only its own.
-            let Some(evict) = self.idle_unpinned_genesis(now) else {
+            // an anchor that serves any room published to it serving none.
+            //
+            // Which room goes is decided by **where the rooms came from**, not by whether anyone
+            // is in them: a stranger can keep records live for every room it mints as cheaply as
+            // it mints them, and a real room's members can all be offline for longer than their
+            // records last. So the board evicts from the source credited with the most rooms
+            // ([`Source`]) — a flood from one network, or spread over a few, displaces only its
+            // own rooms — and among that source's rooms, the one credited to the fewest sources,
+            // then an empty one before a live one, the oldest first. Nobody is refused and nobody
+            // is limited: a source with the most rooms gives one up when the board is full.
+            let Some(evict) = self.eviction_candidate(now) else {
                 return Err(Error::RendezvousRejected("genesis board at capacity"));
             };
             self.forget_channel(&evict);
@@ -413,14 +477,66 @@ impl RendezvousStore {
         if pinned {
             self.pinned.insert(channel_id);
         }
+        self.note_source(&channel_id, source);
         Ok(())
     }
 
-    /// The unpinned genesis that arrived longest ago among those whose room has no live member
-    /// address or bundle record in any epoch, if there is one.
-    fn idle_unpinned_genesis(&self, now: u64) -> Option<Digest32> {
-        let live: HashSet<Digest32> = self
-            .members
+    /// Credit `channel_id`'s room to `source`, if this board holds its genesis (see [`Source`]).
+    pub fn note_source(&mut self, channel_id: &Digest32, source: Option<Source>) {
+        let Some(source) = source else { return };
+        if !self.genesis.contains_key(channel_id) {
+            return;
+        }
+        let set = self.genesis_sources.entry(*channel_id).or_default();
+        if set.len() < MAX_SOURCES_PER_ROOM {
+            set.insert(source);
+        }
+    }
+
+    /// The room a full board gives up for a new one: from the source credited with the most
+    /// unpinned rooms — rooms credited to nobody (the ones an anchor put back on its board after a
+    /// restart, before anyone published to them again) counting as one source of their own — the
+    /// one credited to the fewest sources, then one with no live member record before one with,
+    /// the oldest first.
+    fn eviction_candidate(&self, now: u64) -> Option<Digest32> {
+        let unpinned = || {
+            self.genesis
+                .keys()
+                .filter(|cid| !self.pinned.contains(*cid))
+        };
+        let sources_of = |cid: &Digest32| self.genesis_sources.get(cid).filter(|s| !s.is_empty());
+        let mut held: HashMap<Option<Source>, usize> = HashMap::new();
+        for cid in unpinned() {
+            match sources_of(cid) {
+                Some(sources) => {
+                    for source in sources {
+                        *held.entry(Some(*source)).or_default() += 1;
+                    }
+                }
+                None => *held.entry(None).or_default() += 1,
+            }
+        }
+        let (&largest, _) = held.iter().max_by_key(|(src, n)| (**n, **src))?;
+        let live = self.live_channels(now);
+        unpinned()
+            .filter(|cid| match (sources_of(cid), largest) {
+                (Some(sources), Some(src)) => sources.contains(&src),
+                (None, None) => true,
+                _ => false,
+            })
+            .min_by_key(|cid| {
+                (
+                    sources_of(cid).map_or(0, BTreeSet::len),
+                    live.contains(*cid),
+                    self.genesis_arrived.get(*cid).copied().unwrap_or(0),
+                )
+            })
+            .copied()
+    }
+
+    /// The channels with a live member address or bundle record in any epoch.
+    fn live_channels(&self, now: u64) -> HashSet<Digest32> {
+        self.members
             .iter()
             .filter(|(_, b)| b.values().any(|r| now < member_expiry(r)))
             .map(|((cid, _), _)| *cid)
@@ -430,12 +546,7 @@ impl RendezvousStore {
                     .filter(|(_, b)| b.values().any(|r| now < bundle_expiry(r)))
                     .map(|((cid, _), _)| *cid),
             )
-            .collect();
-        self.genesis
-            .keys()
-            .filter(|cid| !self.pinned.contains(*cid) && !live.contains(*cid))
-            .min_by_key(|cid| self.genesis_arrived.get(*cid).copied().unwrap_or(0))
-            .copied()
+            .collect()
     }
 
     /// Drop everything this board holds for `channel_id`: its genesis and every record filed
@@ -443,6 +554,7 @@ impl RendezvousStore {
     fn forget_channel(&mut self, channel_id: &Digest32) {
         self.genesis.remove(channel_id);
         self.genesis_arrived.remove(channel_id);
+        self.genesis_sources.remove(channel_id);
         self.pinned.remove(channel_id);
         self.prejoins.remove(channel_id);
         self.members.retain(|(cid, _), _| cid != channel_id);
