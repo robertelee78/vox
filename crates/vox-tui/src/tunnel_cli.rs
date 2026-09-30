@@ -878,6 +878,7 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::Unreachable) => {
             "the anchor answered, but no member it knows could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online, or check `vox node` on the anchor shows more than `1m` for this room"
         }
+        Some(Fault::SolveTooSlow) => Fault::SolveTooSlow.explain(),
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
         // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
         // responder, so it is the responder that says no. Leading with "the refusal is
@@ -929,6 +930,7 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
         "RoomNotOnBoard" => Fault::RoomNotOnBoard,
         "BoardUnreachable" => Fault::BoardUnreachable,
         "Unreachable" => Fault::Unreachable,
+        "SolveTooSlow" => Fault::SolveTooSlow,
         "Refused" => Fault::Refused,
         "NotConsented" => Fault::NotConsented,
         "StillTrusted" => Fault::StillTrusted,

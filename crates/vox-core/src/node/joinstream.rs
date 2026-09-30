@@ -373,7 +373,29 @@ async fn recv_frame(recv: &mut RecvStream) -> Result<JoinFrame> {
 /// Measured on a developer machine run 2–3.5× over its cores: 0.9–2.0s a nonce, 1–3 nonces at the
 /// base difficulty. A Raspberry-Pi-class device is an order slower on this memory-hard (200,9)
 /// solve, so this is sized for that rather than for the machine that measured it.
-const SOLVE_BUDGET_PER_EXPECTED_SOLVE: std::time::Duration = std::time::Duration::from_secs(30);
+///
+/// **Two orders slower, not one (V210-87).** At 30s the patience at the base difficulty was 120s,
+/// and a joiner slower than that was turned away every time, told only that no member could be
+/// reached: the responder's own report was `peer sent no frame in time`, on the `Solve`. Measured
+/// through the real binaries on one busy machine (load 30–110, nine joins at once) with the
+/// unoptimized build standing in for a slow device: one join's solve took 22–118s when it got in,
+/// and three of nine were refused after grinding 151–194s. That is a device 20–100× slower than the
+/// one that measured the release build, which a small board under load is. Waiting longer costs
+/// the responder nothing a stranger could not already take: holding a join slot never required
+/// solving (see [`solve_patience`]).
+const SOLVE_BUDGET_PER_EXPECTED_SOLVE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Test-only: make this joiner's grind last at least this many milliseconds, as it does on a
+/// slower device. **For proofs; nothing in a real deployment sets it.** A proof cannot otherwise
+/// stage a joiner slower than the responder's patience with the release build, whose solve takes a
+/// second or two. Unset, empty or unparsable is no floor.
+pub const TEST_SOLVE_AT_LEAST_ENV: &str = "VOX_TEST_SOLVE_AT_LEAST_MS";
+
+/// How close to the responder's patience a grind may finish and still count as in time. The
+/// responder started its clock when it sent the challenge, a one-way trip before this side started
+/// its own, so a grind that ended just inside the patience here may have ended just outside it
+/// there.
+const SOLVE_PATIENCE_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How far past the expected number of solves an honest joiner may run: the nonce search is
 /// geometric, and this covers its tail.
@@ -514,6 +536,15 @@ pub async fn run_initiator(
         )
     };
     let grinding = std::time::Instant::now();
+    let grind = || {
+        let ground = grind()?;
+        let floor = std::env::var(TEST_SOLVE_AT_LEAST_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis);
+        std::thread::sleep(floor.saturating_sub(grinding.elapsed()));
+        Ok::<_, Error>(ground)
+    };
     let (initiator, token, share) = if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
     {
@@ -522,6 +553,17 @@ pub async fn run_initiator(
         grind()?
     };
     let solved_in = grinding.elapsed();
+    // **A grind past the responder's patience is this device's, and said so (V210-87).** The
+    // responder has stopped waiting by then and its refusal arrived here as a stream that failed,
+    // which the join reported as "no member could be reached" — about a member that had answered
+    // and waited. Both sides derive the patience from the same signed difficulty, so this side can
+    // tell, and say how long it took against how long it was given.
+    let patience = solve_patience(challenge.difficulty);
+    let too_slow = || Error::JoinSolveTooSlow {
+        solved_secs: solved_in.as_secs(),
+        patience_secs: patience.as_secs(),
+    };
+    let late = solved_in + SOLVE_PATIENCE_SLACK >= patience;
     send_frame(
         &mut send,
         &JoinFrame::Solve {
@@ -530,13 +572,16 @@ pub async fn run_initiator(
             share,
         },
     )
-    .await?;
+    .await
+    .map_err(|e| if late { too_slow() } else { e })?;
 
     // 3. SHARE.
-    let peer_share = match recv_frame(&mut recv).await? {
-        JoinFrame::Share { share } => share,
-        JoinFrame::Rejected(r) => return Err(Error::JoinRefused(r.as_str())),
-        _ => return Err(Error::MalformedJoin("expected share")),
+    let peer_share = match recv_frame(&mut recv).await {
+        Ok(JoinFrame::Share { share }) => share,
+        Ok(JoinFrame::Rejected(_)) | Err(_) if late => return Err(too_slow()),
+        Ok(JoinFrame::Rejected(r)) => return Err(Error::JoinRefused(r.as_str())),
+        Err(e) => return Err(e),
+        Ok(_) => return Err(Error::MalformedJoin("expected share")),
     };
     let (pending, bootstrap) = initiator.complete_cpace(&peer_share)?;
 

@@ -450,6 +450,10 @@ pub enum Fault {
     BoardUnreachable,
     /// A peer could not be reached (no live endpoint, or the dial failed).
     Unreachable,
+    /// A member answered a join and waited for its proof of work, and this device took longer to
+    /// solve it than the member waits (V210-87). **Not [`Fault::Unreachable`]**, which is how it
+    /// was reported: the member had been reached, and had waited.
+    SolveTooSlow,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
     /// A consent named a member this node has not admitted to the room (yet): it holds no
@@ -552,6 +556,9 @@ impl Fault {
             }
             Fault::Unreachable => {
                 "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
+            }
+            Fault::SolveTooSlow => {
+                "a member answered, but this device took longer to solve the join's proof of work than the member waits\n       your passphrase was never checked — this is not a verdict on it\n       run the join again when this device is less busy"
             }
             Fault::Refused => "the other side refused",
             Fault::NotAdmitted => {
