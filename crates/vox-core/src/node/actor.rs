@@ -140,14 +140,27 @@ fn summary_of(ch: &ChannelState) -> ChannelSummary {
     }
 }
 
-/// A room's detail for the view, from its state.
-fn detail_of(ch: &ChannelState) -> ChannelDetail {
+/// A room's detail for the view, from its state. `prev` is the room's detail last published: its
+/// timeline is shared rather than rebuilt when the room's timeline has not changed since
+/// (V210-71), since most publishes are about something else.
+fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
+    let rows = ch.timeline();
+    let same = |p: &&ChannelDetail| {
+        p.channel_id == ch.channel_id()
+            && p.timeline.len() == rows.len()
+            && p.timeline.first().map(|r| r.entry_hash) == rows.first().map(|r| r.entry_hash)
+            && p.timeline.last().map(|r| r.entry_hash) == rows.last().map(|r| r.entry_hash)
+    };
+    let timeline = match prev.filter(same) {
+        Some(p) => std::sync::Arc::clone(&p.timeline),
+        None => rows.iter().map(row_of).collect(),
+    };
     ChannelDetail {
         channel_id: ch.channel_id(),
         local_name: ch.local_name().to_owned(),
         epoch: ch.epoch(),
         members: ch.members(),
-        timeline: ch.timeline().iter().map(row_of).collect(),
+        timeline,
         services: ch
             .services()
             .iter()
@@ -8291,8 +8304,18 @@ impl Node {
         // command reports; it does not un-send the message that just went out, so the
         // append is still reported as the success it was.
         let rotated = ch.should_rotate_sender(now) && ch.rotate_sender(profile, now).is_ok();
+        let detail = {
+            let published = self.view_tx.borrow();
+            detail_of(
+                &ch,
+                published
+                    .open_channels
+                    .iter()
+                    .find(|d| d.channel_id == *channel_id),
+            )
+        };
         self.fresh_details
-            .insert(*channel_id, (summary_of(&ch), detail_of(&ch)));
+            .insert(*channel_id, (summary_of(&ch), detail));
         drop(ch);
         let channel_id = *channel_id;
         let _ = self.event_tx.send(NodeEvent::NewEntry {
@@ -8449,7 +8472,10 @@ impl Node {
             read.insert(*id);
             summaries.insert(*id, summary_of(&ch));
             mlock_active &= ch.mlock_active();
-            open_channels.push(detail_of(&ch));
+            open_channels.push(detail_of(
+                &ch,
+                prev.open_channels.iter().find(|d| d.channel_id == *id),
+            ));
         }
         let mut channels = Vec::with_capacity(known.len());
         for id in &known {
