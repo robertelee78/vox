@@ -5037,9 +5037,8 @@ impl Node {
             // responder's own board is no more trustworthy than any other — it is
             // where a joiner first looks, which makes it the *first* place a
             // compromised member would seed keys.
-            let mut channel = shared.lock().await;
             let _ = admit_board_records(
-                &mut channel,
+                &shared,
                 profile.store(),
                 &set.bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
@@ -5828,9 +5827,8 @@ impl Node {
         }
         if let Some(store) = self.profile.as_ref().map(Profile::store_handle) {
             let now = self.now();
-            let mut channel = shared.lock().await;
             let _ = admit_board_records(
-                &mut channel,
+                &shared,
                 &store,
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
@@ -6347,20 +6345,14 @@ impl Node {
                     let setup = async {
                         if let Some(pstore) = admit_store {
                             if let Ok(set) = net.fetch_channel(&conn, &cid, known).await {
-                                {
-                                    let mut ch = shared.lock().await;
-                                    let before = ch.author_keys().len();
-                                    let _ = admit_board_records(
-                                        &mut ch,
-                                        &pstore,
-                                        &set.bundles,
-                                        ChannelState::MAX_ADMISSIONS_PER_SWEEP,
-                                        now,
-                                    )
-                                    .await;
-                                    admitted_authors =
-                                        ch.author_keys().len().saturating_sub(before);
-                                }
+                                admitted_authors = admit_board_records(
+                                    shared,
+                                    &pstore,
+                                    &set.bundles,
+                                    ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+                                    now,
+                                )
+                                .await;
                                 // What the peer's board holds is filed on this node's own, so its board
                                 // carries the whole membership it knows. Bundles go first: they carry
                                 // the key an address record is verified with (M15.2a). Mirroring to the
@@ -6876,16 +6868,15 @@ impl Node {
                 return false;
             }
             let now = self.now();
-            let mut channel = shared.lock().await;
             let _ = admit_board_records(
-                &mut channel,
+                &shared,
                 &store,
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now,
             )
             .await;
-            return channel.is_author(peer);
+            return shared.lock().await.is_author(peer);
         }
         if let Some(state) = self.anchored.get(channel_id) {
             return state.lock().await.is_author(peer);
@@ -8624,34 +8615,56 @@ impl crate::node::up::HostDialer for NodeDialer {
 /// but not impossible, so without it one compromised member could still exhaust this
 /// node's author table and deny admission to every legitimate member thereafter.
 async fn admit_board_records(
-    channel: &mut ChannelState,
+    shared: &tokio::sync::Mutex<ChannelState>,
     store: &crate::node::store::Store,
     records: &[crate::nat::record::MemberBundleRecord],
     quota: usize,
     now: u64,
 ) -> usize {
-    let mut admitted = 0usize;
-    let mut pending: Vec<&crate::nat::record::MemberBundleRecord> = records.iter().collect();
-    while admitted < quota {
-        let before = admitted;
-        pending.retain(|record| {
-            if admitted >= quota {
-                return true;
-            }
-            let Ok(key) = crate::identity::composite::CompositePublicKey::from_bytes(
+    // **Only records for keys not yet admitted are verified, and outside the room's lock**
+    // (V210-71). Every record on a board was verified again on every outbound session, under the
+    // lock, though a record for an admitted key can change nothing (`admit_author` of a known key
+    // is a no-op): a room of N members paid N signature checks per session, and every post and
+    // read of that room waited behind them.
+    let known: std::collections::BTreeSet<Digest32> = shared
+        .lock()
+        .await
+        .author_fingerprints()
+        .into_iter()
+        .collect();
+    let mut pending: Vec<(
+        &crate::nat::record::MemberBundleRecord,
+        crate::identity::composite::CompositePublicKey,
+    )> = records
+        .iter()
+        .filter_map(|record| {
+            let key = crate::identity::composite::CompositePublicKey::from_bytes(
                 &record.prekey_bundle.root_pub,
-            ) else {
-                return false;
-            };
+            )
+            .ok()?;
+            if known.contains(&key.fingerprint()) {
+                return None;
+            }
             // The board is availability only. The record must verify under the key it
             // carries, *and* carry the evidence that the key belongs here — a
             // self-signed record proves possession of a key and nothing else, and
             // admitting on who relayed it is the trust-on-first-use ADR-020 decision 3
             // forbids.
-            if record.verify(&key).is_err() {
-                return false;
+            record.verify(&key).is_ok().then_some((record, key))
+        })
+        .collect();
+    if pending.is_empty() {
+        return 0;
+    }
+    let mut channel = shared.lock().await;
+    let mut admitted = 0usize;
+    while admitted < quota {
+        let before = admitted;
+        pending.retain(|(record, key)| {
+            if admitted >= quota {
+                return true;
             }
-            match channel.admit_from_board(store, &key, &record.admission, now) {
+            match channel.admit_from_board(store, key, &record.admission, now) {
                 Ok(true) => {
                     admitted += 1;
                     false
