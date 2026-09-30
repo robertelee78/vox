@@ -137,8 +137,8 @@ fn join(dir: &std::path::Path, address: &str, passphrase: &str, anchor: &str) ->
         &args(&[
             "connect",
             address,
-            "--passphrase",
-            passphrase,
+            "--passphrase-file",
+            &world::room_pass_file(dir, passphrase),
             "--anchor",
             anchor,
             "--listen",

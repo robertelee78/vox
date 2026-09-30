@@ -347,6 +347,9 @@ pub enum NodeCommand {
         service_tag: String,
         /// The local address the service listens on.
         local: std::net::SocketAddr,
+        /// Whether the offer outlives this node's run. `false` for an offer that lasts
+        /// only as long as the process that made it (`vox room send`, V210-72).
+        persist: bool,
     },
     /// Stop offering a service.
     RemoveService {
@@ -406,6 +409,9 @@ pub enum Fault {
     KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
+    /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
+    /// which named the store when the store was fine (V210-77).
+    IdentityFileUnwritable,
     /// The identity passphrase was right, but something this identity sealed (its trust
     /// keyring, pending consents or prekey ring) will not open under it: the data was altered,
     /// or written by another identity. Not [`Fault::WrongPassphrase`], which sent a person to
@@ -442,6 +448,11 @@ pub enum Fault {
     Unreachable,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
+    /// A consent named a member this node has not admitted to the room (yet): it holds no
+    /// verified key for them, so it cannot know it would release to the right party. Not
+    /// [`Fault::UnknownChannel`], which said "no such room" about a room this node holds
+    /// (V210-78).
+    NotAdmitted,
     /// There is no consent to withdraw: the target was never consented to, or the
     /// consent has already been revoked (ADR-007 — consent is single-writer, so this
     /// is a settled fact, not a race).
@@ -508,6 +519,9 @@ impl Fault {
             Fault::Storage => {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
             }
+            Fault::IdentityFileUnwritable => {
+                "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
+            }
             Fault::SealedUnreadable => {
                 "the identity passphrase is right, but this profile's trust keyring, pending \
                  consents or prekey ring will not open under it\n       the store was altered, \
@@ -530,6 +544,9 @@ impl Fault {
                 "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
             }
             Fault::Refused => "the other side refused",
+            Fault::NotAdmitted => {
+                "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
+            }
             Fault::NotConsented => {
                 "there is nothing to withdraw: that identity was never trusted or consented to, or already is not"
             }

@@ -25,6 +25,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// Write the room passphrase `pass` beside the profile at `dir`, for `--passphrase-file`: a
+/// room passphrase is never taken from argv or the environment (V210-72).
+fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let at = dir.join("room-passphrase");
+    std::fs::write(&at, pass).unwrap();
+    at.to_str().unwrap().to_owned()
+}
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const LINE_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -222,8 +230,8 @@ fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
         &[
             "connect".into(),
             address.clone(),
-            "--passphrase".into(),
-            passphrase.clone(),
+            "--passphrase-file".into(),
+            room_pass_file(&guest_dir, &passphrase),
             "--listen".into(),
             "127.0.0.1:0".into(),
         ],

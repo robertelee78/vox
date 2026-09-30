@@ -77,6 +77,9 @@ pub struct PortCounters {
     pub last_failure: Option<String>,
     /// Results that arrived for an attempt already retired (ADR-025 D1a).
     pub stale: u64,
+    /// Entries this peer served that were refused rather than held (V210-74): without their
+    /// payload, past a position not held, or signed but unclassifiable.
+    pub refused: u64,
     /// Sessions that were due but skipped because every outbound slot was taken.
     pub skipped_at_cap: u64,
     /// Times a port waited in the outbound queue for a slot (ADR-025 D6).
@@ -99,6 +102,29 @@ pub struct SyncBook {
     /// Records by others that taught this node's board something and were passed on
     /// (`NetEvent::BoardGrew`, #179): a member's routine refresh is not one.
     board_news: u64,
+    /// The prekey ring as the running node last maintained it (V210-77), or `None` while it
+    /// holds no ring.
+    prekeys: Option<PrekeyCounts>,
+    /// Each open room's stored entries set aside when it opened (V210-74), as `author#seq: why`.
+    set_aside: BTreeMap<Digest32, Vec<String>>,
+}
+
+/// What the prekey ring holds, and what keeping it up has done since the node started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrekeyCounts {
+    /// One-time prekeys left to offer.
+    pub one_time: usize,
+    /// Consumed one-time prekeys still retained for a concurrent duplicate use.
+    pub consumed: usize,
+    /// The id of the signed prekey offered now.
+    pub signed_prekey: u64,
+    /// Signed-prekey rotations the running node made.
+    pub rotated: u64,
+    /// One-time prekeys the running node added.
+    pub refilled: u64,
+    /// Sessions the running node set up with its previous signed prekey: started just before a
+    /// rotation, completed after it.
+    pub previous_used: u64,
 }
 
 /// The book as the actor and the handles share it.
@@ -129,11 +155,42 @@ impl SyncBook {
             .publish_rounds += 1;
     }
 
+    /// What `room` set aside when it opened (V210-74); nothing, and the room is not listed.
+    pub fn note_set_aside(book: &SharedSyncBook, room: Digest32, entries: &[String]) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.is_empty() {
+            b.set_aside.remove(&room);
+        } else {
+            b.set_aside.insert(room, entries.to_vec());
+        }
+    }
+
     /// Count one record of news on this node's board, passed on.
     pub fn note_board_news(book: &SharedSyncBook) {
         book.lock()
             .unwrap_or_else(PoisonError::into_inner)
             .board_news += 1;
+    }
+
+    /// Record the ring as it stands after a maintenance that `rotated` and added `added`, and
+    /// how many sessions it has set up with its previous signed prekey.
+    pub fn note_prekeys(
+        book: &SharedSyncBook,
+        one_time: usize,
+        consumed: usize,
+        signed_prekey: u64,
+        rotated: bool,
+        added: usize,
+        previous_used: u64,
+    ) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        let c = b.prekeys.get_or_insert_with(PrekeyCounts::default);
+        c.one_time = one_time;
+        c.consumed = consumed;
+        c.signed_prekey = signed_prekey;
+        c.rotated += u64::from(rotated);
+        c.refilled += u64::try_from(added).unwrap_or(u64::MAX);
+        c.previous_used = previous_used;
     }
 
     /// Count one reachability ladder run to `peer`.
@@ -156,7 +213,7 @@ impl SyncBook {
                 s,
                 "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
                  \"completed\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\"stale\":{},\
-                 \"skipped_at_cap\":{},\"queued\":{},\"backoff\":{}}}",
+                 \"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{}}}",
                 b32_encode(room),
                 b32_encode(peer),
                 c.opened,
@@ -169,6 +226,7 @@ impl SyncBook {
                     .as_deref()
                     .map_or_else(|| "null".to_owned(), json_string),
                 c.stale,
+                c.refused,
                 c.skipped_at_cap,
                 c.queued,
                 c.backoff.map_or_else(
@@ -212,9 +270,34 @@ impl SyncBook {
         }
         let _ = write!(
             s,
-            "],\"publish\":{{\"rounds\":{},\"board_news\":{}}}}}",
+            "],\"publish\":{{\"rounds\":{},\"board_news\":{}}},\"prekeys\":",
             b.publish_rounds, b.board_news
         );
+        match b.prekeys {
+            Some(p) => {
+                let _ = write!(
+                    s,
+                    "{{\"one_time\":{},\"consumed\":{},\"signed_prekey\":{},\"rotated\":{},\
+                     \"refilled\":{},\"previous_used\":{}}}",
+                    p.one_time, p.consumed, p.signed_prekey, p.rotated, p.refilled, p.previous_used
+                );
+            }
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"set_aside\":[");
+        for (i, (room, entries)) in b.set_aside.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let list: Vec<String> = entries.iter().map(|e| json_string(e)).collect();
+            let _ = write!(
+                s,
+                "{{\"room\":\"{}\",\"entries\":[{}]}}",
+                b32_encode(room),
+                list.join(",")
+            );
+        }
+        s.push_str("]}");
         s
     }
 }
@@ -274,10 +357,7 @@ pub async fn serve(
 /// # Errors
 /// If the node cannot be reached or answers something else.
 pub async fn request(path: &Path) -> Result<String> {
-    let mut stream = UnixStream::connect(path).await.map_err(|e| Error::Path {
-        op: "connect control socket",
-        detail: format!("{}: {e}", path.display()),
-    })?;
+    let mut stream = crate::node::ipc::connect_own(path).await?;
     let Some(hello) = read_frame(&mut stream).await? else {
         return Err(Error::MalformedBundle("ipc closed before hello"));
     };

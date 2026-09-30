@@ -211,6 +211,14 @@ pub struct RelayWorld {
 }
 
 impl RelayWorld {
+    /// The room passphrase in a file, for `--passphrase-file`: a room passphrase is never
+    /// taken from argv or the environment (V210-72).
+    pub fn passphrase_file(&self) -> String {
+        let at = self.tmp.path().join("room-passphrase");
+        std::fs::write(&at, &self.passphrase).unwrap();
+        at.to_str().unwrap().to_owned()
+    }
+
     /// The guest's `--listen` and the anchor spec it can use.
     fn guest_net(&self) -> (&'static str, &str) {
         (
@@ -305,8 +313,8 @@ impl RelayWorld {
             &args(&[
                 "connect",
                 &self.address,
-                "--passphrase",
-                &self.passphrase,
+                "--passphrase-file",
+                &self.passphrase_file(),
                 "--anchor",
                 spec,
                 "--listen",
@@ -330,8 +338,8 @@ impl RelayWorld {
                 &self.host_fp,
                 &self.service,
                 "127.0.0.1:0",
-                "--passphrase",
-                &self.passphrase,
+                "--passphrase-file",
+                &self.passphrase_file(),
                 "--anchor",
                 &spec,
                 "--listen",

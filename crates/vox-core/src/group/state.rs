@@ -456,6 +456,13 @@ impl ReceiverChain {
         self.next_iteration
     }
 
+    /// Whether this receiver can still open the message at `iteration`: it is not yet reached, or
+    /// its key was skipped and kept. A message below that has been opened, or its key dropped.
+    #[must_use]
+    pub fn holds_key_for(&self, iteration: u64) -> bool {
+        iteration >= self.next_iteration || self.skipped.contains_key(&iteration)
+    }
+
     /// Decrypt+verify an inbound broadcast. Enforces (in order):
     /// 1. `(channelID, epoch, author_id, chain_id)` match this chain's binding
     ///    (cross-group-confusion guard) — else reject.

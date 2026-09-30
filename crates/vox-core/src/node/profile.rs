@@ -37,6 +37,9 @@ use crate::node::store::Store;
 const META_FINGERPRINT: &str = "identity_fingerprint";
 const META_CREATED: &str = "identity_created";
 
+/// The operation a failure to write the vault is reported as, so it is named as the vault's.
+pub const VAULT_WRITE: &str = "write the identity file";
+
 /// An opened profile: sealed vault + store, and the unlocked identity when
 /// unlocked.
 pub struct Profile {
@@ -92,13 +95,64 @@ impl Profile {
         let backup = IdentityBackup::new(&root, dh.secret_bytes(), &self_seed, &openpgp_fpr)?;
         let vault = IdentityVault::seal(&backup, passphrase, argon2)?;
         let fingerprint = root.fingerprint();
-        // Persist: vault file first (0600, atomic), then the store with the public
-        // facts. A crash between the two leaves a vault without meta, which `open`
-        // repairs from the vault on the next unlock.
-        write_private_file(&paths.vault_file(), &vault.to_canonical_vec())?;
-        let store = std::sync::Arc::new(Store::open(&paths.store_file())?);
-        store.put_meta(META_FINGERPRINT, &fingerprint)?;
-        store.put_meta(META_CREATED, &now_secs.to_be_bytes())?;
+        // Persist: the store with the public facts first, then the vault file (0600,
+        // atomic), which is what makes the profile exist. A failure anywhere before the
+        // vault leaves no identity, so creating again works; the other order left a vault
+        // whose store had no fingerprint, which neither opens nor can be created over.
+        //
+        // **A store with no vault beside it is moved aside, never adopted** (V210-77).
+        // Everything in it is sealed under the identity whose vault is gone, so the new one
+        // could not open it — its prekeys, keyring and rooms would refuse every unlock. It is
+        // kept, renamed, in case that vault turns up again.
+        let store_file = paths.store_file();
+        let mut aside = None;
+        if store_file.exists() {
+            // Never over another one kept aside: a rename replaces what is there.
+            let mut to = store_file.with_extension(format!("redb.orphaned-{now_secs}"));
+            let mut n = 1u32;
+            while to.exists() {
+                to = store_file.with_extension(format!("redb.orphaned-{now_secs}-{n}"));
+                n += 1;
+            }
+            std::fs::rename(&store_file, &to).map_err(|e| Error::Path {
+                op: "move aside a store with no vault",
+                detail: format!("{} -> {}: {e}", store_file.display(), to.display()),
+            })?;
+            aside = Some(to);
+        }
+        let made = Store::open(&store_file).and_then(|store| {
+            let store = std::sync::Arc::new(store);
+            store.put_meta(META_FINGERPRINT, &fingerprint)?;
+            store.put_meta(META_CREATED, &now_secs.to_be_bytes())?;
+            // Named as the vault's, not the store's: it is the file a person would look for.
+            write_private_file(&paths.vault_file(), &vault.to_canonical_vec()).map_err(
+                |e| match e {
+                    Error::Path { detail, .. } => Error::Path {
+                        op: VAULT_WRITE,
+                        detail,
+                    },
+                    other => other,
+                },
+            )?;
+            Ok(store)
+        });
+        // **A failed attempt leaves nothing behind** (V210-77): the store it made holds only
+        // the public facts of an identity that never existed, so it is removed, and a store it
+        // moved aside goes back where it was, for the next attempt to move aside again. So is
+        // the vault, if the failure came after its rename (the directory would not flush): a
+        // vault left beside a removed or restored store is a profile that opens as nobody. It
+        // is this attempt's own — creating refuses a profile that already has one.
+        let store = match made {
+            Ok(store) => store,
+            Err(e) => {
+                let _ = std::fs::remove_file(paths.vault_file());
+                let _ = std::fs::remove_file(&store_file);
+                if let Some(from) = aside {
+                    let _ = std::fs::rename(&from, &store_file);
+                }
+                return Err(e);
+            }
+        };
         let signer = VaultRootSigner::from_backup(&backup)?;
         drop(backup);
         Ok(Self {
