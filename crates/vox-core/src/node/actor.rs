@@ -6145,6 +6145,19 @@ impl Node {
                 ran = true;
             }
         }
+        // MUTANT V210-90: no queueing at the cap. What found no slot is skipped and marked synced,
+        // as before ADR-025, and waits for another trigger.
+        for (room, peer) in self.port_queue.all() {
+            self.port_queue.remove(&room, &peer);
+            if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                port.queued = false;
+                port.done_gen = port.gen.load(std::sync::atomic::Ordering::Relaxed);
+                port.req_done = port.req_gen;
+            }
+            crate::node::status::SyncBook::with(&self.sync_book, room, peer, |c| {
+                c.skipped_at_cap += 1;
+            });
+        }
         for key in newly_queued {
             if self.ports.get(&key).is_some_and(|p| p.queued) {
                 crate::node::status::SyncBook::with(&self.sync_book, key.0, key.1, |c| {
