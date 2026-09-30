@@ -478,11 +478,14 @@ impl NodeNet {
     /// Best-effort by design: a node with no dialable address is not broken. It still
     /// reaches peers outbound and is reached through the ladder's later rungs, which
     /// is the ordinary case for a client inside a private network.
-    pub async fn refresh_advertised(&self) -> Vec<crate::nat::portmap::PortMapping> {
+    pub async fn refresh_advertised(
+        &self,
+        leased: &[crate::nat::portmap::PortMapping],
+    ) -> Vec<crate::nat::portmap::PortMapping> {
         let Ok(bound) = self.manager.endpoint().local_addr() else {
             return Vec::new();
         };
-        let (list, mappings) = crate::nat::reachability::advertise_endpoints(bound).await;
+        let (list, mappings) = crate::nat::reachability::advertise_endpoints(bound, leased).await;
         *lock(&self.advertised) = Some(list);
         mappings
     }

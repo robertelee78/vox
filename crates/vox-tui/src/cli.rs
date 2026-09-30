@@ -60,7 +60,24 @@ impl ProfileArgs {
     }
 
     /// The configured anchors, parsed and merged by identity.
+    ///
+    /// # Errors
+    /// [`vox_core::error::Error::AnchorsFileUnusable`] when every line of the anchors file was
+    /// skipped and no `--anchor` was given (V210-75): a verb that needs an anchor refuses to
+    /// start with none. `vox node` may run anchorless, and uses [`Self::anchor_set_lenient`].
     pub fn anchor_set(&self) -> vox_core::error::Result<BootstrapSet> {
+        let (set, unusable) = self.anchor_set_lenient()?;
+        match unusable {
+            Some(e) => Err(e),
+            None => Ok(set),
+        }
+    }
+
+    /// [`Self::anchor_set`], and separately the refusal it would give when the anchors file
+    /// names no usable anchor, for `vox node`, which runs anchorless and says so.
+    pub fn anchor_set_lenient(
+        &self,
+    ) -> vox_core::error::Result<(BootstrapSet, Option<vox_core::error::Error>)> {
         let mut set = BootstrapSet::new();
         // The profile's anchors file first, then `--anchor` on top (ADR-017 decision 7,
         // M17.4). Both merge into one set rather than one replacing the other: an anchor
@@ -69,16 +86,27 @@ impl ProfileArgs {
         // configured". `vox node` writes its own spec into that file, so a client on the
         // same machine as its anchor needs no flag at all, which was the whole point.
         // A line that cannot be used is skipped and said, and the others still count (V210-75).
-        for skipped in merge_anchors_file(&mut set, &self.paths()?.anchors_file())? {
-            eprintln!("vox: {skipped}");
+        let file = self.paths()?.anchors_file();
+        let skipped = merge_anchors_file(&mut set, &file)?;
+        for line in &skipped {
+            eprintln!("vox: {line}");
         }
+        // **A file that names nothing usable is not an empty file** (V210-75): with no
+        // `--anchor` either, a verb would start with no anchor at all.
+        let unusable = (set.is_empty()
+            && !skipped.is_empty()
+            && self.anchors.iter().all(|a| a.trim().is_empty()))
+        .then(|| vox_core::error::Error::AnchorsFileUnusable {
+            path: file.display().to_string(),
+            skipped: skipped.len(),
+        });
         for spec in &self.anchors {
             if spec.trim().is_empty() {
                 continue;
             }
             merge_anchor_spec(&mut set, spec)?;
         }
-        Ok(set)
+        Ok((set, unusable))
     }
 }
 
@@ -1212,8 +1240,13 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let anchors = match args.anchor_set() {
-                Ok(a) => a,
+            let anchors = match args.anchor_set_lenient() {
+                Ok((a, None)) => a,
+                // An anchor may run with no anchor of its own, but it says why it has none.
+                Ok((a, Some(unusable))) => {
+                    eprintln!("vox node: {unusable}; running with no anchor of its own");
+                    a
+                }
                 Err(e) => {
                     eprintln!("vox node: --anchor: {e}");
                     return ExitCode::FAILURE;
