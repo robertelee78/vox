@@ -223,8 +223,9 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     let (ok, link, err) = vox_once(&host_dir, &args(&["room", "invite", &prefix]));
     assert!(ok, "CANNOT MEASURE: room invite: {err}");
     let link = link.trim().to_owned();
-    let join = |data: &Path, who: &str| {
-        (1..=6).any(|attempt| {
+    // How many attempts a join took: `None` if none got in.
+    let attempts = |data: &Path, who: &str| {
+        (1..=6).find(|attempt| {
             let (ok, out, err) =
                 vox_in(data, &["room", "join", &link, "--name", "team"], ROOM_PASS);
             if !ok {
@@ -234,6 +235,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
             ok
         })
     };
+    let join = |data: &Path, who: &str| attempts(data, who).is_some();
     let t_setup = Instant::now();
     for (name, d, fp) in &members {
         assert!(join(d, name), "CANNOT MEASURE: {name} could not join");
@@ -303,16 +305,24 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         trust(&host_dir, "add", &newcomer_fp, "newcomer"),
         "CANNOT MEASURE: the host could not trust the newcomer"
     );
-    let _newcomer = daemon("newcomer", &newcomer_dir, &spec, &pass_file);
+    let newcomer = daemon("newcomer", &newcomer_dir, &spec, &pass_file);
     let t_join = Instant::now();
+    let tries = attempts(&newcomer_dir, "newcomer");
     assert!(
-        join(&newcomer_dir, "newcomer"),
+        tries.is_some(),
         "CANNOT MEASURE: the newcomer could not join"
     );
     let joined = Instant::now();
+    // The newcomer's daemon names each step of its join: `join got in — board …, solve …`.
+    let steps: Vec<String> = newcomer
+        .said_since(t_join)
+        .into_iter()
+        .filter(|l| l.contains("vox: join "))
+        .collect();
     println!(
-        "[proof] the newcomer's join returned in {:?}",
-        t_join.elapsed()
+        "[proof] the newcomer's join returned in {:?} after {} attempt(s); its steps: {steps:?}",
+        t_join.elapsed(),
+        tries.unwrap_or(0)
     );
     let marker = "posted by the host after the newcomer joined";
     let (ok, _, err) = vox_once(&host_dir, &args(&["room", "post", &room, marker]));

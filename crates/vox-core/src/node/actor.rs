@@ -4340,9 +4340,19 @@ impl Node {
                 // refused the same way for good. Forget it, so the retry opens a fresh one from
                 // the member's bundle and offers it — unless a newer one has been filed since the
                 // key was sealed, which the member does hold.
+                //
+                // **Or the key did not open under the session it holds** (V210-71): the two ends
+                // hold different sessions, or ours ran more than `MAX_SKIP` messages ahead of it.
+                // Every key is sealed before its write, so each write that failed used a message of
+                // the session up, and a member whose writes kept failing was pushed past the gap it
+                // accepts. Either way every later key under this session fails the same way, and a
+                // fresh one is the cure, as for no session at all.
                 use crate::node::pairwise_stream::KeyRefusal;
                 let key = (channel_id, peer);
-                if why == KeyRefusal::describe(KeyRefusal::NoSession.code().into_inner())
+                let dead_session = [KeyRefusal::NoSession, KeyRefusal::CannotOpen]
+                    .iter()
+                    .any(|r| why == KeyRefusal::describe(r.code().into_inner()));
+                if dead_session
                     && session.is_some()
                     && self.session_serial.get(&key).copied() == session
                 {
