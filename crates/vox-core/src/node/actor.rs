@@ -1202,6 +1202,29 @@ fn test_stopped_delay_ms() -> Option<u64> {
     std::env::var(TEST_STOPPED_DELAY_ENV).ok()?.parse().ok()
 }
 
+/// **For proofs only.** When set to `N`, the node loses the first `N` pairwise streams that
+/// carry a hello: it resets them unread, as a stream lost with its connection is, so the sender
+/// learns only that its key was not taken. The simultaneous-session proof uses it to force what a
+/// duplicate-connection close did by chance (V210-89): each member's hello lost after it was
+/// written. Nothing a person runs sets it; unset, nothing changes.
+pub const TEST_LOSE_HELLOS_ENV: &str = "VOX_TEST_LOSE_HELLOS";
+
+/// Whether this inbound hello is one [`TEST_LOSE_HELLOS_ENV`] says to lose.
+fn test_lose_hello() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LEFT: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    LEFT.get_or_init(|| {
+        AtomicU64::new(
+            std::env::var(TEST_LOSE_HELLOS_ENV)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        )
+    })
+    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+    .is_ok()
+}
+
 /// How many inbound handshakes may run at once.
 ///
 /// Inline, the ceiling was one, which was the defect. This is the same bound in spirit as
@@ -4113,6 +4136,12 @@ impl Node {
                     self.accepted_hello.remove(&key);
                     self.reopen.remove(&key);
                     self.session_serial.remove(&key);
+                } else if session.is_some() && self.session_serial.get(&key).copied() == session {
+                    // **Any other refusal of a key sealed under the session held** (V210-89): the
+                    // peer may never have read the hello in front of it, or holds a competing
+                    // session. The retry carries the hello again, so the pair converges instead of
+                    // the peer refusing every key for good.
+                    self.offer_hello_again(&key);
                 }
                 // 2, 4, 8 … 64s: a refusal that cures (a session that converges, a member learnt
                 // from the board) is retried promptly, and one that does not stops costing a
@@ -7276,6 +7305,28 @@ impl Node {
         }
     }
 
+    /// **Offer the hello for a session this node opened again** (V210-89), because something sealed
+    /// under it was not taken. `true` if there is a hello to offer.
+    ///
+    /// A hello counts as delivered once it is written, and written is not delivered: the stream
+    /// can be lost with its connection before the peer reads it. Measured through the real
+    /// binaries: two members who trusted each other at once dialled each other at the same moment,
+    /// each wrote its hello and key over the connection it dialled, and both streams came back
+    /// `connection lost`. Each then held its own session, believed its hello delivered, and sent
+    /// every later key without one; the peer, holding its own, answered each with "the key did
+    /// not open under the session it holds", and neither ever read the other. Only a peer with no
+    /// session at all was recovered (V210-78). Offered again, the hello reaches the peer and
+    /// [`incoming_session_wins`] settles the pair, whichever end it favours.
+    fn offer_hello_again(&mut self, key: &(Digest32, Digest32)) -> bool {
+        match self.initiated.get_mut(key) {
+            Some(i) if i.initial.is_some() => {
+                i.hello_delivered = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Learn, off the actor, whether the key just written to `target` was taken; if it was not,
     /// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
     ///
@@ -7491,7 +7542,7 @@ impl Node {
     async fn take_inbound_skdm(
         &mut self,
         peer: Digest32,
-        send: quinn::SendStream,
+        mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
     ) {
         use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
@@ -7512,6 +7563,12 @@ impl Node {
         // ordering back. `JoinerDone` replays whatever was held.
         if self.joining.contains(&room) && !self.channels.contains_key(&room) {
             self.held_pairwise.push((room, peer, first, send, recv));
+            return;
+        }
+        if matches!(first, PairwiseFrame::Hello { .. }) && test_lose_hello() {
+            eprintln!("vox: {TEST_LOSE_HELLOS_ENV}: an inbound hello was lost, unread");
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+            let _ = recv.stop(quinn::VarInt::from_u32(0));
             return;
         }
         self.handle_pairwise(peer, first, send, recv).await;
@@ -7609,6 +7666,13 @@ impl Node {
             return Some(Err(KeyRefusal::NoSession));
         };
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
+            // The two ends hold different sessions (V210-89). If the one held here is ours, the
+            // peer never took its hello, so offer it again rather than wait for the peer to do
+            // something: the rule then settles the pair, however the two opens interleaved.
+            let key = (channel_id, peer);
+            if self.offer_hello_again(&key) {
+                self.reopen.insert(key);
+            }
             return Some(Err(KeyRefusal::CannotOpen));
         };
         let backfilled = match (
