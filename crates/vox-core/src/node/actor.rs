@@ -499,6 +499,16 @@ impl NodeConfig {
 /// for up to 30 s (CI run 36418572653: a first relayed connection in 30065 ms, 55 attempts).
 const ANCHOR_REDIAL_SECS: u64 = 30;
 
+/// The longest an anchor whose **dial failed** waits before the next (V210-86, #278). Every
+/// second of it is a second a member stays away after its anchor is back: doubled to
+/// [`ANCHOR_REDIAL_SECS`], a member whose dials failed while its anchor restarted could come back
+/// up to 30 s after it. A dial that failed never became a connection, so what a shorter wait costs
+/// the anchor is bounded by its handshake cap and queue (`HANDSHAKES_IN_FLIGHT`,
+/// `HANDSHAKES_WAITING`). At the cap the wait is 1 or 2 s at random, so a room's members do not
+/// redial in step. A connection lost as soon as it is made (a flap, [`ANCHOR_FLAP_SECS`]) still
+/// backs off to [`ANCHOR_REDIAL_SECS`]: each of those was a whole handshake.
+const ANCHOR_UNREACHED_REDIAL_SECS: u64 = 2;
+
 /// An anchor connection lost within this long of being made counts as a **failure** for the
 /// backoff, not as a loss to redial at once (V210-57): two live processes of one identity (a
 /// copied profile, an old binary) supersede each other at the anchor, and redialling each loss at
@@ -4161,12 +4171,18 @@ impl Node {
             }
             NetEvent::ReachFailed { peer, why } => {
                 // An anchor that failed to connect waits before its next dial, doubling to
-                // `ANCHOR_REDIAL_SECS` (V210-57).
+                // `ANCHOR_UNREACHED_REDIAL_SECS` (V210-57, V210-86), jittered once it is there.
                 if self.anchors.nodes().iter().any(|a| a.id == peer) {
                     let wait = self
                         .anchor_backoff
                         .get(&peer)
-                        .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
+                        .map_or(1, |(_, w)| (w * 2).min(ANCHOR_UNREACHED_REDIAL_SECS));
+                    let wait = if wait == ANCHOR_UNREACHED_REDIAL_SECS {
+                        let coin = crate::identity::rng::random_array::<1>().map_or(0, |b| b[0]);
+                        wait - u64::from(coin & 1)
+                    } else {
+                        wait
+                    };
                     self.anchor_backoff.insert(peer, (self.now() + wait, wait));
                     if let Some(net) = self.net.as_ref() {
                         net.manager().note(
