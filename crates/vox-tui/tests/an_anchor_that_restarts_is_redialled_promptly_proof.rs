@@ -15,9 +15,19 @@
 //! process, so every connection to the old one is gone. The forward must carry an echo again within
 //! [`BACK_WITHIN`] of the anchor's return, and say it saw the anchor go.
 //!
-//! **Not covered: an anchor that crashes.** A crash sends no close, so its peers learn of it only
-//! when its connection falls silent (`SILENCE_IS_DEATH`). How soon a node *learns* of a loss is not
-//! what #243 changed; how soon it *acts* on one is.
+//! **V210-93 (#287): the loss is noticed and said, however the anchor went, in every build.** In a
+//! debug build the forward never said it: the arm above was red there. Two more arms stop the
+//! anchor for good and time the forward's "gone" line from the moment the anchor was stopped:
+//! - **SIGKILL** (a crash, as far as anyone can tell): no close is sent, so only the node's own
+//!   probing of a quiet anchor connection can notice. It must say so within [`KILLED_WITHIN`]; the
+//!   node used to learn it from the connection's silence (`SILENCE_IS_DEATH`, 30 s): 28 s measured.
+//! - **SIGTERM** (how a service manager stops an anchor): a clean stop, whose close must reach the
+//!   forward, so it says so within [`CLOSED_WITHIN`], well short of what silence alone can do
+//!   ([`KILLED_WITHIN`]'s probe needs at least 8 s of it). The forward is then sent SIGTERM too,
+//!   and must stop the way Ctrl-C stops it: say it is stopping and exit 0.
+//!
+//! Mutations: the probe disabled (a quiet anchor connection is never judged) → the SIGKILL arm red;
+//! `vox node` without its SIGTERM handler, or its closes not waited for → the SIGTERM arm red.
 //!
 //! **Why the bound separates the two:** the old redial ran at the node's start and then every 30 s,
 //! so a forward started at `t` redialled at `t + 30`. The anchor returns at about `t + 9`, so the
@@ -51,6 +61,20 @@ const DOWN: Duration = Duration::from_secs(3);
 const BACK_WITHIN: Duration = Duration::from_secs(10);
 /// What a node says when its anchor connection goes.
 const GONE: &str = "the connection to this anchor is gone";
+/// Why, when the anchor was stopped cleanly (V210-93): it closed with "the peer stopped".
+const STOPPED: &str = "the anchor stopped";
+/// What a clean stop must never be reported as: it is not an authentication failure.
+const NOT_AUTH: &str = "authenticator invalid";
+/// What a node says when its anchor connection is made.
+const CONNECTED: &str = "connected to this anchor";
+/// How many times the anchor is stopped the moment the forward has reached it.
+const STOPS_AT_ONCE: usize = 3;
+/// How soon after a SIGKILL the forward must say its anchor is gone: 8 s of unanswered probes, a
+/// 1 s tick, and 2 s for a loaded box. Silence alone took 28 s.
+const KILLED_WITHIN: Duration = Duration::from_secs(11);
+/// How soon after a SIGTERM the forward must say it: the close arrives at once and the next 1 s
+/// tick reads it. Short of the 8 s any inference from silence needs.
+const CLOSED_WITHIN: Duration = Duration::from_secs(3);
 
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
@@ -129,4 +153,250 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
         saw_it_go,
         "the forward did not say its anchor connection went ({GONE:?})\n{said}"
     );
+    assert_says_stopped("the forward", &said);
+    let host = w.host.as_mut().map(|h| h.transcript()).unwrap_or_default();
+    assert_says_stopped("the host", &host);
+}
+
+/// A clean stop is said as one (V210-93): every "gone" line in `said` gives "the anchor stopped"
+/// as the reason, at least one does, and none calls it an authentication failure.
+fn assert_says_stopped(who: &str, said: &str) {
+    let gone: Vec<&str> = said.lines().filter(|l| l.contains(GONE)).collect();
+    let auth = said.lines().filter(|l| l.contains(NOT_AUTH)).count();
+    eprintln!(
+        "[proof] {who}: {} \"gone\" line(s), {} saying {STOPPED:?}, {auth} saying {NOT_AUTH:?}",
+        gone.len(),
+        gone.iter().filter(|l| l.contains(STOPPED)).count()
+    );
+    assert!(
+        auth == 0,
+        "{who} reported a cleanly stopped anchor as {NOT_AUTH:?}\n{said}"
+    );
+    assert!(
+        !gone.is_empty() && gone.iter().all(|l| l.contains(STOPPED)),
+        "{who} did not say its anchor stopped ({STOPPED:?}) when it was stopped cleanly\n{said}"
+    );
+}
+
+#[test]
+#[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
+fn a_killed_anchor_is_noticed_promptly() {
+    let _ = stopped_for_good("KILL", KILLED_WITHIN);
+}
+
+#[test]
+#[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
+fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
+    let mut w = stopped_for_good("TERM", CLOSED_WITHIN);
+    let said = w.fwd.as_mut().unwrap().transcript();
+    assert_says_stopped("the forward", &said);
+    // ---- and a forward stops on SIGTERM as it does on Ctrl-C -----------------------------------
+    let fwd = w.fwd.as_mut().unwrap();
+    let signalled = Instant::now();
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &fwd.child.id().to_string()])
+        .status();
+    let status = loop {
+        if let Some(status) = fwd.child.try_wait().ok().flatten() {
+            break Some(status);
+        }
+        if signalled.elapsed() > Duration::from_secs(10) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let said = fwd.transcript();
+    let stopping = said
+        .lines()
+        .any(|l| l.contains("vox: stopping the forward"));
+    eprintln!(
+        "[proof] SIGTERM to the forward: exited {status:?} after {:?}, said it was stopping: \
+         {stopping}",
+        signalled.elapsed()
+    );
+    assert!(
+        status.is_some_and(|s| s.success()) && stopping,
+        "the forward did not stop cleanly on SIGTERM (exit {status:?}, said it was stopping: \
+         {stopping})\n{said}"
+    );
+}
+
+/// Stop the anchor with `signal` and leave it down; the forward must say its anchor connection is
+/// gone within `within` of the signal.
+fn stopped_for_good(signal: &str, within: Duration) -> RelayWorld {
+    watchdog::arm();
+    let mut w = RelayWorld::new(Split::Families);
+    let (ok, took, out, err) = w.join_guest();
+    assert!(
+        ok,
+        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+    );
+    let started = Instant::now();
+    let at = w.forward();
+    let first = round_trip(at, b"before", Duration::from_secs(30));
+    assert!(
+        first.as_deref().is_ok_and(|b| b == b"before"),
+        "CANNOT MEASURE: no echo through the forward before the anchor went: {first:?}\n{}",
+        w.fwd.as_mut().unwrap().transcript()
+    );
+    std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
+    let fwd = w.fwd.as_mut().unwrap();
+    let before = fwd
+        .transcript()
+        .lines()
+        .filter(|l| l.contains(GONE))
+        .count();
+    assert_eq!(
+        before,
+        0,
+        "CANNOT MEASURE: the forward said its anchor went before it was stopped\n{}",
+        fwd.transcript()
+    );
+
+    // ---- the anchor is stopped, and stays down --------------------------------------------------
+    let stopped = Instant::now();
+    let _ = std::process::Command::new("kill")
+        .args([&format!("-{signal}"), &w.anchor.proc.child.id().to_string()])
+        .status();
+    while w.anchor.proc.child.try_wait().ok().flatten().is_none() {
+        assert!(
+            stopped.elapsed() < Duration::from_secs(10),
+            "CANNOT MEASURE: the anchor did not exit within 10 s of SIG{signal}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let exited = stopped.elapsed();
+
+    // ---- the forward says so ---------------------------------------------------------------------
+    // Watched well past the bound, so a red prints how long it did take.
+    let fwd = w.fwd.as_mut().unwrap();
+    let mut said = None;
+    while stopped.elapsed() < within + Duration::from_secs(30) {
+        let _ = fwd.transcript();
+        said = fwd
+            .said_since(stopped)
+            .into_iter()
+            .find(|l| l.starts_with("[+") && l.contains(GONE));
+        if said.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let after = said.as_deref().and_then(|l| {
+        l.strip_prefix("[+")?
+            .split_once("s]")?
+            .0
+            .parse::<f64>()
+            .ok()
+            .map(Duration::from_secs_f64)
+    });
+    eprintln!(
+        "[proof] SIG{signal}: the anchor exited {exited:?} after the signal; the forward said its \
+         anchor connection went {after:?} after it (bound {within:?}): {said:?}"
+    );
+    let transcript = fwd.transcript();
+    let after = after.unwrap_or_else(|| {
+        panic!(
+            "the forward never said its anchor connection went ({GONE:?}) within {:?} of \
+             SIG{signal}\n---- the forward ----\n{transcript}\n---- the anchor ----\n{}",
+            within + Duration::from_secs(30),
+            w.anchor.proc.transcript()
+        )
+    });
+    assert!(
+        after < within,
+        "the forward said its anchor connection went only {after:?} after SIG{signal}, over \
+         {within:?}\n---- the forward ----\n{transcript}"
+    );
+    w
+}
+
+/// **A connection lost the moment it is made is still said to be gone** (V210-93), however soon
+/// after the forward reached its anchor the anchor goes. This is the proven cause, staged every
+/// time rather than by luck: the anchor is stopped (SIGINT) the instant the forward prints that it
+/// reached it, which is before the forward's 1 s tick can have looked at the new connection, and
+/// brought back on the same port. That is done [`STOPS_AT_ONCE`] times, and every stop must be
+/// said, as a clean stop.
+///
+/// Mutation: the connection watched only from a tick's look, not from when it is made (as before
+/// V210-93) → the stops are not said → red.
+#[test]
+#[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
+fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
+    watchdog::arm();
+    let mut w = RelayWorld::new(Split::Families);
+    let (ok, took, out, err) = w.join_guest();
+    assert!(
+        ok,
+        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+    );
+    let _ = w.forward();
+    let anchor_dir = w.tmp.path().join("anchor");
+    let mut stops = 0;
+    for round in 1..=STOPS_AT_ONCE {
+        // The next "connected" line, read as it arrives: the stop follows it at once. The first
+        // may already have been read while the forward started.
+        let fwd = w.fwd.as_mut().unwrap();
+        let reached = if round == 1 && fwd.seen.iter().any(|l| l.contains(CONNECTED)) {
+            Some(Instant::now())
+        } else {
+            next_line(fwd, CONNECTED, Duration::from_secs(60))
+        };
+        assert!(
+            reached.is_some(),
+            "CANNOT MEASURE: round {round}: the forward never said it reached its anchor\n{}",
+            w.fwd.as_mut().unwrap().transcript()
+        );
+        let _ = std::process::Command::new("kill")
+            .args(["-INT", &w.anchor.proc.child.id().to_string()])
+            .status();
+        let stopping = Instant::now();
+        while w.anchor.proc.child.try_wait().ok().flatten().is_none() {
+            assert!(
+                stopping.elapsed() < Duration::from_secs(10),
+                "CANNOT MEASURE: the anchor did not stop within 10 s of SIGINT"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stops += 1;
+        eprintln!(
+            "[proof] round {round}: the anchor was stopped {:?} after the forward said it reached it",
+            reached.map(|at| stopping.duration_since(at))
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        w.anchor.restart(&anchor_dir);
+    }
+    // Every stop is said within a few ticks of it: the last one is waited for.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let fwd = w.fwd.as_mut().unwrap();
+    let mut said = fwd.transcript();
+    while said.lines().filter(|l| l.contains(GONE)).count() < stops && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        said = fwd.transcript();
+    }
+    let gone = said.lines().filter(|l| l.contains(GONE)).count();
+    eprintln!(
+        "[proof] the anchor was stopped {stops} times; the forward said it went {gone} times"
+    );
+    assert!(
+        gone >= stops,
+        "the anchor was stopped {stops} times, each the moment the forward reached it, and the \
+         forward said it went only {gone} times\n{said}"
+    );
+    assert_says_stopped("the forward", &said);
+}
+
+/// Read `proc`'s output as it arrives until a line containing `what`, and say when it came.
+fn next_line(proc: &mut world::VoxProc, what: &str, within: Duration) -> Option<Instant> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if let Ok(line) = proc.lines.recv_timeout(Duration::from_millis(10)) {
+            let hit = line.contains(what);
+            proc.seen.push(line);
+            if hit {
+                return Some(Instant::now());
+            }
+        }
+    }
+    None
 }

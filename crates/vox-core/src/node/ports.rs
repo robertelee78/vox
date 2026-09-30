@@ -151,7 +151,10 @@ pub fn backoff_kind(fail: &SyncFailure) -> Option<BackoffKind> {
             // The peer does not know this node as a member yet (#217): it clears within seconds,
             // so it is paced like `Busy`, never by the 30 s `Policy` interval.
             WireError::NotYetMember => BackoffKind::Busy,
-            WireError::TransportFailed | WireError::Unresponsive => BackoffKind::Unreachable,
+            WireError::TransportFailed
+            | WireError::Unresponsive
+            | WireError::ShuttingDown
+            | WireError::Superseded => BackoffKind::Unreachable,
             WireError::EpochMismatch | WireError::AuthenticatorInvalid => BackoffKind::Policy,
             WireError::ProtocolVersionUnsupported
             | WireError::SuiteBelowFloor
@@ -160,7 +163,10 @@ pub fn backoff_kind(fail: &SyncFailure) -> Option<BackoffKind> {
             | WireError::SyncModeUnsupported => BackoffKind::NoProgress,
         },
         SyncFailure::Session(SessionError::Local(code)) => match code {
-            WireError::TransportFailed | WireError::Unresponsive => BackoffKind::Unreachable,
+            WireError::TransportFailed
+            | WireError::Unresponsive
+            | WireError::ShuttingDown
+            | WireError::Superseded => BackoffKind::Unreachable,
             WireError::SessionBusy | WireError::NotYetMember => BackoffKind::Busy,
             WireError::EpochMismatch => BackoffKind::Policy,
             WireError::ProtocolVersionUnsupported

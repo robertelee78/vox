@@ -463,9 +463,10 @@ pub async fn forward(
     // Keep reading events while forwarding, so a connection the host refused or cut says
     // why here (PRD-001 R23). The application only ever sees its socket reset; waiting on
     // Ctrl-C alone left the reason in a queue nobody read.
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
+    // One stop listener (Ctrl-C, SIGTERM, SIGHUP, SIGQUIT) for the whole loop: one made per turn
+    // misses a signal that lands in the same turn as another arm (see `app::run_node`). Each of
+    // them stops the verb cleanly, closing its connections (V210-93).
+    let interrupted = crate::app::stop_requested("vox");
     tokio::pin!(interrupted);
     loop {
         tokio::select! {
@@ -578,9 +579,10 @@ pub async fn serve(
 
     // Until interrupted: report who reaches the service. The service itself cannot say
     // — every Vox client arrives at it from loopback (ADR-017 decision 6).
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
+    // One stop listener (Ctrl-C, SIGTERM, SIGHUP, SIGQUIT) for the whole loop: one made per turn
+    // misses a signal that lands in the same turn as another arm (see `app::run_node`). Each of
+    // them stops the verb cleanly, closing its connections (V210-93).
+    let interrupted = crate::app::stop_requested("vox");
     tokio::pin!(interrupted);
     loop {
         tokio::select! {
@@ -749,9 +751,10 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     // reach says so (ADR-017 M17.11). Without this the proxy stays up and silent and the
     // person sees only `ssh` dying, which reads as a network fault and invites a retry that
     // cannot succeed.
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
+    // One stop listener (Ctrl-C, SIGTERM, SIGHUP, SIGQUIT) for the whole loop: one made per turn
+    // misses a signal that lands in the same turn as another arm (see `app::run_node`). Each of
+    // them stops the verb cleanly, closing its connections (V210-93).
+    let interrupted = crate::app::stop_requested("vox");
     tokio::pin!(interrupted);
     loop {
         tokio::select! {
