@@ -2903,7 +2903,6 @@ impl Node {
         let Ok((address, bundle)) = records else {
             return;
         };
-        self.arm_record_renewal(channel_id);
         // **Bounded, and it stops at the first dead stream.** Each put waits for the board's answer,
         // which a live board gives in milliseconds, but a connection that died without saying so waits
         // out the full frame patience (`SYNC_FRAME_TIMEOUT`, 20s) *per put*, and every one of those
@@ -3494,7 +3493,10 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        // Armed before the round rather than after it: the records are signed below.
+        // Armed before the round rather than after it: the records are signed below. **Only here**:
+        // every full round (this, then every anchor) comes through here, and a round to one anchor
+        // must not re-arm it, or an anchor reconnecting more often than every half-lifetime put
+        // the renewal off for good, and the own board and every other anchor lapsed.
         self.arm_record_renewal(channel_id);
         let seq = self.next_record_seq(channel_id);
         let stamp = self.record_timestamp(channel_id);
@@ -5722,9 +5724,9 @@ impl Node {
     /// an idle room lost its record after two hours either way, and then a joiner or a restarted
     /// member that finds this node through the board did not find it. So, whatever the traffic,
     /// a round goes out at half the lifetime: to this node's own board and every anchor. It is
-    /// armed by every round that signs the records ([`Self::arm_record_renewal`]), so a node that
-    /// published for another reason is not asked again sooner: at most one renewal per room per
-    /// half-lifetime.
+    /// armed by every full round ([`Self::arm_record_renewal`], from `publish_channel_locally`), so
+    /// a node that published everywhere for another reason is not asked again sooner: at most one
+    /// renewal per room per half-lifetime. A round to one anchor does not arm it.
     async fn renew_records_if_due(&mut self) {
         let now = self.now();
         let due: Vec<Digest32> = self
