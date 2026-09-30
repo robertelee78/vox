@@ -90,6 +90,10 @@ const JOIN_BOUND: Duration = if cfg!(debug_assertions) {
 };
 /// How long a stranger's churning join may take to be turned away before it counts as holding.
 const ARRIVAL: Duration = Duration::from_secs(10);
+/// Between the stranger's arrivals. Each is a `vox room join` process; at 0.2s the unoptimized
+/// build spent more on the stranger's processes than on carol's grind (one debug run: 288 arrivals,
+/// carol in 412s).
+const CHURN_PAUSE: Duration = Duration::from_secs(1);
 /// How long after carol's join the stranger's refused joins are given to have said so.
 const TOLD_GRACE: Duration = Duration::from_secs(5);
 /// How many more times the stranger is to be turned away after carol's join.
@@ -458,7 +462,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
                     turned_after.fetch_add(1, Ordering::SeqCst);
                 }
                 said_to.lock().unwrap().push(said);
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(CHURN_PAUSE);
             }
         });
 
