@@ -32,7 +32,7 @@
 //! reorder these frames; it cannot forge, read or replay one into a different
 //! channel or epoch.
 
-use quinn::{RecvStream, SendStream};
+use quinn::RecvStream;
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -166,68 +166,75 @@ impl PairwiseFrame {
     }
 }
 
-/// Seal `skdm` into `session` and write it as one frame for `channel_id`.
-pub async fn send_skdm(
-    send: &mut SendStream,
-    channel_id: &crate::hash::Digest32,
-    session: &mut Session,
-    skdm: &Skdm,
-) -> Result<()> {
-    let sealed = skdm.seal_into(session)?.to_wire();
-    let frame = PairwiseFrame::Skdm {
+/// The frame that carries `initial`, the opening message of a session this node started from
+/// the peer's bundle record, ahead of what it opens the session for on the same stream.
+#[must_use]
+pub fn hello_frame(channel_id: &crate::hash::Digest32, initial: &InitialMessage) -> Vec<u8> {
+    PairwiseFrame::Hello {
         channel_id: *channel_id,
-        sealed,
-    };
-    write_frame(send, &frame.to_frame()).await
+        initial: initial.to_wire(),
+    }
+    .to_frame()
 }
 
-/// Open a `pairwise` stream on `conn`, deliver one SKDM, and half-close. The
-/// stream's lifetime is the delivery: nothing is expected back.
+/// Seal `skdm` into `session` as one frame for `channel_id`. Sealing steps the ratchet, so it
+/// happens where the session lives (the actor), in the order the frames are written.
 ///
-/// `hello` is `Some` exactly when this node has just opened the session from the
-/// peer's bundle record and the peer therefore does not hold it yet. It goes first,
-/// on the same stream, so the peer has accepted the session before it reads the SKDM.
-///
-/// Bounded by [`WRITE_PATIENCE`]: the caller is the node's actor, and a peer that grants no
-/// stream or flow credit would otherwise hold it for as long as it liked (V210-71).
-pub async fn deliver_skdm(
-    conn: &VoxConnection,
+/// # Errors
+/// The session could not seal it.
+pub fn skdm_frame(
     channel_id: &crate::hash::Digest32,
     session: &mut Session,
     skdm: &Skdm,
-    hello: Option<&InitialMessage>,
-) -> Result<quinn::RecvStream> {
-    tokio::time::timeout(
-        WRITE_PATIENCE,
-        deliver_skdm_unbounded(conn, channel_id, session, skdm, hello),
-    )
-    .await
-    .map_err(|_| Error::Unreachable("the peer did not take a pairwise stream in time"))?
+) -> Result<Vec<u8>> {
+    let sealed = skdm.seal_into(session)?.to_wire();
+    Ok(PairwiseFrame::Skdm {
+        channel_id: *channel_id,
+        sealed,
+    }
+    .to_frame())
+}
+
+/// One ratchet message carrying nothing, which gives the far side a sending direction
+/// (M17.6). It grants nothing: see [`PairwiseFrame::Open`].
+///
+/// # Errors
+/// The session could not seal it.
+pub fn open_frame(channel_id: &crate::hash::Digest32, session: &mut Session) -> Result<Vec<u8>> {
+    let sealed = session.encrypt(&[])?.to_wire();
+    Ok(PairwiseFrame::Open {
+        channel_id: *channel_id,
+        sealed,
+    }
+    .to_frame())
 }
 
 /// How long writing a key, or a hello, to a peer may take. The frames are a few KiB on a live
 /// connection, so anything near this is a peer withholding credit, not a slow network.
 pub const WRITE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn deliver_skdm_unbounded(
-    conn: &VoxConnection,
-    channel_id: &crate::hash::Digest32,
-    session: &mut Session,
-    skdm: &Skdm,
-    hello: Option<&InitialMessage>,
-) -> Result<quinn::RecvStream> {
-    let (mut send, recv) = open_typed(conn, StreamKind::Pairwise).await?;
-    if let Some(initial) = hello {
-        let frame = PairwiseFrame::Hello {
-            channel_id: *channel_id,
-            initial: initial.to_wire(),
-        };
-        write_frame(&mut send, &frame.to_frame()).await?;
-    }
-    send_skdm(&mut send, channel_id, session, skdm).await?;
-    let _ = send.finish();
-    // Returned so the caller can learn whether the key was taken: see `refused`.
-    Ok(recv)
+/// Open a `pairwise` stream on `conn`, write `frames` (already sealed), and half-close.
+/// The stream's lifetime is the delivery: the receive half is returned so the caller can learn
+/// whether a key was taken (see [`refused`]).
+///
+/// Bounded by [`WRITE_PATIENCE`], and awaited by the node's per-peer writer, **never on the
+/// actor** (V210-71): a peer that grants no stream or flow credit would otherwise hold the whole
+/// node for as long as it liked.
+///
+/// # Errors
+/// The stream would not open or take the frames in time.
+pub async fn write_pairwise(conn: &VoxConnection, frames: &[Vec<u8>]) -> Result<RecvStream> {
+    let written = async {
+        let (mut send, recv) = open_typed(conn, StreamKind::Pairwise).await?;
+        for f in frames {
+            write_frame(&mut send, f).await?;
+        }
+        let _ = send.finish();
+        Ok::<RecvStream, Error>(recv)
+    };
+    tokio::time::timeout(WRITE_PATIENCE, written)
+        .await
+        .map_err(|_| Error::Unreachable("the peer did not take a pairwise stream in time"))?
 }
 
 /// The recipient's answer on a pairwise stream that carried a key it took.
@@ -292,51 +299,6 @@ pub async fn refused(mut recv: quinn::RecvStream, patience: std::time::Duration)
         Ok(Err(e)) => Some(e.to_string()),
         Err(_) => Some(format!("no answer within {}s", patience.as_secs())),
     }
-}
-
-/// Open a `pairwise` stream, give the far side the ratchet message its sending
-/// direction needs, and half-close (M17.6).
-///
-/// This grants nothing. See [`PairwiseFrame::Open`] for why the session needs it and
-/// why meeting that need with a sender key was the defect.
-///
-/// Bounded by [`WRITE_PATIENCE`], as [`deliver_skdm`] is.
-pub async fn open_sending_direction(
-    conn: &VoxConnection,
-    channel_id: &crate::hash::Digest32,
-    session: &mut Session,
-    hello: Option<&InitialMessage>,
-) -> Result<()> {
-    tokio::time::timeout(
-        WRITE_PATIENCE,
-        open_sending_direction_unbounded(conn, channel_id, session, hello),
-    )
-    .await
-    .map_err(|_| Error::Unreachable("the peer did not take a pairwise stream in time"))?
-}
-
-async fn open_sending_direction_unbounded(
-    conn: &VoxConnection,
-    channel_id: &crate::hash::Digest32,
-    session: &mut Session,
-    hello: Option<&InitialMessage>,
-) -> Result<()> {
-    let (mut send, _recv) = open_typed(conn, StreamKind::Pairwise).await?;
-    if let Some(initial) = hello {
-        let frame = PairwiseFrame::Hello {
-            channel_id: *channel_id,
-            initial: initial.to_wire(),
-        };
-        write_frame(&mut send, &frame.to_frame()).await?;
-    }
-    let sealed = session.encrypt(&[])?.to_wire();
-    let frame = PairwiseFrame::Open {
-        channel_id: *channel_id,
-        sealed,
-    };
-    write_frame(&mut send, &frame.to_frame()).await?;
-    let _ = send.finish();
-    Ok(())
 }
 
 /// Read the next frame from an already-accepted, already-authorized `pairwise`

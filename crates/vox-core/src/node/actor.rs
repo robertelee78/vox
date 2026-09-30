@@ -299,6 +299,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::JoinRequest { .. } => "answering somebody's join",
         NetEvent::SyncRequest { .. } => "answering a sync",
         NetEvent::Pairwise(..) => "taking a pairwise stream",
+        NetEvent::HelloUndelivered { .. } => "owing a hello that could not be written",
+        NetEvent::ReopenUndelivered { .. } => "owing a reopen that could not be written",
         NetEvent::Stream { .. } => "serving a stream",
         NetEvent::Connected { .. } => "filing a new connection",
         NetEvent::BetterPath { .. } => "adopting a connection",
@@ -648,6 +650,22 @@ enum NetEvent {
     },
     /// A peer's pairwise stream, its frames **already read** off the actor (V210-71).
     Pairwise(PairwiseIn),
+    /// A stream that carried this node's hello to `peer` could not be written: the peer does not
+    /// hold the session, so the next delivery must carry the hello again.
+    HelloUndelivered {
+        /// The room.
+        channel_id: Digest32,
+        /// The member.
+        peer: Digest32,
+    },
+    /// A hello offered again with an `Open` behind it (ADR-021 F12) could not be written: it is
+    /// offered again.
+    ReopenUndelivered {
+        /// The room.
+        channel_id: Digest32,
+        /// The member.
+        peer: Digest32,
+    },
     /// A peer connected inbound: it gets a sync schedule, due immediately.
     Connected {
         /// The authenticated peer.
@@ -1119,6 +1137,97 @@ fn spawn_stream_loop(
         // This peer's report of our address dies with its connection.
         net.forget_observed(&peer);
     })
+}
+
+/// Sealed pairwise frames for one stream to one member, and what their delivery decides.
+struct PairwiseJob {
+    /// The connection to write on.
+    conn: Arc<VoxConnection>,
+    /// The frames, sealed on the actor in order.
+    frames: Vec<Vec<u8>>,
+    /// The room the frames are for.
+    channel_id: Digest32,
+    /// What the write's outcome tells the actor.
+    after: AfterWrite,
+}
+
+/// What a pairwise write's outcome decides.
+enum AfterWrite {
+    /// The stream carried a key of this generation (and a hello in front of it, if `hello`):
+    /// whether it was taken is learnt from the recipient's answer.
+    Key {
+        /// The key's generation.
+        chain_id: u64,
+        /// Whether the stream carried the hello.
+        hello: bool,
+    },
+    /// The stream offered a hello again with an `Open` behind it (ADR-021 F12).
+    Reopen,
+}
+
+/// Write one member's pairwise streams in the order they were queued (V210-71), each bounded by
+/// `pairwise_stream::WRITE_PATIENCE`. A write that fails is reported so the actor owes it again.
+async fn write_pairwise_jobs(
+    peer: Digest32,
+    mut jobs: mpsc::UnboundedReceiver<PairwiseJob>,
+    tx: mpsc::Sender<NetEvent>,
+) {
+    while let Some(job) = jobs.recv().await {
+        let written = crate::node::pairwise_stream::write_pairwise(&job.conn, &job.frames).await;
+        let channel_id = job.channel_id;
+        let events = match (written, job.after) {
+            (Ok(sent), AfterWrite::Key { chain_id, .. }) => {
+                watch_delivery(tx.clone(), sent, channel_id, peer, chain_id);
+                Vec::new()
+            }
+            (Ok(_), AfterWrite::Reopen) => Vec::new(),
+            (Err(e), AfterWrite::Key { chain_id, hello }) => {
+                let mut v = Vec::with_capacity(2);
+                if hello {
+                    v.push(NetEvent::HelloUndelivered { channel_id, peer });
+                }
+                v.push(NetEvent::SkdmRefused {
+                    channel_id,
+                    peer,
+                    chain_id,
+                    why: e.to_string(),
+                });
+                v
+            }
+            (Err(_), AfterWrite::Reopen) => vec![NetEvent::ReopenUndelivered { channel_id, peer }],
+        };
+        for event in events {
+            if tx.send(event).await.is_err() {
+                return; // the actor is gone
+            }
+        }
+    }
+}
+
+/// Learn, off the actor, whether the key just written to `target` was taken; if it was not,
+/// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
+fn watch_delivery(
+    tx: mpsc::Sender<NetEvent>,
+    sent: quinn::RecvStream,
+    channel_id: Digest32,
+    target: Digest32,
+    chain_id: u64,
+) {
+    tokio::spawn(async move {
+        let event = match crate::node::pairwise_stream::refused(sent, KEY_DELIVERY_PATIENCE).await {
+            Some(why) => NetEvent::SkdmRefused {
+                channel_id,
+                peer: target,
+                chain_id,
+                why,
+            },
+            None => NetEvent::SkdmTaken {
+                channel_id,
+                peer: target,
+            },
+        };
+        let _ = tx.send(event).await;
+    });
 }
 
 /// How many of one connection's pairwise streams may wait to be read.
@@ -2140,6 +2249,8 @@ pub struct Node {
     /// Pairwise streams for a room still being joined, held until the join reports back: see
     /// `take_inbound_skdm`.
     held_pairwise: Vec<(Digest32, PairwiseIn)>,
+    /// Each member's pairwise writer (V210-71): see `write_pairwise`.
+    pairwise_out: BTreeMap<Digest32, mpsc::UnboundedSender<PairwiseJob>>,
     /// Per room, the members this node's board has held a bundle record for. A record from an
     /// author not in it is a member this node has just learned of, which is what
     /// `note_new_members` passes on at once; a refresh of a known member's record is not.
@@ -2370,6 +2481,7 @@ impl Node {
             reopen_task: None,
             unlock_waiters: Vec::new(),
             held_pairwise: Vec::new(),
+            pairwise_out: BTreeMap::new(),
             board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
             publish_again: std::collections::BTreeSet::new(),
@@ -3973,6 +4085,17 @@ impl Node {
             NetEvent::Pairwise(stream) => {
                 self.take_inbound_skdm(stream).await;
             }
+            NetEvent::HelloUndelivered { channel_id, peer } => {
+                if let Some(i) = self.initiated.get_mut(&(channel_id, peer)) {
+                    i.hello_delivered = false;
+                }
+            }
+            NetEvent::ReopenUndelivered { channel_id, peer } => {
+                if let Some(i) = self.initiated.get_mut(&(channel_id, peer)) {
+                    i.hello_delivered = false;
+                }
+                self.reopen.insert((channel_id, peer));
+            }
             NetEvent::SyncRequest {
                 conn,
                 peer,
@@ -5192,18 +5315,18 @@ impl Node {
         let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
             return Outcome::Failed(Fault::Unreachable);
         };
-        let sent = match crate::node::pairwise_stream::deliver_skdm(
-            &conn,
-            channel_id,
-            session,
-            &skdm,
-            hello.as_ref(),
-        )
-        .await
-        {
-            Ok(sent) => sent,
+        // Sealed here, where the session lives; written by this member's writer, off the actor
+        // (V210-71). A write that fails is a key not taken, re-owed like any other.
+        let mut frames = Vec::with_capacity(2);
+        if let Some(initial) = hello.as_ref() {
+            frames.push(crate::node::pairwise_stream::hello_frame(
+                channel_id, initial,
+            ));
+        }
+        match crate::node::pairwise_stream::skdm_frame(channel_id, session, &skdm) {
+            Ok(f) => frames.push(f),
             Err(e) => return Outcome::Failed(fault_of(&e)),
-        };
+        }
         if hello.is_some() {
             self.hello_delivered(channel_id, target);
         }
@@ -5257,7 +5380,18 @@ impl Node {
         // one, and a refusal must re-owe exactly that (V210-30).
         let chain_id = skdm.body.chain_id;
         // The consent is a fact once decided; whether the key landed is learnt off the actor.
-        self.watch_delivery(sent, *channel_id, target, chain_id);
+        self.write_pairwise(
+            target,
+            PairwiseJob {
+                conn,
+                frames,
+                channel_id: *channel_id,
+                after: AfterWrite::Key {
+                    chain_id,
+                    hello: hello.is_some(),
+                },
+            },
+        );
         if history_owed {
             // At once rather than on the tick: the connection and session are live now.
             let _ = self.deliver_rekeys_for(channel_id, asked).await;
@@ -5746,34 +5880,52 @@ impl Node {
             };
             let mut all_sent = true;
             let mut hello_left = hello.as_ref();
+            let mut jobs = Vec::with_capacity(keys.len());
             for key in keys {
                 let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
                     all_sent = false;
                     break;
                 };
                 // The hello rides the first key only: the peer holds the session after it.
-                let Ok(sent) = crate::node::pairwise_stream::deliver_skdm(
-                    &conn,
-                    channel_id,
-                    session,
-                    key,
-                    hello_left.take(),
-                )
-                .await
+                let mut frames = Vec::with_capacity(2);
+                let carries_hello = match hello_left.take() {
+                    Some(initial) => {
+                        frames.push(crate::node::pairwise_stream::hello_frame(
+                            channel_id, initial,
+                        ));
+                        true
+                    }
+                    None => false,
+                };
+                let Ok(frame) = crate::node::pairwise_stream::skdm_frame(channel_id, session, key)
                 else {
                     all_sent = false;
                     break;
                 };
-                if hello.is_some() {
-                    self.hello_delivered(channel_id, target);
-                }
+                frames.push(frame);
                 // Each key's own generation: a refusal re-owes exactly what was refused.
-                self.watch_delivery(sent, *channel_id, target, key.body.chain_id);
+                jobs.push(PairwiseJob {
+                    conn: Arc::clone(&conn),
+                    frames,
+                    channel_id: *channel_id,
+                    after: AfterWrite::Key {
+                        chain_id: key.body.chain_id,
+                        hello: carries_hello,
+                    },
+                });
             }
             if !all_sent {
                 continue;
             }
-            // Recorded only after the bytes went out, so a failed delivery stays owed.
+            if hello.is_some() {
+                self.hello_delivered(channel_id, target);
+            }
+            // Written in order by this member's writer, off the actor (V210-71); a write that
+            // fails is a key not taken, which re-owes it (`NetEvent::SkdmRefused`).
+            for job in jobs {
+                self.write_pairwise(target, job);
+            }
+            // Recorded once the keys are sealed and queued; a delivery that fails is owed again.
             let noted = {
                 let Some(profile) = self.profile.as_ref() else {
                     return delivered;
@@ -7106,18 +7258,26 @@ impl Node {
                 self.reopen.remove(&(channel_id, peer));
                 continue;
             };
-            if crate::node::pairwise_stream::open_sending_direction(
-                &conn,
-                &channel_id,
-                session,
-                Some(&initial),
-            )
-            .await
-            .is_ok()
-            {
-                self.reopen.remove(&(channel_id, peer));
-                self.hello_delivered(&channel_id, peer);
-            }
+            let Ok(open) = crate::node::pairwise_stream::open_frame(&channel_id, session) else {
+                continue;
+            };
+            let frames = vec![
+                crate::node::pairwise_stream::hello_frame(&channel_id, &initial),
+                open,
+            ];
+            // Queued, not awaited (V210-71): a write that fails puts the offer back
+            // (`NetEvent::ReopenUndelivered`).
+            self.reopen.remove(&(channel_id, peer));
+            self.hello_delivered(&channel_id, peer);
+            self.write_pairwise(
+                peer,
+                PairwiseJob {
+                    conn,
+                    frames,
+                    channel_id,
+                    after: AfterWrite::Reopen,
+                },
+            );
         }
     }
 
@@ -7128,32 +7288,23 @@ impl Node {
         }
     }
 
-    /// Learn, off the actor, whether the key just written to `target` was taken; if it was not,
-    /// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
-    fn watch_delivery(
-        &self,
-        sent: quinn::RecvStream,
-        channel_id: Digest32,
-        target: Digest32,
-        chain_id: u64,
-    ) {
-        let tx = self.net_tx.clone();
-        tokio::spawn(async move {
-            let event =
-                match crate::node::pairwise_stream::refused(sent, KEY_DELIVERY_PATIENCE).await {
-                    Some(why) => NetEvent::SkdmRefused {
-                        channel_id,
-                        peer: target,
-                        chain_id,
-                        why,
-                    },
-                    None => NetEvent::SkdmTaken {
-                        channel_id,
-                        peer: target,
-                    },
-                };
-            let _ = tx.send(event).await;
-        });
+    /// Hand `job` to `peer`'s pairwise writer, starting one if it has none (V210-71).
+    ///
+    /// One writer per member, so the streams to that member are opened in the order their frames
+    /// were sealed: a hello and the keys behind it, and the ratchet messages of one session, must
+    /// arrive in order (F12). The actor only seals and queues; it never waits on the peer.
+    fn write_pairwise(&mut self, peer: Digest32, job: PairwiseJob) {
+        let job = match self.pairwise_out.get(&peer) {
+            Some(q) => match q.send(job) {
+                Ok(()) => return,
+                Err(mpsc::error::SendError(job)) => job,
+            },
+            None => job,
+        };
+        let (q, rx) = mpsc::unbounded_channel();
+        tokio::spawn(write_pairwise_jobs(peer, rx, self.net_tx.clone()));
+        let _ = q.send(job);
+        self.pairwise_out.insert(peer, q);
     }
 
     /// A connection to `target`: the live one if there is one, otherwise dialled
@@ -7527,6 +7678,8 @@ impl Node {
         // (their secrets zeroize on drop).
         self.sessions.clear();
         self.initiated.clear();
+        // Their writers end with their queues; what they hold is sealed bytes, no key material.
+        self.pairwise_out.clear();
         self.accepted_hello.clear();
         self.reopen.clear();
         // And take the network down: a locked node has no identity to present, so it
