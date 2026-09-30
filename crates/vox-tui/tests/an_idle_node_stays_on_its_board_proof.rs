@@ -7,7 +7,8 @@
 //! two hours either way, and after #179 so did a room that only carried messages. Then a joiner,
 //! or a member restarting, that finds this node through the board found nothing.
 //!
-//! Every process here runs with `VOX_TEST_RECORD_TTL_SECS` = [`TTL`] (test-only, lower-only: a
+//! Every process here runs with `VOX_TEST_RECORD_TTL_SECS` = [`TTL`] ([`CHURN_TTL`] in the second
+//! arm) (test-only, lower-only: a
 //! shorter record lifetime, and the board's refresh floor scaled with it), so several lifetimes
 //! pass in under a minute:
 //!
@@ -25,6 +26,17 @@
 //!
 //! Mutation: no scheduled renewal. The records lapse; Carol's join polls the board for about
 //! twenty seconds until a member's own traffic brings one back, and Alice's rounds fall to 0–1.
+//!
+//! **A round to one anchor does not put off the others'** ([`a_round_to_one_anchor_does_not_put_off_the_others`]).
+//! The renewal is one deadline per room. A round to a single anchor (it reconnected, it asked
+//! again, it learned news) signs the records too, and it used to re-arm that deadline, so an anchor
+//! that reconnected more often than every half-lifetime kept the room's renewal from ever coming
+//! due: its own board and every other anchor lapsed. The second arm runs the same scene with a
+//! second anchor, B, which is stopped and started again every few seconds while everyone is idle,
+//! and Carol joins through the first, A, alone.
+//!
+//! Mutation: the renewal re-armed by a round to one anchor, and the second arm's Carol polls A's
+//! board; the first arm stays green, which is why the second exists.
 
 #![cfg(unix)]
 
@@ -43,9 +55,15 @@ use world::{args, vox_once, VoxProc, IDENTITY, VOX};
 
 /// The record lifetime every process runs with, in seconds.
 const TTL: u64 = 16;
+/// The record lifetime in the second arm: a returning anchor is reached again only every few
+/// seconds (up to 10 s apart, measured), and the rounds to it must come closer than half of this.
+const CHURN_TTL: u64 = 32;
 /// How many lifetimes everyone stays idle before Carol joins.
 const LIFETIMES: u64 = 3;
 const TIMEOUT: Duration = Duration::from_secs(90);
+/// How often anchor B restarts in the second arm: well inside half of [`CHURN_TTL`]. Faster than
+/// this, the node backs off its redial and reaches B less often, not more.
+const CHURN: Duration = Duration::from_secs(4);
 
 fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     let mut child = Command::new(VOX)
@@ -127,32 +145,85 @@ fn without_endpoint_of(address: &str, who: &str) -> String {
 #[test]
 #[ignore = "real vox processes with production Argon2id, idle for several record lifetimes; CI runs it in release"]
 fn an_idle_node_stays_findable_on_its_board() {
+    idle_then_join(false);
+}
+
+#[test]
+#[ignore = "real vox processes with production Argon2id, idle for several record lifetimes; CI runs it in release"]
+fn a_round_to_one_anchor_does_not_put_off_the_others() {
+    idle_then_join(true);
+}
+
+/// A free loopback UDP port, for an anchor that must come back where it was.
+fn free_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A `vox node` anchor listening on `port`, and its `--anchor` spec.
+fn anchor_on(name: &str, data: &Path, port: u16) -> (VoxProc, String) {
+    let mut p = VoxProc::spawn(
+        name,
+        data,
+        &args(&["node", "--listen", &format!("127.0.0.1:{port}")]),
+    );
+    let spec = p
+        .expect_line("an --anchor spec", |l| {
+            l.trim_start().contains("@/ip4/127.0.0.1/udp/")
+        })
+        .trim()
+        .to_owned();
+    (p, spec)
+}
+
+/// Stop `p` as a person does (SIGINT: it closes its connections, so its peers learn at once).
+fn stop(mut p: VoxProc) {
+    let pid = p.child.id().to_string();
+    let _ = Command::new("kill").args(["-INT", &pid]).status();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while p.child.try_wait().ok().flatten().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: anchor {pid} did not stop within 10 s of SIGINT"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The scene in the header; with `churn`, anchor B restarts all through the idle time.
+fn idle_then_join(churn: bool) {
     watchdog::arm();
     // Every process this proof starts inherits it: the nodes give their records this lifetime,
     // and the anchor's board scales its refresh floor with it.
-    std::env::set_var(vox_core::nat::store::TEST_RECORD_TTL_ENV, TTL.to_string());
+    let ttl = if churn { CHURN_TTL } else { TTL };
+    std::env::set_var(vox_core::nat::store::TEST_RECORD_TTL_ENV, ttl.to_string());
     let tmp = tempfile::tempdir().unwrap();
     let dir = |n: &str| {
         let d = tmp.path().join(n);
         std::fs::create_dir_all(d.join("cfg")).unwrap();
         d
     };
-    let (anchor_dir, alice_dir, bob_dir, carol_dir) =
-        (dir("anchor"), dir("alice"), dir("bob"), dir("carol"));
+    let (anchor_dir, second_dir, alice_dir, bob_dir, carol_dir) = (
+        dir("anchor"),
+        dir("second"),
+        dir("alice"),
+        dir("bob"),
+        dir("carol"),
+    );
     let idpass = tmp.path().join("idpass");
     std::fs::write(&idpass, IDENTITY).unwrap();
 
-    let mut anchor = VoxProc::spawn(
-        "anchor",
-        &anchor_dir,
-        &args(&["node", "--listen", "127.0.0.1:0"]),
-    );
-    let spec = anchor
-        .expect_line("an --anchor spec", |l| {
-            l.trim_start().contains("@/ip4/127.0.0.1/udp/")
-        })
-        .trim()
-        .to_owned();
+    let (anchor, spec) = anchor_on("anchor", &anchor_dir, free_port());
+    // Anchor B, only with `churn`: on a port it can come back to.
+    let second_port = free_port();
+    let mut second = churn.then(|| anchor_on("second", &second_dir, second_port));
+    let anchors = match &second {
+        Some((_, b)) => format!("{spec},{}", b),
+        None => spec.clone(),
+    };
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
         assert!(ok, "vox id: {err}");
@@ -162,8 +233,8 @@ fn an_idle_node_stays_findable_on_its_board() {
     fp(&bob_dir);
     fp(&carol_dir);
 
-    let _alice = daemon("alice", &alice_dir, &spec, &idpass);
-    let _bob = daemon("bob", &bob_dir, &spec, &idpass);
+    let alice = daemon("alice", &alice_dir, &anchors, &idpass);
+    let _bob = daemon("bob", &bob_dir, &anchors, &idpass);
     let (ok, out, err) = vox_in(
         &alice_dir,
         &["room", "create", "--name", "quiet"],
@@ -190,12 +261,71 @@ fn an_idle_node_stays_findable_on_its_board() {
 
     // ---- nobody does anything for several lifetimes -----------------------------------------
     let before = rounds(&alice_dir);
-    let idle = Duration::from_secs(TTL * LIFETIMES);
-    std::thread::sleep(idle);
+    let idle = Duration::from_secs(ttl * LIFETIMES);
+    let idle_from = Instant::now();
+    let mut restarts = 0u32;
+    match second.take() {
+        // B goes away and comes back every few seconds, well inside a half-lifetime: each return
+        // is a round to B alone.
+        Some((mut b, b_spec)) => {
+            while idle_from.elapsed() + CHURN < idle {
+                std::thread::sleep(CHURN);
+                stop(b);
+                b = anchor_on("second", &second_dir, second_port).0;
+                restarts += 1;
+            }
+            std::thread::sleep(idle.saturating_sub(idle_from.elapsed()));
+            second = Some((b, b_spec));
+        }
+        None => std::thread::sleep(idle),
+    }
     let renewed = rounds(&alice_dir).saturating_sub(before);
 
     // ---- Carol, who has only the anchor ----------------------------------------------------
-    let anchor_only = without_endpoint_of(&link, &alice_fp);
+    let mut anchor_only = without_endpoint_of(&link, &alice_fp);
+    // Rounds to B alone, one per return: counted in `renewed` too.
+    let mut reconnects = 0u64;
+    if let Some((_, b_spec)) = &second {
+        // Through A alone: B's pair goes too.
+        let b_fp = b_spec.split('@').next().unwrap();
+        anchor_only = without_endpoint_of(&anchor_only, b_fp);
+        assert!(
+            !anchor_only.contains(b_fp),
+            "CANNOT MEASURE: anchor B is still in the address: {anchor_only}"
+        );
+        // B came back as often as asked, and Alice reached it again each time: otherwise there
+        // were no rounds to B alone to put anything off.
+        // Each return's time, from the `[+12.345s]` alice's own line carries.
+        let back: Vec<f64> = alice
+            .said_since(idle_from)
+            .iter()
+            .filter(|l| {
+                // A daemon names a peer by the first 26 characters of its id.
+                l.contains(&format!("connection to {}", &b_fp[..26]))
+                    && l.contains("connected to this anchor")
+            })
+            .filter_map(|l| l.strip_prefix("[+")?.split('s').next()?.parse().ok())
+            .collect();
+        let reached = back.len();
+        reconnects = reached as u64;
+        // Rounds to B alone put the renewal off only if none is more than half a lifetime after
+        // the last (or after the idle time began): past that, the renewal was due and went out.
+        let widest = std::iter::once(0.0)
+            .chain(back.iter().copied())
+            .collect::<Vec<f64>>()
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(0.0_f64, f64::max);
+        println!(
+            "[proof] anchor B restarted {restarts} time(s); alice reconnected to it {reached} \
+             time(s), at most {widest:.1}s apart"
+        );
+        assert!(
+            reached >= 8 && widest < (ttl / 2) as f64,
+            "CANNOT MEASURE: alice reached anchor B {reached} time(s) while idle, at most \
+             {widest:.1}s apart; the arm needs rounds to B alone closer than half a lifetime"
+        );
+    }
     assert!(
         !anchor_only.contains(&format!("a={alice_fp}&b=")),
         "CANNOT MEASURE: Alice's endpoint is still in the address: {anchor_only}"
@@ -220,7 +350,7 @@ fn an_idle_node_stays_findable_on_its_board() {
         .find_map(|l| l.split("vox: join got in — ").nth(1))
         .map(str::to_owned);
     println!(
-        "[proof] idle {}s ({LIFETIMES} lifetimes of {TTL}s): alice's node renewed with {renewed} \
+        "[proof] idle {}s ({LIFETIMES} lifetimes of {ttl}s): alice's node renewed with {renewed} \
          publish round(s); carol, with only the anchor's address, joined = {joined} in {:.1?}",
         idle.as_secs(),
         took
@@ -239,12 +369,14 @@ fn an_idle_node_stays_findable_on_its_board() {
          carol's join had to wait for one — {steps}"
     );
     // At half the lifetime to one anchor: about two rounds a lifetime. At least one a lifetime,
-    // or the records would have lapsed; at most twice the schedule, or it is a storm.
-    let (least, most) = (LIFETIMES, 4 * LIFETIMES);
+    // or the records would have lapsed; at most twice the schedule, or it is a storm. With anchor
+    // B coming back, each return is a round to B alone as well.
+    let (least, most) = (LIFETIMES, 4 * LIFETIMES + reconnects);
     assert!(
         (least..=most).contains(&renewed),
         "alice's node renewed with {renewed} publish rounds over {LIFETIMES} idle lifetimes; \
          expected {least}..={most}"
     );
+    drop(second);
     drop(anchor);
 }
