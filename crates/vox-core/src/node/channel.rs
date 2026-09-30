@@ -2159,23 +2159,47 @@ impl ChannelState {
             delivered_skdm,
             self.genesis.body.policy.history_mode,
         )?;
-        self.append_governance(profile, &grant.to_wire(), now_secs)?;
         // The grant is the record that `target` holds the generation it was given; the ledger
         // is how a later rotation knows it has not yet been given the next one. The generation
         // is the delivered key's own, not the current one: a key taken when consent was decided
         // and delivered after a rotation is the older generation, and the rotation still owes
         // this member the new one (V210-30).
-        self.delivered.insert(target, delivered_skdm.body.chain_id);
-        self.persist_delivered(profile.store())?;
+        let mut delivered = self.delivered.clone();
+        delivered.insert(target, delivered_skdm.body.chain_id);
         // An entitlement already held (an earlier consent never revoked) stands: both were
         // decided, and the earlier one released what it released.
-        let from = self
-            .entitled
+        let mut entitled = self.entitled.clone();
+        let from = entitled
             .get(&target)
             .map_or(entitled_from, |e| (*e).min(entitled_from));
-        if self.entitled.insert(target, from) != Some(from) {
-            self.persist_entitled(profile.store())?;
-        }
+        entitled.insert(target, from);
+        // **One transaction for all three** (V210-76). Written one after another, a crash after
+        // the grant left a consenter with no `delivered` row, so it was owed a re-key, and no
+        // `entitled` row, so the re-key released the live generation from its origin: the posts
+        // sealed before the consent.
+        let rows = [
+            (
+                SEG_DELIVERED,
+                seal_segment(
+                    &self.sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_DELIVERED,
+                    &delivered_bytes(&delivered),
+                )?,
+            ),
+            (
+                SEG_ENTITLED,
+                seal_segment(
+                    &self.sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_ENTITLED,
+                    &positions_bytes(&entitled),
+                )?,
+            ),
+        ];
+        self.append_governance_with(profile, &grant.to_wire(), now_secs, &rows)?;
+        self.delivered = delivered;
+        self.entitled = entitled;
         Ok(grant)
     }
 
@@ -2918,6 +2942,18 @@ impl ChannelState {
         payload: &[u8],
         now_secs: u64,
     ) -> Result<Digest32> {
+        self.append_governance_with(profile, payload, now_secs, &[])
+    }
+
+    /// [`Self::append_governance`], committing `rows` — sealed `KeyMaterial` segments by id — in
+    /// the same transaction as the entry, so neither is ever on disk without the other.
+    fn append_governance_with(
+        &mut self,
+        profile: &Profile,
+        payload: &[u8],
+        now_secs: u64,
+        rows: &[(u64, SealedSegment)],
+    ) -> Result<Digest32> {
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
@@ -2942,11 +2978,14 @@ impl ChannelState {
         self.dag
             .accept(entry, EntryKind::Governance, &key, &self.admission)
             .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
-        if let Err(e) =
-            profile
-                .store()
-                .put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)
-        {
+        let written = profile.store().batch().and_then(|mut batch| {
+            batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
+            for (row, seg) in rows {
+                batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, *row, seg)?;
+            }
+            batch.commit()
+        });
+        if let Err(e) = written {
             self.poisoned = true;
             return Err(e);
         }
