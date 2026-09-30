@@ -312,7 +312,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ReopenGone { .. } => "forgetting a room that no longer exists",
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
-        NetEvent::Stopped => "shutting the network down",
+        NetEvent::Stopped { .. } => "shutting the network down",
     }
 }
 
@@ -860,7 +860,11 @@ enum NetEvent {
         inbound: Inbound,
     },
     /// The accept loop stopped (the endpoint closed).
-    Stopped,
+    Stopped {
+        /// The network whose accept loop it was. The event can arrive after a lock and an unlock
+        /// have replaced that network with a new one, which it must leave alone (V210-80).
+        net: std::sync::Weak<NodeNet>,
+    },
 }
 
 // The clock lives in `crate::time` (M14.2: the rendezvous service needs it too and
@@ -929,12 +933,28 @@ fn spawn_stream_loop(
             // them is exactly the race F12 was.
             let (kind, send, recv) = match net.accept_authorized_on(&quic, peer).await {
                 Ok(accepted) => accepted,
+                // **A refusal is not a failure.** The stream was typed and answered; the peer
+                // may not open that kind *yet* — a joiner syncing before it is a member, a
+                // responder pushing before the room is held here — and it will be allowed once
+                // the view catches up. Counted, sixteen of those ended this loop while the
+                // connection stayed filed, and every stream the peer opened after that, allowed
+                // or not, went unserved for the connection's life (V210-80). It cannot spin:
+                // each one is a stream the peer opened.
+                Err(crate::error::Error::StreamRefused(_)) => continue,
                 Err(_) => {
                     if quic.close_reason().is_some() {
                         break; // the peer or the network closed it
                     }
                     failures += 1;
                     if failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
+                        // Closed, not only abandoned: a connection nobody serves must not stay
+                        // filed as this peer's, or both ends go on using it for nothing.
+                        quic.close(
+                            crate::transport::quic::close_code(
+                                crate::wire::WireError::TransportFailed,
+                            ),
+                            b"stream failures",
+                        );
                         break;
                     }
                     continue;
@@ -1123,6 +1143,7 @@ fn spawn_stream_loop(
 /// deny service for up to `HANDSHAKE_TIMEOUT` each. Bounded, and far better than a single
 /// slot, but not nothing.
 fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
+    let gone = Arc::downgrade(&net);
     tokio::spawn(async move {
         let gate = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_IN_FLIGHT));
         loop {
@@ -1148,8 +1169,21 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
                 }
             });
         }
-        let _ = tx.send(NetEvent::Stopped).await;
+        if let Some(ms) = test_stopped_delay_ms() {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+        let _ = tx.send(NetEvent::Stopped { net: gone }).await;
     });
+}
+
+/// **For proofs only.** When set, the accept loop waits this many milliseconds between stopping
+/// and saying so (`NetEvent::Stopped`), which stands for an actor queue that is full or a task that
+/// is scheduled late. The lock-and-unlock proof uses it to land the event after an unlock started
+/// a new network. Nothing a person runs sets it; unset, nothing changes.
+pub const TEST_STOPPED_DELAY_ENV: &str = "VOX_TEST_STOPPED_DELAY_MS";
+
+fn test_stopped_delay_ms() -> Option<u64> {
+    std::env::var(TEST_STOPPED_DELAY_ENV).ok()?.parse().ok()
 }
 
 /// How many inbound handshakes may run at once.
@@ -2034,6 +2068,9 @@ pub struct Node {
     reopen_task: Option<tokio::task::AbortHandle>,
     /// Unlock replies held until the reopening has finished (#208).
     unlock_waiters: Vec<oneshot::Sender<Outcome>>,
+    /// The last `refresh_network_view` gave up on a busy room, so the view is behind and the tick
+    /// rebuilds it. Atomic only because the refresh takes `&self`.
+    view_stale: std::sync::atomic::AtomicBool,
     /// Pairwise streams for a room still being joined, held until the join reports back: see
     /// `take_inbound_skdm`.
     held_pairwise: Vec<(
@@ -2277,6 +2314,7 @@ impl Node {
             reopening: std::collections::BTreeSet::new(),
             reopen_task: None,
             unlock_waiters: Vec::new(),
+            view_stale: std::sync::atomic::AtomicBool::new(false),
             held_pairwise: Vec::new(),
             board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
@@ -2463,6 +2501,9 @@ impl Node {
                     self.maintain_prekeys();
                     self.renew_mappings_if_due();
                     self.adopt_anchored_from_board().await;
+                    if self.view_stale.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.refresh_network_view().await;
+                    }
                     self.redial_anchors_if_due();
                     // A rotation's re-keys go out as the remaining consenters become
                     // reachable, which is why they are retried here and not only at
@@ -3552,9 +3593,11 @@ impl Node {
     ///
     /// Twenty seconds and change, which is that frame timeout to the millisecond. During it the
     /// anchor could not act on the very entries it had just taken, so a message that had reached the
-    /// anchor never reached the other member and the room looked quiet. This is a **view**: it is
-    /// rebuilt on every tick and on every piece of network work, so abandoning one attempt costs a
-    /// tick and nothing else.
+    /// anchor never reached the other member and the room looked quiet. This is a **view**: an
+    /// abandoned attempt marks it stale (`view_stale`) and the next tick rebuilds it, so abandoning
+    /// one costs a tick and nothing else. (It was said to be rebuilt on every tick; it was not, and
+    /// an attempt abandoned with nothing after it left the view behind until something else
+    /// happened to refresh it, V210-80.)
     ///
     /// Abandoned whole rather than in part. A policy assembled from the rooms that happened to be
     /// free would be missing members, and this policy is what authorizes streams — a partial one
@@ -3565,7 +3608,11 @@ impl Node {
         let mut policy = PeerPolicy::new();
         for (cid, shared) in &self.channels {
             let Ok(ch) = shared.try_lock() else {
-                return; // busy: a session holds it. Keep the policy we have; the tick retries.
+                // Busy: a session holds it. Keep the policy we have, and say it is behind so the
+                // tick retries — nothing else is certain to come along and refresh it.
+                self.view_stale
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
             };
             let members: BTreeMap<Digest32, CompositePublicKey> = ch
                 .author_keys()
@@ -3580,7 +3627,10 @@ impl Node {
         // open what a member may.
         for (cid, state) in &self.anchored {
             let Ok(st) = state.try_lock() else {
-                return; // same: an anchored room mid-sync must not stop the actor.
+                // Same: an anchored room mid-sync must not stop the actor.
+                self.view_stale
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
             };
             let members: BTreeMap<Digest32, CompositePublicKey> = st
                 .author_keys()
@@ -3595,15 +3645,11 @@ impl Node {
             policy.add_anchor(*anchor);
         }
         // Replacing wholesale would drop the pending joiners the actor is expecting, and the
-        // responders a join in flight is waiting on, so both are carried over.
-        let previous = net.policy().snapshot();
-        net.policy().replace(policy);
-        for joiner in previous.pending_joiners() {
-            net.policy().expect_joiner(joiner);
-        }
-        for responder in previous.join_responders() {
-            net.policy().expect_join_responder(responder);
-        }
+        // responders a join in flight is waiting on, so both are carried over — in the same lock
+        // as the replace, because a join task registers its responder from its own task.
+        net.policy().rebuild(policy);
+        self.view_stale
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Handle one piece of network work.
@@ -3646,8 +3692,18 @@ impl Node {
                     let _ = reply.send(Outcome::Done);
                 }
             }
-            NetEvent::Stopped => {
-                self.net = None;
+            NetEvent::Stopped { net } => {
+                // Only the network that stopped. A lock takes the network down and an unlock
+                // starts a new one, and this event, sent from the old accept loop, can arrive
+                // after both: taken as "the network stopped" it wiped the new one, and the node
+                // went on unlocked with no network at all (V210-80).
+                if self
+                    .net
+                    .as_ref()
+                    .is_some_and(|held| std::ptr::eq(Arc::as_ptr(held), net.as_ptr()))
+                {
+                    self.net = None;
+                }
             }
             NetEvent::JoinRequest {
                 peer,
@@ -3683,6 +3739,10 @@ impl Node {
                         .await
                         .admit_author(profile.store(), &identity, now);
                 }
+                // And into the view the board and the stream gate read, before the joiner is
+                // answered: an author only the room knows is still a stranger to the board, which
+                // refused the newcomer's records until something else refreshed it (V210-80).
+                self.refresh_network_view().await;
                 // Answered whatever happened: a joiner waiting on this must not be left holding a
                 // stream because the room closed or this node has no profile. It will find out from
                 // the join's own outcome, which is the right place for it to learn.
@@ -4886,6 +4946,15 @@ impl Node {
                 &passphrase,
                 now,
                 sealed,
+                // Keep the responder's witness to this join (M17.6). It is republished with
+                // every bundle record this node ever puts on a board for this room, so it is
+                // persisted rather than held: a node that lost it could publish nothing and
+                // would fall off every board. The joiner already verified it binds its own key,
+                // this room and this epoch, in `run_initiator`. Written with the room, in one
+                // batch, so a join that fails here leaves no room behind (V210-80).
+                Some(crate::nat::record::Admission::Witnessed(Box::new(
+                    joined.witness.clone(),
+                ))),
             ) {
                 Ok(c) => c,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
@@ -4896,25 +4965,6 @@ impl Node {
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
         );
-        // Keep the responder's witness to this join (M17.6). It is republished with
-        // every bundle record this node ever puts on a board for this room, so it is
-        // persisted rather than held: a node that lost it could publish nothing and
-        // would fall off every board. The joiner already verified it binds its own key,
-        // this room and this epoch, in `run_initiator`.
-        if let (Some(profile), Some(shared)) = (
-            self.profile.as_ref(),
-            self.channels.get(&parsed.channel_id).map(Arc::clone),
-        ) {
-            let admission =
-                crate::nat::record::Admission::Witnessed(Box::new(joined.witness.clone()));
-            if let Err(e) = shared
-                .lock()
-                .await
-                .set_own_admission(profile.store(), admission)
-            {
-                return Outcome::Failed(fault_of(&e));
-            }
-        }
         // Every member whose bundle is on the board is an admitted author **on the
         // M17.6 evidence its record carries** — a self-signed record proves possession
         // of a key and nothing else. Sync hard-fails on an entry from an author we

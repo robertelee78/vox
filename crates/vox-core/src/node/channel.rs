@@ -1605,6 +1605,7 @@ impl ChannelState {
             channel_passphrase,
             now_secs,
             (sek, wrap),
+            None,
         )
     }
 
@@ -1639,8 +1640,16 @@ impl ChannelState {
     /// which the node runs off its actor. The checks of [`ChannelState::join_checks`] are repeated
     /// here, because time passed while the seal ran.
     ///
+    /// `own_admission` is how this node was let in (the witness the responder signed, M17.6). It
+    /// is written **in the same batch** as the room: a room held without it can publish nothing
+    /// and falls off every board, and while it was a second write that could fail after the
+    /// first, a failed join left exactly that room in the profile — which then refused every
+    /// retry of the join as "already in the profile" (V210-80).
+    ///
     /// # Errors
-    /// A failed check, a segment that cannot be sealed, or a store write that fails.
+    /// A failed check, a segment that cannot be sealed, or a store write that fails. On an error
+    /// nothing of the room is written.
+    #[allow(clippy::too_many_arguments)]
     pub fn join_channel_from_sealed(
         profile: &Profile,
         genesis: &Genesis,
@@ -1649,6 +1658,7 @@ impl ChannelState {
         channel_passphrase: &[u8],
         now_secs: u64,
         sealed: (Sek, crate::atrest::SekWrap),
+        own_admission: Option<Admission>,
     ) -> Result<Self> {
         Self::join_checks(profile, genesis, channel_id, local_name)?;
         let (sek, wrap) = sealed;
@@ -1693,6 +1703,17 @@ impl ChannelState {
             SEG_ORIGINS,
             &origins.to_state(),
         )?;
+        let admission_seg = own_admission
+            .as_ref()
+            .map(|a| {
+                seal_segment(
+                    &sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_ADMISSION,
+                    &a.body_bytes(),
+                )
+            })
+            .transpose()?;
         let mut batch = profile.store().batch()?;
         batch.put_sek_wrap(channel_id, &wrap)?;
         batch.put_segment(
@@ -1719,6 +1740,9 @@ impl ChannelState {
             SEG_ORIGINS,
             &origins_seg,
         )?;
+        if let Some(seg) = &admission_seg {
+            batch.put_segment(channel_id, SegmentKind::KeyMaterial, SEG_ADMISSION, seg)?;
+        }
         batch.commit()?;
 
         let mut admission = AdmissionPolicy::new();
@@ -1749,8 +1773,8 @@ impl ChannelState {
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
             transient: BTreeSet::new(),
-            // Set by the caller from the join witness the responder signed (M17.6).
-            own_admission: None,
+            // The join witness the responder signed (M17.6), written with the room above.
+            own_admission,
             origins,
             delivered: BTreeMap::new(),
             history: BTreeMap::new(),
@@ -2016,30 +2040,6 @@ impl ChannelState {
     #[must_use]
     pub fn own_admission(&self) -> Option<&Admission> {
         self.own_admission.as_ref()
-    }
-
-    /// Record how this node came to be a member here, and persist it.
-    ///
-    /// Called once, by the join path, with the witness the responder signed. The
-    /// creator sets it at creation and never calls this.
-    pub fn set_own_admission(&mut self, store: &Store, admission: Admission) -> Result<()> {
-        let seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_ADMISSION,
-            &admission.body_bytes(),
-        )?;
-        if let Err(e) = store.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_ADMISSION,
-            &seg,
-        ) {
-            self.poisoned = true;
-            return Err(e);
-        }
-        self.own_admission = Some(admission);
-        Ok(())
     }
 
     fn persist_services(&mut self, store: &Store) -> Result<()> {

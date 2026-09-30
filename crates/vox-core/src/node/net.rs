@@ -488,7 +488,13 @@ impl ConnectionManager {
     pub fn existing(&self, peer: &Digest32) -> Option<Arc<VoxConnection>> {
         let conn = lock(&self.conns).get(peer).cloned()?;
         if !is_live(&conn) {
-            lock(&self.conns).remove(peer);
+            // Only if it is still the one held: the lock was let go since it was read, and a
+            // fresh connection filed for the peer in between is live and must stay (V210-80).
+            let mut map = lock(&self.conns);
+            if map.get(peer).is_some_and(|held| Arc::ptr_eq(held, &conn)) {
+                map.remove(peer);
+            }
+            drop(map);
             return self.promote_heard(peer);
         }
         if self.is_dead(&conn) {
