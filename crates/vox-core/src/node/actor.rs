@@ -6145,6 +6145,19 @@ impl Node {
                 ran = true;
             }
         }
+        // MUTANT ac-ver282c1 (V210-90, never merge): no queueing at the cap. A port that found no
+        // free slot is dropped from the queue (not marked synced) and counted as skipped at the cap;
+        // it runs again only when another event touches its room, or on the tick.
+        let _ = std::hint::black_box("AC_VER282C1_MUTANT_NO_QUEUE_AT_CAP");
+        for (room, peer) in self.port_queue.all() {
+            self.port_queue.remove(&room, &peer);
+            if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                port.queued = false;
+            }
+            crate::node::status::SyncBook::with(&self.sync_book, room, peer, |c| {
+                c.skipped_at_cap += 1;
+            });
+        }
         for key in newly_queued {
             if self.ports.get(&key).is_some_and(|p| p.queued) {
                 crate::node::status::SyncBook::with(&self.sync_book, key.0, key.1, |c| {
