@@ -5999,6 +5999,7 @@ impl Node {
             .collect();
         for room in due {
             self.records_renew_at.remove(&room);
+            crate::node::status::SyncBook::note_renewal(&self.sync_book);
             self.publish_channel_locally(&room).await;
             self.publish_channel_to_anchors(&room).await;
         }

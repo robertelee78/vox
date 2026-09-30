@@ -18,8 +18,12 @@
 //!    out of it, so the only way to reach anyone in the room is the records the anchor's board
 //!    still holds. She must get in.
 //!
-//! And while everyone was idle, Alice's node renewed, and not in a storm: its publish rounds
-//! (`vox status --json`) are at least one per lifetime and at most two per half-lifetime.
+//! And while everyone was idle, Alice's node renewed, and not in a storm: its scheduled renewals
+//! (`publish.renewals` in `vox status --json`, one per room per half-lifetime, whatever the number
+//! of boards each reaches) are at least one per lifetime and at most two per half-lifetime. Its
+//! publish rounds, one per board reached, are printed too: with two anchors, one of them coming
+//! back every few seconds, they count every renewal twice and every return of B once more, so
+//! they are not what the design bounds.
 //!
 //! Carol's daemon names each step of her join; the board must have held a member's address when
 //! she asked (no `address poll`: she did not have to wait for anyone to publish again).
@@ -115,14 +119,14 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
     panic!("{name}'s daemon never answered `vox room list`");
 }
 
-/// A node's publish rounds so far (`vox status --json`).
-fn rounds(data: &Path) -> u64 {
+/// A node's `publish.<what>` counter so far (`vox status --json`): `rounds` or `renewals`.
+fn publish(data: &Path, what: &str) -> u64 {
     let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
     assert!(ok, "vox status --json: {err}");
     let v: serde_json::Value = serde_json::from_str(out.trim()).expect("status is JSON");
-    v["publish"]["rounds"]
+    v["publish"][what]
         .as_u64()
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.rounds: {out}"))
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.{what}: {out}"))
 }
 
 /// `address` without the `a=<who>&b=<endpoint>` pair naming `who`: what is left names the anchor.
@@ -260,7 +264,10 @@ fn idle_then_join(churn: bool) {
     assert!(ok, "bob joins: {out}{err}");
 
     // ---- nobody does anything for several lifetimes -----------------------------------------
-    let before = rounds(&alice_dir);
+    let (before, rounds_before) = (
+        publish(&alice_dir, "renewals"),
+        publish(&alice_dir, "rounds"),
+    );
     let idle = Duration::from_secs(ttl * LIFETIMES);
     let idle_from = Instant::now();
     let mut restarts = 0u32;
@@ -279,11 +286,12 @@ fn idle_then_join(churn: bool) {
         }
         None => std::thread::sleep(idle),
     }
-    let renewed = rounds(&alice_dir).saturating_sub(before);
+    let renewed = publish(&alice_dir, "renewals").saturating_sub(before);
+    let rounds = publish(&alice_dir, "rounds").saturating_sub(rounds_before);
 
     // ---- Carol, who has only the anchor ----------------------------------------------------
     let mut anchor_only = without_endpoint_of(&link, &alice_fp);
-    // Rounds to B alone, one per return: counted in `renewed` too.
+    // Rounds to B alone, one per return: printed beside the rounds they add to.
     let mut reconnects = 0u64;
     if let Some((_, b_spec)) = &second {
         // Through A alone: B's pair goes too.
@@ -350,8 +358,9 @@ fn idle_then_join(churn: bool) {
         .find_map(|l| l.split("vox: join got in — ").nth(1))
         .map(str::to_owned);
     println!(
-        "[proof] idle {}s ({LIFETIMES} lifetimes of {ttl}s): alice's node renewed with {renewed} \
-         publish round(s); carol, with only the anchor's address, joined = {joined} in {:.1?}",
+        "[proof] idle {}s ({LIFETIMES} lifetimes of {ttl}s): alice's node renewed {renewed} \
+         time(s), in {rounds} publish round(s) to boards ({reconnects} return(s) of anchor B); \
+         carol, with only the anchor's address, joined = {joined} in {:.1?}",
         idle.as_secs(),
         took
     );
@@ -368,13 +377,13 @@ fn idle_then_join(churn: bool) {
         "after {LIFETIMES} idle lifetimes the anchor's board no longer held a member's address: \
          carol's join had to wait for one — {steps}"
     );
-    // At half the lifetime to one anchor: about two rounds a lifetime. At least one a lifetime,
-    // or the records would have lapsed; at most twice the schedule, or it is a storm. With anchor
-    // B coming back, each return is a round to B alone as well.
-    let (least, most) = (LIFETIMES, 4 * LIFETIMES + reconnects);
+    // One renewal per room per half-lifetime, however many boards it reaches: about two a
+    // lifetime. At least one a lifetime, or the records would have lapsed; at most twice the
+    // schedule, or it is a storm.
+    let (least, most) = (LIFETIMES, 4 * LIFETIMES);
     assert!(
         (least..=most).contains(&renewed),
-        "alice's node renewed with {renewed} publish rounds over {LIFETIMES} idle lifetimes; \
+        "alice's node renewed its records {renewed} times over {LIFETIMES} idle lifetimes; \
          expected {least}..={most}"
     );
     drop(second);

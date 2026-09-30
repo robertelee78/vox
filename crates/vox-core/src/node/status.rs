@@ -99,6 +99,9 @@ pub struct SyncBook {
     /// Publish rounds this node started (one per `(room, board)` round that went out): what no
     /// person can see directly, and what a storm of rounds looks like (#179).
     publish_rounds: u64,
+    /// Scheduled renewals of a room's own records (V210-68): one per room per half of the
+    /// records' lifetime, whatever the traffic and however many boards the round then reaches.
+    renewals: u64,
     /// Records by others that taught this node's board something and were passed on
     /// (`NetEvent::BoardGrew`, #179): a member's routine refresh is not one.
     board_news: u64,
@@ -146,6 +149,11 @@ impl SyncBook {
     ) {
         let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
         f(b.ports.entry((room, peer)).or_default());
+    }
+
+    /// Count one scheduled renewal of a room's own records (V210-68).
+    pub fn note_renewal(book: &SharedSyncBook) {
+        book.lock().unwrap_or_else(PoisonError::into_inner).renewals += 1;
     }
 
     /// Count one publish round started.
@@ -270,8 +278,8 @@ impl SyncBook {
         }
         let _ = write!(
             s,
-            "],\"publish\":{{\"rounds\":{},\"board_news\":{}}},\"prekeys\":",
-            b.publish_rounds, b.board_news
+            "],\"publish\":{{\"rounds\":{},\"renewals\":{},\"board_news\":{}}},\"prekeys\":",
+            b.publish_rounds, b.renewals, b.board_news
         );
         match b.prekeys {
             Some(p) => {
