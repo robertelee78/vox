@@ -665,7 +665,7 @@ impl RendezvousService {
                 {
                     return Err(RejectReason::Policy);
                 }
-                store.accept_genesis(genesis, local)
+                store.accept_genesis(genesis, local, now)
             }
             _ => return Err(RejectReason::UnknownKind),
         };

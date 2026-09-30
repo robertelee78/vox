@@ -258,6 +258,11 @@ pub struct RendezvousStore {
     /// The channels whose genesis this node filed itself — its own rooms and the ones it
     /// anchors. Never displaced and not counted against [`MAX_GENESIS_CHANNELS`].
     pinned: HashSet<Digest32>,
+    /// `channelID` → when its genesis arrived, in arrival order: what a full board evicts by
+    /// (see [`RendezvousStore::accept_genesis`]).
+    genesis_arrived: HashMap<Digest32, u64>,
+    /// The next genesis arrival number.
+    genesis_arrivals: u64,
 }
 
 impl RendezvousStore {
@@ -412,7 +417,7 @@ impl RendezvousStore {
     /// pinning one the board already holds from a peer takes it out of that count.
     /// Whether a board takes an unpinned genesis at all is the service's decision, not
     /// the store's (see `RendezvousService::serve_rooms`).
-    pub fn accept_genesis(&mut self, genesis: Genesis, pinned: bool) -> Result<()> {
+    pub fn accept_genesis(&mut self, genesis: Genesis, pinned: bool, now: u64) -> Result<()> {
         genesis.verify()?;
         let channel_id = genesis.channel_id();
         if let Some(existing) = self.genesis.get(&channel_id) {
@@ -427,13 +432,60 @@ impl RendezvousStore {
             return Err(Error::RendezvousRejected("genesis already present"));
         }
         if !pinned && self.genesis.len() - self.pinned.len() >= MAX_GENESIS_CHANNELS {
-            return Err(Error::RendezvousRejected("genesis board at capacity"));
+            // **A full board makes room; it does not turn a new room away** (V210-70). Refusing
+            // let one stranger fill an anchor with 4096 rooms it minted over one connection, and
+            // every room created after that could not be published there or joined through it —
+            // an anchor that serves any room published to it serving none. The room that goes is
+            // the one that arrived longest ago **with nobody in it**: no live member address or
+            // bundle record. A real room's members keep those records current, so rooms nobody
+            // publishes to are displaced before any room that is in use, and a flood of empty
+            // ones displaces only its own.
+            let Some(evict) = self.idle_unpinned_genesis(now) else {
+                return Err(Error::RendezvousRejected("genesis board at capacity"));
+            };
+            self.forget_channel(&evict);
         }
         self.genesis.insert(channel_id, genesis);
+        self.genesis_arrived
+            .insert(channel_id, self.genesis_arrivals);
+        self.genesis_arrivals = self.genesis_arrivals.wrapping_add(1);
         if pinned {
             self.pinned.insert(channel_id);
         }
         Ok(())
+    }
+
+    /// The unpinned genesis that arrived longest ago among those whose room has no live member
+    /// address or bundle record in any epoch, if there is one.
+    fn idle_unpinned_genesis(&self, now: u64) -> Option<Digest32> {
+        let live: HashSet<Digest32> = self
+            .members
+            .iter()
+            .filter(|(_, b)| b.values().any(|r| now < member_expiry(r)))
+            .map(|((cid, _), _)| *cid)
+            .chain(
+                self.bundles
+                    .iter()
+                    .filter(|(_, b)| b.values().any(|r| now < bundle_expiry(r)))
+                    .map(|((cid, _), _)| *cid),
+            )
+            .collect();
+        self.genesis
+            .keys()
+            .filter(|cid| !self.pinned.contains(*cid) && !live.contains(*cid))
+            .min_by_key(|cid| self.genesis_arrived.get(*cid).copied().unwrap_or(0))
+            .copied()
+    }
+
+    /// Drop everything this board holds for `channel_id`: its genesis and every record filed
+    /// under it.
+    fn forget_channel(&mut self, channel_id: &Digest32) {
+        self.genesis.remove(channel_id);
+        self.genesis_arrived.remove(channel_id);
+        self.pinned.remove(channel_id);
+        self.prejoins.remove(channel_id);
+        self.members.retain(|(cid, _), _| cid != channel_id);
+        self.bundles.retain(|(cid, _), _| cid != channel_id);
     }
 
     /// Whether this node filed `channel_id`'s genesis itself (see
