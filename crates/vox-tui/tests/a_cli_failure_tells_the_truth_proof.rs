@@ -21,6 +21,22 @@
 //!    one cause a person can stage is a tag that is not offered, and its wording is asserted
 //!    here; the others (a store that failed, a node with no identity) cannot be staged through
 //!    any command and rest on code review, as does the governance `DenyReason` order.
+//! 5. **A request whose node is suspended mid-request ends, and says so.** Only the greeting was
+//!    bounded, so a node suspended after it greeted left the request waiting for ever. A second
+//!    joiner's `vox room join` is sent while the host is suspended, so the join is still being
+//!    worked on a second later; then the joiner's own daemon is suspended. The join must exit
+//!    non-zero within 45 s (the product checks every 10 s and gives a greeting 10 s; the bound
+//!    here is hard-coded) saying the node stopped answering while the request waited. If it
+//!    says instead that the node never greeted, the suspension came before the request was sent:
+//!    CANNOT MEASURE. The control: after SIGCONT the same daemon answers `vox status`. A node
+//!    whose actor is stuck while it still greets cannot be staged through any command; that
+//!    half (the ping each check sends through the actor) rests on code review.
+//! 6. **A holder whose control socket cannot be bound runs on, and says why** (separate test,
+//!    `a_holder_runs_without_its_control_socket`). A profile path too long for a socket puts the
+//!    socket in `$TMPDIR/vox-<uid>`, and there a plain file stands where that directory should be
+//!    — what another local user can plant in `/tmp`. `vox serve` must keep serving and `vox
+//!    connect` must join (exit 0), each warning that the control socket is unavailable, naming
+//!    the path and the cause; and the file must be left as it was, never used.
 //!
 //! **Staging.** An anchor (`vox node`), a host (`vox serve` of a loopback echo service), and a
 //! joiner's `vox daemon`. Every participant is the shipped binary; every process is killed by its
@@ -29,7 +45,9 @@
 //! **Mutations that must turn it red**, one per claim: (1) drop the exchange failure's
 //! `why.push` in the actor's join walk — no `said:` line; (2) remove the `ANSWER_WITHIN` bound
 //! from `IpcClient::open` and `status::request` — `vox status` is still running at 30 s;
-//! (3) `Ok(None) => return Ok(())` back in `room_cli::tail` — the tail exits 0.
+//! (3) `Ok(None) => return Ok(())` back in `room_cli::tail` — the tail exits 0; (5)
+//! `IpcClient::request` without `while_answering` — the join is still running at 45 s; (6)
+//! `serve_control_socket(..)?`, a bind failure fatal again — `vox serve` exits 1 at once.
 
 #![cfg(unix)]
 
@@ -73,9 +91,10 @@ fn collect(stream: impl Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
     lines
 }
 
-fn command(dir: &std::path::Path, args: &[&str]) -> Command {
+fn command(dir: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Command {
     let mut c = Command::new(VOX);
     c.args(args)
+        .envs(envs.iter().copied())
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
@@ -89,7 +108,17 @@ fn command(dir: &std::path::Path, args: &[&str]) -> Command {
 
 impl Proc {
     fn spawn(name: &'static str, dir: &std::path::Path, args: &[&str], stdin: &str) -> Self {
-        let mut child = command(dir, args)
+        Self::spawn_env(name, dir, args, stdin, &[])
+    }
+
+    fn spawn_env(
+        name: &'static str,
+        dir: &std::path::Path,
+        args: &[&str],
+        stdin: &str,
+        envs: &[(&str, &str)],
+    ) -> Self {
+        let mut child = command(dir, args, envs)
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
         let mut pipe = child.stdin.take().expect("stdin");
@@ -158,7 +187,18 @@ fn vox(
     stdin: &str,
     within: Duration,
 ) -> Option<(bool, String, Duration)> {
-    let mut p = Proc::spawn("verb", dir, args, stdin);
+    vox_env(dir, args, stdin, within, &[])
+}
+
+/// [`vox`], with more environment.
+fn vox_env(
+    dir: &std::path::Path,
+    args: &[&str],
+    stdin: &str,
+    within: Duration,
+    envs: &[(&str, &str)],
+) -> Option<(bool, String, Duration)> {
+    let mut p = Proc::spawn_env("verb", dir, args, stdin, envs);
     let (status, took) = p.exit_within(within)?;
     // Let the reader threads take the last lines.
     std::thread::sleep(Duration::from_millis(100));
@@ -238,7 +278,7 @@ fn a_cli_failure_tells_the_truth() {
     joiner.expect_out("its control socket", |l| l.contains("control socket"));
 
     // ---- (1) a join refused in the exchange says what was said ----
-    let (ok, said, _) = must(
+    let (ok, said, took) = must(
         "vox room join (wrong passphrase)",
         vox(
             &joiner_dir,
@@ -248,7 +288,8 @@ fn a_cli_failure_tells_the_truth() {
         ),
     );
     eprintln!(
-        "[join, wrong passphrase] {}",
+        "[join, wrong passphrase] in {:.1}s: {}",
+        took.as_secs_f64(),
         said.trim().replace('\n', " / ")
     );
     assert!(!ok, "a wrong passphrase must not join: {said}");
@@ -269,7 +310,7 @@ fn a_cli_failure_tells_the_truth() {
     );
     claims += 1;
 
-    let (ok, said, _) = must(
+    let (ok, said, took) = must(
         "vox room join",
         vox(
             &joiner_dir,
@@ -277,6 +318,10 @@ fn a_cli_failure_tells_the_truth() {
             &format!("{passphrase}\n"),
             quick,
         ),
+    );
+    eprintln!(
+        "[join, right passphrase] ok={ok} in {:.1}s",
+        took.as_secs_f64()
     );
     assert!(ok, "CANNOT MEASURE: the right passphrase must join: {said}");
 
@@ -302,6 +347,94 @@ fn a_cli_failure_tells_the_truth() {
         said.contains("not offered in this room") && !said.contains("Failed("),
         "(4) the failure must name its cause: {said}"
     );
+    claims += 1;
+
+    // ---- (5) a node suspended mid-request: the request ends, and says so ----
+    let late_dir = dir("late");
+    let (ok, said, _) = must("vox id (late)", vox(&late_dir, &["id"], "", quick));
+    assert!(ok, "CANNOT MEASURE: vox id (late): {said}");
+    let late = Proc::spawn(
+        "late-daemon",
+        &late_dir,
+        &["daemon", "--listen", "127.0.0.1:0", "--anchor", &spec],
+        &format!("{IDPASS}\n"),
+    );
+    late.expect_out("its control socket", |l| l.contains("control socket"));
+    let (host_pid, late_pid) = (host.child.id(), late.child.id());
+    // The host is suspended, so the join waits on it and is still being worked on a second
+    // after it is asked.
+    assert!(
+        signal("STOP", host_pid),
+        "CANNOT MEASURE (5): could not SIGSTOP the host"
+    );
+    let mut join = Proc::spawn(
+        "late join",
+        &late_dir,
+        &["room", "join", &address, "--name", "svc"],
+        &format!("{passphrase}\n"),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    if let Some(s) = join.child.try_wait().expect("wait") {
+        signal("CONT", host_pid);
+        std::thread::sleep(Duration::from_millis(100));
+        panic!(
+            "CANNOT MEASURE (5): the join ended ({s}) before its node could be suspended \
+             mid-request: {}\n{}",
+            join.stdout().join("\n"),
+            join.stderr()
+        );
+    }
+    assert!(
+        signal("STOP", late_pid),
+        "CANNOT MEASURE (5): could not SIGSTOP the late joiner's daemon"
+    );
+    let mid_bound = Duration::from_secs(45);
+    let ended = join.exit_within(mid_bound);
+    assert!(
+        signal("CONT", late_pid) && signal("CONT", host_pid),
+        "CANNOT MEASURE (5): could not SIGCONT the daemons"
+    );
+    let Some((status, took)) = ended else {
+        panic!(
+            "(5) `vox room join` against a node suspended mid-request was still running after \
+             {mid_bound:?}"
+        );
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let said = format!("{}\n{}", join.stdout().join("\n"), join.stderr());
+    eprintln!(
+        "[room join, node suspended mid-request] exit {:?} in {:.1}s: {}",
+        status.code(),
+        took.as_secs_f64(),
+        said.trim().replace('\n', " / ")
+    );
+    assert!(
+        !said.contains("did not answer within"),
+        "CANNOT MEASURE (5): the node was suspended before it greeted, so the request was never \
+         sent: {said}"
+    );
+    assert!(
+        !status.success(),
+        "(5) a join whose node was suspended mid-request must fail: {said}"
+    );
+    assert!(
+        said.contains("stopped answering while this request waited"),
+        "(5) the join must say its node stopped answering while it waited: {said}"
+    );
+    let (ok, said, took) = must(
+        "vox status (late, resumed)",
+        vox(&late_dir, &["status"], "", bound),
+    );
+    eprintln!(
+        "[vox status, late node resumed] ok={ok} in {:.1}s",
+        took.as_secs_f64()
+    );
+    assert!(
+        ok,
+        "CANNOT MEASURE (5): the resumed node did not answer `vox status` either, so the \
+         silence was not the suspension's: {said}"
+    );
+    drop(late);
     claims += 1;
 
     // ---- the tail, attached and delivering before anything is done to its node ----
@@ -400,5 +533,155 @@ fn a_cli_failure_tells_the_truth() {
     claims += 1;
 
     eprintln!("[proof] {claims} claims held");
-    assert_eq!(claims, 4);
+    assert_eq!(claims, 5);
+}
+
+/// (6) A holder whose control socket cannot be bound runs on, and says why.
+#[test]
+#[ignore = "real vox processes, production Argon2id and a real PoW; CI runs it in release"]
+fn a_holder_runs_without_its_control_socket() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let quick = Duration::from_secs(90);
+    // A profile path too long for a socket address, so the socket falls back to
+    // `$TMPDIR/vox-<uid>`; and there, a plain file where that directory should be.
+    let long = |n: &str| {
+        let d = tmp.path().join(format!("{n}-{}", "p".repeat(120)));
+        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        d
+    };
+    let (host_dir, guest_dir) = (long("host"), long("guest"));
+    let anchor_dir = tmp.path().join("anchor");
+    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    let blocked_tmp = tmp.path().join("t");
+    std::fs::create_dir_all(&blocked_tmp).unwrap();
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    let squat = blocked_tmp.join(format!("vox-{}", uid.trim()));
+    std::fs::write(&squat, "not a directory\n").unwrap();
+    let tmpdir = format!("{}/", blocked_tmp.display());
+    let env = [("TMPDIR", tmpdir.as_str())];
+    let mut held = 0usize;
+
+    let anchor = Proc::spawn(
+        "anchor",
+        &anchor_dir,
+        &["node", "--listen", "127.0.0.1:0"],
+        "",
+    );
+    let spec = anchor
+        .expect_out("an anchor spec", |l| {
+            l.trim_start().contains('@')
+                && l.trim_start().starts_with(|c: char| c.is_alphanumeric())
+        })
+        .trim()
+        .to_owned();
+    for d in [&host_dir, &guest_dir] {
+        let (ok, said, _) = must("vox id", vox_env(d, &["id"], "", quick, &env));
+        assert!(ok, "CANNOT MEASURE: vox id: {said}");
+    }
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let service_port = service.local_addr().unwrap().port().to_string();
+    let mut host = Proc::spawn_env(
+        "host",
+        &host_dir,
+        &[
+            "serve",
+            &service_port,
+            "--anchor",
+            &spec,
+            "--listen",
+            "127.0.0.1:0",
+        ],
+        "",
+        &env,
+    );
+    // Its lines, or its exit.
+    let t0 = Instant::now();
+    let printed = loop {
+        if host.stdout().iter().any(|l| l.starts_with("passphrase")) {
+            break true;
+        }
+        if host.child.try_wait().expect("wait").is_some() || t0.elapsed() > quick {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // Still serving a moment after it printed them.
+    std::thread::sleep(Duration::from_secs(2));
+    let running = host.child.try_wait().expect("wait").is_none();
+    let err = host.stderr();
+    eprintln!(
+        "[vox serve, socket blocked] printed={printed} running={running}: {}",
+        err.trim().replace('\n', " / ")
+    );
+    assert!(
+        printed && running,
+        "(6) `vox serve` must keep serving when its control socket cannot be bound; \
+         printed={printed} running={running}; stderr:\n{err}"
+    );
+    let warned = |said: &str| {
+        said.contains("control socket unavailable")
+            && said.contains(&squat.display().to_string())
+            && said.contains("not a directory owned by you")
+    };
+    assert!(
+        warned(&err),
+        "(6) `vox serve` must say the control socket is unavailable, where and why: {err}"
+    );
+    held += 1;
+
+    let field = |label: &str| {
+        host.expect_out(label, |l| l.starts_with(label))
+            .strip_prefix(label)
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    let (address, passphrase) = (field("address"), field("passphrase"));
+    let pass_file = guest_dir.join("room-pass");
+    std::fs::write(&pass_file, format!("{passphrase}\n")).unwrap();
+    let (ok, said, took) = must(
+        "vox connect",
+        vox_env(
+            &guest_dir,
+            &[
+                "connect",
+                &address,
+                "--passphrase-file",
+                pass_file.to_str().unwrap(),
+                "--anchor",
+                &spec,
+                "--listen",
+                "127.0.0.1:0",
+            ],
+            "",
+            quick,
+            &env,
+        ),
+    );
+    eprintln!(
+        "[vox connect, socket blocked] ok={ok} in {:.1}s: {}",
+        took.as_secs_f64(),
+        said.trim().replace('\n', " / ")
+    );
+    assert!(
+        ok && said.contains("joined."),
+        "(6) `vox connect` must join when its control socket cannot be bound: {said}"
+    );
+    assert!(
+        warned(&said),
+        "(6) `vox connect` must say the control socket is unavailable, where and why: {said}"
+    );
+    held += 1;
+
+    // What stood where the directory should be was never used.
+    let left = std::fs::symlink_metadata(&squat).map(|m| m.file_type().is_file());
+    assert!(
+        matches!(left, Ok(true)) && std::fs::read_to_string(&squat).unwrap() == "not a directory\n",
+        "(6) the file at {} was changed: {left:?}",
+        squat.display()
+    );
+    drop(service);
+    eprintln!("[proof] {held} holders ran without their control socket");
+    assert_eq!(held, 2);
 }

@@ -383,6 +383,10 @@ pub enum NodeCommand {
     },
     /// Stop the actor (locks first).
     Shutdown,
+    /// Change nothing and answer `Done`: proof that the actor is taking commands. A control
+    /// client waiting on a long request asks it, to tell a node at work from a stuck one
+    /// (V210-83).
+    Ping,
 }
 
 /// Why a command did not succeed — closed, machine-stable, redaction-safe.

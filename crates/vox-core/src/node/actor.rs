@@ -2397,6 +2397,12 @@ impl Node {
                     let shutdown = matches!(command, NodeCommand::Shutdown);
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
+                    // Proof the actor is taking commands (V210-83): it changes nothing, so nothing
+                    // is published or scheduled for it.
+                    if matches!(command, NodeCommand::Ping) {
+                        let _ = reply.send(Outcome::Done);
+                        continue;
+                    }
                     // **Answered off the actor.** Checking the identity passphrase is production
                     // Argon2id, and every `vox trust add/list/remove` asks for it. Inline, it held
                     // the actor for ~0.3 s per command, and nothing on the node — posts, reads,
@@ -2683,7 +2689,7 @@ impl Node {
                 }
             }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
-            NodeCommand::Shutdown => Outcome::Done,
+            NodeCommand::Shutdown | NodeCommand::Ping => Outcome::Done,
         }
     }
 

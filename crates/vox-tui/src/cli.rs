@@ -1267,7 +1267,7 @@ pub fn run() -> ExitCode {
                 move |node, anchors| async move {
                     // Only the verbs that keep running serve the socket: `vox id` and the trust
                     // verbs share this path and are done in a moment (V210-83, #263).
-                    let _control = crate::tunnel_cli::serve_control_socket(&node, socket)?;
+                    let _control = crate::tunnel_cli::serve_control_socket(&node, socket);
                     crate::tunnel_cli::serve(&node, &anchors, &a.name, a.port, a.at).await
                 },
             )
@@ -1292,7 +1292,7 @@ pub fn run() -> ExitCode {
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
-                    let _control = crate::tunnel_cli::serve_control_socket(&node, socket)?;
+                    let _control = crate::tunnel_cli::serve_control_socket(&node, socket);
                     crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp).await
                 },
             )

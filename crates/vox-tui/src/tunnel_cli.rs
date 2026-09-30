@@ -171,12 +171,25 @@ fn profile_busy(socket: &std::path::Path) -> AppError {
 /// remedy that did not work. `vox serve` even printed `vox trust add <fingerprint>` as the next
 /// step, which could not be done while it ran. Now the running node answers on the socket the
 /// message names, as a `vox daemon`'s does.
+///
+/// **A socket that cannot be bound is reported, not fatal** (V210-83), as in the TUI. The verb's
+/// job — hosting a service, forwarding a port — does not depend on the socket, and a path another
+/// user can occupy first (the `$TMPDIR/vox-<uid>` fallback, `/tmp` on Linux) must not be able to
+/// stop it. A socket or directory that is not this user's is never used: `bind_at` refuses it.
 pub fn serve_control_socket(
     node: &NodeHandle,
     socket: std::path::PathBuf,
-) -> Result<vox_core::node::ipc::IpcServer, AppError> {
-    vox_core::node::ipc::bind_at(node.clone(), socket)
-        .map_err(|e| AppError::Usage(format!("control socket: {e}")))
+) -> Option<vox_core::node::ipc::IpcServer> {
+    match vox_core::node::ipc::bind_at(node.clone(), socket) {
+        Ok(server) => Some(server),
+        Err(e) => {
+            eprintln!(
+                "vox: control socket unavailable ({e}); this node runs on, but `vox trust`, \
+                 `vox room` and `vox status` will not reach it while it does"
+            );
+            None
+        }
+    }
 }
 
 pub async fn open_profile(
@@ -984,7 +997,7 @@ where
         &target.room_passphrase,
     )
     .await?;
-    let _control = serve_control_socket(&node, socket)?;
+    let _control = serve_control_socket(&node, socket);
     let handle = node.clone();
     let result = body(node, channel_id).await;
     // The verbs are one-shot; `forward` shuts the node down itself when the person
