@@ -187,22 +187,34 @@ where
         identity_passphrase,
         identity_passphrase_file,
         None,
-        body,
+        || Ok(()),
+        move |node, anchors, ()| body(node, anchors),
     )
 }
 
-/// [`run_new_room_verb`] for a verb that says what it was waiting for when SIGINT or SIGTERM
-/// stops it (`vox connect`, V210-85): with `waiting`, the whole run — the unlock too — races
-/// [`crate::tunnel_cli::a_stop_signal`], and a stop ends with [`crate::tunnel_cli::Waiting::stopped_by`].
-fn run_new_room_verb_with<F, Fut>(
+/// [`run_new_room_verb`] for a verb that says what it was waiting for when a signal stops it
+/// (`vox connect`, V210-85): with `waiting`, the whole run races
+/// [`crate::tunnel_cli::a_stop_signal`], and a stop ends with
+/// [`crate::tunnel_cli::Waiting::stopped_by`]. `ask` collects what the verb needs from the person
+/// before the identity is unlocked — `connect`'s room passphrase — and its answer is handed to
+/// `body`.
+///
+/// **The race starts before the first prompt.** The prompts ran before the handler was taken, so a
+/// connect stopped while it waited at one — reading a passphrase from a pipe, or a terminal closed
+/// under it — still died on the signal and said nothing. They run on a blocking thread now, inside
+/// the race.
+fn run_new_room_verb_with<A, T, F, Fut>(
     profile: ProfileArgs,
     identity_passphrase: Option<String>,
     identity_passphrase_file: Option<std::path::PathBuf>,
     waiting: Option<std::sync::Arc<crate::tunnel_cli::Waiting>>,
+    ask: A,
     body: F,
 ) -> ExitCode
 where
-    F: FnOnce(vox_core::node::actor::NodeHandle, BootstrapSet) -> Fut + Send + 'static,
+    A: FnOnce() -> Result<T, crate::app::AppError> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(vox_core::node::actor::NodeHandle, BootstrapSet, T) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
 {
     let paths = match profile.paths() {
@@ -214,17 +226,6 @@ where
     };
     let anchors = match profile.anchor_set() {
         Ok(a) => a,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let identity = match crate::tunnel_cli::identity_passphrase_for(
-        &paths,
-        identity_passphrase,
-        identity_passphrase_file,
-    ) {
-        Ok(p) => p,
         Err(e) => {
             eprintln!("vox: {e}");
             return ExitCode::FAILURE;
@@ -245,35 +246,61 @@ where
     let anchors_for_body = anchors.clone();
     let unlocking = waiting.clone();
     let work = async move {
+        let asking = unlocking.clone();
+        let paths_for_asking = paths.clone();
+        let (asked, identity) = tokio::task::spawn_blocking(move || {
+            let asked = ask()?;
+            if let Some(w) = &asking {
+                w.on("this profile's identity passphrase");
+            }
+            let identity = crate::tunnel_cli::identity_passphrase_for(
+                &paths_for_asking,
+                identity_passphrase,
+                identity_passphrase_file,
+            )?;
+            Ok::<_, crate::app::AppError>((asked, identity))
+        })
+        .await
+        .map_err(|e| crate::app::AppError::Usage(format!("asking for a passphrase: {e}")))??;
         if let Some(w) = &unlocking {
             w.on("this profile's identity to unlock");
         }
         let node = crate::tunnel_cli::open_profile(paths, listen, anchors, &identity).await?;
-        body(node, anchors_for_body).await
+        body(node, anchors_for_body, asked).await
     };
     let (outcome, stopped) = rt.block_on(async move {
         match waiting {
             None => (work.await, false),
+            // `biased`: the handlers are taken on the first poll, before the work's first prompt.
             Some(waiting) => tokio::select! {
-                done = work => (done, false),
+                biased;
                 signal = crate::tunnel_cli::a_stop_signal() => {
                     (Err(waiting.stopped_by(signal)), true)
                 }
+                done = work => (done, false),
             },
         }
     });
+    if stopped {
+        // A prompt stopped part-way leaves the terminal in raw mode: no echo, no line editing, in
+        // the shell it hands back to. Nothing to undo when no prompt was open.
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
     let code = match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("vox: {e}");
+            // Not `eprintln!`: after a hangup stderr can be a terminal that is gone, and a write
+            // that fails there must not turn the reason into a panic.
+            use std::io::Write as _;
+            let _ = writeln!(io::stderr(), "vox: {e}");
             e.exit_code()
         }
     };
     // **A stop is not a wait for the work it abandoned.** Dropping the runtime waits for its
     // blocking threads, and one of them can be the join's proof of work: measured, a stopped
     // `vox connect` printed why at once and then stayed alive past 15 s in a debug build,
-    // until the solve it no longer wanted finished. Nothing it was doing is kept either way —
-    // the store commits atomically, and survives a kill as it must.
+    // until the solve it no longer wanted finished. A prompt still reading is another. Nothing it
+    // was doing is kept either way — the store commits atomically, and survives a kill as it must.
     if stopped {
         rt.shutdown_background();
     }
@@ -1303,25 +1330,21 @@ pub fn run() -> ExitCode {
             )
         }
         Cmd::Connect(args) => {
-            let room_pp = match crate::tunnel_cli::room_passphrase_for(
-                args.passphrase.as_ref(),
-                args.passphrase_file.as_deref(),
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
             let a = args.clone();
             let waiting = crate::tunnel_cli::Waiting::new("the room was not joined");
             let steps = std::sync::Arc::clone(&waiting);
+            let asking = std::sync::Arc::clone(&waiting);
+            let (given, file) = (args.passphrase.clone(), args.passphrase_file.clone());
             run_new_room_verb_with(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 Some(waiting),
-                move |node, _anchors| async move {
+                move || {
+                    asking.on("the room passphrase");
+                    crate::tunnel_cli::room_passphrase_for(given.as_ref(), file.as_deref())
+                },
+                move |node, _anchors, room_pp| async move {
                     crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp, &steps).await
                 },
             )

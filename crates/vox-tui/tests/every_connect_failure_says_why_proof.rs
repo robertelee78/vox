@@ -1,5 +1,5 @@
 //! V210-85 / #277 — **every way `vox connect` ends without joining says why**, driven through the
-//! shipped binary over a relay circuit.
+//! shipped binary.
 //!
 //! Found in the relayed-restart proof: a guest's `vox connect` ended non-zero after 92.5 s with an
 //! empty stdout and an empty stderr. The transcript shows what that was: the test's watchdog had
@@ -8,40 +8,53 @@
 //! said nothing. That connect was not stuck — its sibling trials joined in 36.8–61.0 s, and the
 //! same join measured here spent **108.7 s in its own proof-of-work solve** in a debug build on a
 //! loaded machine (`join got in — … solve 108.73s …`). But it could not have said so: a `vox
-//! connect` stopped by Ctrl-C or a SIGTERM died on the signal's default action, silently, and one
-//! whose `Joined` event was lost from the lossy event stream waited for it for good.
+//! connect` stopped by Ctrl-C, a SIGTERM or a hangup died on the signal's default action, silently,
+//! and one whose `Joined` event was lost from the lossy event stream waited for it for good.
 //!
-//! What must hold, each through the anchor's circuit (the host on IPv4, the guest on `[::1]`, so
-//! the circuit is the only path — see `support/relay.rs`):
+//! What must hold. The joins go through the anchor's circuit (the host on IPv4, the guest on
+//! `[::1]`, so the circuit is the only path — see `support/relay.rs`):
 //!
-//! 1. **Stopped mid-join by SIGTERM**: exit status 143 — not death by the signal — and stderr says
-//!    `stopped by SIGTERM after …s`, that the room was not joined, and the join step it was waiting
-//!    in — naming the host, when that step waits on a member. The host is SIGSTOPped the moment the guest's
-//!    pre-join record reaches the board, so the join is left waiting on it: for its dial, or for
-//!    its answer to the proof of work. A join that ended before it could be stopped is CANNOT
-//!    MEASURE, never a pass. **And it ends when it says so**, within [`STOPS_WITHIN`] of the
-//!    signal: the first version printed its reason at once and then lived on in a debug build until
-//!    the proof of work it had abandoned finished, past 15 s.
-//! 2. **Stopped mid-join by SIGINT** (Ctrl-C): the same, with 130.
-//! 3. **The host gone** (SIGKILLed): exit status 1, `cannot join: …`, and the join's steps with the
-//!    one that failed — the host's dial — and how long each took.
-//! 4. **Refused** (a wrong room passphrase, checked by the live host): exit status 1, `cannot join:
+//! 1. **Stopped mid-join by SIGTERM, SIGINT, SIGHUP or SIGQUIT**: exit status 143, 130, 129 or
+//!    131 — not death by the signal — and stderr says `stopped by <SIGNAL> after …s`, that the room
+//!    was not joined, and the join step it was waiting in, which names the host it waited on. **And
+//!    it ends when it says so**, within [`STOPS_WITHIN`] of the signal: the first version printed
+//!    its reason at once and then lived on in a debug build until the proof of work it had
+//!    abandoned finished, past 15 s. SIGHUP is what a closed terminal or a dropped ssh session
+//!    sends; with stderr kept in a log it was the original symptom exactly.
+//! 2. **A join its host never answers** (left to run out): exit status 1, and the reason names the
+//!    host and the step that did not complete — the join exchange. The exchange's timeout used to
+//!    name nobody: the join ended on advice about members that could not be reached, for one that
+//!    had been reached and then went quiet.
+//! 3. **Refused** (a wrong room passphrase, checked by the live host): exit status 1, `cannot join:
 //!    …`, the refusal, and the steps. The refusal is the host's own answer over the circuit, so it
 //!    is also the control: this world's joins reach the host and are answered.
-//! 5. **A join that times out on its host** (SIGSTOPped as in 1, and left to run out): exit status
-//!    1, and the reason names the host and the step that did not complete — its dial, or the join
-//!    exchange. The exchange's timeout used to name nobody: the join ended on advice about members
-//!    that could not be reached, for one that had been reached and then went quiet.
+//! 4. **The host gone** (SIGKILLed): exit status 1, `cannot join: …`, and the join's steps with the
+//!    one that failed — the host's dial — and how long each took.
+//! 5. **Stopped at a passphrase prompt** — the room passphrase's, or the identity's — on a
+//!    terminal: SIGTERM gives 143 and SIGHUP 129, each naming the prompt it waited at, and the
+//!    terminal is handed back with echo and line editing on, not in the prompt's raw mode. Ctrl-C
+//!    typed at the prompt ends with a status and `cancelled`. The prompts ran before the signal
+//!    handler was taken, so a stop there died on the signal and said nothing.
 //!
-//! In every one, stderr is non-empty and the exit is a status, never a signal. Cases 1 and 4 share
-//! one world, 2 and 3 another and 5 a third, as three tests that run side by side. Each prints its
+//! In every one, stderr is non-empty and the exit is a status, never a signal. Each prints its
 //! counts.
 //!
+//! **Staging without a race.** Cases 1 and 2 need a join that is still waiting on its host when it
+//! is stopped. The first version SIGSTOPped the host once the guest's pre-join record reached the
+//! board — and the anchor shows that on a 500 ms tick, so under load the join had sometimes been
+//! answered before the host stopped, the join succeeded, and the proof called it a product red.
+//! Here the host runs with `VOX_TEST_JOIN_UNANSWERED` (inert unset): it takes every join exchange
+//! and never answers, so no join into it can get in, however late the stop lands. Each stop uses a
+//! guest of its own, so each announce shows on the board as one more pending joiner (`1m/<k>p`),
+//! and the stop is sent after that. Case 5 waits for the prompt itself on the pty: the handlers are
+//! taken before the prompt is shown, so nothing about when the signal lands is left to timing.
+//!
 //! **Mutations that must turn it red:** the verb runner printing nothing for an error; `vox
-//! connect` not taking SIGINT/SIGTERM (cases 1 and 2 die by the signal); the joiner not announcing
-//! its steps (cases 1 and 2 name no member); the exchange's timeout naming nobody (case 5); a stop
-//! that waits for the runtime's blocking work (cases 1 and 2 outlive [`STOPS_WITHIN`] in a debug
-//! build, where the solve is long).
+//! connect` not taking one of the four signals (that case dies by the signal); the prompts run
+//! before the handler is taken (case 5 dies by the signal); the terminal not handed back (case 5,
+//! still raw); the joiner not announcing its steps (case 1 names no join step); the exchange's
+//! timeout naming nobody (case 2); a stop that waits for the runtime's blocking work (case 1
+//! outlives [`STOPS_WITHIN`] in a debug build, where the solve is long).
 //!
 //! `#[ignore]`d: production Argon2id and a real PoW. Run it in release.
 
@@ -56,26 +69,32 @@ mod world;
 #[path = "support/relay.rs"]
 mod relay;
 
+use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
-use std::process::ExitStatus;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use relay::{RelayWorld, Split};
-use world::{args, VoxProc};
+use world::{args, vox_once, VoxProc, VOX};
 
 /// A `vox connect` that fails on its own must have ended by then: past the board's 30 s patience,
 /// a dial's timeout and a proof of work, with room for a loaded machine.
 const FAILS_WITHIN: Duration = Duration::from_secs(300);
 
-/// A `vox connect` sent SIGINT or SIGTERM must have ended, and said so, by then — whatever it was
-/// doing, a proof of work included.
+/// A `vox connect` sent a signal must have ended, and said so, by then — whatever it was doing, a
+/// proof of work included.
 const STOPS_WITHIN: Duration = Duration::from_secs(10);
 
-/// How long the join is left waiting on the stopped host before it is stopped itself: well inside
-/// the 10 s its dial to the host takes to give up (measured: `dial 10.00s`) and the 30 s it waits
-/// for a frame, so the stop lands mid-join and not after a failure of its own.
+/// How long the join is left waiting on its host before it is stopped: past its announce, into
+/// the dial and the exchange with a host that never answers, and well inside the 30 s the exchange
+/// waits for a frame, so the stop lands mid-join and not after a failure of its own.
 const LEFT_WAITING: Duration = Duration::from_secs(2);
+
+/// How long a `vox connect` may take to show a passphrase prompt on its terminal.
+const PROMPTS_WITHIN: Duration = Duration::from_secs(60);
 
 /// The build profile, named in every count line.
 const PROFILE: &str = if cfg!(debug_assertions) {
@@ -96,6 +115,13 @@ const JOIN_STEPS: [&str; 8] = [
     "making the room here",
 ];
 
+/// The join's steps that wait on one member, and name it.
+const MEMBER_STEPS: [&str; 3] = [
+    "waiting for member ",
+    "dialling member ",
+    "the join exchange with member ",
+];
+
 /// How a `vox connect` ended.
 struct Ended {
     status: ExitStatus,
@@ -114,15 +140,35 @@ impl Ended {
             self.stderr
         )
     }
+
+    /// The step stderr says it had waited in: what follows `it had waited <n>s for `.
+    fn waited(&self) -> &str {
+        self.stderr
+            .split("it had waited ")
+            .nth(1)
+            .and_then(|l| l.lines().next())
+            .and_then(|l| l.split_once(" for "))
+            .map(|(_, step)| step)
+            .unwrap_or_default()
+    }
 }
 
-/// Start the guest's `vox connect` with `passphrase`, on `[::1]` through the anchor's IPv6 name.
-fn start_connect(w: &RelayWorld, passphrase: &str) -> (VoxProc, Instant) {
-    let file = w.tmp.path().join("connect-passphrase");
+/// A new guest profile under `w`'s temp dir, with an identity of its own.
+fn new_guest(w: &RelayWorld, k: usize) -> PathBuf {
+    let dir = w.tmp.path().join(format!("guest-{k}"));
+    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    let (ok, _, err) = vox_once(&dir, &args(&["id"]));
+    assert!(ok, "vox id (guest {k}): {err}");
+    dir
+}
+
+/// Start `guest`'s `vox connect` with `passphrase`, on `[::1]` through the anchor's IPv6 name.
+fn start_connect(w: &RelayWorld, guest: &Path, passphrase: &str) -> (VoxProc, Instant) {
+    let file = guest.join("connect-passphrase");
     std::fs::write(&file, passphrase).unwrap();
     let proc = VoxProc::spawn(
         "connect",
-        &w.guest_dir,
+        guest,
         &args(&[
             "connect",
             &w.address,
@@ -175,7 +221,7 @@ fn finish(mut proc: VoxProc, t0: Instant, within: Duration) -> Ended {
 
 /// Send `sig` to `pid`.
 fn signal(pid: u32, sig: &str) {
-    let ok = std::process::Command::new("kill")
+    let ok = Command::new("kill")
         .args([sig, &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
@@ -183,8 +229,8 @@ fn signal(pid: u32, sig: &str) {
 }
 
 /// Wait until the anchor's board holds the host's room with its one member. The host prints its
-/// address before it has published there, and a host stopped before that leaves a board with
-/// nothing for the room: a join then fails on its own, before it ever waits on the host.
+/// address before it has published there, and a join before that fails on its own, before it ever
+/// waits on the host.
 fn until_published(w: &mut RelayWorld) {
     let held = format!("board — {} 1m", &w.room[..12]);
     w.anchor.proc.expect_within(
@@ -194,13 +240,15 @@ fn until_published(w: &mut RelayWorld) {
     );
 }
 
-/// Wait until the anchor's board holds the guest's pre-join record: the guest has unlocked, reached
-/// the board and announced itself, so its join is past its own machine and waiting on the host.
-fn until_announced(w: &mut RelayWorld) {
+/// Wait until the anchor's board holds `k` pre-join records for the room: the `k`-th guest has
+/// unlocked, reached the board and announced itself, so its join is past its own machine and
+/// waiting on the host. Every guest is a new identity, so each announce is one more.
+fn until_announced(w: &mut RelayWorld, k: usize) {
+    let pending = format!("board — {} 1m/{k}p", &w.room[..12]);
     w.anchor.proc.expect_within(
         Duration::from_secs(240),
-        "the guest's pre-join record on the anchor's board",
-        |l| l.contains("board — ") && l.contains("/1p"),
+        &format!("guest {k}'s pre-join record on the anchor's board"),
+        |l| l.contains(&pending),
     );
 }
 
@@ -225,13 +273,27 @@ fn assert_said_why(e: &Ended, case: &str, code: i32) {
     );
 }
 
-/// Cases 1 and 2: stopped by `sig` while the join waits on the host, SIGSTOPped once the guest has
-/// announced itself. The host is left stopped.
-fn stopped_mid_join(w: &mut RelayWorld, host: u32, sig: &str, name: &str, code: i32) -> Ended {
-    until_published(w);
-    let (mut connect, t0) = start_connect(w, &w.passphrase.clone());
-    until_announced(w);
-    signal(host, "-STOP");
+/// What every stop must say: how long it ran, that the room was not joined, and what it waited for.
+fn assert_says_stopped(e: &Ended, case: &str, name: &str) {
+    for want in [
+        format!("stopped by {name} after "),
+        "the room was not joined".to_owned(),
+        "it had waited ".to_owned(),
+    ] {
+        assert!(
+            e.stderr.contains(&want),
+            "{case}: stderr does not say {want:?} — it must say how long it ran, that the room \
+             was not joined, and the step it was waiting in.\n{}",
+            e.describe()
+        );
+    }
+}
+
+/// Case 1: guest `k` stopped by `sig` while its join waits on a host that never answers.
+fn stopped_mid_join(w: &mut RelayWorld, k: usize, sig: &str, name: &str, code: i32) {
+    let guest = new_guest(w, k);
+    let (mut connect, t0) = start_connect(w, &guest, &w.passphrase.clone());
+    until_announced(w, k);
     std::thread::sleep(LEFT_WAITING);
     if let Ok(Some(status)) = connect.child.try_wait() {
         panic!(
@@ -250,31 +312,11 @@ fn stopped_mid_join(w: &mut RelayWorld, host: u32, sig: &str, name: &str, code: 
     );
     let case = format!("stopped by {name}");
     assert_said_why(&e, &case, code);
-    let host12 = &w.host_fp[..12];
-    for want in [
-        format!("stopped by {name} after "),
-        "the room was not joined".to_owned(),
-        "it had waited ".to_owned(),
-    ] {
-        assert!(
-            e.stderr.contains(&want),
-            "{case}: stderr does not say {want:?} — it must say how long it ran, that the room \
-             was not joined, and the step it was waiting in.\n{}",
-            e.describe()
-        );
-    }
-    // Which step the stop lands in depends on how far the join got before the host stopped — a
-    // member step, or the room being made after the host had answered — but it is always one of the
-    // join's own, never the verb's fallback ("the node to take the join"). A step that waits on a
-    // member names it.
-    let waited = e
-        .stderr
-        .split("it had waited ")
-        .nth(1)
-        .and_then(|l| l.lines().next())
-        .and_then(|l| l.split_once(" for "))
-        .map(|(_, step)| step)
-        .unwrap_or_default();
+    assert_says_stopped(&e, &case, name);
+    // Past its announce the join waits on the host — to be dialled, or to answer the exchange —
+    // and the host never answers, so the step is one of the join's own that waits on a member,
+    // never the verb's fallback ("the node to take the join"), and the member is the host.
+    let waited = e.waited();
     let step = JOIN_STEPS
         .iter()
         .find(|s| waited.starts_with(*s))
@@ -285,15 +327,21 @@ fn stopped_mid_join(w: &mut RelayWorld, host: u32, sig: &str, name: &str, code: 
             )
         });
     assert!(
-        !waited.contains("member ") || waited.contains(&format!("member {host12}")),
+        MEMBER_STEPS.contains(step),
+        "{case}: it waited in {waited:?}, but a join past its announce into a host that never \
+         answers waits on that host.\n{}",
+        e.describe()
+    );
+    let host12 = &w.host_fp[..12];
+    assert!(
+        waited.starts_with(&format!("{step}{host12}")),
         "{case}: it waited on a member, but not the host {host12}.\n{}",
         e.describe()
     );
-    eprintln!("[proof] ({PROFILE}) {name}: stopped in the step {step:?}");
-    e
+    eprintln!("[proof] ({PROFILE}) {name}: stopped in the step {step:?} on the host");
 }
 
-/// Cases 3 and 4: a join that fails on its own.
+/// Cases 2–4: a join that fails on its own.
 fn failed_join(e: &Ended, case: &str, also: &[&str]) {
     assert_said_why(e, case, 1);
     for want in ["cannot join: ", "join did not get in — "]
@@ -310,15 +358,61 @@ fn failed_join(e: &Ended, case: &str, also: &[&str]) {
 
 #[test]
 #[ignore = "production Argon2id + a real PoW, a relayed world of real `vox` processes; run in release"]
-fn a_connect_stopped_by_sigterm_or_refused_says_why() {
+fn a_connect_stopped_by_a_signal_or_never_answered_says_why() {
     watchdog::arm();
-    // SIGTERM mid-join, then a refusal.
-    let mut w = RelayWorld::new(Split::Families);
-    let host = w.host.as_ref().expect("a host").child.id();
-    stopped_mid_join(&mut w, host, "-TERM", "SIGTERM", 143);
-    signal(host, "-CONT");
+    let mut w = RelayWorld::with_host_env(Split::Families, &[("VOX_TEST_JOIN_UNANSWERED", "1")]);
+    until_published(&mut w);
+    let stops = [
+        ("-TERM", "SIGTERM", 143),
+        ("-INT", "SIGINT", 130),
+        ("-HUP", "SIGHUP", 129),
+        ("-QUIT", "SIGQUIT", 131),
+    ];
+    for (k, (sig, name, code)) in stops.iter().enumerate() {
+        stopped_mid_join(&mut w, k + 1, sig, name, *code);
+    }
 
-    let (c, t0) = start_connect(&w, "not-the-room-passphrase");
+    // Left to run out on the host that never answers.
+    let host12 = w.host_fp[..12].to_owned();
+    let guest = new_guest(&w, stops.len() + 1);
+    let (connect, t0) = start_connect(&w, &guest, &w.passphrase.clone());
+    let e = finish(connect, t0, FAILS_WITHIN);
+    let exchange = format!("{host12}: exchange (incl. solve) ");
+    failed_join(&e, "never answered", &[&exchange]);
+    let reason = e
+        .stderr
+        .lines()
+        .find(|l| l.starts_with("vox: cannot join: "))
+        .unwrap_or_default();
+    assert!(
+        reason.contains(&host12),
+        "never answered: the reason does not name the host {host12}, the member the join waited \
+         on.\n{}",
+        e.describe()
+    );
+    eprintln!(
+        "[proof] ({PROFILE}) never answered: status {} in {:.1}s, the reason names the host",
+        e.status,
+        e.took.as_secs_f64()
+    );
+    eprintln!(
+        "[proof] ({PROFILE}) {}/{} failures said why (SIGTERM, SIGINT, SIGHUP, SIGQUIT, never \
+         answered)",
+        stops.len() + 1,
+        stops.len() + 1
+    );
+}
+
+#[test]
+#[ignore = "production Argon2id + a real PoW, a relayed world of real `vox` processes; run in release"]
+fn a_refused_connect_and_one_without_its_host_say_why() {
+    watchdog::arm();
+    let mut w = RelayWorld::new(Split::Families);
+    let host12 = w.host_fp[..12].to_owned();
+    until_published(&mut w);
+
+    let guest = w.guest_dir.clone();
+    let (c, t0) = start_connect(&w, &guest, "not-the-room-passphrase");
     let e = finish(c, t0, FAILS_WITHIN);
     // The host checks the passphrase only after the joiner's proof of work, and gives up on a solve
     // that outlasts its patience: in a debug build on a loaded machine the solve alone has taken
@@ -342,22 +436,12 @@ fn a_connect_stopped_by_sigterm_or_refused_says_why() {
         e.status,
         e.took.as_secs_f64()
     );
-    eprintln!("[proof] ({PROFILE}) 2/2 failures said why (SIGTERM, refused)");
-}
 
-#[test]
-#[ignore = "production Argon2id + a real PoW, a relayed world of real `vox` processes; run in release"]
-fn a_connect_stopped_by_sigint_or_left_without_its_host_says_why() {
-    watchdog::arm();
-    // SIGINT mid-join, then the host gone.
-    let mut w = RelayWorld::new(Split::Families);
-    let host = w.host.as_ref().expect("a host").child.id();
-    let host12 = w.host_fp[..12].to_owned();
-    stopped_mid_join(&mut w, host, "-INT", "SIGINT", 130);
-    drop(w.host.take());
-    eprintln!("[test] host pid {host} killed and reaped");
-
-    let (c, t0) = start_connect(&w, &w.passphrase.clone());
+    let host = w.host.take().expect("a host");
+    let pid = host.child.id();
+    drop(host);
+    eprintln!("[test] host pid {pid} killed and reaped");
+    let (c, t0) = start_connect(&w, &guest, &w.passphrase.clone());
     let e = finish(c, t0, FAILS_WITHIN);
     let dial = format!("{host12}: dial");
     failed_join(&e, "the host gone", &[&dial]);
@@ -366,50 +450,244 @@ fn a_connect_stopped_by_sigint_or_left_without_its_host_says_why() {
         e.status,
         e.took.as_secs_f64()
     );
-    eprintln!("[proof] ({PROFILE}) 2/2 failures said why (SIGINT, the host gone)");
+    eprintln!("[proof] ({PROFILE}) 2/2 failures said why (refused, the host gone)");
+}
+
+/// A `vox connect` on a terminal of its own: stdin and stdout on a pty, stderr on a pipe.
+struct OnTerminal {
+    child: Child,
+    /// The pty's other end, kept to read the terminal's modes after the connect has ended.
+    terminal: std::os::fd::OwnedFd,
+    /// Everything the connect drew on its terminal, read as it arrives: a process that exits with
+    /// output nobody has read cannot finish exiting on macOS.
+    shown: Arc<Mutex<Vec<u8>>>,
+    /// The pty's controlling side, to type on.
+    keys: std::fs::File,
+    stderr: mpsc::Receiver<String>,
+    t0: Instant,
+}
+
+impl OnTerminal {
+    /// `vox connect` for `profile`, with no identity passphrase in its environment, and the room
+    /// passphrase from `room_file` or else prompted for.
+    fn start(profile: &Path, room_file: Option<&Path>) -> Self {
+        use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
+        let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("openpt");
+        grantpt(&controller).expect("grantpt");
+        unlockpt(&controller).expect("unlockpt");
+        let name = ptsname(&controller, Vec::new()).expect("ptsname");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(name.to_str().expect("a pty name"))
+                .expect("open the pty")
+        };
+        let terminal: std::os::fd::OwnedFd = open().into();
+        // Nothing reads this address before both prompts are answered: the stop lands first.
+        let mut a = vec![
+            "connect".to_owned(),
+            "vox://not-read-before-the-prompts".to_owned(),
+        ];
+        if let Some(f) = room_file {
+            a.push("--passphrase-file".to_owned());
+            a.push(f.to_str().unwrap().to_owned());
+        }
+        let mut child = Command::new(VOX)
+            .args(&a)
+            .env("VOX_DATA_DIR", profile)
+            .env("VOX_CONFIG_DIR", profile.join("cfg"))
+            .env_remove("VOX_IDENTITY_PASSPHRASE")
+            .env_remove("VOX_ROOM_PASSPHRASE")
+            .stdin(Stdio::from(open()))
+            .stdout(Stdio::from(open()))
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vox connect on a pty");
+        let t0 = Instant::now();
+        let mut screen = std::fs::File::from(controller);
+        let keys = screen.try_clone().expect("the pty, to type on");
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let into = Arc::clone(&shown);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = screen.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                into.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        let (tx, stderr) = mpsc::channel();
+        let err = child.stderr.take().expect("stderr");
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            terminal,
+            shown,
+            keys,
+            stderr,
+            t0,
+        }
+    }
+
+    /// Wait until the connect shows `prompt` on its terminal.
+    fn until_prompted(&mut self, prompt: &str) {
+        let deadline = Instant::now() + PROMPTS_WITHIN;
+        loop {
+            let shown = String::from_utf8_lossy(&self.shown.lock().unwrap()).into_owned();
+            if shown.contains(prompt) {
+                return;
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "CANNOT MEASURE: `vox connect` ended ({status}) before it showed {prompt:?}. \
+                     Its terminal:\n{shown}\n--- stderr:\n{}",
+                    self.stderr.try_iter().collect::<Vec<_>>().join("\n")
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "`vox connect` did not show {prompt:?} within {PROMPTS_WITHIN:?}. Its terminal:\n{shown}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Read what it says on stderr until the pipe closes, and reap it; panics past [`STOPS_WITHIN`].
+    fn finish(mut self) -> (Ended, rustix::termios::Termios) {
+        let deadline = Instant::now() + STOPS_WITHIN;
+        let mut stderr = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "`vox connect` had not ended {STOPS_WITHIN:?} after it was due to. It said:\n{}",
+                stderr.join("\n")
+            );
+            match self.stderr.recv_timeout(left.min(Duration::from_secs(1))) {
+                Ok(line) => stderr.push(line),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let status = self.child.wait().expect("reap vox connect");
+        let modes = rustix::termios::tcgetattr(&self.terminal).expect("the terminal's modes");
+        let ended = Ended {
+            status,
+            took: self.t0.elapsed(),
+            stdout: String::from_utf8_lossy(&self.shown.lock().unwrap()).into_owned(),
+            stderr: stderr.join("\n"),
+        };
+        eprintln!(
+            "[connect] {}",
+            ended.describe().replace('\n', "\n[connect] ")
+        );
+        (ended, modes)
+    }
+}
+
+impl Drop for OnTerminal {
+    fn drop(&mut self) {
+        // By its own PID, and reaped.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The terminal a stopped prompt hands back must echo and edit lines again.
+fn assert_terminal_handed_back(modes: &rustix::termios::Termios, case: &str, e: &Ended) {
+    use rustix::termios::LocalModes;
+    assert!(
+        modes
+            .local_modes
+            .contains(LocalModes::ECHO | LocalModes::ICANON),
+        "{case}: the terminal was left without echo or line editing (local modes {:?}) — the \
+         prompt's raw mode, handed back to the shell.\n{}",
+        modes.local_modes,
+        e.describe()
+    );
+}
+
+/// Case 5: stopped at a prompt by `sig`, it says so, names the prompt, and hands the terminal back.
+fn stopped_at_prompt(
+    profile: &Path,
+    room_file: Option<&Path>,
+    prompt: &str,
+    stop: (&str, &str, i32),
+    waited_for: &str,
+) {
+    let (sig, name, code) = stop;
+    let mut c = OnTerminal::start(profile, room_file);
+    c.until_prompted(prompt);
+    signal(c.child.id(), sig);
+    let (e, modes) = c.finish();
+    let case = format!("{name} at the {prompt:?} prompt");
+    assert_said_why(&e, &case, code);
+    assert_says_stopped(&e, &case, name);
+    assert_eq!(
+        e.waited(),
+        waited_for,
+        "{case}: it does not say it had waited for {waited_for:?}.\n{}",
+        e.describe()
+    );
+    assert_terminal_handed_back(&modes, &case, &e);
+    eprintln!(
+        "[proof] ({PROFILE}) {case}: status {}, waited for {waited_for:?}, terminal handed back",
+        e.status
+    );
 }
 
 #[test]
-#[ignore = "production Argon2id + a real PoW, a relayed world of real `vox` processes; run in release"]
-fn a_relayed_join_that_times_out_names_its_host_and_the_step() {
+#[ignore = "production Argon2id for the profile's identity; run in release"]
+fn a_connect_stopped_at_a_passphrase_prompt_says_why() {
     watchdog::arm();
-    let mut w = RelayWorld::new(Split::Families);
-    let host = w.host.as_ref().expect("a host").child.id();
-    let host12 = w.host_fp[..12].to_owned();
-    until_published(&mut w);
-    let (connect, t0) = start_connect(&w, &w.passphrase.clone());
-    until_announced(&mut w);
-    signal(host, "-STOP");
-    let e = finish(connect, t0, FAILS_WITHIN);
-    failed_join(&e, "timed out on the host", &[]);
-    let reason = e
-        .stderr
-        .lines()
-        .find(|l| l.starts_with("vox: cannot join: "))
-        .unwrap_or_default();
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = tmp.path().join("guest");
+    std::fs::create_dir_all(profile.join("cfg")).unwrap();
+    let (ok, _, err) = vox_once(&profile, &args(&["id"]));
+    assert!(ok, "vox id: {err}");
+    let room_file = tmp.path().join("room-passphrase");
+    std::fs::write(&room_file, "a room passphrase").unwrap();
+
+    stopped_at_prompt(
+        &profile,
+        None,
+        "room passphrase: ",
+        ("-TERM", "SIGTERM", 143),
+        "the room passphrase",
+    );
+    stopped_at_prompt(
+        &profile,
+        Some(&room_file),
+        "identity passphrase: ",
+        ("-HUP", "SIGHUP", 129),
+        "this profile's identity passphrase",
+    );
+
+    // Ctrl-C typed at the prompt is a key on a raw terminal, not a signal: the prompt's own "no".
+    let mut c = OnTerminal::start(&profile, Some(&room_file));
+    c.until_prompted("identity passphrase: ");
+    std::io::Write::write_all(&mut c.keys, b"\x03").expect("type Ctrl-C");
+    let (e, modes) = c.finish();
+    let case = "Ctrl-C at the identity passphrase prompt";
+    assert_said_why(&e, case, 1);
     assert!(
-        reason.contains(&host12),
-        "timed out on the host: the reason does not name the host {host12}, the member the join \
-         waited on.\n{}",
+        e.stderr.contains("cancelled"),
+        "{case}: stderr does not say it was cancelled.\n{}",
         e.describe()
     );
-    let step = [
-        format!("{host12}: exchange (incl. solve) "),
-        format!("{host12}: dial "),
-    ]
-    .into_iter()
-    .find(|s| e.stderr.contains(s.as_str()))
-    .unwrap_or_else(|| {
-        panic!(
-            "timed out on the host: the steps do not name the host's dial or join exchange as the \
-             one that did not complete.\n{}",
-            e.describe()
-        )
-    });
-    signal(host, "-CONT");
+    assert_terminal_handed_back(&modes, case, &e);
     eprintln!(
-        "[proof] ({PROFILE}) timed out on the host: status {} in {:.1}s, step {step:?}",
-        e.status,
-        e.took.as_secs_f64()
+        "[proof] ({PROFILE}) {case}: status {}, said it was cancelled",
+        e.status
     );
+    eprintln!("[proof] ({PROFILE}) 3/3 stops at a prompt said why (SIGTERM, SIGHUP, Ctrl-C)");
 }

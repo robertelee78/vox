@@ -239,6 +239,11 @@ impl RelayWorld {
 
     /// Anchor, and a host serving a loopback echo service with the guest already trusted.
     pub fn new(split: Split) -> Self {
+        Self::with_host_env(split, &[])
+    }
+
+    /// [`RelayWorld::new`] with extra environment for the host, for the proofs' test-only knobs.
+    pub fn with_host_env(split: Split, host_env: &[(&str, &str)]) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let (anchor_dir, host_dir, guest_dir) = (
             tmp.path().join("anchor"),
@@ -263,7 +268,7 @@ impl RelayWorld {
         assert!(ok, "trust add: {out}\n{err}");
 
         let service = echo_service().to_string();
-        let mut host = VoxProc::spawn(
+        let mut host = VoxProc::spawn_env(
             "host",
             &host_dir,
             &args(&[
@@ -274,6 +279,7 @@ impl RelayWorld {
                 "--listen",
                 "127.0.0.1:0",
             ]),
+            host_env,
         );
         let room = after_label(
             &host.expect_line("room", |l| l.starts_with("room ")),

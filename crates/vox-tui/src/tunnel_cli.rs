@@ -630,9 +630,9 @@ pub async fn connect(
 /// What a one-shot verb is waiting for, and since when: what it says when it is stopped before it
 /// finishes (V210-85).
 ///
-/// A `vox connect` stopped by Ctrl-C or a SIGTERM died on the signal's default action and printed
-/// nothing, so a person — or a proof reading its stderr — got a non-zero exit with no reason at
-/// all, after however long it had been joining. A SIGKILL cannot be answered; these two can.
+/// A `vox connect` stopped by Ctrl-C, a SIGTERM or a hangup died on the signal's default action and
+/// printed nothing, so a person — or a proof reading its stderr — got a non-zero exit with no reason
+/// at all, after however long it had been joining. A SIGKILL cannot be answered; these can.
 pub struct Waiting {
     started: Instant,
     /// What the verb could not finish without.
@@ -690,6 +690,10 @@ pub enum StopSignal {
     Interrupt,
     /// A service manager's, or `kill`'s.
     Terminate,
+    /// The terminal went away: a closed window, a dropped ssh session.
+    Hangup,
+    /// `Ctrl-\`.
+    Quit,
 }
 
 impl StopSignal {
@@ -697,6 +701,8 @@ impl StopSignal {
         match self {
             StopSignal::Interrupt => "SIGINT",
             StopSignal::Terminate => "SIGTERM",
+            StopSignal::Hangup => "SIGHUP",
+            StopSignal::Quit => "SIGQUIT",
         }
     }
 
@@ -704,39 +710,50 @@ impl StopSignal {
         match self {
             StopSignal::Interrupt => 130,
             StopSignal::Terminate => 143,
+            StopSignal::Hangup => 129,
+            StopSignal::Quit => 131,
         }
     }
 }
 
-/// The first SIGINT or SIGTERM.
+/// The first SIGINT, SIGTERM, SIGHUP or SIGQUIT.
 ///
 /// **Taking one replaces its default action for the rest of the process**, so only a verb that
 /// races this for its whole run may call it: anywhere else, Ctrl-C would stop doing anything.
+///
+/// SIGHUP is the one a dropped ssh session or a closed terminal sends, and with stderr kept in a
+/// log it was the original symptom exactly: a non-zero exit that said nothing (V210-85).
 pub async fn a_stop_signal() -> StopSignal {
     #[cfg(unix)]
     {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            // A handler that could not be taken is not a signal: that branch just never fires.
-            Ok(mut term) => tokio::select! {
-                Ok(()) = tokio::signal::ctrl_c() => StopSignal::Interrupt,
-                Some(()) = term.recv() => StopSignal::Terminate,
-                else => std::future::pending().await,
-            },
-            Err(_) => interrupt().await,
-        }
+        use tokio::signal::unix::{signal, SignalKind};
+        // A handler that could not be taken is not a signal: that one just never fires.
+        let mut stops = [
+            (SignalKind::interrupt(), StopSignal::Interrupt),
+            (SignalKind::terminate(), StopSignal::Terminate),
+            (SignalKind::hangup(), StopSignal::Hangup),
+            (SignalKind::quit(), StopSignal::Quit),
+        ]
+        .map(|(kind, stop)| (signal(kind).ok(), stop));
+        std::future::poll_fn(|cx| {
+            for (taken, stop) in &mut stops {
+                if let Some(taken) = taken {
+                    if let std::task::Poll::Ready(Some(())) = taken.poll_recv(cx) {
+                        return std::task::Poll::Ready(*stop);
+                    }
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await
     }
     #[cfg(not(unix))]
     {
-        interrupt().await
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        StopSignal::Interrupt
     }
-}
-
-/// Ctrl-C, or never.
-async fn interrupt() -> StopSignal {
-    if tokio::signal::ctrl_c().await.is_err() {
-        std::future::pending::<()>().await;
-    }
-    StopSignal::Interrupt
 }
 
 /// `vox up` — the local entry point: a SOCKS5 proxy carrying one room's services
