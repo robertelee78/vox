@@ -13,26 +13,38 @@
 //! few at a time, so their first connections are not the burst being measured, and the anchor must
 //! report all of them connected. Then the anchor is **stopped** (SIGINT, as a person stops it: it
 //! closes every connection, so every member learns at once and redials together), kept down for
-//! [`DOWN`], and brought back **on the same port** from the same profile.
+//! [`DOWN`], and brought back **on the same port** from the same profile. Once it is listening it
+//! is held for [`HELD`] (SIGSTOP, then SIGCONT, by its PID), as an anchor busy starting up is: the
+//! members' redials queue in its socket and it meets them all at once. The bound runs from SIGCONT.
+//!
+//! **Why the hold.** Without it, on an 18-core machine, the redials arrive spread over each
+//! member's tick and QUIC retransmit schedule, and each handshake ends in milliseconds: measured,
+//! the burst never reached the cap, and the old code and the new both had all 300 back 4.03 s after
+//! the restart. The run measured nothing, and said CANNOT MEASURE. The defect needs the redials to
+//! meet the anchor together, which is what fix-v210-70's 300 simultaneous dials did, and what a
+//! slower anchor, or one that takes a moment to start, sees.
 //!
 //! **Asserted:**
-//! - the restarted anchor reports all [`MEMBERS`] peers connected within [`BACK_WITHIN`] of its
-//!   return — its own `N peer(s) connected` line, read as it is printed;
-//! - the burst reached the cap (the anchor says attempts waited for a handshake slot — otherwise
-//!   the run measured nothing and says CANNOT MEASURE), never more than [`CAP`] handshakes ran at
-//!   once while they waited, and none was refused.
+//! - the restarted anchor reports all [`MEMBERS`] peers connected within [`BACK_WITHIN`] of
+//!   SIGCONT — its own `N peer(s) connected` line, read as it is printed;
+//! - the burst reached the cap (the anchor says attempts waited for a handshake slot, or were
+//!   refused — otherwise the run measured nothing and says CANNOT MEASURE), never more than [`CAP`]
+//!   handshakes ran at once meanwhile, and **none was refused**.
 //!
-//! The in-flight count is the anchor's own report ([`NodeEvent::HandshakesQueued`]); nothing
-//! outside the process can see a handshake slot. The bound is observed from outside.
+//! The in-flight and refused counts are the anchor's own report ([`NodeEvent::HandshakesQueued`],
+//! said once a burst has nobody left waiting; a refusal with nobody waiting is a burst of its own,
+//! so no refusal goes unsaid). Nothing outside the process can see a handshake slot, and a member's
+//! daemon prints nothing about its anchor dials. The bound is observed from outside.
 //!
-//! **Why the bound separates the two:** with refusals, the members past the cap each wait a backoff
-//! step, then meet the cap again with the next ones, and the last of them come back on a doubling
-//! backoff many seconds later (the old code measured below); waiting for a slot brings every one in
-//! within the same burst.
+//! **What the bound does not separate, stated:** on this machine the old code met it too. Measured
+//! with the hold, the old code had all 300 back 2.47 s after SIGCONT, the new 0.95 s: a refused
+//! member's first backoff is a single second, and on 18 cores the next wave fits under the cap.
+//! What separates the two is the refusals, so the old code goes red on those. The bound stays, as the
+//! acceptance's "within a hard-coded bound".
 //!
 //! Mutations (each must go red):
 //! - validated attempts past the cap refused again (`HANDSHAKES_WAITING` = 0, the old behaviour)
-//!   → red on the bound;
+//!   → red on the refusals;
 //! - the cap raised (`HANDSHAKES_IN_FLIGHT` = 100) → red on the cap.
 //!
 //! [`NodeEvent::HandshakesQueued`]: vox_core::node::api::NodeEvent::HandshakesQueued
@@ -57,6 +69,8 @@ const MEMBERS: usize = 300;
 const CAP: usize = 64;
 /// How long the anchor stays down.
 const DOWN: Duration = Duration::from_secs(3);
+/// How long the restarted anchor is held (SIGSTOP) once it is listening, so the redials meet it at once.
+const HELD: Duration = Duration::from_secs(3);
 /// How soon after the anchor is back every member must be connected to it again.
 const BACK_WITHIN: Duration = Duration::from_secs(10);
 /// How long the members get to connect the first time, before anything is measured.
@@ -152,6 +166,19 @@ fn every_member_is_back_after_an_anchor_restart() {
         &anchor_dir,
         &args(&["node", "--listen", &listen]),
     );
+    anchor.expect_line("the restarted anchor's --anchor spec", |l| {
+        l.contains("@/ip4/127.0.0.1/udp/")
+    });
+    // Held as a slow start holds it: bound, and reading nothing. The members' redials queue in
+    // its socket and reach it together when it goes on (see the header).
+    let pid = anchor.child.id().to_string();
+    let _ = std::process::Command::new("kill")
+        .args(["-STOP", &pid])
+        .status();
+    std::thread::sleep(HELD);
+    let _ = std::process::Command::new("kill")
+        .args(["-CONT", &pid])
+        .status();
     let back = Instant::now();
 
     // ---- every member is connected again within BACK_WITHIN ------------------------------------
@@ -165,15 +192,19 @@ fn every_member_is_back_after_an_anchor_restart() {
         "[proof] after the restart: {most}/{MEMBERS} members connected, the last {at:?} after the \
          anchor was back (bound {BACK_WITHIN:?})"
     );
-    // The burst's report comes when none is left waiting, which may be a moment after the count.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut said = None;
-    while said.is_none() && Instant::now() < deadline {
-        anchor.transcript();
-        said = anchor.seen.iter().find(|l| l.contains(WAITED)).cloned();
-        std::thread::sleep(Duration::from_millis(100));
+    // A burst's report comes once none is left waiting, which may be a moment after the count.
+    std::thread::sleep(Duration::from_secs(8));
+    anchor.transcript();
+    let said: Vec<String> = anchor
+        .seen
+        .iter()
+        .filter(|l| l.contains(WAITED))
+        .cloned()
+        .collect();
+    eprintln!("[proof] the anchor said, {} report(s):", said.len());
+    for l in said.iter().take(5) {
+        eprintln!("[proof]   {l}");
     }
-    eprintln!("[proof] the anchor said: {said:?}");
     assert!(
         most >= MEMBERS,
         "only {most} of {MEMBERS} members were connected again within {:?} of the anchor's \
@@ -188,16 +219,9 @@ fn every_member_is_back_after_an_anchor_restart() {
         anchor.transcript()
     );
 
-    // ---- the cap held ---------------------------------------------------------------------------
-    let said = said.unwrap_or_else(|| {
-        panic!(
-            "CANNOT MEASURE: the anchor never said attempts waited for a handshake slot, so the \
-             burst never reached the cap of {CAP}\n{}",
-            anchor.transcript()
-        )
-    });
-    let number = |after: &str| -> usize {
-        said.split(after)
+    // ---- the cap held, and nobody was refused ---------------------------------------------------
+    let number = |line: &str, after: &str| -> usize {
+        line.split(after)
             .nth(1)
             .and_then(|r| r.split_whitespace().next())
             .and_then(|n| {
@@ -205,18 +229,33 @@ fn every_member_is_back_after_an_anchor_restart() {
                     .parse()
                     .ok()
             })
-            .unwrap_or_else(|| panic!("no number after {after:?} in {said:?}"))
+            .unwrap_or_else(|| panic!("no number after {after:?} in {line:?}"))
     };
-    let (waited, running, refused) = (number("vox node: "), number("while at most "), number("; "));
+    let (mut waited, mut running, mut refused) = (0, 0, 0);
+    for l in &said {
+        waited += number(l, "vox node: ");
+        running = running.max(number(l, "while at most "));
+        refused += number(l, "; ");
+    }
     eprintln!(
         "[proof] {waited} attempts waited, at most {running} handshakes ran at once (cap {CAP}), \
-         {refused} refused"
+         {refused} refused, over {} report(s)",
+        said.len()
+    );
+    assert!(
+        waited + refused > 0,
+        "CANNOT MEASURE: the anchor never said attempts waited for a handshake slot or were \
+         refused, so the burst never reached the cap of {CAP}\n{}",
+        anchor.transcript()
     );
     assert!(
         running <= CAP,
-        "{running} handshakes ran at once, over the cap of {CAP}: {said}"
+        "{running} handshakes ran at once, over the cap of {CAP}: {said:#?}"
     );
-    assert_eq!(refused, 0, "attempts were refused at the cap: {said}");
+    assert_eq!(
+        refused, 0,
+        "{refused} attempts were refused at the cap instead of waiting for a slot: {said:#?}"
+    );
 }
 
 /// A `vox daemon` for the profile at `dir`, pointed at the anchor `spec`.
@@ -262,6 +301,7 @@ fn wait_for_peers(
                 {
                     if n > most {
                         (most, at) = (n, t0.elapsed());
+                        eprintln!("[proof]   {n} peer(s) connected at {at:?}");
                     }
                 }
                 anchor.seen.push(line);

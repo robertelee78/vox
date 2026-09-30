@@ -1178,7 +1178,8 @@ fn spawn_stream_loop(
 ///   those members are in within the burst instead of on a backoff.
 ///
 /// Waiting holds a pending attempt (its first packets, which quinn bounds), not a handshake.
-/// When a burst has waited, the node says how it went ([`NodeEvent::HandshakesQueued`]).
+/// When a burst has waited or been refused, the node says how it went
+/// ([`NodeEvent::HandshakesQueued`]).
 ///
 /// **Residual, stated rather than implied:** 64 *validated* handshakes that stall still
 /// deny service for up to `HANDSHAKE_TIMEOUT` each. Bounded, and far better than a single
@@ -1207,8 +1208,17 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
                 continue;
             }
             let Ok(place) = Arc::clone(&queue).try_acquire_owned() else {
-                lock_burst(&burst).refused += 1;
+                let over = {
+                    let mut b = lock_burst(&burst);
+                    b.refused += 1;
+                    b.over()
+                };
                 incoming.refuse();
+                // Without waiting: this loop never waits (see above), and a report lost to a full
+                // queue costs nothing but the report.
+                if let Some(over) = over {
+                    let _ = tx.try_send(over);
+                }
                 continue;
             };
             lock_burst(&burst).enter(&gate);
@@ -1335,6 +1345,12 @@ impl Burst {
     fn leave(&mut self, waited: Duration) -> Option<NetEvent> {
         self.waiting -= 1;
         self.longest = self.longest.max(waited);
+        self.over()
+    }
+
+    /// When nothing is left waiting, the burst is over: what it came to, to be said. A refusal
+    /// with nothing waiting is a burst of its own, so no refusal goes unsaid.
+    fn over(&mut self) -> Option<NetEvent> {
         (self.waiting == 0).then(|| {
             let b = std::mem::take(self);
             NetEvent::HandshakesQueued {

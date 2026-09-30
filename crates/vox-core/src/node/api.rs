@@ -762,8 +762,8 @@ pub enum NodeEvent {
         note: String,
     },
     /// More peers dialled this node at once than it runs handshakes for, and the ones past the
-    /// cap waited for a slot (V210-86): said once per burst, when none is left waiting, so an
-    /// operator can see a burst was absorbed, or how many were turned away.
+    /// cap waited for a slot or were refused (V210-86): said once per burst, when none is left
+    /// waiting, so an operator can see a burst was absorbed, or how many were turned away.
     HandshakesQueued {
         /// How many attempts waited for a slot.
         waited: usize,
