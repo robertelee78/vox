@@ -225,6 +225,11 @@ fn a_cli_failure_tells_the_truth() {
     };
     let (anchor_dir, host_dir, joiner_dir) = (dir("anchor"), dir("host"), dir("joiner"));
     let quick = Duration::from_secs(90);
+    // A join's exchange includes the joiner's proof-of-work solve, which a debug build runs
+    // ~50× slower than release, and whose nonce search is geometric: five debug runs measured the
+    // exchange at 22–77 s, and one ran past 90 s. Release joins take 1–7 s. A join's bound only
+    // decides CANNOT MEASURE, never a claim, so it is sized for the debug build's tail.
+    let join_within = Duration::from_secs(240);
     let bound = Duration::from_secs(30);
     let mut claims = 0usize;
 
@@ -284,7 +289,7 @@ fn a_cli_failure_tells_the_truth() {
             &joiner_dir,
             &["room", "join", &address, "--name", "svc"],
             "not the passphrase\n",
-            quick,
+            join_within,
         ),
     );
     eprintln!(
@@ -316,7 +321,7 @@ fn a_cli_failure_tells_the_truth() {
             &joiner_dir,
             &["room", "join", &address, "--name", "svc"],
             &format!("{passphrase}\n"),
-            quick,
+            join_within,
         ),
     );
     eprintln!(
