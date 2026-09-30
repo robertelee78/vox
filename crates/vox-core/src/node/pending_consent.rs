@@ -16,6 +16,8 @@
 
 use std::collections::BTreeMap;
 
+use zeroize::Zeroizing;
+
 use crate::atrest::sek::Sek;
 use crate::atrest::sek::NONCE_LEN;
 use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
@@ -52,16 +54,21 @@ const MAX_PENDING: usize = MAX_TRUSTED * 16;
 const MAX_SKDM: usize = 16 * 1024;
 
 /// `(room, member) → the SKDM taken when this identity decided to consent to that member`.
+///
+/// An SKDM carries a chain key of this identity's sender key, so each is zeroized when it is
+/// dropped: when delivered, when forgotten, and when the node locks (V210-76).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PendingConsents {
-    entries: BTreeMap<(Digest32, Digest32), Vec<u8>>,
+    entries: BTreeMap<(Digest32, Digest32), Zeroizing<Vec<u8>>>,
 }
 
 impl PendingConsents {
     /// The SKDM (wire form) held for `target` in `channel_id`, if any.
     #[must_use]
     pub fn get(&self, channel_id: &Digest32, target: &Digest32) -> Option<&[u8]> {
-        self.entries.get(&(*channel_id, *target)).map(Vec::as_slice)
+        self.entries
+            .get(&(*channel_id, *target))
+            .map(|skdm| skdm.as_slice())
     }
 
     /// Hold `skdm` (wire form) as the key to release to `target` in `channel_id`, unless that
@@ -75,7 +82,7 @@ impl PendingConsents {
         {
             return false;
         }
-        self.entries.insert(key, skdm);
+        self.entries.insert(key, Zeroizing::new(skdm));
         true
     }
 
@@ -91,15 +98,16 @@ impl PendingConsents {
         self.entries.len() != before
     }
 
-    /// Canonical CBOR body: `[version, [[room, member, skdm], ..]]`.
+    /// Canonical CBOR body: `[version, [[room, member, skdm], ..]]`. It holds every SKDM, so it
+    /// is zeroized when dropped.
     #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
         e.array(2).uint(VERSION).array(self.entries.len());
         for ((room, member), skdm) in &self.entries {
             e.array(3).bytes(room).bytes(member).bytes(skdm);
         }
-        e.finish()
+        Zeroizing::new(e.finish())
     }
 
     /// Parse a body.
@@ -129,7 +137,7 @@ impl PendingConsents {
                 return Err(Error::SizeLimitExceeded("pending consent key"));
             }
             if entries.len() < MAX_PENDING {
-                entries.insert((room, member), skdm.to_vec());
+                entries.insert((room, member), Zeroizing::new(skdm.to_vec()));
             }
         }
         d.finish().map_err(|_| bad("pending consents trailing"))?;

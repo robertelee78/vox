@@ -1325,6 +1325,26 @@ struct Joiner {
     passphrase: Secret,
 }
 
+/// A caller's reply carried by a task that [`Node::lock_all`] may abort (V210-76): answered
+/// `Locked` if the task is dropped before it hands the reply on, so the caller is told what
+/// happened rather than that the node went away.
+struct AnsweredIfAborted(Option<oneshot::Sender<Outcome>>);
+
+impl AnsweredIfAborted {
+    /// The reply, for the task to pass on now that it was not aborted.
+    fn into_reply(mut self) -> Option<oneshot::Sender<Outcome>> {
+        self.0.take()
+    }
+}
+
+impl Drop for AnsweredIfAborted {
+    fn drop(&mut self) {
+        if let Some(reply) = self.0.take() {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+        }
+    }
+}
+
 /// A join that got in: what the actor needs to make the room.
 struct JoinerWon {
     joined: crate::node::joinstream::JoinOutcome,
@@ -2062,7 +2082,8 @@ pub struct Node {
     join_slots: Arc<tokio::sync::Semaphore>,
     /// Slots for identity-passphrase checks; see [`VERIFIES_IN_FLIGHT`].
     verify_slots: Arc<tokio::sync::Semaphore>,
-    /// The join exchanges running right now.
+    /// The join exchanges running right now, both sides of them, and the room creations sealing
+    /// their key (V210-76).
     ///
     /// Tracked rather than detached for one reason: each holds an `Arc<VaultRootSigner>`, and
     /// ADR-015 says a locked node holds no identity secrets. [`Node::lock_all`] aborts this set,
@@ -4920,8 +4941,16 @@ impl Node {
             passphrase: passphrase.clone(),
         };
         let tx = self.net_tx.clone();
-        tokio::spawn(async move {
+        // **Tracked, so a lock aborts it** (V210-76). The joiner holds the vault signer, the
+        // prekey ring and the room passphrase, and signs with them for as long as the join runs;
+        // detached, it went on joining for tens of seconds after the node locked.
+        let reply = AnsweredIfAborted(Some(reply));
+        self.reap_join_tasks();
+        self.join_tasks.spawn(async move {
             let result = job.run().await;
+            let Some(reply) = reply.into_reply() else {
+                return;
+            };
             let _ = tx
                 .send(NetEvent::JoinerDone {
                     reply,
@@ -7582,6 +7611,10 @@ impl Node {
             task.abort();
         }
         self.reopening.clear();
+        // An aborted joiner never reports back, so nothing is being joined any more, and what was
+        // held for the join goes with the network.
+        self.joining.clear();
+        self.held_pairwise.clear();
         // The unlock they wait on did happen; what it reopened is locked again with the rest.
         for reply in std::mem::take(&mut self.unlock_waiters) {
             let _ = reply.send(Outcome::Done);
@@ -7596,6 +7629,9 @@ impl Node {
         // and says who this operator talks to. A locked node holds neither, and it
         // is re-opened on the next unlock (ADR-020 §3).
         self.trust = crate::node::trust::Keyring::new();
+        // The sender keys held for consents not yet delivered are room secrets: dropped, and
+        // zeroized as they go (V210-76). They are reloaded, sealed, at the next unlock.
+        self.consent_keys = crate::node::pending_consent::PendingConsents::default();
         // Pairwise sessions hold ratchet key material: drop them with everything else
         // (their secrets zeroize on drop).
         self.sessions.clear();
@@ -7705,7 +7741,11 @@ impl Node {
         let tx = self.net_tx.clone();
         let channel_id = genesis.channel_id();
         let seal_passphrase = passphrase.clone();
-        tokio::spawn(async move {
+        // Tracked, so a lock aborts it: it holds the signer (V210-76). The seal itself runs on a
+        // blocking thread, which cannot be interrupted; its result is dropped with the task.
+        let reply = AnsweredIfAborted(Some(reply));
+        self.reap_join_tasks();
+        self.join_tasks.spawn(async move {
             let sealed = tokio::task::spawn_blocking(move || {
                 let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
                 sek.seal(&factor, &channel_id, &seal_passphrase, argon2)
@@ -7713,6 +7753,9 @@ impl Node {
             })
             .await
             .unwrap_or(Err(Error::Argon2Failed));
+            let Some(reply) = reply.into_reply() else {
+                return;
+            };
             let _ = tx
                 .send(NetEvent::ChannelSealed {
                     reply,
