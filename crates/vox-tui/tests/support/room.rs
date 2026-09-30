@@ -24,6 +24,12 @@ use vox_core::node::paths::Paths;
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a daemon may take to answer after it starts. It unlocks the identity first, which is
+/// production Argon2id: measured 6–17s for the unoptimized build on a busy machine (V210-87), and
+/// several of those at once went past the 60s this shared with everything else. Not a product
+/// bound — nothing a person runs waits on it — so it is sized to never be the thing that fails.
+const DAEMON_START_PATIENCE: Duration = Duration::from_secs(240);
+
 const ID_PASS: &str = "identity passphrase";
 const ROOM_PASS: &str = "channel passphrase";
 
@@ -297,15 +303,23 @@ fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
         .spawn()
         .expect("spawn vox daemon");
     w.daemon = Some(Proc(child));
-    let deadline = Instant::now() + TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + DAEMON_START_PATIENCE;
     while !w.vox(None, &["room", "list"]).ok {
         assert!(
             Instant::now() < deadline,
-            "{}'s daemon never answered",
-            w.name
+            "{}'s daemon never answered in {}s; its stderr:\n{}",
+            w.name,
+            DAEMON_START_PATIENCE.as_secs(),
+            std::fs::read_to_string(err).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+    eprintln!(
+        "[harness] {}'s daemon answered in {:.1}s",
+        w.name,
+        started.elapsed().as_secs_f64()
+    );
 }
 
 /// Build `names.len()` workers in one room: an anchor, a daemon per worker, the first
@@ -338,19 +352,30 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         .stdout
         .trim()
         .to_owned();
+    let host_err = tmp.join(format!("{}.daemon.err", workers[0].name));
     for w in &workers[1..] {
         // A join can be turned away while the host is busy admitting another joiner — a
         // known, separate defect. Retry, bounded, and say so in the receipt.
         let joined = (1..=6).any(|attempt| {
+            let t = Instant::now();
             let o = w.vox_in(
                 None,
                 &["room", "join", &link, "--name", "mission"],
                 Some(ROOM_PASS),
             );
+            eprintln!(
+                "[harness] {} join attempt {attempt}: {} in {:.1}s",
+                w.name,
+                if o.ok { "joined" } else { "refused" },
+                t.elapsed().as_secs_f64()
+            );
             if !o.ok {
+                // The refusing side's own report: the host daemon says why it turned the
+                // joiner away (`a join did not complete — answering …: <reason>`).
                 eprintln!(
-                    "[harness] {} join attempt {attempt} refused; retrying",
-                    w.name
+                    "[harness] {}'s daemon stderr:\n{}",
+                    workers[0].name,
+                    std::fs::read_to_string(&host_err).unwrap_or_default()
                 );
                 std::thread::sleep(Duration::from_secs(5));
             }

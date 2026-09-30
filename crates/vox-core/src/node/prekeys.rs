@@ -117,6 +117,27 @@ pub const ONE_TIME_PREKEY_TARGET: usize = 64;
 /// low-water mark").
 pub const ONE_TIME_PREKEY_LOW_WATER: usize = 16;
 
+/// **Test-only**: a smaller one-time pool, so a proof crosses it in a dozen sessions rather than
+/// 64 (V210-77). Its value is the pool's target, from 1 to [`ONE_TIME_PREKEY_TARGET`], and the
+/// low-water mark is a quarter of it. Unset, empty, unparsable or out of range is the production
+/// pool: nothing in a real deployment sets it.
+pub const TEST_ONE_TIME_PREKEYS_ENV: &str = "VOX_TEST_ONE_TIME_PREKEYS";
+
+/// The one-time pool's `(low-water mark, target)`: the production pair, or
+/// [`TEST_ONE_TIME_PREKEYS_ENV`]'s.
+fn one_time_pool() -> (usize, usize) {
+    static POOL: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *POOL.get_or_init(|| {
+        std::env::var(TEST_ONE_TIME_PREKEYS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (1..=ONE_TIME_PREKEY_TARGET).contains(n))
+            .map_or((ONE_TIME_PREKEY_LOW_WATER, ONE_TIME_PREKEY_TARGET), |n| {
+                (n / 4, n)
+            })
+    })
+}
+
 /// How long a **consumed** one-time prekey is retained so a concurrent duplicate
 /// use can still establish (ADR-004 §"Serverless consume semantics"). One hour
 /// covers a genuine race; see the module docs for why it is not the bundle TTL.
@@ -192,6 +213,9 @@ pub struct PrekeyRing {
     pool: OneTimePrekeyPool,
     /// Recently consumed one-time prekeys, oldest first.
     consumed: Vec<ConsumedOneTime>,
+    /// Initial messages this process answered with the **previous** signed prekey: sessions
+    /// started just before a rotation. Not persisted; `vox status --json` reports it.
+    previous_used: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for PrekeyRing {
@@ -223,7 +247,7 @@ impl PrekeyRing {
         identity_dh_secret: &[u8; 32],
         now_secs: u64,
     ) -> Result<Self> {
-        Self::generate_sized(signer, identity_dh_secret, now_secs, ONE_TIME_PREKEY_TARGET)
+        Self::generate_sized(signer, identity_dh_secret, now_secs, one_time_pool().1)
     }
 
     /// [`PrekeyRing::generate`] with an explicit initial pool size. Private: the
@@ -250,6 +274,7 @@ impl PrekeyRing {
             next_signed_prekey_id: 2,
             pool,
             consumed: Vec::new(),
+            previous_used: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -283,9 +308,22 @@ impl PrekeyRing {
         if self.current.public().prekey_id == prekey_id {
             return Some(&self.current);
         }
-        self.previous
+        let previous = self
+            .previous
             .as_ref()
-            .filter(|p| p.public().prekey_id == prekey_id)
+            .filter(|p| p.public().prekey_id == prekey_id);
+        if previous.is_some() {
+            self.previous_used
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        previous
+    }
+
+    /// How many initial messages this process answered with the previous signed prekey.
+    #[must_use]
+    pub fn previous_used(&self) -> u64 {
+        self.previous_used
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The current signed prekey's id.
@@ -366,12 +404,9 @@ impl PrekeyRing {
             self.previous = Some(std::mem::replace(&mut self.current, fresh));
             out.rotated = true;
         }
-        out.one_time_added = self.pool.refill_to(
-            signer,
-            ONE_TIME_PREKEY_LOW_WATER,
-            ONE_TIME_PREKEY_TARGET,
-            now_secs,
-        )?;
+        out.one_time_added =
+            self.pool
+                .refill_to(signer, one_time_pool().0, one_time_pool().1, now_secs)?;
         // Retention elapsed: drop the consumed secrets (forward secrecy restored).
         let before = self.consumed.len();
         self.consumed
@@ -501,6 +536,7 @@ impl PrekeyRing {
             next_signed_prekey_id,
             pool,
             consumed,
+            previous_used: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }

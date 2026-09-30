@@ -2117,10 +2117,37 @@ pub async fn connect_own(path: &Path) -> Result<UnixStream> {
                 c.uid()
             ),
         })),
+        // **A peer that has already hung up cannot be asked who it is** (V210-72): macOS's
+        // LOCAL_PEERCRED answers ENOTCONN once the server has closed, and that was reported as
+        // a refusal where the truth is "the node closed the connection before greeting". Only
+        // a peer that is provably gone falls through — nothing sent on this connection can
+        // reach anyone — and the caller then reports what it reads. A live peer that will not
+        // say who it is stays refused.
+        Err(_) if peer_is_gone(&stream) => Ok(stream),
         Err(e) => Err(Error::Ipc(IpcHandshake::NotYours {
             detail: format!("cannot tell who serves {}: {e}", path.display()),
         })),
     }
+}
+
+/// Whether the other end of `stream` has hung up: the socket reports a hang-up, or a peek
+/// finds the end of the stream. Neither consumes anything the peer sent before it went.
+fn peer_is_gone(stream: &UnixStream) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::net::{recv, RecvFlags};
+    let mut fds = [PollFd::new(stream, PollFlags::IN)];
+    let now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if poll(&mut fds, Some(&now)).is_ok() && fds[0].revents().contains(PollFlags::HUP) {
+        return true;
+    }
+    let mut byte = [0u8; 1];
+    matches!(
+        recv(stream, &mut byte, RecvFlags::PEEK | RecvFlags::DONTWAIT),
+        Ok((_, 0))
+    )
 }
 
 impl IpcClient {
