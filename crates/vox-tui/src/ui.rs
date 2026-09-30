@@ -67,8 +67,9 @@ fn sync_label(s: SyncStatus) -> String {
     }
 }
 
-/// Render the whole UI for the current state.
-pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &UiState) {
+/// Render the whole UI for the current state. The timeline's scroll is clamped to what it drew,
+/// so scrolling up past the oldest line leaves nothing to scroll back through.
+pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -141,7 +142,7 @@ fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiSta
     frame.render_widget(list, area);
 }
 
-fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
+fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiState) {
     let Some(channel) = vm.active.as_ref() else {
         let p = Paragraph::new("No channel open").block(Block::default().borders(Borders::ALL));
         frame.render_widget(p, area);
@@ -158,7 +159,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(cols[0]);
 
-    render_timeline(
+    ui.timeline_scroll = render_timeline(
         frame,
         body[0],
         &channel.held_back,
@@ -187,7 +188,7 @@ fn render_timeline(
     timeline: &[MessageView],
     scroll: usize,
     focus: bool,
-) {
+) -> usize {
     // Who this room holds back for equivocating comes first, one line each (V210-66).
     let notices = held_back.iter().map(|n| {
         Line::from(Span::styled(
@@ -225,17 +226,19 @@ fn render_timeline(
         }
     }
     rows.reverse();
-    let bottom = rows
-        .len()
-        .saturating_sub(scroll.min(rows.len().saturating_sub(height)));
+    // Only a window that reached the oldest line can be short of `want`, so this is the most
+    // there is to scroll; the scroll drawn is returned, and PageDown moves from it at once.
+    let scroll = scroll.min(rows.len().saturating_sub(height));
+    let bottom = rows.len() - scroll;
     let shown: Vec<Line> = rows[bottom.saturating_sub(height)..bottom].to_vec();
-    let title = if scroll > 0 && rows.len() > height {
+    let title = if scroll > 0 {
         "Timeline (scrolled — End: newest)"
     } else {
         "Timeline"
     };
     let p = Paragraph::new(shown).block(pane_block(title, focus));
     frame.render_widget(p, area);
+    scroll
 }
 
 /// `line` broken into rows of at most `width` display columns, its styles kept.

@@ -9,11 +9,16 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   newest    the timeline shows the room's newest message (m-070), not its first (m-001);
   follows   a message Alice posts while it is open (m-071) is shown when it arrives;
   scrolls   PageUp brings m-001 into view, and End returns to m-071;
+  clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
+            lines): m-011 is the first line shown, not m-001 still;
   consent   Carol, whom Bob never consented to, is not shown "consented"; Alice, whom he did, is;
   verify    `:verify` on Carol does not show her "verified" (the node has nothing to compare);
   sync      the status bar says how many peers the node is connected to, not "idle";
   target    with Carol selected, Dave joins and sorts in above her; `:consent grant` then
-            consents to Carol (her row becomes "consented") and not to whoever took her place.
+            consents to Carol (her row becomes "consented") and not to whoever took her place;
+  reach     back on the channel list, the room reads "● online" while Bob's node is connected to
+            its other members;
+  unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline".
 
 Exit 0 = pass, 1 = red, 2 = apparatus (CANNOT MEASURE). Every process is recorded and killed by
 PID. Bounded throughout (`vox_pty.py`, V210-54).
@@ -172,6 +177,21 @@ try:
           f"after PageUp m-001 shown: {has(up, 'm-001')}; after End m-{POSTS + 1:03d} shown: "
           f"{has(back, f'm-{POSTS + 1:03d}')}")
 
+    stage("clamp")
+    def first_shown():
+        n = [int(x) for x in re.findall(r"(?<![0-9])m-([0-9]{3})(?![0-9])", timeline())]
+        return min(n) if n else None
+    for _ in range((POSTS + 10) // 10):
+        tui.key("\x1b[5~", 0.2)  # PageUp, well past the oldest line
+    if not tui.until(lambda: first_shown() == 1, 5, 0.2):
+        apparatus(f"PageUp past the top did not show m-001 first (first shown: {first_shown()})")
+    tui.key("\x1b[6~", 0)  # PageDown, once
+    tui.until(lambda: first_shown() == 11, 3, 0.2)
+    moved = first_shown()
+    claim("clamp", moved == 11, f"first line after one PageDown from past the top: m-{moved or 0:03d}")
+    tui.key("\x1b[F", 0)  # End
+    tui.until(lambda: has(timeline(), f"m-{POSTS + 1:03d}"), 5, 0.2)
+
     tui.key("\t", 1)   # timeline -> composer
     tui.key("\t", 1)   # composer -> members
     pane = lambda: [row[112:].rstrip() for row in tui.display()]
@@ -230,6 +250,20 @@ try:
     claim("target", granted and "consented" not in dave_label,
           f"carol: {label_of('carol')[0].strip()!r}; {dave}: {dave_label.strip()!r}")
 
+    stage("reach")
+    tui.key("\x1b", 2)  # Esc back to the channel list
+    rows = lambda: [r.strip() for r in tui.display() if "online" in r or "offline" in r]
+    tui.until(lambda: any("● online" in r for r in rows()), 20, 1)
+    claim("reach", any("● online" in r for r in rows()), f"list rows: {rows()!r}")
+
+    stage("unreach")
+    for w in ("alice", "carol", dave):
+        daemons[w].terminate()
+    for w in ("alice", "carol", dave):
+        stop(daemons[w])
+    gone = tui.until(lambda: any("○ offline" in r for r in rows()), 30, 1)
+    claim("unreach", gone, f"with every other member's daemon stopped, list rows: {rows()!r}")
+
     print(f"{TAG} the TUI drew {tui.bytes} bytes")
     print(f"{TAG} screen at the end:")
     for r in tui.display():
@@ -243,6 +277,10 @@ except Apparatus as a:
     code = 2
 except Hung as h:
     print(f"{TAG} HUNG at {h}")
+    code = 1
+except subprocess.TimeoutExpired as t:
+    # A `vox` verb that never returned is a red of its own, named, not a driver with no verdict.
+    print(f"{TAG} RED: `vox {' '.join(t.cmd[1:3])}` did not return within {t.timeout:.0f} s")
     code = 1
 finally:
     disarm()
