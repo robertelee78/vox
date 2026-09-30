@@ -933,180 +933,276 @@ fn spawn_stream_loop(
         // The loop ends when the connection itself is gone — or after this many
         // consecutive failures, which cannot happen without the connection being
         // unusable and which keeps a pathological peer from spinning this task.
-        const MAX_CONSECUTIVE_STREAM_FAILURES: u32 = 16;
         let mut failures = 0;
-        loop {
-            // **The kinds this node serves to completion get a task each.** `accept_stream`
-            // served them inline — `dispatch`'s own doc says to put it on its own task when
-            // accepting in a loop, and this loop did not — so while one was being served no other
-            // stream from this peer was even accepted. A rendezvous stream holds its server until
-            // the client finishes or a 20s frame read gives up; a circuit's opening exchange waits
-            // on the *target* peer's answer, which is another node's loop. On an anchor that put a
-            // member's next board `put` behind whatever that member's last stream was waiting for,
-            // 20s at a time, and the member's actor — which awaits its puts — answered nobody for
-            // 30s, 60s, 80s, measured through the real binaries.
-            //
-            // Only these three. Every other kind is handed on in the order it arrived, as before:
-            // a pairwise hello and the key that follows it are separate streams, and reordering
-            // them is exactly the race F12 was.
-            let (kind, send, recv) = match net.accept_authorized_on(&quic, peer).await {
-                Ok(accepted) => accepted,
-                // **A refusal is not a failure.** The stream was typed and answered; the peer
-                // may not open that kind *yet* — a joiner syncing before it is a member, a
-                // responder pushing before the room is held here — and it will be allowed once
-                // the view catches up. Counted, sixteen of those ended this loop while the
-                // connection stayed filed, and every stream the peer opened after that, allowed
-                // or not, went unserved for the connection's life (V210-80). It cannot spin:
-                // each one is a stream the peer opened.
-                Err(crate::error::Error::StreamRefused(_)) => continue,
-                Err(_) => {
-                    if quic.close_reason().is_some() {
-                        break; // the peer or the network closed it
-                    }
-                    failures += 1;
-                    if failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
-                        // Closed, not only abandoned: a connection nobody serves must not stay
-                        // filed as this peer's, or both ends go on using it for nothing.
-                        quic.close(
-                            crate::transport::quic::close_code(
-                                crate::wire::WireError::TransportFailed,
-                            ),
-                            b"stream failures",
-                        );
-                        break;
-                    }
-                    continue;
+        // **Each stream's kind is read on a task of its own** (V210-80). Read here, in the loop,
+        // a peer that opened a stream and withheld its kind frame held every stream it opened
+        // after that for `FRAME_PATIENCE` (30 s) — its sync, its keys, its board puts — one
+        // withheld stream at a time, for ever.
+        //
+        // **Still handed on in the order they arrived.** A pairwise hello and the key that
+        // follows it are separate streams, and reordering them is exactly the race F12 was. So
+        // a typed stream waits for the streams accepted before it — but only for
+        // [`KIND_ORDER_GRACE`]. An honest peer writes a stream's kind with the stream itself
+        // (`open_typed`), so its streams are all typed within a scheduling delay and keep their
+        // order exactly; a stream still untyped past the grace stops holding the ones behind it,
+        // and is served whenever its kind does arrive, or dropped when its read gives up.
+        let mut readers = tokio::task::JoinSet::new();
+        let mut typed: BTreeMap<u64, crate::error::Result<Typed>> = BTreeMap::new();
+        let mut untyped_since: BTreeMap<u64, tokio::time::Instant> = BTreeMap::new();
+        let (mut accepted, mut next) = (0u64, 0u64);
+        'streams: loop {
+            // Whatever is typed at the head of the arrival order goes on, in order.
+            while let Some(stream) = typed.remove(&next) {
+                next += 1;
+                if serve_typed(&net, &conn, &tx, &quic, peer, stream, &mut failures).await
+                    == Flow::Stop
+                {
+                    break 'streams;
                 }
-            };
-            // Nobody holds the connection any more: the node has let it go, and a stream
-            // arriving on it has nothing to be served against.
-            let Some(conn) = conn.upgrade() else {
-                break;
-            };
-            if matches!(
-                kind,
-                crate::transport::streams::StreamKind::Rendezvous
-                    | crate::transport::streams::StreamKind::Coord
-                    | crate::transport::streams::StreamKind::Circuit
-            ) {
-                failures = 0;
-                let net = Arc::clone(&net);
-                let conn = Arc::clone(&conn);
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    // A coordination stream can end by handing the actor a punch to run.
-                    if let Ok(inbound @ Inbound::Punch { .. }) =
-                        net.dispatch(&conn, kind, send, recv).await
-                    {
-                        let _ = tx
-                            .send(NetEvent::Stream {
-                                conn: Arc::clone(&conn),
-                                inbound,
-                            })
-                            .await;
-                    }
-                });
-                continue;
             }
-            match net.dispatch(&conn, kind, send, recv).await {
-                Ok(
-                    Inbound::ServedRendezvous { .. }
-                    | Inbound::ServedCoord { .. }
-                    | Inbound::ServedCircuit { .. },
-                ) => failures = 0,
-                // A sync stream's preamble is read **here, on a task of its own**, and the
-                // actor is told only once the request is in hand.
-                //
-                // The actor is a single task and the only writer of channel state, so
-                // anything it awaits inline stops the whole node: commands, the tick, and —
-                // once the network queue fills — accepting connections at all. Awaiting an
-                // untrusted peer's first frame there meant one stream carrying zero bytes
-                // stopped a node permanently, from any peer holding a valid identity, with an
-                // anchor the worst target because it is always addressable. The connection's
-                // keep-alive is no defence: quinn PINGs the connection for ever while a
-                // stream on it stays silent.
-                //
-                // A task per stream, rather than reading in this loop, so a silent stream does
-                // not even hold up the other streams on its own connection. The read is
-                // bounded by `framing::FRAME_PATIENCE`. Every state mutation still happens in
-                // the actor, in order.
-                // A join request is read here for the same reason a sync preamble is, and the
-                // exposure is worse: a peer needs only a valid identity and a `.vox` name.
-                // `Unknown` may open a `Rendezvous` stream, publish a self-signed pre-join
-                // record naming itself for any channel this board serves, and is then
-                // classified `PendingJoiner` — which may open `Join`. So the read that used to
-                // sit in the actor was reachable by anyone who had ever seen an invite link.
-                Ok(Inbound::Join { peer, send, recv }) => {
-                    failures = 0;
-                    let tx = tx.clone();
-                    let conn = Arc::clone(&conn);
-                    tokio::spawn(async move {
-                        let mut recv = recv;
-                        let Ok((channel_id, epoch)) =
-                            crate::node::joinstream::read_join_request(&mut recv).await
-                        else {
-                            crate::node::joinstream::refuse_join(send).await;
-                            return;
-                        };
-                        let _ = tx
-                            .send(NetEvent::JoinRequest {
-                                conn,
-                                peer,
-                                channel_id,
-                                epoch,
-                                send,
-                                recv,
-                            })
-                            .await;
-                    });
-                }
-                Ok(Inbound::Sync { peer, send, recv }) => {
-                    failures = 0;
-                    let tx = tx.clone();
-                    let conn = Arc::clone(&conn);
-                    tokio::spawn(async move {
-                        let mut recv = recv;
-                        let Ok((channel_id, epoch)) =
-                            crate::node::syncstream::read_sync_request(&mut recv).await
-                        else {
-                            return;
-                        };
-                        let _ = tx
-                            .send(NetEvent::SyncRequest {
-                                conn,
-                                peer,
-                                channel_id,
-                                epoch,
-                                send,
-                                recv,
-                            })
-                            .await;
-                    });
-                }
-                Ok(inbound) => {
-                    failures = 0;
-                    let event = NetEvent::Stream {
-                        conn: Arc::clone(&conn),
-                        inbound,
-                    };
-                    if tx.send(event).await.is_err() {
-                        return; // the actor is gone
-                    }
-                }
-                Err(_) => {
-                    if quic.close_reason().is_some() {
+            let head_due = untyped_since.get(&next).map(|at| *at + KIND_ORDER_GRACE);
+            tokio::select! {
+                stream = quic.accept_bi() => {
+                    let Ok((send, recv)) = stream else {
                         break; // the peer or the network closed it
+                    };
+                    let n = accepted;
+                    accepted += 1;
+                    untyped_since.insert(n, tokio::time::Instant::now());
+                    readers.spawn(async move {
+                        (n, crate::transport::streams::read_kind(send, recv).await)
+                    });
+                }
+                Some(read) = readers.join_next(), if !readers.is_empty() => {
+                    let Ok((n, stream)) = read else { continue };
+                    untyped_since.remove(&n);
+                    if n < next {
+                        // Its turn was given up at the grace: served now, out of order.
+                        if serve_typed(&net, &conn, &tx, &quic, peer, stream, &mut failures).await
+                            == Flow::Stop
+                        {
+                            break 'streams;
+                        }
+                    } else {
+                        typed.insert(n, stream);
                     }
-                    failures += 1;
-                    if failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
-                        break;
-                    }
+                }
+                () = tokio::time::sleep_until(head_due.unwrap_or_else(tokio::time::Instant::now)),
+                    if head_due.is_some() =>
+                {
+                    // The head is still untyped past the grace: the streams behind it go on.
+                    untyped_since.remove(&next);
+                    next += 1;
                 }
             }
         }
         // This peer's report of our address dies with its connection.
         net.forget_observed(&peer);
     })
+}
+
+/// A stream whose kind has been read: the kind and both halves.
+type Typed = (
+    crate::transport::streams::StreamKind,
+    quinn::SendStream,
+    quinn::RecvStream,
+);
+
+/// How long a stream accepted on a connection may stay untyped before the streams accepted after
+/// it stop waiting for it (see `spawn_stream_loop`). An honest peer's kind arrives with the stream,
+/// so this is only ever reached by a peer that withholds it, or on a path slow enough that order
+/// between its streams is the least of its problems.
+const KIND_ORDER_GRACE: Duration = Duration::from_secs(2);
+
+/// Whether the stream loop goes on.
+#[derive(PartialEq, Eq)]
+enum Flow {
+    Go,
+    Stop,
+}
+
+/// Serve one stream of `peer`'s whose kind has been read: authorize it and hand it on, as the
+/// stream loop always has (see `spawn_stream_loop`). `failures` counts consecutive failures, and
+/// [`Flow::Stop`] ends the loop.
+async fn serve_typed(
+    net: &Arc<NodeNet>,
+    conn: &std::sync::Weak<crate::transport::quic::VoxConnection>,
+    tx: &mpsc::Sender<NetEvent>,
+    quic: &quinn::Connection,
+    peer: Digest32,
+    stream: crate::error::Result<Typed>,
+    failures: &mut u32,
+) -> Flow {
+    // One stream failing is **not** the connection failing. A refused kind, a malformed frame or
+    // a peer that abandons a stream must not stop the others being served: a peer that opens a
+    // bad `coord` stream would otherwise take its own sync path down with it, and the node would
+    // go quiet until it reconnected. The loop ends when the connection itself is gone — or after
+    // this many consecutive failures, which cannot happen without the connection being unusable
+    // and which keeps a pathological peer from spinning this task.
+    const MAX_CONSECUTIVE_STREAM_FAILURES: u32 = 16;
+    let (kind, send, recv) = match stream.and_then(|t| net.authorize_typed(peer, t)) {
+        Ok(accepted) => accepted,
+        // **A refusal is not a failure.** The stream was typed and answered; the peer may not
+        // open that kind *yet* — a joiner syncing before it is a member, a responder pushing
+        // before the room is held here — and it will be allowed once the view catches up.
+        // Counted, sixteen of those ended this loop while the connection stayed filed, and every
+        // stream the peer opened after that, allowed or not, went unserved for the connection's
+        // life (V210-80). It cannot spin: each one is a stream the peer opened.
+        Err(crate::error::Error::StreamRefused(_)) => return Flow::Go,
+        Err(_) => {
+            if quic.close_reason().is_some() {
+                return Flow::Stop; // the peer or the network closed it
+            }
+            *failures += 1;
+            if *failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
+                // Closed, not only abandoned: a connection nobody serves must not stay filed as
+                // this peer's, or both ends go on using it for nothing.
+                quic.close(
+                    crate::transport::quic::close_code(crate::wire::WireError::TransportFailed),
+                    b"stream failures",
+                );
+                return Flow::Stop;
+            }
+            return Flow::Go;
+        }
+    };
+    // Nobody holds the connection any more: the node has let it go, and a stream
+    // arriving on it has nothing to be served against.
+    let Some(conn) = conn.upgrade() else {
+        return Flow::Stop;
+    };
+    // **The kinds this node serves to completion get a task each.** `accept_stream` served them
+    // inline — `dispatch`'s own doc says to put it on its own task when accepting in a loop, and
+    // this loop did not — so while one was being served no other stream from this peer was even
+    // accepted. A rendezvous stream holds its server until the client finishes or a 20s frame read
+    // gives up; a circuit's opening exchange waits on the *target* peer's answer, which is another
+    // node's loop. On an anchor that put a member's next board `put` behind whatever that member's
+    // last stream was waiting for, 20s at a time, and the member's actor — which awaits its puts —
+    // answered nobody for 30s, 60s, 80s, measured through the real binaries.
+    //
+    // Only these three. Every other kind is handed on in the order it arrived, as before: a
+    // pairwise hello and the key that follows it are separate streams, and reordering them is
+    // exactly the race F12 was.
+    if matches!(
+        kind,
+        crate::transport::streams::StreamKind::Rendezvous
+            | crate::transport::streams::StreamKind::Coord
+            | crate::transport::streams::StreamKind::Circuit
+    ) {
+        *failures = 0;
+        let net = Arc::clone(net);
+        let conn = Arc::clone(&conn);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            // A coordination stream can end by handing the actor a punch to run.
+            if let Ok(inbound @ Inbound::Punch { .. }) = net.dispatch(&conn, kind, send, recv).await
+            {
+                let _ = tx
+                    .send(NetEvent::Stream {
+                        conn: Arc::clone(&conn),
+                        inbound,
+                    })
+                    .await;
+            }
+        });
+        return Flow::Go;
+    }
+    match net.dispatch(&conn, kind, send, recv).await {
+        Ok(
+            Inbound::ServedRendezvous { .. }
+            | Inbound::ServedCoord { .. }
+            | Inbound::ServedCircuit { .. },
+        ) => *failures = 0,
+        // A sync stream's preamble is read **here, on a task of its own**, and the
+        // actor is told only once the request is in hand.
+        //
+        // The actor is a single task and the only writer of channel state, so
+        // anything it awaits inline stops the whole node: commands, the tick, and —
+        // once the network queue fills — accepting connections at all. Awaiting an
+        // untrusted peer's first frame there meant one stream carrying zero bytes
+        // stopped a node permanently, from any peer holding a valid identity, with an
+        // anchor the worst target because it is always addressable. The connection's
+        // keep-alive is no defence: quinn PINGs the connection for ever while a
+        // stream on it stays silent.
+        //
+        // A task per stream, rather than reading in this loop, so a silent stream does
+        // not even hold up the other streams on its own connection. The read is
+        // bounded by `framing::FRAME_PATIENCE`. Every state mutation still happens in
+        // the actor, in order.
+        // A join request is read here for the same reason a sync preamble is, and the
+        // exposure is worse: a peer needs only a valid identity and a `.vox` name.
+        // `Unknown` may open a `Rendezvous` stream, publish a self-signed pre-join
+        // record naming itself for any channel this board serves, and is then
+        // classified `PendingJoiner` — which may open `Join`. So the read that used to
+        // sit in the actor was reachable by anyone who had ever seen an invite link.
+        Ok(Inbound::Join { peer, send, recv }) => {
+            *failures = 0;
+            let tx = tx.clone();
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move {
+                let mut recv = recv;
+                let Ok((channel_id, epoch)) =
+                    crate::node::joinstream::read_join_request(&mut recv).await
+                else {
+                    crate::node::joinstream::refuse_join(send).await;
+                    return;
+                };
+                let _ = tx
+                    .send(NetEvent::JoinRequest {
+                        conn,
+                        peer,
+                        channel_id,
+                        epoch,
+                        send,
+                        recv,
+                    })
+                    .await;
+            });
+        }
+        Ok(Inbound::Sync { peer, send, recv }) => {
+            *failures = 0;
+            let tx = tx.clone();
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move {
+                let mut recv = recv;
+                let Ok((channel_id, epoch)) =
+                    crate::node::syncstream::read_sync_request(&mut recv).await
+                else {
+                    return;
+                };
+                let _ = tx
+                    .send(NetEvent::SyncRequest {
+                        conn,
+                        peer,
+                        channel_id,
+                        epoch,
+                        send,
+                        recv,
+                    })
+                    .await;
+            });
+        }
+        Ok(inbound) => {
+            *failures = 0;
+            let event = NetEvent::Stream {
+                conn: Arc::clone(&conn),
+                inbound,
+            };
+            if tx.send(event).await.is_err() {
+                return Flow::Stop; // the actor is gone
+            }
+        }
+        Err(_) => {
+            if quic.close_reason().is_some() {
+                return Flow::Stop; // the peer or the network closed it
+            }
+            *failures += 1;
+            if *failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
+                return Flow::Stop;
+            }
+        }
+    }
+    Flow::Go
 }
 
 /// Accept connections and their streams forever, forwarding to the actor the ones

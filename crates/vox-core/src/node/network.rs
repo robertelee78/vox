@@ -549,7 +549,20 @@ impl NodeNet {
         conn: &quinn::Connection,
         peer: Digest32,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
-        let (kind, mut send, mut recv) = accept_typed_on(conn).await?;
+        let typed = accept_typed_on(conn).await?;
+        self.authorize_typed(peer, typed)
+    }
+
+    /// Authorize a stream whose kind has been read: refused, with the coded answer, when `peer`
+    /// may not open that kind (see [`Self::classify`]).
+    ///
+    /// # Errors
+    /// [`crate::error::Error::StreamRefused`] when the peer may not open that kind.
+    pub fn authorize_typed(
+        &self,
+        peer: Digest32,
+        (kind, mut send, mut recv): (StreamKind, SendStream, RecvStream),
+    ) -> Result<(StreamKind, SendStream, RecvStream)> {
         let class = self.classify(&peer);
         if !PeerPolicy::allows(class, kind) {
             crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
