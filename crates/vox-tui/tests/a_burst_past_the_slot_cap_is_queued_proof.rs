@@ -82,6 +82,14 @@ const STAGE_TRIES: usize = 5;
 const SETTLE: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
 
+/// Print a line that reaches the log **when the test passes too**: straight to stderr, past
+/// libtest's capture, which swallows `println!` of a passing test. CI shows a green run's burst
+/// meeting the cap this way, not only a red one's (V210-90).
+fn shown(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
 /// Alice's ports to `peer` that are in backoff, as `room-prefix kind/failures (last failure)`.
 fn backoffs(status: &serde_json::Value, peer: &str) -> Vec<String> {
     status["sync"]
@@ -214,10 +222,10 @@ fn a_burst_past_the_slot_cap_is_queued() {
     }
     bob_d.signal("-CONT");
     let resumed = Instant::now();
-    println!(
+    shown(&format!(
         "[proof] bob paused for {:?} while the burst was posted",
         resumed - paused
-    );
+    ));
     let mut seen: Vec<Option<Instant>> = vec![None; ROOMS];
     let deadline = Instant::now() + Duration::from_secs(45);
     while seen.iter().any(Option::is_none) && Instant::now() < deadline {
@@ -249,7 +257,7 @@ fn a_burst_past_the_slot_cap_is_queued() {
         }
     }
     let max = lat.iter().copied().max().unwrap_or_default();
-    println!(
+    shown(&format!(
         "[proof] P2: {ROOMS} rooms posted at once; alice->bob skipped_at_cap {skipped}, queued \
          {queued}, opened {opened}, failed {failed}; crossings p50 {:?} p95 {:?} max {max:?}; {} \
          over {BOUND:?}; last failures {:?}",
@@ -257,7 +265,7 @@ fn a_burst_past_the_slot_cap_is_queued() {
         pct(&mut lat.clone(), 95.0),
         late.len(),
         failures(&after)
-    );
+    ));
     let refused: Vec<usize> = (0..ROOMS)
         .filter(|&i| {
             after["sync"].as_array().is_some_and(|rows| {
