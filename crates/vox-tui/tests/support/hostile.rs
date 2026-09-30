@@ -73,7 +73,14 @@ pub async fn connect<S: vox_core::identity::composite::RootSigner>(
     addr: std::net::SocketAddr,
     id: Digest32,
 ) -> (VoxEndpoint, Arc<VoxConnection>) {
-    let endpoint = VoxEndpoint::bind(signer, "127.0.0.1:0".parse().unwrap()).unwrap();
+    // Bound in the target's family: an IPv4 socket cannot reach `::1`, nor an IPv6 one
+    // `127.0.0.1`.
+    let local = if addr.is_ipv6() {
+        "[::1]:0"
+    } else {
+        "127.0.0.1:0"
+    };
+    let endpoint = VoxEndpoint::bind(signer, local.parse().unwrap()).unwrap();
     let conn = endpoint
         .connect(addr, id, now())
         .await
