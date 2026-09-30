@@ -55,7 +55,6 @@ impl Proc {
             .env("VOX_DATA_DIR", data)
             .env("VOX_CONFIG_DIR", data.join("cfg"))
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
-            .env("VOX_ROOM_PASSPHRASE", "a room passphrase")
             .stdin(Stdio::null())
             .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
             .stderr(Stdio::from(std::fs::File::create(&err).unwrap()))
@@ -116,6 +115,9 @@ fn an_anchors_file_with_no_usable_anchor_is_refused() {
     let pass = tmp.path().join("identity.pass");
     std::fs::write(&pass, format!("{IDENTITY}\n")).unwrap();
     let pass = pass.to_str().unwrap().to_owned();
+    let room_pass = tmp.path().join("room.pass");
+    std::fs::write(&room_pass, "a room passphrase\n").unwrap();
+    let room_pass = room_pass.to_str().unwrap().to_owned();
     let path = anchors.display().to_string();
 
     // ---- the verbs that need an anchor refuse, naming the file --------------------------------
@@ -136,8 +138,8 @@ fn an_anchors_file_with_no_usable_anchor_is_refused() {
             vec![
                 "connect",
                 "vox://example",
-                "--passphrase",
-                "a room passphrase",
+                "--passphrase-file",
+                &room_pass,
                 "--listen",
                 "127.0.0.1:0",
             ],

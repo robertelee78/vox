@@ -90,6 +90,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
         "CANNOT MEASURE: the guest has an anchors file ({}), so its anchor would be configured",
         anchors_file.display()
     );
+    let pass_file = w.passphrase_file();
     let started = Instant::now();
     let mut fwd = VoxProc::spawn(
         "forward",
@@ -100,8 +101,8 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
             &w.host_fp,
             &w.service,
             "127.0.0.1:0",
-            "--passphrase",
-            &w.passphrase,
+            "--passphrase-file",
+            &pass_file,
             "--listen",
             Split::Families.guest_listen(),
         ]),
