@@ -680,7 +680,7 @@ enum NetEvent {
         peer: Digest32,
         /// The generation it took.
         chain_id: u64,
-        /// Whether it was the last key of the history `peer` was owed.
+        /// Whether it was one of the keys of the history `peer` was owed.
         history: bool,
     },
     /// A sender key written to `peer` was not taken (see `pairwise_stream::refused`): it is owed
@@ -696,6 +696,8 @@ enum NetEvent {
         why: String,
         /// The serial of the session the key was sealed under (V210-78).
         session: Option<u64>,
+        /// Whether it was one of the keys of the history `peer` was owed.
+        history: bool,
     },
     /// A publish round to a board ended (see `publish_channel_to_anchor`).
     PublishDone {
@@ -2150,6 +2152,10 @@ pub struct Node {
     /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
     /// key cut off by a crash is owed again after the restart; see [`Node::watch_delivery`].
     keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
+    /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
+    /// whether the batch fell short (a key refused, or not all of it written). The history is
+    /// recorded as delivered only once every key of a whole batch was taken (V210-88).
+    history_in_flight: BTreeMap<(Digest32, Digest32), (u32, bool)>,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012), across restarts too: see `next_record_seq`.
     record_seq: BTreeMap<Digest32, u64>,
@@ -2358,6 +2364,7 @@ impl Node {
             fresh_details: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
             keys_in_flight: BTreeMap::new(),
+            history_in_flight: BTreeMap::new(),
             record_seq: BTreeMap::new(),
             record_ts_floor: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -4036,8 +4043,12 @@ impl Node {
                 chain_id,
                 why,
                 session,
+                history,
             } => {
                 self.key_landed(channel_id, peer);
+                if history {
+                    self.history_landed(channel_id, peer, false);
+                }
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
@@ -4232,6 +4243,7 @@ impl Node {
             } => {
                 self.key_backoff.remove(&(channel_id, peer));
                 self.key_landed(channel_id, peer);
+                let whole_history = history && self.history_landed(channel_id, peer, true);
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
@@ -4241,7 +4253,7 @@ impl Node {
                 // A failed write leaves the key owed, and it is sent again: never the other way.
                 let mut channel = shared.lock().await;
                 let _ = channel.note_delivered(profile.store(), peer, chain_id);
-                if history {
+                if whole_history {
                     let _ = channel.note_history_delivered(profile.store(), &peer);
                 }
             }
@@ -5752,6 +5764,16 @@ impl Node {
             {
                 continue;
             }
+            // **A key still in flight is not sent again** (V210-88): nothing is recorded as
+            // delivered until the member takes it, so until it answers it stays owed here. A
+            // history batch waits for the one in flight; history itself is not held back by a
+            // single key, since a consent's own key is in flight when its history is sent.
+            let pair = (*channel_id, target);
+            if self.history_in_flight.contains_key(&pair)
+                || (!history.contains_key(&target) && self.keys_in_flight.contains_key(&pair))
+            {
+                continue;
+            }
             // Open a session from the member's bundle record if none exists, and reach
             // them through the ladder rather than requiring a live connection: a re-key
             // that only reaches members this process happened to join with is the M15
@@ -5763,12 +5785,6 @@ impl Node {
             };
             let batch = history.remove(&target);
             let owes_history = batch.is_some();
-            // **A key still in flight is not sent again** (V210-88): nothing is recorded as
-            // delivered until the member takes it, so until it answers it stays owed here. History
-            // is not held back: a consent's own key is in flight when its history is sent.
-            if !owes_history && self.keys_in_flight.contains_key(&(*channel_id, target)) {
-                continue;
-            }
             let keys: Vec<&crate::group::skdm::Skdm> = match batch.as_ref() {
                 Some(b) => b.iter().collect(),
                 None => match skdm.get(&target) {
@@ -5778,8 +5794,8 @@ impl Node {
             };
             let mut all_sent = true;
             let mut hello_left = hello.as_ref();
-            let last = keys.len().saturating_sub(1);
-            for (at, key) in keys.into_iter().enumerate() {
+            let mut watched = 0u32;
+            for key in keys {
                 let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
                     all_sent = false;
                     break;
@@ -5801,14 +5817,13 @@ impl Node {
                     self.hello_delivered(channel_id, target);
                 }
                 // Each key's own generation: a refusal re-owes exactly what was refused, and it is
-                // recorded as delivered only once taken (V210-88) — history with the batch's last.
-                self.watch_delivery(
-                    sent,
-                    *channel_id,
-                    target,
-                    key.body.chain_id,
-                    owes_history && at == last,
-                );
+                // recorded as delivered only once taken (V210-88).
+                self.watch_delivery(sent, *channel_id, target, key.body.chain_id, owes_history);
+                watched += 1;
+            }
+            if owes_history && watched > 0 {
+                // Answers are handled on this actor, after this returns: none is lost.
+                self.history_in_flight.insert(pair, (watched, !all_sent));
             }
             if all_sent {
                 delivered += 1;
@@ -5826,6 +5841,23 @@ impl Node {
                 self.keys_in_flight.remove(&key);
             }
         }
+    }
+
+    /// A key of the history batch in flight to `peer` was answered. Returns whether that was the
+    /// last one and every key of the whole batch was taken, so the history is delivered.
+    fn history_landed(&mut self, channel_id: Digest32, peer: Digest32, taken: bool) -> bool {
+        let key = (channel_id, peer);
+        let Some((left, short)) = self.history_in_flight.get_mut(&key) else {
+            return false;
+        };
+        *left = left.saturating_sub(1);
+        *short |= !taken;
+        if *left > 0 {
+            return false;
+        }
+        let whole = !*short;
+        self.history_in_flight.remove(&key);
+        whole
     }
 
     /// **A member this node has just learned of is passed on at once**, like a local append.
@@ -7205,9 +7237,9 @@ impl Node {
     /// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
     ///
     /// **Taken is when it is delivered** (V210-88): `NetEvent::SkdmTaken` records generation
-    /// `chain_id` as `target`'s, and with `history` the history it was owed as well, since this is
-    /// the last key of that batch. Until then the key is only in flight, which is kept in memory,
-    /// so a crash leaves it owed and the restarted node sends it again.
+    /// `chain_id` as `target`'s, and a `history` key counts towards the batch it belongs to, whose
+    /// history is recorded once all of it was taken. Until then the key is only in flight, which
+    /// is kept in memory, so a crash leaves it owed and the restarted node sends it again.
     fn watch_delivery(
         &mut self,
         sent: quinn::RecvStream,
@@ -7228,6 +7260,7 @@ impl Node {
                         chain_id,
                         why,
                         session,
+                        history,
                     },
                     None => NetEvent::SkdmTaken {
                         channel_id,
@@ -7634,6 +7667,7 @@ impl Node {
         self.held_pairwise.clear();
         // Keys still in flight stay owed, and are sent again after the next unlock (V210-88).
         self.keys_in_flight.clear();
+        self.history_in_flight.clear();
         // The unlock they wait on did happen; what it reopened is locked again with the rest.
         for reply in std::mem::take(&mut self.unlock_waiters) {
             let _ = reply.send(Outcome::Done);
