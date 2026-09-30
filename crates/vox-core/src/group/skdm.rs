@@ -31,6 +31,8 @@
 //! (cross-group confusion, eprint 2023/1385). The recipient additionally rejects
 //! any SKDM whose `(channelID, epoch)` ≠ the channel it processes ([`Skdm::verify`]).
 
+use zeroize::Zeroizing;
+
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::group::senderkey::{ChainKey, CHAIN_KEY_LEN};
@@ -86,10 +88,11 @@ impl SkdmBody {
     /// Canonical-CBOR body in the ADR-006 field order
     /// `[channelID, epoch, author_id, chain_id, iteration, chain_key,
     ///   signing_pubkey, [sign_algo, aead_algo]]` (the signature is appended by
-    /// the framed [`Skdm`], never inside its own signing input).
+    /// the framed [`Skdm`], never inside its own signing input). It holds the chain key, so it
+    /// is zeroized when dropped, and so is every buffer it outgrew on the way (V210-94).
     #[must_use]
-    pub fn canonical_body(&self) -> Vec<u8> {
-        let mut e = Encoder::new();
+    pub fn canonical_body(&self) -> Zeroizing<Vec<u8>> {
+        let mut e = Encoder::for_secrets();
         e.array(8)
             .bytes(&self.channel_id)
             .uint(self.epoch)
@@ -101,13 +104,14 @@ impl SkdmBody {
             .array(2)
             .uint(u64::from(self.algo_ids[0]))
             .uint(u64::from(self.algo_ids[1]));
-        e.finish()
+        Zeroizing::new(e.finish())
     }
 
-    /// The signing input: `vox/skdm/v1 ‖ canonical_body` (ADR-008 framing).
+    /// The signing input: `vox/skdm/v1 ‖ canonical_body` (ADR-008 framing). Zeroized when
+    /// dropped, like the body.
     #[must_use]
-    pub fn signing_input(&self) -> Vec<u8> {
-        signing_input(StructTag::Skdm, &self.canonical_body())
+    pub fn signing_input(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(signing_input(StructTag::Skdm, &self.canonical_body()))
     }
 
     /// Decode an SKDM body from its canonical bytes, validating arity, the
@@ -220,9 +224,10 @@ impl Skdm {
 
     /// The 9-field canonical CBOR body: the 8 signed fields plus the composite
     /// root signature as the 9th element (ADR-006 §Wire). Framed by [`Skdm::to_wire`].
+    /// Zeroized when dropped, as is every buffer it outgrew.
     #[must_use]
-    fn wire_body(&self) -> Vec<u8> {
-        let mut e = Encoder::new();
+    fn wire_body(&self) -> Zeroizing<Vec<u8>> {
+        let mut e = Encoder::for_secrets();
         e.array(9)
             .bytes(&self.body.channel_id)
             .uint(self.body.epoch)
@@ -235,7 +240,7 @@ impl Skdm {
             .uint(u64::from(self.body.algo_ids[0]))
             .uint(u64::from(self.body.algo_ids[1]));
         e.bytes(&self.signature.to_bytes());
-        e.finish()
+        Zeroizing::new(e.finish())
     }
 
     /// The framed wire bytes per ADR-008: `tag(2 BE) ‖ version(1) ‖
@@ -244,9 +249,12 @@ impl Skdm {
     /// ([`SkdmBody::signing_input`]), **not** the wire frame — transmitted structs
     /// carry the struct-tag frame, never the signing label (ADR-008 §Struct
     /// framing). The root signature still covers the 8-field signing input.
+    ///
+    /// The bytes carry the chain key, so they are zeroized when dropped (V210-94); `frame` sizes
+    /// its buffer once, so it leaves no smaller copy behind.
     #[must_use]
-    pub fn to_wire(&self) -> Vec<u8> {
-        frame(StructTag::Skdm, &self.wire_body())
+    pub fn to_wire(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(frame(StructTag::Skdm, &self.wire_body()))
     }
 
     /// Parse a framed SKDM from the wire, rejecting a wrong/unknown struct tag,
@@ -270,7 +278,7 @@ impl Skdm {
         let author_id = take_digest(&mut d)?;
         let chain_id = d.uint()?;
         let iteration = d.uint()?;
-        let chain_key = d.bytes()?.to_vec();
+        let chain_key = Zeroizing::new(d.bytes()?.to_vec());
         let signing_pubkey = d.bytes()?.to_vec();
         if d.array()? != 2 {
             return Err(Error::MalformedBundle("skdm algo_ids arity"));
@@ -281,7 +289,7 @@ impl Skdm {
         d.finish()?;
 
         // Rebuild the 8-field body bytes and decode strictly (class checks etc.).
-        let mut be = Encoder::new();
+        let mut be = Encoder::for_secrets();
         be.array(8)
             .bytes(&channel_id)
             .uint(epoch)
@@ -293,7 +301,7 @@ impl Skdm {
             .array(2)
             .uint(sign_algo)
             .uint(aead_algo);
-        let body = SkdmBody::from_canonical_body(&be.finish())?;
+        let body = SkdmBody::from_canonical_body(&Zeroizing::new(be.finish()))?;
 
         let sig_arr: [u8; crate::hash::COMPOSITE_SIG_LEN] = sig_bytes
             .as_slice()
@@ -346,7 +354,7 @@ impl Skdm {
     /// Decrypt an inbound M2 message carrying an SKDM and parse it (still
     /// unverified — the caller verifies against the author's root).
     pub fn open_from(session: &mut Session, message: &Message, now: u64) -> Result<Self> {
-        let plaintext = session.decrypt(message, now)?;
+        let plaintext = Zeroizing::new(session.decrypt(message, now)?);
         Self::from_wire(&plaintext)
     }
 }
