@@ -3,7 +3,7 @@
 //!
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob and Carol
 //! (Alice and Bob trust each other, nobody trusts Carol), Alice posts 70 lines, and Bob's real
-//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks ten claims, each
+//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks thirteen claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -15,13 +15,19 @@
 //! - `consent`: Carol, whom Bob never consented to, is not shown "consented", while Alice is (the
 //!   pane said "consented" for everyone);
 //! - `verify`: `:verify` does not mark Carol "verified" (it did, with nothing compared);
-//! - `sync`: the status bar says how many peers the node is connected to (it said "idle" always);
+//! - `sync`: the status bar says how many peers the node is connected to, the anchor and at least
+//!   one member, so 2 or more (it said "idle" always);
 //! - `target`: with Carol selected, Dave joins and sorts in above her; `:consent grant` then
 //!   consents to Carol and not to Dave (the selection was a position, so the join moved it onto
 //!   someone else);
+//! - `delivers`: the grant is the node's, not only the pane's: a line Bob then posts from the
+//!   composer reaches Carol's `vox room read`;
 //! - `reach`: back on the channel list, the room reads "● online" while Bob's node is connected
 //!   to its other members (it said offline always);
-//! - `unreach`: once every other member's daemon is stopped, it reads "○ offline".
+//! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
+//! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
+//!   not the node's stayed where it was);
+//! - `idle`: once the anchor is stopped too, it says "idle", with no count.
 //!
 //! A selected member who leaves the pane is replaced by its first member, so the marker and the
 //! member a command acts on stay one; no `vox` verb removes a member from a room's pane today, so
@@ -29,8 +35,9 @@
 //!
 //! Each claim turns red against a product that restores its defect: the timeline drawn from the
 //! top, a scroll not clamped to the oldest line, `OutboundConsent::Granted` for everyone, the local
-//! verification mark, `SyncStatus::Idle`, the member selected by index, or `Reachability`
-//! hard-coded either way. It passes only on the script's PASS with all 10 claims ok; its
+//! verification mark, `SyncStatus` hard-coded (idle, or any one count), the member selected by
+//! index, or `Reachability` hard-coded either way. It passes only on the script's PASS with all 13
+//! claims ok; its
 //! apparatus failures (exit 2: `pyte` missing, a join or a precondition that did not happen, such
 //! as Dave's join not moving Carol) fail as CANNOT MEASURE, never as a pass.
 
@@ -42,18 +49,28 @@ mod watchdog;
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
 
+use std::time::Duration;
+
 #[test]
 #[ignore = "real daemons and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
 fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     // A hung proof is a failing proof (ADR-018 §6), and the driver is bounded on its own (#240).
-    watchdog::arm();
+    // Its bounds are the product's: a member waits 480 s for a joiner's proof of work (V210-87),
+    // which a debug build can take minutes to grind, and the driver joins three members. So the
+    // driver's budget is 1170 s, it is stopped from outside at 1200 s, and the watchdog is past
+    // both. A release run takes about a minute.
+    watchdog::arm_for(Duration::from_secs(1300));
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_room_truth.py");
-    let out = pty_driver::run(script, &[env!("CARGO_BIN_EXE_vox"), "truth"]);
+    let out = pty_driver::run_within(
+        script,
+        &[env!("CARGO_BIN_EXE_vox"), "truth"],
+        Duration::from_secs(1200),
+    );
     let said = out.stdout.clone();
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (10 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (13 expected); the driver took {:?}; its last \
          stage: {:?}",
         claims.len(),
         out.took,
@@ -67,8 +84,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (10, 10),
-                "a PASS must rest on all 10 claims, each ok: {said}"
+                (13, 13),
+                "a PASS must rest on all 13 claims, each ok: {said}"
             );
         }
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),

@@ -59,7 +59,14 @@ impl Driven {
 }
 
 /// Run `python3 <script> <args…>`, bounded; see the module docs.
+#[allow(dead_code)] // a proof that needs a longer bound calls `run_within` instead
 pub fn run(script: &str, args: &[&str]) -> Driven {
+    run_within(script, args, BOUND)
+}
+
+/// [`run`], stopped from outside past `bound` rather than [`BOUND`]: for a driver whose own
+/// budget is longer, because the product bounds it waits on are (a debug-build join).
+pub fn run_within(script: &str, args: &[&str], bound: Duration) -> Driven {
     let t0 = Instant::now();
     let stage_file = std::env::temp_dir().join(format!(
         "vox-pty-stage-{}-{}",
@@ -97,12 +104,12 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
             break Some(status);
         }
         match stopped {
-            None if t0.elapsed() >= BOUND => {
+            None if t0.elapsed() >= bound => {
                 for (pid, start) in descendants(child.id()) {
                     seen.entry(pid).or_insert(start);
                 }
                 eprintln!(
-                    "[pty] the driver still runs after {BOUND:?}: sending it SIGTERM (pid {}; it \
+                    "[pty] the driver still runs after {bound:?}: sending it SIGTERM (pid {}; it \
                      started {:?})",
                     child.id(),
                     seen.keys().collect::<Vec<_>>()
