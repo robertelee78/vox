@@ -682,6 +682,8 @@ enum NetEvent {
         chain_id: u64,
         /// Whether it was one of the keys of the history `peer` was owed.
         history: bool,
+        /// The [`Node::delivery_epoch`] its watcher started in.
+        epoch: u64,
     },
     /// A sender key written to `peer` was not taken (see `pairwise_stream::refused`): it is owed
     /// again, and the tick re-sends it.
@@ -698,6 +700,8 @@ enum NetEvent {
         session: Option<u64>,
         /// Whether it was one of the keys of the history `peer` was owed.
         history: bool,
+        /// The [`Node::delivery_epoch`] its watcher started in.
+        epoch: u64,
     },
     /// A publish round to a board ended (see `publish_channel_to_anchor`).
     PublishDone {
@@ -2156,6 +2160,11 @@ pub struct Node {
     /// whether the batch fell short (a key refused, or not all of it written). The history is
     /// recorded as delivered only once every key of a whole batch was taken (V210-88).
     history_in_flight: BTreeMap<(Digest32, Digest32), (u32, bool)>,
+    /// Which delivery watchers are current (V210-88): bumped when the node locks, which forgets
+    /// what is in flight. A watcher started before carries the old value, and its answer arriving
+    /// after an unlock does not count towards what is in flight now: it could otherwise complete a
+    /// new history batch before that batch's own keys were taken.
+    delivery_epoch: u64,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012), across restarts too: see `next_record_seq`.
     record_seq: BTreeMap<Digest32, u64>,
@@ -2365,6 +2374,7 @@ impl Node {
             key_backoff: BTreeMap::new(),
             keys_in_flight: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
+            delivery_epoch: 0,
             record_seq: BTreeMap::new(),
             record_ts_floor: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -4044,10 +4054,14 @@ impl Node {
                 why,
                 session,
                 history,
+                epoch,
             } => {
-                self.key_landed(channel_id, peer);
-                if history {
-                    self.history_landed(channel_id, peer, false);
+                // A watcher from before a lock: what it answered is no longer in flight.
+                if epoch == self.delivery_epoch {
+                    self.key_landed(channel_id, peer);
+                    if history {
+                        self.history_landed(channel_id, peer, false);
+                    }
                 }
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
@@ -4240,10 +4254,16 @@ impl Node {
                 peer,
                 chain_id,
                 history,
+                epoch,
             } => {
                 self.key_backoff.remove(&(channel_id, peer));
-                self.key_landed(channel_id, peer);
-                let whole_history = history && self.history_landed(channel_id, peer, true);
+                // The key was taken, and is recorded so whenever it answered. What is in flight,
+                // and so a whole history batch, is counted only by a watcher of this epoch.
+                let fresh = epoch == self.delivery_epoch;
+                if fresh {
+                    self.key_landed(channel_id, peer);
+                }
+                let whole_history = fresh && history && self.history_landed(channel_id, peer, true);
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
@@ -7250,6 +7270,7 @@ impl Node {
     ) {
         *self.keys_in_flight.entry((channel_id, target)).or_default() += 1;
         let session = self.session_serial.get(&(channel_id, target)).copied();
+        let epoch = self.delivery_epoch;
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
             let event =
@@ -7261,12 +7282,14 @@ impl Node {
                         why,
                         session,
                         history,
+                        epoch,
                     },
                     None => NetEvent::SkdmTaken {
                         channel_id,
                         peer: target,
                         chain_id,
                         history,
+                        epoch,
                     },
                 };
             let _ = tx.send(event).await;
@@ -7667,6 +7690,8 @@ impl Node {
         self.held_pairwise.clear();
         // Keys still in flight stay owed, and are sent again after the next unlock (V210-88).
         self.keys_in_flight.clear();
+        // And the watchers still running answer for what is no longer in flight.
+        self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.history_in_flight.clear();
         // The unlock they wait on did happen; what it reopened is locked again with the rest.
         for reply in std::mem::take(&mut self.unlock_waiters) {
