@@ -10,7 +10,8 @@
 //!   records live.
 //! - **Geneses.** A board took a genesis from any peer, up to 4096, and never let one go. A
 //!   member node that anyone had filled could not put a room it created *later* on its own board,
-//!   so that room could not be joined through it.
+//!   and an anchor anyone had filled took no new room at all, so rooms created later could not be
+//!   joined through either.
 //!
 //! **Staging.** The anchor (`vox node`), the victim `vox daemon` holding the room, and the joiner
 //! are the real binary. The strangers are test-side clients speaking the Vox wire protocol, each
@@ -21,20 +22,26 @@
 //! 1. 300 strangers, each on its own connection, put a pre-join for the room on the anchor and on
 //!    the victim, and at least 256 of them are taken by each — the slots really are full. Fewer is
 //!    `CANNOT MEASURE`.
-//! 2. 4100 geneses for rooms strangers invented are offered to the victim, and then the victim
-//!    creates a second room.
-//! 3. The victim's own board serves the second room's genesis — what a joiner reaching it
-//!    fetches first. (The anchor holds the room too, so a join alone could succeed through the
-//!    anchor and say nothing about the victim's board.)
+//! 2. 4100 geneses for rooms one stranger invented are offered, over one connection, to the
+//!    victim and to the anchor (a default `vox node`, which serves any room published to it). The
+//!    anchor takes at least 4095 — its 4096 rooms from peers less the room in use — so its board
+//!    is full (fewer is `CANNOT MEASURE`), and it still
+//!    serves the room in use: a room with live members is never displaced by empty ones.
+//! 3. The victim then creates a second room, and **both** boards serve its genesis — what a
+//!    joiner reaching either fetches first. (A join races both boards, so a join alone could
+//!    succeed through one and say nothing about the other.)
 //! 4. A real joiner joins **each** room with `vox room join`, and both joins succeed within 120 s.
 //!
 //! **Mutations that must turn it red.**
 //! - `nat::store::RendezvousStore::accept_prejoin`: refuse a new pre-join at capacity again ("pre-join channel at
 //!   capacity") instead of letting the oldest arrival go. The joiner's own pre-join is refused and
 //!   its join fails.
-//! - `nat::service`'s `put`: take a peer's genesis on any board (drop the `serve_any_room` gate)
+//! - `nat::service`'s `put`: take a peer's genesis on any board (drop the `serve_rooms` gate)
 //!   and count the node's own geneses against the cap. The victim's board fills with strangers'
 //!   rooms and its second room never reaches it (assertion 3).
+//! - `nat::store::RendezvousStore::accept_genesis`: refuse a genesis at capacity again instead of
+//!   evicting the oldest one with no live members. The anchor's board stays full of strangers'
+//!   rooms and the second room never reaches it (assertion 3).
 
 #![cfg(unix)]
 
@@ -201,44 +208,75 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
                 .to_wire()
         })
         .collect();
-    let taken = rt.block_on(async {
-        let (_ep, conn) = connect(&inventor, victim_addr, victim_id).await;
-        let mut client = vox_core::nat::service::RendezvousClient::open(&conn)
-            .await
-            .expect("CANNOT MEASURE: a rendezvous stream to the victim");
-        let mut taken = 0usize;
-        for g in &geneses {
-            if client.put(g).await.is_ok() {
-                taken += 1;
+    let offer = |addr: std::net::SocketAddr, id: vox_core::hash::Digest32| {
+        rt.block_on(async {
+            let (_ep, conn) = connect(&inventor, addr, id).await;
+            let mut client = vox_core::nat::service::RendezvousClient::open(&conn)
+                .await
+                .expect("CANNOT MEASURE: a rendezvous stream");
+            let mut taken = 0usize;
+            for g in &geneses {
+                if client.put(g).await.is_ok() {
+                    taken += 1;
+                }
             }
-        }
-        client.finish();
-        taken
-    });
+            client.finish();
+            taken
+        })
+    };
+    // What any joiner that reaches a board fetches first: the room's genesis. A join races every
+    // board it knows, so a join alone can succeed through either node and say nothing about the
+    // other; these say it of each board.
+    let serves = |addr: std::net::SocketAddr, id: vox_core::hash::Digest32, room| {
+        rt.block_on(async {
+            let (_ep, conn) = connect(&inventor, addr, id).await;
+            let mut client = vox_core::nat::service::RendezvousClient::open(&conn)
+                .await
+                .expect("CANNOT MEASURE: a rendezvous stream");
+            let set = client
+                .get(&room, 0, vox_core::nat::service::RecordKinds::GENESIS)
+                .await;
+            client.finish();
+            set.map(|s| s.genesis.is_some())
+        })
+    };
+    let on_victim = offer(victim_addr, victim_id);
+    let on_anchor = offer(anchor_addr, anchor_id);
     println!(
-        "[proof] genesis flood: the victim took {taken}/{GENESES} stranger geneses in {:?}",
+        "[proof] genesis flood: the victim took {on_victim}/{GENESES} stranger geneses, the \
+         anchor {on_anchor}/{GENESES}, in {:?}",
         t0.elapsed()
+    );
+    assert!(
+        on_anchor >= 4095,
+        "CANNOT MEASURE: the anchor took only {on_anchor} of {GENESES} stranger geneses, so its \
+         board was never full (it holds 4096 rooms from peers, one of them the room in use)"
+    );
+    let first_kept = serves(anchor_addr, anchor_id, room);
+    println!("[proof] the anchor still serves the room in use: {first_kept:?}");
+    assert!(
+        matches!(first_kept, Ok(true)),
+        "strangers' {GENESES} empty rooms displaced a room in use from the anchor ({first_kept:?})"
     );
     let (second, second_link) = create_room(&victim_dir, "second", ROOM_PASS);
     std::thread::sleep(Duration::from_secs(3));
-    // What any joiner that reaches the victim's board fetches first: the room's genesis. A join
-    // races every board it knows and the anchor also holds the room, so the join below can
-    // succeed through the anchor alone — this is what says the victim's own board serves it.
-    let served = rt.block_on(async {
-        let (_ep, conn) = connect(&inventor, victim_addr, victim_id).await;
-        let mut client = vox_core::nat::service::RendezvousClient::open(&conn)
-            .await
-            .expect("CANNOT MEASURE: a rendezvous stream to the victim");
-        let set = client
-            .get(&second, 0, vox_core::nat::service::RecordKinds::GENESIS)
-            .await;
-        client.finish();
-        set.map(|s| s.genesis.is_some())
-    });
-    println!("[proof] the victim's board serves the second room's genesis: {served:?}");
+    let on_victim_board = serves(victim_addr, victim_id, second);
+    let on_anchor_board = serves(anchor_addr, anchor_id, second);
+    println!(
+        "[proof] the second room's genesis is served by the victim: {on_victim_board:?}, by the \
+         anchor: {on_anchor_board:?}"
+    );
     assert!(
-        matches!(served, Ok(true)),
-        "a room the victim created after strangers offered its board {GENESES} geneses is not on the victim's own board ({served:?}): nobody reaching that node can join it through it"
+        matches!(on_victim_board, Ok(true)),
+        "a room the victim created after strangers offered its board {GENESES} geneses is not on \
+         the victim's own board ({on_victim_board:?}): nobody reaching that node can join it \
+         through it"
+    );
+    assert!(
+        matches!(on_anchor_board, Ok(true)),
+        "a room created after a stranger filled the anchor with {GENESES} geneses is not on the \
+         anchor ({on_anchor_board:?}): an anchor that serves any room published to it serves no \
+         new one"
     );
 
     // ---- 3. real joins, through the flooded nodes ------------------------------------------
