@@ -278,6 +278,7 @@ pub fn ui_error(f: Fault) -> UiError {
             UiError::Unreachable
         }
         Fault::SolveTooSlow => UiError::JoinPowTooSlow,
+        Fault::MembersBusy => UiError::JoinMembersBusy,
         Fault::Refused => UiError::Refused,
         Fault::NotAdmitted => UiError::NotAdmitted,
         Fault::NotConsented => UiError::NotConsented,

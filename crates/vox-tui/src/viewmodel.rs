@@ -210,6 +210,8 @@ pub enum UiError {
     JoinPowDelay,
     /// This device took longer to solve a join's proof of work than the member waits (V210-87).
     JoinPowTooSlow,
+    /// Every member that answered a join was busy answering others (V210-92).
+    JoinMembersBusy,
     /// Join proof-of-possession / identity mismatch.
     JoinProofMismatch,
     /// No reachable peer / your node — "both must be online" for a 2-member channel.
@@ -281,6 +283,9 @@ impl UiError {
             UiError::JoinPowDelay => "join proof-of-work in progress…",
             UiError::JoinPowTooSlow => {
                 "this device solved the join's proof of work too slowly for the member — try when it is less busy"
+            }
+            UiError::JoinMembersBusy => {
+                "a member is busy answering other joins — try again shortly"
             }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — both must be online (or run your node)",

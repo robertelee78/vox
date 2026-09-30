@@ -110,6 +110,10 @@ pub enum JoinReject {
     /// Refused after the work gate: wrong passphrase, identity mismatch, an
     /// unresolvable prekey, or a policy refusal. One value, so it is no oracle.
     Refused = 3,
+    /// Every one of the responder's join slots was held, so it did not start the exchange
+    /// (V210-92). Sent before the challenge, so before anything about the passphrase is known: it
+    /// says only that this member is busy, and nothing about the joiner.
+    Busy = 4,
 }
 
 impl JoinReject {
@@ -118,6 +122,7 @@ impl JoinReject {
             1 => Some(Self::PowInvalid),
             2 => Some(Self::Malformed),
             3 => Some(Self::Refused),
+            4 => Some(Self::Busy),
             _ => None,
         }
     }
@@ -129,6 +134,7 @@ impl JoinReject {
             Self::PowInvalid => "responder refused: proof-of-work invalid",
             Self::Malformed => "responder refused: malformed frame",
             Self::Refused => "responder refused",
+            Self::Busy => "responder refused: busy answering other joins",
         }
     }
 }
@@ -485,7 +491,12 @@ pub async fn run_initiator(
         nonce,
         sid,
         bundle,
-    } = recv_frame(&mut recv).await?
+    } = (match recv_frame(&mut recv).await? {
+        // A member whose every join slot was held (V210-92): not a verdict on this joiner, and
+        // said as such, not as the refusal a wrong passphrase gets.
+        JoinFrame::Rejected(JoinReject::Busy) => return Err(Error::JoinResponderBusy),
+        frame => frame,
+    })
     else {
         return Err(Error::MalformedJoin("expected challenge"));
     };
@@ -671,8 +682,14 @@ pub async fn read_join_request(recv: &mut RecvStream) -> Result<(Digest32, u64)>
 /// Refuse a join on a stream whose `WANT` named a channel this node cannot answer
 /// for (it does not hold it, or it is app-locked so the passphrase is gone). The
 /// reason is the same opaque `Refused` every post-work refusal uses.
-pub async fn refuse_join(mut send: SendStream) {
-    let _ = send_frame(&mut send, &JoinFrame::Rejected(JoinReject::Refused)).await;
+pub async fn refuse_join(send: SendStream) {
+    refuse_join_as(send, JoinReject::Refused).await;
+}
+
+/// Refuse a join with `reason`, as [`refuse_join`] does. Only [`JoinReject::Busy`] is said apart,
+/// and only before the exchange starts, where it depends on nothing the joiner sent.
+pub async fn refuse_join_as(mut send: SendStream, reason: JoinReject) {
+    let _ = send_frame(&mut send, &JoinFrame::Rejected(reason)).await;
     let _ = send.finish();
 }
 

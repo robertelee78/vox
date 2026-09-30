@@ -37,9 +37,18 @@
 //! the base difficulty), so in debug the bound is the proof's watchdog, and what is asserted is
 //! that carol gets in at all.
 //!
-//! **The mutation that must turn it red.** `JoinSlots::take` refusing every newcomer once the cap
-//! is reached (first come, first served, as before): carol is refused `already answering 16 joins`
-//! and her join fails, in both cases.
+//! **And a joiner turned away at the cap is told so.** Every one of the stranger's joins that alice
+//! turns away while its slots are held (it is the heaviest source, so it is refused) must say the
+//! member is busy answering other joins, and none may say the room passphrase is wrong: that is
+//! what a bare refusal said, and it sent a person looking for a typo. So that some certainly are,
+//! after carol's join the stranger joins a room of its own three more times, one after another.
+//! A probe that is let in, or not answered within 60s, or none turned away, is CANNOT MEASURE.
+//!
+//! **The mutations that must turn it red.**
+//! - `JoinSlots::take` refusing every newcomer once the cap is reached (first come, first served,
+//!   as before): carol is refused and her join fails, in both cases.
+//! - The cap's refusal sent as the bare `JoinReject::Refused` again: carol still gets in, and the
+//!   stranger's refused joins are told `usually the room passphrase is wrong`, in both cases.
 
 #![cfg(unix)]
 
@@ -70,6 +79,12 @@ const JOIN_BOUND: Duration = if cfg!(debug_assertions) {
 };
 /// How long a stranger's churning join may take to be turned away before it counts as holding.
 const ARRIVAL: Duration = Duration::from_secs(10);
+/// How long after carol's join the stranger's refused joins are given to have said so.
+const TOLD_GRACE: Duration = Duration::from_secs(5);
+/// How many joins the stranger makes after carol's, each certain to be turned away.
+const PROBES: usize = 3;
+/// How long one of those may take to be turned away.
+const PROBE_PATIENCE: Duration = Duration::from_secs(60);
 /// How long a daemon may take to answer after it starts (production Argon2id unlock).
 const START_PATIENCE: Duration = Duration::from_secs(240);
 
@@ -145,13 +160,24 @@ impl Who {
         )
     }
 
-    /// `vox room join <link>` left running: a stranger's join, which never finishes.
-    fn join_in_background(&self, link: &str, name: &str) -> Proc {
+    /// `vox room join <link>` left running: a stranger's join, which never finishes. What it says,
+    /// if it does end, goes to `said`.
+    fn join_in_background(&self, link: &str, name: &str, said: Option<&Path>) -> Proc {
+        let to = || match said {
+            Some(p) => Stdio::from(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .unwrap(),
+            ),
+            None => Stdio::null(),
+        };
         let mut child = self
             .command(&["room", "join", link, "--name", name])
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(to())
+            .stderr(to())
             .spawn()
             .expect("spawn vox room join");
         let mut pipe = child.stdin.take().unwrap();
@@ -189,6 +215,7 @@ impl Who {
 }
 
 struct Staged {
+    dir: PathBuf,
     _anchor: Proc,
     _daemons: Vec<Proc>,
     carol: Who,
@@ -298,6 +325,7 @@ fn stage(tmp: &Path, rooms: usize, strangers: usize) -> Staged {
         started.elapsed().as_secs_f64()
     );
     Staged {
+        dir: tmp.to_path_buf(),
         _anchor: anchor,
         _daemons: daemons,
         carol,
@@ -323,7 +351,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
     let mut held: Vec<Proc> = holds
         .iter()
         .map(|&(who, room)| {
-            s.strangers[who].join_in_background(&s.links[room], &format!("s{room}"))
+            s.strangers[who].join_in_background(&s.links[room], &format!("s{room}"), None)
         })
         .collect();
 
@@ -332,6 +360,8 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
     // A churning join that did not come back within `ARRIVAL` is holding a slot: kept, and killed
     // with the rest at the end.
     let kept = std::sync::Mutex::new(Vec::<Proc>::new());
+    // Where each of the stranger's churning joins wrote what it was told.
+    let said_to = std::sync::Mutex::new(Vec::<PathBuf>::new());
     let rooms: Vec<usize> = holds
         .iter()
         .filter(|&&(who, _)| who == churner)
@@ -347,15 +377,20 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
                 if done.load(Ordering::SeqCst) {
                     break;
                 }
-                let mut join = s.strangers[churner].join_in_background(&s.links[room], "churn");
+                let n = churned.fetch_add(1, Ordering::SeqCst);
+                let said = s.dir.join(format!("churn-{case}-{n}.out"));
+                let mut join =
+                    s.strangers[churner].join_in_background(&s.links[room], "churn", Some(&said));
                 let sent = Instant::now();
                 while join.0.try_wait().ok().flatten().is_none() && sent.elapsed() < ARRIVAL {
                     std::thread::sleep(Duration::from_millis(100));
                 }
+                // Still running: holding a slot, or still being turned away. Either way it is
+                // kept, and what it said is read at the end.
                 if join.0.try_wait().ok().flatten().is_none() {
                     kept.lock().unwrap().push(join);
                 }
-                churned.fetch_add(1, Ordering::SeqCst);
+                said_to.lock().unwrap().push(said);
                 std::thread::sleep(Duration::from_millis(200));
             }
         });
@@ -417,9 +452,77 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
             JOIN_BOUND.as_secs()
         );
     });
+    // A joiner turned away at the cap is told that, and not that its passphrase is wrong. Read
+    // after a grace, so a refusal that took longer than `ARRIVAL` to be reported is counted too;
+    // a join that is still holding a slot has said nothing. Only a refusal by alice herself is
+    // counted: a join this daemon would not start (the room already being joined) never reached her.
+    //
+    // And, so the claim does not rest on how many times the stranger happened to arrive while
+    // carol joined, it joins a room of its own [`PROBES`] more times now, one after another, with
+    // every slot still held: each is its heaviest source's newest, so each is turned away.
+    let mut said_to = said_to.into_inner().unwrap();
+    let probe_room = s.links.len() - 1;
+    for n in 0..PROBES {
+        let said = s.dir.join(format!("probe-{case}-{n}.out"));
+        let mut probe =
+            s.strangers[churner].join_in_background(&s.links[probe_room], "probe", Some(&said));
+        let sent = Instant::now();
+        let ended = loop {
+            if let Some(status) = probe.0.try_wait().ok().flatten() {
+                break status;
+            }
+            assert!(
+                sent.elapsed() < PROBE_PATIENCE,
+                "CANNOT MEASURE: {case}: the stranger's probe was neither turned away nor let in \
+                 within {}s",
+                PROBE_PATIENCE.as_secs()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(
+            !ended.success(),
+            "CANNOT MEASURE: {case}: the stranger's probe got in while every slot was held"
+        );
+        said_to.push(said);
+    }
+    std::thread::sleep(TOLD_GRACE);
+    let turned_away: Vec<String> = said_to
+        .iter()
+        .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+        .filter(|t| t.contains("a member answered"))
+        .collect();
+    let blamed = turned_away
+        .iter()
+        .filter(|t| t.contains("passphrase is wrong"))
+        .count();
+    let busy = turned_away
+        .iter()
+        .filter(|t| t.contains("busy answering other joins") && !t.contains("passphrase is wrong"))
+        .count();
+    eprintln!(
+        "[proof] {} {case}: the stranger was turned away {} times: {busy} told the member was busy, \
+         {blamed} told the passphrase was wrong",
+        profile(),
+        turned_away.len()
+    );
+    assert!(
+        !turned_away.is_empty(),
+        "CANNOT MEASURE: {case}: none of the stranger's joins was turned away by alice"
+    );
+    assert!(
+        busy == turned_away.len(),
+        "{case}: a joiner turned away at the join-slot cap was not told the member was busy \
+         ({busy} of {}), {blamed} were told the passphrase was wrong:\n{}",
+        turned_away.len(),
+        turned_away.join("\n---\n")
+    );
     held.clear();
     kept.lock().unwrap().clear();
-    eprintln!("[proof] {} {case}: 1/1 got in", profile());
+    eprintln!(
+        "[proof] {} {case}: 1/1 got in; {busy}/{} turned away at the cap were told why",
+        profile(),
+        turned_away.len()
+    );
 }
 
 #[test]
@@ -428,7 +531,8 @@ fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     // Rooms 0–15 are held; room 16 is the one the stranger keeps arriving for.
-    let s = stage(tmp.path(), SLOTS + 1, 1);
+    // Rooms 0–15 are held, 16 is the one the stranger keeps arriving for, 17 its probes'.
+    let s = stage(tmp.path(), SLOTS + 2, 1);
     let holds: Vec<(usize, usize)> = (0..SLOTS).map(|room| (0, room)).collect();
     run(&s, &holds, 0, SLOTS, "one identity");
 }
@@ -439,7 +543,8 @@ fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     // Four identities hold four rooms each; room 4 is the one the first keeps arriving for.
-    let s = stage(tmp.path(), 5, 4);
+    // Room 5 is the probes'.
+    let s = stage(tmp.path(), 6, 4);
     let holds: Vec<(usize, usize)> = (0..4)
         .flat_map(|who| (0..4).map(move |room| (who, room)))
         .collect();

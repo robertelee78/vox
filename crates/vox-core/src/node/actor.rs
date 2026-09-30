@@ -4511,7 +4511,11 @@ impl Node {
                     crate::node::network::short_id(peer)
                 ),
             });
-            Self::spawn_refuse_join(send);
+            // Told why (V210-92): a bare refusal reads to the joiner as a wrong passphrase.
+            tokio::spawn(crate::node::joinstream::refuse_join_as(
+                send,
+                crate::node::joinstream::JoinReject::Busy,
+            ));
             return;
         };
         if let Some(ended) = ended {
@@ -8746,6 +8750,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
         Error::JoinSolveTooSlow { .. } => Fault::SolveTooSlow,
+        Error::JoinResponderBusy => Fault::MembersBusy,
         Error::Path {
             op: crate::node::profile::VAULT_WRITE,
             ..

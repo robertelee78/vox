@@ -352,6 +352,11 @@ pub enum Error {
     #[error("join refused: {0}")]
     JoinRefused(&'static str),
 
+    /// Every one of the responder's join slots was held, so it refused before the exchange began
+    /// (V210-92). The passphrase was never checked.
+    #[error("a member is busy answering other joins")]
+    JoinResponderBusy,
+
     /// This joiner's proof of work took longer than the responder waits for it, so the responder
     /// had stopped waiting before the solution arrived (V210-87). Both sides derive the wait from
     /// the same signed difficulty, so the joiner can say this rather than a refusal it cannot name.
