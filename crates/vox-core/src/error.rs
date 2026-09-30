@@ -352,6 +352,20 @@ pub enum Error {
     #[error("join refused: {0}")]
     JoinRefused(&'static str),
 
+    /// This joiner's proof of work took longer than the responder waits for it, so the responder
+    /// had stopped waiting before the solution arrived (V210-87). Both sides derive the wait from
+    /// the same signed difficulty, so the joiner can say this rather than a refusal it cannot name.
+    #[error(
+        "this device took {solved_secs}s to solve the join's proof of work, and a member waits \
+         {patience_secs}s for it"
+    )]
+    JoinSolveTooSlow {
+        /// How long this side's grind took, in whole seconds.
+        solved_secs: u64,
+        /// How long the responder waits for it at the difficulty it demanded, in whole seconds.
+        patience_secs: u64,
+    },
+
     /// A peer opened a stream kind its class is not authorized to open (ADR-016
     /// §"Connections": an anchor has no channel authority, a pending joiner may
     /// open only the join stream, an unknown peer only the rendezvous service).

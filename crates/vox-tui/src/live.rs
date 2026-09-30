@@ -277,6 +277,7 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::Unreachable | Fault::BoardUnreachable | Fault::RoomNotOnBoard => {
             UiError::Unreachable
         }
+        Fault::SolveTooSlow => UiError::JoinPowTooSlow,
         Fault::Refused => UiError::Refused,
         Fault::NotAdmitted => UiError::NotAdmitted,
         Fault::NotConsented => UiError::NotConsented,
