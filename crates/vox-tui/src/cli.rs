@@ -1075,9 +1075,11 @@ pub struct NodeArgs {
     pub profile: ProfileArgs,
     /// Which rooms this anchor serves: `anyone` (the default) serves any room published to
     /// it; `trusted` serves only rooms made by someone in this profile's `vox trust` list.
-    /// `trusted` needs this profile's identity passphrase (`--identity-passphrase-file` or
-    /// `VOX_IDENTITY_PASSPHRASE`) to read that list, and reads it once at start. Without the
-    /// flag, the `serve` file in the config directory (`anyone` or `trusted`) decides.
+    /// `trusted` needs this profile's identity passphrase to read that list, and reads it once
+    /// at start. Give it with `--identity-passphrase-file`: `VOX_IDENTITY_PASSPHRASE` also
+    /// works, but it stays in the anchor's environment for as long as it runs, where any
+    /// process of the same user can read it (`ps -E`). Without the flag, the `serve` file in
+    /// the config directory (`anyone` or `trusted`) decides.
     #[arg(long, env = "VOX_SERVE", value_enum)]
     pub serve: Option<Serve>,
     /// **Refused**, as for every verb: a command line is world-readable while the process
@@ -1128,10 +1130,22 @@ impl NodeArgs {
                  `vox trust` list, so it will not start without it"
             ))
         };
+        // Two different failures, and each needs different advice: a profile with no identity
+        // has no trust list to read and needs one made; a profile that has one but cannot be
+        // opened has a list this process cannot get at, and remaking it would not help.
+        if !vox_core::node::profile::Profile::exists(paths) {
+            return Err(refuse(format!(
+                "this profile has no identity, so no `vox trust` list to read; make one with \
+                 `vox id` and `vox trust add <fingerprint>` in the profile at {}",
+                paths.profile_dir.display()
+            )));
+        }
         let mut profile = vox_core::node::profile::Profile::open(paths.clone()).map_err(|e| {
             refuse(format!(
-                "this profile has no `vox trust` list to read ({e}); make one with `vox id` \
-                 and `vox trust add <fingerprint>`"
+                "this profile's identity and `vox trust` list exist but could not be opened \
+                 ({e}); check that the files in {} belong to and are readable by the user \
+                 running `vox node`, and that no other vox has this profile open",
+                paths.profile_dir.display()
             ))
         })?;
         // Held only for the one unlock, and wiped when it goes: an anchor runs for months, and

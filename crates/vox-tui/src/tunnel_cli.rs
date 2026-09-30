@@ -76,8 +76,12 @@ pub fn identity_passphrase_for(
         ));
     }
     if let Some(path) = file {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+        // The whole file is the passphrase and whatever follows it, so it is wiped on drop like
+        // the copy returned: only that copy should outlive this read.
+        let text = zeroize::Zeroizing::new(
+            std::fs::read_to_string(&path)
+                .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?,
+        );
         let first = text.lines().next().unwrap_or_default();
         if first.is_empty() {
             return Err(AppError::Usage(format!(
