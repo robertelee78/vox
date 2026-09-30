@@ -306,6 +306,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
+        NetEvent::ChannelUnsealed { .. } => "holding a room whose key was unwrapped",
         NetEvent::Dialed { .. } => "adopting a connection a join dialled",
         NetEvent::JoinerDone { .. } => "finishing a join",
         NetEvent::ForwardDialed { .. } => "binding a forward whose dial landed",
@@ -846,6 +847,18 @@ enum NetEvent {
         now: u64,
         /// The room key and its sealed wrap, or why sealing failed.
         sealed: crate::error::Result<(crate::atrest::sek::Sek, crate::atrest::SekWrap)>,
+        /// For `vox serve`: the one service the room is made for, as (tag, endpoint).
+        service: Option<(String, SocketAddr)>,
+    },
+    /// A room's key was unwrapped and its log re-verified on a blocking thread (the slow part of
+    /// opening a room with its passphrase, V210-71): hold the room and answer the command.
+    ChannelUnsealed {
+        /// The `OpenChannel` command's reply.
+        reply: oneshot::Sender<Outcome>,
+        /// The room.
+        channel_id: Digest32,
+        /// The opened room, or why it would not open.
+        opened: Box<crate::error::Result<ChannelState>>,
     },
     /// A record by another author was admitted to this node's board, so what this node can
     /// vouch for has grown and its anchors do not know it yet.
@@ -2438,9 +2451,43 @@ impl Node {
                         passphrase,
                     } = command
                     {
-                        self.begin_create_channel(local_name, passphrase, reply).await;
+                        self.begin_create_channel(local_name, passphrase, None, reply)
+                            .await;
                         self.note_if_stalled(name, started);
                         self.publish().await;
+                        continue;
+                    }
+                    // **`vox serve` and `vox room open` too** (V210-71): serving seals a new
+                    // room's key and opening unwraps one, each production Argon2id, and opening
+                    // also re-verifies the room's whole log. Both ran on the actor, so a post on
+                    // any other room waited seconds behind them.
+                    if let NodeCommand::Serve {
+                        local_name,
+                        passphrase,
+                        port,
+                        at,
+                    } = command
+                    {
+                        let endpoint =
+                            at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)));
+                        self.begin_create_channel(
+                            local_name,
+                            passphrase,
+                            Some((port.to_string(), endpoint)),
+                            reply,
+                        )
+                        .await;
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
+                        continue;
+                    }
+                    if let NodeCommand::OpenChannel {
+                        channel_id,
+                        passphrase,
+                    } = command
+                    {
+                        self.begin_open_channel(channel_id, passphrase, reply);
+                        self.note_if_stalled(name, started);
                         continue;
                     }
                     // **A forward is answered later too** (#215): its first dial runs the whole
@@ -2626,10 +2673,8 @@ impl Node {
                 local_name,
                 passphrase,
             } => self.create_channel(&local_name, &passphrase).await,
-            NodeCommand::OpenChannel {
-                channel_id,
-                passphrase,
-            } => self.open_channel(&channel_id, &passphrase).await,
+            // Answered through `begin_open_channel`, which the run loop calls instead of this.
+            NodeCommand::OpenChannel { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id).await,
             NodeCommand::SendText { channel_id, text } => self.send_text(&channel_id, &text).await,
             NodeCommand::Invite { channel_id } => self.invite(&channel_id).await,
@@ -2665,12 +2710,8 @@ impl Node {
                 petname,
             } => self.trust_identity(fingerprint, &petname).await,
             NodeCommand::Untrust { fingerprint } => self.untrust_identity(&fingerprint).await,
-            NodeCommand::Serve {
-                local_name,
-                passphrase,
-                port,
-                at,
-            } => self.serve_room(&local_name, &passphrase, port, at).await,
+            // Answered through `begin_create_channel`, which the run loop calls instead of this.
+            NodeCommand::Serve { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::Up { channel_id, bind } => self.bring_up(&channel_id, bind).await,
             NodeCommand::AddService {
                 channel_id,
@@ -3859,6 +3900,7 @@ impl Node {
                 genesis,
                 now,
                 sealed,
+                service,
             } => {
                 let room = genesis.channel_id();
                 let outcome = match sealed {
@@ -3874,13 +3916,35 @@ impl Node {
                             &wrap,
                             now,
                         ) {
-                            Ok(ch) => self.finish_create_channel(ch).await,
+                            Ok(ch) => match service {
+                                None => self.finish_create_channel(ch).await,
+                                Some((tag, endpoint)) => {
+                                    self.finish_serve_room(ch, &tag, endpoint).await
+                                }
+                            },
                             Err(e) => Outcome::Failed(fault_of(&e)),
                         },
                     },
                 };
                 // The view first, then the answer — as for a join above.
                 self.answer_when_published(room, reply, outcome).await;
+            }
+            NetEvent::ChannelUnsealed {
+                reply,
+                channel_id,
+                opened,
+            } => {
+                let outcome = match *opened {
+                    // Opened meanwhile by another command, or by the reopening: that one is held.
+                    _ if self.channels.contains_key(&channel_id) => Outcome::Done,
+                    // Locked meanwhile: a locked node holds no room key (ADR-015).
+                    _ if !self.profile.as_ref().is_some_and(Profile::is_unlocked) => {
+                        Outcome::Failed(Fault::NoIdentity)
+                    }
+                    Ok(ch) => self.finish_open_channel(ch).await,
+                    Err(e) => Outcome::Failed(fault_of(&e)),
+                };
+                self.answer_when_published(channel_id, reply, outcome).await;
             }
             NetEvent::BoardGrew { channel_id } => {
                 // Pass it on, which for a member means its anchors. A node that is not a member of
@@ -7533,6 +7597,7 @@ impl Node {
         &mut self,
         local_name: String,
         passphrase: Secret,
+        service: Option<(String, SocketAddr)>,
         reply: oneshot::Sender<Outcome>,
     ) {
         let now = self.now();
@@ -7540,12 +7605,12 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
             return;
         };
-        let (genesis, sek) = match ChannelState::create_genesis(
-            profile,
-            &local_name,
-            crate::governance::capability::CapabilitySet::new(),
-            now,
-        ) {
+        // A service room's genesis grants dialling its one service (ADR-017).
+        let grant = match &service {
+            Some((tag, _)) => CapabilitySet::from_iter_caps([Capability::dial(tag.clone())]),
+            None => crate::governance::capability::CapabilitySet::new(),
+        };
+        let (genesis, sek) = match ChannelState::create_genesis(profile, &local_name, grant, now) {
             Ok(g) => g,
             Err(e) => {
                 let _ = reply.send(Outcome::Failed(fault_of(&e)));
@@ -7579,44 +7644,30 @@ impl Node {
                     genesis: Box::new(genesis),
                     now,
                     sealed,
+                    service,
                 })
                 .await;
         });
     }
 
-    /// Create a service room and offer its one service, atomically (ADR-017).
+    /// Finish a service room whose key was sealed off the actor, and offer its one service,
+    /// atomically (ADR-017).
     ///
     /// The two halves are one command because either alone is a lie: a room with a
     /// service grant and no service hands out an address for nothing, and a service in a
     /// room nobody can join is unreachable. If the service cannot be offered the room is
     /// not kept.
-    async fn serve_room(
+    async fn finish_serve_room(
         &mut self,
-        local_name: &str,
-        passphrase: &Secret,
-        port: u16,
-        at: Option<SocketAddr>,
+        mut channel: ChannelState,
+        tag: &str,
+        endpoint: SocketAddr,
     ) -> Outcome {
-        let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        let tag = port.to_string();
-        let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)));
-        let grant = CapabilitySet::from_iter_caps([Capability::dial(tag.clone())]);
-        let mut channel = match ChannelState::create_with_grant(
-            profile,
-            local_name,
-            passphrase,
-            grant,
-            now,
-            self.argon2,
-        ) {
-            Ok(ch) => ch,
-            Err(e) => return Outcome::Failed(fault_of(&e)),
-        };
         let id = channel.channel_id();
-        if let Err(e) = channel.add_service(profile.store(), profile, &tag, endpoint) {
+        if let Err(e) = channel.add_service(profile.store(), profile, tag, endpoint) {
             // Drop the room rather than keep a half-made one. Nothing outside this
             // function has seen it: it is not in `self.channels` and has not been
             // published, so forgetting it here is the whole of the rollback.
@@ -7752,31 +7803,69 @@ impl Node {
         self.reopen_task = Some(task.abort_handle());
     }
 
-    async fn open_channel(&mut self, channel_id: &Digest32, passphrase: &Secret) -> Outcome {
-        if self.channels.contains_key(channel_id) {
-            return Outcome::Done;
+    /// Open a room with its passphrase: **unwrap its key and re-verify its log off the actor**
+    /// (V210-71), then hold it through `NetEvent::ChannelUnsealed`.
+    ///
+    /// The unwrap is production Argon2id and the open re-verifies every entry of the room's log;
+    /// on the actor, every other room's posts, reads and syncs waited behind both.
+    fn begin_open_channel(
+        &mut self,
+        channel_id: Digest32,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        if self.channels.contains_key(&channel_id) {
+            let _ = reply.send(Outcome::Done);
+            return;
         }
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
+            let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
+            return;
         };
-        match ChannelState::open(profile, channel_id, passphrase, now) {
-            Ok(ch) => {
-                self.remember_or_say(&ch);
-                self.channels
-                    .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
-                self.mark_decisions_on_open(channel_id).await;
-                self.adopt_channel_anchors(channel_id, None).await;
-                self.refresh_network_view().await;
-                self.publish_channel_locally(channel_id).await;
-                self.publish_channel_to_anchors(channel_id).await;
-                let _ = self.event_tx.send(NodeEvent::ChannelOpened {
-                    channel_id: *channel_id,
-                });
-                Outcome::Done
+        let signer = match profile.signer_arc() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                return;
             }
-            Err(e) => Outcome::Failed(fault_of(&e)),
-        }
+        };
+        let store = profile.store_handle();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let opened = tokio::task::spawn_blocking(move || {
+                let wrap = store
+                    .get_sek_wrap(&channel_id)?
+                    .ok_or(Error::Profile("no such channel in this profile"))?;
+                let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
+                let sek = wrap.unwrap_sek(&factor, &channel_id, &passphrase)?;
+                ChannelState::open_with_sek(&store, &channel_id, sek, &passphrase, now)
+            })
+            .await
+            .unwrap_or(Err(Error::Argon2Failed));
+            let _ = tx
+                .send(NetEvent::ChannelUnsealed {
+                    reply,
+                    channel_id,
+                    opened: Box::new(opened),
+                })
+                .await;
+        });
+    }
+
+    /// Hold a room opened off the actor: everything [`Self::begin_open_channel`] leaves.
+    async fn finish_open_channel(&mut self, ch: ChannelState) -> Outcome {
+        let channel_id = ch.channel_id();
+        self.remember_or_say(&ch);
+        self.channels
+            .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+        self.mark_decisions_on_open(&channel_id).await;
+        self.adopt_channel_anchors(&channel_id, None).await;
+        self.refresh_network_view().await;
+        self.publish_channel_locally(&channel_id).await;
+        self.publish_channel_to_anchors(&channel_id).await;
+        let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
+        Outcome::Done
     }
 
     async fn close_channel(&mut self, channel_id: &Digest32) -> Outcome {
