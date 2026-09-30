@@ -245,6 +245,10 @@ where
     let listen = profile.listen;
     let anchors_for_body = anchors.clone();
     let unlocking = waiting.clone();
+    // The node, once there is one, for a stop to shut down: see below.
+    let opened: std::sync::Arc<std::sync::Mutex<Option<vox_core::node::actor::NodeHandle>>> =
+        std::sync::Arc::default();
+    let opening = std::sync::Arc::clone(&opened);
     let work = async move {
         let asking = unlocking.clone();
         let paths_for_asking = paths.clone();
@@ -266,6 +270,9 @@ where
             w.on("this profile's identity to unlock");
         }
         let node = crate::tunnel_cli::open_profile(paths, listen, anchors, &identity).await?;
+        if let Ok(mut slot) = opening.lock() {
+            *slot = Some(node.clone());
+        }
         body(node, anchors_for_body, asked).await
     };
     let (outcome, stopped) = rt.block_on(async move {
@@ -275,7 +282,22 @@ where
                 // Taken here, before the work is first polled, so before its first prompt.
                 let stop = crate::app::stop_requested("vox");
                 tokio::select! {
-                    signal = stop => (Err(waiting.stopped_by(signal)), true),
+                    signal = stop => {
+                        let why = waiting.stopped_by(signal);
+                        // **Its peers are told it went** (V210-85). Stopped mid-join, it left its
+                        // connections to the anchor and the host unclosed, and both counted it as
+                        // connected until their idle timeout. A shutdown closes each with a
+                        // reason; bounded, because what it abandoned must not hold the exit.
+                        let node = opened.lock().ok().and_then(|n| n.clone());
+                        if let Some(node) = node {
+                            let _ = tokio::time::timeout(
+                                STOP_CLOSE_PATIENCE,
+                                node.apply(vox_core::node::api::NodeCommand::Shutdown),
+                            )
+                            .await;
+                        }
+                        (Err(why), true)
+                    }
                     done = work => (done, false),
                 }
             }
@@ -306,6 +328,10 @@ where
     }
     code
 }
+
+/// How long a stopped `vox connect` waits for its node to close its connections before it exits
+/// anyway. The closes go out first thing in a shutdown; the rest of it is not worth waiting for.
+const STOP_CLOSE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Whether a node is already serving this profile.
 fn node_answers(profile: &ProfileArgs) -> bool {

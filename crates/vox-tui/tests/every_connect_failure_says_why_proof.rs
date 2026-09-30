@@ -20,7 +20,10 @@
 //!    it ends when it says so**, within [`STOPS_WITHIN`] of the signal: the first version printed
 //!    its reason at once and then lived on in a debug build until the proof of work it had
 //!    abandoned finished, past 15 s. SIGHUP is what a closed terminal or a dropped ssh session
-//!    sends; with stderr kept in a log it was the original symptom exactly.
+//!    sends; with stderr kept in a log it was the original symptom exactly. **And its peers are
+//!    told**: the connect closes its connections before it exits, so the anchor counts it gone
+//!    within [`CLOSED_WITHIN`] of the signal — a stop that just exited left the anchor and the host
+//!    counting it until their idle timeout.
 //! 2. **A join its host never answers** (left to run out): exit status 1, and the reason names the
 //!    host and the step that did not complete — the join exchange. The exchange's timeout used to
 //!    name nobody: the join ended on advice about members that could not be reached, for one that
@@ -35,6 +38,15 @@
 //!    terminal is handed back with echo and line editing on, not in the prompt's raw mode. Ctrl-C
 //!    typed at the prompt ends with a status and `cancelled`. The prompts ran before the signal
 //!    handler was taken, so a stop there died on the signal and said nothing.
+//!
+//! 6. **An anchor stopped by SIGQUIT** (`Ctrl-\`): the stop helper `vox connect` shares with the
+//!    long-running verbs takes SIGQUIT as a clean stop for all of them, so `vox node` must end with
+//!    status 0, not a core dump, say `stopped by SIGQUIT` and that it is shutting down, and a forward
+//!    through it must say its anchor connection is gone within [`CLOSED_WITHIN`] — its close, not
+//!    the seconds of silence a vanished anchor takes to be noticed.
+//! 7. **An anchor stopped by SIGHUP** (its terminal closed, its ssh session gone): `vox node` ends
+//!    with status 0, not death by the signal, and says `stopped by SIGHUP` and that it is shutting
+//!    down.
 //!
 //! In every one, stderr is non-empty and the exit is a status, never a signal. Each prints its
 //! counts.
@@ -51,10 +63,12 @@
 //!
 //! **Mutations that must turn it red:** the verb runner printing nothing for an error; `vox
 //! connect` not taking one of the four signals (that case dies by the signal); the prompts run
-//! before the handler is taken (case 5 dies by the signal); the terminal not handed back (case 5,
-//! still raw); the joiner not announcing its steps (case 1 names no join step); the exchange's
-//! timeout naming nobody (case 2); a stop that waits for the runtime's blocking work (case 1
-//! outlives [`STOPS_WITHIN`] in a debug build, where the solve is long).
+//! before the handler is taken (case 5 dies by the signal); SIGQUIT or SIGHUP not taken (cases 1,
+//! 6 and 7 die by it); a stop that exits without closing (case 1's anchor counts the connect until
+//! its idle timeout); the terminal not handed back (case 5, still raw); the joiner not announcing
+//! its steps (case 1 names no join step); the exchange's timeout naming nobody (case 2); a stop
+//! that waits for the runtime's blocking work (case 1 outlives [`STOPS_WITHIN`] in a debug build,
+//! where the solve is long).
 //!
 //! `#[ignore]`d: production Argon2id and a real PoW. Run it in release.
 
@@ -78,7 +92,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use relay::{RelayWorld, Split};
-use world::{args, vox_once, VoxProc, VOX};
+use world::{args, round_trip, vox_once, VoxProc, VOX};
 
 /// A `vox connect` that fails on its own must have ended by then: past the board's 30 s patience,
 /// a dial's timeout and a proof of work, with room for a loaded machine.
@@ -95,6 +109,14 @@ const LEFT_WAITING: Duration = Duration::from_secs(2);
 
 /// How long a `vox connect` may take to show a passphrase prompt on its terminal.
 const PROMPTS_WITHIN: Duration = Duration::from_secs(60);
+
+/// How soon after a stop signal its peers must count a stopped process gone: a forward through a
+/// stopped anchor says so on its next 1 s tick, an anchor whose joiner stopped on its next 500 ms
+/// status tick. The close arrives at once; short of the 8 s any inference from silence needs.
+const CLOSED_WITHIN: Duration = Duration::from_secs(3);
+
+/// What a node says when its anchor connection goes.
+const GONE: &str = "the connection to this anchor is gone";
 
 /// The build profile, named in every count line.
 const PROFILE: &str = if cfg!(debug_assertions) {
@@ -301,16 +323,42 @@ fn stopped_mid_join(w: &mut RelayWorld, k: usize, sig: &str, name: &str, code: i
             connect.transcript()
         );
     }
+    let case = format!("stopped by {name}");
+    let before = w.anchor.proc.transcript();
+    let peers = before
+        .lines()
+        .rev()
+        .find_map(peers_connected)
+        .unwrap_or_else(|| {
+            panic!(
+                "CANNOT MEASURE ({name}): the anchor never said how many peers it has.\n{before}"
+            )
+        });
     signal(connect.child.id(), sig);
     let sent = Instant::now();
+    // Timed as it happens, both of them: when the connect exits, and when the anchor's count of
+    // connected peers drops by the one that went. Watched well past the bound, so a red says how
+    // long it did take.
+    let (mut exited, mut gone) = (None, None);
+    while sent.elapsed() < CLOSED_WITHIN + Duration::from_secs(30) && gone.is_none() {
+        if exited.is_none() && connect.child.try_wait().ok().flatten().is_some() {
+            exited = Some(sent.elapsed());
+        }
+        if let Ok(line) = w.anchor.proc.lines.recv_timeout(Duration::from_millis(20)) {
+            if peers_connected(&line).is_some_and(|n| n < peers) {
+                gone = Some(sent.elapsed());
+            }
+            w.anchor.proc.seen.push(line);
+        }
+    }
     let e = finish(connect, t0, STOPS_WITHIN);
     eprintln!(
-        "[proof] ({PROFILE}) {name}: status {} {:.1}s after the signal, {:.1}s after the start",
+        "[proof] ({PROFILE}) {name}: status {} {:.1}s after the signal, {:.1}s after the start; \
+         the anchor counted it gone {gone:?} after the signal",
         e.status,
-        sent.elapsed().as_secs_f64(),
+        exited.unwrap_or_else(|| sent.elapsed()).as_secs_f64(),
         e.took.as_secs_f64()
     );
-    let case = format!("stopped by {name}");
     assert_said_why(&e, &case, code);
     assert_says_stopped(&e, &case, name);
     // Past its announce the join waits on the host — to be dialled, or to answer the exchange —
@@ -339,6 +387,30 @@ fn stopped_mid_join(w: &mut RelayWorld, k: usize, sig: &str, name: &str, code: i
         e.describe()
     );
     eprintln!("[proof] ({PROFILE}) {name}: stopped in the step {step:?} on the host");
+    let gone = gone.unwrap_or_else(|| {
+        panic!(
+            "{case}: the anchor still counted {peers} peers {:?} after the signal — the connect \
+             did not close its connection to it.\n---- the anchor ----\n{}",
+            CLOSED_WITHIN + Duration::from_secs(30),
+            w.anchor.proc.transcript()
+        )
+    });
+    assert!(
+        gone < CLOSED_WITHIN,
+        "{case}: the anchor counted the connect gone only {gone:?} after the signal, over \
+         {CLOSED_WITHIN:?} — not a close, the silence of one that never came.\n---- the anchor \
+         ----\n{}",
+        w.anchor.proc.transcript()
+    );
+}
+
+/// The number of peers `vox node` says it has connected, from its status line.
+fn peers_connected(line: &str) -> Option<usize> {
+    line.strip_prefix("vox node: ")?
+        .split_once(" peer(s) connected")?
+        .0
+        .parse()
+        .ok()
 }
 
 /// Cases 2–4: a join that fails on its own.
@@ -690,4 +762,154 @@ fn a_connect_stopped_at_a_passphrase_prompt_says_why() {
         e.status
     );
     eprintln!("[proof] ({PROFILE}) 3/3 stops at a prompt said why (SIGTERM, SIGHUP, Ctrl-C)");
+}
+
+#[test]
+#[ignore = "production Argon2id + a real PoW, a relayed world of real `vox` processes; run in release"]
+fn an_anchor_stopped_by_sigquit_stops_cleanly_and_is_noticed() {
+    watchdog::arm();
+    let mut w = RelayWorld::new(Split::Families);
+    let (ok, took, out, err) = w.join_guest();
+    assert!(
+        ok,
+        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+    );
+    let started = Instant::now();
+    let at = w.forward();
+    let first = round_trip(at, b"before", Duration::from_secs(30));
+    assert!(
+        first.as_deref().is_ok_and(|b| b == b"before"),
+        "CANNOT MEASURE: no echo through the forward before the anchor was stopped: {first:?}\n{}",
+        w.fwd.as_mut().unwrap().transcript()
+    );
+    // Long enough that the forward holds its anchor connection and its circuit.
+    std::thread::sleep(Duration::from_secs(4).saturating_sub(started.elapsed()));
+    let fwd = w.fwd.as_mut().unwrap();
+    assert!(
+        !fwd.transcript().contains(GONE),
+        "CANNOT MEASURE: the forward said its anchor went before it was stopped\n{}",
+        fwd.transcript()
+    );
+
+    let stopped = Instant::now();
+    signal(w.anchor.proc.child.id(), "-QUIT");
+    let status = loop {
+        if let Some(status) = w.anchor.proc.child.try_wait().ok().flatten() {
+            break status;
+        }
+        assert!(
+            stopped.elapsed() < STOPS_WITHIN,
+            "`vox node` had not ended {STOPS_WITHIN:?} after SIGQUIT.\n{}",
+            w.anchor.proc.transcript()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let exited = stopped.elapsed();
+    let said = w.anchor.proc.transcript();
+    eprintln!("[proof] ({PROFILE}) SIGQUIT to the anchor: {status} after {exited:?}");
+    assert_eq!(
+        status.signal(),
+        None,
+        "`vox node` died by SIGQUIT (a core dump) instead of stopping.\n{said}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "`vox node` stopped by SIGQUIT: exit status\n{said}"
+    );
+    for want in ["vox node: stopped by SIGQUIT", "vox node: shutting down"] {
+        assert!(
+            said.lines().any(|l| l == want),
+            "`vox node` stopped by SIGQUIT does not say {want:?}.\n{said}"
+        );
+    }
+
+    // Watched well past the bound, so a red prints how long it did take.
+    let fwd = w.fwd.as_mut().unwrap();
+    let mut gone = None;
+    while stopped.elapsed() < CLOSED_WITHIN + Duration::from_secs(30) {
+        let _ = fwd.transcript();
+        gone = fwd
+            .said_since(stopped)
+            .into_iter()
+            .find(|l| l.starts_with("[+") && l.contains(GONE));
+        if gone.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let after = gone.as_deref().and_then(|l| {
+        l.strip_prefix("[+")?
+            .split_once("s]")?
+            .0
+            .parse::<f64>()
+            .ok()
+            .map(Duration::from_secs_f64)
+    });
+    eprintln!(
+        "[proof] ({PROFILE}) SIGQUIT: the forward said its anchor connection went {after:?} after \
+         the signal (bound {CLOSED_WITHIN:?}): {gone:?}"
+    );
+    let transcript = fwd.transcript();
+    let after = after.unwrap_or_else(|| {
+        panic!(
+            "the forward never said its anchor connection went ({GONE:?}) within {:?} of \
+             SIGQUIT\n---- the forward ----\n{transcript}",
+            CLOSED_WITHIN + Duration::from_secs(30)
+        )
+    });
+    assert!(
+        after < CLOSED_WITHIN,
+        "the forward said its anchor connection went only {after:?} after SIGQUIT, over \
+         {CLOSED_WITHIN:?}\n---- the forward ----\n{transcript}"
+    );
+}
+
+#[test]
+#[ignore = "real `vox` processes; run in release"]
+fn an_anchor_stopped_by_sighup_stops_cleanly() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("anchor");
+    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    let mut anchor = VoxProc::spawn("anchor", &dir, &args(&["node", "--listen", "127.0.0.1:0"]));
+    anchor.expect_line("an --anchor spec", |l| {
+        !l.starts_with("! ")
+            && l.trim_start().contains('@')
+            && l.trim_start().starts_with(|c: char| c.is_alphanumeric())
+    });
+    let stopped = Instant::now();
+    signal(anchor.child.id(), "-HUP");
+    let status = loop {
+        if let Some(status) = anchor.child.try_wait().ok().flatten() {
+            break status;
+        }
+        assert!(
+            stopped.elapsed() < STOPS_WITHIN,
+            "`vox node` had not ended {STOPS_WITHIN:?} after SIGHUP.\n{}",
+            anchor.transcript()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let said = anchor.transcript();
+    eprintln!(
+        "[proof] ({PROFILE}) SIGHUP to the anchor: {status} after {:?}",
+        stopped.elapsed()
+    );
+    assert_eq!(
+        status.signal(),
+        None,
+        "`vox node` died by SIGHUP instead of stopping.\n{said}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "`vox node` stopped by SIGHUP: exit status\n{said}"
+    );
+    for want in ["vox node: stopped by SIGHUP", "vox node: shutting down"] {
+        assert!(
+            said.lines().any(|l| l == want),
+            "`vox node` stopped by SIGHUP does not say {want:?}.\n{said}"
+        );
+    }
 }

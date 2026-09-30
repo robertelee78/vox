@@ -414,7 +414,12 @@ pub fn run_node(
         // anchor descheduled past a tick on a loaded box, then signalled — went to a listener
         // that was then dropped, and the anchor served on, deaf to Ctrl-C: 13 of 20 anchors
         // stopped for 1.2 s and signalled never exited.
-        let interrupted = tokio::signal::ctrl_c();
+        //
+        // **And not only on Ctrl-C** (V210-93, V210-85): SIGTERM, which a service manager and
+        // `kill` send, SIGHUP and SIGQUIT stop it the same way. Left to their defaults they killed
+        // it on the spot, closes unsent — SIGQUIT with a core dump — and every peer counted the
+        // anchor as connected until it stopped answering.
+        let interrupted = stop_requested("vox node");
         tokio::pin!(interrupted);
         loop {
             tokio::select! {
@@ -632,7 +637,8 @@ pub fn run_node(
                         }
                     }
                 }
-                _ = &mut interrupted => {
+                signal = &mut interrupted => {
+                    println!("vox node: stopped by {}", signal.name());
                     println!("vox node: shutting down");
                     let _ = node.apply(NodeCommand::Shutdown).await;
                     break;
