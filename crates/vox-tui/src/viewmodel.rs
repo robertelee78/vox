@@ -208,6 +208,8 @@ pub enum UiError {
     SealedUnreadable,
     /// Join proof-of-work is still being computed (Equihash delay).
     JoinPowDelay,
+    /// This device took longer to solve a join's proof of work than the member waits (V210-87).
+    JoinPowTooSlow,
     /// Join proof-of-possession / identity mismatch.
     JoinProofMismatch,
     /// No reachable peer / your node — "both must be online" for a 2-member channel.
@@ -277,6 +279,9 @@ impl UiError {
                 "passphrase right, but this profile's keyring or prekeys will not open — altered, or another identity's"
             }
             UiError::JoinPowDelay => "join proof-of-work in progress…",
+            UiError::JoinPowTooSlow => {
+                "this device solved the join's proof of work too slowly for the member — try when it is less busy"
+            }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — both must be online (or run your node)",
             UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
