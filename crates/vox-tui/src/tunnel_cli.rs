@@ -252,6 +252,7 @@ pub async fn service_add(
             channel_id,
             service_tag: tag.to_owned(),
             local,
+            persist: true,
         })
         .await;
     if !out.is_done() {
@@ -845,6 +846,7 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::Unreachable) => {
             "the anchor answered, but no member it knows could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online, or check `vox node` on the anchor shows more than `1m` for this room"
         }
+        Some(Fault::SolveTooSlow) => Fault::SolveTooSlow.explain(),
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
         // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
         // responder, so it is the responder that says no. Leading with "the refusal is
@@ -878,6 +880,7 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
         "RoomNotOnBoard" => Fault::RoomNotOnBoard,
         "BoardUnreachable" => Fault::BoardUnreachable,
         "Unreachable" => Fault::Unreachable,
+        "SolveTooSlow" => Fault::SolveTooSlow,
         "Refused" => Fault::Refused,
         "NotNetworked" => Fault::NotNetworked,
         "Locked" => Fault::Locked,
@@ -990,12 +993,48 @@ pub fn prompt_passphrase(what: &str) -> Result<String, AppError> {
     result.map(|()| out)
 }
 
-/// A passphrase given by flag or environment, else prompted for.
-pub fn passphrase_or_prompt(given: Option<&String>, what: &str) -> Result<String, AppError> {
-    match given {
-        Some(p) => Ok(p.clone()),
-        None => prompt_passphrase(what),
+/// The room passphrase: from `--passphrase-file`, else prompted for (a line of stdin when
+/// stdin is not a terminal).
+///
+/// **Never from argv or the environment** (V210-72). A command line is readable by every
+/// process on the machine while it runs (`ps`, `/proc/<pid>/cmdline`), and an environment
+/// by whatever runs as the user and everything the process starts. Both are refused with
+/// the replacement named, rather than ignored, so a script using them is told why and does
+/// not go on to wait at a prompt.
+pub fn room_passphrase_for(
+    given: Option<&String>,
+    file: Option<&std::path::Path>,
+) -> Result<String, AppError> {
+    if given.is_some() {
+        return Err(AppError::Usage(
+            "--passphrase is refused: a command line is world-readable while the process \
+             runs (`ps`, /proc/<pid>/cmdline), so the room passphrase would be disclosed to \
+             every process on this machine, and kept in the shell's history.\n\
+             \x20      Use --passphrase-file <path>, or omit it and be prompted."
+                .into(),
+        ));
     }
+    if std::env::var_os("VOX_ROOM_PASSPHRASE").is_some() {
+        return Err(AppError::Usage(
+            "VOX_ROOM_PASSPHRASE is refused: an environment is readable by whatever runs as \
+             you and is inherited by every process this one starts. Unset it.\n\
+             \x20      Use --passphrase-file <path>, or omit it and be prompted."
+                .into(),
+        ));
+    }
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+        let first = text.lines().next().unwrap_or_default();
+        if first.is_empty() {
+            return Err(AppError::Usage(format!(
+                "{} is empty; a room passphrase cannot be",
+                path.display()
+            )));
+        }
+        return Ok(first.to_owned());
+    }
+    prompt_passphrase("room passphrase")
 }
 
 /// `vox trust add` — decide that an identity may read this node, and reach its services.

@@ -208,6 +208,8 @@ pub enum UiError {
     SealedUnreadable,
     /// Join proof-of-work is still being computed (Equihash delay).
     JoinPowDelay,
+    /// This device took longer to solve a join's proof of work than the member waits (V210-87).
+    JoinPowTooSlow,
     /// Join proof-of-possession / identity mismatch.
     JoinProofMismatch,
     /// No reachable peer / your node — "both must be online" for a 2-member channel.
@@ -244,6 +246,8 @@ pub enum UiError {
     Refused,
     /// There is no consent to withdraw from that member.
     NotConsented,
+    /// A consent named a member this node has not admitted to the room yet.
+    NotAdmitted,
     /// This client is not networked, or is locked, so it cannot reach anyone.
     NotNetworked,
     /// A local address the node needs (its listen port) is already in use.
@@ -275,6 +279,9 @@ impl UiError {
                 "passphrase right, but this profile's keyring or prekeys will not open — altered, or another identity's"
             }
             UiError::JoinPowDelay => "join proof-of-work in progress…",
+            UiError::JoinPowTooSlow => {
+                "this device solved the join's proof of work too slowly for the member — try when it is less busy"
+            }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — both must be online (or run your node)",
             UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
@@ -290,6 +297,7 @@ impl UiError {
             UiError::KeyringFull => "your trust keyring is full (1,024) — remove one first",
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
+            UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",

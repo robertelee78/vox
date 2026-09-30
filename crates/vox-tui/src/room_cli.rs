@@ -438,6 +438,12 @@ pub async fn post_cmd(
         urgent: opts.urgent,
         re: opts.re.clone(),
         thread: opts.thread.clone(),
+        // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's
+        // budget less one, so an urgent reply chain ends at zero instead of looping.
+        hops: opts
+            .re
+            .as_ref()
+            .map(|re| crate::wake::reply_hops(re, &snap.rows)),
         body: body.trim_end().to_owned(),
         data,
     };
@@ -1023,6 +1029,14 @@ async fn run_op(
         .outcomes
         .get(&posting.entry_hash)
         .cloned();
+    // **A claim is recorded when it is made** (V210-79), so one that lapses before this
+    // session's next drain is still reported lost there. By what the operation did, not by
+    // what the fold says now: a short ttl can already have run out by the read-back.
+    if matches!(kind, claim::CLAIM | claim::RENEW) && outcome == Some(Outcome::Applied) {
+        if let Some(resource) = draft.data.get("resource").and_then(|v| v.as_str()) {
+            crate::agent_hook::note_held(paths, &room_key, &session, resource);
+        }
+    }
     Ok(Done {
         posting,
         outcome,
@@ -1700,9 +1714,14 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_owned());
-    // The tag is derived from the content, so two offers of the same bytes collide
-    // harmlessly and two different files never do.
-    let tag = format!("file-{}", &sha256[..16]);
+    // The tag names the content and **this offer**: `file-<16 hex of the SHA-256>-<16 hex of
+    // randomness>`. It was the content alone, so two offers of the same file shared one
+    // service, and whichever ended first withdrew the other's while it still ran (V210-72):
+    // the daemon withdraws an offer by its tag when the connection that made it closes.
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| AppError::Usage(format!("no randomness for the offer's tag: {e}")))?;
+    let tag = format!("file-{}-{}", &sha256[..16], hex(&nonce));
 
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;

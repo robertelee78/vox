@@ -293,6 +293,15 @@ impl AuthorResolver for ChannelAuthors {
             .and_then(|p| classify_payload(p).ok())
             .unwrap_or(EntryKind::Content)
     }
+
+    fn unclassifiable(&self, entry: &Entry) -> Option<Error> {
+        let payload = entry.payload.as_deref()?;
+        match classify_payload(payload) {
+            Err(e) => Some(e),
+            Ok(EntryKind::Governance) => GovEntry::body_bound_to(entry).err(),
+            Ok(EntryKind::Content) => None,
+        }
+    }
 }
 
 /// What one [`ChannelState::sync_over`] session did.
@@ -304,6 +313,8 @@ pub struct SyncOutcome {
     pub governance: usize,
     /// How many of those were decrypted and rendered into the timeline.
     pub rendered: usize,
+    /// Entries refused rather than held (V210-74): by sync before they were held, or after.
+    pub refused: usize,
     /// Whether every position this side asked for was filled (ADR-025 D3): `false` for a serve the
     /// peer bounded, which ends cleanly but leaves the rest owed.
     pub complete: bool,
@@ -400,6 +411,7 @@ impl SessionReport {
         out.filled_any = s.filled_any;
         out.unadmitted = s.unadmitted;
         out.frozen = s.frozen;
+        out.refused += s.refused;
         out.gen_have = s.gen_have;
         out.gen_end = s.gen_end;
         let fail = match fatal {
@@ -461,6 +473,12 @@ pub struct ChannelState {
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
+    /// Stored entries set aside when the room opened (V210-74): each as `author#seq: why`.
+    set_aside: Vec<String>,
+    /// A receiver chain advanced in memory since the chains were last written (V210-74): a decrypt
+    /// uses its message key up even when what it opened does not render, so a pass that rendered
+    /// nothing must write the chains too, or a restart could derive that key again.
+    chains_advanced: bool,
     timeline: Vec<Rendered>,
     /// Accepted governance entries (consent grants and the rest) in acceptance
     /// order — the evaluator's input, rebuilt from the log on open (M14.5).
@@ -472,8 +490,12 @@ pub struct ChannelState {
     /// The anchors this channel is published to (M15.1), persisted in `SEG_ANCHORS`.
     anchors: BootstrapSet,
     /// The services this node offers in this channel (ADR-013 Bind config, M16.1),
-    /// persisted in `SEG_SERVICES`.
+    /// persisted in `SEG_SERVICES` — except those in `transient`.
     services: BTreeMap<String, SocketAddr>,
+    /// The tags in `services` that live only as long as whatever offered them (V210-72): a
+    /// `vox room send` offer, withdrawn when its process goes. Never persisted, so a node
+    /// that stops while one runs does not come back offering a port nobody serves any more.
+    transient: BTreeSet<String>,
     /// How **this node** came to be a member here (M17.6), persisted in
     /// `SEG_ADMISSION`: it created the channel, or a member witnessed its join. Needed
     /// whenever this node publishes its own bundle record, which is every time it
@@ -1122,11 +1144,14 @@ impl ChannelState {
             evaluator,
             sender,
             next_log_id: 1,
+            set_aside: Vec::new(),
+            chains_advanced: false,
             timeline: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
+            transient: BTreeSet::new(),
             // This node made the channel, so the genesis names it and nothing else needs
             // to (M17.6).
             own_admission: Some(Admission::Creator),
@@ -1208,32 +1233,98 @@ impl ChannelState {
         // Rebuild the DAG: every stored entry re-passes the acceptance predicate,
         // classified by its payload so governance entries are not re-admitted as
         // content.
+        //
+        // **What a hostile peer got onto disk before V210-74 does not keep the room shut.** An entry
+        // its author signed that cannot be classified, or whose governance body does not bind to
+        // it, is set aside and reported, and still taken as a link in its author's feed so the
+        // author's later entries link. An entry held without its predecessor (a payload stripped
+        // in transit was held and never logged) is retried once the rest is in, and set aside only
+        // if it still does not link: sync then fetches the missing ones again. Anything else that
+        // fails acceptance is a tampered store, and the room does not open.
         let mut dag = Dag::new();
         let mut next_log_id = 1u64;
         let mut gov_entries = Vec::new();
+        let mut set_aside = Vec::new();
+        let mut unlinked = Vec::new();
+        // For the V210-73 check below: each log row's entry, and each received message's chain
+        // position.
+        let mut log_at: BTreeMap<u64, Digest32> = BTreeMap::new();
+        let mut received: Vec<(u64, String, Digest32, Digest32, u64, u64)> = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::LogDb)? {
+            next_log_id = id.saturating_add(1);
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
             let entry = Entry::from_wire(&wire)?;
             let key = authors
                 .get(&entry.skeleton.author_id)
                 .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?
                 .clone();
-            let payload = entry
-                .payload
-                .as_deref()
-                .ok_or(Error::MalformedAtRest("stored entry payload pruned"))?;
-            let kind = classify_payload(payload)?;
-            if kind == EntryKind::Governance {
-                gov_entries.push(GovEntry::from_verified_log_entry(
-                    &entry,
-                    &key,
-                    channel_id,
-                    Default::default(),
-                )?);
+            let at = format!(
+                "{}#{}",
+                crate::node::link::b32_encode(&entry.skeleton.author_id)
+                    .chars()
+                    .take(12)
+                    .collect::<String>(),
+                entry.skeleton.seq
+            );
+            let Some(payload) = entry.payload.as_deref() else {
+                set_aside.push(format!("{at}: held without its payload"));
+                continue;
+            };
+            let kind = match classify_payload(payload) {
+                Ok(EntryKind::Governance) => {
+                    match GovEntry::from_verified_log_entry(
+                        &entry,
+                        &key,
+                        channel_id,
+                        Default::default(),
+                    ) {
+                        Ok(gov) => {
+                            gov_entries.push(gov);
+                            EntryKind::Governance
+                        }
+                        Err(e) => {
+                            set_aside.push(format!("{at}: {e}"));
+                            EntryKind::Content
+                        }
+                    }
+                }
+                Ok(kind) => kind,
+                Err(e) => {
+                    set_aside.push(format!("{at}: {e}"));
+                    EntryKind::Content
+                }
+            };
+            log_at.insert(id, entry.entry_hash());
+            if kind == EntryKind::Content {
+                if let Ok(msg) = crate::group::message::GroupMessage::from_wire(payload) {
+                    received.push((
+                        id,
+                        at.clone(),
+                        entry.entry_hash(),
+                        entry.skeleton.author_id,
+                        msg.header.chain_id,
+                        msg.header.iteration,
+                    ));
+                }
             }
-            dag.accept(entry, kind, &key, &admission)
-                .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
-            next_log_id = id.saturating_add(1);
+            match dag.accept(entry.clone(), kind, &key, &admission) {
+                Ok(_) => {}
+                Err(crate::log::dag::Rejected::Feed(_)) => unlinked.push((at, entry, kind, key)),
+                Err(_) => return Err(Error::MalformedAtRest("stored entry failed acceptance")),
+            }
+        }
+        // Retried until a pass links nothing more: a predecessor logged later links then.
+        loop {
+            let before = unlinked.len();
+            unlinked.retain(|(_, entry, kind, key)| {
+                dag.accept(entry.clone(), *kind, key, &admission).is_err()
+            });
+            if unlinked.len() == before {
+                break;
+            }
+        }
+        for (at, ..) in unlinked {
+            set_aside.push(format!("{at}: an earlier entry of its author is missing"));
         }
 
         // The fork proofs this room kept (V210-63), each checked as a new one would be: a proof
@@ -1264,10 +1355,25 @@ impl ChannelState {
         }
 
         // Timeline from the sealed plaintext cache, render-gated by the DAG.
+        //
+        // A cache row takes its id from the same counter as the log (a received message's row is
+        // the id after its entry's), so the counter resumes past the highest of **both** (V210-73).
+        // Resumed from the log alone, the first post after a restart took the id of the last
+        // received message's cache row, and its own cache row overwrote that one: the message
+        // was gone from the room at the next restart.
         let mut timeline = Vec::new();
+        let mut cache_at: BTreeMap<u64, (Digest32, Digest32)> = BTreeMap::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::PlaintextCache)? {
+            #[cfg(feature = "mutant-sender")]
+            let old_row_ids = crate::log::sync::mutant::old_row_ids();
+            #[cfg(not(feature = "mutant-sender"))]
+            let old_row_ids = false;
+            if !old_row_ids {
+                next_log_id = next_log_id.max(id.saturating_add(1));
+            }
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
             let rendered = parse_cache(&row)?;
+            cache_at.insert(id, (rendered.entry_hash, rendered.author));
             if dag.contains(&rendered.entry_hash) {
                 timeline.push(rendered);
             }
@@ -1289,6 +1395,31 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
+        // **A received message lost to the row-id collision before V210-73** is reported, since it
+        // cannot be brought back: its only plaintext was the overwritten row, and its message key
+        // was used up when it was read (forward secrecy). Two things together say which: the row
+        // after its log row holds one of this node's own posts, log and cache row both (the post
+        // that took the id), and its author's chain has already opened that message. A message not
+        // readable yet fails the second.
+        let me = sender.author_id();
+        let shown: BTreeSet<Digest32> = timeline.iter().map(|r: &Rendered| r.entry_hash).collect();
+        for (id, at, hash, author, chain, iteration) in received {
+            if author == me || shown.contains(&hash) {
+                continue;
+            }
+            let next = id.saturating_add(1);
+            let overwritten = cache_at
+                .get(&next)
+                .is_some_and(|(h, a)| *a == me && log_at.get(&next) == Some(h));
+            let opened = receivers
+                .get(&(author, chain))
+                .is_some_and(|c: &ReceiverChain| !c.holds_key_for(iteration));
+            if overwritten && opened {
+                set_aside.push(format!(
+                    "{at}: a received message lost to the row-id collision fixed in V210-73"
+                ));
+            }
+        }
         // The anchors this channel is published to (M15.1). A channel from before the
         // segment existed has none recorded, which is what it had.
         let anchors = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ANCHORS)? {
@@ -1384,11 +1515,14 @@ impl ChannelState {
             evaluator,
             sender,
             next_log_id,
+            set_aside,
+            chains_advanced: false,
             timeline,
             gov_entries,
             receivers,
             anchors,
             services,
+            transient: BTreeSet::new(),
             own_admission,
             origins,
             delivered,
@@ -1495,6 +1629,7 @@ impl ChannelState {
             channel_passphrase,
             now_secs,
             (sek, wrap),
+            None,
         )
     }
 
@@ -1529,8 +1664,16 @@ impl ChannelState {
     /// which the node runs off its actor. The checks of [`ChannelState::join_checks`] are repeated
     /// here, because time passed while the seal ran.
     ///
+    /// `own_admission` is how this node was let in (the witness the responder signed, M17.6). It
+    /// is written **in the same batch** as the room: a room held without it can publish nothing
+    /// and falls off every board, and while it was a second write that could fail after the
+    /// first, a failed join left exactly that room in the profile — which then refused every
+    /// retry of the join as "already in the profile" (V210-80).
+    ///
     /// # Errors
-    /// A failed check, a segment that cannot be sealed, or a store write that fails.
+    /// A failed check, a segment that cannot be sealed, or a store write that fails. On an error
+    /// nothing of the room is written.
+    #[allow(clippy::too_many_arguments)]
     pub fn join_channel_from_sealed(
         profile: &Profile,
         genesis: &Genesis,
@@ -1539,6 +1682,7 @@ impl ChannelState {
         channel_passphrase: &[u8],
         now_secs: u64,
         sealed: (Sek, crate::atrest::SekWrap),
+        own_admission: Option<Admission>,
     ) -> Result<Self> {
         Self::join_checks(profile, genesis, channel_id, local_name)?;
         let (sek, wrap) = sealed;
@@ -1583,6 +1727,17 @@ impl ChannelState {
             SEG_ORIGINS,
             &origins.to_state(),
         )?;
+        let admission_seg = own_admission
+            .as_ref()
+            .map(|a| {
+                seal_segment(
+                    &sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_ADMISSION,
+                    &a.body_bytes(),
+                )
+            })
+            .transpose()?;
         let mut batch = profile.store().batch()?;
         batch.put_sek_wrap(channel_id, &wrap)?;
         batch.put_segment(
@@ -1609,6 +1764,9 @@ impl ChannelState {
             SEG_ORIGINS,
             &origins_seg,
         )?;
+        if let Some(seg) = &admission_seg {
+            batch.put_segment(channel_id, SegmentKind::KeyMaterial, SEG_ADMISSION, seg)?;
+        }
         batch.commit()?;
 
         let mut admission = AdmissionPolicy::new();
@@ -1631,13 +1789,16 @@ impl ChannelState {
             evaluator,
             sender,
             next_log_id: 1,
+            set_aside: Vec::new(),
+            chains_advanced: false,
             timeline: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
-            // Set by the caller from the join witness the responder signed (M17.6).
-            own_admission: None,
+            transient: BTreeSet::new(),
+            // The join witness the responder signed (M17.6), written with the room above.
+            own_admission,
             origins,
             delivered: BTreeMap::new(),
             history: BTreeMap::new(),
@@ -1846,7 +2007,8 @@ impl ChannelState {
     }
 
     /// Offer `service_tag` at `local`, persisted under the channel's SEK so a restart
-    /// still serves it. Replacing an existing tag's address is allowed (that is how a
+    /// still serves it — unless `persist` is false, when it lasts only until it is removed
+    /// or this node stops. Replacing an existing tag's address is allowed (that is how a
     /// service moves); the caller must hold `bind:<tag>` in this channel, which is
     /// checked here — a host cannot offer what the log does not let it offer.
     ///
@@ -1857,6 +2019,7 @@ impl ChannelState {
         profile: &Profile,
         service_tag: &str,
         local: SocketAddr,
+        persist: bool,
     ) -> Result<bool> {
         if service_tag.is_empty() || service_tag.len() > crate::tunnel::session::MAX_SERVICE_TAG_LEN
         {
@@ -1878,6 +2041,11 @@ impl ChannelState {
             return Err(Error::SizeLimitExceeded("channel services"));
         }
         self.services.insert(service_tag.to_owned(), local);
+        if persist {
+            self.transient.remove(service_tag);
+        } else {
+            self.transient.insert(service_tag.to_owned());
+        }
         self.persist_services(store)?;
         Ok(fresh)
     }
@@ -1887,6 +2055,7 @@ impl ChannelState {
         if self.services.remove(service_tag).is_none() {
             return Ok(false);
         }
+        self.transient.remove(service_tag);
         self.persist_services(store)?;
         Ok(true)
     }
@@ -1898,36 +2067,19 @@ impl ChannelState {
         self.own_admission.as_ref()
     }
 
-    /// Record how this node came to be a member here, and persist it.
-    ///
-    /// Called once, by the join path, with the witness the responder signed. The
-    /// creator sets it at creation and never calls this.
-    pub fn set_own_admission(&mut self, store: &Store, admission: Admission) -> Result<()> {
-        let seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_ADMISSION,
-            &admission.body_bytes(),
-        )?;
-        if let Err(e) = store.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_ADMISSION,
-            &seg,
-        ) {
-            self.poisoned = true;
-            return Err(e);
-        }
-        self.own_admission = Some(admission);
-        Ok(())
-    }
-
     fn persist_services(&mut self, store: &Store) -> Result<()> {
         let seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_SERVICES,
-            &services_bytes(&self.services),
+            &services_bytes(
+                &self
+                    .services
+                    .iter()
+                    .filter(|(tag, _)| !self.transient.contains(*tag))
+                    .map(|(tag, at)| (tag.clone(), *at))
+                    .collect(),
+            ),
         )?;
         if let Err(e) = store.put_segment(
             &self.channel_id,
@@ -2818,6 +2970,12 @@ impl ChannelState {
         self.gov_entries.iter().map(|g| g.entry_hash).collect()
     }
 
+    /// The stored entries set aside when this room opened (V210-74), each as `author#seq: why`.
+    #[must_use]
+    pub fn set_aside(&self) -> &[String] {
+        &self.set_aside
+    }
+
     /// The resolver ADR-008 sync needs: this channel's admitted authors and the
     /// entry classification for `kind_for`.
     #[must_use]
@@ -2884,15 +3042,23 @@ impl ChannelState {
     }
 
     /// Rebuild the evaluator over the governance folded in since `could_read` was taken, and
-    /// render into `batch` what that made readable. `Ok(Err(..))` is a refusal (the rebuild),
-    /// `Err` a write failure, as in [`ChannelState::absorb_arrived`].
+    /// render into `batch` what that made readable. `Err` is a write failure, as in
+    /// [`ChannelState::absorb_arrived`].
+    ///
+    /// `run` is how many entries at the end of `gov_entries` the pending run pushed. **A fold that
+    /// fails takes back out only what fails on its own** (V210-80): the run is folded again one
+    /// entry at a time, from the evaluator before it, and each entry whose fold fails is dropped,
+    /// or every later rebuild failed on it too. That costs a build per entry, only when a batch
+    /// failed. Returns the rows it rendered and how many entries it dropped, refused.
     fn fold_governance_into(
         &mut self,
         batch: &mut crate::node::store::Batch<'_>,
         could_read: &BTreeSet<Digest32>,
         rendered: &[Rendered],
+        run: usize,
         now_secs: u64,
-    ) -> Result<std::result::Result<Vec<Rendered>, Error>> {
+    ) -> Result<(Vec<Rendered>, usize)> {
+        let mut dropped = 0usize;
         match Self::rebuild_evaluator(
             &self.genesis,
             &self.authors,
@@ -2901,13 +3067,34 @@ impl ChannelState {
             &self.evaluator,
         ) {
             Ok(evaluator) => self.evaluator = Arc::new(evaluator),
-            Err(e) => return Ok(Err(e)),
+            Err(_) => {
+                let at = self.gov_entries.len().saturating_sub(run);
+                let pending: Vec<GovEntry> = self.gov_entries.drain(at..).collect();
+                for gov in pending {
+                    self.gov_entries.push(gov);
+                    match Self::rebuild_evaluator(
+                        &self.genesis,
+                        &self.authors,
+                        &self.gov_entries,
+                        now_secs,
+                        &self.evaluator,
+                    ) {
+                        Ok(evaluator) => self.evaluator = Arc::new(evaluator),
+                        Err(_) => {
+                            self.gov_entries.pop();
+                            dropped += 1;
+                        }
+                    }
+                }
+            }
         }
         // Into this pass's batch, never a batch of its own: a second write transaction opened
         // while this one is open blocks forever (redb).
         let skip: BTreeSet<Digest32> = rendered.iter().map(|r| r.entry_hash).collect();
-        self.backfill_newly_readable_into(batch, could_read, &skip)
-            .map(Ok)
+        Ok((
+            self.backfill_newly_readable_into(batch, could_read, &skip)?,
+            dropped,
+        ))
     }
 
     /// Each author's head, for [`ChannelState::absorb_arrived`] to find what a sync added.
@@ -2953,12 +3140,12 @@ impl ChannelState {
         // **One durable commit for the whole batch** (see `render_content_into`).
         //
         // Two kinds of failure, kept apart as they were when each entry committed on its own:
-        // - an entry this node refuses (an unadmitted author, bad governance) stops the pass
-        //   **without** poisoning the room: what came before it is still committed and rendered,
-        //   and the refusal is returned after that;
+        // - an entry this node refuses (bad governance) is counted and the pass goes on, **without**
+        //   poisoning the room (V210-74): the entries after it are already held, so stopping left
+        //   them in memory and not on disk, and a refusal reported as an error poisoned the room's
+        //   sync. Sync refuses what cannot be classified before it is held, so this is what is left;
         // - a failed write poisons the room, because memory has advanced past what is on disk.
         let mut rendered_rows: Vec<Rendered> = Vec::new();
-        let mut refused: Option<Error> = None;
         let mut batch = match store.batch() {
             Ok(b) => b,
             Err(e) => {
@@ -2979,6 +3166,9 @@ impl ChannelState {
         // so every entry still renders against all the governance before it — and at the end.
         // `could_read` is who was readable before the run, for the backfill.
         let mut gov_pending: Option<BTreeSet<Digest32>> = None;
+        // How many governance entries the pending run pushed: a fold that fails takes back out
+        // only the ones that fail on their own (V210-80's rule), never the run.
+        let mut gov_run: usize = 0;
         for (author, entry_hash, payload) in arrived {
             let step =
                 (|| -> Result<std::result::Result<Vec<Rendered>, Error>> {
@@ -3028,16 +3218,22 @@ impl ChannelState {
                             gov_pending = Some(self.readable_authors());
                         }
                         self.gov_entries.push(gov);
+                        gov_run += 1;
                         out.governance += 1;
                         return Ok(Ok(Vec::new()));
                     }
                     let mut rows = match gov_pending.take() {
-                        Some(could_read) => refuse!(self.fold_governance_into(
-                            &mut batch,
-                            &could_read,
-                            &rendered_rows,
-                            now_secs,
-                        )?),
+                        Some(could_read) => {
+                            let (rows, dropped) = self.fold_governance_into(
+                                &mut batch,
+                                &could_read,
+                                &rendered_rows,
+                                std::mem::take(&mut gov_run),
+                                now_secs,
+                            )?;
+                            out.refused += dropped;
+                            rows
+                        }
                         None => Vec::new(),
                     };
                     rows.extend(
@@ -3047,10 +3243,7 @@ impl ChannelState {
                 })();
             match step {
                 Ok(Ok(rows)) => rendered_rows.extend(rows),
-                Ok(Err(refusal)) => {
-                    refused = Some(refusal);
-                    break;
-                }
+                Ok(Err(_refusal)) => out.refused += 1,
                 Err(e) => {
                     write_failed = Some(e);
                     break;
@@ -3060,10 +3253,16 @@ impl ChannelState {
         // The run of governance the batch ended on, as each entry was before: even a pass that
         // stopped at a refusal keeps the governance folded ahead of it.
         if let (Some(could_read), None) = (gov_pending.take(), write_failed.as_ref()) {
-            match self.fold_governance_into(&mut batch, &could_read, &rendered_rows, now_secs) {
-                Ok(Ok(rows)) => rendered_rows.extend(rows),
-                Ok(Err(refusal)) => {
-                    refused.get_or_insert(refusal);
+            match self.fold_governance_into(
+                &mut batch,
+                &could_read,
+                &rendered_rows,
+                std::mem::take(&mut gov_run),
+                now_secs,
+            ) {
+                Ok((rows, dropped)) => {
+                    out.refused += dropped;
+                    rendered_rows.extend(rows);
                 }
                 Err(e) => write_failed = Some(e),
             }
@@ -3071,7 +3270,7 @@ impl ChannelState {
         let committed = match write_failed {
             Some(e) => Err(e),
             None => (|| -> Result<()> {
-                if !rendered_rows.is_empty() {
+                if !rendered_rows.is_empty() || self.chains_advanced {
                     self.queue_receivers(&mut batch)?;
                 }
                 batch.commit()
@@ -3081,6 +3280,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        self.chains_advanced = false;
         // Only now, after the commit: `SessionRoom::apply` reports `stored` from the generation,
         // and ADR-025 credits the peer from it, so it must count exactly the rows now durable —
         // none when the write failed (the room is poisoned above), and a refused pass's rows too.
@@ -3088,9 +3288,7 @@ impl ChannelState {
             .fetch_add(logged, std::sync::atomic::Ordering::Relaxed);
         out.rendered += rendered_rows.len();
         self.timeline.extend(rendered_rows);
-        if let Some(refusal) = refused {
-            return Err(refusal);
-        }
+
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
         Ok(out)
@@ -3229,7 +3427,7 @@ impl ChannelState {
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
             rows = self.backfill_newly_readable_into(&mut batch, could_read, &BTreeSet::new())?;
-            if rows.is_empty() {
+            if rows.is_empty() && !self.chains_advanced {
                 return Ok(());
             }
             self.queue_receivers(&mut batch)?;
@@ -3239,6 +3437,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        self.chains_advanced = false;
         let rendered = rows.len();
         self.timeline.extend(rows);
         Ok(rendered)
@@ -3272,7 +3471,7 @@ impl ChannelState {
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
             rows = self.backfill_into(&mut batch, author, &BTreeSet::new())?;
-            if rows.is_empty() {
+            if rows.is_empty() && !self.chains_advanced {
                 return Ok(());
             }
             self.queue_receivers(&mut batch)?;
@@ -3282,6 +3481,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        self.chains_advanced = false;
         let rendered = rows.len();
         self.timeline.extend(rows);
         Ok(rendered)
@@ -3392,6 +3592,7 @@ impl ChannelState {
             Ok(p) => Zeroizing::new(p),
             Err(_) => return Ok(None),
         };
+        self.chains_advanced = true;
         // **Skipped, not propagated** — matching the three `Ok(false)` paths above it.
         //
         // An entry this node cannot render is one entry it cannot show, and every other reason for
@@ -3576,6 +3777,23 @@ impl ChannelState {
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
         let payload = msg.to_wire();
+        #[cfg(feature = "mutant-sender")]
+        let payload = crate::log::sync::mutant::authored(payload);
+        #[cfg(feature = "mutant-sender")]
+        let payload = if crate::log::sync::mutant::misbound() {
+            let skdm = self.skdm_for_consent(profile)?;
+            crate::governance::membership::issue_consent_grant(
+                signer,
+                &self.channel_id,
+                self.epoch + 7,
+                me,
+                &skdm,
+                self.genesis.body.policy.history_mode,
+            )?
+            .to_wire()
+        } else {
+            payload
+        };
 
         let skeleton = self.next_skeleton(&me, &payload);
         let entry = Entry::build_signed(signer, skeleton, payload)?;
@@ -3888,6 +4106,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 let mut out = self.out.borrow_mut();
                 out.rendered += got.rendered;
                 out.governance += got.governance;
+                out.refused += got.refused;
             }
             Err(e) => {
                 *self.fatal.borrow_mut() = Some(e);
