@@ -2309,8 +2309,8 @@ impl ChannelState {
         }
     }
 
-    /// Record that `target` has been delivered generation `chain_id` of this
-    /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
+    /// Record that `target` refused generation `chain_id` of this identity's sender key, so it
+    /// is [`owed`](ChannelState::owed_rekeys) again. A later generation it did take stays recorded.
     pub fn note_undelivered(
         &mut self,
         store: &Store,
