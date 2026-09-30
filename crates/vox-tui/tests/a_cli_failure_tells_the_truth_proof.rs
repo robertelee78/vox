@@ -660,7 +660,8 @@ fn a_holder_runs_without_its_control_socket() {
                 "127.0.0.1:0",
             ],
             "",
-            quick,
+            // A join, so the same proof-of-work tail as the joins above.
+            Duration::from_secs(240),
             &env,
         ),
     );
