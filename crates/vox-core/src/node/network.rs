@@ -1201,6 +1201,17 @@ impl NodeNet {
             .unwrap_or_default()
     }
 
+    /// Whether this node's board holds a live member address or bundle record for
+    /// `channel_id` — somebody is in the room.
+    #[must_use]
+    pub fn board_has_members(&self, channel_id: &Digest32) -> bool {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        !guard.current_members(channel_id, 0, now).is_empty()
+            || !guard.current_bundles(channel_id, 0, now).is_empty()
+    }
+
     /// The genesis this node's board holds for `channel_id`, if any.
     #[must_use]
     pub fn board_genesis(&self, channel_id: &Digest32) -> Option<Genesis> {

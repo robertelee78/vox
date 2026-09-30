@@ -29,6 +29,10 @@
 //!    charlie. **Neither is carried**, and nobody is offered one.
 //! 3. Bravo publishes the bundle of X, a key nobody admitted, to the victim with no witness; X
 //!    publishes its own address record and asks for a circuit to charlie. **Not carried.**
+//!    - (3b) X2 publishes a bundle whose join witness names bravo but is signed by a stranger,
+//!      and asks for a circuit to charlie. **The bundle is refused and nothing is carried.**
+//!    - (3c) A stranger P puts a pre-join naming another identity Q, on the victim and on the
+//!      anchor. **Both refuse it.**
 //! 4. The stranger publishes its genesis to the anchor — which takes it: keeping a room's board
 //!    is what an anchor is for — and asks the anchor for a circuit to charlie. **Not carried.**
 //!
@@ -39,6 +43,9 @@
 //!   gate).
 //! - (3) `nat::service`'s `put`: admit a bundle for an unknown author under the key it carries
 //!   whenever the publisher is a known member and not the author (the old vouch).
+//! - (3b) `nat::service`'s `witnessed_key`: skip `JoinWitness::verify` (take any witness that
+//!   names a key this board knows).
+//! - (3c) `nat::service`'s `put`: drop the check that a pre-join comes from the identity it names.
 //! - (4) `node::network::NodeNet::relays_between`: return `true` for any two peers.
 
 #![cfg(unix)]
@@ -62,7 +69,9 @@ use vox_core::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, His
 use vox_core::hash::Digest32;
 use vox_core::identity::composite::RootSigner;
 use vox_core::nat::multiaddr::EndpointList;
-use vox_core::nat::record::{Admission, JoinWitness, MemberBundleRecord, RendezvousRecord};
+use vox_core::nat::record::{
+    Admission, JoinWitness, MemberBundleRecord, PreJoinRecord, RendezvousRecord,
+};
 use vox_core::node::prekeys::PrekeyRing;
 use vox_core::transport::quic::VoxConnection;
 use world::IDENTITY;
@@ -139,7 +148,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     .expect("the anchor's fingerprint");
     let victim_id = fingerprint(&victim_dir);
     let charlie_id = fingerprint(&charlie_dir);
-    fingerprint(&bravo_dir);
+    let bravo_id = fingerprint(&bravo_dir);
     let victim_port = free_port();
     let _victim = daemon("victim", &victim_dir, victim_port, &spec, &pass_file);
     let (room, link) = create_room(&victim_dir, "team", ROOM_PASS);
@@ -279,6 +288,79 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         "a key no member witnessed was treated as a member of the victim's board: the victim \
          carried its circuit to a real member ({asked:?}, {got} offered) after a member \
          published its bundle with no join witness (bundle {vouched:?}, address {addressed:?})"
+    );
+
+    // ---- 3b. a forged witness ----------------------------------------------------------------
+    // A witness that names bravo — a real member — as the one who admitted X, but is signed by
+    // a stranger. Only the witness's signature separates it from a real one.
+    let x2 = stranger(0x78);
+    let forger = stranger(0x79);
+    let t = hostile::now();
+    let ring = PrekeyRing::generate(&x2, &[0x3E; 32], t).unwrap();
+    let mut forged = JoinWitness::build(&forger, &room, 0, &x2.fingerprint(), t).unwrap();
+    forged.witness_id = bravo_id;
+    let x2_bundle = MemberBundleRecord::build(
+        &x2,
+        &room,
+        0,
+        ring.bundle(&x2.public_key()).unwrap(),
+        1,
+        t,
+        3600,
+        Admission::Witnessed(Box::new(forged)),
+    )
+    .unwrap()
+    .to_wire();
+    let x2_address = RendezvousRecord::build(
+        &x2,
+        &room,
+        0,
+        EndpointList::new(Vec::new()).unwrap(),
+        1,
+        t,
+        3600,
+    )
+    .unwrap()
+    .to_wire();
+    let (_x2, x2_v) = rt.block_on(connect(&x2, victim_addr, victim_id));
+    let forged_bundle = rt.block_on(put(&x2_v, &x2_bundle));
+    let forged_address = rt.block_on(put(&x2_v, &x2_address));
+    println!(
+        "[proof] step: X2 publishes a bundle whose witness names bravo but a stranger signed → \
+         {forged_bundle:?}; its address → {forged_address:?}"
+    );
+    let (asked, got) = attack(&rt, &x2_v, charlie_id, &offered_v);
+    println!("[proof] X2 → charlie through the victim: {asked:?}, charlie offered {got}");
+    assert!(
+        forged_bundle.is_err() && asked != CircuitAnswer::Opened && got == 0,
+        "a bundle whose join witness is forged — naming bravo, signed by a stranger — was taken \
+         and its key treated as a member ({forged_bundle:?}, {asked:?}, {got} offered)"
+    );
+
+    // ---- 3c. a pre-join put by one identity for another --------------------------------------
+    let p = stranger(0x81);
+    let q = stranger(0x82);
+    let t = hostile::now();
+    let qring = PrekeyRing::generate(&q, &[0x3F; 32], t).unwrap();
+    let q_prejoin = PreJoinRecord::build(
+        &q,
+        &room,
+        qring.bundle(&q.public_key()).unwrap(),
+        EndpointList::new(Vec::new()).unwrap(),
+        1,
+        t,
+    )
+    .unwrap()
+    .to_wire();
+    let (_p1, p_v) = rt.block_on(connect(&p, victim_addr, victim_id));
+    let (_p2, p_a) = rt.block_on(connect(&p, anchor_addr, anchor_id));
+    let on_victim = rt.block_on(put(&p_v, &q_prejoin));
+    let on_anchor = rt.block_on(put(&p_a, &q_prejoin));
+    println!("[proof] step: P puts Q's pre-join → victim {on_victim:?}, anchor {on_anchor:?}");
+    assert!(
+        on_victim.is_err() && on_anchor.is_err(),
+        "a pre-join was taken from an identity other than the one it names — one connection can \
+         fill a room's pre-join slots (victim {on_victim:?}, anchor {on_anchor:?})"
     );
 
     // ---- 4. the stranger's own room, on the anchor ----------------------------------------

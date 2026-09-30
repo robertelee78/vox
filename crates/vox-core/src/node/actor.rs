@@ -3277,7 +3277,12 @@ impl Node {
         let Some(genesis) = net.board_genesis(channel_id) else {
             return;
         };
-        if !net.may_anchor(&genesis) {
+        // A room nobody has published a member record for is a genesis and nothing else: no log
+        // to keep yet. Adopting it anyway wrote an anchored copy to this node's store for every
+        // genesis a stranger minted — 4100 of them, from one connection — and the copies outlive
+        // the board evicting those geneses (V210-70). Retried every tick, so a real room is
+        // adopted as soon as its first member's records land.
+        if !net.may_anchor(&genesis) || !net.board_has_members(channel_id) {
             return;
         }
         let (Some(store), Some(sek)) = (self.log_store(), self.anchor_sek(channel_id)) else {
