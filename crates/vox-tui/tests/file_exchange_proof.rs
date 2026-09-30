@@ -436,7 +436,14 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     };
-    let tag = format!("file-{}", &sha[..16]);
+    // The live offer's own tag, as `vox room send` printed it: it names the content and the
+    // offer (V210-72), so it is read rather than derived.
+    let tag = _offer
+        .said()
+        .split_whitespace()
+        .find(|w| w.starts_with(&format!("file-{}-", &sha[..16])))
+        .expect("the offer printed its tag")
+        .to_owned();
     for (hostile, lands_as) in [
         ("../../x", "x"),
         (absolute.to_str().unwrap(), "absolute-target.bin"),

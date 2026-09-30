@@ -292,6 +292,8 @@ pub struct Draft {
     pub re: Option<String>,
     /// Thread root.
     pub thread: Option<String>,
+    /// Remaining hop budget; `None` is the default. A reply's is its parent's less one.
+    pub hops: Option<u32>,
     /// Human prose.
     pub body: String,
     /// Payload, without `op` or `vox`.
@@ -326,6 +328,9 @@ fn envelope(draft: &Draft, session: &str, op: &str) -> Envelope {
     env.urgent = draft.urgent;
     env.re.clone_from(&draft.re);
     env.thread.clone_from(&draft.thread);
+    if let Some(h) = draft.hops {
+        env.hops = h;
+    }
     let mut data = draft.data.clone();
     data.insert(ops::OP_KEY.into(), op.into());
     data.insert(VOX_KEY.into(), VERSION.into());
