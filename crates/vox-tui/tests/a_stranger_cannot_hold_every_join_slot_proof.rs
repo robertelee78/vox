@@ -41,8 +41,8 @@
 //! turns away while its slots are held (it is the heaviest source, so it is refused) must say the
 //! member is busy answering other joins, and none may say the room passphrase is wrong: that is
 //! what a bare refusal said, and it sent a person looking for a typo. So that some certainly are,
-//! after carol's join the stranger joins a room of its own three more times, one after another.
-//! A probe that is let in, or not answered within 60s, or none turned away, is CANNOT MEASURE.
+//! the stranger goes on joining after carol's join until alice has turned it away three more
+//! times; not within 120s is CANNOT MEASURE.
 //!
 //! **The mutations that must turn it red.**
 //! - `JoinSlots::take` refusing every newcomer once the cap is reached (first come, first served,
@@ -81,10 +81,10 @@ const JOIN_BOUND: Duration = if cfg!(debug_assertions) {
 const ARRIVAL: Duration = Duration::from_secs(10);
 /// How long after carol's join the stranger's refused joins are given to have said so.
 const TOLD_GRACE: Duration = Duration::from_secs(5);
-/// How many joins the stranger makes after carol's, each certain to be turned away.
+/// How many more times the stranger is to be turned away after carol's join.
 const PROBES: usize = 3;
-/// How long one of those may take to be turned away.
-const PROBE_PATIENCE: Duration = Duration::from_secs(60);
+/// How long that may take.
+const PROBE_PATIENCE: Duration = Duration::from_secs(120);
 /// How long a daemon may take to answer after it starts (production Argon2id unlock).
 const START_PATIENCE: Duration = Duration::from_secs(240);
 
@@ -345,8 +345,10 @@ fn alice_counts(s: &Staged) -> (usize, usize, String) {
     (refused, ended, text)
 }
 
-/// Fill alice's slots with `holds` (stranger, room) joins, then keep `churner` joining `churn_room`
-/// until carol's join is done; assert carol gets in.
+/// Fill alice's slots with `holds` (stranger, room) joins, then keep `churner` joining its rooms,
+/// `churn_room` and the last room until carol's join is done and it has been turned away
+/// [`PROBES`] more times; assert carol gets in, and that each time it was turned away it was told
+/// why.
 fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, case: &str) {
     let mut held: Vec<Proc> = holds
         .iter()
@@ -366,8 +368,12 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
         .iter()
         .filter(|&&(who, _)| who == churner)
         .map(|&(_, room)| room)
-        .chain([churn_room])
+        .chain([churn_room, s.links.len() - 1])
         .collect();
+    // Set once carol's join has ended; from then on the joins alice turns away are counted, and
+    // the stranger goes on until it has been turned away `PROBES` times more.
+    let carol_done = AtomicBool::new(false);
+    let turned_after = AtomicUsize::new(0);
     std::thread::scope(|sc| {
         // The stranger keeps arriving, before and during carol's join: each of its joins is one
         // more that wants a slot. It goes round its rooms, so a room whose join alice ended or
@@ -389,6 +395,12 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
                 // kept, and what it said is read at the end.
                 if join.0.try_wait().ok().flatten().is_none() {
                     kept.lock().unwrap().push(join);
+                } else if carol_done.load(Ordering::SeqCst)
+                    && std::fs::read_to_string(&said)
+                        .unwrap_or_default()
+                        .contains("a member answered")
+                {
+                    turned_after.fetch_add(1, Ordering::SeqCst);
                 }
                 said_to.lock().unwrap().push(said);
                 std::thread::sleep(Duration::from_millis(200));
@@ -427,6 +439,22 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
             Some(ROOM_PASS),
         );
         let took = t.elapsed();
+        // So the claim below does not rest on how often the stranger happened to arrive while
+        // carol joined, it goes on until alice has turned it away `PROBES` more times.
+        carol_done.store(true, Ordering::SeqCst);
+        let probing = Instant::now();
+        while turned_after.load(Ordering::SeqCst) < PROBES {
+            if probing.elapsed() >= PROBE_PATIENCE {
+                done.store(true, Ordering::SeqCst);
+                panic!(
+                    "CANNOT MEASURE: {case}: alice turned the stranger away {} times in {}s after \
+                     carol's join, not {PROBES}",
+                    turned_after.load(Ordering::SeqCst),
+                    PROBE_PATIENCE.as_secs()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
         done.store(true, Ordering::SeqCst);
         let (refused, ended, text) = alice_counts(s);
         let alice_ended: Vec<&str> = text.lines().filter(|l| l.contains("— ended ")).collect();
@@ -456,35 +484,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
     // after a grace, so a refusal that took longer than `ARRIVAL` to be reported is counted too;
     // a join that is still holding a slot has said nothing. Only a refusal by alice herself is
     // counted: a join this daemon would not start (the room already being joined) never reached her.
-    //
-    // And, so the claim does not rest on how many times the stranger happened to arrive while
-    // carol joined, it joins a room of its own [`PROBES`] more times now, one after another, with
-    // every slot still held: each is its heaviest source's newest, so each is turned away.
-    let mut said_to = said_to.into_inner().unwrap();
-    let probe_room = s.links.len() - 1;
-    for n in 0..PROBES {
-        let said = s.dir.join(format!("probe-{case}-{n}.out"));
-        let mut probe =
-            s.strangers[churner].join_in_background(&s.links[probe_room], "probe", Some(&said));
-        let sent = Instant::now();
-        let ended = loop {
-            if let Some(status) = probe.0.try_wait().ok().flatten() {
-                break status;
-            }
-            assert!(
-                sent.elapsed() < PROBE_PATIENCE,
-                "CANNOT MEASURE: {case}: the stranger's probe was neither turned away nor let in \
-                 within {}s",
-                PROBE_PATIENCE.as_secs()
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        assert!(
-            !ended.success(),
-            "CANNOT MEASURE: {case}: the stranger's probe got in while every slot was held"
-        );
-        said_to.push(said);
-    }
+    let said_to = said_to.into_inner().unwrap();
     std::thread::sleep(TOLD_GRACE);
     let turned_away: Vec<String> = said_to
         .iter()
@@ -530,8 +530,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
 fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
-    // Rooms 0–15 are held; room 16 is the one the stranger keeps arriving for.
-    // Rooms 0–15 are held, 16 is the one the stranger keeps arriving for, 17 its probes'.
+    // Rooms 0–15 are held; 16 and 17 are two more the stranger keeps arriving for.
     let s = stage(tmp.path(), SLOTS + 2, 1);
     let holds: Vec<(usize, usize)> = (0..SLOTS).map(|room| (0, room)).collect();
     run(&s, &holds, 0, SLOTS, "one identity");
@@ -542,8 +541,8 @@ fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
 fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
-    // Four identities hold four rooms each; room 4 is the one the first keeps arriving for.
-    // Room 5 is the probes'.
+    // Four identities hold four rooms each; rooms 4 and 5 are two more the first keeps arriving
+    // for.
     let s = stage(tmp.path(), 6, 4);
     let holds: Vec<(usize, usize)> = (0..4)
         .flat_map(|who| (0..4).map(move |room| (who, room)))
