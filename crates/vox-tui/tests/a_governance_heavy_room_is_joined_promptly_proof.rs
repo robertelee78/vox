@@ -21,10 +21,17 @@
 //! **Asserted.**
 //! 1. The history exists: at least [`MIN_ENTRIES`] of the members' trust changes succeeded (each
 //!    is one governance entry). Fewer is `CANNOT MEASURE`.
-//! 2. After its join returns, the newcomer's `vox room read` shows a post the host made after the
-//!    join **within [`READ_BOUND`]** — which needs the newcomer to have synced and folded the
-//!    whole governance history (the host's consent to it is the last of it).
-//! 3. Meanwhile the newcomer's own `vox room post`, once a second, **each return within
+//! 2. **The join, from the start of the attempt that got in to the newcomer reading a post the
+//!    host made after it, takes less than [`JOIN_BOUND`] of work** — its time less the two steps
+//!    that are the joiner's own CPU and nothing else: the admission puzzle (`solve`) and sealing
+//!    the room key (`seal`), as the newcomer's daemon reports them in `join got in — …`. That span
+//!    holds the whole join and the first sync, which has to fold the whole governance history (the
+//!    host's consent to the newcomer is the last of it). The two CPU steps are subtracted because
+//!    on a loaded machine they alone take tens of seconds (a 3.7 s solve on this one, idle), and
+//!    they are the same with the defect or without it; a join refused and retried is timed from
+//!    the attempt that got in.
+//! 3. After its join returns, the read lands **within [`READ_BOUND`]**.
+//! 4. Meanwhile the newcomer's own `vox room post`, once a second, **each return within
 //!    [`POST_BOUND`]**: the room's lock is not held for the fold.
 //!
 //! **Mutation that must turn it red.** Rebuild the evaluator from scratch for every synced
@@ -53,6 +60,12 @@ const MEMBERS: usize = 6;
 const CYCLES: usize = 25;
 /// Governance entries the history must hold for the measurement to mean anything.
 const MIN_ENTRIES: usize = 280;
+/// The join's work, from the start of the attempt that got in to the read showing the host's post,
+/// less its `solve` and `seal`. Measured with the fix: about 0.7 s (a 4.48 s join of which the
+/// solve was 3.68 s and the seal 0.56 s, then the read 0.57 s after it returned). With the
+/// evaluator rebuilt per entry the read alone came 13–29 s after the join returned (V210-71's
+/// verifier, candidate 1).
+const JOIN_BOUND: Duration = Duration::from_secs(6);
 /// From the newcomer's `vox room join` returning to its read showing the host's post. Measured:
 /// 0.25 s with the fix, 8.3 s with the evaluator rebuilt per entry, on a history of 300.
 const READ_BOUND: Duration = Duration::from_secs(4);
@@ -223,16 +236,17 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     let (ok, link, err) = vox_once(&host_dir, &args(&["room", "invite", &prefix]));
     assert!(ok, "CANNOT MEASURE: room invite: {err}");
     let link = link.trim().to_owned();
-    // How many attempts a join took: `None` if none got in.
+    // Which attempt got in, and when it started: `None` if none did.
     let attempts = |data: &Path, who: &str| {
-        (1..=6).find(|attempt| {
+        (1..=6).find_map(|attempt| {
+            let started = Instant::now();
             let (ok, out, err) =
                 vox_in(data, &["room", "join", &link, "--name", "team"], ROOM_PASS);
             if !ok {
                 eprintln!("[proof] {who}'s join attempt {attempt} refused: {out} {err}");
                 std::thread::sleep(Duration::from_secs(5));
             }
-            ok
+            ok.then_some((attempt, started))
         })
     };
     let join = |data: &Path, who: &str| attempts(data, who).is_some();
@@ -307,11 +321,9 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     );
     let newcomer = daemon("newcomer", &newcomer_dir, &spec, &pass_file);
     let t_join = Instant::now();
-    let tries = attempts(&newcomer_dir, "newcomer");
-    assert!(
-        tries.is_some(),
-        "CANNOT MEASURE: the newcomer could not join"
-    );
+    let Some((tries, got_in_from)) = attempts(&newcomer_dir, "newcomer") else {
+        panic!("CANNOT MEASURE: the newcomer could not join");
+    };
     let joined = Instant::now();
     // The newcomer's daemon names each step of its join: `join got in — board …, solve …`.
     let steps: Vec<String> = newcomer
@@ -320,9 +332,26 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         .filter(|l| l.contains("vox: join "))
         .collect();
     println!(
-        "[proof] the newcomer's join returned in {:?} after {} attempt(s); its steps: {steps:?}",
-        t_join.elapsed(),
-        tries.unwrap_or(0)
+        "[proof] the newcomer's join returned in {:?} after {tries} attempt(s); its steps: \
+         {steps:?}",
+        t_join.elapsed()
+    );
+    // The joiner's own CPU, as its daemon names it: `<peer>: solve 3.68s` and `seal 0.56s`.
+    let step_secs = |name: &str| -> f64 {
+        steps
+            .iter()
+            .filter(|l| l.contains("join got in"))
+            .flat_map(|l| l.split(", "))
+            .filter_map(|part| {
+                let (_, rest) = part.split_once(&format!("{name} "))?;
+                rest.trim_end_matches('s').parse::<f64>().ok()
+            })
+            .sum()
+    };
+    let (solve, seal) = (step_secs("solve"), step_secs("seal"));
+    assert!(
+        solve > 0.0 && seal > 0.0,
+        "CANNOT MEASURE: the newcomer's daemon did not name its join's solve and seal: {steps:?}"
     );
     let marker = "posted by the host after the newcomer joined";
     let (ok, _, err) = vox_once(&host_dir, &args(&["room", "post", &room, marker]));
@@ -355,6 +384,18 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         std::thread::sleep(Duration::from_millis(100));
     };
     let slowest = posts.iter().max().copied().unwrap_or_default();
+    let end_to_end = got_in_from.elapsed().saturating_sub(joined.elapsed()) + read_at;
+    let work = end_to_end.saturating_sub(Duration::from_secs_f64(solve + seal));
+    println!(
+        "[proof] from the attempt that got in to the read, {end_to_end:?}, of which solve \
+         {solve:.2}s and seal {seal:.2}s: the join's work {work:?}"
+    );
+    assert!(
+        work < JOIN_BOUND,
+        "the newcomer's join and first sync took {work:?} of work (bound {JOIN_BOUND:?}; \
+         {end_to_end:?} in all, less solve {solve:.2}s and seal {seal:.2}s) in a room of \
+         {entries} consents and revocations: it folds the governance too slowly"
+    );
     println!(
         "[proof] {entries} governance entries: the newcomer read the host {read_at:?} after \
          its join returned; {} posts meanwhile, slowest {slowest:?}",
