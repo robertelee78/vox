@@ -194,7 +194,7 @@ where
 
 /// [`run_new_room_verb`] for a verb that says what it was waiting for when a signal stops it
 /// (`vox connect`, V210-85): with `waiting`, the whole run races
-/// [`crate::tunnel_cli::a_stop_signal`], and a stop ends with
+/// [`crate::app::stop_requested`], and a stop ends with
 /// [`crate::tunnel_cli::Waiting::stopped_by`]. `ask` collects what the verb needs from the person
 /// before the identity is unlocked — `connect`'s room passphrase — and its answer is handed to
 /// `body`.
@@ -271,14 +271,14 @@ where
     let (outcome, stopped) = rt.block_on(async move {
         match waiting {
             None => (work.await, false),
-            // `biased`: the handlers are taken on the first poll, before the work's first prompt.
-            Some(waiting) => tokio::select! {
-                biased;
-                signal = crate::tunnel_cli::a_stop_signal() => {
-                    (Err(waiting.stopped_by(signal)), true)
+            Some(waiting) => {
+                // Taken here, before the work is first polled, so before its first prompt.
+                let stop = crate::app::stop_requested("vox");
+                tokio::select! {
+                    signal = stop => (Err(waiting.stopped_by(signal)), true),
+                    done = work => (done, false),
                 }
-                done = work => (done, false),
-            },
+            }
         }
     });
     if stopped {

@@ -664,7 +664,7 @@ impl Waiting {
     /// what it had been waiting for, for how long. Exits 128 + the signal's number, as a shell
     /// reports a process the signal killed.
     #[must_use]
-    pub fn stopped_by(&self, signal: StopSignal) -> AppError {
+    pub fn stopped_by(&self, signal: crate::app::StopSignal) -> AppError {
         let (what, since) = self
             .now
             .lock()
@@ -680,79 +680,6 @@ impl Waiting {
                 since.elapsed().as_secs_f64(),
             ),
         }
-    }
-}
-
-/// A signal that asks a process to stop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StopSignal {
-    /// Ctrl-C.
-    Interrupt,
-    /// A service manager's, or `kill`'s.
-    Terminate,
-    /// The terminal went away: a closed window, a dropped ssh session.
-    Hangup,
-    /// `Ctrl-\`.
-    Quit,
-}
-
-impl StopSignal {
-    fn name(self) -> &'static str {
-        match self {
-            StopSignal::Interrupt => "SIGINT",
-            StopSignal::Terminate => "SIGTERM",
-            StopSignal::Hangup => "SIGHUP",
-            StopSignal::Quit => "SIGQUIT",
-        }
-    }
-
-    fn exit_code(self) -> u8 {
-        match self {
-            StopSignal::Interrupt => 130,
-            StopSignal::Terminate => 143,
-            StopSignal::Hangup => 129,
-            StopSignal::Quit => 131,
-        }
-    }
-}
-
-/// The first SIGINT, SIGTERM, SIGHUP or SIGQUIT.
-///
-/// **Taking one replaces its default action for the rest of the process**, so only a verb that
-/// races this for its whole run may call it: anywhere else, Ctrl-C would stop doing anything.
-///
-/// SIGHUP is the one a dropped ssh session or a closed terminal sends, and with stderr kept in a
-/// log it was the original symptom exactly: a non-zero exit that said nothing (V210-85).
-pub async fn a_stop_signal() -> StopSignal {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        // A handler that could not be taken is not a signal: that one just never fires.
-        let mut stops = [
-            (SignalKind::interrupt(), StopSignal::Interrupt),
-            (SignalKind::terminate(), StopSignal::Terminate),
-            (SignalKind::hangup(), StopSignal::Hangup),
-            (SignalKind::quit(), StopSignal::Quit),
-        ]
-        .map(|(kind, stop)| (signal(kind).ok(), stop));
-        std::future::poll_fn(|cx| {
-            for (taken, stop) in &mut stops {
-                if let Some(taken) = taken {
-                    if let std::task::Poll::Ready(Some(())) = taken.poll_recv(cx) {
-                        return std::task::Poll::Ready(*stop);
-                    }
-                }
-            }
-            std::task::Poll::Pending
-        })
-        .await
-    }
-    #[cfg(not(unix))]
-    {
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-        StopSignal::Interrupt
     }
 }
 
