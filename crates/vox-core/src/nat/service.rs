@@ -47,7 +47,7 @@ use crate::log::sync::wire_error_for;
 use crate::nat::record::{
     MemberBundleRecord, PreJoinRecord, RendezvousRecord, MAX_PREKEY_BUNDLE_BYTES,
 };
-use crate::nat::store::{RendezvousStore, MAX_AUTHORS_PER_BUCKET, MAX_PREJOIN_PER_CHANNEL};
+use crate::nat::store::{RendezvousStore, Source, MAX_AUTHORS_PER_BUCKET, MAX_PREJOIN_PER_CHANNEL};
 use crate::time::Clock;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::{close_code, VoxConnection};
@@ -453,9 +453,10 @@ impl RendezvousService {
     pub fn handle(
         &self,
         publisher: Option<&Digest32>,
+        source: Option<Source>,
         request: &RendezvousRequest,
     ) -> Vec<RendezvousResponse> {
-        self.handle_as(publisher, request, false)
+        self.handle_as(publisher, source, request, false)
     }
 
     /// [`RendezvousService::handle`] for a request **this node** makes of its own board
@@ -467,19 +468,20 @@ impl RendezvousService {
         publisher: &Digest32,
         request: &RendezvousRequest,
     ) -> Vec<RendezvousResponse> {
-        self.handle_as(Some(publisher), request, true)
+        self.handle_as(Some(publisher), None, request, true)
     }
 
     fn handle_as(
         &self,
         publisher: Option<&Digest32>,
+        source: Option<Source>,
         request: &RendezvousRequest,
         local: bool,
     ) -> Vec<RendezvousResponse> {
         let now = (self.clock)();
         match request {
             RendezvousRequest::Put { record } => {
-                vec![match self.put(publisher, record, now, local) {
+                vec![match self.put(publisher, source, record, now, local) {
                     Ok(()) => RendezvousResponse::Accepted,
                     Err(e) => RendezvousResponse::Rejected(e),
                 }]
@@ -585,11 +587,13 @@ impl RendezvousService {
     /// `publisher` is the authenticated peer the record came in from (this node itself
     /// for a local publish, `None` when nobody is named). It matters for a pre-join: a
     /// joiner announces **itself**, so a pre-join is taken only from the identity it
-    /// names. `local` says the request is this node's own (see
+    /// names. `source` is where it came from, which a full board shares itself out by
+    /// ([`Source`]); `local` says the request is this node's own (see
     /// [`RendezvousService::handle_local`]).
     fn put(
         &self,
         publisher: Option<&Digest32>,
+        source: Option<Source>,
         record: &[u8],
         now: u64,
         local: bool,
@@ -615,13 +619,15 @@ impl RendezvousService {
                 let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
                 let mut store = lock(&self.store);
                 let key = self.known_key(&store, &cid, epoch, &author, now);
-                store
-                    .accept_member(rec, |_| key.clone(), now)
-                    .map(|learned| {
-                        if learned && publisher.is_some() {
-                            grew = Some(cid);
-                        }
-                    })
+                let res = store.accept_member(rec, |_| key.clone(), now);
+                if res.is_ok() {
+                    store.note_source(&cid, source);
+                }
+                res.map(|learned| {
+                    if learned && publisher.is_some() {
+                        grew = Some(cid);
+                    }
+                })
             }
             StructTag::MemberBundleRecord => {
                 let rec = MemberBundleRecord::from_wire(record)
@@ -631,13 +637,15 @@ impl RendezvousService {
                 let key = self
                     .known_key(&store, &cid, epoch, &author, now)
                     .or_else(|| self.witnessed_key(&store, &rec, now));
-                store
-                    .accept_bundle(rec, |_| key.clone(), now)
-                    .map(|learned| {
-                        if learned && publisher.is_some() {
-                            grew = Some(cid);
-                        }
-                    })
+                let res = store.accept_bundle(rec, |_| key.clone(), now);
+                if res.is_ok() {
+                    store.note_source(&cid, source);
+                }
+                res.map(|learned| {
+                    if learned && publisher.is_some() {
+                        grew = Some(cid);
+                    }
+                })
             }
             StructTag::PreJoinRecord => {
                 let rec =
@@ -665,7 +673,7 @@ impl RendezvousService {
                 {
                     return Err(RejectReason::Policy);
                 }
-                store.accept_genesis(genesis, local, now)
+                store.accept_genesis(genesis, local, now, source)
             }
             _ => return Err(RejectReason::UnknownKind),
         };
@@ -689,6 +697,7 @@ impl RendezvousService {
     pub async fn serve_stream(
         &self,
         publisher: Digest32,
+        source: Source,
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<()> {
@@ -712,7 +721,7 @@ impl RendezvousService {
                     return Err(e);
                 }
             };
-            for response in self.handle(Some(&publisher), &request) {
+            for response in self.handle(Some(&publisher), Some(source), &request) {
                 if let Err(e) = write_frame(&mut send, &response.to_frame()).await {
                     reset(&mut send, &mut recv, &e);
                     return Err(e);
