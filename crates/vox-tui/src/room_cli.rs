@@ -1799,34 +1799,22 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
     println!("     Ctrl-C stops the offer; the announcement stays on the log");
 
     let path = path.to_owned();
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
+    // Every transfer in flight, and the word to stop them: a stopped offer ends each one with a
+    // reset, never a clean close (see below).
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let mut transfers = tokio::task::JoinSet::new();
+    // One stop listener (Ctrl-C, SIGTERM, SIGHUP, SIGQUIT) for the whole loop: one made per turn
+    // misses a signal that lands in the same turn as another arm (see `app::run_node`). A SIGTERM
+    // left to its default ended the process where it stood, closing every transfer in flight
+    // gracefully with no cut at all.
+    let interrupted = crate::app::stop_requested("vox room send");
     tokio::pin!(interrupted);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((mut sock, _)) = accepted else { continue };
-                let p = path.clone();
-                // `std::fs` because this workspace's tokio has no `fs` feature, and
-                // widening a dependency for one CLI verb is the wrong trade. The
-                // reads are chunked, so a large file is not held in memory.
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt as _;
-                    let Ok(mut f) = std::fs::File::open(&p) else { return };
-                    let mut buf = vec![0u8; 64 * 1024];
-                    loop {
-                        match std::io::Read::read(&mut f, &mut buf) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                if sock.write_all(&buf[..n]).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    let _ = sock.flush().await;
-                });
+                let Ok((sock, _)) = accepted else { continue };
+                while transfers.try_join_next().is_some() {}
+                transfers.spawn(serve_file(path.clone(), sock, stopping.clone()));
             }
             _ = &mut interrupted => break,
         }
@@ -1838,7 +1826,60 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
             service_tag: tag,
         })
         .await;
+    // Then reset what is still in flight, and wait for the resets to leave before exiting:
+    // an exit would close these sockets gracefully.
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(
+        vox_core::tunnel::session::DRAIN_BOUND + std::time::Duration::from_secs(1),
+        async { while transfers.join_next().await.is_some() {} },
+    )
+    .await;
     Ok(())
+}
+
+/// Send the file at `path` to one collector's connection, and close it cleanly only if all of
+/// it was sent.
+///
+/// **Any other ending is a reset** — the offer stopped (`stopping`), or the file could not be
+/// read. A clean close says "that was all of it", so a transfer cut short that way reached the
+/// collector as a clean, truncated end (V210-81): when `vox room send` was stopped, its exit
+/// closed each connection gracefully, and that close could reach the collector before the
+/// node's own cut of the session did.
+async fn serve_file(
+    path: std::path::PathBuf,
+    mut sock: tokio::net::TcpStream,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+) {
+    use tokio::io::AsyncWriteExt as _;
+    // `std::fs` because this workspace's tokio has no `fs` feature, and widening a dependency
+    // for one CLI verb is the wrong trade. The reads are chunked, so a large file is not held
+    // in memory.
+    let whole = {
+        let send = async {
+            let Ok(mut f) = std::fs::File::open(&path) else {
+                return false;
+            };
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match std::io::Read::read(&mut f, &mut buf) {
+                    Ok(0) => return sock.flush().await.is_ok(),
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            return false;
+                        }
+                    }
+                    Err(_) => return false,
+                }
+            }
+        };
+        tokio::select! {
+            whole = send => whole,
+            _ = stopping.wait_for(|stop| *stop) => false,
+        }
+    };
+    if !whole {
+        vox_core::tunnel::session::abort_after_drain(sock).await;
+    }
 }
 
 fn room_of_label(channel_id: Digest32) -> String {

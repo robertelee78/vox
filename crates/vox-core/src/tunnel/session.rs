@@ -592,7 +592,7 @@ pub const DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 /// writable only once nothing is queued. It is registered afresh, so that report reflects the
 /// socket now rather than a readiness remembered from an earlier write. The zero linger is set
 /// first, so any path out of here resets.
-async fn abort_after_drain(tcp: TcpStream) {
+pub async fn abort_after_drain(tcp: TcpStream) {
     abort_local(&tcp);
     let _ = socket2::SockRef::from(&tcp).set_send_buffer_size(2048);
     let Ok(std) = tcp.into_std() else { return };

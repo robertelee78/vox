@@ -1,5 +1,5 @@
 //! V210-81 (#272) — **a session Vox cuts on purpose reaches the local application as a reset,
-//! never a hang**, through the shipped binary.
+//! never a hang and never a clean end**, through the shipped binary.
 //!
 //! When a host withdraws reach — here by stopping `vox room send`, which removes the offer's
 //! service (PRD-001 R22) — every live session on it is cut, and the application at the far end
@@ -8,21 +8,34 @@
 //! toward an application that is reading them: the application is left with an ESTABLISHED
 //! connection that never delivers another byte (found by inv-share-stall through `vox room get`).
 //!
+//! And the offer's own end must not beat the cut with a clean close: `vox room send` used to exit
+//! as soon as the service was removed, and its exit closed each transfer's socket gracefully. When
+//! that close reached the host's splice before the cut did, the stream was finished, and the
+//! collector read a clean, truncated end ("the transfer does not match what was announced"). A
+//! SIGTERM did the same with no cut at all, since it ended the process where it stood.
+//!
 //! Staging, all real processes: Alice and Bob are `vox daemon`s in one room. Each round Alice
 //! offers a fresh [`FILE_BYTES`]-byte file with `vox room send`; Bob runs `vox room get`, which
 //! reads its daemon's forward as fast as it can; as soon as the first bytes land, Alice's
-//! `vox room send` is interrupted (SIGINT), cutting the session with megabytes still queued
-//! toward the collector. `vox room get` gives up on a transfer silent for 30 s.
+//! `vox room send` is stopped, with megabytes still queued toward the collector. `vox room get`
+//! gives up on a transfer silent for 30 s. Two arms:
 //!
-//! Asserted: in every one of [`ROUNDS`] rounds the collector ends within [`BOUND`] (a reset, and
-//! so an error naming the connection), never by stalling.
+//! - **Ctrl-C** ([`ROUNDS`] rounds, SIGINT): as a person stops it. The node's cut and the
+//!   offer's own close race; either may arrive first.
+//! - **SIGTERM** ([`TERM_ROUNDS`] rounds): as `kill` or a service manager stops it. Before the
+//!   fix nothing cut these sessions, so every round ended in the clean, truncated end: the arm is
+//!   deterministic.
+//!
+//! Asserted: in every round of both arms the collector ends within [`BOUND`] with a reset (an
+//! error naming the connection), never by stalling and never with a clean end.
 //!
 //! ## Preconditions (else CANNOT MEASURE)
-//! Each collector had received bytes, and not the whole file, when the offer was withdrawn.
+//! Each collector had received bytes, and not the whole file, when the offer was stopped.
 //!
 //! ## Mutation
 //! Reset the local socket at once (`abort_local` without waiting for its queue to empty), and
-//! collectors stall: red.
+//! collectors stall: red. Let `vox room send` close an unfinished transfer gracefully (the old
+//! exit), and the SIGTERM arm ends every round with a clean, truncated end: red.
 
 #![cfg(unix)]
 
@@ -42,6 +55,8 @@ use sync_pair::{Member, ID_PASS, VOX};
 /// Rounds: 30 in release; 3 in a debug build, whose hashing of each offered file and whose joins
 /// (a proof of work) otherwise take the run past the watchdog's budget.
 const ROUNDS: usize = if cfg!(debug_assertions) { 3 } else { 30 };
+/// Rounds of the SIGTERM arm, whose red was every round.
+const TERM_ROUNDS: usize = if cfg!(debug_assertions) { 2 } else { 10 };
 const FILE_BYTES: usize = 64 << 20;
 /// A collector that is reset ends at once; one that hangs is given up on by `vox room get` after
 /// 30 s of silence.
@@ -119,7 +134,8 @@ fn a_cut_session_is_reset_not_hung() {
     let cb = rb.room(&room);
 
     let mut ends = Vec::new();
-    for round in 0..ROUNDS {
+    let arms = std::iter::repeat_n("-INT", ROUNDS).chain(std::iter::repeat_n("-TERM", TERM_ROUNDS));
+    for (round, sig) in arms.enumerate() {
         // A fresh file each round: the offer's tag is derived from the content.
         let name = format!("r{round}.bin");
         let file = root.join(&name);
@@ -171,13 +187,14 @@ fn a_cut_session_is_reset_not_hung() {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
-        // Withdraw the offer, as a person stops `vox room send`.
+        // Stop the offer, as a person (`-INT`) or a service manager (`-TERM`) stops
+        // `vox room send`.
         let ok = Command::new("kill")
-            .args(["-INT", &send.0.id().to_string()])
+            .args([sig, &send.0.id().to_string()])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(ok, "kill -INT vox room send");
+        assert!(ok, "kill {sig} vox room send");
         let cut = Instant::now();
         let held = bytes_in(&dir);
         let end = loop {
@@ -204,22 +221,32 @@ fn a_cut_session_is_reset_not_hung() {
             std::thread::sleep(Duration::from_millis(20));
         };
         eprintln!(
-            "[proof] round {round}: cut at {held} of {FILE_BYTES} bytes; the collector ended \
-             {end:?} after {:?}",
+            "[proof] round {round} ({sig}): cut at {held} of {FILE_BYTES} bytes; the collector \
+             ended {end:?} after {:?}",
             cut.elapsed()
         );
         drop(get);
         drop(send);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&file);
-        ends.push(end);
+        ends.push((sig, end));
     }
-    let count = |e: End| ends.iter().filter(|x| **x == e).count();
-    let (reset, stalled, other) = (count(End::Reset), count(End::Stalled), count(End::Other));
-    eprintln!("[proof] {ROUNDS} cut transfers: {reset} reset, {stalled} stalled, {other} other");
+    let mut red = Vec::new();
+    for (sig, rounds) in [("-INT", ROUNDS), ("-TERM", TERM_ROUNDS)] {
+        let count = |e: End| ends.iter().filter(|(s, x)| *s == sig && *x == e).count();
+        let (reset, stalled, other) = (count(End::Reset), count(End::Stalled), count(End::Other));
+        eprintln!(
+            "[proof] {sig}: {rounds} cut transfers: {reset} reset, {stalled} stalled, {other} other"
+        );
+        if reset != rounds {
+            red.push(format!(
+                "{sig}: {reset} of {rounds} reset, {stalled} stalled past {BOUND:?}, {other} other"
+            ));
+        }
+    }
     assert!(
-        stalled == 0 && reset == ROUNDS,
-        "every transfer Vox cuts on purpose must reach the collector as a reset: {reset} of \
-         {ROUNDS} reset, {stalled} stalled past {BOUND:?}, {other} other"
+        red.is_empty(),
+        "every transfer Vox cuts on purpose must reach the collector as a reset: {}",
+        red.join("; ")
     );
 }

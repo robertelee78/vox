@@ -285,6 +285,96 @@ fn dialable(listening: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// A signal that asks this process to stop, as `stop_requested` resolves to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopSignal {
+    /// Ctrl-C.
+    Interrupt,
+    /// A service manager's, or `kill`'s.
+    Terminate,
+    /// The terminal went away: a closed window, a dropped ssh session.
+    Hangup,
+    /// `Ctrl-\`.
+    Quit,
+}
+
+impl StopSignal {
+    /// Its name, as a person reads it: `SIGTERM`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            StopSignal::Interrupt => "SIGINT",
+            StopSignal::Terminate => "SIGTERM",
+            StopSignal::Hangup => "SIGHUP",
+            StopSignal::Quit => "SIGQUIT",
+        }
+    }
+
+    /// 128 + the signal's number, as a shell reports a process the signal killed.
+    #[must_use]
+    pub fn exit_code(self) -> u8 {
+        match self {
+            StopSignal::Interrupt => 130,
+            StopSignal::Terminate => 143,
+            StopSignal::Hangup => 129,
+            StopSignal::Quit => 131,
+        }
+    }
+}
+
+/// Resolves when this process is asked to stop: Ctrl-C (SIGINT), SIGTERM (a service manager's stop,
+/// `kill`), SIGHUP (its terminal went away) or SIGQUIT (`Ctrl-\`) (V210-85, V210-93), to which one
+/// it was. Each is registered when this is called, not when the future is first polled, so a signal
+/// that arrives before the caller first waits is not lost; call it once, before the work it races,
+/// and keep it.
+///
+/// **Registering one replaces its default action for the rest of the process**, so only a verb
+/// that races this for its whole run may call it: anywhere else, Ctrl-C would stop doing anything.
+/// Left to their defaults these ended the process on the spot, saying nothing — for `vox connect`
+/// a non-zero exit with an empty stderr (V210-85).
+pub(crate) fn stop_requested(verb: &'static str) -> impl std::future::Future<Output = StopSignal> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, Signal, SignalKind};
+        let listen = |kind: SignalKind, name: &str| match signal(kind) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("{verb}: no {name} handler ({e})");
+                None
+            }
+        };
+        let mut int = listen(SignalKind::interrupt(), "SIGINT");
+        let mut term = listen(SignalKind::terminate(), "SIGTERM");
+        let mut hup = listen(SignalKind::hangup(), "SIGHUP");
+        let mut quit = listen(SignalKind::quit(), "SIGQUIT");
+        async fn recv(s: &mut Option<Signal>) {
+            match s {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        async move {
+            tokio::select! {
+                () = recv(&mut int) => StopSignal::Interrupt,
+                () = recv(&mut term) => StopSignal::Terminate,
+                () = recv(&mut hup) => StopSignal::Hangup,
+                () = recv(&mut quit) => StopSignal::Quit,
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = verb;
+        let interrupted = tokio::signal::ctrl_c();
+        async move {
+            let _ = interrupted.await;
+            StopSignal::Interrupt
+        }
+    }
+}
+
 pub fn run_node(
     paths: Paths,
     listen: std::net::SocketAddr,
