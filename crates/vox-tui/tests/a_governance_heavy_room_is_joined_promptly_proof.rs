@@ -61,11 +61,10 @@ const CYCLES: usize = 25;
 /// Governance entries the history must hold for the measurement to mean anything.
 const MIN_ENTRIES: usize = 280;
 /// The join's work, from the start of the attempt that got in to the read showing the host's post,
-/// less its `solve` and `seal`. Measured with the fix: about 0.7 s (a 4.48 s join of which the
-/// solve was 3.68 s and the seal 0.56 s, then the read 0.57 s after it returned). With the
-/// evaluator rebuilt per entry the read alone came 13–29 s after the join returned (V210-71's
-/// verifier, candidate 1).
-const JOIN_BOUND: Duration = Duration::from_secs(6);
+/// less its `solve` and `seal`. Measured with the fix: 0.70 s twice (joins of 4.48 s and 2.34 s,
+/// nearly all solve and seal). With the evaluator rebuilt per entry: 8.06 s and 7.42 s, and the
+/// read alone 13–29 s after the join returned in V210-71's verifier's runs of candidate 1.
+const JOIN_BOUND: Duration = Duration::from_secs(4);
 /// From the newcomer's `vox room join` returning to its read showing the host's post. Measured:
 /// 0.25 s with the fix, 8.3 s with the evaluator rebuilt per entry, on a history of 300.
 const READ_BOUND: Duration = Duration::from_secs(4);
