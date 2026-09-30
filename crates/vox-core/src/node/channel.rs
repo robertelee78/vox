@@ -2155,8 +2155,7 @@ impl ChannelState {
         // history: in the same transaction, or a crash between the two lost them.
         // As `owe_history`: only generations before the live one, and the oldest floor stands.
         let floor = entitled_from.0;
-        let history_owed =
-            floor < delivered_skdm.body.chain_id && floor < self.sender.chain_id();
+        let history_owed = floor < delivered_skdm.body.chain_id && floor < self.sender.chain_id();
         let mut history = self.history.clone();
         let history_changed = history_owed && history.get(&target).is_none_or(|f| *f > floor);
         if history_changed {

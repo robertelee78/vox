@@ -409,6 +409,9 @@ pub enum Fault {
     KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
+    /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
+    /// which named the store when the store was fine (V210-77).
+    IdentityFileUnwritable,
     /// The identity passphrase was right, but something this identity sealed (its trust
     /// keyring, pending consents or prekey ring) will not open under it: the data was altered,
     /// or written by another identity. Not [`Fault::WrongPassphrase`], which sent a person to
@@ -515,6 +518,9 @@ impl Fault {
             }
             Fault::Storage => {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
+            }
+            Fault::IdentityFileUnwritable => {
+                "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
             }
             Fault::SealedUnreadable => {
                 "the identity passphrase is right, but this profile's trust keyring, pending \
