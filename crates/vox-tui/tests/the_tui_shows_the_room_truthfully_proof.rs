@@ -3,24 +3,34 @@
 //!
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob and Carol
 //! (Alice and Bob trust each other, nobody trusts Carol), Alice posts 70 lines, and Bob's real
-//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks seven claims, each
+//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks ten claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
 //!   scrolled, so once a room filled the pane a new message was never seen);
 //! - `follows`: m-071, posted while the TUI is open, is shown when it arrives;
 //! - `scrolls`: PageUp brings m-001 into view, and End returns to m-071;
+//! - `clamp`: PageUp well past the oldest line, then one PageDown, shows m-011 first (the scroll
+//!   ran on past the top, so PageDown needed as many presses again before the view moved);
 //! - `consent`: Carol, whom Bob never consented to, is not shown "consented", while Alice is (the
 //!   pane said "consented" for everyone);
 //! - `verify`: `:verify` does not mark Carol "verified" (it did, with nothing compared);
 //! - `sync`: the status bar says how many peers the node is connected to (it said "idle" always);
 //! - `target`: with Carol selected, Dave joins and sorts in above her; `:consent grant` then
 //!   consents to Carol and not to Dave (the selection was a position, so the join moved it onto
-//!   someone else).
+//!   someone else);
+//! - `reach`: back on the channel list, the room reads "● online" while Bob's node is connected
+//!   to its other members (it said offline always);
+//! - `unreach`: once every other member's daemon is stopped, it reads "○ offline".
+//!
+//! A selected member who leaves the pane is replaced by its first member, so the marker and the
+//! member a command acts on stay one; no `vox` verb removes a member from a room's pane today, so
+//! that point rests on code review (`UiState::settle`), not on this proof.
 //!
 //! Each claim turns red against a product that restores its defect: the timeline drawn from the
-//! top, `OutboundConsent::Granted` for everyone, the local verification mark, `SyncStatus::Idle`,
-//! or the member selected by index. It passes only on the script's PASS with all 7 claims ok; its
+//! top, a scroll not clamped to the oldest line, `OutboundConsent::Granted` for everyone, the local
+//! verification mark, `SyncStatus::Idle`, the member selected by index, or `Reachability`
+//! hard-coded either way. It passes only on the script's PASS with all 10 claims ok; its
 //! apparatus failures (exit 2: `pyte` missing, a join or a precondition that did not happen, such
 //! as Dave's join not moving Carol) fail as CANNOT MEASURE, never as a pass.
 
@@ -43,7 +53,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (7 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (10 expected); the driver took {:?}; its last \
          stage: {:?}",
         claims.len(),
         out.took,
@@ -57,8 +67,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (7, 7),
-                "a PASS must rest on all 7 claims, each ok: {said}"
+                (10, 10),
+                "a PASS must rest on all 10 claims, each ok: {said}"
             );
         }
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
@@ -78,7 +88,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
         ),
         _ => panic!(
             "the TUI must show the room's newest message, follow and scroll, show consent, \
-             verification and sync as the node has them, and consent to the member selected: \
+             verification, reachability and sync as the node has them, and consent to the \
+             member selected: \
              red claims: {:?}",
             claims
                 .iter()

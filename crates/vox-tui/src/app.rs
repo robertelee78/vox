@@ -1286,7 +1286,7 @@ fn event_loop(
         }
         was_locked = Some(vm.locked);
 
-        io.draw(&mut |f| render(f, &vm, &ui))?;
+        io.draw(&mut |f| render(f, &vm, &mut ui))?;
 
         // Idle lock (ADR-015): lock the node after IDLE_LOCK_SECS without input.
         let now = clock();

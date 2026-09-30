@@ -253,15 +253,20 @@ impl UiState {
     }
 
     /// Fold the latest `vm` into the selection: an open channel's first member is selected when
-    /// nothing is, so the marker the pane draws and the member a command acts on are one member,
-    /// held by identity from then on.
+    /// nothing is, or when the member selected is no longer in the pane, so the marker the pane
+    /// draws and the member a command acts on are one member, held by identity from then on.
     pub fn settle(&mut self, vm: &ViewModel) {
-        if self.screen == Screen::Channel && self.selected_member.is_none() {
-            self.selected_member = vm
-                .active
-                .as_ref()
-                .and_then(|c| c.members.first())
-                .map(|m| m.id);
+        if self.screen != Screen::Channel {
+            return;
+        }
+        let Some(members) = vm.active.as_ref().map(|c| &c.members) else {
+            return;
+        };
+        if self
+            .selected_member
+            .is_none_or(|id| !members.iter().any(|m| m.id == id))
+        {
+            self.selected_member = members.first().map(|m| m.id);
         }
     }
 
