@@ -13,12 +13,20 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             lines): m-011 is the first line shown, not m-001 still;
   consent   Carol, whom Bob never consented to, is not shown "consented"; Alice, whom he did, is;
   verify    `:verify` on Carol does not show her "verified" (the node has nothing to compare);
-  sync      the status bar says how many peers the node is connected to, not "idle";
+  sync      the status bar says how many peers the node is connected to: the anchor and at least
+            one member, so 2 or more (it said "idle" always);
   target    with Carol selected, Dave joins and sorts in above her; `:consent grant` then
             consents to Carol (her row becomes "consented") and not to whoever took her place;
+  delivers  the grant is the node's: a line Bob then posts from the composer reaches Carol's
+            `vox room read` (a pane that only drew "consented" would pass `target`, not this);
   reach     back on the channel list, the room reads "● online" while Bob's node is connected to
             its other members;
-  unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline".
+  unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline";
+  fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
+  idle      once the anchor is stopped too, it says "idle", with no count.
+
+`vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
+its slack; every other verb 120 s. A verb past its time is a named RED, not a hang.
 
 Exit 0 = pass, 1 = red, 2 = apparatus (CANNOT MEASURE). Every process is recorded and killed by
 PID. Bounded throughout (`vox_pty.py`, V210-54).
@@ -30,7 +38,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
 
 VOX, TAG = sys.argv[1], sys.argv[2]
-BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "330"))  # inside pty_driver::BOUND (360 s)
+# Sized for the debug build, whose joins grind their proof of work for minutes: two joins at
+# JOIN_SECS each, and the rest (about 150 s in debug). The Rust wrapper's bound sits above it.
+BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1170"))
+# A member waits 480 s for a joiner's proof of work (V210-87), plus its 5 s slack: a join that has
+# not returned by then is past what the product allows, and is a named RED.
+JOIN_SECS = 490
 SP = os.environ.get("VOX_PTY_SCRATCH") or __import__("tempfile").mkdtemp(prefix="vox-tui-truth-")
 S = f"{SP}/tuit-{TAG}"
 POSTS = 70  # the timeline pane holds 43 lines at 160x50
@@ -51,7 +64,8 @@ def env(w):
     return e
 
 def run(w, *args, stdin=None):
-    return subprocess.run([VOX, *args], env=env(w), input=stdin, capture_output=True, text=True, timeout=120)
+    secs = JOIN_SECS if args[:2] == ("room", "join") else 120
+    return subprocess.run([VOX, *args], env=env(w), input=stdin, capture_output=True, text=True, timeout=secs)
 
 def spawn(w, *args, out):
     p = subprocess.Popen([VOX, *args], env=env(w), stdin=subprocess.DEVNULL,
@@ -121,9 +135,21 @@ try:
     if run("alice", "room", "create", "--name", "m", stdin="room pass").returncode != 0: apparatus("create")
     room = run("alice", "room", "list").stdout.split()[0]
     link = run("alice", "room", "invite", room).stdout.strip()
-    for w in ("bob", "carol"):
-        j = run(w, "room", "join", link, "--name", "m", stdin="room pass")
-        if j.returncode != 0: apparatus(f"{w} join: {j.stderr.strip()}")
+    # Bob and Carol join at once, as two people given the link might: so the budget holds two
+    # joins' worth of JOIN_SECS in a row (theirs, then Dave's), not three.
+    joins = {w: subprocess.Popen([VOX, "room", "join", link, "--name", "m"], env=env(w),
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True) for w in ("bob", "carol")}
+    PROCS.extend(joins.values())
+    t_join = time.time()
+    for w, p in joins.items():
+        try:
+            _, err = p.communicate("room pass", timeout=max(1, JOIN_SECS - (time.time() - t_join)))
+        except subprocess.TimeoutExpired as t:
+            t.cmd = [VOX, "room", "join"]
+            raise
+        if p.returncode != 0: apparatus(f"{w} join: {err.strip()}")
+    print(f"{TAG} bob's and carol's joins took {time.time() - t_join:.1f} s")
     for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob")):
         t = run(w, "trust", "add", fp[other], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
         if t.returncode != 0: apparatus(f"{w} trust add: {t.stderr}")
@@ -228,8 +254,13 @@ try:
     claim("verify", "verified" in v and "unverified" in v and "✓" not in v, f"carol after :verify: {v.strip()!r}")
 
     stage("sync")
+    def peers():
+        """The count the status bar gives, or None when it gives none."""
+        m = re.search(r"connected to (\d+) peers?\b", tui.display()[-2])
+        return int(m.group(1)) if m else None
     bar = tui.display()[-2]
-    claim("sync", "connected to" in bar and "idle" not in bar, f"status bar: {bar.strip()!r}")
+    # The anchor and at least one member (the room reads online): two peers or more.
+    claim("sync", (peers() or 0) >= 2, f"status bar: {bar.strip()!r}")
 
     stage("dave joins while carol is selected")
     before = label_of("carol")[2]
@@ -250,6 +281,14 @@ try:
     claim("target", granted and "consented" not in dave_label,
           f"carol: {label_of('carol')[0].strip()!r}; {dave}: {dave_label.strip()!r}")
 
+    stage("delivers")
+    # The grant is the node's, not the pane's: Carol reads what Bob posts after it.
+    tui.key("\t", 0.5)  # members -> timeline
+    tui.key("\t", 0.5)  # timeline -> composer
+    tui.key("b-after-grant\r", 1)
+    got = until(lambda: "b-after-grant" in run("carol", "room", "read", room, "--limit", "500").stdout, 60, 1)
+    claim("delivers", got, f"carol read bob's post after :consent grant within 60 s: {got}")
+
     stage("reach")
     tui.key("\x1b", 2)  # Esc back to the channel list
     rows = lambda: [r.strip() for r in tui.display() if "online" in r or "offline" in r]
@@ -263,6 +302,16 @@ try:
         stop(daemons[w])
     gone = tui.until(lambda: any("○ offline" in r for r in rows()), 30, 1)
     claim("unreach", gone, f"with every other member's daemon stopped, list rows: {rows()!r}")
+    # Only the anchor is left to be connected to.
+    tui.until(lambda: peers() == 1, 30, 1)
+    claim("fewer", peers() == 1, f"with only the anchor left, status bar: {tui.display()[-2].strip()!r}")
+
+    stage("idle")
+    # Ctrl-C, how a person stops `vox node` (it takes no SIGTERM of its own).
+    anchor.send_signal(__import__("signal").SIGINT)
+    tui.until(lambda: "idle" in tui.display()[-2], 30, 1)
+    bar = tui.display()[-2]
+    claim("idle", "idle" in bar and peers() is None, f"with no peer left, status bar: {bar.strip()!r}")
 
     print(f"{TAG} the TUI drew {tui.bytes} bytes")
     print(f"{TAG} screen at the end:")
