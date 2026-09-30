@@ -141,7 +141,8 @@ pub fn backoff_kind(fail: &SyncFailure) -> Option<BackoffKind> {
     Some(match fail {
         SyncFailure::Poisoned(_) => return None,
         SyncFailure::Unreachable(_) => BackoffKind::Unreachable,
-        SyncFailure::Panicked | SyncFailure::Session(SessionError::ProtocolViolation) => {
+        SyncFailure::Panicked
+        | SyncFailure::Session(SessionError::ProtocolViolation | SessionError::DrainBudget(_)) => {
             BackoffKind::NoProgress
         }
         // Every code is named, in both arms, with no catch-all: a code added to `WireError` does not

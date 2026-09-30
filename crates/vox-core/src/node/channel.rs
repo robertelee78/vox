@@ -358,6 +358,11 @@ impl std::fmt::Display for SyncFailure {
             Self::Session(SessionError::ProtocolViolation) => {
                 f.write_str("sync failed: the peer served an entry that was not asked for")
             }
+            Self::Session(SessionError::DrainBudget(secs)) => write!(
+                f,
+                "sync stopped: the peer's entries did not all arrive within {secs}s; what \
+                 arrived was kept"
+            ),
             Self::Unreachable(why) | Self::Poisoned(why) => f.write_str(why),
             Self::Panicked => f.write_str("sync failed: the session panicked"),
         }
