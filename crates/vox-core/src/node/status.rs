@@ -122,6 +122,9 @@ pub struct PrekeyCounts {
     pub rotated: u64,
     /// One-time prekeys the running node added.
     pub refilled: u64,
+    /// Sessions the running node set up with its previous signed prekey: started just before a
+    /// rotation, completed after it.
+    pub previous_used: u64,
 }
 
 /// The book as the actor and the handles share it.
@@ -169,7 +172,8 @@ impl SyncBook {
             .board_news += 1;
     }
 
-    /// Record the ring as it stands after a maintenance that `rotated` and added `added`.
+    /// Record the ring as it stands after a maintenance that `rotated` and added `added`, and
+    /// how many sessions it has set up with its previous signed prekey.
     pub fn note_prekeys(
         book: &SharedSyncBook,
         one_time: usize,
@@ -177,6 +181,7 @@ impl SyncBook {
         signed_prekey: u64,
         rotated: bool,
         added: usize,
+        previous_used: u64,
     ) {
         let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
         let c = b.prekeys.get_or_insert_with(PrekeyCounts::default);
@@ -185,6 +190,7 @@ impl SyncBook {
         c.signed_prekey = signed_prekey;
         c.rotated += u64::from(rotated);
         c.refilled += u64::try_from(added).unwrap_or(u64::MAX);
+        c.previous_used = previous_used;
     }
 
     /// Count one reachability ladder run to `peer`.
@@ -272,8 +278,8 @@ impl SyncBook {
                 let _ = write!(
                     s,
                     "{{\"one_time\":{},\"consumed\":{},\"signed_prekey\":{},\"rotated\":{},\
-                     \"refilled\":{}}}",
-                    p.one_time, p.consumed, p.signed_prekey, p.rotated, p.refilled
+                     \"refilled\":{},\"previous_used\":{}}}",
+                    p.one_time, p.consumed, p.signed_prekey, p.rotated, p.refilled, p.previous_used
                 );
             }
             None => s.push_str("null"),

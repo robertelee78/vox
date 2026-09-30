@@ -7539,6 +7539,7 @@ impl Node {
             ring.signed_prekey_id(),
             done.rotated,
             done.one_time_added,
+            ring.previous_used(),
         );
     }
 
@@ -8697,6 +8698,10 @@ fn fault_of(e: &Error) -> Fault {
         Error::MalformedLink(_) | Error::MalformedAnchor(_) => Fault::BadLink,
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
+        Error::Path {
+            op: crate::node::profile::VAULT_WRITE,
+            ..
+        } => Fault::IdentityFileUnwritable,
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,
         // A join refused before the challenge (the responder does not hold that
         // channel open) reaches the joiner as a malformed exchange; report it as the
