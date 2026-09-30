@@ -41,6 +41,13 @@
 //! Paths are as the call named them (for `open` and `rename`) or as the kernel reports them (for a
 //! descriptor), so a reader compares them after canonicalising the directory.
 //!
+//! ## Kill points
+//! With `VOX_INTERPOSE_KILL_ARM` naming a file, the process kills itself with `SIGKILL` right
+//! after the `N`th flush of a `store.redb` that returns while that file holds `N`: at a boundary
+//! between two of the store's transactions, the one place a crash can leave it (V210-76). Flushes
+//! are counted only while the file exists, so a proof arms it at the moment the operation under
+//! test starts, and sweeps `N`. The kill is recorded first: `kill path n`.
+//!
 //! ## Variadic calls
 //! `open`, `openat` and `fcntl` take their last argument variadically. On Apple arm64 a variadic
 //! argument is passed on the stack, not in the register a non-variadic function reads it from,
@@ -71,6 +78,9 @@ extern "C" {
     fn openat(fd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn fsync(fd: c_int) -> c_int;
+    fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
+    fn close(fd: c_int) -> c_int;
+    fn kill(pid: c_int, sig: c_int) -> c_int;
     fn rename(from: *const c_char, to: *const c_char) -> c_int;
     fn renameat(fromfd: c_int, from: *const c_char, tofd: c_int, to: *const c_char) -> c_int;
     fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
@@ -113,6 +123,10 @@ pub struct IoVec {
 // ---- the log ------------------------------------------------------------------------------
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
+/// Flushes of the store counted while a kill point was armed.
+static ARMED_SYNCS: AtomicU64 = AtomicU64::new(0);
+const O_RDONLY: c_int = 0;
+const SIGKILL: c_int = 9;
 /// The log's descriptor: -1 not yet opened, -2 no log wanted (or it would not open).
 static LOG_FD: AtomicI32 = AtomicI32::new(-1);
 
@@ -225,6 +239,47 @@ fn at_path(dirfd: c_int, path: *const c_char) -> String {
     format!("{}/{p}", fd_path(dirfd))
 }
 
+/// The kill point armed now: the number in the file `VOX_INTERPOSE_KILL_ARM` names, or 0.
+fn armed() -> u64 {
+    // SAFETY: getenv/open/read/close are called with valid arguments; this library's own calls
+    // are not interposed.
+    unsafe {
+        let path = getenv(c"VOX_INTERPOSE_KILL_ARM".as_ptr());
+        if path.is_null() {
+            return 0;
+        }
+        let fd = open(path, O_RDONLY | O_CLOEXEC);
+        if fd < 0 {
+            return 0;
+        }
+        let mut buf = [0u8; 32];
+        let n = read(fd, buf.as_mut_ptr(), buf.len());
+        close(fd);
+        let n = usize::try_from(n).unwrap_or(0);
+        std::str::from_utf8(&buf[..n])
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+/// After a flush of `path` returned: the kill point, if this is it. See the module docs.
+fn after_sync(path: &str, ret: c_int) {
+    if ret != 0 || !path.ends_with("/store.redb") {
+        return;
+    }
+    let n = armed();
+    if n == 0 {
+        return;
+    }
+    let k = ARMED_SYNCS.fetch_add(1, Ordering::AcqRel) + 1;
+    if k == n {
+        record(&["kill", path, &k.to_string()]);
+        // SAFETY: kill and getpid have no preconditions.
+        unsafe { kill(getpid(), SIGKILL) };
+    }
+}
+
 /// Whether a flush of `path` is to fail with `EIO` (`VOX_INTERPOSE_FAIL_DIR_SYNC`).
 fn fail_flush_of(path: &str) -> bool {
     // SAFETY: getenv is called with a NUL-terminated name; the value it returns is read once.
@@ -294,6 +349,7 @@ pub unsafe extern "C" fn vti_fcntl_hook(fd: c_int, cmd: c_int, arg: c_ulong) -> 
             "F_BARRIERFSYNC"
         };
         record(&["sync", &path, how, &ret, &errno]);
+        after_sync(&path, r);
     }
     r
 }
@@ -308,6 +364,7 @@ pub unsafe extern "C" fn vti_fsync(fd: c_int) -> c_int {
     };
     let (ret, errno) = outcome(r);
     record(&["sync", &path, "fsync", &ret, &errno]);
+    after_sync(&path, r);
     r
 }
 

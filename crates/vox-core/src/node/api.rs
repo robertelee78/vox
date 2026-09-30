@@ -383,6 +383,10 @@ pub enum NodeCommand {
     },
     /// Stop the actor (locks first).
     Shutdown,
+    /// Change nothing and answer `Done`: proof that the actor is taking commands. A control
+    /// client waiting on a long request asks it, to tell a node at work from a stuck one
+    /// (V210-83).
+    Ping,
 }
 
 /// Why a command did not succeed — closed, machine-stable, redaction-safe.
@@ -484,6 +488,12 @@ pub enum Fault {
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
     /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
     NotAServiceRoom,
+    /// A service removal named a tag this room does not offer. Not [`Fault::UnknownChannel`],
+    /// which said "no such room in this profile" about a room that was right there (V210-83).
+    NotOffered,
+    /// A forward was to be stopped at a local address where no forward is listening. Not
+    /// [`Fault::UnknownChannel`] either: no room was named at all (V210-83).
+    NoSuchForward,
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }
@@ -572,6 +582,10 @@ impl Fault {
             Fault::NotAServiceRoom => {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
             }
+            Fault::NotOffered => {
+                "that service is not offered in this room\n       check its name: it is the tag that was given to `vox service add`"
+            }
+            Fault::NoSuchForward => "no forward is listening at that local address",
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"
             }

@@ -470,4 +470,35 @@ pub enum IpcHandshake {
         /// What was found instead.
         detail: String,
     },
+    /// The node took the connection and then said nothing: it is suspended, or stuck. Waiting
+    /// on it was forever (V210-83), since a suspended process's socket still accepts.
+    #[error(
+        "the node took the connection but did not answer within {secs} s: it may be suspended \
+         (Ctrl-Z, SIGSTOP) or stuck. Resume it, or stop it and start it again"
+    )]
+    Silent {
+        /// How long it was given.
+        secs: u64,
+    },
+    /// A request was waiting, and a second connection then got no greeting: the node stopped
+    /// answering while it worked on this one (V210-83).
+    #[error(
+        "the node stopped answering while this request waited: a new connection got no greeting \
+         within {secs} s. It may be suspended (Ctrl-Z, SIGSTOP) or stuck. Resume it, or stop it \
+         and start it again"
+    )]
+    StoppedAnswering {
+        /// How long the new connection was given.
+        secs: u64,
+    },
+    /// A request was waiting, and the node still greets, but its actor answered no ping: nothing
+    /// sent to it will be answered (V210-83).
+    #[error(
+        "the node greets but has taken no command for {secs} s, so this request will not be \
+         answered: it is stuck. Stop it and start it again"
+    )]
+    Stuck {
+        /// How long the ping was given.
+        secs: u64,
+    },
 }
