@@ -561,8 +561,8 @@ impl ConnectionManager {
         Some(conn)
     }
 
-    /// Probe `conn` and close it if nothing at all comes back within [`probe_patience`] — the
-    /// question [`Self::probe_held`] asks of a held connection when a newcomer arrives, asked
+    /// Probe `conn` and close it if nothing at all comes back within `probe_patience` — the
+    /// question `probe_held` asks of a held connection when a newcomer arrives, asked
     /// here by a caller whose own traffic went unanswered. Returns whether it was closed.
     ///
     /// A live far end ACKs the probe from its QUIC stack whatever its application is doing, so
