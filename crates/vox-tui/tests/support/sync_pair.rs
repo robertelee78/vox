@@ -404,6 +404,45 @@ impl Reader {
     pub fn has(&mut self, room: vox_core::hash::Digest32, text: &str) -> bool {
         self.texts(room).iter().any(|t| t == text)
     }
+
+    /// The author of the latest post in the room whose text contains `needle`.
+    pub fn author_of(
+        &mut self,
+        room: vox_core::hash::Digest32,
+        needle: &str,
+    ) -> Option<vox_core::hash::Digest32> {
+        match self.rt.block_on(self.client.request(&Request::Read {
+            channel_id: room,
+            since: None,
+            limit: 0,
+        })) {
+            Ok(Frame::Rows { rows }) => rows
+                .iter()
+                .rev()
+                .find(|r| r.text.contains(needle))
+                .map(|r| r.author),
+            _ => None,
+        }
+    }
+
+    /// Ask this member's daemon for a local forward to `host`'s service `tag` in the room, as
+    /// `vox room get` does. The bound local address.
+    pub fn forward(
+        &mut self,
+        room: vox_core::hash::Digest32,
+        host: vox_core::hash::Digest32,
+        tag: &str,
+    ) -> String {
+        match self.rt.block_on(self.client.request(&Request::Forward {
+            channel_id: room,
+            host,
+            service_tag: tag.to_owned(),
+            local: "127.0.0.1:0".into(),
+        })) {
+            Ok(Frame::Bound { local }) => local,
+            other => panic!("forward to {tag}: {other:?}"),
+        }
+    }
 }
 
 /// Nearest-rank percentile of `samples` (sorted in place).

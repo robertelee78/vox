@@ -1,31 +1,44 @@
-//! V210-81 (#272) — **two tunnels whose readers stopped reading cannot starve the room's sync
-//! between the same two nodes**, through the shipped binary.
+//! V210-81 (#272) — **two tunnels whose far end stopped reading cannot starve the room's sync
+//! between the same two nodes, in either direction**, through the shipped binary.
 //!
 //! Alice and Bob are real `vox daemon`s in one room, reading each other. Alice offers a large file
-//! with `vox room send`; Bob starts two `vox room get`s of it, and each is frozen (`SIGSTOP`) as
-//! soon as its first bytes land. A frozen collector stops reading its local socket, so Bob's
-//! daemon stops reading each tunnel's QUIC stream, and each stream's receive window fills with
-//! bytes nobody reads. Both tunnels ride the one QUIC connection that also carries the room's sync
-//! between Alice and Bob.
+//! with `vox room send`. Both tunnels of each arm ride the one QUIC connection that also carries
+//! the room's sync between Alice and Bob.
+//!
+//! - **Download arm** (the tunnels fill Bob's receive window, the dialing side's): Bob starts two
+//!   `vox room get`s of the file, and each is frozen (`SIGSTOP`) as soon as its first bytes land.
+//!   A frozen collector stops reading its local socket, so Bob's daemon stops reading each
+//!   tunnel's QUIC stream, and each stream's receive window fills with bytes nobody reads.
+//! - **Upload arm** (the tunnels fill Alice's receive window, the host's): Alice's `vox room send`
+//!   is frozen, so it reads nothing its tunnels carry. This test asks Bob's daemon for a forward
+//!   to the offer over Bob's control socket, exactly as `vox room get` does, opens two
+//!   connections through it and writes into both until they stop taking bytes.
 //!
 //! The defect (sweep F-X7): the connection's receive window was two stream windows
 //! (`CONNECTION_WINDOW = 2 × STREAM_WINDOW`, 32 MiB), so two backpressured tunnels could hold all
-//! of it, and then Alice could send Bob nothing on that connection: no sync frame, no pairwise
-//! key. A post then waits for `SYNC_FRAME_TIMEOUT` and fails ("peer stopped taking frames").
+//! of it, and then the other side could send nothing on that connection: no sync frame, no
+//! pairwise key. A post then waits for `SYNC_FRAME_TIMEOUT` and fails ("peer stopped taking
+//! frames").
 //!
 //! Measured here: posts each way, timed from the post to the other side reading it on its own
-//! control socket, first with no tunnel ([`POSTS`], the control) and then with both tunnels frozen
-//! ([`FROZEN_POSTS`]).
-//! Asserted: with the tunnels frozen, every post is read within [`BOUND`].
+//! control socket, first with no tunnel ([`POSTS`], the control) and then, in each arm, with both
+//! tunnels backpressured ([`FROZEN_POSTS`]).
+//! Asserted: in each arm, every post is read within [`BOUND`].
 //!
 //! ## Preconditions (else CANNOT MEASURE)
-//! Both collectors received bytes before they were frozen, neither had the whole file, and the
-//! control posts all arrived within [`BOUND`].
+//! The control posts all arrived within [`BOUND`]. In the download arm, both collectors received
+//! bytes before they were frozen and neither had the whole file. In each arm, **the tunnels took
+//! the window**: the writing end stopped advancing (Alice's `vox room send` stopped reading the
+//! file, or this test's writes stopped being taken) while more than the defect's whole connection
+//! window (2 × `STREAM_WINDOW`) had been written and not read. A writer that cannot advance is
+//! held by flow control, so the reading side's windows are full.
 //!
 //! ## Mutation
 //! Restore the old windows (`CONNECTION_WINDOW = 2 * STREAM_WINDOW`, each stream allowed the
 //! whole [`STREAM_WINDOW`](vox_core::transport::quic::STREAM_WINDOW)), and the frozen phase goes
-//! red: Alice's posts are not read by Bob within the bound.
+//! red: Alice's posts are not read by Bob within the bound. Credit only the dialing side's tunnels
+//! (no `carry_tunnel` in the host's `serve_reporting`), and the upload arm goes red: Bob's posts
+//! are not read by Alice.
 
 #![cfg(unix)]
 
@@ -36,11 +49,15 @@ mod sync_pair;
 mod watchdog;
 
 use std::io::Write as _;
+use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sync_pair::{counter, failures, pct, Member, Reader, ID_PASS, VOX};
+use vox_core::transport::quic::STREAM_WINDOW;
 
 /// Posts timed each way with no tunnel (the control).
 const POSTS: usize = 10;
@@ -55,6 +72,11 @@ const GIVE_UP: Duration = Duration::from_secs(25);
 /// The offered file: far more than a tunnel's window, so a frozen collector never has all of it.
 const FILE_BYTES: usize = 256 << 20;
 const POLL: Duration = Duration::from_millis(10);
+/// What the tunnels must hold, written and not read, for the window to count as taken: the
+/// defect's whole connection window.
+const TAKEN: u64 = 2 * STREAM_WINDOW as u64;
+/// How long the writing end may keep advancing before the arm cannot measure.
+const STALL_WITHIN: Duration = Duration::from_secs(30);
 
 /// A child process killed by its own PID however the proof ends.
 struct Kid(Child);
@@ -107,6 +129,61 @@ fn collected(dir: &Path) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+/// How far each of `pid`'s open descriptors of `name` has read, from the shipped `lsof`.
+fn read_offsets(pid: u32, name: &str) -> Vec<u64> {
+    let out = Command::new("lsof")
+        .args([
+            "-n",
+            "-P",
+            "-o",
+            "-o",
+            "0",
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-F",
+            "fon",
+        ])
+        .output()
+        .expect("lsof ran");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut offset, mut offsets) = (None, Vec::new());
+    for line in text.lines() {
+        if let Some(o) = line.strip_prefix('o') {
+            offset = o
+                .strip_prefix("0t")
+                .and_then(|d| d.parse().ok())
+                .or_else(|| {
+                    o.strip_prefix("0x")
+                        .and_then(|h| u64::from_str_radix(h, 16).ok())
+                });
+        } else if let Some(n) = line.strip_prefix('n') {
+            if n.ends_with(name) {
+                offsets.extend(offset);
+            }
+        } else if line.starts_with('f') {
+            offset = None;
+        }
+    }
+    offsets
+}
+
+/// Sample `now` once a second until two samples in a row are equal: the writing end has stopped
+/// advancing. That sample, or `None` if it was still advancing after [`STALL_WITHIN`].
+fn stalled(mut now: impl FnMut() -> Vec<u64>) -> Option<Vec<u64>> {
+    let t0 = Instant::now();
+    let mut last = now();
+    while t0.elapsed() < STALL_WITHIN {
+        std::thread::sleep(Duration::from_secs(1));
+        let next = now();
+        if next == last {
+            return Some(next);
+        }
+        last = next;
+    }
+    None
 }
 
 /// Post `count` texts as `from` and time each until `to` reads it. `None` is a post not read
@@ -217,7 +294,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         }
     }
     let send_out = root.join("send.out");
-    let _send = spawn_vox(
+    let send = spawn_vox(
         &alice,
         &["room", "send", &room, file.to_str().unwrap()],
         &send_out,
@@ -272,33 +349,112 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         held.iter().all(|&b| b > 0 && b < FILE_BYTES as u64),
         "CANNOT MEASURE: a collector was not mid-transfer when frozen: {held:?}"
     );
-
-    let a0 = alice.status();
-    let b0 = bob.status();
-    let a2b = deliveries(&alice, &mut rb, cb, &room, "frozen", FROZEN_POSTS);
-    let b2a = deliveries(&bob, &mut ra, ca, &room, "frozen", FROZEN_POSTS);
-    let frozen = [
-        summary("frozen alice→bob", &a2b),
-        summary("frozen bob→alice", &b2a),
-    ];
-    let (a1, b1) = (alice.status(), bob.status());
+    let send_pid = send.0.id();
+    let offsets = stalled(|| read_offsets(send_pid, "big.bin"));
+    let read: u64 = offsets.iter().flatten().sum();
+    let unread = read.saturating_sub(held.iter().sum());
     eprintln!(
-        "[proof] sync failures during the frozen phase: alice {} bob {}; last: {:?} {:?}",
-        counter(&a1, "failed", None) - counter(&a0, "failed", None),
-        counter(&b1, "failed", None) - counter(&b0, "failed", None),
-        failures(&a1),
-        failures(&b1)
+        "[proof] download arm: the sender stopped reading the file at {offsets:?}; {unread} bytes \
+         written and not read (the window counts as taken from {TAKEN})"
     );
+    assert!(
+        offsets.as_ref().is_some_and(|o| o.len() == 2) && unread >= TAKEN,
+        "CANNOT MEASURE: the download tunnels did not take the window: the sender's reads \
+         {offsets:?}, {unread} bytes unread of the {TAKEN} needed"
+    );
+
+    let download = phase(&alice, &bob, &mut ra, &mut rb, ca, cb, &room, "download");
     for (kid, _) in &gets {
         kid.signal("-CONT");
     }
     drop(gets);
 
-    assert!(
-        frozen.iter().all(|m| m.is_some_and(|m| m <= BOUND)),
-        "with two tunnels backpressured, a post was not read within {BOUND:?} (alice→bob {:?}, \
-         bob→alice {:?}): the tunnels took the connection's credit",
-        frozen[0],
-        frozen[1]
+    // The upload arm: Alice's side reads nothing its tunnels carry.
+    send.signal("-STOP");
+    let said = std::fs::read_to_string(&send_out).unwrap_or_default();
+    let tag = said
+        .lines()
+        .find_map(|l| l.split(" as ").nth(1))
+        .map(str::trim)
+        .expect("vox room send names its offer's tag")
+        .to_owned();
+    let host = rb
+        .author_of(cb, "big.bin")
+        .expect("Bob reads who offered big.bin");
+    let bound = rb.forward(cb, host, &tag);
+    let written: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::default()).collect();
+    let socks: Vec<TcpStream> = written
+        .iter()
+        .map(|count| {
+            let sock = TcpStream::connect(&bound).expect("connect to Bob's forward");
+            let mut w = sock.try_clone().unwrap();
+            let count = Arc::clone(count);
+            std::thread::spawn(move || {
+                let chunk = vec![0x5a_u8; 64 * 1024];
+                while let Ok(n) = w.write(&chunk) {
+                    count.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            });
+            sock
+        })
+        .collect();
+    let taken = stalled(|| written.iter().map(|c| c.load(Ordering::Relaxed)).collect());
+    eprintln!(
+        "[proof] upload arm: the writes stopped being taken at {taken:?} bytes (the window counts \
+         as taken from {TAKEN} in all)"
     );
+    assert!(
+        taken
+            .as_ref()
+            .is_some_and(|t| t.iter().all(|&b| b > 0) && t.iter().sum::<u64>() >= TAKEN),
+        "CANNOT MEASURE: the upload tunnels did not take the window: written {taken:?} of the \
+         {TAKEN} needed"
+    );
+    let upload = phase(&alice, &bob, &mut ra, &mut rb, ca, cb, &room, "upload");
+    for sock in &socks {
+        let _ = sock.shutdown(Shutdown::Both);
+    }
+    send.signal("-CONT");
+
+    for (arm, got) in [("download", download), ("upload", upload)] {
+        assert!(
+            got.iter().all(|m| m.is_some_and(|m| m <= BOUND)),
+            "{arm} arm: with two tunnels backpressured, a post was not read within {BOUND:?} \
+             (alice→bob {:?}, bob→alice {:?}): the tunnels took the connection's credit",
+            got[0],
+            got[1]
+        );
+    }
+}
+
+/// Posts each way with the tunnels backpressured: the slowest each way, `None` for a post not
+/// read.
+#[allow(clippy::too_many_arguments)]
+fn phase(
+    alice: &Member,
+    bob: &Member,
+    ra: &mut Reader,
+    rb: &mut Reader,
+    ca: vox_core::hash::Digest32,
+    cb: vox_core::hash::Digest32,
+    room: &str,
+    arm: &str,
+) -> [Option<Duration>; 2] {
+    let a0 = alice.status();
+    let b0 = bob.status();
+    let a2b = deliveries(alice, rb, cb, room, arm, FROZEN_POSTS);
+    let b2a = deliveries(bob, ra, ca, room, arm, FROZEN_POSTS);
+    let got = [
+        summary(&format!("{arm} alice→bob"), &a2b),
+        summary(&format!("{arm} bob→alice"), &b2a),
+    ];
+    let (a1, b1) = (alice.status(), bob.status());
+    eprintln!(
+        "[proof] sync failures during the {arm} arm: alice {} bob {}; last: {:?} {:?}",
+        counter(&a1, "failed", None) - counter(&a0, "failed", None),
+        counter(&b1, "failed", None) - counter(&b0, "failed", None),
+        failures(&a1),
+        failures(&b1)
+    );
+    got
 }

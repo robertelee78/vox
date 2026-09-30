@@ -234,14 +234,17 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
         "CANNOT MEASURE: the host did not advertise the relay: {address}"
     );
 
+    // In a file, as a person passes it: a command line is world-readable, so `--passphrase` is
+    // refused.
+    let pass_file = world::room_pass_file(&guest_dir, &passphrase);
     let mut connect = VoxProc::spawn_env(
         "connect",
         &guest_dir,
         &args(&[
             "connect",
             &address,
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &pass_file,
             "--anchor",
             &anchor.v6_spec,
             "--listen",
@@ -264,8 +267,8 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
             host_fp.trim(),
             &backend.to_string(),
             "127.0.0.1:0",
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &pass_file,
             "--anchor",
             &anchor.v6_spec,
             "--listen",

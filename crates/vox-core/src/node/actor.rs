@@ -121,7 +121,14 @@ const RELAYED_CLOSE_LEAD: Duration = Duration::from_millis(50);
 
 /// How long a stopping node waits for tunnels that finished their stream to have their last bytes
 /// acknowledged before it closes its connections (see `stop_network`).
-const STOP_ACK_BOUND: Duration = Duration::from_secs(5);
+///
+/// **Shorter than `vox daemon`'s 5 s stop patience**, on purpose. The daemon gives its node that
+/// long to stop and then leaves, dropping the node's tasks; at an equal bound, a stop that waited
+/// the whole of it (a peer that vanished holding unacknowledged bytes) raced the daemon's leaving
+/// with its connection closes, and a close that lost left every other peer to learn of the stop
+/// only by its idle timeout. The bound still covers a reply of several MiB draining over a slow
+/// path.
+const STOP_ACK_BOUND: Duration = Duration::from_secs(3);
 
 /// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
