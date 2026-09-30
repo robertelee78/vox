@@ -170,3 +170,69 @@ fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed
         drop(node);
     }
 }
+
+/// **`vox node --serve trusted` says what is wrong when it cannot read its trust list.** A profile
+/// with no identity has no list and needs one made; a profile whose store this user cannot read
+/// has one, and telling that person to make one sent them the wrong way (the #261 c2 verifier).
+///
+/// Asserted: with no identity it refuses and says so, advising `vox id` / `vox trust add`; with the
+/// profile's `store.redb` unreadable (mode 000) it refuses, says the list exists but could not be
+/// opened, names the profile directory, and does **not** advise making one. Neither ever starts.
+#[test]
+#[ignore = "real vox processes with production Argon2id; run in release"]
+fn vox_node_serve_trusted_names_what_is_wrong_with_its_trust_list() {
+    use std::os::unix::fs::PermissionsExt as _;
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let run = |data: &Path| {
+        let out = std::process::Command::new(world::VOX)
+            .args(["node", "--listen", "127.0.0.1:0", "--serve", "trusted"])
+            .env("VOX_DATA_DIR", data)
+            .env("VOX_CONFIG_DIR", data.join("cfg"))
+            .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run vox node");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+
+    let bare = hostile::profile_dir(tmp.path(), "bare");
+    let (ok, said) = run(&bare);
+    println!(
+        "[proof] --serve trusted, no identity: ok={ok}: {}",
+        said.trim()
+    );
+    assert!(
+        !ok && said.contains("has no identity") && said.contains("vox trust add"),
+        "`vox node --serve trusted` in a profile with no identity must refuse and say to make one: \
+         ok={ok}: {said}"
+    );
+
+    let locked = hostile::profile_dir(tmp.path(), "locked");
+    hostile::fingerprint(&locked);
+    let store = locked.join("default").join("store.redb");
+    assert!(
+        store.is_file(),
+        "CANNOT MEASURE: no store at {}",
+        store.display()
+    );
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (ok, said) = run(&locked);
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+    println!(
+        "[proof] --serve trusted, unreadable store: ok={ok}: {}",
+        said.trim()
+    );
+    assert!(
+        !ok && said.contains("exist but could not be opened") && !said.contains("make one with"),
+        "`vox node --serve trusted` with an unreadable store must say the list exists but could \
+         not be opened, and must not advise making one: ok={ok}: {said}"
+    );
+}
