@@ -1261,6 +1261,16 @@ pub fn run_loop(
     result
 }
 
+/// Say a lock is under way before asking for it. A lock waits for work still holding a secret —
+/// an Argon2id seal, a passphrase check, a room being reopened — to finish and wipe it (V210-94),
+/// which can take a derivation's time, and the TUI waits on the answer: without this it looked
+/// frozen.
+fn say_locking(io: &mut impl TerminalIo, vm: &ViewModel, ui: &mut UiState) -> Result<(), AppError> {
+    ui.status_message = Some("locking… waiting for work that holds a secret to finish".to_owned());
+    io.draw(&mut |f| render(f, vm, ui))?;
+    Ok(())
+}
+
 fn event_loop(
     io: &mut impl TerminalIo,
     core: &mut impl CoreHandle,
@@ -1290,6 +1300,7 @@ fn event_loop(
         // Idle lock (ADR-015): lock the node after IDLE_LOCK_SECS without input.
         let now = clock();
         if !vm.locked && vm.has_identity && idle_lock_due(last_input, now) {
+            say_locking(io, &vm, &mut ui)?;
             ui.status_message = Some(core.apply(Command::Lock).message());
             last_input = now;
             continue;
@@ -1305,6 +1316,9 @@ fn event_loop(
             Action::Quit => return Ok(()),
             Action::Redraw => {}
             Action::Dispatch(cmd) => {
+                if matches!(cmd, Command::Lock) {
+                    say_locking(io, &vm, &mut ui)?;
+                }
                 ui.status_message = Some(core.apply(cmd).message());
             }
         }

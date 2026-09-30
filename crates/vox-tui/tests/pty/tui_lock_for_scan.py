@@ -11,7 +11,8 @@ locks it with `:lock` when the proof says so (V210-94). The proof talks to it th
   TUI SIGHUP (which locks it, ADR-015), and writes `locked` once the TUI shows itself locked:
   LOCKED on its status bar, with an empty passphrase prompt. The node publishes a locked view only
   once the lock is done, and a TUI still waiting on its unlock (a SIGHUP while rooms reopen) shows
-  the prompt it was typed into, dots and all, until the node answers it;
+  the prompt it was typed into, dots and all, until the node answers it. The cue holds
+  `said-locking` if the TUI showed "locking…" while it waited, else `silent`;
 - the proof writes `stop`; this driver quits the TUI.
 
 `VOX_PTY_DYLD_INSERT=<path>` among the K=V becomes the TUI's `DYLD_INSERT_LIBRARIES`: named
@@ -70,6 +71,9 @@ try:
     said_unlocked = False
     end = time.time() + 240
     while not has_cue("lock"):
+        if has_cue("stop"):
+            print(f"{TAG} APPARATUS: stopped before the lock cue; the screen:\n{tui.text()}")
+            sys.exit(2)
         if time.time() >= end:
             print(f"{TAG} APPARATUS: no lock cue:\n{tui.text()}")
             sys.exit(2)
@@ -85,10 +89,19 @@ try:
     else:
         stage(":lock")
         tui.key(":lock\r", 0.05)
-    if not tui.until(lambda: "LOCKED" in bottom() and "\u2022" not in bottom(), 120, 0.05):
+    said_locking = []
+
+    def locked_now():
+        b = bottom()
+        if "locking\u2026" in b and not said_locking:
+            said_locking.append(True)
+        return "LOCKED" in b and "\u2022" not in b
+
+    if not tui.until(locked_now, 120, 0.05):
         print(f"{TAG} APPARATUS: the TUI never showed itself locked ({how}):\n{tui.text()}")
         sys.exit(2)
-    cue("locked")
+    # Whether the TUI said "locking…" while it waited: the proof checks it for a typed `:lock`.
+    cue("locked", "said-locking" if said_locking else "silent")
     stage("wait for the stop cue")
     if not tui.until(lambda: has_cue("stop"), 240, 0.2):
         print(f"{TAG} APPARATUS: no stop cue")

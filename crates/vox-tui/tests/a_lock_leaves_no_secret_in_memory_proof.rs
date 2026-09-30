@@ -38,6 +38,10 @@
 //! taking `secret_work`'s write side): measured, one copy of the passphrase left after the lock in
 //! each case, the lock answered in about 0.4 s instead of the 15 s the held thread takes.
 //!
+//! Also asserted: a typed `:lock` that waits more than [`SAID_LOCKING_AFTER`] shows "locking…"
+//! meanwhile. Mutation: `say_locking` not called (`app.rs`); the TUI then looks frozen for the
+//! whole wait.
+//!
 //! What is not measured here, and rests on review: that the seal's thread is given the passphrase
 //! alone (not the signer or the room key), since neither the identity's key nor a random room key
 //! is known to a test; and the zeroizing of CBOR buffers that grow (`Encoder::for_secrets`).
@@ -64,6 +68,8 @@ const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const DELAY_MS: &str = "15000";
 /// How long the work has to show up in memory once started.
 const SHOWS_UP: Duration = Duration::from_secs(60);
+/// A typed `:lock` that took longer than this must have shown "locking…" while it waited.
+const SAID_LOCKING_AFTER: Duration = Duration::from_secs(2);
 /// The scanner's mask (`crates/vox-test-interpose/src/scan.rs`).
 const MASK: u8 = 0xA5;
 
@@ -253,16 +259,22 @@ impl Tui {
             .unwrap()
     }
 
-    fn unlocked(&self) {
-        assert!(
-            cue(&self.cues.join("unlocked"), Duration::from_secs(120)),
-            "CANNOT MEASURE: {}'s TUI never unlocked",
-            self.tag
+    fn unlocked(&mut self) {
+        if cue(&self.cues.join("unlocked"), Duration::from_secs(120)) {
+            return;
+        }
+        // What the TUI showed instead: the driver prints its screen when stopped early.
+        std::fs::write(self.cues.join("stop"), b"").unwrap();
+        let driven = self.driver.take().unwrap().join().expect("the TUI driver");
+        panic!(
+            "CANNOT MEASURE: {}'s TUI never unlocked; its driver said:\n{}",
+            self.tag, driven.stdout
         );
     }
 
     /// Lock the TUI — `:lock` typed, or with `hup` a SIGHUP — and wait until it shows itself
-    /// locked; how long that took.
+    /// locked; how long that took. A typed `:lock` that waits must have said "locking…" meanwhile:
+    /// the TUI waits on the lock's answer, and looked frozen (V210-94).
     fn lock(&self, hup: bool) -> Duration {
         let t0 = Instant::now();
         let how: &[u8] = if hup { b"hup" } else { b"key" };
@@ -272,7 +284,17 @@ impl Tui {
             "CANNOT MEASURE: {}'s TUI never showed itself locked",
             self.tag
         );
-        t0.elapsed()
+        let took = t0.elapsed();
+        let said = std::fs::read_to_string(self.cues.join("locked")).unwrap_or_default();
+        println!("[proof] {}'s TUI while the lock ran: {said}", self.tag);
+        if !hup && took > SAID_LOCKING_AFTER {
+            assert_eq!(
+                said, "said-locking",
+                "{}'s TUI waited {took:?} on :lock and never said it was locking: it looked frozen",
+                self.tag
+            );
+        }
+        took
     }
 
     fn stop(mut self) {
@@ -352,7 +374,7 @@ fn a_lock_waits_for_a_room_seal_and_leaves_no_passphrase() {
     let (identity, roompass) = (unique("idp"), unique("seal-rp"));
     new_profile(&bob, &identity);
     let scanner = Scanner::new(tmp.path().join("scan"), &[("room", &roompass)]);
-    let tui = Tui::start(
+    let mut tui = Tui::start(
         &bob,
         &identity,
         tmp.path().join("cues"),
@@ -388,7 +410,7 @@ fn a_lock_waits_for_a_passphrase_check_and_leaves_no_passphrase() {
     let identity = unique("check-idp");
     new_profile(&bob, &identity);
     let scanner = Scanner::new(tmp.path().join("scan"), &[("identity", &identity)]);
-    let tui = Tui::start(
+    let mut tui = Tui::start(
         &bob,
         &identity,
         tmp.path().join("cues"),
@@ -418,7 +440,7 @@ fn a_lock_waits_for_a_room_reopening_and_leaves_no_passphrase() {
     new_profile(&bob, &identity);
     // A room bob holds open, so his next unlock reopens it (#208).
     {
-        let tui = Tui::start(&bob, &identity, tmp.path().join("cues1"), "bob1", &[]);
+        let mut tui = Tui::start(&bob, &identity, tmp.path().join("cues1"), "bob1", &[]);
         tui.unlocked();
         let mut create = start(
             &bob,
