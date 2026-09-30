@@ -455,6 +455,49 @@ impl ConnectionManager {
         lock(&self.conns).get(peer).is_some_and(|c| is_live(c))
     }
 
+    /// The live connection held for `peer`, **looking only**, like [`Self::holds`].
+    #[must_use]
+    pub fn held(&self, peer: &Digest32) -> Option<Arc<VoxConnection>> {
+        lock(&self.conns)
+            .get(peer)
+            .filter(|c| is_live(c))
+            .map(Arc::clone)
+    }
+
+    /// Keep asking whether the process behind `conn` is still there, and close `conn` once it has
+    /// not answered for `loss_after`; how long it was silent, if it was closed.
+    ///
+    /// **A process that stops without a close — SIGKILL, a crash, a pulled cable — must still be
+    /// noticed** (V210-93). Nothing arrives to say so, and the idle timeout (60 s) and even
+    /// [`SILENCE_IS_DEATH`] (30 s) are measured against a keep-alive every 20 s. So once `conn`
+    /// has heard nothing for `probe_after`, every call sends a probe, which a live peer ACKs
+    /// within a round trip; a peer that answers none of the probes sent across `loss_after` is
+    /// gone. A connection that cannot carry a probe is never judged by its silence, since a live
+    /// peer on it could be quiet for a whole keep-alive.
+    pub fn close_if_unanswering(
+        &self,
+        conn: &VoxConnection,
+        probe_after: Duration,
+        loss_after: Duration,
+    ) -> Option<Duration> {
+        if !is_live(conn) {
+            return None;
+        }
+        let silent = self.silent_for(conn);
+        if silent < probe_after {
+            return None;
+        }
+        let probed = conn
+            .quinn()
+            .send_datagram(bytes::Bytes::from_static(&[PROBE_BYTE]))
+            .is_ok();
+        if probed && silent >= loss_after {
+            conn.close(WireError::Unresponsive);
+            return Some(silent);
+        }
+        None
+    }
+
     /// One [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote), if
     /// anyone is listening.
     pub fn note(&self, peer: Digest32, note: String) {

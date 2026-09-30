@@ -15,9 +15,19 @@
 //! process, so every connection to the old one is gone. The forward must carry an echo again within
 //! [`BACK_WITHIN`] of the anchor's return, and say it saw the anchor go.
 //!
-//! **Not covered: an anchor that crashes.** A crash sends no close, so its peers learn of it only
-//! when its connection falls silent (`SILENCE_IS_DEATH`). How soon a node *learns* of a loss is not
-//! what #243 changed; how soon it *acts* on one is.
+//! **V210-93 (#287): the loss is noticed and said, however the anchor went, in every build.** In a
+//! debug build the forward never said it: the arm above was red there. Two more arms stop the
+//! anchor for good and time the forward's "gone" line from the moment the anchor was stopped:
+//! - **SIGKILL** (a crash, as far as anyone can tell): no close is sent, so only the node's own
+//!   probing of a quiet anchor connection can notice. It must say so within [`KILLED_WITHIN`]; the
+//!   node used to learn it from the connection's silence (`SILENCE_IS_DEATH`, 30 s): 28 s measured.
+//! - **SIGTERM** (how a service manager stops an anchor): a clean stop, whose close must reach the
+//!   forward, so it says so within [`CLOSED_WITHIN`], well short of what silence alone can do
+//!   ([`KILLED_WITHIN`]'s probe needs at least 8 s of it). The forward is then sent SIGTERM too,
+//!   and must stop the way Ctrl-C stops it: say it is stopping and exit 0.
+//!
+//! Mutations: the probe disabled (a quiet anchor connection is never judged) → the SIGKILL arm red;
+//! `vox node` without its SIGTERM handler, or its closes not waited for → the SIGTERM arm red.
 //!
 //! **Why the bound separates the two:** the old redial ran at the node's start and then every 30 s,
 //! so a forward started at `t` redialled at `t + 30`. The anchor returns at about `t + 9`, so the
@@ -51,6 +61,12 @@ const DOWN: Duration = Duration::from_secs(3);
 const BACK_WITHIN: Duration = Duration::from_secs(10);
 /// What a node says when its anchor connection goes.
 const GONE: &str = "the connection to this anchor is gone";
+/// How soon after a SIGKILL the forward must say its anchor is gone: 8 s of unanswered probes, a
+/// 1 s tick, and 2 s for a loaded box. Silence alone took 28 s.
+const KILLED_WITHIN: Duration = Duration::from_secs(11);
+/// How soon after a SIGTERM the forward must say it: the close arrives at once and the next 1 s
+/// tick reads it. Short of the 8 s any inference from silence needs.
+const CLOSED_WITHIN: Duration = Duration::from_secs(3);
 
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
@@ -129,4 +145,135 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
         saw_it_go,
         "the forward did not say its anchor connection went ({GONE:?})\n{said}"
     );
+}
+
+#[test]
+#[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
+fn a_killed_anchor_is_noticed_promptly() {
+    let _ = stopped_for_good("KILL", KILLED_WITHIN);
+}
+
+#[test]
+#[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
+fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
+    let mut w = stopped_for_good("TERM", CLOSED_WITHIN);
+    // ---- and a forward stops on SIGTERM as it does on Ctrl-C -----------------------------------
+    let fwd = w.fwd.as_mut().unwrap();
+    let signalled = Instant::now();
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &fwd.child.id().to_string()])
+        .status();
+    let status = loop {
+        if let Some(status) = fwd.child.try_wait().ok().flatten() {
+            break Some(status);
+        }
+        if signalled.elapsed() > Duration::from_secs(10) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let said = fwd.transcript();
+    let stopping = said
+        .lines()
+        .any(|l| l.contains("vox: stopping the forward"));
+    eprintln!(
+        "[proof] SIGTERM to the forward: exited {status:?} after {:?}, said it was stopping: \
+         {stopping}",
+        signalled.elapsed()
+    );
+    assert!(
+        status.is_some_and(|s| s.success()) && stopping,
+        "the forward did not stop cleanly on SIGTERM (exit {status:?}, said it was stopping: \
+         {stopping})\n{said}"
+    );
+}
+
+/// Stop the anchor with `signal` and leave it down; the forward must say its anchor connection is
+/// gone within `within` of the signal.
+fn stopped_for_good(signal: &str, within: Duration) -> RelayWorld {
+    watchdog::arm();
+    let mut w = RelayWorld::new(Split::Families);
+    let (ok, took, out, err) = w.join_guest();
+    assert!(
+        ok,
+        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+    );
+    let started = Instant::now();
+    let at = w.forward();
+    let first = round_trip(at, b"before", Duration::from_secs(30));
+    assert!(
+        first.as_deref().is_ok_and(|b| b == b"before"),
+        "CANNOT MEASURE: no echo through the forward before the anchor went: {first:?}\n{}",
+        w.fwd.as_mut().unwrap().transcript()
+    );
+    std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
+    let fwd = w.fwd.as_mut().unwrap();
+    let before = fwd
+        .transcript()
+        .lines()
+        .filter(|l| l.contains(GONE))
+        .count();
+    assert_eq!(
+        before,
+        0,
+        "CANNOT MEASURE: the forward said its anchor went before it was stopped\n{}",
+        fwd.transcript()
+    );
+
+    // ---- the anchor is stopped, and stays down --------------------------------------------------
+    let stopped = Instant::now();
+    let _ = std::process::Command::new("kill")
+        .args([&format!("-{signal}"), &w.anchor.proc.child.id().to_string()])
+        .status();
+    while w.anchor.proc.child.try_wait().ok().flatten().is_none() {
+        assert!(
+            stopped.elapsed() < Duration::from_secs(10),
+            "CANNOT MEASURE: the anchor did not exit within 10 s of SIG{signal}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let exited = stopped.elapsed();
+
+    // ---- the forward says so ---------------------------------------------------------------------
+    // Watched well past the bound, so a red prints how long it did take.
+    let fwd = w.fwd.as_mut().unwrap();
+    let mut said = None;
+    while stopped.elapsed() < within + Duration::from_secs(30) {
+        let _ = fwd.transcript();
+        said = fwd
+            .said_since(stopped)
+            .into_iter()
+            .find(|l| l.starts_with("[+") && l.contains(GONE));
+        if said.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let after = said.as_deref().and_then(|l| {
+        l.strip_prefix("[+")?
+            .split_once("s]")?
+            .0
+            .parse::<f64>()
+            .ok()
+            .map(Duration::from_secs_f64)
+    });
+    eprintln!(
+        "[proof] SIG{signal}: the anchor exited {exited:?} after the signal; the forward said its \
+         anchor connection went {after:?} after it (bound {within:?}): {said:?}"
+    );
+    let transcript = fwd.transcript();
+    let after = after.unwrap_or_else(|| {
+        panic!(
+            "the forward never said its anchor connection went ({GONE:?}) within {:?} of \
+             SIG{signal}\n---- the forward ----\n{transcript}\n---- the anchor ----\n{}",
+            within + Duration::from_secs(30),
+            w.anchor.proc.transcript()
+        )
+    });
+    assert!(
+        after < within,
+        "the forward said its anchor connection went only {after:?} after SIG{signal}, over \
+         {within:?}\n---- the forward ----\n{transcript}"
+    );
+    w
 }

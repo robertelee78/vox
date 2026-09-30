@@ -155,12 +155,18 @@ pub trait TerminalIo {
     /// Leave the alternate screen (clearing it), purge scrollback, restore the
     /// terminal. Idempotent; also performed on drop by real backends.
     fn leave(&mut self) -> io::Result<()>;
+    /// Whether the process was asked to stop (SIGTERM), so the loop ends as a quit does. The
+    /// loop checks it at least every poll.
+    fn stop_requested(&self) -> bool {
+        false
+    }
 }
 
 /// The real crossterm/ratatui backend with a RAII restore on every exit path.
 pub struct CrosstermIo {
     terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
     entered: bool,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CrosstermIo {
@@ -170,7 +176,14 @@ impl CrosstermIo {
         Self {
             terminal: None,
             entered: false,
+            stop: std::sync::Arc::default(),
         }
+    }
+
+    /// Set to stop the loop as a quit would (see [`TerminalIo::stop_requested`]).
+    #[must_use]
+    pub fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.stop)
     }
 }
 
@@ -222,6 +235,10 @@ impl TerminalIo for CrosstermIo {
             Event::Key(key) if key.kind != KeyEventKind::Release => Ok(Some(key)),
             _ => Ok(None),
         }
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn leave(&mut self) -> io::Result<()> {
@@ -285,6 +302,54 @@ fn dialable(listening: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Resolves when this process is asked to stop: Ctrl-C (SIGINT), SIGTERM (a service manager's stop,
+/// `kill`) or SIGHUP (its terminal went away) (V210-93). Each is registered when this is called, not
+/// when the future is first polled, so a signal that arrives before the caller's loop first waits is
+/// not lost; call it once, before the loop, and keep it (see `run_node`).
+///
+/// A verb that runs until stopped must stop **cleanly** on all three: shut its node down, so its
+/// connections close and its peers learn at once that it went. SIGTERM and SIGHUP left to their
+/// defaults ended the process with nothing sent.
+pub(crate) fn stop_requested(verb: &'static str) -> impl std::future::Future<Output = ()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, Signal, SignalKind};
+        let listen = |kind: SignalKind, name: &str| match signal(kind) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("{verb}: no {name} handler ({e})");
+                None
+            }
+        };
+        let mut int = listen(SignalKind::interrupt(), "SIGINT");
+        let mut term = listen(SignalKind::terminate(), "SIGTERM");
+        let mut hup = listen(SignalKind::hangup(), "SIGHUP");
+        async fn recv(s: &mut Option<Signal>) {
+            match s {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        async move {
+            tokio::select! {
+                () = recv(&mut int) => {}
+                () = recv(&mut term) => {}
+                () = recv(&mut hup) => {}
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = verb;
+        let interrupted = tokio::signal::ctrl_c();
+        async move {
+            let _ = interrupted.await;
+        }
+    }
+}
+
 pub fn run_node(
     paths: Paths,
     listen: std::net::SocketAddr,
@@ -324,7 +389,12 @@ pub fn run_node(
         // anchor descheduled past a tick on a loaded box, then signalled — went to a listener
         // that was then dropped, and the anchor served on, deaf to Ctrl-C: 13 of 20 anchors
         // stopped for 1.2 s and signalled never exited.
-        let interrupted = tokio::signal::ctrl_c();
+        //
+        // **And not only on Ctrl-C** (V210-93): SIGTERM, which a service manager and `kill` send,
+        // and SIGHUP stop it the same way. Left to their defaults they killed it on the spot,
+        // closes unsent, and every peer counted the anchor as connected until it stopped
+        // answering.
+        let interrupted = stop_requested("vox node");
         tokio::pin!(interrupted);
         loop {
             tokio::select! {
@@ -1223,8 +1293,24 @@ pub fn run_live(
         }
     };
     let cancel = CancellationToken::new();
+    let io = CrosstermIo::new();
     #[cfg(unix)]
     {
+        // **SIGTERM quits as `q` does** (V210-93): the terminal is restored and the node shut
+        // down, so its connections close and its peers learn at once. Left to its default it
+        // killed the process with nothing sent and the terminal left raw.
+        let stop = io.stop_flag();
+        let term = {
+            let _in_rt = rt.enter();
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        };
+        if let Ok(mut term) = term {
+            rt.spawn(async move {
+                if term.recv().await.is_some() {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
         // SIGHUP (terminal went away) locks the node (ADR-015).
         let n = node.clone();
         let c = cancel.clone();
@@ -1242,7 +1328,7 @@ pub fn run_live(
         });
     }
     let core = LiveCore::new(node.clone(), rt.handle().clone());
-    let result = run_loop(CrosstermIo::new(), core, system_clock());
+    let result = run_loop(io, core, system_clock());
     cancel.cancel();
     // Shutdown locks (wipes every SEK and the signer) before the process exits.
     let _ = rt.block_on(node.apply(NodeCommand::Shutdown));
@@ -1272,6 +1358,9 @@ fn event_loop(
     let mut last_input = clock();
     let mut was_locked: Option<bool> = None;
     loop {
+        if io.stop_requested() {
+            return Ok(());
+        }
         let vm = core.view();
 
         // Onboarding / re-auth prompts: open once per transition, never on top of

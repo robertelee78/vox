@@ -619,6 +619,12 @@ impl VoxEndpoint {
             .close(quinn::VarInt::from_u32(0), b"endpoint closed");
     }
 
+    /// Wait until every connection of this endpoint has finished closing, which includes its
+    /// CONNECTION_CLOSE having left. Callers bound it.
+    pub async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
+
     /// Clone the private key (rustls `PrivateKeyDer` is clone-by-method).
     fn clone_key(&self) -> rustls_pki_types::PrivateKeyDer<'static> {
         self.leaf_key.clone_key()

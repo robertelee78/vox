@@ -119,6 +119,10 @@ const MEMBER_REDIAL_SECS: u64 = 30;
 /// circuit's stream, which happens on the endpoint driver's next turn.
 const RELAYED_CLOSE_LEAD: Duration = Duration::from_millis(50);
 
+/// How long stopping the network waits for its connections' closes to leave (see `stop_network`).
+/// They leave on the endpoint driver's next turns; this is a ceiling for one that cannot.
+const CLOSE_FLUSH: Duration = Duration::from_secs(1);
+
 /// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
@@ -504,6 +508,15 @@ const ANCHOR_REDIAL_SECS: u64 = 30;
 /// once would make that a loop at the tick's rate. Backed off, it settles to one try per
 /// [`ANCHOR_REDIAL_SECS`].
 const ANCHOR_FLAP_SECS: u64 = 10;
+
+/// How long an anchor connection may hear nothing before every tick probes it (V210-93).
+const ANCHOR_PROBE_AFTER: Duration = Duration::from_secs(3);
+
+/// How long an anchor connection may go unanswered, probed on every tick, before its anchor is
+/// taken for gone (V210-93): an anchor that was killed or crashed sends no close, and without this
+/// a node learned of it only from the 60 s idle timeout. Five probes at least go unanswered first,
+/// so a loaded anchor slow to ACK one is not buried. A loss is said within this and a tick.
+const ANCHOR_SILENCE_IS_LOSS: Duration = Duration::from_secs(8);
 
 /// What a sync session runs against: a member's channel, or an anchor's copy.
 enum SessionTarget {
@@ -2012,12 +2025,13 @@ pub struct Node {
     /// starting up dialled each anchor from both its start and its first tick, and the
     /// duplicate lost a tie-break against the first on every start.
     anchor_dials: Arc<std::sync::Mutex<BTreeSet<Digest32>>>,
-    /// When each anchor's current connection was made (unix seconds), so one lost soon after is
-    /// told from one lost after a while ([`ANCHOR_FLAP_SECS`]).
-    anchor_connected_at: BTreeMap<Digest32, u64>,
-    /// The anchors this node held a connection to at the last look, so losing one is said when
-    /// it happens, not only when it is next redialled (#229's diagnostics).
-    anchors_up: BTreeSet<Digest32>,
+    /// When each anchor's current connection was made (unix seconds), with that connection's
+    /// serial, so one lost soon after is told from one lost after a while ([`ANCHOR_FLAP_SECS`]).
+    anchor_connected_at: BTreeMap<Digest32, (u64, u64)>,
+    /// The connection held to each anchor at the last look, so losing one is said when it
+    /// happens, not only when it is next redialled (#229's diagnostics). The connection, not
+    /// only the anchor: one lost and replaced between two looks is still a loss (V210-93).
+    anchors_up: BTreeMap<Digest32, Arc<VoxConnection>>,
     /// Peers a room's sync is dialling right now (`reach_for_sync`), so one is not dialled twice.
     sync_dials: BTreeSet<Digest32>,
     /// When the granted mappings must be renewed (unix seconds), or `None` when there
@@ -2325,7 +2339,7 @@ impl Node {
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             anchor_connected_at: BTreeMap::new(),
-            anchors_up: BTreeSet::new(),
+            anchors_up: BTreeMap::new(),
             sync_dials: BTreeSet::new(),
             renew_mappings_at: None,
             ports: BTreeMap::new(),
@@ -2922,6 +2936,11 @@ impl Node {
             }
             net.manager().close_all();
             net.manager().endpoint().close();
+            // **The closes leave before the node goes on** (V210-93). `close` only queues each
+            // CONNECTION_CLOSE for the endpoint's driver; a process that exits straight after can
+            // take them with it, and its peers then learn it went only by inference. Bounded: a
+            // close that cannot leave is not worth a stuck shutdown.
+            let _ = tokio::time::timeout(CLOSE_FLUSH, net.manager().endpoint().wait_idle()).await;
         }
         self.stream_loops.clear();
         // A UPnP mapping the router granted only *permanently* (lifetime 0) would
@@ -3408,43 +3427,39 @@ impl Node {
             return;
         };
         let known: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
-        let up: BTreeSet<Digest32> = known
-            .iter()
-            .map(|a| a.id)
-            .filter(|id| net.manager().holds(id))
-            .collect();
-        let lost: Vec<Digest32> = self.anchors_up.difference(&up).copied().collect();
-        for lost in lost {
-            let lasted = self
-                .anchor_connected_at
-                .remove(&lost)
-                .map(|at| now.saturating_sub(at));
-            if lasted.is_some_and(|s| s < ANCHOR_FLAP_SECS) {
-                // Lost almost as soon as it was made: backed off like a failed dial.
-                let wait = self
-                    .anchor_backoff
-                    .get(&lost)
-                    .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
-                self.anchor_backoff.insert(lost, (now + wait, wait));
-                net.manager().note(
-                    lost,
-                    format!(
-                        "the connection to this anchor is gone {}s after it was made; it is \
-                         redialled in {wait}s",
-                        lasted.unwrap_or(0)
-                    ),
-                );
-            } else {
-                self.anchor_backoff.remove(&lost);
-                net.manager().note(
-                    lost,
-                    "the connection to this anchor is gone; it is redialled now".to_owned(),
-                );
+        // **A loss is noticed however the anchor went** (V210-93), in every build. A clean stop
+        // closes the connection; a kill or a crash closes nothing, so the connection held is also
+        // probed once it falls quiet, and closed here when nothing answers.
+        let mut silent: BTreeMap<Digest32, Duration> = BTreeMap::new();
+        for (id, conn) in &self.anchors_up {
+            if let Some(s) =
+                net.manager()
+                    .close_if_unanswering(conn, ANCHOR_PROBE_AFTER, ANCHOR_SILENCE_IS_LOSS)
+            {
+                silent.insert(*id, s);
             }
+        }
+        let up: BTreeMap<Digest32, Arc<VoxConnection>> = known
+            .iter()
+            .filter_map(|a| net.manager().held(&a.id).map(|c| (a.id, c)))
+            .collect();
+        // Lost: the connection seen at the last look is closed, or none is held — **whether or
+        // not another has replaced it since**. Asking only whether *a* connection was held missed
+        // an anchor that came back between two looks: a restarted anchor's new connection
+        // supersedes the old one at once, and the loss was never said. (One a better path retired
+        // is still open, and is no loss.)
+        let lost: Vec<(Digest32, Arc<VoxConnection>)> = self
+            .anchors_up
+            .iter()
+            .filter(|(id, conn)| conn.quinn().close_reason().is_some() || !up.contains_key(*id))
+            .map(|(id, conn)| (*id, Arc::clone(conn)))
+            .collect();
+        for (id, conn) in lost {
+            self.say_anchor_lost(&net, id, &conn, silent.get(&id).copied());
         }
         self.anchors_up = up;
         for anchor in known {
-            if anchor.id == net.local_id() || self.anchors_up.contains(&anchor.id) {
+            if anchor.id == net.local_id() || self.anchors_up.contains_key(&anchor.id) {
                 continue;
             }
             // **On the next tick, not the next half-minute** (V210-57): an anchor is this node's
@@ -3465,6 +3480,54 @@ impl Node {
                     format!("dialling this anchor again, {waited}s after it last failed"),
                 );
             }
+        }
+    }
+
+    /// Say that the connection `conn` to the anchor `id` is gone, and when it is redialled: at
+    /// once, or backed off like a failed dial if it was lost soon after it was made
+    /// ([`ANCHOR_FLAP_SECS`]). `silent` is how long it answered nothing, if that is why it went.
+    fn say_anchor_lost(
+        &mut self,
+        net: &Arc<NodeNet>,
+        id: Digest32,
+        conn: &VoxConnection,
+        silent: Option<Duration>,
+    ) {
+        let now = self.now();
+        let lasted = match self.anchor_connected_at.get(&id) {
+            Some((serial, at)) if *serial == conn.serial() => {
+                let at = *at;
+                self.anchor_connected_at.remove(&id);
+                Some(now.saturating_sub(at))
+            }
+            _ => None,
+        };
+        let why = match (silent, conn.quinn().close_reason()) {
+            (Some(s), _) => format!("it answered nothing for {}s", s.as_secs()),
+            (None, Some(e)) => e.to_string(),
+            (None, None) => "it is no longer held".to_owned(),
+        };
+        if lasted.is_some_and(|s| s < ANCHOR_FLAP_SECS) {
+            // Lost almost as soon as it was made: backed off like a failed dial.
+            let wait = self
+                .anchor_backoff
+                .get(&id)
+                .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
+            self.anchor_backoff.insert(id, (now + wait, wait));
+            net.manager().note(
+                id,
+                format!(
+                    "the connection to this anchor is gone {}s after it was made ({why}); it is \
+                     redialled in {wait}s",
+                    lasted.unwrap_or(0)
+                ),
+            );
+        } else {
+            self.anchor_backoff.remove(&id);
+            net.manager().note(
+                id,
+                format!("the connection to this anchor is gone ({why}); it is redialled now"),
+            );
         }
     }
 
@@ -4009,9 +4072,22 @@ impl Node {
             }
             NetEvent::AnchorConnected { conn } => {
                 let peer = conn.peer_id();
+                // **Watched from the moment it is made** (V210-93), not from the next tick's look:
+                // a connection lost before any tick had seen it was never said to be gone. In a
+                // debug build a `vox forward` spends 5 s unlocking its identity, connects to its
+                // anchor, and an anchor stopped a moment later went unreported for good. One this
+                // replaces that has closed is a loss, said now.
+                if let Some(old) = self.anchors_up.insert(peer, Arc::clone(&conn)) {
+                    if old.serial() != conn.serial() && old.quinn().close_reason().is_some() {
+                        if let Some(net) = self.net.as_ref().map(Arc::clone) {
+                            self.say_anchor_lost(&net, peer, &old, None);
+                        }
+                    }
+                }
                 // The backoff is kept until the connection has lasted (`ANCHOR_FLAP_SECS`): one
                 // superseded at once is a flap, not a success.
-                self.anchor_connected_at.insert(peer, self.now());
+                self.anchor_connected_at
+                    .insert(peer, (conn.serial(), self.now()));
                 // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
                 // whose forward said it dialled and then nothing).
                 if let Some(net) = self.net.as_ref() {
