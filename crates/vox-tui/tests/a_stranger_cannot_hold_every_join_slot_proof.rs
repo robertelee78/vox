@@ -15,14 +15,23 @@
 //! product's test-only floor on a joiner's own grind (V210-87), inert when unset. A join that
 //! grinds for an hour is a join that never finishes, which is what a stranger's join is, and it
 //! is staged with nothing but the shipped binary. One daemon holds many slots by joining many rooms
-//! at once. Everything is on 127.0.0.1, so every join here comes from **one address**: the
-//! stranger's and carol's alike.
+//! at once. The strangers are all on 127.0.0.1, **one address**.
 //!
 //! 1. `one_identity_holding_every_slot_does_not_keep_a_joiner_out`: one stranger identity joins 16
 //!    of alice's rooms at once, then keeps joining a 17th, over and over, for as long as carol's
 //!    join runs.
 //! 2. `a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out`: four stranger
 //!    identities join 4 rooms each, and one of them keeps joining a 5th.
+//!
+//!    In these two, carol is on 127.0.0.1 too, so what sets her apart is her identity.
+//! 3. `one_address_holding_every_slot_does_not_keep_a_joiner_from_another_out`: sixteen stranger
+//!    identities join one room once each, so by identity every hold weighs what carol's does; and
+//!    carol joins from **::1**, a second source address on the same machine, no sudo needed. Alice
+//!    and the anchor listen on both families (`[::]`), and alice advertises exactly `[::1]` and
+//!    `127.0.0.1` (`VOX_TEST_ADVERTISE`, inert when unset), so no third address of this machine's
+//!    comes into it. Only the address tells carol from the flood. The product keys an IPv4 source
+//!    by its address (an IPv4-mapped one canonicalised first) and an IPv6 one by its /64, so
+//!    `127.0.0.1` and `::1` are two sources.
 //!
 //! **The precondition**, before carol joins, read from alice's own stderr: the cap was reached
 //! with only the stranger's joins in flight — alice refused one of them (`already answering 16
@@ -46,9 +55,11 @@
 //!
 //! **The mutations that must turn it red.**
 //! - `JoinSlots::take` refusing every newcomer once the cap is reached (first come, first served,
-//!   as before): carol is refused and her join fails, in both cases.
+//!   as before): carol is refused and her join fails, in every case.
 //! - The cap's refusal sent as the bare `JoinReject::Refused` again: carol still gets in, and the
-//!   stranger's refused joins are told `usually the room passphrase is wrong`, in both cases.
+//!   stranger's refused joins are told `usually the room passphrase is wrong`, in every case.
+//! - Holds weighed by identity alone, the address dropped: case 3 red, carol ties with every hold
+//!   and is refused; cases 1 and 2 stay green, since they turn on the identity.
 
 #![cfg(unix)]
 
@@ -187,9 +198,9 @@ impl Who {
     }
 
     /// `vox daemon` for this profile, stderr to `err`, answering on its socket before this returns.
-    fn daemon(&self, anchor: &str, err: &Path, env: &[(&str, String)]) -> Proc {
+    fn daemon(&self, anchor: &str, listen: &str, err: &Path, env: &[(&str, String)]) -> Proc {
         let mut cmd = Command::new(VOX);
-        cmd.args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
+        cmd.args(["daemon", "--listen", listen, "--anchor", anchor])
             .arg("--passphrase-file")
             .arg(&self.pass)
             .env("VOX_DATA_DIR", &self.data)
@@ -226,13 +237,23 @@ struct Staged {
 }
 
 /// An anchor; alice's daemon with `rooms` rooms; carol's daemon; and `strangers` stranger daemons,
-/// each grinding for an hour on any join.
-fn stage(tmp: &Path, rooms: usize, strangers: usize) -> Staged {
+/// each grinding for an hour on any join. The strangers are on 127.0.0.1; with `two_addresses`,
+/// alice and the anchor listen on both families and carol joins from ::1, a second source address
+/// on the same machine.
+fn stage(tmp: &Path, rooms: usize, strangers: usize, two_addresses: bool) -> Staged {
     let anchor_who = Who::new(tmp, "anchor");
     let out = tmp.join("anchor.out");
     let anchor = Proc(
         Command::new(VOX)
-            .args(["node", "--listen", "127.0.0.1:0"])
+            .args([
+                "node",
+                "--listen",
+                if two_addresses {
+                    "[::]:0"
+                } else {
+                    "127.0.0.1:0"
+                },
+            ])
             .env("VOX_DATA_DIR", &anchor_who.data)
             .env("VOX_CONFIG_DIR", &anchor_who.cfg)
             .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
@@ -241,13 +262,15 @@ fn stage(tmp: &Path, rooms: usize, strangers: usize) -> Staged {
             .expect("spawn vox node"),
     );
     let started = Instant::now();
-    let spec = loop {
+    let (fp, port) = loop {
         let text = std::fs::read_to_string(&out).unwrap_or_default();
-        if let Some(s) = text
+        if let Some((fp, port)) = text
             .split_whitespace()
-            .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
+            .find(|w| w.contains("@/ip") && w.contains("/udp/"))
+            .and_then(|w| w.split_once('@'))
+            .and_then(|(fp, addr)| Some((fp.to_owned(), addr.rsplit('/').next()?.to_owned())))
         {
-            break s.to_owned();
+            break (fp, port);
         }
         assert!(
             started.elapsed() < START_PATIENCE,
@@ -261,38 +284,70 @@ fn stage(tmp: &Path, rooms: usize, strangers: usize) -> Staged {
     let strangers: Vec<Who> = (0..strangers)
         .map(|i| Who::new(tmp, &format!("stranger{i}")))
         .collect();
+    let v4_spec = format!("{fp}@/ip4/127.0.0.1/udp/{port}");
+    let v6_spec = format!("{fp}@/ip6/::1/udp/{port}");
+    // Alice on both families, advertising exactly her two loopback addresses: what the ladder
+    // would add (this machine's LAN addresses) would be a third source nobody here chose.
+    let (alice_listen, alice_env) = if two_addresses {
+        let port = std::net::UdpSocket::bind("[::]:0")
+            .and_then(|s| s.local_addr())
+            .expect("a free port")
+            .port();
+        (
+            format!("[::]:{port}"),
+            vec![(
+                "VOX_TEST_ADVERTISE",
+                format!("[::1]:{port},127.0.0.1:{port}"),
+            )],
+        )
+    } else {
+        ("127.0.0.1:0".to_owned(), Vec::new())
+    };
+    let (carol_listen, carol_spec) = if two_addresses {
+        ("[::1]:0", &v6_spec)
+    } else {
+        ("127.0.0.1:0", &v4_spec)
+    };
     let alice_err = tmp.join("alice.daemon.err");
-    // Every identity, then every daemon, at once: each unlock is production Argon2id.
+    // Identities and daemons four at a time: each is production Argon2id at 256 MiB or more.
     let everyone: Vec<&Who> = [&alice, &carol].into_iter().chain(&strangers).collect();
-    let daemons = std::thread::scope(|sc| {
-        let ids: Vec<_> = everyone
-            .iter()
-            .map(|&w| sc.spawn(move || w.vox(&["id"], None)))
-            .collect();
-        for id in ids {
-            let (ok, out, err) = id.join().unwrap();
-            assert!(ok, "CANNOT MEASURE: vox id failed: {out}{err}");
-        }
-        let (spec, alice_err) = (&spec, &alice_err);
-        let (alice, carol) = (&alice, &carol);
-        let mut running = vec![
-            sc.spawn(move || alice.daemon(spec, alice_err, &[])),
-            sc.spawn(move || carol.daemon(spec, &tmp.join("carol.daemon.err"), &[])),
-        ];
-        for (i, s) in strangers.iter().enumerate() {
-            running.push(sc.spawn(move || {
-                s.daemon(
-                    spec,
-                    &tmp.join(format!("stranger{i}.daemon.err")),
-                    &[("VOX_TEST_SOLVE_AT_LEAST_MS", NEVER_MS.to_string())],
-                )
-            }));
-        }
-        running
-            .into_iter()
-            .map(|d| d.join().unwrap())
-            .collect::<Vec<_>>()
-    });
+    for batch in everyone.chunks(4) {
+        std::thread::scope(|sc| {
+            let ids: Vec<_> = batch
+                .iter()
+                .map(|&w| sc.spawn(move || w.vox(&["id"], None)))
+                .collect();
+            for id in ids {
+                let (ok, out, err) = id.join().unwrap();
+                assert!(ok, "CANNOT MEASURE: vox id failed: {out}{err}");
+            }
+        });
+    }
+    let mut daemons = vec![
+        alice.daemon(&v4_spec, &alice_listen, &alice_err, &alice_env),
+        carol.daemon(carol_spec, carol_listen, &tmp.join("carol.daemon.err"), &[]),
+    ];
+    let numbered: Vec<(usize, &Who)> = strangers.iter().enumerate().collect();
+    for batch in numbered.chunks(4) {
+        let started: Vec<Proc> = std::thread::scope(|sc| {
+            let running: Vec<_> = batch
+                .iter()
+                .map(|&(i, s)| {
+                    let spec = &v4_spec;
+                    sc.spawn(move || {
+                        s.daemon(
+                            spec,
+                            "127.0.0.1:0",
+                            &tmp.join(format!("stranger{i}.daemon.err")),
+                            &[("VOX_TEST_SOLVE_AT_LEAST_MS", NEVER_MS.to_string())],
+                        )
+                    })
+                })
+                .collect();
+            running.into_iter().map(|d| d.join().unwrap()).collect()
+        });
+        daemons.extend(started);
+    }
     drop(everyone);
 
     let mut links = Vec::new();
@@ -531,7 +586,7 @@ fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     // Rooms 0–15 are held; 16 and 17 are two more the stranger keeps arriving for.
-    let s = stage(tmp.path(), SLOTS + 2, 1);
+    let s = stage(tmp.path(), SLOTS + 2, 1, false);
     let holds: Vec<(usize, usize)> = (0..SLOTS).map(|room| (0, room)).collect();
     run(&s, &holds, 0, SLOTS, "one identity");
 }
@@ -543,9 +598,22 @@ fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
     let tmp = tempfile::tempdir().unwrap();
     // Four identities hold four rooms each; rooms 4 and 5 are two more the first keeps arriving
     // for.
-    let s = stage(tmp.path(), 6, 4);
+    let s = stage(tmp.path(), 6, 4, false);
     let holds: Vec<(usize, usize)> = (0..4)
         .flat_map(|who| (0..4).map(move |room| (who, room)))
         .collect();
     run(&s, &holds, 0, 4, "four identities");
+}
+
+#[test]
+#[ignore = "sixteen joins that never finish, production Argon2id and a real anchor; CI runs it in release"]
+fn one_address_holding_every_slot_does_not_keep_a_joiner_from_another_out() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    // Sixteen identities on 127.0.0.1 hold one slot each, of room 0, so by identity every hold
+    // weighs what carol's does: only the address tells them apart. Carol joins from ::1. Rooms 1
+    // and 2 are the ones the first stranger keeps arriving for.
+    let s = stage(tmp.path(), 3, SLOTS, true);
+    let holds: Vec<(usize, usize)> = (0..SLOTS).map(|who| (who, 0)).collect();
+    run(&s, &holds, 0, 1, "one address");
 }
