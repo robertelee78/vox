@@ -267,6 +267,15 @@ fn every_common_failure_names_its_cause() {
     // A join grinds a production proof of work before it is answered, right or wrong: a debug
     // build's measured join cost on top of `quick` (zero in release, where this bound counts).
     let join_quick = quick + watchdog::debug_cost(1, 0);
+    // One of eight `trust add`s at once checks the passphrase with production Argon2id: in a
+    // debug build that was measured at up to 74.33 s, too near `quick`, so it gets
+    // DEBUG_FILL_ADD on top (zero in release).
+    let add_quick = quick
+        + if cfg!(debug_assertions) {
+            DEBUG_FILL_ADD
+        } else {
+            Duration::ZERO
+        };
 
     // A real service to offer: an echo server.
     let service = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -391,7 +400,7 @@ fn every_common_failure_names_its_cause() {
                             joiner_dir,
                             &["trust", "add", &fp, "--name", &format!("filler-{n}")],
                             "",
-                            quick,
+                            add_quick,
                         );
                         took.push(elapsed);
                         if !ok {
