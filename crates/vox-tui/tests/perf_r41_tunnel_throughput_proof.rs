@@ -979,7 +979,9 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     );
     assert!(
         failed.is_empty(),
-        "R41 (PRODUCT): the tunnel throttles the link it runs over: {failed:?}\n{}",
+        "R41 (PRODUCT): the tunnel throttles the link it runs over: {failed:?}\nand CANNOT MEASURE \
+         (APPARATUS) on {} other arm(s): {cannot:?}\n{}",
+        cannot.len(),
         report.join("\n")
     );
     assert!(
@@ -1260,6 +1262,13 @@ fn lateness(w: &[Window]) -> String {
 /// `QUEUE_DELAY_MIN`): emulator lateness at this size can fake or hide the signal.
 const QUEUE_SIGNAL_LATENESS: Duration = Duration::from_millis(4);
 
+/// Record an arm's CANNOT MEASURE as it happens: a product red on another arm ends the run first, and
+/// must not hide it.
+fn cant(cannot: &mut Vec<String>, fault: String) {
+    shown(&format!("R41: {fault}"));
+    cannot.push(fault);
+}
+
 /// Record an arm's line as it is measured, so an arm that ends the run early leaves the others'.
 fn note(report: &mut Vec<String>, line: String) {
     shown(&format!("R41: {line}"));
@@ -1454,7 +1463,7 @@ fn taper_arms(
         let fidelity =
             windows_cal.iter().copied().fold(f64::INFINITY, f64::min) * 8.0 / CLEAN_LAN.bits_per_sec;
         if fidelity < EMULATOR_FIDELITY {
-            cannot.push(format!(
+            cant(cannot, format!(
                 "CANNOT MEASURE {} (APPARATUS): the emulator itself delivered only {:.1}% of the \
                  link's rate in a calibration window (windows {pct:?}; each must reach {:.0}%), so \
                  this arm would measure the emulator, not vox (load: {})",
@@ -1477,7 +1486,7 @@ fn taper_arms(
         std::thread::sleep(Duration::from_secs(1));
         let w = &all[SETTLE.as_secs() as usize..];
         if let Some(e) = late_fault(CLEAN_LAN.name, w) {
-            cannot.push(e);
+            cant(cannot, e);
             break 'clean;
         }
         let below = w.iter().filter(|x| x.vox < bar).count();
@@ -1535,7 +1544,7 @@ fn taper_arms(
             .or_else(|| late_fault(lossy.name, &c))
             .or_else(|| competed_fault(lossy.name, &c))
         {
-            cannot.push(e);
+            cant(cannot, e);
             continue;
         }
         let (vm, cm) = (mean_of(&v, |x| x.vox), mean_of(&c, |x| x.other));
@@ -1546,7 +1555,7 @@ fn taper_arms(
         } else {
             failed.push(format!(
                 "{}: the emulator was on time and the comparison flow (Cubic, same loss) carried \
-                 {:.1} Mbit/s; vox carried {:.1} Mbit/s, {ratio:.2}x of it, under {LOSSY_WIN:.1}x: \
+                 {:.1} Mbit/s; vox carried {:.1} Mbit/s, {ratio:.3}x of it, under {LOSSY_WIN:.1}x: \
                  vox is slow on a lossy link",
                 lossy.name,
                 cm / 1e6,
@@ -1555,7 +1564,7 @@ fn taper_arms(
             format!("BELOW {LOSSY_WIN:.1}x")
         };
         note(report, format!(
-            "{}: vox {:.1} Mbit/s, Cubic on the same loss {:.1} Mbit/s, {ratio:.2}x — {verdict}; \
+            "{}: vox {:.1} Mbit/s, Cubic on the same loss {:.1} Mbit/s, {ratio:.3}x — {verdict}; \
              vox's {}; the Cubic flow's {}; per-second vox {:?}, Cubic {:?}",
             lossy.name,
             vm / 1e6,
@@ -1584,7 +1593,7 @@ fn taper_arms(
         if let Some(e) =
             late_fault(congested.name, &w).or_else(|| competed_fault(congested.name, &w))
         {
-            cannot.push(e);
+            cant(cannot, e);
             continue;
         }
         let (vm, cm) = (mean_of(&w, |x| x.vox), mean_of(&w, |x| x.other));
@@ -1592,7 +1601,7 @@ fn taper_arms(
         let verdict = if ratio < FAIR_LOW {
             failed.push(format!(
                 "{}: the emulator was on time; vox carried {:.1} Mbit/s against the Cubic flow's \
-                 {:.1}, {ratio:.2}x, under {FAIR_LOW:.1}x: vox gives way on a shared link",
+                 {:.1}, {ratio:.3}x, under {FAIR_LOW:.1}x: vox gives way on a shared link",
                 congested.name,
                 vm / 1e6,
                 cm / 1e6
@@ -1601,7 +1610,7 @@ fn taper_arms(
         } else if ratio > FAIR_HIGH {
             failed.push(format!(
                 "{}: the emulator was on time; vox carried {:.1} Mbit/s against the Cubic flow's \
-                 {:.1}, {ratio:.2}x, over {FAIR_HIGH:.1}x: vox takes more than its share",
+                 {:.1}, {ratio:.3}x, over {FAIR_HIGH:.1}x: vox takes more than its share",
                 congested.name,
                 vm / 1e6,
                 cm / 1e6
@@ -1623,7 +1632,7 @@ fn taper_arms(
             pairs.iter().copied().fold(0.0, f64::max)
         ));
         note(report, format!(
-            "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.2}x over {} s — {verdict}; {}; \
+            "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.3}x over {} s — {verdict}; {}; \
              per-second vox {:?}, Cubic {:?}",
             congested.name,
             vm / 1e6,
@@ -1656,7 +1665,7 @@ fn taper_arms(
             .find(|(n, _)| *n == lossy_link.name)
             .map(|&(_, b)| b)
         else {
-            cannot.push(format!(
+            cant(cannot, format!(
                 "CANNOT MEASURE {name} (APPARATUS): the lossy arm it is judged against did not \
                  measure (precondition unmet)"
             ));
@@ -1679,7 +1688,7 @@ fn taper_arms(
             &all[s + 2 * n..s + 3 * n],
         );
         if let Some(e) = late_fault(&name, &all[s..]) {
-            cannot.push(e);
+            cant(cannot, e);
             continue;
         }
         let below = |w: &[Window]| w.iter().filter(|x| x.vox < bar).count();
@@ -1745,7 +1754,7 @@ fn taper_arms(
             .find(|(n, _)| *n == WIFI.name)
             .map(|&(_, b)| b)
         else {
-            cannot.push(format!(
+            cant(cannot, format!(
                 "CANNOT MEASURE {PAUSED_NAME} (APPARATUS): the 1% lossy arm it is judged against did \
                  not measure (precondition unmet)"
             ));
@@ -1765,7 +1774,7 @@ fn taper_arms(
         let _ = pump.join();
         let judged_after = &after[CLIMB_WITHIN.as_secs() as usize..];
         if let Some(e) = late_fault(PAUSED_NAME, judged_after) {
-            cannot.push(e);
+            cant(cannot, e);
             break 'paused;
         }
         let m = mean_of(judged_after, |x| x.vox);
