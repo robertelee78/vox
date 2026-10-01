@@ -27,8 +27,13 @@
 //!   ended in the clean, truncated end. Not every round: the node's withdrawal can still win, and
 //!   a verifier's mutant with only that half restored reset 4 of 10.
 //!
+//! - **Frozen daemon** (once): Alice's daemon is stopped with SIGSTOP, as a wedged daemon is, and
+//!   her `vox room send` of a small offer is sent SIGTERM. It asked the daemon to withdraw the
+//!   offer and waited for the answer with no bound, so only SIGKILL ended it.
+//!
 //! Asserted: in every round of both arms the collector ends within [`BOUND`] with a reset (an
-//! error naming the connection), never by stalling and never with a clean end.
+//! error naming the connection), never by stalling and never with a clean end. With the daemon
+//! frozen, `vox room send` exits within [`STOP_WITHIN`] of SIGTERM, saying [`FROZEN_SAID`].
 //!
 //! ## Preconditions (else CANNOT MEASURE)
 //! Each collector had received bytes, and not the whole file, when the offer was stopped.
@@ -36,7 +41,9 @@
 //! ## Mutation
 //! Reset the local socket at once (`abort_local` without waiting for its queue to empty), and
 //! collectors stall: red. Let `vox room send` close an unfinished transfer gracefully (the old
-//! exit), and rounds end with a clean, truncated end: red.
+//! exit), and rounds end with a clean, truncated end: red. Wait for the offer's withdrawal with no
+//! bound (no `REMOVE_SERVICE_PATIENCE`), and the frozen-daemon arm is still running at
+//! [`STOP_WITHIN`]: red.
 
 #![cfg(unix)]
 
@@ -62,6 +69,12 @@ const FILE_BYTES: usize = 64 << 20;
 /// A collector that is reset ends at once; one that hangs is given up on by `vox room get` after
 /// 30 s of silence.
 const BOUND: Duration = Duration::from_secs(20);
+/// How long a `vox room send` whose daemon is stopped may take to exit on SIGTERM: the 5 s it
+/// waits for the daemon to withdraw the offer, and as long again for the process to start
+/// exiting and be seen to.
+const STOP_WITHIN: Duration = Duration::from_secs(10);
+/// What it says when its daemon did not answer.
+const FROZEN_SAID: &str = "the daemon did not answer within 5s";
 
 struct Kid(Child);
 
@@ -130,7 +143,7 @@ fn a_cut_session_is_reset_not_hung() {
     let bob = Member::new(root, "bob");
     alice.trust(&bob);
     bob.trust(&alice);
-    let _alice_d = alice.daemon(None);
+    let alice_d = alice.daemon(None);
     let _bob_d = bob.daemon(None);
     let room = alice.create("pair");
     bob.join(&alice.invite(&room), "pair");
@@ -245,6 +258,62 @@ fn a_cut_session_is_reset_not_hung() {
         let _ = std::fs::remove_file(&file);
         ends.push((sig, end));
     }
+    // The frozen-daemon arm: Alice's daemon is stopped (SIGSTOP), then her `vox room send` is sent
+    // SIGTERM. It cannot withdraw the offer, and is to stop anyway, saying so.
+    let name = "frozen.bin";
+    let file = root.join(name);
+    std::fs::write(&file, b"an offer whose daemon will not answer")
+        .expect("APPARATUS: write the offered file");
+    let send_out = root.join("send-frozen.out");
+    let mut send = spawn_vox(
+        &alice,
+        &[
+            "room",
+            "send",
+            &room,
+            file.to_str().expect("APPARATUS: a UTF-8 path"),
+        ],
+        &send_out,
+    );
+    let t0 = Instant::now();
+    while !rb.texts(cb).iter().any(|t| t.contains(name)) {
+        assert!(
+            t0.elapsed() < Duration::from_secs(60),
+            "CANNOT MEASURE: the frozen-daemon arm: Bob never read the offer\n{}",
+            said(&send_out)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    alice_d.signal("-STOP");
+    let ok = Command::new("kill")
+        .args(["-TERM", &send.0.id().to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(ok, "APPARATUS: kill -TERM of vox room send did not take");
+    let termed = Instant::now();
+    let exited = loop {
+        if send
+            .0
+            .try_wait()
+            .expect("APPARATUS: poll vox room send's exit")
+            .is_some()
+        {
+            break Some(termed.elapsed());
+        }
+        if termed.elapsed() > STOP_WITHIN {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    alice_d.signal("-CONT");
+    drop(send);
+    let frozen_said = said(&send_out);
+    eprintln!(
+        "[proof] frozen daemon: vox room send exited {exited:?} after SIGTERM, saying: {}",
+        frozen_said.trim()
+    );
+
     let mut red = Vec::new();
     for (sig, rounds) in [("-INT", ROUNDS), ("-TERM", TERM_ROUNDS)] {
         let count = |e: End| ends.iter().filter(|(s, x)| *s == sig && *x == e).count();
@@ -262,5 +331,11 @@ fn a_cut_session_is_reset_not_hung() {
         red.is_empty(),
         "PRODUCT: every transfer Vox cuts on purpose must reach the collector as a reset: {}",
         red.join("; ")
+    );
+    assert!(
+        exited.is_some() && frozen_said.contains(FROZEN_SAID),
+        "PRODUCT: with its daemon stopped, a SIGTERM'd `vox room send` did not exit within \
+         {STOP_WITHIN:?} saying {FROZEN_SAID:?}: exited {exited:?} (None: still running), said \
+         {frozen_said:?}"
     );
 }
