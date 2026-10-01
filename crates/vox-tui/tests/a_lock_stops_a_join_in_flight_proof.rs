@@ -216,10 +216,18 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
             )
         })
     };
-    assert!(
-        cue(&cues.join("unlocked"), Duration::from_secs(120)),
-        "CANNOT MEASURE: bob's TUI never unlocked"
-    );
+    if !cue(&cues.join("unlocked"), Duration::from_secs(120)) {
+        // A driver that gave up (pyte missing, no unlock screen) has already said why.
+        let said = if driver.is_finished() {
+            driver.join().map_or_else(
+                |_| "the TUI driver thread panicked".to_owned(),
+                |d| format!("the driver exited {:?} saying:\n{}", d.code, d.stdout),
+            )
+        } else {
+            "the driver is still running".to_owned()
+        };
+        panic!("CANNOT MEASURE: bob's TUI never unlocked; {said}");
+    }
 
     // ---- a join that cannot finish yet, and a lock while it runs --------------------------
     signal(alice_pid, "-STOP");
