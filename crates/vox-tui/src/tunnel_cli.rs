@@ -162,6 +162,36 @@ fn profile_busy(socket: &std::path::Path) -> AppError {
     ))
 }
 
+/// Serve this profile's control socket for as long as the returned guard lives.
+///
+/// **Whatever holds a profile answers for it** (V210-83, ported from v0.3.0's #236). A one-shot
+/// verb — `serve`, `connect`, `service`, `forward`, `up` — holds the profile for as long as it
+/// runs, and served nothing: `vox status`, `vox trust add/remove` and the `vox room …` verbs were
+/// refused with `profile_busy`'s message, which named a control socket that did not exist and a
+/// remedy that did not work. `vox serve` even printed `vox trust add <fingerprint>` as the next
+/// step, which could not be done while it ran. Now the running node answers on the socket the
+/// message names, as a `vox daemon`'s does.
+///
+/// **A socket that cannot be bound is reported, not fatal** (V210-83), as in the TUI. The verb's
+/// job — hosting a service, forwarding a port — does not depend on the socket, and a path another
+/// user can occupy first (the `$TMPDIR/vox-<uid>` fallback, `/tmp` on Linux) must not be able to
+/// stop it. A socket or directory that is not this user's is never used: `bind_at` refuses it.
+pub fn serve_control_socket(
+    node: &NodeHandle,
+    socket: std::path::PathBuf,
+) -> Option<vox_core::node::ipc::IpcServer> {
+    match vox_core::node::ipc::bind_at(node.clone(), socket) {
+        Ok(server) => Some(server),
+        Err(e) => {
+            eprintln!(
+                "vox: control socket unavailable ({e}); this node runs on, but `vox trust`, \
+                 `vox room` and `vox status` will not reach it while it does"
+            );
+            None
+        }
+    }
+}
+
 pub async fn open_profile(
     paths: Paths,
     listen: SocketAddr,
@@ -282,8 +312,10 @@ pub async fn service_remove(
             service_tag: tag.to_owned(),
         })
         .await;
+    // The node's own reason, not "was not offered": a room that is not open, or a store that
+    // failed, was reported as a tag that was never there (V210-83).
     if !out.is_done() {
-        return Err(AppError::Usage(format!("{tag:?} was not offered here")));
+        return Err(AppError::Usage(format!("cannot remove {tag:?}: {out}")));
     }
     println!("vox: no longer offering {tag:?}");
     Ok(())
@@ -940,28 +972,51 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         }
         // Joining a room this node already holds used to say `Failed(IdentityExists)`.
         Some(Fault::AlreadyMember) => Fault::AlreadyMember.explain(),
-        _ => "the node did not say why, which is itself worth reporting",
+        // Every other fault says what it is. They all fell to "the node did not say why" here,
+        // a claim that was false whenever the node had named one (V210-83).
+        Some(other) => other.explain(),
+        None => "the node did not say why, which is itself worth reporting",
     }
 }
 
 /// The fault named in a daemon's reply to a join (`"Failed(Refused)"`), for the verbs that reach
 /// the node over its control socket, where only the outcome's name crosses the wire. The name is
 /// the reply's first line; a failed join's steps follow it (see [`join_detail`]).
+///
+/// **Every fault, not the ones a join was expected to meet** (V210-83). It knew ten, and a join
+/// that failed for any other — the store, the node shutting down, a bug — printed the enum's name
+/// to the person: `cannot join: Failed(Storage)`.
 pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
     let first = reason.lines().next().unwrap_or_default();
     let name = first.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
     Some(match name {
+        "NoIdentity" => Fault::NoIdentity,
+        "IdentityExists" => Fault::IdentityExists,
+        "Locked" => Fault::Locked,
         "WrongPassphrase" => Fault::WrongPassphrase,
+        "UnknownChannel" => Fault::UnknownChannel,
+        "ChannelNotOpen" => Fault::ChannelNotOpen,
+        "TooLong" => Fault::TooLong,
+        "KeyringFull" => Fault::KeyringFull,
+        "Storage" => Fault::Storage,
+        "SealedUnreadable" => Fault::SealedUnreadable,
+        "ShuttingDown" => Fault::ShuttingDown,
+        "NotNetworked" => Fault::NotNetworked,
         "BadLink" => Fault::BadLink,
         "RoomNotOnBoard" => Fault::RoomNotOnBoard,
         "BoardUnreachable" => Fault::BoardUnreachable,
         "Unreachable" => Fault::Unreachable,
         "SolveTooSlow" => Fault::SolveTooSlow,
         "Refused" => Fault::Refused,
-        "NotNetworked" => Fault::NotNetworked,
-        "Locked" => Fault::Locked,
-        "NoIdentity" => Fault::NoIdentity,
+        "NotConsented" => Fault::NotConsented,
+        "StillTrusted" => Fault::StillTrusted,
+        "NotLoopback" => Fault::NotLoopback,
+        "AddressInUse" => Fault::AddressInUse,
         "AlreadyMember" => Fault::AlreadyMember,
+        "NotAServiceRoom" => Fault::NotAServiceRoom,
+        "NotOffered" => Fault::NotOffered,
+        "NoSuchForward" => Fault::NoSuchForward,
+        "Internal" => Fault::Internal,
         _ => return None,
     })
 }
@@ -1010,6 +1065,7 @@ where
     F: FnOnce(NodeHandle, Digest32) -> Fut,
     Fut: std::future::Future<Output = Result<(), AppError>>,
 {
+    let socket = target.paths.socket_file();
     let (node, channel_id) = open_room(
         target.paths,
         target.listen,
@@ -1019,6 +1075,7 @@ where
         &target.room_passphrase,
     )
     .await?;
+    let _control = serve_control_socket(&node, socket);
     let handle = node.clone();
     let result = body(node, channel_id).await;
     // The verbs are one-shot; `forward` shuts the node down itself when the person
