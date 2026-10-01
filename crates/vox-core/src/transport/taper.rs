@@ -44,8 +44,10 @@
 //!   Two inputs are fixed against what they would otherwise hide. The base is never above the base
 //!   at entry to tier 3: another flow's standing queue lifts every sample, and a base that followed
 //!   it would cancel the test (measured with a Cubic flow on a 4-BDP buffer: no round fired in 125
-//!   samples). And the bound is BBR's target, not its current window: in recovery or ProbeRtt the
-//!   window drops below the queue it has already built, and the test then fired with no other flow.
+//!   samples). And the bound is BBR's target window, not its current one, which moves the wrong way
+//!   both times it matters: in recovery or ProbeRtt it drops below the queue BBR has already built
+//!   (the test fired with no other flow), and while another flow takes share it lags BBR's falling
+//!   estimate, so `window / estimate` grows with that flow's queue (it never fired).
 //!   A share of the base, the other tiers' test, read BBR's own queue as congestion and took tier 3
 //!   out within a second, every time. **No delay test that stays quiet with Vox alone can see a
 //!   buffer of a bandwidth-delay product or less**: BBR's own window fills it. There the
@@ -53,8 +55,9 @@
 //! - **Descend 3 → 2 when the loss is gone:** the loss share under half [`GENTLE_LOSS_CAP`] for
 //!   [`QUIET_ROUNDS`] rounds and [`QUIET_TIME`].
 //! - **Descend 2 → 1** after a quiet stretch: [`QUIET_ROUNDS`] consecutive rounds and
-//!   [`QUIET_TIME`] with no loss, no queue, and delivery at least [`HOLDING_FRACTION`] of the best
-//!   rate. Tier 2's loss baseline is cleared.
+//!   [`QUIET_TIME`] with no loss and no queue. Tier 2's loss baseline is cleared. Not on the rate
+//!   holding up as well: a rate measured on this connection cannot tell a path that got worse from
+//!   an application that sent less, or from an earlier, faster path within the window.
 //! - **Hysteresis and dwell.** Each climb and its descent test different things, and a descent
 //!   needs a longer stretch than a climb. Every tier is left no sooner than [`DWELL_ROUNDS`]
 //!   rounds and [`DWELL_TIME`], except tier 3 by a queue or a failed trial.
@@ -126,8 +129,6 @@ pub(crate) const TIER3_QUEUE_ROUNDS: u32 = 2;
 pub(crate) const TIER3_QUEUE_FACTOR: f64 = 1.25;
 /// …plus this, is a queue another flow is building (see the module docs).
 pub(crate) const TIER3_QUEUE_MIN: Duration = Duration::from_millis(4);
-/// A quiet round delivers at least this share of the best rate.
-pub(crate) const HOLDING_FRACTION: f64 = 0.8;
 /// Consecutive rounds of a stretch that descends a tier…
 pub(crate) const QUIET_ROUNDS: u32 = 40;
 /// …spanning at least this long.
@@ -322,14 +323,12 @@ impl Tapered {
         };
         let lossy =
             self.signals.losses_without_queue_in_last(1) > 0 || self.signals.loss_with_queue();
-        let holding = self.signals.delivery_rate() as f64
-            >= HOLDING_FRACTION * self.signals.best_rate(now) as f64;
 
         self.queue.update(now, tier3_queued);
         self.queued.update(now, queued);
         self.unqueued
             .update(now, self.queued.rounds < CLIMB_3_QUEUE_ROUNDS);
-        self.quiet.update(now, !queued && !lossy && holding);
+        self.quiet.update(now, !queued && !lossy);
         self.loss_gone.update(now, share < GENTLE_LOSS_CAP / 2.0);
 
         let dwelt = self.rounds_in_tier >= DWELL_ROUNDS && in_tier >= DWELL_TIME;
@@ -435,8 +434,6 @@ impl Tapered {
             reason,
             window_before = window,
             window_after = self.tier.controller().window(),
-            rate = self.signals.delivery_rate(),
-            best_rate = self.signals.best_rate(now),
             loss_share = self.signals.loss_share(),
             trend_share = self.signals.trend_share(),
             entry_share = self.entry_share,

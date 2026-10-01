@@ -223,10 +223,11 @@ impl VoxBbr {
 
     /// The round trip this BBR can raise by itself on a path whose base round trip is `base`, with
     /// no other flow: its target window (`cwnd_gain` bandwidth-delay products of `base`, plus the
-    /// acknowledgement aggregation it measured), or its current window if larger, drained at its
-    /// bandwidth estimate. quinn paces from the window, so this is the queue BBR alone can stand.
-    /// It is computed from `base`, not from this model's own minimum round trip, which a standing
-    /// queue of another flow's raises.
+    /// acknowledgement aggregation it measured) drained at its bandwidth estimate. quinn paces from
+    /// the window, so this is the queue BBR alone can stand. It is computed from `base`, not from
+    /// this model's own minimum round trip, which another flow's standing queue raises; and from the
+    /// target, not the current window, which lags a falling estimate: with a Cubic flow taking share
+    /// on a 4-BDP buffer, `window / estimate` grew with the very queue it was meant to see.
     pub(crate) fn standing_rtt(&self, base: Duration) -> Duration {
         let bw = self.max_bandwidth.get_estimate();
         if bw == 0 {
@@ -234,8 +235,7 @@ impl VoxBbr {
         }
         let target = K_DERIVED_HIGH_CWNDGAIN as f64 * bw as f64 * base.as_secs_f64()
             + self.ack_aggregation.max_ack_height.get() as f64;
-        let bytes = target.max(self.cwnd as f64);
-        base.max(Duration::from_secs_f64(bytes / bw as f64))
+        base.max(Duration::from_secs_f64(target / bw as f64))
     }
 
     fn enter_startup_mode(&mut self) {
