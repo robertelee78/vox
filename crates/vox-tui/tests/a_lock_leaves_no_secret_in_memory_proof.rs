@@ -26,8 +26,16 @@
 //! the node publishes a locked view only when its lock is done, and a TUI still waiting on its
 //! unlock (the reopen case) shows the prompt it was typed into, dots and all, until then.
 //!
-//! **Asserted,** with no tolerance: after the lock, the passphrase is **nowhere** in the process's
-//! written memory, live or freed. Preconditions, or `CANNOT MEASURE`: the work had not finished
+//! - **idle:** bob's TUI is unlocked by typing his identity passphrase at its prompt, and he types
+//!   `:lock` with nothing in flight.
+//!
+//! **Every case looks for every passphrase the lock is to wipe** (V210-94): the one its work held,
+//! and the identity passphrase typed at unlock. The terminal library kept that one in its input
+//! buffer, whole after a SIGHUP and with only `:lock\r` typed over its start after a typed lock,
+//! and a case that looked for just its own passphrase, whole, could not see it.
+//!
+//! **Asserted,** with no tolerance: after the lock, no passphrase is anywhere in the process's
+//! written memory, live or freed, **whole or as any 6-byte piece** (the scanner's `+pieces`). Preconditions, or `CANNOT MEASURE`: the work had not finished
 //! when the lock was asked for; the scan saw the work's copy before the lock.
 //!
 //! Not "no more copies than before the work": the identity passphrase typed at unlock is in memory
@@ -54,6 +62,30 @@
 //!   within [`ANSWERS`], and the lock settles within [`SETTLES`], not once the grind ends.
 //!   Mutation: the grind back inside the task (`block_in_place`, holding the passphrase); the lock
 //!   then settles only when the held grind ends, about [`GRIND_MS`] later.
+//!
+//! **Which case proves which fix.** The idle and reopen cases are what see a passphrase left in the
+//! terminal input buffer (mutation: a secret field read through crossterm again). Only the grind
+//! case can see the control socket's request frame left unwiped (mutation: `ipc.rs`'s wipe
+//! reverted, which turns it red and no other case): a join is the one request still being answered
+//! after the lock settles, and **macOS's allocator zeroes small freed blocks** (measured by
+//! verifier-288c2: up to at least 3500 bytes), so a frame freed earlier cannot be seen here
+//! whatever the product did. The seal, check and reopen cases are not proof of that wipe. On an
+//! allocator that does not zero (glibc), the wipe of every other request rests on review; so does a
+//! prompt field that would grow and free its old buffer, kept from growing by
+//! `PROMPT_FIELD_CAPACITY` — a freed copy of it is just as invisible here.
+//!
+//! **Why a file of its own.** Each case needs the scanner (`vox-test-interpose`, loaded with
+//! `DYLD_INSERT_LIBRARIES` and reading memory with `mach_vm_*`), which is macOS-only, and a moment
+//! held open by a test-only knob. The user journeys that lock — `a_lock_stops_a_join_in_flight`
+//! (a join stopped by a lock, Linux and macOS) and `a_daemon_reopens_its_rooms` (rooms back after an
+//! unlock) — run on both systems in CI and need neither; carrying these cases would confine them to
+//! macOS, or leave a memory claim half-run on Linux.
+//!
+//! **Test-only knobs** (`VOX_TEST_SECRET_WORK_DELAY_MS`, `VOX_TEST_SOLVE_AT_LEAST_MS`) stage what a
+//! person's situation is — a slow derivation, a slow device — and nothing a `vox` command can. Once
+//! #300 compiles them out of the shipped binary, this proof is to build with
+//! `--features vox-tui/test-knobs` and refuse as CANNOT MEASURE a `vox` without them
+//! (`support/test_knobs.rs`'s `require`).
 //!
 //! What is not measured here, and rests on review: that the seal's thread is given the passphrase
 //! alone (not the signer or the room key), since neither the identity's key nor a random room key
@@ -97,6 +129,30 @@ const SAID_LOCKING_AFTER: Duration = Duration::from_secs(2);
 /// The scanner's mask (`crates/vox-test-interpose/src/scan.rs`).
 const MASK: u8 = 0xA5;
 
+/// **Every red names which it is** (the decider's rule 1). A step of the proof's own staging that
+/// fails — a file, a process, a parse — is `CANNOT MEASURE (harness error)` at its line; what the
+/// product did wrong is `PRODUCT:`. Nothing here unwraps bare.
+trait Staged<T> {
+    /// The value, or `CANNOT MEASURE (harness error)` naming this line and what failed.
+    fn staged(self) -> T;
+}
+
+impl<T, E: std::fmt::Debug> Staged<T> for Result<T, E> {
+    #[track_caller]
+    fn staged(self) -> T {
+        let at = std::panic::Location::caller();
+        self.unwrap_or_else(|e| panic!("CANNOT MEASURE (harness error) at {at}: {e:?}"))
+    }
+}
+
+impl<T> Staged<T> for Option<T> {
+    #[track_caller]
+    fn staged(self) -> T {
+        let at = std::panic::Location::caller();
+        self.unwrap_or_else(|| panic!("CANNOT MEASURE (harness error) at {at}: nothing there"))
+    }
+}
+
 /// A child process, killed by its own PID when dropped.
 struct Proc(Child);
 
@@ -111,7 +167,7 @@ impl Drop for Proc {
 fn unique(tag: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .staged()
         .as_nanos();
     format!("{tag}-{:x}-{nanos:x}", std::process::id())
 }
@@ -138,10 +194,10 @@ fn start(dir: &Path, args: &[&str], identity: &str, stdin: Option<&str>) -> Proc
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .staged();
     if let Some(text) = stdin {
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(text.as_bytes()).expect("write stdin");
+        let mut pipe = child.stdin.take().staged();
+        pipe.write_all(text.as_bytes()).staged();
     }
     Proc(child)
 }
@@ -166,53 +222,74 @@ struct Scanner {
 /// One scan: how many copies of each needle, and where the first few are.
 struct Scan {
     counts: BTreeMap<String, usize>,
+    /// For each needle, how many places hold a 6-byte piece of it (the scanner's `+pieces`).
+    pieces: BTreeMap<String, usize>,
     hits: Vec<String>,
     scanned: String,
 }
 
 impl Scan {
     fn of(&self, label: &str) -> usize {
-        self.counts[label]
+        self.counts.get(label).copied().unwrap_or_else(|| {
+            panic!("CANNOT MEASURE (harness error): the scan reported no count for {label}")
+        })
+    }
+
+    fn pieces_of(&self, label: &str) -> usize {
+        self.pieces.get(label).copied().unwrap_or_else(|| {
+            panic!("CANNOT MEASURE (harness error): the scan reported no pieces for {label}")
+        })
     }
 }
 
 impl Scanner {
     fn new(dir: PathBuf, needles: &[(&str, &str)]) -> Self {
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).staged();
         let text: String = needles
             .iter()
             .map(|(label, s)| {
                 let hex: String = s.bytes().map(|b| format!("{:02x}", b ^ MASK)).collect();
-                format!("{label}\t{hex}\n")
+                // `+pieces`: every 6-byte window of it is looked for too (V210-94). A copy the
+                // product partly overwrote is still a copy: `:lock\r` typed over the start of one.
+                format!("{label}+pieces\t{hex}\n")
             })
             .collect();
-        std::fs::write(dir.join("needles"), text).unwrap();
+        std::fs::write(dir.join("needles"), text).staged();
         Self { dir }
     }
 
     fn scan(&self) -> Scan {
         let result = self.dir.join("result");
         let _ = std::fs::remove_file(&result);
-        std::fs::write(self.dir.join("go"), b"").unwrap();
+        std::fs::write(self.dir.join("go"), b"").staged();
         assert!(
             cue(&result, Duration::from_secs(60)),
             "CANNOT MEASURE: the TUI's scanner never answered (is the interposer loaded?)"
         );
-        let text = std::fs::read_to_string(&result).unwrap();
+        let text = std::fs::read_to_string(&result).staged();
         let mut scan = Scan {
             counts: BTreeMap::new(),
+            pieces: BTreeMap::new(),
             hits: Vec::new(),
             scanned: String::new(),
+        };
+        let number = |v: Option<&&str>| -> usize {
+            v.and_then(|n| n.parse().ok()).unwrap_or_else(|| {
+                panic!("CANNOT MEASURE (harness error): the scanner wrote {text:?}")
+            })
         };
         for line in text.lines() {
             let f: Vec<&str> = line.split('\t').collect();
             match f.first().copied() {
                 Some("count") => {
-                    scan.counts.insert(f[1].to_owned(), f[2].parse().unwrap());
+                    scan.counts.insert(f[1].to_owned(), number(f.get(2)));
+                }
+                Some("pieces") => {
+                    scan.pieces.insert(f[1].to_owned(), number(f.get(2)));
                 }
                 Some("hit") => scan.hits.push(f[1..].join(" ")),
                 Some("scanned") => scan.scanned = f[1..].join(" "),
-                _ => panic!("CANNOT MEASURE: the scanner said {line:?}"),
+                _ => panic!("CANNOT MEASURE (harness error): the scanner said {line:?}"),
             }
         }
         assert!(
@@ -223,16 +300,21 @@ impl Scanner {
     }
 
     /// Scan until `label` shows more copies than `before`, for up to [`SHOWS_UP`].
-    fn until_more(&self, label: &str, before: usize) -> Option<Scan> {
+    /// `CANNOT MEASURE (staging not achieved)` if it never does: the work the case locks during never
+    /// held the passphrase where the scan could see it.
+    fn until_more(&self, label: &str, before: usize) -> Scan {
         let t0 = Instant::now();
         while t0.elapsed() < SHOWS_UP {
             let scan = self.scan();
             if scan.of(label) > before {
-                return Some(scan);
+                return scan;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        None
+        panic!(
+            "CANNOT MEASURE (staging not achieved): the {label} passphrase never showed up in the \
+             TUI's memory within {SHOWS_UP:?} of the work starting"
+        )
     }
 }
 
@@ -245,17 +327,17 @@ struct Tui {
 
 impl Tui {
     fn start(bob: &Path, identity: &str, cues: PathBuf, tag: &str, extra: &[String]) -> Self {
-        std::fs::create_dir_all(&cues).unwrap();
+        std::fs::create_dir_all(&cues).staged();
         let script = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/pty/tui_lock_for_scan.py"
         );
         let mut args: Vec<String> = vec![
             VOX.to_owned(),
-            bob.to_str().unwrap().to_owned(),
-            bob.join("cfg").to_str().unwrap().to_owned(),
+            bob.to_str().staged().to_owned(),
+            bob.join("cfg").to_str().staged().to_owned(),
             identity.to_owned(),
-            cues.to_str().unwrap().to_owned(),
+            cues.to_str().staged().to_owned(),
             tag.to_owned(),
         ];
         args.extend(extra.iter().cloned());
@@ -277,10 +359,10 @@ impl Tui {
             self.tag
         );
         std::fs::read_to_string(self.cues.join("pid"))
-            .unwrap()
+            .staged()
             .trim()
             .parse()
-            .unwrap()
+            .staged()
     }
 
     fn unlocked(&mut self) {
@@ -288,8 +370,8 @@ impl Tui {
             return;
         }
         // What the TUI showed instead: the driver prints its screen when stopped early.
-        std::fs::write(self.cues.join("stop"), b"").unwrap();
-        let driven = self.driver.take().unwrap().join().expect("the TUI driver");
+        std::fs::write(self.cues.join("stop"), b"").staged();
+        let driven = self.driver.take().staged().join().staged();
         panic!(
             "CANNOT MEASURE: {}'s TUI never unlocked; its driver said:\n{}",
             self.tag, driven.stdout
@@ -307,7 +389,7 @@ impl Tui {
     /// Ask for the lock, without waiting for it; when it was asked.
     fn ask_lock(&self, hup: bool) -> Instant {
         let how: &[u8] = if hup { b"hup" } else { b"key" };
-        std::fs::write(self.cues.join("lock"), how).unwrap();
+        std::fs::write(self.cues.join("lock"), how).staged();
         Instant::now()
     }
 
@@ -336,7 +418,7 @@ impl Tui {
         if !hup && waited > SAID_LOCKING_AFTER {
             assert_eq!(
                 said, "said-locking",
-                "{}'s TUI waited {waited:?} on :lock and never said it was locking: it looked \
+                "PRODUCT: {}'s TUI waited {waited:?} on :lock and never said it was locking: it looked \
                  frozen",
                 self.tag
             );
@@ -345,8 +427,8 @@ impl Tui {
     }
 
     fn stop(mut self) {
-        std::fs::write(self.cues.join("stop"), b"").unwrap();
-        let driven = self.driver.take().unwrap().join().expect("the TUI driver");
+        std::fs::write(self.cues.join("stop"), b"").staged();
+        let driven = self.driver.take().staged().join().staged();
         println!(
             "[proof] {}'s TUI driver exited {:?} after {:?} at {:?}",
             self.tag, driven.code, driven.took, driven.stage
@@ -370,57 +452,72 @@ fn tui_env(scan: &Path) -> Vec<String> {
 }
 
 fn new_profile(dir: &Path, identity: &str) {
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
-    let out = command(dir, &["id"], identity).output().expect("vox id");
+    std::fs::create_dir_all(dir.join("cfg")).staged();
+    let out = command(dir, &["id"], identity).output().staged();
     assert!(
         out.status.success(),
-        "vox id: {}",
+        "CANNOT MEASURE (staging not achieved): `vox id` made no identity to stage with: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
 
 /// Whether `work` is still running; `CANNOT MEASURE` if it already finished.
 fn still_running(work: &mut Proc, what: &str) {
-    let early = work.0.try_wait().expect("poll");
+    let early = work.0.try_wait().staged();
     assert!(
         early.is_none(),
         "CANNOT MEASURE: {what} finished ({early:?}) before the lock, so nothing was in flight"
     );
 }
 
-/// The verdict for one case: no copy of the needle after the lock.
-fn judge(case: &str, label: &str, before: &Scan, during: &Scan, after: &Scan, took: Duration) {
+/// The verdict for one case: after the lock, **no copy and no 6-byte piece of any passphrase the
+/// case looked for** — the one its work held and the identity passphrase typed at unlock, which the
+/// lock is to wipe as well (V210-94).
+fn judge(case: &str, before: &Scan, during: &Scan, after: &Scan, took: Duration) {
+    for label in after.counts.keys() {
+        println!(
+            "[proof] {case}: the {label} passphrase in the TUI's memory, copies (and 6-byte \
+             pieces) — before the work {} ({}), while it ran {} ({}), after the lock {} ({}) (the \
+             lock answered {took:?} after it was asked)",
+            before.of(label),
+            before.pieces_of(label),
+            during.of(label),
+            during.pieces_of(label),
+            after.of(label),
+            after.pieces_of(label),
+        );
+    }
     println!(
-        "[proof] {case}: copies of the {label} passphrase in the TUI's memory — before the work \
-         {}, while it ran {}, after the lock {} (the lock answered {took:?} after it was asked); \
-         after the lock: {:?}; scanned {}",
-        before.of(label),
-        during.of(label),
-        after.of(label),
-        after.hits,
-        after.scanned
+        "[proof] {case}: after the lock: {:?}; scanned {}",
+        after.hits, after.scanned
     );
-    assert!(
-        after.of(label) == 0,
-        "{case}: the lock is done and the {label} passphrase is still in memory: {} copies, at \
-         {:?} ({} before the work started, {} while it ran) — work the lock did not wait for \
-         still holds it",
-        after.of(label),
-        after.hits,
-        before.of(label),
-        during.of(label)
-    );
+    for label in after.counts.keys() {
+        assert!(
+            after.of(label) == 0 && after.pieces_of(label) == 0,
+            "PRODUCT: {case}: the lock is done and the {label} passphrase is still in memory: {} \
+             copies and {} places holding a 6-byte piece of it, at {:?} ({} copies before the work \
+             started, {} while it ran)",
+            after.of(label),
+            after.pieces_of(label),
+            after.hits,
+            before.of(label),
+            during.of(label)
+        );
+    }
 }
 
 #[test]
 #[ignore = "real vox tui in a pty with the interposer loaded, production Argon2id; macOS"]
 fn a_lock_waits_for_a_room_seal_and_leaves_no_passphrase() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().staged();
     let bob = tmp.path().join("bob");
     let (identity, roompass) = (unique("idp"), unique("seal-rp"));
     new_profile(&bob, &identity);
-    let scanner = Scanner::new(tmp.path().join("scan"), &[("room", &roompass)]);
+    let scanner = Scanner::new(
+        tmp.path().join("scan"),
+        &[("room", &roompass), ("identity", &identity)],
+    );
     let mut tui = Tui::start(
         &bob,
         &identity,
@@ -436,9 +533,7 @@ fn a_lock_waits_for_a_room_seal_and_leaves_no_passphrase() {
         &identity,
         Some(&format!("{roompass}\n")),
     );
-    let during = scanner
-        .until_more("room", before.of("room"))
-        .expect("CANNOT MEASURE: the room passphrase never showed up in the TUI's memory");
+    let during = scanner.until_more("room", before.of("room"));
     still_running(&mut create, "vox room create");
     let asked = tui.ask_lock(false);
     // **The node answers while the lock settles** (V210-71): a command that goes through the
@@ -452,7 +547,7 @@ fn a_lock_waits_for_a_room_seal_and_leaves_no_passphrase() {
         &identity,
         Some("a probe passphrase\n"),
     );
-    let probe_status = probe.0.wait().expect("the probe");
+    let probe_status = probe.0.wait().staged();
     let probe_took = probe_at.elapsed();
     let settled_first = tui.is_locked();
     let took = tui.wait_locked(asked, false);
@@ -466,21 +561,21 @@ fn a_lock_waits_for_a_room_seal_and_leaves_no_passphrase() {
     );
     assert!(
         probe_took < ANSWERS,
-        "the node answered nobody while its lock settled: a command took {probe_took:?} (bound \
+        "PRODUCT: the node answered nobody while its lock settled: a command took {probe_took:?} (bound \
          {ANSWERS:?}) — the actor waited for the lock"
     );
     let after = scanner.scan();
-    let answered = create.0.try_wait().expect("poll");
+    let answered = create.0.try_wait().staged();
     println!("[proof] seal: vox room create after the lock: {answered:?}");
     tui.stop();
-    judge("seal", "room", &before, &during, &after, took);
+    judge("seal", &before, &during, &after, took);
 }
 
 #[test]
 #[ignore = "real vox tui in a pty with the interposer loaded, production Argon2id; macOS"]
 fn a_lock_waits_for_a_passphrase_check_and_leaves_no_passphrase() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().staged();
     let bob = tmp.path().join("bob");
     let identity = unique("check-idp");
     new_profile(&bob, &identity);
@@ -495,21 +590,19 @@ fn a_lock_waits_for_a_passphrase_check_and_leaves_no_passphrase() {
     tui.unlocked();
     let before = scanner.scan();
     let mut check = start(&bob, &["trust", "list"], &identity, None);
-    let during = scanner
-        .until_more("identity", before.of("identity"))
-        .expect("CANNOT MEASURE: the identity passphrase never showed up again in memory");
+    let during = scanner.until_more("identity", before.of("identity"));
     still_running(&mut check, "vox trust list");
     let took = tui.lock(false);
     let after = scanner.scan();
     tui.stop();
-    judge("check", "identity", &before, &during, &after, took);
+    judge("check", &before, &during, &after, took);
 }
 
 #[test]
 #[ignore = "real vox tui in a pty with the interposer loaded, production Argon2id; macOS"]
 fn a_lock_waits_for_a_room_reopening_and_leaves_no_passphrase() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().staged();
     let bob = tmp.path().join("bob");
     let (identity, roompass) = (unique("idp"), unique("reopen-rp"));
     new_profile(&bob, &identity);
@@ -523,12 +616,15 @@ fn a_lock_waits_for_a_room_reopening_and_leaves_no_passphrase() {
             &identity,
             Some(&format!("{roompass}\n")),
         );
-        let status = create.0.wait().expect("vox room create");
+        let status = create.0.wait().staged();
         assert!(status.success(), "CANNOT MEASURE: vox room create failed");
         tui.lock(false);
         tui.stop();
     }
-    let scanner = Scanner::new(tmp.path().join("scan"), &[("room", &roompass)]);
+    let scanner = Scanner::new(
+        tmp.path().join("scan"),
+        &[("room", &roompass), ("identity", &identity)],
+    );
     let tui = Tui::start(
         &bob,
         &identity,
@@ -538,9 +634,7 @@ fn a_lock_waits_for_a_room_reopening_and_leaves_no_passphrase() {
     );
     tui.pid();
     let before = scanner.scan();
-    let during = scanner
-        .until_more("room", before.of("room"))
-        .expect("CANNOT MEASURE: the room passphrase never showed up: no reopening");
+    let during = scanner.until_more("room", before.of("room"));
     assert!(
         !tui.cues.join("unlocked").exists(),
         "CANNOT MEASURE: the TUI finished unlocking, so the reopening was not in flight"
@@ -548,13 +642,13 @@ fn a_lock_waits_for_a_room_reopening_and_leaves_no_passphrase() {
     let took = tui.lock(true);
     let after = scanner.scan();
     tui.stop();
-    judge("reopen", "room", &before, &during, &after, took);
+    judge("reopen", &before, &during, &after, took);
 }
 
 /// Read `child`'s stdout until a line matches `wanted`; the line.
 fn line_from(child: &mut Proc, what: &str, wanted: impl Fn(&str) -> bool) -> String {
     use std::io::BufRead as _;
-    let out = child.0.stdout.take().expect("stdout");
+    let out = child.0.stdout.take().staged();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
@@ -578,14 +672,14 @@ fn line_from(child: &mut Proc, what: &str, wanted: impl Fn(&str) -> bool) -> Str
 #[ignore = "real vox tui in a pty with the interposer loaded, a real join; macOS"]
 fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().staged();
     let (anchor_dir, alice, bob) = (
         tmp.path().join("anchor"),
         tmp.path().join("alice"),
         tmp.path().join("bob"),
     );
     let (alice_id, identity, roompass) = (unique("alice-idp"), unique("idp"), unique("grind-rp"));
-    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(anchor_dir.join("cfg")).staged();
     new_profile(&alice, &alice_id);
     new_profile(&bob, &identity);
     // An anchor, and alice hosting a room through it, all the shipped binary.
@@ -600,7 +694,7 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     })
     .split_whitespace()
     .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-    .unwrap()
+    .staged()
     .to_owned();
     let _alice_daemon = start(
         &alice,
@@ -626,25 +720,28 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
         Some(&format!("{roompass}\n")),
     );
     assert!(
-        create.0.wait().expect("room create").success(),
+        create.0.wait().staged().success(),
         "CANNOT MEASURE: alice could not create the room"
     );
     let list = command(&alice, &["room", "list"], &alice_id)
         .output()
-        .unwrap();
+        .staged();
     let prefix = String::from_utf8_lossy(&list.stdout)
         .split_whitespace()
         .next()
-        .expect("CANNOT MEASURE: alice's room in `vox room list`")
+        .staged()
         .to_owned();
     let invite = command(&alice, &["room", "invite", &prefix], &alice_id)
         .output()
-        .unwrap();
+        .staged();
     assert!(invite.status.success(), "CANNOT MEASURE: room invite");
     let link = String::from_utf8_lossy(&invite.stdout).trim().to_owned();
 
     // Bob's TUI, scanned, with his node's grind held long.
-    let scanner = Scanner::new(tmp.path().join("scan"), &[("room", &roompass)]);
+    let scanner = Scanner::new(
+        tmp.path().join("scan"),
+        &[("room", &roompass), ("identity", &identity)],
+    );
     let mut env = tui_env(&scanner.dir);
     env.retain(|e| !e.starts_with("VOX_TEST_SECRET_WORK_DELAY_MS="));
     env.push(format!("VOX_TEST_SOLVE_AT_LEAST_MS={GRIND_MS}"));
@@ -658,9 +755,7 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
         &identity,
         Some(&format!("{roompass}\n")),
     );
-    let during = scanner
-        .until_more("room", before.of("room"))
-        .expect("CANNOT MEASURE: the room passphrase never showed up in the TUI's memory");
+    let during = scanner.until_more("room", before.of("room"));
     // Into the grind: past the dial and the challenge, well short of the held grind's end.
     std::thread::sleep(Duration::from_secs(5));
     still_running(&mut join, "vox room join");
@@ -673,11 +768,11 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
         &identity,
         Some("a probe passphrase\n"),
     );
-    let probe_status = probe.0.wait().expect("the probe");
+    let probe_status = probe.0.wait().staged();
     let probe_took = probe_at.elapsed();
     let took = tui.wait_locked(asked, false);
     let after = scanner.scan();
-    let joined = join.0.try_wait().expect("poll");
+    let joined = join.0.try_wait().staged();
     println!(
         "[proof] grind: a `vox room create` asked as the lock began answered in {probe_took:?} \
          ({probe_status}); the lock settled {took:?} after it was asked (bound {SETTLES:?}, the \
@@ -685,14 +780,41 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     );
     assert!(
         probe_took < ANSWERS,
-        "the node answered nobody while its lock settled: a command took {probe_took:?} (bound \
+        "PRODUCT: the node answered nobody while its lock settled: a command took {probe_took:?} (bound \
          {ANSWERS:?}) — the actor waited for the lock"
     );
     assert!(
         took < SETTLES,
-        "the lock waited out the join's grind: it settled {took:?} after it was asked (bound \
+        "PRODUCT: the lock waited out the join's grind: it settled {took:?} after it was asked (bound \
          {SETTLES:?}) — the grind held the join's secrets where no abort reached them"
     );
     tui.stop();
-    judge("grind", "room", &before, &during, &after, took);
+    judge("grind", &before, &during, &after, took);
+}
+
+#[test]
+#[ignore = "real vox tui in a pty with the interposer loaded; macOS"]
+fn a_typed_lock_leaves_no_piece_of_the_identity_passphrase() {
+    // Nothing in flight: the identity passphrase typed at the unlock prompt is the only secret, and
+    // the lock is to leave no piece of it (V210-94). The terminal library kept it in its input
+    // buffer, and a typed `:lock` overwrote only its first six bytes.
+    watchdog::arm();
+    let tmp = tempfile::tempdir().staged();
+    let bob = tmp.path().join("bob");
+    let identity = unique("idle-idp");
+    new_profile(&bob, &identity);
+    let scanner = Scanner::new(tmp.path().join("scan"), &[("identity", &identity)]);
+    let mut tui = Tui::start(
+        &bob,
+        &identity,
+        tmp.path().join("cues"),
+        "bob",
+        &tui_env(&scanner.dir),
+    );
+    tui.unlocked();
+    let before = scanner.scan();
+    let took = tui.lock(false);
+    let after = scanner.scan();
+    tui.stop();
+    judge("idle", &before, &before, &after, took);
 }
