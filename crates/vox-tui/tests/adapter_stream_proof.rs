@@ -158,6 +158,12 @@ const LAG_PAD: usize = 8 * 1024;
 #[ignore = "two networked nodes, production Argon2id and a 1,800-message burst; CI runs it in release"]
 fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     watchdog::arm();
+    let t0 = std::time::Instant::now();
+    macro_rules! mark {
+        ($n:expr) => {
+            eprintln!("[phase] {:>7.1}s {}", t0.elapsed().as_secs_f64(), $n)
+        };
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -168,6 +174,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.clone();
     let cid = room.cid;
+    mark!("room ready");
 
     // ---- the fold half: a contested claim, a completed handoff, a lapse ----
     assert!(
@@ -282,6 +289,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     assert_eq!(from_board.get("passed").map(|x| x.1.as_str()), Some("b1"));
     assert!(!from_board.contains_key("lapsed"));
     eprintln!("[proof] board --json == independent fold: {from_board:?}");
+    mark!("fold half done");
 
     // ---- the stream half ----
     let start_cursor = rows.last().unwrap()["entry_hash"]
@@ -344,21 +352,25 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
     signal(&run, "-STOP"); // frozen: it reads nothing, so only the kernel buffer absorbs
     burst(bob, 899, LAG_PAD);
+    mark!("run1 burst 899 posted");
     std::thread::sleep(Duration::from_secs(2));
     signal(&run, "-CONT");
     run.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     consume(&run, 300, idle, &mut cursor, &mut seen);
+    mark!("run1 consumed 300");
     kill(&mut run, &mut restarts, &cursor, &seen);
     // Run 2: die in the middle of a synced burst from the other node.
     let mut run = start(bob, &r, &cursor, &stderr);
     // First drain the backlog run 1 left, so every row counted below is one that
     // arrived by sync WHILE this consumer was running.
     while consume(&run, 1000, Duration::from_secs(3), &mut cursor, &mut seen) > 0 {}
+    mark!("run2 backlog drained");
     burst(alice, 300, 0);
     // LIVENESS, not just completeness: rows synced from another node must reach a
     // consumer while it runs. A stream that only delivered them after a restart would
     // still have no gap — the defect `tail` shipped with — so this is its own assertion.
     let live = consume(&run, 200, idle, &mut cursor, &mut seen);
+    mark!("run2 live 200");
     assert_eq!(
         live, 200,
         "rows synced from another node must reach a LIVE consumer, not only a restarted one"
@@ -367,15 +379,18 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     // Run 3: stall under another synced burst, then die.
     let mut run = start(bob, &r, &cursor, &stderr);
     consume(&run, 50, idle, &mut cursor, &mut seen);
+    mark!("run3 consumed 50");
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
     burst(alice, 300, 0);
     std::thread::sleep(Duration::from_secs(2));
     run.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     consume(&run, 250, idle, &mut cursor, &mut seen);
+    mark!("run3 consumed 250");
     kill(&mut run, &mut restarts, &cursor, &seen);
     // The rest, while nobody is listening.
     burst(alice, 300, 0);
     assert_eq!(n, 1800);
+    mark!("all bursts posted");
 
     let all = until(
         bob,
@@ -407,6 +422,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         1800,
         "the log after the starting cursor is the burst"
     );
+    mark!("log holds 1800");
 
     let mut run = start(bob, &r, &cursor, &stderr);
     let expected: BTreeSet<&String> = after.iter().collect();
@@ -419,6 +435,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     }
     let _ = run.child.kill();
     let _ = run.child.wait();
+    mark!("final drain done");
 
     let missing: Vec<&&String> = expected
         .iter()
