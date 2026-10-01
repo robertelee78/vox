@@ -25,6 +25,10 @@
 //!   made without an idle end, idle for just as long, stays open: an idle end is never applied to
 //!   a room whose creator did not choose one.
 //!
+//! - **The TUI.** The same verbs typed in `vox tui` (`tests/pty/tui_room_verb.py`, a pty read
+//!   through `pyte`): carol's `:leave` drops her from alice's and bob's rosters; alice's `:end`
+//!   reaches bob's `vox room list`; alice's `:forget` leaves her store without the room's id.
+//!
 //! **Every red names which it is.** `PRODUCT:` — `vox` did the wrong thing, and what it said is
 //! quoted. `APPARATUS:` — the staging was not achieved or a precondition is unmet (a setup verb
 //! failed, posting drove no session at all), so nothing about the claim was measured. The watchdog
@@ -35,6 +39,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 #[path = "support/room.rs"]
 mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -438,4 +444,92 @@ fn a_chosen_idle_end_ends_a_quiet_room_and_only_that_room() {
         "[proof] idle end: the {IDLE:?} room ended after {:?} quiet; the room with none stays open",
         IDLE + Duration::from_secs(5)
     );
+}
+
+/// Run `:verb` in `w`'s `vox tui` (its daemon stopped), keeping it open `hold` after; a red for a
+/// refusal (`PRODUCT`) or a driver that could not get there (`APPARATUS`).
+fn tui_verb(w: &Worker, verb: &str, hold: Duration) {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_room_verb.py");
+    let tag = format!("[{} :{verb}]", w.name);
+    let hold = hold.as_secs().to_string();
+    let driven = pty_driver::run(
+        script,
+        &[
+            support::VOX,
+            w.data.to_str().unwrap(),
+            w.cfg.to_str().unwrap(),
+            "identity passphrase",
+            "channel passphrase",
+            &tag,
+            verb,
+            &hold,
+        ],
+    );
+    eprintln!(
+        "[proof] tui: {} -> {:?}: {}",
+        tag,
+        driven.code,
+        driven.stdout.trim()
+    );
+    match driven.code {
+        Some(0) => {}
+        Some(3) => panic!(
+            "PRODUCT: `vox tui` refused :{verb} on {}: {}",
+            w.name, driven.stdout
+        ),
+        _ => panic!(
+            "APPARATUS: the TUI driver did not get to an answer to :{verb} on {} (exit {:?}, \
+             stage {:?}), so nothing was measured: {}",
+            w.name, driven.code, driven.stage, driven.stdout
+        ),
+    }
+}
+
+#[test]
+#[ignore = "real daemons, an anchor and `vox tui` in a pty, production Argon2id; needs pyte"]
+fn the_tui_leaves_ends_and_forgets() {
+    watchdog::arm();
+    let rt = runtime();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol"]);
+    let id = room.id.clone();
+    let cid = room.cid;
+
+    room.workers[2].stop_daemon();
+    tui_verb(&room.workers[2], "leave", Duration::from_secs(15));
+    let carol = room.workers[2].b32();
+    for w in &room.workers[..2] {
+        let (gone, o) = poll(w, &["room", "roster", &id], WITHIN, |o| {
+            o.ok && !o.stdout.contains(&carol)
+        });
+        assert!(
+            gone,
+            "PRODUCT: after carol's :leave in the TUI, {}'s roster still names her: {o:?}",
+            w.name
+        );
+    }
+
+    room.workers[0].stop_daemon();
+    tui_verb(&room.workers[0], "end", Duration::from_secs(15));
+    let bob = &room.workers[1];
+    let (ended, o) = poll(bob, &["room", "list"], WITHIN, |o| {
+        o.stdout
+            .lines()
+            .any(|l| l.starts_with(&id[..12]) && l.contains("ended"))
+    });
+    assert!(
+        ended,
+        "PRODUCT: after alice's :end in the TUI, bob's `vox room list` does not say the room \
+         ended: {o:?}"
+    );
+
+    tui_verb(&room.workers[0], "forget", Duration::from_secs(3));
+    let store = room.workers[0].paths.store_file();
+    let bytes = std::fs::read(&store).unwrap_or_default();
+    assert!(
+        !bytes.windows(cid.len()).any(|w| w == cid),
+        "PRODUCT: after alice's :forget in the TUI, her store.redb still holds the room's id: {}",
+        store.display()
+    );
+    eprintln!("[proof] tui: :leave, :end and :forget each did what the CLI verb does");
 }

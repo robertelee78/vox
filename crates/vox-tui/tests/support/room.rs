@@ -217,6 +217,12 @@ impl Worker {
         vox_core::node::link::b32_encode(&self.fp)
     }
 
+    /// Stop this worker's daemon, by its own handle, so another `vox` can hold the profile.
+    #[allow(dead_code)] // not every proof that includes this support module stops one
+    pub fn stop_daemon(&mut self) {
+        drop(self.daemon.take());
+    }
+
     /// Stop this worker's daemon, by its own handle, and start it again as it was started.
     #[allow(dead_code)] // not every proof that includes this support module restarts one
     pub fn restart_daemon(&mut self, err: &std::path::Path) {
