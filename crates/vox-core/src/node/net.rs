@@ -670,14 +670,22 @@ impl ConnectionManager {
         if let Some(conn) = self.existing(&peer) {
             return Ok(conn);
         }
-        let candidates = direct_candidates(endpoints);
-        let conn = connect_direct(
-            Arc::clone(&self.endpoint),
-            &candidates,
-            peer,
-            (self.clock)(),
-        )
-        .await?;
+        self.connect_to(peer, &direct_candidates(endpoints)).await
+    }
+
+    /// [`Self::connect`] at a list of direct addresses rather than one peer's advertised
+    /// [`EndpointList`], which is bounded at eight: an anchor several rooms name is dialled at
+    /// the union of their addresses (V210-75).
+    pub async fn connect_to(
+        &self,
+        peer: Digest32,
+        candidates: &[std::net::SocketAddr],
+    ) -> Result<Arc<VoxConnection>> {
+        if let Some(conn) = self.existing(&peer) {
+            return Ok(conn);
+        }
+        let conn =
+            connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)()).await?;
         Ok(self.file(conn).await)
     }
 
