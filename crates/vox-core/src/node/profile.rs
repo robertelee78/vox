@@ -279,6 +279,7 @@ impl Profile {
         passphrase: &[u8],
     ) -> Result<()> {
         crate::node::seal_migration::migrate_to_vault_seals(&self.store, signer)?;
+        #[cfg(feature = "test-knobs")]
         test_pause(TEST_REWRITE_DELAY_ENV, "about to rewrite the store");
         // The old seals are still in the file's replaced pages until it is rewritten. Before the
         // vault moves to v2: a crash after the rewrite leaves a v1 vault, whose next unlock
@@ -422,11 +423,13 @@ fn read_vault(paths: &Paths) -> Result<IdentityVault> {
 /// re-sealing the blobs and before rewriting the store, which stands for a slow disk or a
 /// process descheduled at the worst moment. The concurrent-migration proof uses it to hold a
 /// second vox inside a migration while the first finishes its own. Nothing a person runs sets
-/// it; unset, nothing changes.
+/// it; unset, nothing changes. Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_REWRITE_DELAY_ENV: &str = "VOX_TEST_REWRITE_DELAY_MS";
 
 /// Wait for the milliseconds named by the proof-only variable `env`, saying so on stderr so a
 /// proof can tell the moment has been reached; nothing when it is unset.
+#[cfg(feature = "test-knobs")]
 pub(crate) fn test_pause(env: &str, what: &str) {
     let Some(ms) = std::env::var(env).ok().and_then(|v| v.parse::<u64>().ok()) else {
         return;
@@ -486,6 +489,7 @@ fn lock_dir(
             locked.map_err(fail)?;
         }
     }
+    #[cfg(feature = "test-knobs")]
     test_pause(TEST_LOCK_HOLD_ENV, "holding the profile lock");
     Ok(handle)
 }
@@ -495,7 +499,9 @@ const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// **For proofs only.** When set, a vox that has just taken the profile lock (to create the
 /// identity, or to migrate it) holds it this many milliseconds before going on, so a proof can
-/// stop it while it holds the lock. Nothing a person runs sets it; unset, nothing changes.
+/// stop it while it holds the lock. Nothing a person runs sets it; unset, nothing changes. Not
+/// compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_LOCK_HOLD_ENV: &str = "VOX_TEST_LOCK_HOLD_MS";
 
 /// An owned passphrase check (see [`Profile::passphrase_verifier`]).

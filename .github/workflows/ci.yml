@@ -125,8 +125,12 @@ jobs:
       # default build, so it is linted and documented on its own here.
       - name: Clippy (mutant sender)
         run: cargo clippy -p vox-core --features mutant-sender -- -D warnings
+      # The test-only knobs (`test-knobs`, V210-105) are in no shipped build either; the proofs
+      # build with them, and refuse a `vox` without them as CANNOT MEASURE.
+      - name: Clippy (test knobs)
+        run: cargo clippy --all-targets --features vox-tui/test-knobs -- -D warnings
       - name: Test (default, pure-Rust)
-        run: cargo test --workspace --no-fail-fast
+        run: cargo test --workspace --no-fail-fast --features vox-tui/test-knobs
         env:
           # `update_proof` asks GitHub which releases exist, to find one to update *from*.
           GH_TOKEN: ${{ github.token }}
@@ -134,6 +138,8 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
       - name: Docs (mutant sender)
         run: RUSTDOCFLAGS="-D warnings" cargo doc -p vox-core --no-deps --features mutant-sender
+      - name: Docs (test knobs)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features vox-tui/test-knobs
       # The proofs that drive the shipped `vox` with production parameters (Argon2id, real
       # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
       # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
@@ -154,7 +160,7 @@ jobs:
           echo "VOX_MUTANT_SENDER=$path" >> "$GITHUB_ENV"
       - name: Real-parameter gates (release)
         run: |
-          cargo test --release --workspace --no-fail-fast -- --ignored \
+          cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored \
             --skip r40_ --skip r41_
 
   # **The PRD-001 transport proofs, in parallel with the rest.** They are blocking — a release
@@ -184,4 +190,4 @@ jobs:
         # gated here on ubuntu and on real Mac hardware by the local macOS gate before a tag.
         env:
           VOX_PERF_REPORT_ONLY: ${{ runner.os == 'macOS' && 'WAN' || '' }}
-        run: cargo test --release --workspace --no-fail-fast -- --ignored r40_ r41_
+        run: cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored r40_ r41_

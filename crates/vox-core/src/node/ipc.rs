@@ -73,9 +73,10 @@ pub const MAX_FRAME: usize = 256 * 1024;
 pub const ROWS_BUDGET: usize = MAX_FRAME / 2;
 
 /// The environment variable [`frame_limit`] reads. **Test-only.**
+#[cfg(feature = "test-knobs")]
 pub const TEST_MAX_FRAME_ENV: &str = "VOX_TEST_MAX_FRAME";
 
-/// The smallest frame [`TEST_MAX_FRAME_ENV`] may set: half of it still carries the largest room
+/// The smallest frame `VOX_TEST_MAX_FRAME` may set: half of it still carries the largest room
 /// or trusted-identity entry, so a listing still pages.
 pub const MIN_TEST_FRAME: usize = 4 * 1024;
 
@@ -91,6 +92,7 @@ pub const MIN_TEST_FRAME: usize = 4 * 1024;
 /// [`MIN_TEST_FRAME`]..=[`MAX_FRAME`]; unset, empty or unparsable is [`MAX_FRAME`]. Under it, a
 /// single row larger than half the frame (a long message) is refused, so a proof that sets it
 /// keeps its rows small.
+#[cfg(feature = "test-knobs")]
 #[must_use]
 pub fn frame_limit() -> usize {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -100,6 +102,14 @@ pub fn frame_limit() -> usize {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .map_or(MAX_FRAME, |n| n.clamp(MIN_TEST_FRAME, MAX_FRAME))
     })
+}
+
+/// The largest frame accepted: [`MAX_FRAME`]. The proof-only lower limit is not compiled in
+/// without the `test-knobs` feature (V210-105).
+#[cfg(not(feature = "test-knobs"))]
+#[must_use]
+pub const fn frame_limit() -> usize {
+    MAX_FRAME
 }
 
 /// What one reply may carry in force: half of [`frame_limit`] ([`ROWS_BUDGET`] unless a proof

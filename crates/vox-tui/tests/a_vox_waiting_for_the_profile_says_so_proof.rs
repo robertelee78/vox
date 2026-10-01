@@ -36,6 +36,9 @@ mod watchdog;
 #[path = "support/previous_release.rs"]
 mod previous_release;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -85,6 +88,7 @@ fn exited_within(p: &mut VoxProc, within: Duration) -> Option<std::process::Exit
 
 /// One arm: A takes the lock and is stopped holding it, B waits; then A is resumed.
 fn arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str]) -> Vec<String> {
+    test_knobs::require(&["VOX_TEST_LOCK_HOLD_MS"]);
     let mut a = VoxProc::spawn_env(
         &format!("{label} A"),
         data,

@@ -1588,6 +1588,7 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
                 }
             });
         }
+        #[cfg(feature = "test-knobs")]
         if let Some(ms) = test_stopped_delay_ms() {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
@@ -1598,9 +1599,12 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
 /// **For proofs only.** When set, the accept loop waits this many milliseconds between stopping
 /// and saying so (`NetEvent::Stopped`), which stands for an actor queue that is full or a task that
 /// is scheduled late. The lock-and-unlock proof uses it to land the event after an unlock started
-/// a new network. Nothing a person runs sets it; unset, nothing changes.
+/// a new network. Nothing a person runs sets it; unset, nothing changes. Not compiled in without
+/// the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_STOPPED_DELAY_ENV: &str = "VOX_TEST_STOPPED_DELAY_MS";
 
+#[cfg(feature = "test-knobs")]
 fn test_stopped_delay_ms() -> Option<u64> {
     std::env::var(TEST_STOPPED_DELAY_ENV).ok()?.parse().ok()
 }
@@ -1608,7 +1612,9 @@ fn test_stopped_delay_ms() -> Option<u64> {
 /// **For proofs only.** When set, each blocking task that holds a secret (`secret_blocking`)
 /// waits this many milliseconds, holding what it was given, before it starts its work: a stand-in
 /// for a slow Argon2id or a large room, so a proof can lock while one runs (V210-94). Nothing a
-/// person runs sets it; unset, nothing changes.
+/// person runs sets it; unset, nothing changes. Not compiled in without the `test-knobs` feature
+/// (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_SECRET_WORK_DELAY_ENV: &str = "VOX_TEST_SECRET_WORK_DELAY_MS";
 
 /// Run `work`, which holds a secret, on a blocking thread, and hold a read guard of `secret_work`
@@ -1626,12 +1632,14 @@ async fn secret_blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
     let held = Arc::clone(secret_work).read_owned().await;
+    #[cfg(feature = "test-knobs")]
     let delay = std::env::var(TEST_SECRET_WORK_DELAY_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
     let (done, result) = oneshot::channel();
     tokio::task::spawn_blocking(move || {
         let _held = held;
+        #[cfg(feature = "test-knobs")]
         if let Some(ms) = delay {
             std::thread::sleep(Duration::from_millis(ms));
         }
@@ -1692,10 +1700,13 @@ fn spawn_handshake(
 /// carry a hello: it resets them unread, as a stream lost with its connection is, so the sender
 /// learns only that its key was not taken. The simultaneous-session proof uses it to force what a
 /// duplicate-connection close did by chance (V210-89): each member's hello lost after it was
-/// written. Nothing a person runs sets it; unset, nothing changes.
+/// written. Nothing a person runs sets it; unset, nothing changes. Not compiled in without the
+/// `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_LOSE_HELLOS_ENV: &str = "VOX_TEST_LOSE_HELLOS";
 
 /// Whether this inbound hello is one [`TEST_LOSE_HELLOS_ENV`] says to lose.
+#[cfg(feature = "test-knobs")]
 fn test_lose_hello() -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LEFT: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
@@ -8637,6 +8648,7 @@ impl Node {
             self.held_pairwise.push((room, stream));
             return;
         }
+        #[cfg(feature = "test-knobs")]
         if matches!(stream.first, PairwiseFrame::Hello { .. }) && test_lose_hello() {
             eprintln!("vox: {TEST_LOSE_HELLOS_ENV}: an inbound hello was lost, unread");
             let PairwiseIn {

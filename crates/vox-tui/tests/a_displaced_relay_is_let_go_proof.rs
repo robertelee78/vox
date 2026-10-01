@@ -36,6 +36,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/world.rs"]
 mod world;
 
@@ -61,6 +64,7 @@ const PAYLOAD: usize = 16 * 1024;
 #[test]
 #[ignore = "production Argon2id + a real PoW, a relayed pair upgraded and a 60 s grace watched; run in release"]
 fn a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let mut w = ForwardedWorld::new(false);
     eprintln!(
