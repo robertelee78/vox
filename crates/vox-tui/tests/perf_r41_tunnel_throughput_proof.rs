@@ -1059,6 +1059,17 @@ const CONGESTED: Link = Link {
     gated: true,
     queue_bdps: Some(1.0),
 };
+/// A congested LAN: 1 Gbit/s, 2 ms, one-BDP queue (250 KB) shared with the Cubic flow. A full queue
+/// here is only 2 ms of delay, under tier 2's delay test, so only the loss signals can see this
+/// congestion: tier 2 alone took 2.56x the Cubic flow here (ADR-024 M24.1).
+const CONGESTED_LAN: Link = Link {
+    name: "congested LAN, 1 Gbit/s, 2 ms RTT, 1-BDP queue, shared with a Cubic flow",
+    bits_per_sec: 1e9,
+    one_way: Duration::from_millis(1),
+    loss: 0.0,
+    gated: true,
+    queue_bdps: Some(1.0),
+};
 /// The same, behind a shallow router buffer: a quarter of a bandwidth-delay product, 62.5 KB or
 /// about 2.5 ms at the link's rate. Congestion here shows as loss with almost no rise in delay,
 /// which is the case a delay-based reading of loss gets wrong: tier 2's guard is what keeps Vox
@@ -1400,7 +1411,7 @@ fn taper_arms(
     }
 
     // The congested links: Vox and the comparison flow at once, through one queue, deep and shallow.
-    for congested in [CONGESTED, CONGESTED_SHALLOW] {
+    for congested in [CONGESTED, CONGESTED_SHALLOW, CONGESTED_LAN] {
         if !wanted(congested.name) {
             continue;
         }
