@@ -85,8 +85,13 @@ const SHOWS_UP: Duration = Duration::from_secs(60);
 const ANSWERS: Duration = Duration::from_secs(5);
 /// How long a joiner's grind is held in the grind case: far past [`SETTLES`].
 const GRIND_MS: &str = "60000";
-/// A lock with nothing but a join's grind in flight settles within this.
-const SETTLES: Duration = Duration::from_secs(10);
+/// A lock with nothing but a join's grind in flight settles within this, in either build.
+///
+/// Sized for at least twice the margin on both sides of what was measured. With the fix the
+/// slowest settle measured was 5.1 s (debug; release 0.3–0.9 s), and 2 × 5.1 = 10.2 s is under
+/// 25 s. With the grind back in the task, the lock waited out the held grind: 54.8 and 54.9 s
+/// (release), and 2 × 25 = 50 s is under that. One bound serves both builds.
+const SETTLES: Duration = Duration::from_secs(25);
 /// A typed `:lock` that took longer than this must have shown "locking…" while it waited.
 const SAID_LOCKING_AFTER: Duration = Duration::from_secs(2);
 /// The scanner's mask (`crates/vox-test-interpose/src/scan.rs`).
