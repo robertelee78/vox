@@ -682,3 +682,154 @@ fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
         "the room in use after a stranger re-seeded the restarted anchor and flooded it",
     );
 }
+
+#[test]
+#[ignore = "real vox processes with production Argon2id, an anchor restart, a flood and a real join; run in release"]
+fn a_non_creator_members_republish_keeps_a_room_credited() {
+    // The room in use is kept alive by a member who did not create it: its creator is away, so the
+    // creator's genesis re-put (which also credits) never happens. After a restart the stranger
+    // re-seeds the room's records first, and the only thing that can credit the room is the live
+    // member's own republish of its address record — a re-send the board already holds. If that
+    // credits (the putter wrote it), the room is filed under the member's network and a flood
+    // credited to no one leaves it; if a put must store something new to credit, the member's
+    // re-send credits nothing, the room is credited to no one with the flood, and it is evicted.
+    watchdog::arm_for(BUDGET);
+    let tmp = tempfile::tempdir().unwrap();
+    let (anchor_dir, creator_dir, member_dir, joiner_dir) = (
+        profile_dir(tmp.path(), "anchor"),
+        profile_dir(tmp.path(), "creator"),
+        profile_dir(tmp.path(), "member"),
+        profile_dir(tmp.path(), "joiner"),
+    );
+    let pass_file = tmp.path().join("identity.pass");
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    let port = free_port();
+    let (anchor, spec, anchor_id) = dual_anchor("anchor", &anchor_dir, port, &[]);
+    let nets = Networks::to(port);
+    fingerprint(&creator_dir);
+    fingerprint(&member_dir);
+    fingerprint(&joiner_dir);
+    let creator = daemon("creator", &creator_dir, free_port(), &spec, &pass_file);
+    let (room, creator_link) = create_room(&creator_dir, "first", ROOM_PASS);
+    let member = daemon("member", &member_dir, free_port(), &spec, &pass_file);
+    let (ok, out, err) = vox_in(
+        &member_dir,
+        &["room", "join", &creator_link, "--name", "first"],
+        ROOM_PASS,
+    );
+    assert!(
+        ok,
+        "CANNOT MEASURE: the member could not join the room: {out}{err}"
+    );
+
+    // Both members' records on the board, and the member's own invite for the final join (the
+    // creator will be away).
+    let rt = Rt::new();
+    let deadline = Instant::now() + PUBLISH_PATIENCE;
+    let two = loop {
+        let b = board(&rt, nets.anchor6, anchor_id, room);
+        if b.1 >= 2 || Instant::now() >= deadline {
+            break b;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    println!("[proof] the anchor holds of the room, two members expected: {two:?}");
+    assert!(
+        two.0 && two.1 >= 2,
+        "CANNOT MEASURE: both members' records never reached the anchor ({two:?})"
+    );
+    let (ok, member_link, err) = {
+        let (listed, list, _) = world::vox_once(&member_dir, &args(&["room", "list"]));
+        assert!(listed, "CANNOT MEASURE: the member's vox room list failed");
+        let short = list
+            .lines()
+            .find(|l| l.contains("first"))
+            .and_then(|l| l.split_whitespace().next())
+            .expect("CANNOT MEASURE: the member does not list the room");
+        let (ok, link, err) = world::vox_once(&member_dir, &args(&["room", "invite", short]));
+        (ok, link.trim().to_owned(), err)
+    };
+    assert!(ok, "CANNOT MEASURE: the member could not invite: {err}");
+
+    let (genesis, members, bundles) = fetch(&rt, nets.anchor6, anchor_id, room);
+    let seeded_members = members.clone();
+    // Bundles before address records: a member who joined is known to the board by its
+    // witnessed bundle, so its address record is taken only once that bundle is there.
+    let seed: Vec<Vec<u8>> = genesis.into_iter().chain(bundles).chain(members).collect();
+
+    // The creator goes away for good; only the member keeps the room live. The member is held
+    // still so the stranger is first to the restarted board.
+    signal(&creator, "-STOP");
+    signal(&member, "-STOP");
+    drop(anchor);
+    let (_anchor, spec2, id2) = dual_anchor("anchor", &anchor_dir, port, &[]);
+    assert!(
+        spec2 == spec && id2 == anchor_id,
+        "CANNOT MEASURE: the restarted anchor came back as {spec2}, not {spec}"
+    );
+    let reseeder = stranger(0x77);
+    let answers = rt.block_on(async {
+        let (_e, c) = connect_from(&reseeder, nets.local6, nets.anchor6, anchor_id).await;
+        let mut client = RendezvousClient::open(&c)
+            .await
+            .expect("CANNOT MEASURE: a rendezvous stream from [::1]");
+        let mut out = Vec::new();
+        for wire in &seed {
+            out.push(format!("{:?}", client.put(wire).await));
+        }
+        client.finish();
+        out
+    });
+    println!(
+        "[proof] the anchor restarted; the stranger re-seeded the room's {} record(s) from [::1]: \
+         {answers:?}",
+        seed.len()
+    );
+    assert!(
+        answers.len() >= 4 && answers.iter().all(|a| a == "Ok(())"),
+        "CANNOT MEASURE: the restarted anchor did not take the room the stranger put back \
+         ({answers:?})"
+    );
+    // Only the member comes back; the creator stays away, so no genesis re-put by its creator can
+    // credit the room.
+    signal(&member, "-CONT");
+    std::thread::sleep(REPUBLISH_SETTLE);
+    let (_, members_now, _) = fetch(&rt, nets.anchor6, anchor_id, room);
+    let held_unchanged = seeded_members.iter().all(|m| members_now.contains(m));
+    println!(
+        "[proof] {REPUBLISH_SETTLE:?} after the member resumed, the anchor still holds the \
+         stranger's copies of the members' records unchanged: {held_unchanged} ({} record(s))",
+        members_now.len()
+    );
+    assert!(
+        held_unchanged,
+        "CANNOT MEASURE: a member's republish renewed its record rather than being a no-op the \
+         board already held, so the re-send path was not exercised"
+    );
+
+    let t0 = Instant::now();
+    let (_, geneses, taken) = flood(&rt, &nets, anchor_id, &[], Credit::Nobody);
+    println!(
+        "[proof] flood credited to no one: {geneses}/{ROOMS} geneses, {taken}/{ROOMS} bundles, in \
+         {:?}",
+        t0.elapsed()
+    );
+    assert_full(geneses, taken);
+    let kept = board(&rt, nets.anchor6, anchor_id, room);
+    println!(
+        "[proof] after the flood the anchor holds of the room kept live by a non-creator: {kept:?}"
+    );
+    assert!(
+        kept.0,
+        "the restarted anchor gave up a room whose creator is away and whose live member re-sent \
+         its own record ({kept:?}): a member's own put of a record the board already holds credited \
+         nothing, so the room was credited to no one with the flood"
+    );
+    let _joiner = daemon("joiner", &joiner_dir, free_port(), &spec, &pass_file);
+    real_join(
+        &joiner_dir,
+        &member_link,
+        "first",
+        "a room whose creator is away, after a stranger re-seeded the restarted anchor and flooded it",
+    );
+}

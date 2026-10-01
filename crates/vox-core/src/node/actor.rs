@@ -4973,7 +4973,7 @@ impl Node {
         if let Some(pow) = self.pow_params {
             ctx.pow_params = pow;
         }
-        let source = crate::node::joinslots::JoinSource::of(&conn);
+        let source = crate::nat::source::Source::of_conn(&conn);
         let Some((mut slot, ended)) =
             crate::node::joinslots::JoinSlots::take(&self.join_slots, peer, source)
         else {
