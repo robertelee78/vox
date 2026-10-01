@@ -2452,6 +2452,9 @@ pub struct Node {
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
     key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
+    /// Set when this node adopted a peer's session over its own (ADR-021 F12): what it owes that
+    /// peer goes out as soon as the stream that carried the hello is answered, not on the tick.
+    redeliver_now: bool,
     /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
     /// key cut off by a crash is owed again after the restart; see [`Node::watch_delivery`].
     keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
@@ -2685,6 +2688,7 @@ impl Node {
             pending_consents: Vec::new(),
             fresh_details: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
+            redeliver_now: false,
             keys_in_flight: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
@@ -4548,6 +4552,19 @@ impl Node {
                 // key was sealed, which the member does hold.
                 use crate::node::pairwise_stream::KeyRefusal;
                 let key = (channel_id, peer);
+                // **Refused under a session already superseded** (V210-80): this node has adopted
+                // the peer's since it sealed the key (two members trusting each other at once),
+                // so the refusal says nothing about the session held now. Resend at once, under
+                // it, with no backoff.
+                if session.is_some() && self.session_serial.get(&key).copied() != session {
+                    let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
+                        channel_id,
+                        peer,
+                        why,
+                    });
+                    self.deliver_owed_consents(None).await;
+                    return;
+                }
                 if why == KeyRefusal::describe(KeyRefusal::NoSession.code().into_inner())
                     && session.is_some()
                     && self.session_serial.get(&key).copied() == session
@@ -4561,9 +4578,20 @@ impl Node {
                 // 2, 4, 8 … 64s: a refusal that cures (a session that converges, a member learnt
                 // from the board) is retried promptly, and one that does not stops costing a
                 // stream every second.
+                //
+                // A refused hello is cured by the peer's own, which it offers on its next tick,
+                // and adopting it resends at once (`accept_hello`). Should that offer be lost
+                // with its connection, the retry here is what brings the next one: it stays at
+                // the first step rather than doubling, so one lost offer costs 2 s, not 2 + 4 + 8.
                 let now = self.now();
+                let hello_refused =
+                    why == KeyRefusal::describe(KeyRefusal::HelloRefused.code().into_inner());
                 let entry = self.key_backoff.entry((channel_id, peer)).or_insert((0, 0));
-                entry.0 = entry.0.saturating_add(1);
+                entry.0 = if hello_refused {
+                    1
+                } else {
+                    entry.0.saturating_add(1)
+                };
                 entry.1 = now.saturating_add(1u64 << entry.0.min(6));
                 let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
                     channel_id,
@@ -7755,9 +7783,13 @@ impl Node {
         self.accepted_hello.insert(key, hello_hash);
         if replaces {
             // Whatever this node sent under the session it just dropped was sealed where
-            // the peer cannot open it: forget that it was delivered, so the tick re-sends
-            // the current key over the session both ends now hold.
+            // the peer cannot open it: forget that it was delivered, and send the current
+            // key over the session both ends now hold at once. A backoff earned by a key
+            // sealed under the dropped session is not this one's (V210-80): it held the
+            // resend back 2 s, and more after a second refusal.
             self.forget_delivery(&channel_id, &peer).await;
+            self.key_backoff.remove(&key);
+            self.redeliver_now = true;
         }
         true
     }
@@ -8173,6 +8205,11 @@ impl Node {
             None => {
                 let _ = send.finish();
             }
+        }
+        // The race between two sessions is resolved: send what is owed under the one both ends
+        // now hold, rather than leave it to a tick and a backoff that were for the dropped one.
+        if std::mem::take(&mut self.redeliver_now) {
+            self.deliver_owed_consents(None).await;
         }
     }
 
