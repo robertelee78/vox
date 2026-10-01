@@ -475,6 +475,10 @@ pub enum IpcHandshake {
         /// Whether a fresh connection to the same socket was taken when the reply went missing.
         still_running: bool,
     },
+    /// The connection ended under a write (V210-101). A client names it [`Self::HungUp`], once
+    /// it has asked whether the node is still running; the node's side says this.
+    #[error("the other end closed the control-socket connection")]
+    Cut,
     /// The node greeted in another control protocol: the two are different vox versions.
     #[error(
         "the node speaks a different control protocol (this vox is protocol {mine}, the node is \

@@ -486,7 +486,9 @@ async fn ask(path: &Path) -> Result<String> {
     }
     let mut e = Encoder::new();
     e.array(1).uint(T_STATUS);
-    write_frame(&mut stream, &e.finish()).await?;
+    if let Err(e) = write_frame(&mut stream, &e.finish()).await {
+        return Err(crate::node::ipc::named(path, e).await);
+    }
     let Some(body) = read_frame(&mut stream).await? else {
         return Err(crate::node::ipc::hung_up(path).await);
     };

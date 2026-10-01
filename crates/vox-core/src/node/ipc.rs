@@ -1359,36 +1359,51 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
 // ---- transport -------------------------------------------------------------
 
 /// Write one length-prefixed frame, mirroring [`crate::transport::framing`].
+///
+/// A write that fails is the connection ending under it ([`IpcHandshake::Cut`]), never a
+/// malformed message (V210-101): nothing was received to be malformed.
 pub async fn write_frame(s: &mut UnixStream, body: &[u8]) -> Result<()> {
     let len =
         u32::try_from(body.len()).map_err(|_| Error::SizeLimitExceeded("ipc frame length"))?;
     s.write_all(&len.to_be_bytes())
         .await
-        .map_err(|_| Error::MalformedIpc("ipc write len"))?;
+        .map_err(|_| Error::Ipc(IpcHandshake::Cut))?;
     s.write_all(body)
         .await
-        .map_err(|_| Error::MalformedIpc("ipc write body"))?;
+        .map_err(|_| Error::Ipc(IpcHandshake::Cut))?;
     Ok(())
 }
 
-/// Read one length-prefixed frame of at most `MAX_FRAME` bytes. A clean EOF
-/// exactly at a frame boundary is the peer hanging up → `Ok(None)`.
+/// Read one length-prefixed frame of at most `MAX_FRAME` bytes. The connection ending, at a
+/// frame boundary **or part-way through a frame**, is the peer hanging up → `Ok(None)`.
+///
+/// Part-way counts too (V210-101): a node killed while it writes a reply larger than the socket's
+/// buffer leaves the reader a length and part of a body, then EOF. That is a hang-up, not a
+/// malformed message, and so is a read the OS fails (a reset): neither is bytes that arrived and
+/// did not parse, the one case "malformed" names.
 pub async fn read_frame(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
-    match s.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(_) => return Err(Error::MalformedIpc("ipc read len")),
+    if s.read_exact(&mut len_buf).await.is_err() {
+        return Ok(None);
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > frame_limit() {
         return Err(Error::SizeLimitExceeded("ipc frame length"));
     }
     let mut body = vec![0u8; len];
-    s.read_exact(&mut body)
-        .await
-        .map_err(|_| Error::MalformedIpc("ipc read body"))?;
+    if s.read_exact(&mut body).await.is_err() {
+        return Ok(None);
+    }
     Ok(Some(body))
+}
+
+/// A failed exchange with the node at `path`, with the connection ending under a write named as
+/// the hang-up it is ([`hung_up`]).
+pub(crate) async fn named(path: &Path, e: Error) -> Error {
+    match e {
+        Error::Ipc(IpcHandshake::Cut) => hung_up(path).await,
+        e => e,
+    }
 }
 
 // ---- server ----------------------------------------------------------------
@@ -1484,7 +1499,9 @@ async fn still_answering(path: &Path) -> Result<()> {
     };
     // A bare exchange, not `request`, which would check on the check.
     let ping = async {
-        write_frame(&mut probe.stream, &Request::Ping.to_bytes()).await?;
+        if let Err(e) = write_frame(&mut probe.stream, &Request::Ping.to_bytes()).await {
+            return Err(named(path, e).await);
+        }
         read_frame(&mut probe.stream).await
     };
     match tokio::time::timeout(ACTOR_WITHIN, ping).await {
@@ -2329,7 +2346,9 @@ impl IpcClient {
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
         let Self { stream, path, .. } = self;
         let exchange = async {
-            write_frame(stream, &req.to_bytes()).await?;
+            if let Err(e) = write_frame(stream, &req.to_bytes()).await {
+                return Err(named(path, e).await);
+            }
             let Some(body) = read_frame(stream).await? else {
                 return Err(hung_up(path).await);
             };
