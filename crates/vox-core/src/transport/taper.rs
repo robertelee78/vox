@@ -16,16 +16,12 @@
 //!   losses with no queue building, once tier 1's dwell is over. Tier 1's loss share
 //!   is marked as tier 2's baseline: loss that then grows with Vox's own sending is congestion.
 //! - **Climb 2 → 3** when the loss share over the last 32 MiB sent (`PathSignals::trend_share`)
-//!   is at or above [`CLIMB_3_SHARE`] ([`CLIMB_3_CAP_FRACTION`] of [`GENTLE_LOSS_CAP`], past which
-//!   tier 2 cuts for every loss), and no queue has
+//!   is at or above [`GENTLE_LOSS_CAP`], past which tier 2 cuts for every loss, and no queue has
 //!   been held for [`CLIMB_3_QUEUE_ROUNDS`] rounds in the last [`CLIMB_3_ROUNDS`] rounds and
 //!   [`CLIMB_3_TIME`]. Not the share over the last few rounds: at 8 KB datagrams eight rounds
 //!   hold a couple of hundred packets, and on a link losing 5% at random that share read 0–14%
 //!   from one half-second to the next, so a streak of rounds at the cap never reached 20 and tier 3
-//!   was never entered (measured: 1.42x and 1.62x a Cubic flow, against BBR's 7.68x). And not at
-//!   the cap itself: on a link losing 5% the trend read 4.5–4.9%, so tier 2 cut for every loss
-//!   half the time (the eight-round share was over the cap) while the trend never reached it
-//!   (measured: 22.7 Mbit/s through a 5% phase that tier 3 carries at 196). Nor a
+//!   was never entered (measured: 1.42x and 1.62x a Cubic flow, against BBR's 7.68x). Nor a
 //!   single round's queue: one round in the trace read 39 ms on a 10.6 ms base with nothing else
 //!   on the path. **The loss share is the clean-LAN guard:** a clean link loses only when its
 //!   queue overflows, well under 1% of what it sends, so it never reaches BBR.
@@ -87,10 +83,6 @@ use super::vox_bbr::{RateSeed, VoxBbr};
 pub(crate) const CLIMB_1_ROUNDS: usize = 8;
 /// …and the losses with no queue building it needs in them.
 pub(crate) const CLIMB_1_LOSSES: u32 = 3;
-/// The share of [`GENTLE_LOSS_CAP`] the loss trend must reach for a climb from tier 2…
-pub(crate) const CLIMB_3_CAP_FRACTION: f64 = 0.8;
-/// …that is, this loss share.
-pub(crate) const CLIMB_3_SHARE: f64 = CLIMB_3_CAP_FRACTION * GENTLE_LOSS_CAP;
 /// Consecutive rounds without a held queue for a climb from tier 2…
 pub(crate) const CLIMB_3_ROUNDS: u32 = 20;
 /// …spanning at least this long; a queue is held when it shows for this many rounds in a row.
@@ -341,7 +333,7 @@ impl Tapered {
                 if dwelt
                     && !self.backoff.locked(now)
                     && self.unqueued.held(now, CLIMB_3_ROUNDS, CLIMB_3_TIME)
-                    && self.signals.trend_share() >= CLIMB_3_SHARE =>
+                    && self.signals.trend_share() >= GENTLE_LOSS_CAP =>
             {
                 Some((TierId::Three, "loss at the cap without a queue", false))
             }
