@@ -3853,6 +3853,16 @@ impl Node {
         // closes the connection; a kill or a crash closes nothing, so the connection held is also
         // probed once it falls quiet, and closed here when nothing answers.
         let mut silent: BTreeMap<Digest32, Duration> = BTreeMap::new();
+        // **A connection whose only path ran through a relay that stopped is gone** (V210-93): its
+        // circuit went with the relay, so it can carry nothing, however long its silence takes to
+        // reach a probe's verdict — and a severed circuit, no longer the held connection, could sit
+        // unjudged past the probe. Closed here now, it is said lost on this look as the relay's
+        // stop.
+        for conn in self.anchors_up.values() {
+            if conn.carrier_stopped().is_some() && conn.quinn().close_reason().is_none() {
+                conn.close(crate::wire::WireError::Unresponsive);
+            }
+        }
         for (id, conn) in &self.anchors_up {
             if let Some(s) = net.manager().close_if_unanswering(
                 conn,
