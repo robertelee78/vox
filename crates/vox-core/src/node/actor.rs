@@ -4475,6 +4475,11 @@ impl Node {
                 // answered: an author only the room knows is still a stranger to the board, which
                 // refused the newcomer's records until something else refreshed it (V210-80).
                 self.refresh_network_view().await;
+                // No longer waiting to join, so its pre-join record goes, and this node's board
+                // stops counting it as pending (V210-102).
+                if let Some(net) = self.net.as_ref() {
+                    net.forget_prejoin(&channel_id, &identity.fingerprint());
+                }
                 // Answered whatever happened: a joiner waiting on this must not be left holding a
                 // stream because the room closed or this node has no profile. It will find out from
                 // the join's own outcome, which is the right place for it to learn.
