@@ -375,13 +375,8 @@ impl VoxCubic {
                     rounds: 0,
                 };
             }
-            // RFC 9406 §4.2: the rise was spurious; back to slow start. Judged only in the rounds
-            // after the one that entered CSS (V210-109). The baseline is that round's minimum so far,
-            // and the round's later samples only lower its minimum, so judging them against it
-            // called every exit spurious at the next lower sample: slow start re-entered at once,
-            // the window kept doubling, and slow start ended only on the loss burst of an
-            // overshoot (a 35 MB window on a 1 Gbit/s, 2 ms path, then six halvings).
-            Phase::Css { baseline, rounds } if rounds > 0 && current < baseline => {
+            Phase::Css { baseline, .. } if current < baseline => {
+                // RFC 9406 §4.2: the rise was spurious; back to slow start.
                 self.phase = Phase::SlowStart;
             }
             _ => {}
