@@ -92,6 +92,10 @@ pub struct NodeView {
     pub identity: Option<IdentityInfo>,
     /// Whether the identity is locked (no signer in memory).
     pub locked: bool,
+    /// Whether a lock is under way: the identity is locked and refuses new work, and the node is
+    /// waiting for work that still held a secret to finish and wipe it (V210-94). `locked` turns
+    /// true when it has.
+    pub locking: bool,
     /// Whether every open channel's SEK is `mlock`ed (`true` when none are open).
     /// `false` surfaces the documented zeroize-only degradation (ADR-010/015).
     pub mlock_active: bool,
@@ -619,6 +623,71 @@ impl std::fmt::Display for Fault {
     }
 }
 
+/// A fault's name and its way back from one, made from **one list** (V210-114).
+///
+/// A daemon names the fault of a failed join over its control socket (`Failed(ProfileBusy)`),
+/// and `vox room join` turns the name back into the fault to say what it means. That was a table
+/// of its own in the CLI, and every fault added after it was written fell out of it unseen:
+/// `ProfileBusy`, `IdentityFileUnwritable` and `NotAdmitted` reached the person as a bare
+/// `Failed(…)`, not as their cause. Here [`Fault::name`]'s match is exhaustive, so a fault that is
+/// not on the list does not build, and [`Fault::from_name`] is made from the same list.
+macro_rules! fault_names {
+    ($($fault:ident),* $(,)?) => {
+        impl Fault {
+            /// This fault's name, as its `Debug` writes it: what crosses the control socket.
+            #[must_use]
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Fault::$fault => stringify!($fault),)*
+                }
+            }
+
+            /// The fault named `name` (as [`Fault::name`] gives it), if there is one.
+            #[must_use]
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $(stringify!($fault) => Some(Fault::$fault),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+fault_names!(
+    NoIdentity,
+    IdentityExists,
+    Locked,
+    WrongPassphrase,
+    UnknownChannel,
+    ChannelNotOpen,
+    TooLong,
+    KeyringFull,
+    Storage,
+    ProfileBusy,
+    IdentityFileUnwritable,
+    SealedUnreadable,
+    ShuttingDown,
+    NotNetworked,
+    BadLink,
+    RoomNotOnBoard,
+    BoardUnreachable,
+    Unreachable,
+    SolveTooSlow,
+    MembersBusy,
+    Refused,
+    NotAdmitted,
+    NotConsented,
+    StillTrusted,
+    NotLoopback,
+    AddressInUse,
+    AlreadyMember,
+    NotAServiceRoom,
+    NotOffered,
+    NoSuchForward,
+    Internal,
+);
+
 /// The result of a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -818,6 +887,15 @@ pub enum NodeEvent {
         joined: bool,
         /// Each step and how long it took, in order.
         steps: String,
+    },
+    /// A join this node is running has begun a step: what it now waits for (V210-85).
+    ///
+    /// [`NodeEvent::JoinSteps`] arrives only once the join has ended, so a join that is stopped
+    /// before then — Ctrl-C, a service manager's SIGTERM — had nothing to say about where it was.
+    /// `vox connect` keeps the latest of these, and names it when it is stopped.
+    JoinStep {
+        /// The step, for the person: `dialling member 7r7pa7jfcfdo`.
+        step: String,
     },
     /// An upgrade off a relayed path was tried and nothing better landed, with what each rung
     /// reported.

@@ -14,7 +14,7 @@
 //! reaches her and completes.
 //!
 //! **Asserted,** with hard-coded bounds: bob's `vox room join` fails, and within [`ANSWERED`] of
-//! the lock; and alice's roster, read [`SETTLE`] after she is resumed, does not name bob.
+//! the lock, and what it prints names the lock (not "run `vox id`", V210-94); and alice's roster, read [`SETTLE`] after she is resumed, does not name bob.
 //! Preconditions, or `CANNOT MEASURE`: the join had not returned when bob locked; alice's roster
 //! names alice.
 //!
@@ -287,6 +287,14 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
     assert!(
         !status.success(),
         "bob's `vox room join` succeeded after he locked"
+    );
+    // **And it says why: the lock** (V210-94). It said "this profile has no unlocked identity, so
+    // there is nobody to join as / run `vox id` to make one", which sent a person who had just
+    // locked to make a second identity.
+    assert!(
+        said.contains("identity is locked") && !said.contains("vox id"),
+        "bob's `vox room join` failed after the lock without naming it — the product said: {}",
+        said.trim()
     );
     assert!(
         took < ANSWERED,
