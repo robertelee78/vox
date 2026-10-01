@@ -644,6 +644,10 @@ impl PathSignals {
         let elapsed = self
             .round_start
             .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
+        // No round is shorter than the path's base round trip: one that seems to be closed on a
+        // bunch of acknowledgements arriving together, and its bytes over its own length read as
+        // several times the link (fix-adr024-bbr measured 875-3368 Mbit/s on a 200 Mbit/s link).
+        let elapsed = elapsed.max(self.min_rtt().unwrap_or(Duration::ZERO));
         if !elapsed.is_zero() {
             self.last_rate = (self.round_acked as f64 / elapsed.as_secs_f64()) as u64;
             // An application-limited round says what the application offered, not what the path
@@ -704,6 +708,11 @@ impl PathSignals {
     /// The base round trip: the smallest sample of the last [`BASE_RTT_WINDOW`].
     pub(crate) fn min_rtt(&self) -> Option<Duration> {
         self.base.front().map(|&(_, m)| m)
+    }
+
+    /// The last finished round's minimum round trip.
+    pub(crate) fn round_min_rtt(&self) -> Option<Duration> {
+        self.last_round_min
     }
 
     pub(crate) fn srtt(&self) -> Duration {
