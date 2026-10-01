@@ -86,6 +86,115 @@ pub struct PortCounters {
     pub queued: u64,
     /// The backoff the port is in now, and its consecutive failures.
     pub backoff: Option<(BackoffKind, u32)>,
+    /// The sessions running on the port now, by token: which end opened each, the step it is at,
+    /// since when, and when it started (V210-110). A session that never ends was otherwise only a counter that did
+    /// not move; with this, `vox status` says which session is stuck, and at which step.
+    pub running: BTreeMap<u64, (bool, SyncStep, std::time::Instant, std::time::Instant)>,
+}
+
+/// The step a sync session is at (V210-110).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStep {
+    /// Reading the peer's board for who has joined, and offering it what this node's holds (an
+    /// outbound session's first step).
+    Setup,
+    /// Opening the sync stream (outbound).
+    Opening,
+    /// Exchanging entries (either direction).
+    Exchanging,
+}
+
+impl SyncStep {
+    /// The name `vox status --json` prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Opening => "opening",
+            Self::Exchanging => "exchanging",
+        }
+    }
+}
+
+/// One running session's place in the book: it moves the session's step, and its drop removes
+/// the session, however the session ends (it is held by the port's attempt, V210-110).
+pub struct Running {
+    book: SharedSyncBook,
+    room: Digest32,
+    peer: Digest32,
+    token: u64,
+}
+
+impl Running {
+    /// List a session as running on `(room, peer)` from now, at `step`.
+    #[must_use]
+    pub fn start(
+        book: &SharedSyncBook,
+        room: Digest32,
+        peer: Digest32,
+        token: u64,
+        outbound: bool,
+        step: SyncStep,
+    ) -> Self {
+        SyncBook::with(book, room, peer, |c| {
+            let now = std::time::Instant::now();
+            c.running.insert(token, (outbound, step, now, now));
+        });
+        Self {
+            book: Arc::clone(book),
+            room,
+            peer,
+            token,
+        }
+    }
+
+    /// A handle that moves this session's step and never removes it, for the session's task.
+    #[must_use]
+    pub fn stepper(&self) -> Stepper {
+        Stepper {
+            book: Arc::clone(&self.book),
+            room: self.room,
+            peer: self.peer,
+            token: self.token,
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let token = self.token;
+        SyncBook::with(&self.book, self.room, self.peer, |c| {
+            c.running.remove(&token);
+        });
+    }
+}
+
+impl std::fmt::Debug for Running {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Running")
+            .field("token", &self.token)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Moves a running session's step (see [`Running::stepper`]). A session already gone stays gone.
+pub struct Stepper {
+    book: SharedSyncBook,
+    room: Digest32,
+    peer: Digest32,
+    token: u64,
+}
+
+impl Stepper {
+    /// The session is at `step` from now.
+    pub fn step(&self, step: SyncStep) {
+        let token = self.token;
+        SyncBook::with(&self.book, self.room, self.peer, |c| {
+            if let Some(r) = c.running.get_mut(&token) {
+                *r = (r.0, step, std::time::Instant::now(), r.3);
+            }
+        });
+    }
 }
 
 /// Why a publish round started (V210-68): one round per `(room, board)`, counted by what asked
@@ -295,7 +404,8 @@ impl SyncBook {
                 s,
                 "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
                  \"completed\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\"stale\":{},\
-                 \"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{}}}",
+                 \"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{},\
+                 \"running\":[{}]}}",
                 b32_encode(room),
                 b32_encode(peer),
                 c.opened,
@@ -315,6 +425,17 @@ impl SyncBook {
                     || "null".to_owned(),
                     |(k, n)| format!("{{\"kind\":\"{}\",\"failures\":{n}}}", k.name())
                 ),
+                c.running
+                    .values()
+                    .map(|(outbound, step, since, started)| format!(
+                        "{{\"dir\":\"{}\",\"step\":\"{}\",\"for_ms\":{},\"age_ms\":{}}}",
+                        if *outbound { "out" } else { "in" },
+                        step.name(),
+                        since.elapsed().as_millis(),
+                        started.elapsed().as_millis()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(","),
             );
         }
         s.push_str("],\"reach\":[");
