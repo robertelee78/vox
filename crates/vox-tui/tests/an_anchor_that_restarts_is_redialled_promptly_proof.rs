@@ -243,20 +243,13 @@ fn an_anchor_stopped_while_it_carries_a_transfer_is_said_to_have_stopped() {
     assert_says_stopped("the forward", &said, &anchor);
 }
 
-/// **SIGTERM, and what else the stop ends** (V210-93). The forward also names its host as an
-/// anchor (`--anchor`), which a node may well hold: the families are split, so the only path to the
-/// host is a circuit through the anchor that is stopped. The forward must say the anchor stopped,
-/// within [`CLOSED_WITHIN`], and of its host — still running — that the connection went because
-/// its path ran through the anchor, which stopped: not a liveness probe's verdict on a path that no
-/// longer exists. This is the scene of a debug red (#287 c3), where the forward had taken its host
-/// as an anchor on its own and gave the probe's verdict.
-///
-/// Mutation: the relay's stop not carried to the connections over its circuits (the reason left to
-/// the probe) → red on the host's line.
+/// **SIGTERM** (V210-93): the forward says, within [`CLOSED_WITHIN`], that its anchor stopped, and
+/// any other connection the stop ended says its path ran through the stopped anchor (see
+/// [`assert_says_stopped`]). The forward is then stopped by SIGTERM itself, as Ctrl-C stops it.
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
-    let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false, true);
+    let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false, false);
     let anchor = anchor_id(&w);
     let said = w.fwd.as_mut().unwrap().transcript();
     assert_says_stopped("the forward", &said, &anchor);
@@ -287,6 +280,31 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
         "the forward did not stop cleanly on SIGTERM (exit {status:?}, said it was stopping: \
          {stopping})\n{said}"
     );
+}
+
+/// **What else a relay's stop ends** (V210-93; opt-in, `--features heavy-proofs`). The forward
+/// also names its host as an anchor (`--anchor`): the families are split, so its only path to the
+/// host is a circuit through the anchor that is stopped (SIGTERM). The forward must say the anchor
+/// stopped, and of its host — still running — that the connection went because its path ran
+/// through the anchor, which stopped: not a liveness probe's verdict on a path that no longer
+/// exists. That is the scene of verifier-287c3's debug red, where the forward had taken its host
+/// as an anchor on its own.
+///
+/// **Optional, and why.** Whether the forward holds that relayed connection as its host's — rather
+/// than keep redialling the host directly, with "dialling this anchor failed … no direct
+/// candidates" — is not settled by anything the proof controls (a filing question of its own,
+/// reported apart from V210-93). Held, the claim is measured; not held, the arm says CANNOT MEASURE.
+///
+/// Mutation: the relay's stop not carried to the connections over its circuits (the reason left to
+/// the probe) → red on the host's line, with the probe's verdict.
+#[cfg(feature = "heavy-proofs")]
+#[test]
+#[ignore = "opt-in proof: real binaries, production Argon2id and a PoW; run with --features heavy-proofs"]
+fn a_connection_held_only_through_the_stopped_anchor_says_so() {
+    let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false, true);
+    let anchor = anchor_id(&w);
+    let said = w.fwd.as_mut().unwrap().transcript();
+    assert_says_stopped("the forward", &said, &anchor);
 }
 
 /// Stop the anchor with `signal` and leave it down; the forward must say its anchor connection is
