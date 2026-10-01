@@ -594,6 +594,14 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     }
     send.signal("-CONT");
 
+    assert!(
+        [bob_rows, bob_lines, alice_rows, alice_lines]
+            .iter()
+            .all(|&n| n == cap),
+        "PRODUCT: with {cap} tunnels open from Bob to Alice's offer, `vox status` did not list each \
+         on both sides: Bob {bob_rows} in --json, {bob_lines} line(s); Alice {alice_rows} in \
+         --json, {alice_lines} line(s)\nBob's vox status:\n{bob_human}\nAlice's:\n{alice_human}"
+    );
     eprintln!("[proof] cap arm: Bob's `vox room get` past the cap said:\n{get_said}");
     assert!(
         refused.is_some_and(|ok| !ok)
@@ -604,14 +612,6 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
          {REFUSED_WITHIN:?} saying {LIMIT_SAID:?}, how to free one ({FREE_ONE_SAID:?}) and which \
          service they go to (\"{tag} ×{cap}\"): it exited {refused:?} (None: still running) and \
          said {get_said:?}"
-    );
-    assert!(
-        [bob_rows, bob_lines, alice_rows, alice_lines]
-            .iter()
-            .all(|&n| n == cap),
-        "PRODUCT: with {cap} tunnels open from Bob to Alice's offer, `vox status` did not list each \
-         on both sides: Bob {bob_rows} in --json, {bob_lines} line(s); Alice {alice_rows} in \
-         --json, {alice_lines} line(s)\nBob's vox status:\n{bob_human}\nAlice's:\n{alice_human}"
     );
     assert!(
         past_cap.iter().flatten().all(|&b| b < ONE_WINDOW_TAKEN),
