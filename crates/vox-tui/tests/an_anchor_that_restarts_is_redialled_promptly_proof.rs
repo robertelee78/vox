@@ -253,7 +253,7 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
     let anchor = anchor_id(&w);
     let said = w.fwd.as_mut().unwrap().transcript();
     assert_says_stopped("the forward", &said, &anchor);
-    // ---- and a forward stops on SIGTERM as it does on Ctrl-C -----------------------------------
+    // ---- and a forward stops on SIGTERM, saying so (V210-108's contract, #303) ----------------
     let fwd = w.fwd.as_mut().unwrap();
     let signalled = Instant::now();
     kill(["-TERM", &fwd.child.id().to_string()]);
@@ -267,18 +267,18 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
         std::thread::sleep(Duration::from_millis(20));
     };
     let said = fwd.transcript();
-    let stopping = said
-        .lines()
-        .any(|l| l.contains("vox: stopping the forward"));
+    let stopping = said.lines().any(|l| l.contains("stopped by SIGTERM"));
     eprintln!(
-        "[proof] SIGTERM to the forward: exited {status:?} after {:?}, said it was stopping: \
-         {stopping}",
+        "[proof] SIGTERM to the forward: exited {status:?} after {:?}, said it was stopped by \
+         SIGTERM: {stopping}",
         signalled.elapsed()
     );
+    // A stop ends with the signal's status, 128 + 15, never death by it (V210-85, V210-108).
+    use std::os::unix::process::ExitStatusExt;
     assert!(
-        status.is_some_and(|s| s.success()) && stopping,
-        "the forward did not stop cleanly on SIGTERM (exit {status:?}, said it was stopping: \
-         {stopping})\n{said}"
+        status.is_some_and(|s| s.signal().is_none() && s.code() == Some(143)) && stopping,
+        "the forward did not stop cleanly on SIGTERM (exit {status:?}, said it was stopped by \
+         SIGTERM: {stopping})\n{said}"
     );
 }
 
