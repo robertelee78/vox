@@ -27,20 +27,24 @@
 //! **Asserted:**
 //! - the restarted anchor reports all [`MEMBERS`] peers connected within [`BACK_WITHIN`] of
 //!   SIGCONT — its own `N peer(s) connected` line, read as it is printed;
-//! - the burst reached the cap (the anchor says attempts waited for a handshake slot, or were
-//!   refused — otherwise the run measured nothing and says CANNOT MEASURE), never more than [`CAP`]
-//!   handshakes ran at once meanwhile, and **none was refused**.
+//! - **no member was turned away**: none says its dial to the anchor failed after the restart (a
+//!   member the anchor refuses says so, with the reason and its next try).
 //!
-//! The in-flight and refused counts are the anchor's own report ([`NodeEvent::HandshakesQueued`],
-//! said once a burst has nobody left waiting; a refusal with nobody waiting is a burst of its own,
-//! so no refusal goes unsaid). Nothing outside the process can see a handshake slot. The bound is
-//! observed from outside; what each member said about its anchor is printed for the last to return.
+//! The staging — that the burst met the anchor's cap of 64 handshakes — is something only the
+//! anchor can see, and it says so to its operator: "N connection attempt(s) waited for a handshake
+//! slot … M refused". A run where it never says so measured nothing, and says CANNOT MEASURE. The
+//! cap itself is unchanged and rests on review: how many handshakes run at once is not something a
+//! user sees. What each member said about its anchor is printed for the last to return.
 //!
-//! **What the first bound does not separate, stated:** on this machine the old code met it too.
-//! Measured with the hold, the old code had all 300 back 2.47 s after SIGCONT, the new 0.95 s: a
+//! **A stop must be said to every member** for the first bound to hold: a member that misses its
+//! anchor's close learns it is gone only from its silence (30 s). In a debug build the anchor's
+//! closes were lost as it exited (#287, V210-93, measured here: 300 members back up to 26 s after
+//! the restart); that is #287's to fix, and until it lands this arm is red in debug.
+//!
+//! **What the first bound does not separate, stated:** on this machine, in release, the old
+//! queueing code met it too: the old code had all 300 back 2.47 s after SIGCONT, the new 0.95 s. A
 //! refused member's first backoff is a single second, and on 18 cores the next wave fits under the
-//! cap. What separates the two is the refusals, so the old code goes red on those. The bound stays,
-//! as the acceptance's "within a hard-coded bound".
+//! cap. What separates the two is what the members were told, so the old code goes red on that.
 //!
 //! **Then a long outage.** A member whose dial to its anchor fails waits before the next, and that
 //! wait used to double to 30 s. Measured with the restart above, one run in eight had 94 of 300
@@ -65,16 +69,18 @@
 //! [`BUSY_BACK_WITHIN`] of the anchor going on; and once the frozen members go on, all [`MEMBERS`]
 //! are connected within [`BACK_WITHIN`].
 //!
+//! Every red says which it is: `PRODUCT:` quotes what the product said or did, `CANNOT MEASURE:`
+//! names staging that was not achieved, `APPARATUS:` names a fault of the proof's own; the
+//! watchdog says it is the watchdog.
+//!
 //! Mutations (each must go red):
 //! - validated attempts past the cap refused again (`HANDSHAKES_WAITING` = 0, the old behaviour)
-//!   → red on the refusals;
-//! - the cap raised (`HANDSHAKES_IN_FLIGHT` = 100) → red on the cap;
+//!   → red on the members turned away;
+//! - a refused dial reported as a bad signature again (the dial's `map_err` back to
+//!   `Error::SignatureInvalid`) → red on what the refused members were told;
 //! - a failed anchor dial backed off to 30 s again (`ANCHOR_UNREACHED_REDIAL_SECS` = 30) → red on
 //!   the bound after the outage;
-//! - a refused dial reported as a bad signature again (the dial's `map_err` back to
-//!   `Error::SignatureInvalid`) → red on what the refused members were told.
 //!
-//! [`NodeEvent::HandshakesQueued`]: vox_core::node::api::NodeEvent::HandshakesQueued
 
 #![cfg(unix)]
 
@@ -92,8 +98,6 @@ use world::{args, vox_once, VoxProc, IDENTITY};
 
 /// How many members redial the restarted anchor.
 const MEMBERS: usize = 300;
-/// The anchor's handshake cap, restated rather than read, so a changed cap goes red.
-const CAP: usize = 64;
 /// How long the anchor stays down.
 const DOWN: Duration = Duration::from_secs(3);
 /// How long the restarted anchor is held (SIGSTOP) once it is listening, so the redials meet it at once.
@@ -120,9 +124,10 @@ const BUSY: &str = "the peer is busy";
 #[ignore = "real binaries, 300 daemons and production Argon2id; CI runs it in release"]
 fn every_member_is_back_after_an_anchor_restart() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let anchor_dir = tmp.path().join("anchor");
-    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(anchor_dir.join("cfg"))
+        .expect("APPARATUS: cannot make a profile directory");
     let port = free_udp_port();
     let listen = format!("127.0.0.1:{port}");
     let mut anchor = VoxProc::spawn("anchor", &anchor_dir, &args(&["node", "--listen", &listen]));
@@ -145,21 +150,23 @@ fn every_member_is_back_after_an_anchor_restart() {
             .map(|dir| {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
-                    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+                    std::fs::create_dir_all(dir.join("cfg"))
+                        .expect("APPARATUS: cannot make a profile directory");
                     let (ok, _, err) = vox_once(&dir, &args(&["id"]));
-                    assert!(ok, "CANNOT MEASURE: vox id failed: {err}");
+                    assert!(ok, "CANNOT MEASURE: vox id (staging) failed: {err}");
                 })
             })
             .collect();
         for h in handles {
-            h.join().unwrap();
+            h.join().expect("APPARATUS: a vox id thread panicked");
         }
     }
     eprintln!("[proof] {MEMBERS} identities made in {:?}", made.elapsed());
 
     // ---- MEMBERS daemons, started a few at a time, all connected --------------------------------
     let pass_file = tmp.path().join("identity-passphrase");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n"))
+        .expect("APPARATUS: cannot write the passphrase file");
     let started = Instant::now();
     let mut daemons: Vec<VoxProc> = Vec::with_capacity(MEMBERS);
     for batch in dirs.chunks(lanes) {
@@ -194,7 +201,7 @@ fn every_member_is_back_after_an_anchor_restart() {
     while anchor.child.try_wait().ok().flatten().is_none() {
         assert!(
             stopping.elapsed() < Duration::from_secs(10),
-            "CANNOT MEASURE: the anchor did not stop within 10 s of SIGINT"
+            "PRODUCT: the anchor did not stop within 10 s of SIGINT"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -278,19 +285,21 @@ fn every_member_is_back_after_an_anchor_restart() {
     }
     assert!(
         most >= MEMBERS,
-        "only {most} of {MEMBERS} members were connected again within {:?} of the anchor's \
+        "PRODUCT: only {most} of {MEMBERS} members were connected again within {:?} of the anchor's \
          return\n---- the anchor ----\n{}",
         BACK_WITHIN + Duration::from_secs(50),
         anchor.transcript()
     );
     assert!(
         at < BACK_WITHIN,
-        "every member was back only {at:?} after the anchor's return, over {BACK_WITHIN:?}: \
-         members turned away at the cap waited out a backoff\n---- the anchor ----\n{}",
+        "PRODUCT: every member was back only {at:?} after the anchor's return, over \
+         {BACK_WITHIN:?}\n---- the anchor ----\n{}",
         anchor.transcript()
     );
 
-    // ---- the cap held, and nobody was refused ---------------------------------------------------
+    // ---- nobody was turned away ------------------------------------------------------------------
+    // The staging: the burst met the cap, which only the anchor can see. Its report is what it
+    // tells its operator.
     let number = |line: &str, after: &str| -> usize {
         line.split(after)
             .nth(1)
@@ -300,32 +309,49 @@ fn every_member_is_back_after_an_anchor_restart() {
                     .parse()
                     .ok()
             })
-            .unwrap_or_else(|| panic!("no number after {after:?} in {line:?}"))
+            .unwrap_or_else(|| {
+                panic!("APPARATUS: the proof cannot read a number after {after:?} in {line:?}")
+            })
     };
-    let (mut waited, mut running, mut refused) = (0, 0, 0);
+    let (mut waited, mut refused) = (0, 0);
     for l in &said {
         waited += number(l, "vox node: ");
-        running = running.max(number(l, "while at most "));
         refused += number(l, "; ");
     }
     eprintln!(
-        "[proof] {waited} attempts waited, at most {running} handshakes ran at once (cap {CAP}), \
-         {refused} refused, over {} report(s)",
+        "[proof] the anchor says {waited} attempts waited for a handshake slot and {refused} were \
+         refused, over {} report(s)",
         said.len()
     );
     assert!(
         waited + refused > 0,
         "CANNOT MEASURE: the anchor never said attempts waited for a handshake slot or were \
-         refused, so the burst never reached the cap of {CAP}\n{}",
+         refused, so the burst never reached its cap\n{}",
         anchor.transcript()
     );
-    assert!(
-        running <= CAP,
-        "{running} handshakes ran at once, over the cap of {CAP}: {said:#?}"
+    // What the members saw: a member the anchor turned away says its dial failed.
+    let turned_away: Vec<String> = daemons
+        .iter()
+        .flat_map(|d| {
+            d.timed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(t, l)| *t >= back && l.contains("dialling this anchor failed"))
+                .map(|(_, l)| format!("{}: {l}", d.name))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    eprintln!(
+        "[proof] {} dial(s) to the restarted anchor failed, as the members said",
+        turned_away.len()
     );
-    assert_eq!(
-        refused, 0,
-        "{refused} attempts were refused at the cap instead of waiting for a slot: {said:#?}"
+    assert!(
+        turned_away.is_empty(),
+        "PRODUCT: the restarted anchor turned members away instead of letting them wait for a \
+         handshake slot; {} failed dial(s), the first: {:#?}",
+        turned_away.len(),
+        &turned_away[..turned_away.len().min(3)]
     );
 
     // ---- a busy anchor: its slots held by members frozen mid-handshake, the rest refused --------
@@ -343,7 +369,7 @@ fn every_member_is_back_after_an_anchor_restart() {
     while anchor.child.try_wait().ok().flatten().is_none() {
         assert!(
             stopping.elapsed() < Duration::from_secs(10),
-            "CANNOT MEASURE: the anchor did not stop within 10 s of SIGINT"
+            "PRODUCT: the anchor did not stop within 10 s of SIGINT"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -439,16 +465,16 @@ fn every_member_is_back_after_an_anchor_restart() {
     );
     assert!(
         told_bad_signature.is_empty(),
-        "a member refused by a busy anchor was told of a bad signature: {told_bad_signature:#?}"
+        "PRODUCT: a member refused by a busy anchor was told of a bad signature: {told_bad_signature:#?}"
     );
     assert!(
         told_busy > 0,
-        "the anchor refused {refused} attempt(s) and no refused member was told it was busy: \
+        "PRODUCT: the anchor refused {refused} attempt(s) and no refused member was told it was busy: \
          {said_failed:#?}"
     );
     assert!(
         most >= want && at < BUSY_BACK_WITHIN,
-        "{most}/{want} refused members were back, the last {at:?} after the busy anchor went on, \
+        "PRODUCT: {most}/{want} refused members were back, the last {at:?} after the busy anchor went on, \
          over {BUSY_BACK_WITHIN:?}: a refused member did not retry once a slot was free"
     );
     // The frozen members come back too.
@@ -463,7 +489,7 @@ fn every_member_is_back_after_an_anchor_restart() {
     );
     assert!(
         most >= MEMBERS && at < BACK_WITHIN,
-        "{most}/{MEMBERS} members were back, the last {at:?} after the stalled ones went on, over \
+        "PRODUCT: {most}/{MEMBERS} members were back, the last {at:?} after the stalled ones went on, over \
          {BACK_WITHIN:?}"
     );
 
@@ -478,14 +504,15 @@ fn every_member_is_back_after_an_anchor_restart() {
     while anchor.child.try_wait().ok().flatten().is_none() {
         assert!(
             stopping.elapsed() < Duration::from_secs(10),
-            "CANNOT MEASURE: the anchor did not stop within 10 s of SIGINT"
+            "PRODUCT: the anchor did not stop within 10 s of SIGINT"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
     drop(anchor);
     let away = Instant::now();
     let stranger_dir = tmp.path().join("stranger");
-    std::fs::create_dir_all(stranger_dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(stranger_dir.join("cfg"))
+        .expect("APPARATUS: cannot make a profile directory");
     let mut stranger = VoxProc::spawn(
         "stranger",
         &stranger_dir,
@@ -502,7 +529,7 @@ fn every_member_is_back_after_an_anchor_restart() {
     while stranger.child.try_wait().ok().flatten().is_none() {
         assert!(
             stopping.elapsed() < Duration::from_secs(10),
-            "CANNOT MEASURE: the stranger did not stop within 10 s of SIGINT"
+            "PRODUCT: the stranger (a vox node) did not stop within 10 s of SIGINT"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -576,7 +603,7 @@ fn every_member_is_back_after_an_anchor_restart() {
     );
     assert!(
         most >= MEMBERS && at <= BACK_WITHIN,
-        "{most}/{MEMBERS} members were back after the outage, the last {at:?} after the anchor was \
+        "PRODUCT: {most}/{MEMBERS} members were back after the outage, the last {at:?} after the anchor was \
          listening again, over {BACK_WITHIN:?}: a member whose dials failed while it was away waits \
          out its backoff"
     );
@@ -639,7 +666,7 @@ fn wait_for_peers(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
-                "CANNOT MEASURE: the anchor exited\n{}",
+                "PRODUCT: the anchor exited by itself\n{}",
                 anchor.seen.join("\n")
             ),
         }
