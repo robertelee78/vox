@@ -160,15 +160,20 @@ fn spawn_vox(m: &Member, args: &[&str], out: &Path) -> Kid {
 }
 
 /// `n` connections to the forward at `bound`, each written into until it stops taking bytes,
-/// with the count each has taken.
+/// with the count each has taken. A connection reset before `connect` returns took nothing: the
+/// forward accepted it, and its tunnel was refused that fast.
 fn writers(bound: &str, n: usize) -> (Vec<TcpStream>, Vec<Arc<AtomicU64>>) {
     let written: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::default()).collect();
     let socks = written
         .iter()
-        .map(|count| {
-            let sock = TcpStream::connect(bound).unwrap_or_else(|e| {
-                panic!("PRODUCT: Bob's daemon bound the forward at {bound} but it refuses a connection: {e}")
-            });
+        .filter_map(|count| {
+            let sock = match TcpStream::connect(bound) {
+                Ok(sock) => sock,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return None,
+                Err(e) => panic!(
+                    "PRODUCT: Bob's daemon bound the forward at {bound} but it refuses a connection: {e}"
+                ),
+            };
             let mut w = sock
                 .try_clone()
                 .expect("APPARATUS: clone the forward socket");
@@ -179,7 +184,7 @@ fn writers(bound: &str, n: usize) -> (Vec<TcpStream>, Vec<Arc<AtomicU64>>) {
                     count.fetch_add(n as u64, Ordering::Relaxed);
                 }
             });
-            sock
+            Some(sock)
         })
         .collect();
     (socks, written)
