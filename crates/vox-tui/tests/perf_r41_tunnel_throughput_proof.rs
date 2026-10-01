@@ -1121,6 +1121,10 @@ const LOSSY_SHARED: [Link; 2] = [
 ];
 /// The decider: on a lossy shared link the Cubic flow keeps at least this share of its solo rate.
 const SHARED_KEEP: f64 = 0.90;
+/// Beside the Cubic flow, vox must carry at least this share of that flow's solo rate on the same
+/// link, or the arm has measured a stalled tunnel, not fairness (a mutant that never cut on loss
+/// carried 0.0 Mbit/s there and left the flow its whole rate).
+const SHARED_VOX_FLOOR: f64 = 0.5;
 /// How long each half of the lossy shared arm (the Cubic flow alone, then both) is judged: long
 /// enough that a loss-limited flow's mean is steady to a few percent.
 const SHARED_MEASURE: Duration = Duration::from_secs(30);
@@ -1712,7 +1716,19 @@ fn taper_arms(
             mean_of(&both, |x| x.vox),
         );
         let share = kept / solo;
-        let verdict = if share >= SHARED_KEEP {
+        // A tunnel that carries nothing beside the flow makes the share say nothing about fairness;
+        // a person sees a stalled tunnel.
+        let verdict = if vm < solo * SHARED_VOX_FLOOR {
+            failed.push(format!(
+                "{}: the emulator was on time; beside the Cubic flow vox carried {:.1} Mbit/s, under \
+                 {:.0}% of that flow's solo {:.1}: the tunnel stalls on a lossy shared link",
+                shared.name,
+                vm / 1e6,
+                SHARED_VOX_FLOOR * 100.0,
+                solo / 1e6
+            ));
+            "BELOW (vox stalled)".to_owned()
+        } else if share >= SHARED_KEEP {
             format!("ok (kept >= {:.0}%)", SHARED_KEEP * 100.0)
         } else {
             failed.push(format!(
