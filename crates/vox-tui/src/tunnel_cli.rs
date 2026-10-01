@@ -520,11 +520,6 @@ pub async fn serve(
     port: u16,
     at: Option<SocketAddr>,
 ) -> Result<(), AppError> {
-    // **Every stop signal is a clean stop** (V210-108): SIGINT, SIGTERM, SIGHUP and SIGQUIT. It
-    // listened for Ctrl-C alone, so a service manager's SIGTERM or a closed tmux pane's SIGHUP
-    // ended it on the spot, saying nothing. Taken first, so a stop sent while the room is being
-    // made is acted on by the loop below rather than by the default action.
-    let interrupted = crate::app::stop_requested("vox serve");
     if !reachable_or_relayed(node, anchors) {
         return Err(AppError::Usage(
             "this machine has no address a guest could reach and no anchor to relay \
@@ -590,29 +585,27 @@ pub async fn serve(
     println!("Ctrl-C to stop");
 
     // Until stopped: report who reaches the service. The service itself cannot say
-    // — every Vox client arrives at it from loopback (ADR-017 decision 6).
-    // One stop listener for the whole loop, taken above: one made per turn misses a SIGINT
-    // that lands in the same turn as another arm (see `app::run_node`).
-    tokio::pin!(interrupted);
-    let signal = loop {
-        tokio::select! {
-            signal = &mut interrupted => break signal,
-            event = node.next_event() => match event {
-                Some(NodeEvent::TunnelServed { client, service_tag, .. }) => {
-                    println!("vox: {} reached {service_tag:?}", crate::ident::author_id(&client));
-                }
-                Some(NodeEvent::PeerJoined { peer, .. }) => {
-                    println!("vox: {} joined", crate::ident::author_id(&peer));
-                }
-                Some(ref other) => say_if_it_explains_a_failure(other),
-                None => return Err(AppError::Usage("the node stopped".into())),
-            },
+    // — every Vox client arrives at it from loopback (ADR-017 decision 6). A stop signal ends the
+    // run in the verb's runner, which raced it from before the identity was unlocked (V210-108).
+    loop {
+        match node.next_event().await {
+            Some(NodeEvent::TunnelServed {
+                client,
+                service_tag,
+                ..
+            }) => {
+                println!(
+                    "vox: {} reached {service_tag:?}",
+                    crate::ident::author_id(&client)
+                );
+            }
+            Some(NodeEvent::PeerJoined { peer, .. }) => {
+                println!("vox: {} joined", crate::ident::author_id(&peer));
+            }
+            Some(ref other) => say_if_it_explains_a_failure(other),
+            None => return Err(AppError::Usage("the node stopped".into())),
         }
-    };
-    crate::app::say(format_args!("vox: stopping"));
-    // Bounded, as every stop is: see `with_room`.
-    let _ = tokio::time::timeout(STOP_PATIENCE, node.apply(NodeCommand::Shutdown)).await;
-    Err(AppError::stopped_by(signal))
+    }
 }
 
 /// `vox connect <address>` — join the room an address names, and print the name its
@@ -683,6 +676,9 @@ pub struct Waiting {
     /// What the verb could not finish without.
     outcome: &'static str,
     now: std::sync::Mutex<(String, Instant)>,
+    /// A server's verb (`vox serve`): being stopped is how it ends, so a stop is a clean exit, not
+    /// an error (V210-108).
+    serves: bool,
 }
 
 impl Waiting {
@@ -695,7 +691,27 @@ impl Waiting {
             started: now,
             outcome,
             now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+            serves: false,
         })
+    }
+
+    /// [`Waiting::new`] for a server's verb, which runs until it is stopped: a stop is its normal
+    /// end and exits 0, as a service manager expects of a service it stopped (V210-108).
+    #[must_use]
+    pub fn server() -> std::sync::Arc<Self> {
+        let now = Instant::now();
+        std::sync::Arc::new(Self {
+            started: now,
+            outcome: "it was serving",
+            now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+            serves: true,
+        })
+    }
+
+    /// Whether a stop is this verb's normal end (see [`Waiting::server`]).
+    #[must_use]
+    pub fn serves(&self) -> bool {
+        self.serves
     }
 
     /// The verb now waits for `what`.

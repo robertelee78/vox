@@ -25,12 +25,16 @@
 //! `World`). Each of `vox up`, `vox forward`, `vox daemon` (holding the room), `vox room tail` and
 //! `vox room send` (through that daemon) on the guest, and `vox serve` on the host, is started,
 //! brought to where it is serving, and sent one signal — each verb once per signal, 24 stops. Each
-//! must, as the person sees it: say on stderr `vox: stopped by <SIGNAL>`, exit with 128 + the
-//! signal's number (not die on the signal's default action), and be gone within [`STOP_BOUND`].
+//! must be gone within [`STOP_BOUND`], not killed by the signal's default action, and, as the
+//! person sees it:
+//! - a **server** (`vox daemon`, `vox serve`) says `stopped by <SIGNAL>` and exits 0: being stopped
+//!   is how a server ends, and a service manager counts a non-zero exit on its stop as a failure;
+//! - a **client** (`vox up`, `vox forward`, `vox room tail`, `vox room send`) says on stderr
+//!   `vox: stopped by <SIGNAL>` and exits 128 + the signal's number, as a shell reports it.
 //!
-//! Mutations, one per claim: `vox serve` listening for Ctrl-C alone; `with_room` (`vox up`,
-//! `vox forward`) listening for Ctrl-C alone; `vox daemon` ignoring SIGHUP again. Each goes red on
-//! the signals it no longer takes.
+//! Mutations, one per claim: `vox serve`'s runner listening for Ctrl-C alone; `with_room`
+//! (`vox up`, `vox forward`) listening for Ctrl-C alone; `vox daemon` ignoring SIGHUP again. Each
+//! goes red on the signals it no longer takes.
 
 #![cfg(unix)]
 
@@ -129,6 +133,9 @@ const STOP_SIGNALS: [(&str, &str, i32); 4] = [
 /// A clean stop takes well under a second; a node's shutdown is bounded at 5 s and a daemon's
 /// runtime at 5 s more. Anything still running after this has not stopped.
 const STOP_BOUND: Duration = Duration::from_secs(20);
+/// The servers, and the prefix each says it was stopped with.
+const DAEMON: Kind = Kind::Server("vox daemon");
+const SERVE: Kind = Kind::Server("vox");
 
 /// Run a staging step. A panic in it is the staging's, not the product's verdict, and says so.
 fn staged<T>(what: &str, step: impl FnOnce() -> T) -> T {
@@ -142,10 +149,27 @@ fn staged<T>(what: &str, step: impl FnOnce() -> T) -> T {
     })
 }
 
-/// Send `verb`'s process the stop signal `(name, flag, code)` and assert, as the person sees it,
-/// that it stops cleanly: gone within [`STOP_BOUND`], `vox: stopped by <name>` on stderr, and exit
-/// code `code` — not the signal's default action.
-fn stops_cleanly(p: &mut VoxProc, verb: &str, (name, flag, code): (&str, &str, i32)) {
+/// How a verb says it was stopped: a server on stdout, as `<prefix>: stopped by <SIGNAL>`, exiting
+/// 0; a client on stderr, as `vox: stopped by <SIGNAL>`, exiting 128 + the signal's number.
+#[derive(Clone, Copy)]
+enum Kind {
+    Server(&'static str),
+    Client,
+}
+
+/// Send `verb`'s process the stop signal `(name, flag, client_code)` and assert, as the person sees
+/// it, that it stops cleanly: gone within [`STOP_BOUND`], not by the signal's default action, saying
+/// it was stopped by `name`, with the exit code its [`Kind`] has.
+fn stops_cleanly(
+    p: &mut VoxProc,
+    verb: &str,
+    kind: Kind,
+    (name, flag, client_code): (&str, &str, i32),
+) {
+    let (code, told) = match kind {
+        Kind::Server(prefix) => (0, format!("{prefix}: stopped by {name}")),
+        Kind::Client => (client_code, format!("! vox: stopped by {name}")),
+    };
     let pid = p.child.id();
     let sent = std::process::Command::new("kill")
         .args([flag, &pid.to_string()])
@@ -191,7 +215,6 @@ fn stops_cleanly(p: &mut VoxProc, verb: &str, (name, flag, code): (&str, &str, i
         Some(code),
         "PRODUCT: {verb} stopped by {name} exited {status:?}, not {code}. It said:\n{said}"
     );
-    let told = format!("! vox: stopped by {name}");
     assert!(
         p.seen.iter().any(|l| l.trim_end() == told),
         "PRODUCT: {verb} did not say it was stopped by {name}. It said:\n{said}"
@@ -239,12 +262,12 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
     // ---- vox up, vox forward: the guest, while the host serves ---------------------------------
     for sig in STOP_SIGNALS {
         let (mut up, _) = staged("`vox up` serving", || w.up("up", &guest));
-        stops_cleanly(&mut up, "`vox up`", sig);
+        stops_cleanly(&mut up, "`vox up`", Kind::Client, sig);
         stops += 1;
     }
     for sig in STOP_SIGNALS {
         let (mut fwd, _) = staged("`vox forward` forwarding", || w.forward("forward", &guest));
-        stops_cleanly(&mut fwd, "`vox forward`", sig);
+        stops_cleanly(&mut fwd, "`vox forward`", Kind::Client, sig);
         stops += 1;
     }
 
@@ -280,7 +303,7 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
         });
         shown.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = poster.join();
-        stops_cleanly(&mut tail, "`vox room tail`", sig);
+        stops_cleanly(&mut tail, "`vox room tail`", Kind::Client, sig);
         stops += 1;
     }
     for sig in STOP_SIGNALS {
@@ -292,22 +315,22 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
         staged("`vox room send` offering", || {
             send.expect_line("the offer", |l| l.starts_with("vox: offering "))
         });
-        stops_cleanly(&mut send, "`vox room send`", sig);
+        stops_cleanly(&mut send, "`vox room send`", Kind::Client, sig);
         stops += 1;
     }
 
     // ---- vox daemon: the one above, then one per remaining signal -------------------------------
-    stops_cleanly(&mut held, "`vox daemon`", STOP_SIGNALS[0]);
+    stops_cleanly(&mut held, "`vox daemon`", DAEMON, STOP_SIGNALS[0]);
     stops += 1;
     for sig in &STOP_SIGNALS[1..] {
         let mut d = daemon(&w, &guest, &pass_file);
-        stops_cleanly(&mut d, "`vox daemon`", *sig);
+        stops_cleanly(&mut d, "`vox daemon`", DAEMON, *sig);
         stops += 1;
     }
 
     // ---- vox serve: the world's host, then a new one per remaining signal -----------------------
     let mut host = w.host.take().expect("APPARATUS: the world's host");
-    stops_cleanly(&mut host, "`vox serve`", STOP_SIGNALS[0]);
+    stops_cleanly(&mut host, "`vox serve`", SERVE, STOP_SIGNALS[0]);
     stops += 1;
     for sig in &STOP_SIGNALS[1..] {
         let mut serve = VoxProc::spawn(
@@ -328,7 +351,7 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
                 "address",
             )
         });
-        stops_cleanly(&mut serve, "`vox serve`", *sig);
+        stops_cleanly(&mut serve, "`vox serve`", SERVE, *sig);
         stops += 1;
     }
     println!("[proof] {stops} of 24 stops were clean");

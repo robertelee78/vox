@@ -230,8 +230,8 @@ where
     let outcome = rt.block_on(async move { crate::tunnel_cli::with_room(target, body).await });
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
-        // Its own code (a stop exits 128 + the signal's number, V210-108), and written without
-        // panicking: after a hangup stderr can be a terminal that is gone.
+        // Its own code (a stopped client verb exits 128 + the signal's number, V210-108), and
+        // written without panicking: after a hangup stderr can be a terminal that is gone.
         Err(e) => {
             use std::io::Write as _;
             let _ = writeln!(io::stderr(), "vox: {e}");
@@ -371,7 +371,16 @@ where
                 let stop = crate::app::stop_requested("vox");
                 tokio::select! {
                     signal = stop => {
-                        let why = waiting.stopped_by(signal);
+                        // **A server's stop is its normal end** (V210-108): `vox serve` says so and
+                        // exits 0, as a service manager expects of a service it stopped. A client
+                        // verb that did not finish exits 128 + the signal's number, saying why.
+                        let why = if waiting.serves() {
+                            crate::app::say(format_args!("vox: stopped by {}", signal.name()));
+                            crate::app::say(format_args!("vox: stopping"));
+                            Ok(())
+                        } else {
+                            Err(waiting.stopped_by(signal))
+                        };
                         // **Its peers are told it went** (V210-85). Stopped mid-join, it left its
                         // connections to the anchor and the host unclosed, and both counted it as
                         // connected until their idle timeout. A shutdown closes each with a
@@ -384,7 +393,7 @@ where
                             )
                             .await;
                         }
-                        (Err(why), true)
+                        (why, true)
                     }
                     done = work => (done, false),
                 }
@@ -1442,12 +1451,15 @@ pub fn run() -> ExitCode {
                 return ExitCode::FAILURE;
             };
             let a = args.clone();
-            run_new_room_verb(
+            // Raced against every stop signal from before the identity is unlocked (V210-108).
+            run_new_room_verb_with(
                 args.profile.clone(),
                 AnchorUse::Needed,
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
-                move |node, anchors| async move {
+                Some(crate::tunnel_cli::Waiting::server()),
+                || Ok(()),
+                move |node, anchors, ()| async move {
                     // Only the verbs that keep running serve the socket: `vox id` and the trust
                     // verbs share this path and are done in a moment (V210-83, #263).
                     let _control = crate::tunnel_cli::serve_control_socket(&node, socket);
@@ -1734,12 +1746,9 @@ pub fn run() -> ExitCode {
                 args.passphrase_file.clone(),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
-                // Its own code (a stop exits 128 + the signal's number, V210-108), and written
-                // without panicking: after a hangup stderr can be a terminal that is gone.
                 Err(e) => {
-                    use std::io::Write as _;
-                    let _ = writeln!(io::stderr(), "vox: {e}");
-                    e.exit_code()
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
                 }
             }
         }

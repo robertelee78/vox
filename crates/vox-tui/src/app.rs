@@ -759,8 +759,9 @@ async fn judge(
 }
 
 impl AppError {
-    /// How a long-running verb ends when `signal` stops it (V210-108): `stopped by SIGHUP`, exiting
-    /// 128 + the signal's number, as a shell reports a process the signal killed.
+    /// How a long-running **client** verb (`vox up`, `vox forward`, `vox room tail`) ends when
+    /// `signal` stops it (V210-108): `stopped by SIGHUP`, exiting 128 + the signal's number, as a
+    /// shell reports a process the signal killed. A server's stop is its normal end, and exits 0.
     #[must_use]
     pub fn stopped_by(signal: StopSignal) -> Self {
         AppError::Refused {
@@ -1235,13 +1236,16 @@ pub fn run_daemon(
         });
     }
 
-    let signal = rt.block_on(async {
+    rt.block_on(async {
         // **SIGHUP stops it too** (V210-108). It used to be ignored, on the reading that a daemon
         // has no terminal to lose and a service manager sends SIGHUP to ask for a reload. But this
         // daemon has nothing to reload, and people start it from tmux and ssh sessions, whose
         // closing sends SIGHUP: an ignored hangup left a daemon nobody could see still holding the
-        // profile. Each of the four stops it the same way, says which, and exits with its code.
+        // profile. Each of the four stops it the same way.
+        // A server's stop is its normal end: it says which signal and exits 0, as a service manager
+        // expects of a service it stopped.
         let signal = stop.await;
+        say(format_args!("vox daemon: stopped by {}", signal.name()));
         say(format_args!("vox daemon: shutting down"));
         // **Bounded.** The node handles one thing at a time, so `Shutdown` waits behind whatever
         // it is doing — and it can be doing a network round trip to a peer that has vanished.
@@ -1261,12 +1265,11 @@ pub fn run_daemon(
                 SHUTDOWN_PATIENCE.as_secs()
             );
         }
-        signal
     });
     // The same bound on the runtime itself: dropping it waits for every blocking task, and a sync
     // session runs on one.
     rt.shutdown_timeout(SHUTDOWN_PATIENCE);
-    Err(AppError::stopped_by(signal))
+    Ok(())
 }
 
 /// Write this anchor's own specs into the profile's anchors file (ADR-017 decision 7, M17.4),
