@@ -158,8 +158,6 @@ impl Controller for IdleRestart {
 
 /// RFC 8312 §5: the multiplicative decrease.
 const BETA_CUBIC: f64 = 0.7;
-/// ADR-024 tier 2: the cut for a loss that arrives with no queue behind it.
-pub(crate) const BETA_LOSS_AWARE: f64 = 0.85;
 /// RFC 8312 §5: the cubic scaling constant.
 const C: f64 = 0.4;
 /// quinn's default initial window: 14,720 bytes clamped to 2-10 base datagrams (1200 bytes).
@@ -274,14 +272,21 @@ impl VoxCubic {
     }
 
     /// Tier 2 on or off (ADR-024): when on, a loss that [`PathSignals`] does not call congestion
-    /// takes the gentle [`BETA_LOSS_AWARE`] cut instead of Cubic's.
+    /// does not cut the window at all.
+    ///
+    /// **No cut, not a smaller one** (ADR-024 M24.1, measured on R41's lossy arm, 200 Mbit/s, 10 ms,
+    /// 1% loss). With 8192-byte datagrams the window there is about 15 packets, Cubic regrows about a
+    /// quarter of a packet per round trip, and a loss arrives every ten or so: a cut of 15% (beta
+    /// 0.85) per such loss held Vox at 1.01x a Cubic flow on the same loss, where no cut reached
+    /// 2.77x. What stops Vox overrunning the path is the classification: the queue it builds shows as
+    /// delay, and past [`GENTLE_LOSS_CAP`] every loss is congestion.
     pub(crate) fn set_loss_aware(&mut self, on: bool) {
         self.loss_aware = on;
     }
 
-    /// A loss, already classified: `congestion` is [`PathSignals::loss_is_congestion`]. Cubic's
-    /// full cut for congestion, for persistent congestion, for an ECN mark (`lost_bytes == 0`), and
-    /// whenever tier 2 is off; the gentle cut otherwise.
+    /// A loss, already classified: `congestion` is what [`PathSignals::on_loss`] answered. Cubic's
+    /// cut for congestion, for persistent congestion, for an ECN mark (`lost_bytes == 0`), and
+    /// whenever tier 2 is off; no cut otherwise.
     pub(crate) fn on_loss(
         &mut self,
         now: Instant,
@@ -290,9 +295,10 @@ impl VoxCubic {
         lost_bytes: u64,
         congestion: bool,
     ) {
-        let gentle = self.loss_aware && !congestion && !is_persistent_congestion && lost_bytes > 0;
-        let beta = if gentle { BETA_LOSS_AWARE } else { BETA_CUBIC };
-        self.cut(now, sent, is_persistent_congestion, beta);
+        if self.loss_aware && !congestion && !is_persistent_congestion && lost_bytes > 0 {
+            return;
+        }
+        self.cut(now, sent, is_persistent_congestion, BETA_CUBIC);
     }
 
     /// Cubic's multiplicative decrease with `beta` (RFC 8312 §4.5-4.6), once per recovery period.
@@ -505,12 +511,22 @@ impl Controller for VoxCubic {
 /// first ran over a faster path it reads that path's round trip for as long as the connection lives.
 pub(crate) const BASE_RTT_WINDOW: Duration = Duration::from_secs(10);
 /// A queue is building when a round's minimum round trip exceeds the base by this much…
-pub(crate) const QUEUE_DELAY_MIN: Duration = Duration::from_millis(2);
+///
+/// Measured on R41's lossy arm, where no loss is congestion: at each loss, the last round's minimum
+/// stood 2.2 ms above the base at the median, 4.3 ms at the 90th percentile and 9 ms at the 99th
+/// (emulator jitter and the peer's acknowledgement delay). Above that noise, and below the 7.4 ms
+/// median a Cubic flow sharing a one-BDP queue raised it to on the congested arm.
+pub(crate) const QUEUE_DELAY_MIN: Duration = Duration::from_millis(4);
 /// …or by this share of the base, whichever is larger.
-pub(crate) const QUEUE_DELAY_SHARE: f64 = 0.25;
-/// Losses that tier 2 treats gently may not exceed this share of the packets sent over the last
-/// [`LOSS_ROUNDS`]; past it, a loss is congestion whatever the delay says (a policer, or a queue
-/// too shallow to show as delay).
+pub(crate) const QUEUE_DELAY_SHARE: f64 = 0.4;
+/// Past this share of the bytes sent over the last [`LOSS_ROUNDS`], a loss is congestion whatever
+/// the delay says: a queue too shallow to show as delay, or a policer.
+///
+/// Measured on R41's arms: Vox's own loss share was 1.0% on the 1%-loss Wi-Fi link, 0.2% sharing a
+/// one-BDP queue with a Cubic flow, and 35.6% sharing a quarter-BDP queue (about 2.5 ms, under the
+/// delay threshold) when nothing capped it, where it took 5.26x the Cubic flow's rate. With this
+/// cap it took 1.35x, the Cubic flow kept what it got against another Cubic (40 against 38 Mbit/s),
+/// and tail drops fell from 44 thousand to 2.3 thousand.
 pub(crate) const GENTLE_LOSS_CAP: f64 = 0.05;
 /// How many recent rounds the loss counts cover.
 pub(crate) const LOSS_ROUNDS: usize = 8;
