@@ -308,12 +308,15 @@ fn udp_shaper(
         });
         let carried = Arc::clone(&carried);
         std::thread::spawn(move || {
-            // MUTANT (V210-98 demo): the emulator stalls 50 of every 100 ms while a link is applied.
+            // MUTANT (V210-98 demo): the tunnel's emulator (the first one made; calibration makes
+            // its own) stalls 50 of every 100 ms while a link is applied.
+            static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let mine = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
             let start = Instant::now();
             for (due, pkt, shaped) in queue {
                 sleep_until(due);
                 let phase = start.elapsed().as_millis() % 100;
-                if shaped && phase >= 50 {
+                if mine && shaped && phase >= 50 {
                     std::thread::sleep(Duration::from_millis((100 - phase) as u64));
                 }
                 note_lateness(shaped, due);
