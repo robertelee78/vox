@@ -185,13 +185,18 @@ fn a_killed_anchor_is_noticed_promptly() {
 }
 
 /// **A clean stop is said as one even when the anchor was busy carrying for the node** (V210-93).
-/// The forward is moving a bulk echo through its circuit, so the anchor has stream data queued
-/// toward it, when the anchor is stopped (SIGINT). The anchor's CONNECTION_CLOSE waits behind that
-/// data: quinn (0.11.19 and earlier, quinn-rs/quinn#2785) holds a close back with the data, and the
-/// connection's closing period can end before it is sent, so the close never leaves. The forward
-/// must still say, within [`CLOSED_WITHIN`], that its anchor **stopped**: not that it answered
-/// nothing, 8 s or more later, or that it reset. That is what a stopping node's goodbye, said on a
-/// stream while the connection still runs, is for.
+/// The forward is moving a bulk echo through its circuit, and is held still for a moment
+/// ([`FROZEN_BEFORE_STOP`], SIGSTOP: a node descheduled on a busy machine, or still in a debug
+/// build's proof of work), so it acknowledges nothing and the anchor's congestion window toward it
+/// fills with the echo. The anchor is stopped (SIGINT) then, and the forward let go
+/// [`FROZEN_AFTER_STOP`] later. The anchor's CONNECTION_CLOSE waits behind its queued data: quinn
+/// (0.11.19 and earlier, quinn-rs/quinn#2785) holds a close back with the data, the connection's
+/// closing period (three probe timeouts, under 100 ms here) ends first, and the close never leaves.
+/// That is the debug red's cause, measured: the anchor made the close for the forward's connection
+/// and no datagram for it reached the socket. The forward must still say, within
+/// [`CLOSED_WITHIN`], that its anchor **stopped**: not that it answered nothing, 8 s or more later,
+/// or that it reset. That is what a stopping node's goodbye, said on a stream while the connection
+/// still runs and waited for, is for.
 ///
 /// Mutation: the goodbye not said (the close left to carry the news alone) → red.
 #[test]
@@ -290,11 +295,24 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool) -> RelayWorl
     }
 
     // ---- the anchor is stopped, and stays down --------------------------------------------------
+    let fwd_pid = w.fwd.as_mut().unwrap().child.id().to_string();
+    if carrying {
+        let _ = std::process::Command::new("kill")
+            .args(["-STOP", &fwd_pid])
+            .status();
+        std::thread::sleep(FROZEN_BEFORE_STOP);
+    }
     let at_stop = transfer.as_ref().map(Transfer::echoed);
     let stopped = Instant::now();
     let _ = std::process::Command::new("kill")
         .args([&format!("-{signal}"), &w.anchor.proc.child.id().to_string()])
         .status();
+    if carrying {
+        std::thread::sleep(FROZEN_AFTER_STOP);
+        let _ = std::process::Command::new("kill")
+            .args(["-CONT", &fwd_pid])
+            .status();
+    }
     while w.anchor.proc.child.try_wait().ok().flatten().is_none() {
         assert!(
             stopped.elapsed() < Duration::from_secs(10),
@@ -304,10 +322,10 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool) -> RelayWorl
     }
     let exited = stopped.elapsed();
     if let (Some(t), Some(before)) = (&transfer, at_stop) {
-        // Still moving while the anchor was stopping: its connection to the forward had data
-        // queued when its close was made, which is the case this arm exists for.
         eprintln!(
-            "[proof] the transfer echoed {} more bytes between the signal and the anchor's exit",
+            "[proof] the forward was held {FROZEN_BEFORE_STOP:?} before the stop and \
+             {FROZEN_AFTER_STOP:?} after it; the transfer echoed {} more bytes between the signal \
+             and the anchor's exit",
             t.echoed().saturating_sub(before)
         );
     }
@@ -360,6 +378,13 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool) -> RelayWorl
 /// How many bytes a transfer must have echoed before the anchor is stopped, so it is known to be
 /// moving through the circuit.
 const TRANSFER_FLOWING: u64 = 1 << 20;
+/// How long the forward is held still before the anchor is stopped: long enough for the anchor's
+/// congestion window toward it to fill, since nothing it sends is acknowledged.
+const FROZEN_BEFORE_STOP: Duration = Duration::from_millis(500);
+/// How long the forward stays held after the stop: past the anchor's closing period (three probe
+/// timeouts, under 100 ms on loopback), so a close held back by its queued data is never sent, and
+/// well short of how long a stopping node waits for its goodbye to be heard (500 ms).
+const FROZEN_AFTER_STOP: Duration = Duration::from_millis(150);
 
 /// A bulk echo through the forward: one thread writes as fast as the path takes it, another reads
 /// the echo back and counts it. Stopped when dropped.
