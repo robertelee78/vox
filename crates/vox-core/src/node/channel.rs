@@ -5321,6 +5321,104 @@ impl ChannelState {
         self.append_governance(profile, &fact.to_wire(), now_secs)
     }
 
+    /// Make `member` an admin of the room (V030-08, the decider 2026-10-01): an admin
+    /// certificate from the creator, carrying `admin`. Only the creator may — not another admin —
+    /// and only for a member of the room.
+    pub fn add_admin(
+        &mut self,
+        profile: &Profile,
+        member: &Digest32,
+        now_secs: u64,
+    ) -> Result<Digest32> {
+        let signer = profile.signer()?;
+        if signer.fingerprint() != self.evaluator.root_admin() {
+            return Err(Error::Profile(
+                "only the room's creator may add or remove an admin",
+            ));
+        }
+        if *member == signer.fingerprint() {
+            return Err(Error::Profile("the room's creator is its admin already"));
+        }
+        if !self.is_member(member) {
+            return Err(Error::Profile("that identity is not a member of the room"));
+        }
+        let key = self
+            .authors
+            .get(member)
+            .cloned()
+            .ok_or(Error::Profile("that identity is not a member of the room"))?;
+        let cert = crate::governance::cert::AdminCert::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            key,
+            crate::governance::capability::CapabilitySet::from_iter_caps([
+                crate::governance::capability::Capability::Admin,
+            ]),
+            0,
+        )?;
+        self.append_governance(profile, &cert.to_wire(), now_secs)
+    }
+
+    /// Take `member`'s admin back (V030-08): revoke every admin certificate the creator issued
+    /// it. Only the creator may.
+    pub fn remove_admin(
+        &mut self,
+        profile: &Profile,
+        member: &Digest32,
+        now_secs: u64,
+    ) -> Result<usize> {
+        use crate::governance::entry::GovBody;
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        if me != self.evaluator.root_admin() {
+            return Err(Error::Profile(
+                "only the room's creator may add or remove an admin",
+            ));
+        }
+        let revoked: BTreeSet<Digest32> = self
+            .gov_entries
+            .iter()
+            .filter_map(|e| match &e.body {
+                GovBody::AdminRevocation(r) => Some(r.body.revoked_delegation_hash),
+                _ => None,
+            })
+            .collect();
+        let certs: Vec<Digest32> = self
+            .gov_entries
+            .iter()
+            .filter(|e| {
+                matches!(&e.body, GovBody::AdminCert(c)
+                    if c.body.issuer_id == me && c.body.delegate_pubkey.fingerprint() == *member)
+            })
+            .map(|e| e.entry_hash)
+            .filter(|h| !revoked.contains(h))
+            .collect();
+        if certs.is_empty() {
+            return Err(Error::Profile("that member is not an admin of the room"));
+        }
+        for hash in &certs {
+            let rev = crate::governance::cert::AdminRevocation::build(
+                signer,
+                &self.channel_id,
+                self.epoch,
+                *hash,
+                crate::governance::cert::RevocationReason::NoLongerNeeded,
+            )?;
+            self.append_governance(profile, &rev.to_wire(), now_secs)?;
+        }
+        Ok(certs.len())
+    }
+
+    /// The room's admins, the creator first (V030-08).
+    #[must_use]
+    pub fn admins(&self) -> Vec<Digest32> {
+        let root = self.evaluator.root_admin();
+        std::iter::once(root)
+            .chain(self.evaluator.admins().into_iter().filter(|a| *a != root))
+            .collect()
+    }
+
     /// Choose the room's idle end (V030-08): it ends after `idle_secs` with nothing said in it.
     /// Only its creator may, and `vox room create` is where it does.
     pub fn choose_idle_end(

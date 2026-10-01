@@ -107,6 +107,8 @@ pub struct ChannelDetail {
     /// Who this identity consents to reading it here (ADR-007), in fingerprint order. Read off
     /// the log, so a revocation takes one out; what a client shows as consent (V210-82).
     pub consented: Vec<Digest32>,
+    /// The room's admins, its creator first (V030-08): who may end it.
+    pub admins: Vec<Digest32>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -264,6 +266,15 @@ pub enum NodeCommand {
     ForgetRoom {
         /// The channelID.
         channel_id: Digest32,
+    },
+    /// Make a member an admin of a room, or take it back (V030-08). Only its creator may.
+    SetAdmin {
+        /// The channelID.
+        channel_id: Digest32,
+        /// The member.
+        member: Digest32,
+        /// `true` to add, `false` to remove.
+        admin: bool,
     },
     /// End a room for everyone (V030-08). Only its creator may.
     EndRoom {
@@ -596,6 +607,8 @@ pub enum Fault {
     /// This node joined the room a moment ago and is still reading it; its own entries wait until
     /// it has (V030-08: a member that joins again must not reuse a position of its earlier feed).
     StillJoining,
+    /// The member named is not an admin of the room, so there is no admin to take back (V030-08).
+    NotAnAdmin,
     /// The room's stored log was written by vox before v0.3.0, whose message format changed;
     /// v0.3.0 does not read it, and the room is made again (decider, 2026-09-29, #226).
     RoomFromBeforeV030,
@@ -707,6 +720,9 @@ impl Fault {
             }
             Fault::NotCreator => {
                 "only the room's creator, or an admin it delegated, may do that — and this identity is neither"
+            }
+            Fault::NotAnAdmin => {
+                "that member is not an admin of the room\n       `vox room admin list` shows who is"
             }
             Fault::StillJoining => {
                 "this node joined the room a moment ago and is still reading it\n       try again in a moment"

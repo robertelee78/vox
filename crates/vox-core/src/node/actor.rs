@@ -187,6 +187,7 @@ fn detail_of(ch: &ChannelState) -> ChannelDetail {
         equivocations: ch.equivocations(),
         creator: ch.genesis().creator_pubkey().fingerprint(),
         consented: ch.consented().into_iter().collect(),
+        admins: ch.admins(),
     }
 }
 
@@ -3101,6 +3102,11 @@ impl Node {
             NodeCommand::LeaveRoom { channel_id } => self.leave_room(&channel_id, false).await,
             NodeCommand::ForgetRoom { channel_id } => self.forget_room(&channel_id).await,
             NodeCommand::EndRoom { channel_id } => self.end_room(&channel_id).await,
+            NodeCommand::SetAdmin {
+                channel_id,
+                member,
+                admin,
+            } => self.set_admin(&channel_id, &member, admin).await,
             NodeCommand::ChooseIdleEnd {
                 channel_id,
                 idle_secs,
@@ -9418,6 +9424,37 @@ impl Node {
         Outcome::Done
     }
 
+    /// Make a member an admin, or take it back (V030-08).
+    async fn set_admin(
+        &mut self,
+        channel_id: &Digest32,
+        member: &Digest32,
+        admin: bool,
+    ) -> Outcome {
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        {
+            let mut ch = shared.lock().await;
+            let done = if admin {
+                ch.add_admin(profile, member, now).map(|_| ())
+            } else {
+                ch.remove_admin(profile, member, now).map(|_| ())
+            };
+            if let Err(e) = done {
+                return Outcome::Failed(fault_of(&e));
+            }
+            self.fresh_details
+                .insert(*channel_id, (summary_of(&ch), detail_of(&ch)));
+        }
+        self.note_local_append(channel_id);
+        Outcome::Done
+    }
+
     /// Choose a room's idle end (V030-08).
     async fn choose_idle_end(&mut self, channel_id: &Digest32, idle_secs: u64) -> Outcome {
         let now = self.now();
@@ -10800,6 +10837,11 @@ fn fault_of(e: &Error) -> Fault {
         Error::Profile("this node is still reading the room after joining it") => {
             Fault::StillJoining
         }
+        Error::Profile("only the room's creator may add or remove an admin") => Fault::NotCreator,
+        Error::Profile("that member is not an admin of the room") => Fault::NotAnAdmin,
+        Error::Profile(
+            "that identity is not a member of the room" | "the room's creator is its admin already",
+        ) => Fault::NotAdmitted,
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,
         // A join refused before the challenge (the responder does not hold that
         // channel open) reaches the joiner as a malformed exchange; report it as the

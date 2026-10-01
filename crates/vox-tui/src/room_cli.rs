@@ -3011,3 +3011,75 @@ fn forget_cursors(paths: &Paths, channel_id: &Digest32, name: &str) -> usize {
     }
     gone
 }
+
+/// `vox room admin add|remove|list` — a room's admins (V030-08).
+///
+/// # Errors
+/// An unknown action, an unreachable node, an unknown or closed room, an unknown member, a
+/// caller who did not create the room, or a member who is not an admin (`remove`).
+pub async fn admin(
+    paths: &Paths,
+    action: &str,
+    room: &str,
+    member: Option<&str>,
+) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    if action == "list" {
+        return match client.request(&Request::Admins { channel_id }).await {
+            Ok(Frame::Members { members }) => {
+                for (i, m) in members.iter().enumerate() {
+                    println!("{}{}", id(m), if i == 0 { "  (creator)" } else { "" });
+                }
+                Ok(())
+            }
+            Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+            Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => Err(AppError::Usage(e.to_string())),
+        };
+    }
+    let add = match action {
+        "add" => true,
+        "remove" => false,
+        other => {
+            return Err(AppError::Usage(format!(
+                "{other:?} is not an admin action: use add, remove or list"
+            )))
+        }
+    };
+    let Some(member) = member else {
+        return Err(AppError::Usage(format!(
+            "`vox room admin {action}` needs the member's fingerprint (`vox room roster` lists them)"
+        )));
+    };
+    let members = match client.request(&Request::Roster { channel_id }).await {
+        Ok(Frame::Members { members }) => members,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let member = resolve_prefix(member, &members)?;
+    match client
+        .request(&Request::SetAdmin {
+            channel_id,
+            member,
+            admin: add,
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!(
+                "vox: {} is {} admin of {}",
+                short(&member),
+                if add { "now an" } else { "no longer an" },
+                short(&channel_id)
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+            "cannot {action} the admin: {reason}"
+        ))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}

@@ -21,8 +21,10 @@
 //!   roster loses her), then nothing of the room is left on her node: `vox room list` lacks it, it
 //!   does not come back when her daemon restarts, and her `store.redb` no longer holds the room's
 //!   id, which every one of its rows is keyed by. Before the forget it does: the control.
-//! - **End.** Bob, who did not create the room, is refused `vox room end`. Alice, its creator,
-//!   ends it. Within [`WITHIN`] every member's `vox room list` says it ended, every member's post
+//! - **End.** Bob, who did not create the room, is refused `vox room admin add`. Alice, its
+//!   creator, makes bob and carol admins (`vox room admin add`) and takes carol's back (`remove`);
+//!   every member's `vox room admin list` says so. Carol is then refused `vox room end`, and bob, an
+//!   admin, ends the room. Within [`WITHIN`] every member's `vox room list` says it ended, every member's post
 //!   is refused, and what was said before stays readable.
 //! - **Idle end.** Alice makes a room with `vox room create --idle-end` [`IDLE`]. A message said
 //!   before the idle time runs out keeps it going past [`IDLE`] from its creation; once nothing is
@@ -41,7 +43,7 @@
 //!
 //! **Mutations that must turn it red:** a member that left still synced with (leave); a member
 //! that joined again not saying it is back (rejoin); the room's rows not deleted (forget); a post
-//! taken after the end (end); the idle end ignored (idle end).
+//! taken after the end, or an admin's end ignored (end); the idle end ignored (idle end).
 
 #![cfg(unix)]
 
@@ -403,10 +405,11 @@ fn a_forgotten_room_leaves_nothing_on_the_node() {
 
 #[test]
 #[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
-fn only_the_creator_ends_a_room_and_then_it_takes_no_new_message() {
+fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
     watchdog::arm();
     let rt = runtime();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let room = room_of(&rt, tmp.path(), &["alice", "bob", "carol"]);
     let [alice, bob, carol] = &room.workers[..] else {
         unreachable!()
@@ -414,18 +417,50 @@ fn only_the_creator_ends_a_room_and_then_it_takes_no_new_message() {
     let id = room.id.as_str();
     setup(bob, &["room", "post", id, "said before the end"]);
 
-    let o = bob.vox(None, &["room", "end", id]);
+    // Only the creator names admins.
+    let o = bob.vox(None, &["room", "admin", "add", id, &carol.b32()]);
     assert!(
         !o.ok && o.stderr.contains("creator"),
-        "PRODUCT: bob, who did not create the room, was not refused `vox room end` as not its \
-         creator: {o:?}"
+        "PRODUCT: bob, who did not create the room, was not refused `vox room admin add`: {o:?}"
+    );
+    // Alice, the creator, makes bob and carol admins, then takes carol's back.
+    for (args, what) in [
+        (["room", "admin", "add", id, &bob.b32()], "add bob"),
+        (["room", "admin", "add", id, &carol.b32()], "add carol"),
+        (
+            ["room", "admin", "remove", id, &carol.b32()],
+            "remove carol",
+        ),
+    ] {
+        let o = alice.vox(None, &args);
+        assert!(
+            o.ok,
+            "PRODUCT: the creator's `vox room admin {what}` was refused: {o:?}"
+        );
+    }
+    for w in [bob, carol] {
+        let (seen, o) = poll(w, &["room", "admin", "list", id], WITHIN, |o| {
+            o.ok && o.stdout.contains(&bob.b32()) && !o.stdout.contains(&carol.b32())
+        });
+        assert!(
+            seen,
+            "PRODUCT: {WITHIN:?} after alice made bob an admin and took carol's back, {}'s \
+             `vox room admin list` does not say so: {o:?}",
+            w.name
+        );
+    }
+    // An admin whose admin was taken back may not end the room.
+    let o = carol.vox(None, &["room", "end", id]);
+    assert!(
+        !o.ok && o.stderr.contains("creator"),
+        "PRODUCT: carol, whose admin was taken back, was not refused `vox room end`: {o:?}"
     );
 
     let t = Instant::now();
-    let o = alice.vox(None, &["room", "end", id]);
+    let o = bob.vox(None, &["room", "end", id]);
     assert!(
         o.ok,
-        "PRODUCT: the creator's `vox room end` was refused: {o:?}"
+        "PRODUCT: bob, an admin the creator named, was refused `vox room end`: {o:?}"
     );
     for w in [alice, bob, carol] {
         let (ended, o) = poll(w, &["room", "list"], WITHIN, |o| {
@@ -435,8 +470,8 @@ fn only_the_creator_ends_a_room_and_then_it_takes_no_new_message() {
         });
         assert!(
             ended,
-            "PRODUCT: {WITHIN:?} after the creator ended the room, {}'s `vox room list` does \
-             not say it ended: {o:?}",
+            "PRODUCT: {WITHIN:?} after bob, an admin, ended the room, {}'s `vox room list` \
+             does not say it ended: {o:?}",
             w.name
         );
     }

@@ -267,6 +267,8 @@ const T_LEAVE: u64 = 30;
 const T_FORGET: u64 = 31;
 const T_END: u64 = 32;
 const T_IDLE_END: u64 = 33;
+const T_SET_ADMIN: u64 = 34;
+const T_ADMINS: u64 = 35;
 /// `NodeEvent::RoomQuiet` and `NodeEvent::RoomForgotten` (V030-08). Additive.
 const T_ROOM_QUIET: u64 = 2440;
 const T_ROOM_FORGOTTEN: u64 = 2441;
@@ -425,6 +427,20 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
+    /// Make a member an admin of a room, or take it back (V030-08); its creator only.
+    SetAdmin {
+        /// The room.
+        channel_id: Digest32,
+        /// The member.
+        member: Digest32,
+        /// `true` to add, `false` to remove.
+        admin: bool,
+    },
+    /// A room's admins, its creator first (V030-08): answered as [`Frame::Members`].
+    Admins {
+        /// The room.
+        channel_id: Digest32,
+    },
     /// Choose a room's idle end (V030-08); its creator only.
     IdleEnd {
         /// The room.
@@ -560,6 +576,20 @@ impl Request {
             }
             Request::Leave { channel_id } => {
                 e.array(2).uint(T_LEAVE).bytes(channel_id);
+            }
+            Request::SetAdmin {
+                channel_id,
+                member,
+                admin,
+            } => {
+                e.array(4)
+                    .uint(T_SET_ADMIN)
+                    .bytes(channel_id)
+                    .bytes(member)
+                    .uint(u64::from(*admin));
+            }
+            Request::Admins { channel_id } => {
+                e.array(2).uint(T_ADMINS).bytes(channel_id);
             }
             Request::Forget { channel_id } => {
                 e.array(2).uint(T_FORGET).bytes(channel_id);
@@ -863,6 +893,24 @@ impl Request {
                     T_FORGET => Request::Forget { channel_id },
                     _ => Request::End { channel_id },
                 })
+            }
+            (T_SET_ADMIN, 4) => {
+                let channel_id = digest(&mut d)?;
+                let member = digest(&mut d)?;
+                let admin = d.uint().map_err(|_| Error::MalformedIpc("ipc admin"))? != 0;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SetAdmin {
+                    channel_id,
+                    member,
+                    admin,
+                })
+            }
+            (T_ADMINS, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Admins { channel_id })
             }
             (T_IDLE_END, 3) => {
                 let channel_id = digest(&mut d)?;
@@ -2544,6 +2592,36 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 crate::node::api::NodeCommand::EndRoom { channel_id },
             )
             .await
+        }
+        Request::SetAdmin {
+            channel_id,
+            member,
+            admin,
+        } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::SetAdmin {
+                    channel_id,
+                    member,
+                    admin,
+                },
+            )
+            .await
+        }
+        Request::Admins { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Members {
+                    members: detail.admins.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
         }
         Request::IdleEnd {
             channel_id,
