@@ -512,3 +512,103 @@ pub async fn post_raw(w: &Worker, cid: [u8; 32], text: &str) {
         other => panic!("raw post refused: {other:?}"),
     }
 }
+
+/// Put a recording `vox` at `bin_dir/vox` for a model's shell: it runs the real binary and
+/// appends to `log` a `call` line before and an `exit` line (status and stderr) after every
+/// command. **It is what tells a product red from an apparatus red** in a live-model proof:
+/// a command the model never ran is the apparatus, a command `vox` refused is the product,
+/// and only a command `vox` accepted can be waited for. The plugin calls `VOX_BIN` directly,
+/// so only the model's own commands land here.
+pub fn model_shim(bin_dir: &std::path::Path, log: &std::path::Path) {
+    let shim = bin_dir.join("vox");
+    let _ = std::fs::remove_file(&shim);
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\n\
+             printf 'call\\t%s\\n' \"$*\" >> '{log}'\n\
+             err=$(mktemp \"${{TMPDIR:-/tmp}}/vox-shim.XXXXXX\")\n\
+             '{vox}' \"$@\" 2>\"$err\"\n\
+             rc=$?\n\
+             cat \"$err\" >&2\n\
+             printf 'exit\\t%s\\t%s\\t%s\\n' \"$rc\" \"$*\" \"$(tr '\\n\\t' '  ' < \"$err\")\" >> '{log}'\n\
+             rm -f \"$err\"\n\
+             exit $rc\n",
+            log = log.display(),
+            vox = VOX
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+/// One command a model's shell ran through [`model_shim`].
+#[derive(Debug, Clone)]
+pub struct ModelCall {
+    pub args: String,
+    /// `vox`'s exit status and stderr; `None` when it never returned.
+    pub exit: Option<(i32, String)>,
+}
+
+/// Every command in a [`model_shim`] log, each paired with its own exit.
+pub fn model_calls(log: &std::path::Path) -> Vec<ModelCall> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let mut calls: Vec<ModelCall> = Vec::new();
+    for l in text.lines() {
+        let f: Vec<&str> = l.splitn(4, '\t').collect();
+        match f.as_slice() {
+            ["call", args] => calls.push(ModelCall {
+                args: (*args).to_owned(),
+                exit: None,
+            }),
+            ["exit", rc, args, err] => {
+                if let Some(c) = calls
+                    .iter_mut()
+                    .find(|c| c.exit.is_none() && c.args == *args)
+                {
+                    c.exit = Some((rc.parse().unwrap_or(-1), err.trim().to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+    calls
+}
+
+/// Judge a model's run of one `vox` command, found in `log` by `matches`: **vox refusing it
+/// is a PRODUCT red quoting the refusal**, and vox never returning is one too. Returns
+/// `false` when the model never ran it — the apparatus, which the caller names.
+pub fn vox_accepted(
+    log: &std::path::Path,
+    who: &str,
+    what: &str,
+    matches: impl Fn(&str) -> bool,
+) -> bool {
+    let calls = model_calls(log);
+    let Some(c) = calls.iter().find(|c| matches(&c.args)) else {
+        return false;
+    };
+    match &c.exit {
+        Some((0, _)) => true,
+        Some((rc, err)) => panic!(
+            "PRODUCT: vox refused {who}'s {what} (`vox {}`), exit {rc}: {err}",
+            c.args
+        ),
+        None => panic!(
+            "PRODUCT: {who}'s {what} (`vox {}`) never returned before the model's turn ended",
+            c.args
+        ),
+    }
+}
+
+/// [`until`] for something `vox` already accepted with exit 0: its never arriving is the
+/// product's failure, and the red says so.
+pub fn arrives(w: &Worker, what: &str, args: &[&str], ok: impl Fn(&Out) -> bool) -> Out {
+    until(
+        w,
+        None,
+        &format!("{what} (PRODUCT: vox accepted it with exit 0, and it never arrived)"),
+        args,
+        ok,
+    )
+}

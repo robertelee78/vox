@@ -836,6 +836,12 @@ that proves it.**
     every checkpoint;
   - a `release` is never recorded as Done;
   - a `result` moves an item to Acceptance at most, never to Release ready or Done;
+
+  The two bullets above are **the stub tracker's own rules, not product proofs**: Vox has no Work phase,
+  so only the stub's own code can move an item past Acceptance, and no change to Vox can turn them red or
+  green (a mutant run found none, 2026-10-01). What Vox contributes to them — the typed `result` row with
+  its attempt and evidence, and the board after a `release` — is proved by the other assertions. The proof
+  names a red on them APPARATUS.
   - `blocked` may change Health but never Work phase;
   - a `failed` attempt leaves the item retryable;
   - **the operator runs no command.**
