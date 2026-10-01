@@ -156,8 +156,17 @@ fn note_lateness(shaped: bool, due: Instant) {
     if shaped {
         let late = Instant::now().saturating_duration_since(due).as_micros() as u64;
         LATENESS_US.fetch_max(late, std::sync::atomic::Ordering::Relaxed);
+        RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if late >= 4_000 {
+            RELEASED_LATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
+
+/// Packets the emulator released on a shaped link, and how many of them at least 4 ms late (the
+/// rise tier 2 reads as a queue): what share of a second's packets ran late, for ADR-024's arms.
+static RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RELEASED_LATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The longest lateness since the last call, and start counting afresh.
 fn take_lateness() -> Duration {
@@ -761,6 +770,7 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         Arc::clone(&bottleneck),
         SEED_TUNNEL,
     );
+    let _ = TUNNEL_CARRIED.set(Arc::clone(&carried));
     let advertise = shaped.to_string();
     let port_s = port.to_string();
     let host = Proc::spawn(
@@ -975,7 +985,10 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     shown(&format!("uptime at end: {}", uptime()));
     assert!(
         later.is_empty(),
-        "CANNOT MEASURE: the tunnel fell back to a relay during the timed transfers: {later:?}"
+        "CANNOT MEASURE: the tunnel fell back to a relay during the timed transfers: {later:?}\n\
+         host said:\n{}\nforward said:\n{}",
+        host.said().join("\n"),
+        forward.said().join("\n")
     );
     assert!(
         failed.is_empty(),
@@ -1190,27 +1203,44 @@ struct Window {
     vox: f64,
     other: f64,
     late: Duration,
+    /// Bits per second the tunnel's emulated link carried toward the host in this window.
+    crossed: f64,
+    /// The share of the packets released in this window at least 4 ms late.
+    late_share: f64,
 }
+
+/// The byte counter of the tunnel's emulated link toward the host, set once the shaper is up.
+static TUNNEL_CARRIED: std::sync::OnceLock<Arc<std::sync::atomic::AtomicU64>> =
+    std::sync::OnceLock::new();
 
 /// Read both counters every [`WINDOW`] for `dur`; `at` runs before each window (to change the link).
 fn windows(dur: Duration, mut at: impl FnMut(Duration)) -> Vec<Window> {
     use std::sync::atomic::Ordering::Relaxed;
     let start = Instant::now();
-    let (mut v0, mut c0) = (STREAMED.load(Relaxed), COMPETED.load(Relaxed));
+    let carried = || TUNNEL_CARRIED.get().map_or(0, |c| c.load(Relaxed));
+    let (mut v0, mut c0, mut x0) = (STREAMED.load(Relaxed), COMPETED.load(Relaxed), carried());
+    let (mut r0, mut l0) = (RELEASED.load(Relaxed), RELEASED_LATE.load(Relaxed));
     let _ = take_lateness();
     let mut out = Vec::new();
     let mut k = 1u32;
     while WINDOW * (k - 1) < dur {
         at(WINDOW * (k - 1));
         sleep_until(start + WINDOW * k);
-        let (v, c) = (STREAMED.load(Relaxed), COMPETED.load(Relaxed));
+        let (v, c, x) = (STREAMED.load(Relaxed), COMPETED.load(Relaxed), carried());
         let s = WINDOW.as_secs_f64();
         out.push(Window {
             vox: (v - v0) as f64 * 8.0 / s,
             other: (c - c0) as f64 * 8.0 / s,
             late: take_lateness(),
+            crossed: (x - x0) as f64 * 8.0 / s,
+            late_share: {
+                let (r, l) = (RELEASED.load(Relaxed), RELEASED_LATE.load(Relaxed));
+                let share = (l - l0) as f64 / (r - r0).max(1) as f64;
+                (r0, l0) = (r, l);
+                share
+            },
         });
-        (v0, c0) = (v, c);
+        (v0, c0, x0) = (v, c, x);
         k += 1;
     }
     out
@@ -1232,21 +1262,18 @@ fn mbit(w: &[Window], f: impl Fn(&Window) -> f64) -> Vec<String> {
 /// 4 ms rise in a round's minimum round trip. A round's minimum is over every packet in it, so one
 /// late release does not move it, but lateness that lasts can fake or hide it (ADR-024).
 fn late_fault(arm: &str, w: &[Window]) -> Option<String> {
-    let mut ms: Vec<Duration> = w.iter().map(|x| x.late).collect();
-    ms.sort_unstable();
-    let median = ms.get(ms.len() / 2).copied().unwrap_or_default();
-    let over = w.iter().filter(|x| x.late >= QUEUE_SIGNAL_LATENESS).count();
-    if median >= QUEUE_SIGNAL_LATENESS || over as f64 > LATE_SECONDS_SHARE * w.len() as f64 {
+    let over = w.iter().filter(|x| x.late_share >= LATE_PACKET_SHARE).count();
+    if over as f64 > LATE_SECONDS_SHARE * w.len() as f64 {
         return Some(format!(
-            "CANNOT MEASURE {arm} (APPARATUS): the emulator ran at least {} ms late in {over} of {} \
-             judged seconds (median {} ms; more than {:.0}% of them, or the median, can fake or hide \
-             the 4 ms rise tier 2 reads as a queue), so this arm measured the emulator, not vox; \
-             per-second lateness {:?} ms; load: {}",
-            QUEUE_SIGNAL_LATENESS.as_millis(),
+            "CANNOT MEASURE {arm} (APPARATUS): in {over} of {} judged seconds the emulator released \
+             at least {:.0}% of the packets {} ms or more late (more than {:.0}% of the seconds; \
+             lateness that lasts across a round can fake or hide the 4 ms rise tier 2 reads as a \
+             queue), so this arm measured the emulator, not vox; per-second late share {:?}; load: {}",
             w.len(),
-            median.as_millis(),
+            LATE_PACKET_SHARE * 100.0,
+            QUEUE_SIGNAL_LATENESS.as_millis(),
             LATE_SECONDS_SHARE * 100.0,
-            w.iter().map(|x| x.late.as_millis()).collect::<Vec<_>>(),
+            w.iter().map(|x| format!("{:.2}", x.late_share)).collect::<Vec<_>>(),
             uptime()
         ));
     }
@@ -1271,12 +1298,22 @@ fn late_fault(arm: &str, w: &[Window]) -> Option<String> {
 fn lateness(w: &[Window]) -> String {
     let mut ms: Vec<u128> = w.iter().map(|x| x.late.as_millis()).collect();
     ms.sort_unstable();
-    let late = w.iter().filter(|x| x.late >= QUEUE_SIGNAL_LATENESS).count();
+    let at: Vec<usize> = w
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.late >= QUEUE_SIGNAL_LATENESS)
+        .map(|(i, _)| i)
+        .collect();
+    let shares: Vec<String> = w.iter().map(|x| format!("{:.2}", x.late_share)).collect();
     format!(
-        "emulator lateness per second: max {} ms, median {} ms, {late} of {} seconds at or over {} ms",
+        "emulator lateness per second: max {} ms, median {} ms, {} of {} seconds at or over {} ms \
+         (judged seconds {at:?}, counted from 0); share of packets released {} ms or more late, per \
+         second: {shares:?}",
         ms.last().copied().unwrap_or_default(),
         ms.get(ms.len() / 2).copied().unwrap_or_default(),
+        at.len(),
         w.len(),
+        QUEUE_SIGNAL_LATENESS.as_millis(),
         QUEUE_SIGNAL_LATENESS.as_millis()
     )
 }
@@ -1284,9 +1321,28 @@ fn lateness(w: &[Window]) -> String {
 /// The rise in a round's minimum round trip that tier 2 reads as a queue (ADR-024,
 /// `QUEUE_DELAY_MIN`): emulator lateness at this size can fake or hide the signal.
 const QUEUE_SIGNAL_LATENESS: Duration = Duration::from_millis(4);
-/// The share of an arm's judged seconds that may run [`QUEUE_SIGNAL_LATENESS`] late before the arm
-/// measures the emulator, not vox (ADR-024; to be calibrated from the counts every arm prints).
+/// The share of an arm's judged seconds that may be late seconds (below) before the arm measures
+/// the emulator, not vox (ADR-024; to be calibrated from the shares every arm prints).
 const LATE_SECONDS_SHARE: f64 = 0.10;
+/// A late second: at least this share of its packets released [`QUEUE_SIGNAL_LATENESS`] or more
+/// late. A round's minimum round trip is over every packet in the round (about 25 at 200 Mbit/s),
+/// so one late release does not move it: only lateness that holds across most of a round does.
+const LATE_PACKET_SHARE: f64 = 0.5;
+
+/// The tunnel's bytes must have crossed its emulated link, or the arm measured some other path (a
+/// relay through the anchor, say) and the link's figures say nothing about it.
+fn crossed_fault(arm: &str, w: &[Window]) -> Option<String> {
+    let (sent, crossed) = (mean_of(w, |x| x.vox), mean_of(w, |x| x.crossed));
+    (crossed < 0.95 * sent).then(|| {
+        format!(
+            "CANNOT MEASURE {arm} (APPARATUS): the tunnel delivered {:.1} Mbit/s but its emulated \
+             link carried only {:.1} Mbit/s toward the host, so the rest took another path (a relay?) \
+             and this arm did not measure the link",
+            sent / 1e6,
+            crossed / 1e6
+        )
+    })
+}
 
 /// Record an arm's CANNOT MEASURE as it happens: a product red on another arm ends the run first, and
 /// must not hide it.
@@ -1511,7 +1567,7 @@ fn taper_arms(
         let _ = pump.join();
         std::thread::sleep(Duration::from_secs(1));
         let w = &all[SETTLE.as_secs() as usize..];
-        if let Some(e) = late_fault(CLEAN_LAN.name, w) {
+        if let Some(e) = late_fault(CLEAN_LAN.name, w).or_else(|| crossed_fault(CLEAN_LAN.name, w)) {
             cant(cannot, e);
             break 'clean;
         }
@@ -1567,6 +1623,7 @@ fn taper_arms(
         stop.store(true, Relaxed);
         std::thread::sleep(Duration::from_secs(1));
         if let Some(e) = late_fault(lossy.name, &v)
+            .or_else(|| crossed_fault(lossy.name, &v))
             .or_else(|| late_fault(lossy.name, &c))
             .or_else(|| competed_fault(lossy.name, &c))
         {
@@ -1617,7 +1674,9 @@ fn taper_arms(
         let _ = pump.join();
         std::thread::sleep(Duration::from_secs(1));
         if let Some(e) =
-            late_fault(congested.name, &w).or_else(|| competed_fault(congested.name, &w))
+            late_fault(congested.name, &w)
+                .or_else(|| crossed_fault(congested.name, &w))
+                .or_else(|| competed_fault(congested.name, &w))
         {
             cant(cannot, e);
             continue;
@@ -1713,7 +1772,7 @@ fn taper_arms(
             &all[s + n..s + 2 * n],
             &all[s + 2 * n..s + 3 * n],
         );
-        if let Some(e) = late_fault(&name, &all[s..]) {
+        if let Some(e) = late_fault(&name, &all[s..]).or_else(|| crossed_fault(&name, &all[s..])) {
             cant(cannot, e);
             continue;
         }
@@ -1723,13 +1782,13 @@ fn taper_arms(
         let mut verdicts = Vec::new();
         if below(clean1) > 0 {
             verdicts.push(format!(
-                "{} of the first clean phase's seconds below the clean bar",
+                "phase CLEAN (first): {} of its seconds below the clean bar",
                 below(clean1)
             ));
         }
         if lossy_mean < lossy_bar {
             verdicts.push(format!(
-                "the lossy phase carried {:.1} Mbit/s, under {LOSSY_WIN:.1}x the Cubic flow on the \
+                "phase LOSSY: it carried {:.1} Mbit/s, under {LOSSY_WIN:.1}x the Cubic flow on the \
                  same loss ({:.1} Mbit/s)",
                 lossy_mean / 1e6,
                 lossy_bar / 1e6
@@ -1737,8 +1796,8 @@ fn taper_arms(
         }
         if below(&clean2[r..]) > 0 {
             verdicts.push(format!(
-                "{} of the second clean phase's seconds after the first {} s below the clean bar \
-                 (not back to full speed {} s after the loss ended, or fell back again)",
+                "phase RECOVERY (second clean): {} of its seconds after the first {} s below the clean \
+                 bar (not back to full speed {} s after the loss ended, or fell back again)",
                 below(&clean2[r..]),
                 RECOVER_WITHIN.as_secs(),
                 RECOVER_WITHIN.as_secs()
@@ -1748,8 +1807,12 @@ fn taper_arms(
             "ok".to_owned()
         } else {
             failed.push(format!(
-                "{name}: the emulator was on time; {}: vox is slow when the link changes",
-                verdicts.join("; ")
+                "{name}: the emulator was on time; {}: vox is slow when the link changes; \
+                 per-second clean {:?}, lossy {:?}, clean {:?} (Mbit/s)",
+                verdicts.join("; "),
+                mbit(clean1, |x| x.vox),
+                mbit(lossy, |x| x.vox),
+                mbit(clean2, |x| x.vox)
             ));
             "BELOW".to_owned()
         };
@@ -1799,7 +1862,9 @@ fn taper_arms(
         stop.store(true, Relaxed);
         let _ = pump.join();
         let judged_after = &after[CLIMB_WITHIN.as_secs() as usize..];
-        if let Some(e) = late_fault(PAUSED_NAME, judged_after) {
+        if let Some(e) =
+            late_fault(PAUSED_NAME, judged_after).or_else(|| crossed_fault(PAUSED_NAME, judged_after))
+        {
             cant(cannot, e);
             break 'paused;
         }
