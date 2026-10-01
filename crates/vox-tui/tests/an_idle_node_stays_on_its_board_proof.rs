@@ -122,27 +122,35 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, ttl: &str) -> V
     panic!("{name}'s daemon never answered `vox room list`");
 }
 
-/// A node's `publish.<what>` counter so far (`vox status --json`): `rounds` or `renewals`.
-fn publish(data: &Path, what: &str) -> u64 {
-    let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
-    assert!(ok, "vox status --json: {err}");
-    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("status is JSON");
-    v["publish"][what]
-        .as_u64()
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.{what}: {out}"))
+/// A node's publish counters at one instant (`vox status --json`): its renewals, its rounds, and
+/// its rounds by cause. **One read for all three**: read apart, a round landing between two reads
+/// is in one count and not the other.
+struct Publish {
+    renewals: u64,
+    rounds: u64,
+    by_cause: std::collections::BTreeMap<String, u64>,
 }
 
-/// A node's publish rounds by cause so far (`publish.by_cause` in `vox status --json`).
-fn by_cause(data: &Path) -> std::collections::BTreeMap<String, u64> {
+fn publish(data: &Path) -> Publish {
     let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
     assert!(ok, "vox status --json: {err}");
     let v: serde_json::Value = serde_json::from_str(out.trim()).expect("status is JSON");
-    v["publish"]["by_cause"]
-        .as_object()
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.by_cause: {out}"))
-        .iter()
-        .map(|(k, n)| (k.clone(), n.as_u64().unwrap_or(0)))
-        .collect()
+    let p = &v["publish"];
+    let n = |what: &str| {
+        p[what]
+            .as_u64()
+            .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.{what}: {out}"))
+    };
+    Publish {
+        renewals: n("renewals"),
+        rounds: n("rounds"),
+        by_cause: p["by_cause"]
+            .as_object()
+            .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.by_cause: {out}"))
+            .iter()
+            .map(|(k, n)| (k.clone(), n.as_u64().unwrap_or(0)))
+            .collect(),
+    }
 }
 
 /// `address` without the `a=<who>&b=<endpoint>` pair naming `who`: what is left names the anchor.
@@ -283,13 +291,9 @@ fn idle_then_join(churn: bool) {
     assert!(ok, "bob joins: {out}{err}");
 
     // ---- nobody does anything for several lifetimes -----------------------------------------
-    let (before, rounds_before) = (
-        publish(&alice_dir, "renewals"),
-        publish(&alice_dir, "rounds"),
-    );
-    let causes_before = by_cause(&alice_dir);
+    let alice_before = publish(&alice_dir);
     // Bob's renewals too: a board passes on another member's record only when it changed.
-    let bob_before = publish(&bob_dir, "renewals");
+    let bob_before = publish(&bob_dir).renewals;
     let idle = Duration::from_secs(ttl * LIFETIMES);
     let idle_from = Instant::now();
     let mut restarts = 0u32;
@@ -308,18 +312,20 @@ fn idle_then_join(churn: bool) {
         }
         None => std::thread::sleep(idle),
     }
-    let renewed = publish(&alice_dir, "renewals").saturating_sub(before);
-    let rounds = publish(&alice_dir, "rounds").saturating_sub(rounds_before);
+    let alice_after = publish(&alice_dir);
+    let renewed = alice_after.renewals.saturating_sub(alice_before.renewals);
+    let rounds = alice_after.rounds.saturating_sub(alice_before.rounds);
     // What asked for each round while everyone was idle.
-    let causes: std::collections::BTreeMap<String, u64> = by_cause(&alice_dir)
+    let causes: std::collections::BTreeMap<String, u64> = alice_after
+        .by_cause
         .into_iter()
         .map(|(k, n)| {
-            let was = causes_before.get(&k).copied().unwrap_or(0);
+            let was = alice_before.by_cause.get(&k).copied().unwrap_or(0);
             (k, n.saturating_sub(was))
         })
         .filter(|(_, n)| *n > 0)
         .collect();
-    let bob_renewed = publish(&bob_dir, "renewals").saturating_sub(bob_before);
+    let bob_renewed = publish(&bob_dir).renewals.saturating_sub(bob_before);
     println!(
         "[proof] alice's publish rounds while idle, by cause: {causes:?}; bob renewed \
          {bob_renewed} time(s)"
