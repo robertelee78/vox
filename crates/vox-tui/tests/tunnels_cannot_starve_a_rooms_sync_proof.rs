@@ -88,7 +88,7 @@ impl Kid {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(ok, "kill {sig} {}", self.0.id());
+        assert!(ok, "APPARATUS: kill {sig} {} did not take", self.0.id());
     }
 }
 
@@ -110,12 +110,15 @@ fn spawn_vox(m: &Member, args: &[&str], out: &Path) -> Kid {
         .env_remove("VOX_ROOM_PASSPHRASE")
         .env_remove("VOX_SESSION")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(out).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(out).expect("APPARATUS: create the stdout file"),
+        ))
         .stderr(Stdio::from(
-            std::fs::File::create(out.with_extension("err")).unwrap(),
+            std::fs::File::create(out.with_extension("err"))
+                .expect("APPARATUS: create the stderr file"),
         ))
         .spawn()
-        .expect("spawn vox");
+        .expect("APPARATUS: spawn vox");
     Kid(child)
 }
 
@@ -147,7 +150,7 @@ fn read_offsets(pid: u32, name: &str) -> Vec<u64> {
             "fon",
         ])
         .output()
-        .expect("lsof ran");
+        .expect("APPARATUS: run lsof");
     let text = String::from_utf8_lossy(&out.stdout);
     let (mut offset, mut offsets) = (None, Vec::new());
     for line in text.lines() {
@@ -237,7 +240,7 @@ fn summary(label: &str, got: &[Option<Duration>]) -> Option<Duration> {
 #[ignore = "two real daemons with production Argon2id and two frozen 256 MiB tunnels; CI runs it in release"]
 fn two_frozen_tunnels_do_not_stop_the_room() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let alice = Member::new(root, "alice");
     let bob = Member::new(root, "bob");
@@ -287,16 +290,22 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     // Alice offers a file far larger than a tunnel's window.
     let file = root.join("big.bin");
     {
-        let mut f = std::fs::File::create(&file).unwrap();
+        let mut f = std::fs::File::create(&file).expect("APPARATUS: create the offered file");
         let chunk: Vec<u8> = (0..1 << 20).map(|i: u32| (i % 251) as u8).collect();
         for _ in 0..FILE_BYTES >> 20 {
-            f.write_all(&chunk).unwrap();
+            f.write_all(&chunk)
+                .expect("APPARATUS: write the offered file");
         }
     }
     let send_out = root.join("send.out");
     let send = spawn_vox(
         &alice,
-        &["room", "send", &room, file.to_str().unwrap()],
+        &[
+            "room",
+            "send",
+            &room,
+            file.to_str().expect("APPARATUS: a UTF-8 path"),
+        ],
         &send_out,
     );
     let offered = Instant::now();
@@ -314,7 +323,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     let mut gets: Vec<(Kid, PathBuf)> = Vec::new();
     for g in 0..2 {
         let dir = root.join(format!("get{g}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("APPARATUS: create the download directory");
         let out = root.join(format!("get{g}.out"));
         let kid = spawn_vox(
             &bob,
@@ -324,7 +333,9 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
                 &room,
                 "big.bin",
                 "--out",
-                dir.join("big.bin").to_str().unwrap(),
+                dir.join("big.bin")
+                    .to_str()
+                    .expect("APPARATUS: a UTF-8 path"),
             ],
             &out,
         );
@@ -376,18 +387,27 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         .lines()
         .find_map(|l| l.split(" as ").nth(1))
         .map(str::trim)
-        .expect("vox room send names its offer's tag")
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: `vox room send` never printed its offer's tag (\"… as <tag>\"): {said:?}"
+            )
+        })
         .to_owned();
-    let host = rb
-        .author_of(cb, "big.bin")
-        .expect("Bob reads who offered big.bin");
+    // Bob has already read the offer above, so a missing author here is the control-socket read.
+    let host = rb.author_of(cb, "big.bin").unwrap_or_else(|| {
+        panic!("APPARATUS: Bob's control-socket read found no row naming big.bin, already read")
+    });
     let bound = rb.forward(cb, host, &tag);
     let written: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::default()).collect();
     let socks: Vec<TcpStream> = written
         .iter()
         .map(|count| {
-            let sock = TcpStream::connect(&bound).expect("connect to Bob's forward");
-            let mut w = sock.try_clone().unwrap();
+            let sock = TcpStream::connect(&bound).unwrap_or_else(|e| {
+                panic!("PRODUCT: Bob's daemon bound the forward at {bound} but it refuses a connection: {e}")
+            });
+            let mut w = sock
+                .try_clone()
+                .expect("APPARATUS: clone the forward socket");
             let count = Arc::clone(count);
             std::thread::spawn(move || {
                 let chunk = vec![0x5a_u8; 64 * 1024];
@@ -419,7 +439,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     for (arm, got) in [("download", download), ("upload", upload)] {
         assert!(
             got.iter().all(|m| m.is_some_and(|m| m <= BOUND)),
-            "{arm} arm: with two tunnels backpressured, a post was not read within {BOUND:?} \
+            "PRODUCT: {arm} arm: with two tunnels backpressured, a post was not read within {BOUND:?} \
              (alice→bob {:?}, bob→alice {:?}): the tunnels took the connection's credit",
             got[0],
             got[1]

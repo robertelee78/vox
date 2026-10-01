@@ -305,12 +305,15 @@ fn spawn_member(m: &Member, args: &[&str], out: &Path) -> Kid {
         .env_remove("VOX_ROOM_PASSPHRASE")
         .env_remove("VOX_SESSION")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(out).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(out).expect("APPARATUS: create the stdout file"),
+        ))
         .stderr(Stdio::from(
-            std::fs::File::create(out.with_extension("err")).unwrap(),
+            std::fs::File::create(out.with_extension("err"))
+                .expect("APPARATUS: create the stderr file"),
         ))
         .spawn()
-        .expect("spawn vox");
+        .expect("APPARATUS: spawn vox");
     Kid(child)
 }
 
@@ -342,7 +345,7 @@ fn read_offsets(pid: u32, name: &str) -> Option<Vec<u64>> {
             "fon",
         ])
         .output()
-        .expect("lsof ran");
+        .expect("APPARATUS: run lsof");
     let text = String::from_utf8_lossy(&out.stdout);
     let (mut offset, mut offsets, mut listed) = (None, Vec::new(), false);
     for line in text.lines() {
@@ -383,18 +386,24 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
     let name = "tail.bin";
     let file = root.join(format!("{n}-{name}"));
     {
-        let mut f = std::fs::File::create(&file).unwrap();
+        let mut f = std::fs::File::create(&file).expect("APPARATUS: create the offered file");
         let chunk: Vec<u8> = (0..1 << 20)
             .map(|i: u32| (i.wrapping_mul(7).wrapping_add(n as u32) % 251) as u8)
             .collect();
         for _ in 0..FILE_BYTES >> 20 {
-            f.write_all(&chunk).unwrap();
+            f.write_all(&chunk)
+                .expect("APPARATUS: write the offered file");
         }
     }
     let send_out = root.join(format!("send{n}.out"));
     let send = spawn_member(
         &alice,
-        &["room", "send", &room, file.to_str().unwrap()],
+        &[
+            "room",
+            "send",
+            &room,
+            file.to_str().expect("APPARATUS: a UTF-8 path"),
+        ],
         &send_out,
     );
     let offered = format!("{n}-{name}");
@@ -407,7 +416,7 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
         std::thread::sleep(Duration::from_millis(50));
     }
     let dir = root.join(format!("get{n}"));
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&dir).expect("APPARATUS: create the download directory");
     let get_out = root.join(format!("get{n}.out"));
     let _get = spawn_member(
         &bob,
@@ -417,7 +426,9 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
             &room,
             &offered,
             "--out",
-            dir.join(&offered).to_str().unwrap(),
+            dir.join(&offered)
+                .to_str()
+                .expect("APPARATUS: a UTF-8 path"),
         ],
         &get_out,
     );
@@ -463,12 +474,17 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
     let stop = Instant::now();
     alice_d.signal("-INT");
     let took = loop {
-        if alice_d.child.try_wait().unwrap().is_some() {
+        if alice_d
+            .child
+            .try_wait()
+            .expect("APPARATUS: poll Alice's daemon's exit")
+            .is_some()
+        {
             break stop.elapsed();
         }
         assert!(
             stop.elapsed() < Duration::from_secs(30),
-            "the product: Alice's daemon did not exit within 30 s of SIGINT:\n{}",
+            "PRODUCT: Alice's daemon did not exit within 30 s of SIGINT:\n{}",
             alice_d.transcript()
         );
         std::thread::sleep(Duration::from_millis(10));
@@ -492,7 +508,7 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
 #[ignore = "real daemons with production Argon2id; CI runs it in release"]
 fn a_stop_waits_out_last_bytes_within_its_patience() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let (took, said) = (0..ATTEMPTS)
         .find_map(|n| attempt(root, n))
@@ -506,7 +522,7 @@ fn a_stop_waits_out_last_bytes_within_its_patience() {
     eprintln!("[proof] Alice's daemon exited {took:?} after SIGINT; gave up: {gave_up:?}");
     assert!(
         gave_up.is_none() && took < PATIENCE,
-        "a daemon stopped with a finished tunnel's tail unacknowledged must finish its own stop \
+        "PRODUCT: a daemon stopped with a finished tunnel's tail unacknowledged must finish its own stop \
          within its {PATIENCE:?} patience: it exited {took:?} after SIGINT and said {gave_up:?}"
     );
 }

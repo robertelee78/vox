@@ -23,8 +23,9 @@
 //! - **Ctrl-C** ([`ROUNDS`] rounds, SIGINT): as a person stops it. The node's cut and the
 //!   offer's own close race; either may arrive first.
 //! - **SIGTERM** ([`TERM_ROUNDS`] rounds): as `kill` or a service manager stops it. Before the
-//!   fix nothing cut these sessions, so every round ended in the clean, truncated end: the arm is
-//!   deterministic.
+//!   fix a SIGTERM ended `vox room send` where it stood, with no cut of its own, so most rounds
+//!   ended in the clean, truncated end. Not every round: the node's withdrawal can still win, and
+//!   a verifier's mutant with only that half restored reset 4 of 10.
 //!
 //! Asserted: in every round of both arms the collector ends within [`BOUND`] with a reset (an
 //! error naming the connection), never by stalling and never with a clean end.
@@ -35,7 +36,7 @@
 //! ## Mutation
 //! Reset the local socket at once (`abort_local` without waiting for its queue to empty), and
 //! collectors stall: red. Let `vox room send` close an unfinished transfer gracefully (the old
-//! exit), and the SIGTERM arm ends every round with a clean, truncated end: red.
+//! exit), and rounds end with a clean, truncated end: red.
 
 #![cfg(unix)]
 
@@ -81,12 +82,15 @@ fn spawn_vox(m: &Member, args: &[&str], out: &Path) -> Kid {
         .env_remove("VOX_ROOM_PASSPHRASE")
         .env_remove("VOX_SESSION")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(out).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(out).expect("APPARATUS: create the stdout file"),
+        ))
         .stderr(Stdio::from(
-            std::fs::File::create(out.with_extension("err")).unwrap(),
+            std::fs::File::create(out.with_extension("err"))
+                .expect("APPARATUS: create the stderr file"),
         ))
         .spawn()
-        .expect("spawn vox");
+        .expect("APPARATUS: spawn vox");
     Kid(child)
 }
 
@@ -120,7 +124,7 @@ enum End {
 #[ignore = "two real daemons with production Argon2id; CI runs it in release"]
 fn a_cut_session_is_reset_not_hung() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let alice = Member::new(root, "alice");
     let bob = Member::new(root, "bob");
@@ -140,18 +144,24 @@ fn a_cut_session_is_reset_not_hung() {
         let name = format!("r{round}.bin");
         let file = root.join(&name);
         {
-            let mut f = std::fs::File::create(&file).unwrap();
+            let mut f = std::fs::File::create(&file).expect("APPARATUS: create the offered file");
             let chunk: Vec<u8> = (0..1 << 20)
                 .map(|i: u32| (i.wrapping_mul(31).wrapping_add(round as u32) % 251) as u8)
                 .collect();
             for _ in 0..FILE_BYTES >> 20 {
-                f.write_all(&chunk).unwrap();
+                f.write_all(&chunk)
+                    .expect("APPARATUS: write the offered file");
             }
         }
         let send_out = root.join(format!("send{round}.out"));
         let send = spawn_vox(
             &alice,
-            &["room", "send", &room, file.to_str().unwrap()],
+            &[
+                "room",
+                "send",
+                &room,
+                file.to_str().expect("APPARATUS: a UTF-8 path"),
+            ],
             &send_out,
         );
         let t0 = Instant::now();
@@ -164,7 +174,7 @@ fn a_cut_session_is_reset_not_hung() {
             std::thread::sleep(Duration::from_millis(50));
         }
         let dir = root.join(format!("get{round}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("APPARATUS: create the download directory");
         let get_out = root.join(format!("get{round}.out"));
         let mut get = spawn_vox(
             &bob,
@@ -174,7 +184,7 @@ fn a_cut_session_is_reset_not_hung() {
                 &room,
                 &name,
                 "--out",
-                dir.join(&name).to_str().unwrap(),
+                dir.join(&name).to_str().expect("APPARATUS: a UTF-8 path"),
             ],
             &get_out,
         );
@@ -194,11 +204,15 @@ fn a_cut_session_is_reset_not_hung() {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(ok, "CANNOT MEASURE: kill {sig} of vox room send failed");
+        assert!(ok, "APPARATUS: kill {sig} of vox room send did not take");
         let cut = Instant::now();
         let held = bytes_in(&dir);
         let end = loop {
-            if let Some(status) = get.0.try_wait().unwrap() {
+            if let Some(status) = get
+                .0
+                .try_wait()
+                .expect("APPARATUS: poll vox room get's exit")
+            {
                 let text = said(&get_out);
                 break if status.success() {
                     // The whole file arrived before the cut took effect.
@@ -246,7 +260,7 @@ fn a_cut_session_is_reset_not_hung() {
     }
     assert!(
         red.is_empty(),
-        "every transfer Vox cuts on purpose must reach the collector as a reset: {}",
+        "PRODUCT: every transfer Vox cuts on purpose must reach the collector as a reset: {}",
         red.join("; ")
     );
 }

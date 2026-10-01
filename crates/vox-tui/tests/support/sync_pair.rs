@@ -440,7 +440,12 @@ impl Reader {
             local: "127.0.0.1:0".into(),
         })) {
             Ok(Frame::Bound { local }) => local,
-            other => panic!("forward to {tag}: {other:?}"),
+            Ok(refused @ Frame::Error { .. }) => panic!(
+                "PRODUCT: the daemon refused the forward to {tag} (as `vox room get` would): \
+                 {refused:?}"
+            ),
+            Ok(other) => panic!("PRODUCT: unexpected reply to a forward to {tag}: {other:?}"),
+            Err(e) => panic!("APPARATUS: control-socket request failed: {e}"),
         }
     }
 }

@@ -18,6 +18,8 @@
 //! interrupted (SIGINT), exactly as a person stops it.
 //!
 //! Asserted: the application reads all [`REPLY`] bytes, in order, and then a clean end of stream.
+//! A warm-up exchange that reads a truncated reply with nothing stopped is the same data loss,
+//! and is a PRODUCT red too, as is a `vox connect` that fails.
 //!
 //! ## Preconditions (else CANNOT MEASURE)
 //! The tunnel crossed the relay, and when the host was interrupted the relay had not yet carried
@@ -68,21 +70,27 @@ fn byte(i: usize) -> u8 {
 /// A UDP relay in front of `upstream` that delays every datagram by [`ONE_WAY`] in each
 /// direction, and carries the host's datagrams toward the client at [`RATE`]. Returns its address and the bytes it has carried toward the client.
 fn delaying_relay(upstream: SocketAddr) -> (SocketAddr, Arc<AtomicU64>) {
-    let front = UdpSocket::bind("[::1]:0").expect("bind the relay");
-    let back = UdpSocket::bind("127.0.0.1:0").expect("bind the relay's upstream side");
-    back.connect(upstream).expect("connect the relay upstream");
-    let addr = front.local_addr().unwrap();
+    let front = UdpSocket::bind("[::1]:0").expect("APPARATUS: bind the relay");
+    let back = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind the relay's upstream side");
+    back.connect(upstream)
+        .expect("APPARATUS: connect the relay upstream");
+    let addr = front.local_addr().expect("APPARATUS: the relay's address");
     let to_client = Arc::new(AtomicU64::new(0));
     let client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
 
     // Toward the host.
-    let (rx, tx) = (front.try_clone().unwrap(), back.try_clone().unwrap());
+    let (rx, tx) = (
+        front
+            .try_clone()
+            .expect("APPARATUS: clone the relay socket"),
+        back.try_clone().expect("APPARATUS: clone the relay socket"),
+    );
     let learn = Arc::clone(&client);
     let (q_tx, q_rx) = mpsc::channel::<(Instant, Vec<u8>)>();
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 65536];
         while let Ok((n, from)) = rx.recv_from(&mut buf) {
-            *learn.lock().unwrap() = Some(from);
+            *learn.lock().expect("APPARATUS: the relay's client lock") = Some(from);
             if q_tx
                 .send((Instant::now() + ONE_WAY, buf[..n].to_vec()))
                 .is_err()
@@ -114,7 +122,7 @@ fn delaying_relay(upstream: SocketAddr) -> (SocketAddr, Arc<AtomicU64>) {
     std::thread::spawn(move || {
         for (due, pkt) in q_rx {
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
-            if let Some(to) = *client.lock().unwrap() {
+            if let Some(to) = *client.lock().expect("APPARATUS: the relay's client lock") {
                 carried.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                 let _ = front.send_to(&pkt, to);
             }
@@ -126,8 +134,11 @@ fn delaying_relay(upstream: SocketAddr) -> (SocketAddr, Arc<AtomicU64>) {
 /// A backend that reads a request to its end, answers [`REPLY`] bytes and closes, then says when
 /// it closed. Returns its port.
 fn replying_backend(closed: mpsc::Sender<Instant>) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the backend");
-    let port = listener.local_addr().unwrap().port();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind the backend");
+    let port = listener
+        .local_addr()
+        .expect("APPARATUS: the backend's address")
+        .port();
     std::thread::spawn(move || {
         for s in listener.incoming() {
             let Ok(mut s) = s else { continue };
@@ -149,11 +160,16 @@ fn replying_backend(closed: mpsc::Sender<Instant>) -> u16 {
 /// The application: connect to the forward, send a request, half-close, and read the whole
 /// reply on a thread. Joins to what it read and how the stream ended.
 fn exchange(at: SocketAddr) -> std::thread::JoinHandle<(Vec<u8>, String)> {
-    let mut app = TcpStream::connect(at).expect("connect to the forward");
-    app.write_all(b"send me the reply").unwrap();
-    app.shutdown(Shutdown::Write).unwrap();
+    let mut app = TcpStream::connect(at).unwrap_or_else(|e| {
+        panic!("PRODUCT: `vox forward` printed {at} but refuses a connection there: {e}")
+    });
+    app.write_all(b"send me the reply")
+        .unwrap_or_else(|e| panic!("PRODUCT: the forward at {at} failed the request's write: {e}"));
+    app.shutdown(Shutdown::Write)
+        .unwrap_or_else(|e| panic!("PRODUCT: the forward at {at} failed the half-close: {e}"));
     std::thread::spawn(move || {
-        app.set_read_timeout(Some(READ_BOUND)).unwrap();
+        app.set_read_timeout(Some(READ_BOUND))
+            .expect("APPARATUS: set the application's read timeout");
         let mut got = Vec::with_capacity(REPLY);
         let mut buf = vec![0u8; 64 * 1024];
         let ending = loop {
@@ -171,38 +187,50 @@ fn exchange(at: SocketAddr) -> std::thread::JoinHandle<(Vec<u8>, String)> {
 #[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
 fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let (anchor_dir, host_dir, guest_dir) = (
         tmp.path().join("anchor"),
         tmp.path().join("host"),
         tmp.path().join("guest"),
     );
     for d in [&anchor_dir, &host_dir, &guest_dir] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a profile directory");
     }
     // Split by address family (`support/relay.rs`): the host on 127.0.0.1 and the guest on [::1]
     // cannot send each other a datagram, so the delaying relay — on [::1], in front of the host —
     // is the only direct path between them, and the only other is the anchor's circuit.
     let anchor = relay::Anchor::start(&anchor_dir);
     let (ok, host_fp, err) = vox_once(&host_dir, &args(&["id"]));
-    assert!(ok, "host id: {err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging: the host's `vox id` failed: {err}"
+    );
     let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-    assert!(ok, "guest id: {err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging: the guest's `vox id` failed: {err}"
+    );
     let (ok, out, err) = vox_once(
         &host_dir,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
     );
-    assert!(ok, "host trusts guest: {out}{err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging: the host's `vox trust add` of the guest failed: {out}{err}"
+    );
 
     let (closed_tx, closed_rx) = mpsc::channel();
     let backend = replying_backend(closed_tx);
     let host_port = UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+        .and_then(|s| s.local_addr())
+        .expect("APPARATUS: find a free port for the host")
         .port();
     let host_listen = format!("127.0.0.1:{host_port}");
-    let (relay, to_guest) = delaying_relay(host_listen.parse().unwrap());
+    let (relay, to_guest) = delaying_relay(
+        host_listen
+            .parse()
+            .expect("APPARATUS: the host's listen address parses"),
+    );
     let relay_s = relay.to_string();
     let mut host = VoxProc::spawn_env(
         "host",
@@ -252,10 +280,13 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
         ]),
         &[],
     );
-    let status = connect.child.wait().expect("vox connect ran");
+    let status = connect
+        .child
+        .wait()
+        .expect("APPARATUS: wait for vox connect");
     assert!(
         status.success(),
-        "CANNOT MEASURE: vox connect failed:\n{}",
+        "PRODUCT: `vox connect` to the host's printed address failed ({status}):\n{}",
         connect.transcript()
     );
     let mut fwd = VoxProc::spawn_env(
@@ -282,9 +313,10 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
     let at: SocketAddr = line
         .split_whitespace()
         .nth(1)
-        .expect("an address")
-        .parse()
-        .expect("a socket address");
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `vox forward`'s bound-address line names no socket address: {line:?}")
+        });
 
     // Unmeasured exchanges first, until one rides the relay: the forward's first tunnels ride
     // the anchor's circuit while the direct path through the relay is found, and the measured
@@ -294,11 +326,16 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
     loop {
         warm += 1;
         let b0 = to_guest.load(Ordering::Relaxed);
-        let (got, ending) = exchange(at).join().expect("the warm-up reader");
+        let (got, ending) = exchange(at)
+            .join()
+            .expect("APPARATUS: the warm-up reader thread panicked");
         assert!(
             got.len() == REPLY,
-            "CANNOT MEASURE: warm-up exchange {warm} read {} of {REPLY} bytes, then {ending}",
-            got.len()
+            "PRODUCT: with nothing stopped, warm-up exchange {warm} read {} of {REPLY} bytes, then \
+             {ending}: the tunnel truncated a reply\nhost:\n{}\nforward:\n{}",
+            got.len(),
+            host.transcript(),
+            fwd.transcript()
         );
         let _ = closed_rx.recv_timeout(Duration::from_secs(10));
         if to_guest.load(Ordering::Relaxed) - b0 >= REPLY as u64 {
@@ -331,14 +368,19 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    assert!(ok, "kill -INT {pid}");
+    assert!(ok, "APPARATUS: kill -INT {pid} (the host) did not take");
     eprintln!(
         "[proof] host interrupted {:?} after the backend closed; the relay had carried {crossed} \
          bytes toward the guest",
         closed_at.elapsed()
     );
-    let (got, ending) = reader.join().expect("the application's reader");
-    let exited = host.child.wait().expect("vox serve exits");
+    let (got, ending) = reader
+        .join()
+        .expect("APPARATUS: the application's reader thread panicked");
+    let exited = host
+        .child
+        .wait()
+        .expect("APPARATUS: wait for vox serve to exit");
     let total = to_guest.load(Ordering::Relaxed) - before;
     eprintln!(
         "[proof] the application read {} of {REPLY} bytes, then {ending}; the host exited {exited} \
@@ -360,7 +402,7 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
     let first_wrong = got.iter().enumerate().position(|(i, b)| *b != byte(i));
     assert!(
         got.len() == REPLY && first_wrong.is_none() && ending == "a clean end of stream",
-        "the host stopped right after its backend finished a {REPLY}-byte reply, and the \
+        "PRODUCT: the host stopped right after its backend finished a {REPLY}-byte reply, and the \
          application read {} bytes (first wrong byte at {first_wrong:?}) and then {ending}: a \
          tunnel's last bytes must be acknowledged before its connection closes.\nhost:\n{}\n\
          forward:\n{}",
