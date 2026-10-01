@@ -59,14 +59,27 @@ impl Driven {
 }
 
 /// Run `python3 <script> <args…>`, bounded; see the module docs.
-#[allow(dead_code)] // a proof that needs a longer bound calls `run_within` instead
+#[allow(dead_code)] // a proof that needs a longer bound calls `run_within` or `run_for` instead
 pub fn run(script: &str, args: &[&str]) -> Driven {
-    run_within(script, args, BOUND)
+    drive(script, args, BOUND, Duration::ZERO)
 }
 
 /// [`run`], stopped from outside past `bound` rather than [`BOUND`]: for a driver whose own
 /// budget is longer, because the product bounds it waits on are (a debug-build join).
+#[allow(dead_code)]
 pub fn run_within(script: &str, args: &[&str], bound: Duration) -> Driven {
+    drive(script, args, bound, Duration::ZERO)
+}
+
+/// [`run`], for a driver that waits on work a debug build is slower at: its bound is [`BOUND`]
+/// plus `debug_cost` (the watchdog's `debug_cost` of that work, which is zero in a release build),
+/// and the driver's own waits grow by it too (`VOX_PTY_DEBUG_EXTRA_SECS`, `vox_pty.DEBUG_EXTRA`).
+#[allow(dead_code)]
+pub fn run_for(script: &str, args: &[&str], debug_cost: Duration) -> Driven {
+    drive(script, args, BOUND + debug_cost, debug_cost)
+}
+
+fn drive(script: &str, args: &[&str], bound: Duration, debug_cost: Duration) -> Driven {
     let t0 = Instant::now();
     let stage_file = std::env::temp_dir().join(format!(
         "vox-pty-stage-{}-{}",
@@ -78,6 +91,7 @@ pub fn run_within(script: &str, args: &[&str], bound: Duration) -> Driven {
         .arg(script)
         .args(args)
         .env("VOX_PTY_STAGE_FILE", &stage_file)
+        .env("VOX_PTY_DEBUG_EXTRA_SECS", debug_cost.as_secs().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
