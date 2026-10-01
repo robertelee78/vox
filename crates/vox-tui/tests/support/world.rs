@@ -643,9 +643,8 @@ pub fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> (u8, TcpStrea
     let mut got = Vec::new();
     socks_write(&mut s, &[0x05, 0x01, 0x00], "its greeting", &got);
     let hello = socks_read(&mut s, 2, "its method choice", &mut got);
-    assert_eq!(
-        hello,
-        [0x05, 0x00],
+    assert!(
+        hello == [0x05, 0x00],
         "PRODUCT: the proxy refused the no-auth method: it sent {got:02x?}"
     );
     let len = u8::try_from(host.len()).unwrap_or_else(|_| {
@@ -656,8 +655,8 @@ pub fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> (u8, TcpStrea
     req.extend_from_slice(&port.to_be_bytes());
     socks_write(&mut s, &req, "the CONNECT request", &got);
     let head = socks_read(&mut s, 4, "its CONNECT reply", &mut got);
-    assert_eq!(
-        head[0], 0x05,
+    assert!(
+        head[0] == 0x05,
         "PRODUCT: the proxy's CONNECT reply is not SOCKS5: it sent {got:02x?}"
     );
     let skip = match head[3] {

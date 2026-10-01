@@ -57,11 +57,11 @@ pub fn previous_release() -> PathBuf {
             .status()
             .is_ok_and(|s| s.success());
         assert!(fetched, "CANNOT MEASURE: could not fetch {url}");
-        assert_eq!(
-            digest(&part),
-            want,
-            "CANNOT MEASURE: {url} does not match its published SHA-256 — the download, or the \
-             published artifact, is not the {PREVIOUS} this proof starts from"
+        let got = digest(&part);
+        assert!(
+            got == want,
+            "CANNOT MEASURE: {url} does not match its published SHA-256 (got {got}, want {want}) — \
+             the download, or the published artifact, is not the {PREVIOUS} this proof starts from"
         );
         std::fs::rename(&part, &exe).unwrap_or_else(|e| {
             panic!(

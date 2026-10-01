@@ -145,8 +145,9 @@ pub fn anchor(root: &Path) -> (Proc, String) {
                 "PRODUCT:"
             };
             panic!(
-                "{side} the anchor (`vox node`) printed no --anchor spec in {patience:?} ({state}; \
+                "{side} the anchor (`vox node`) printed no --anchor spec in {:?} ({state}; \
                  {seen}). It said:\n{}",
+                looks.t0.elapsed(),
                 p.transcript()
             );
         }
@@ -347,9 +348,10 @@ impl Member {
                     "PRODUCT:"
                 };
                 panic!(
-                    "{side} {}'s daemon never answered `vox room list` in {patience:?} ({state}; \
+                    "{side} {}'s daemon never answered `vox room list` in {:?} ({state}; \
                      {seen}). The last answer:\n{out}{err}\nThe daemon said:\n{}",
                     self.name,
+                    looks.t0.elapsed(),
                     p.transcript()
                 );
             }

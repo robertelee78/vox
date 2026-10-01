@@ -239,7 +239,8 @@ fn fire(
         .lock()
         .map(|r| r.join("\n    "))
         .unwrap_or_else(|_| "<unknown: the list's lock was poisoned>".to_owned());
-    let stall = if overslept > STALL {
+    let stalled = overslept > STALL;
+    let stall = if stalled {
         format!(
             "THIS PROCESS STALLED: one {TICK:?} sleep came back {overslept:?} late, {overslept_at:?} \
              in.\n  The runner did not schedule it for that long, so an APPARATUS STALL is likely."
@@ -251,7 +252,8 @@ fn fire(
         )
     };
     let slept = by_wall.saturating_sub(elapsed);
-    let slept = if slept > STALL {
+    let asleep = slept > STALL;
+    let slept = if asleep {
         format!(
             "THE MACHINE SLEPT: the wall clock ran {slept:?} ahead of the monotonic one. A run that \
              overlapped a sleep is NO RESULT."
@@ -261,6 +263,18 @@ fn fire(
             "the wall clock agrees with the monotonic one (within {slept:?}): no machine sleep."
         )
     };
+    // The side, from what was measured: a machine that slept or a process that was not scheduled
+    // is the apparatus's; a process that ran throughout on an awake machine and still did not
+    // finish was held up by what it waits on — the product it drives.
+    let verdict = if asleep {
+        "NO RESULT: the machine slept during the run (below), so the budget measured nothing."
+    } else if stalled {
+        "APPARATUS STALL: this process was not scheduled for longer than the stall line (below)."
+    } else {
+        "PRODUCT HANG: this process was scheduled throughout and the machine did not sleep, so\n\
+         the time went to what it waits on — the `vox` processes it started (CPU below:\n\
+         one near 100% is spinning, one near 0 is stuck waiting)."
+    };
     let children = descendants();
     let cpu = cpu_census(&children);
     say(&format!(
@@ -269,8 +283,9 @@ fn fire(
          This test process has run for {elapsed:?} ({by_wall:?} by the wall clock) against a\n\
          budget of {budget:?}, and is being aborted.\n\
          \n\
-         BUDGET EXCEEDED: a PRODUCT HANG or an APPARATUS STALL. The clock alone cannot\n\
-         say which; what this watchdog measured can:\n\
+         BUDGET EXCEEDED. {verdict}\n\
+         \n\
+         What this watchdog measured:\n\
          \n\
          - {stall}\n\
          - {slept}\n\

@@ -170,8 +170,8 @@ impl Anchor {
         let n = self.circuits(Duration::from_secs(2));
         assert!(
             n >= 1,
-            "NOT RELAYED {when}: the anchor reports {n} circuit(s) carried — this is not measuring \
-             a relayed path.\nanchor:\n{}",
+            "CANNOT MEASURE: staging not achieved: NOT RELAYED {when}: the anchor reports {n} \
+             circuit(s) carried, so this is not measuring a relayed path.\nanchor:\n{}",
             self.proc.transcript()
         );
     }
@@ -205,11 +205,10 @@ impl Anchor {
                 t0.elapsed()
             );
         }
-        assert_eq!(
-            n,
-            0,
-            "NOT DIRECT {when}: the anchor still reports {n} circuit(s) carried after {within:?}, \
-             past a retired circuit's grace.\nanchor:\n{}",
+        assert!(
+            n == 0,
+            "PRODUCT: NOT DIRECT {when}: a pair with a direct path still rides the anchor — it \
+             reports {n} circuit(s) carried after {within:?}, past a retired circuit's grace.\nanchor:\n{}",
             self.proc.transcript()
         );
     }

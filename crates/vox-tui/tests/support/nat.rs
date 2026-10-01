@@ -129,8 +129,8 @@ impl TwoNats {
     /// Two NATs of `kind` in front of whatever binds `127.0.0.1` (the host) and `[::1]` (the
     /// guest), around an anchor listening on `[::]:anchor_port`.
     pub fn start(kind: Kind, anchor_port: u16) -> Self {
-        let anchor_v6: SocketAddr = format!("[::1]:{anchor_port}").parse().unwrap();
-        let anchor_v4: SocketAddr = format!("127.0.0.1:{anchor_port}").parse().unwrap();
+        let anchor_v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, anchor_port));
+        let anchor_v4 = SocketAddr::from(([127, 0, 0, 1], anchor_port));
         let inner = Arc::new(Mutex::new(Inner {
             kind,
             sockets: HashMap::new(),
@@ -150,7 +150,9 @@ impl TwoNats {
             anchor_v4,
         };
         let (anchor_for_host, anchor_for_guest) = {
-            let mut locked = inner.lock().unwrap();
+            let mut locked = inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
                 bind_socket(&mut locked, "127.0.0.1:0", Role::AnchorForHost, &ctx),
                 bind_socket(&mut locked, "[::1]:0", Role::AnchorForGuest, &ctx),
@@ -191,17 +193,27 @@ impl TwoNats {
 
     /// When each inside address first sent the other process a datagram.
     pub fn first_p2p(&self) -> HashMap<SocketAddr, Instant> {
-        self.first_p2p.lock().unwrap().clone()
+        self.first_p2p
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The peer datagrams seen so far (the first few hundred).
     pub fn events(&self) -> Vec<P2pEvent> {
-        self.counters.events.lock().unwrap().clone()
+        self.counters
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The public mappings each NAT holds, as `(inside, public)` — for a report.
     pub fn mappings(&self) -> (usize, usize) {
-        let inner = self.inner.lock().unwrap();
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (inner.host_nat.mapping.len(), inner.guest_nat.mapping.len())
     }
 }
@@ -317,7 +329,10 @@ fn route(
     src: SocketAddr,
     n: usize,
 ) -> Option<(Arc<UdpSocket>, SocketAddr)> {
-    let mut inner = ctx.inner.lock().unwrap();
+    let mut inner = ctx
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match role {
         // A process dials its anchor: out through its NAT, to the anchor's real address.
         Role::AnchorForHost => {
@@ -355,13 +370,17 @@ fn route(
             };
             ctx.first_p2p
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entry(src)
                 .or_insert_with(Instant::now);
             let from_public = egress(&mut inner, ctx, other, src, at);
             let verdict = ingress(&inner, side, at, from_public);
             {
-                let mut ev = ctx.counters.events.lock().unwrap();
+                let mut ev = ctx
+                    .counters
+                    .events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if ev.len() < EVENT_LOG {
                     ev.push(P2pEvent {
                         at: Instant::now(),

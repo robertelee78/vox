@@ -357,8 +357,9 @@ fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
             let (side, seen) = looks.side();
             let side = if exited.is_some() { "PRODUCT:" } else { side };
             panic!(
-                "{side} the anchor (`vox node`) printed no --anchor spec in {TIMEOUT:?} ({}; {seen}).\n\
+                "{side} the anchor (`vox node`) printed no --anchor spec in {:?} ({}; {seen}).\n\
                  stdout:\n{}\nstderr:\n{}",
+                looks.t0.elapsed(),
                 exited.map_or_else(|| "still running".to_owned(), |s| format!("it exited: {s}")),
                 read_log(&out),
                 read_log(&err)
@@ -432,9 +433,10 @@ fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
             let (side, seen) = looks.side();
             let side = if exited.is_some() { "PRODUCT:" } else { side };
             panic!(
-                "{side} {}'s daemon never answered `vox room list` in {DAEMON_START_PATIENCE:?} \
+                "{side} {}'s daemon never answered `vox room list` in {:?} \
                  ({}; {seen}). The last answer: {o:?}\nIts stderr:\n{}",
                 w.name,
+                started.elapsed(),
                 exited.map_or_else(|| "still running".to_owned(), |s| format!("it exited: {s}")),
                 read_log(err)
             );
