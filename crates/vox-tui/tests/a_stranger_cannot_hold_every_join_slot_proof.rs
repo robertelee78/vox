@@ -109,6 +109,32 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+/// **Every red names its kind** (decider rule 1). A verdict on the product says `PRODUCT:` and
+/// quotes what the product said; a staging, precondition or harness failure says `APPARATUS`.
+/// Anything else that panics — an `unwrap` or `expect` on spawning a process, a file, a thread — is
+/// this proof's own failure, and this hook says so before its message.
+fn label_reds() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            if !(message.starts_with("PRODUCT") || message.starts_with("APPARATUS")) {
+                eprintln!(
+                    "APPARATUS (harness error): the panic below is this proof's own, not a \
+                     verdict on the product"
+                );
+            }
+            previous(info);
+        }));
+    });
+}
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -263,7 +289,7 @@ impl Who {
         while !self.vox(&["room", "list"], None).0 {
             assert!(
                 started.elapsed() < START_PATIENCE,
-                "CANNOT MEASURE: a daemon never answered; its stderr:\n{}",
+                "APPARATUS, CANNOT MEASURE: a daemon never answered; its stderr:\n{}",
                 std::fs::read_to_string(err).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(500));
@@ -354,7 +380,7 @@ fn stage(
         }
         assert!(
             started.elapsed() < START_PATIENCE,
-            "CANNOT MEASURE: the anchor never printed its spec"
+            "APPARATUS, CANNOT MEASURE: the anchor never printed its spec"
         );
         std::thread::sleep(Duration::from_millis(250));
     };
@@ -393,7 +419,9 @@ fn stage(
         Layout::TwoAddresses => ("[::1]:0".to_owned(), &v6_spec),
         Layout::Relayed => match (lan, &lan_spec) {
             (Some(ip), Some(spec)) => (format!("{ip}:0"), spec),
-            _ => panic!("CANNOT MEASURE: this machine has no LAN IPv4 address to put carol on"),
+            _ => panic!(
+                "APPARATUS, CANNOT MEASURE: this machine has no LAN IPv4 address to put carol on"
+            ),
         },
     };
     let (stranger_listen, stranger_spec) = ("127.0.0.1:0", &v4_spec);
@@ -408,7 +436,7 @@ fn stage(
                 .collect();
             for id in ids {
                 let (ok, out, err) = id.join().unwrap();
-                assert!(ok, "CANNOT MEASURE: vox id failed: {out}{err}");
+                assert!(ok, "APPARATUS, CANNOT MEASURE: vox id failed: {out}{err}");
             }
         });
     }
@@ -448,13 +476,18 @@ fn stage(
     for r in 0..rooms {
         let name = format!("r{r}");
         let (ok, out, err) = alice.vox(&["room", "create", "--name", &name], Some(ROOM_PASS));
-        assert!(ok, "CANNOT MEASURE: room create failed: {out}{err}");
+        assert!(
+            ok,
+            "APPARATUS, CANNOT MEASURE: room create failed: {out}{err}"
+        );
         let list = alice.vox(&["room", "list"], None).1;
         let id = list
             .lines()
             .find(|l| l.split_whitespace().any(|w| w == name))
             .and_then(|l| l.split_whitespace().next())
-            .unwrap_or_else(|| panic!("CANNOT MEASURE: room {name} not in `vox room list`: {list}"))
+            .unwrap_or_else(|| {
+                panic!("APPARATUS, CANNOT MEASURE: room {name} not in `vox room list`: {list}")
+            })
             .to_owned();
         let link = alice
             .vox(&["room", "invite", &id], None)
@@ -463,7 +496,7 @@ fn stage(
             .to_owned();
         assert!(
             !link.is_empty(),
-            "CANNOT MEASURE: no invite link for room {name}"
+            "APPARATUS, CANNOT MEASURE: no invite link for room {name}"
         );
         links.push(link);
     }
@@ -562,11 +595,11 @@ fn paths(s: &Staged, case: &str) -> Result<(), String> {
     let want = s.strangers.len() + 1;
     match s.layout {
         Layout::TwoAddresses if max > 0 || reports == 0 => Err(format!(
-            "CANNOT MEASURE: {case}: the anchor carried {max} circuit(s) ({reports} reports), so \
+            "APPARATUS, CANNOT MEASURE: {case}: the anchor carried {max} circuit(s) ({reports} reports), so \
              some join was relayed and not from the address measured"
         )),
         Layout::Relayed if max < want => Err(format!(
-            "CANNOT MEASURE: {case}: the anchor carried at most {max} circuit(s) at once, not one \
+            "APPARATUS, CANNOT MEASURE: {case}: the anchor carried at most {max} circuit(s) at once, not one \
              for each of the {} stranger identities and carol ({want}): not every join was relayed",
             s.strangers.len()
         )),
@@ -656,7 +689,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
                 done.store(true, Ordering::SeqCst);
                 let (_, _, text) = alice_counts(s);
                 panic!(
-                    "CANNOT MEASURE: the stranger's {} joins never filled alice's {SLOTS} slots \
+                    "APPARATUS, CANNOT MEASURE: the stranger's {} joins never filled alice's {SLOTS} slots \
                      in {}s; alice's stderr:\n{text}",
                     holds.len(),
                     FILL_PATIENCE.as_secs()
@@ -696,7 +729,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
             if probing.elapsed() >= PROBE_PATIENCE {
                 done.store(true, Ordering::SeqCst);
                 panic!(
-                    "CANNOT MEASURE: {case}: alice turned the stranger away {} times in {}s after \
+                    "APPARATUS, CANNOT MEASURE: {case}: alice turned the stranger away {} times in {}s after \
                      carol's join, not {PROBES}",
                     turned_after.load(Ordering::SeqCst),
                     PROBE_PATIENCE.as_secs()
@@ -718,13 +751,13 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
         );
         assert!(
             ok,
-            "{case}: carol was kept out while a stranger held every join slot, after {:.1}s\n  \
+            "PRODUCT: {case}: carol was kept out while a stranger held every join slot, after {:.1}s\n  \
              carol: {out}{err}\n  alice's stderr:\n{text}",
             took.as_secs_f64()
         );
         assert!(
             took < JOIN_BOUND,
-            "{case}: carol got in, but only after {:.1}s, past {}s\n  alice's stderr:\n{text}",
+            "PRODUCT: {case}: carol got in, but only after {:.1}s, past {}s\n  alice's stderr:\n{text}",
             took.as_secs_f64(),
             JOIN_BOUND.as_secs()
         );
@@ -756,11 +789,11 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
     );
     assert!(
         !turned_away.is_empty(),
-        "CANNOT MEASURE: {case}: none of the stranger's joins was turned away by alice"
+        "APPARATUS, CANNOT MEASURE: {case}: none of the stranger's joins was turned away by alice"
     );
     assert!(
         busy == turned_away.len(),
-        "{case}: a joiner turned away at the join-slot cap was not told the member was busy \
+        "PRODUCT: {case}: a joiner turned away at the join-slot cap was not told the member was busy \
          ({busy} of {}), {blamed} were told the passphrase was wrong:\n{}",
         turned_away.len(),
         turned_away.join("\n---\n")
@@ -778,6 +811,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
 #[ignore = "sixteen joins that never finish, production Argon2id and a real anchor; CI runs it in release"]
 fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
     watchdog::arm();
+    label_reds();
     let tmp = tempfile::tempdir().unwrap();
     // Rooms 0–15 are held; 16 and 17 are two more the stranger keeps arriving for.
     let s = stage(tmp.path(), SLOTS + 2, 1, Layout::OneAddress, &never());
@@ -789,6 +823,7 @@ fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
 #[ignore = "sixteen joins that never finish, production Argon2id and a real anchor; CI runs it in release"]
 fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
     watchdog::arm();
+    label_reds();
     let tmp = tempfile::tempdir().unwrap();
     // Four identities hold four rooms each; rooms 4 and 5 are two more the first keeps arriving
     // for.
@@ -803,6 +838,7 @@ fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
 #[ignore = "sixteen joins that never finish, production Argon2id and a real anchor; CI runs it in release"]
 fn one_address_holding_every_slot_does_not_keep_a_joiner_from_another_out() {
     watchdog::arm();
+    label_reds();
     let tmp = tempfile::tempdir().unwrap();
     // Sixteen identities on 127.0.0.1 hold one slot each, of room 0, so by identity every hold
     // weighs what carol's does: only the address tells them apart. Carol joins from ::1. Rooms 1
@@ -816,6 +852,7 @@ fn one_address_holding_every_slot_does_not_keep_a_joiner_from_another_out() {
 #[ignore = "sixteen joins that never finish, production Argon2id and a real anchor; CI runs it in release"]
 fn a_relayed_flood_from_one_host_does_not_keep_a_relayed_joiner_from_another_out() {
     watchdog::arm();
+    label_reds();
     let tmp = tempfile::tempdir().unwrap();
     // Sixteen stranger identities, every one of their joins relayed by the anchor from one host,
     // hold one slot each of room 0; carol's join is relayed by the same anchor from another
@@ -839,6 +876,7 @@ const ENDED_TELL_PATIENCE: Duration = Duration::from_secs(180);
 #[ignore = "sixteen slow joins, production Argon2id and a real anchor; CI runs it in release"]
 fn a_join_ended_for_another_is_told_the_member_is_busy() {
     watchdog::arm();
+    label_reds();
     let tmp = tempfile::tempdir().unwrap();
     let s = stage(
         tmp.path(),
@@ -876,12 +914,12 @@ fn a_join_ended_for_another_is_told_the_member_is_busy() {
     );
     assert!(
         ended >= 1,
-        "CANNOT MEASURE: carol's join ended none of the stranger's joins (refused {refused}), so \
+        "APPARATUS, CANNOT MEASURE: carol's join ended none of the stranger's joins (refused {refused}), so \
          its {SLOTS} were not all in flight; alice's stderr:\n{text}"
     );
     assert!(
         ok,
-        "carol was kept out: {out}{err}\n  alice's stderr:\n{text}"
+        "PRODUCT: carol was kept out: {out}{err}\n  alice's stderr:\n{text}"
     );
     // Every one of the stranger's joins ends: the ones alice ended hear it once their grind is done;
     // the rest finish their join, since the stranger knows the passphrase.
@@ -892,7 +930,7 @@ fn a_join_ended_for_another_is_told_the_member_is_busy() {
     {
         assert!(
             waiting.elapsed() < ENDED_TELL_PATIENCE,
-            "CANNOT MEASURE: the stranger's joins had not all ended {}s after carol's",
+            "APPARATUS, CANNOT MEASURE: the stranger's joins had not all ended {}s after carol's",
             ENDED_TELL_PATIENCE.as_secs()
         );
         std::thread::sleep(Duration::from_millis(500));
@@ -918,7 +956,7 @@ fn a_join_ended_for_another_is_told_the_member_is_busy() {
     );
     assert!(
         busy >= ended && blamed == 0,
-        "a join alice ended to answer carol was not told the member was busy: {busy} were, {blamed} \
+        "PRODUCT: a join alice ended to answer carol was not told the member was busy: {busy} were, {blamed} \
          were told the passphrase was wrong, and alice ended {ended}:\n{}",
         failed
             .iter()
@@ -969,6 +1007,7 @@ const RETRY_PAUSE: Duration = Duration::from_secs(1);
 /// of doing its work.
 fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
     watchdog::arm();
+    label_reds();
     let tmp = tempfile::tempdir().unwrap();
     let s = stage(
         tmp.path(),
@@ -999,7 +1038,7 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
         }
         assert!(
             filling.elapsed() < FILL_PATIENCE,
-            "CANNOT MEASURE: {case}: only {} of the stranger's {SLOTS} joins did their work in {}s",
+            "APPARATUS, CANNOT MEASURE: {case}: only {} of the stranger's {SLOTS} joins did their work in {}s",
             worked(),
             FILL_PATIENCE.as_secs()
         );
@@ -1009,7 +1048,7 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
     let spread = first_worked.elapsed();
     assert!(
         spread < WORKED_SPREAD,
-        "CANNOT MEASURE: {case}: the stranger's joins did their work {:.1}s apart, past {}s: the \
+        "APPARATUS, CANNOT MEASURE: {case}: the stranger's joins did their work {:.1}s apart, past {}s: the \
          first would be given back before carol could try while all of them hold",
         spread.as_secs_f64(),
         WORKED_SPREAD.as_secs()
@@ -1037,33 +1076,33 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
             let (refused, ended, text) = alice_counts(&s);
             assert!(
                 ended == 0,
-                "{case}: alice ended a join that had done its work to answer carol ({ended} \
+                "PRODUCT: {case}: alice ended a join that had done its work to answer carol ({ended} \
                  ended, {refused} refused):\n{text}"
             );
         }
         let turned_away = said.contains("busy answering other joins");
         if tries == 1 && !turned_away {
             panic!(
-                "CANNOT MEASURE: {case}: carol's first try was not turned away as busy, so the \
+                "APPARATUS, CANNOT MEASURE: {case}: carol's first try was not turned away as busy, so the \
                  stranger's holds did not hold every slot: {said}"
             );
         }
         if !turned_away {
             assert!(
                 ok,
-                "{case}: carol's try {tries}, not turned away as busy, failed: {said}"
+                "PRODUCT: {case}: carol's try {tries}, not turned away as busy, failed: {said}"
             );
             break at;
         }
         assert!(
             !said.contains("passphrase is wrong"),
-            "{case}: carol, turned away while the slots were held, was told the passphrase was \
+            "PRODUCT: {case}: carol, turned away while the slots were held, was told the passphrase was \
              wrong: {said}"
         );
         if first_worked.elapsed() >= ADMIT_BOUND + FRAME_PATIENCE {
             let (_, _, text) = alice_counts(&s);
             panic!(
-                "{case}: joins that did their work kept carol out for {:.1}s: their slots were \
+                "PRODUCT: {case}: joins that did their work kept carol out for {:.1}s: their slots were \
                  never given back\n  alice's stderr:\n{text}",
                 first_worked.elapsed().as_secs_f64()
             );
@@ -1083,7 +1122,7 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
     );
     assert!(
         admitted < ADMIT_BOUND,
-        "{case}: a join that did its work held its slot {:.1}s, past {}s: the member's admission \
+        "PRODUCT: {case}: a join that did its work held its slot {:.1}s, past {}s: the member's admission \
          patience did not give it back\n  alice's stderr:\n{text}",
         admitted.as_secs_f64(),
         ADMIT_BOUND.as_secs()
