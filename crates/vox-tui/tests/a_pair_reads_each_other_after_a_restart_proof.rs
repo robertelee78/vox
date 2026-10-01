@@ -34,9 +34,19 @@
 //!    hide the other's (measured: with both rotating, removing the joiner's half of the fix left
 //!    it green).
 //!
+//! 5. In the responder → joiner world only, alice's daemon is restarted a **second** time, after
+//!    her `vox trust remove <carol>`, so the withdrawal itself must have outlived a restart.
+//!
 //! ## What is asserted
+//! - **trust survives a restart** (RP-19): after step 3, alice's `vox trust list` still names bob
+//!   and carol, whom she trusted before it;
 //! - bob rotates: alice renders his post within 90 s (joiner → responder);
-//! - alice rotates: bob renders her post within 90 s (responder → joiner).
+//! - alice rotates: bob renders her post within 90 s (responder → joiner) — a member trusted
+//!   before the restart is still re-keyed, and so still reads, after it;
+//! - **untrust survives a restart** (RP-19): after step 5, alice's `vox trust list` names bob and
+//!   not carol; bob renders a post alice makes after it, and carol renders **none** of them,
+//!   10 s after bob has and while she still renders bob's own posts. A withdrawal undone by the
+//!   next restart would hand carol alice's key again on the node's next tick.
 //!
 //! The 90 s are an upper wait for a functional claim, not a latency claim: without the fix the
 //! pair never reads each other again. (Joiner → responder takes about 31 s: bob's first key goes
@@ -44,6 +54,12 @@
 //! session comes only after that key's 30 s patience.)
 //!
 //! ## The mutations that must turn it red
+//! - The sealed keyring not opened at unlock (`Keyring::load`'s result dropped and an empty one
+//!   used, `crates/vox-core/src/node/actor.rs`): both tests go red at the first restart, on
+//!   alice's `vox trust list`.
+//! - `vox trust remove` not written through to the sealed keyring (only the in-memory ring
+//!   changed): the responder → joiner test goes red at step 5, on alice's `vox trust list`
+//!   naming carol again.
 //! - In `NetEvent::SkdmRefused` (`crates/vox-core/src/node/actor.rs`), never forget a session
 //!   the member said it does not hold: the joiner → responder test goes red.
 //! - In `accept_hello`, keep a join session that won the rule instead of replacing it with one
@@ -210,6 +226,33 @@ fn start_daemon(m: &mut Member, anchor: &str, tag: &str) {
     }
 }
 
+/// Whom `m`'s running node trusts, by fingerprint, as `vox trust list` prints them.
+fn trusted(m: &Member) -> Vec<String> {
+    let (ok, out, err) = vox(&m.dir, &["trust", "list"], None);
+    assert!(ok, "PRODUCT: {}'s `vox trust list` failed: {err}", m.name);
+    out.lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| w.len() == 52)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// SIGKILL `m`'s daemon by its own handle and start it again with its identity passphrase
+/// alone; wait until it has reopened `room` by itself (#208).
+fn restart(m: &mut Member, anchor: &str, room: &str, tag: &str) {
+    drop(m.daemon.take());
+    start_daemon(m, anchor, tag);
+    let reopened = Instant::now() + Duration::from_secs(60);
+    while !vox(&m.dir, &["room", "read", room], None).0 {
+        assert!(
+            Instant::now() < reopened,
+            "CANNOT MEASURE: {}'s restarted daemon never reopened the room (#208)",
+            m.name
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn post(m: &Member, room: &str, text: &str) {
     let (ok, _, err) = vox(&m.dir, &["room", "post", room, text], None);
     assert!(ok, "{} posts {text:?}: {err}", m.name);
@@ -247,6 +290,7 @@ fn until_read(
 struct World {
     _tmp: tempfile::TempDir,
     _anchor: Proc,
+    spec: String,
     alice: Member,
     bob: Member,
     carol: Member,
@@ -352,17 +396,16 @@ fn restarted_responder() -> World {
     }
 
     // ---- the responder restarts: SIGKILL, then its identity passphrase alone -----------
-    drop(alice.daemon.take());
     let t_restart = Instant::now();
-    start_daemon(&mut alice, &spec, "restart");
-    let reopened = Instant::now() + Duration::from_secs(60);
-    while !vox(&alice.dir, &["room", "read", &room], None).0 {
-        assert!(
-            Instant::now() < reopened,
-            "CANNOT MEASURE: alice's restarted daemon never reopened the room (#208)"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    restart(&mut alice, &spec, &room, "restart");
+    // ---- trust survives it: whom alice trusted before, her node still trusts (RP-19) ----
+    let ring = trusted(&alice);
+    eprintln!("[proof] alice's trust list after the restart: {ring:?}");
+    assert!(
+        ring.contains(&bob.fp) && ring.contains(&carol.fp),
+        "PRODUCT: trust did not survive a restart: alice trusted bob and carol before it, and \
+         after it `vox trust list` names {ring:?}"
+    );
     // Control: the keys already held still work both ways, so the room syncs again.
     let control_ab = until_read(&bob, &alice, &room, "control bob", Duration::from_secs(90));
     let control_ba = until_read(
@@ -386,6 +429,7 @@ fn restarted_responder() -> World {
     World {
         _tmp: tmp,
         _anchor: anchor,
+        spec,
         alice,
         bob,
         carol,
@@ -406,7 +450,11 @@ fn one_rotates(w: &World, rotator: &Member, reader: &Member, arm: &str, why: &st
         ],
         None,
     );
-    assert!(ok, "{} removes carol: {err}", rotator.name);
+    assert!(
+        ok,
+        "PRODUCT: {} trusted carol, yet `vox trust remove` refused to withdraw it: {err}",
+        rotator.name
+    );
     let text = format!("rotated: {} says", rotator.name);
     post(rotator, &w.room, &text);
     let t0 = Instant::now();
@@ -435,7 +483,7 @@ fn one_rotates(w: &World, rotator: &Member, reader: &Member, arm: &str, why: &st
     };
     assert!(
         took.is_some(),
-        "{arm}: {} never read {}'s post under the rotated key within {}s — {why}\nalice's log \
+        "PRODUCT: {arm}: {} never read {}'s post under the rotated key within {}s — {why}\nalice's log \
          tail:\n{}\nbob's log tail:\n{}",
         reader.name,
         rotator.name,
@@ -463,12 +511,68 @@ fn the_joiner_is_read_again_after_the_responder_restarts() {
 #[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
 fn the_responder_is_read_again_after_it_restarts() {
     watchdog::arm();
-    let w = restarted_responder();
+    let mut w = restarted_responder();
     one_rotates(
         &w,
         &w.alice,
         &w.bob,
         "responder -> joiner",
         "bob kept the join's session, which cannot be offered again",
+    );
+
+    // ---- step 5: untrust survives a restart (RP-19) --------------------------------------
+    let (spec, room) = (w.spec.clone(), w.room.clone());
+    restart(&mut w.alice, &spec, &room, "restart2");
+    let ring = trusted(&w.alice);
+    eprintln!("[proof] alice's trust list after the second restart: {ring:?}");
+    assert!(
+        !ring.contains(&w.carol.fp),
+        "PRODUCT: untrust did not survive a restart: alice withdrew carol, and after a restart \
+         `vox trust list` names her again: {ring:?}"
+    );
+    assert!(
+        ring.contains(&w.bob.fp),
+        "PRODUCT: trust did not survive a second restart: alice's `vox trust list` no longer \
+         names bob: {ring:?}"
+    );
+    // Control: carol still renders the room, through bob, who still trusts her.
+    let carol_reads_bob = until_read(&w.bob, &w.carol, &room, "bob for carol", AFTER_ROTATION);
+    assert!(
+        carol_reads_bob.is_some(),
+        "CANNOT MEASURE: carol renders none of bob's posts after alice's second restart, so her \
+         rendering none of alice's would show nothing"
+    );
+    // The trusted member still reads alice, and the withdrawn one does not.
+    let bob_reads = until_read(
+        &w.alice,
+        &w.bob,
+        &room,
+        "after-untrust alice",
+        AFTER_ROTATION,
+    );
+    assert!(
+        bob_reads.is_some(),
+        "PRODUCT: bob, still in alice's ring, renders none of her posts after her second \
+         restart within {}s",
+        AFTER_ROTATION.as_secs()
+    );
+    std::thread::sleep(Duration::from_secs(10));
+    let (ok, seen, err) = vox(&w.carol.dir, &["room", "read", &room], None);
+    assert!(
+        ok && seen.contains("bob for carol "),
+        "CANNOT MEASURE: carol's final read failed or lost bob's control post (ok={ok}): {err}"
+    );
+    let leaked = seen
+        .lines()
+        .filter(|l| l.contains("after-untrust alice "))
+        .count();
+    eprintln!(
+        "[proof] after alice's second restart: bob rendered her in {bob_reads:?}; carol renders \
+         {leaked} of her posts"
+    );
+    assert_eq!(
+        leaked, 0,
+        "PRODUCT: untrust did not survive a restart: carol, whom alice withdrew before it, \
+         renders {leaked} of alice's posts made after it"
     );
 }

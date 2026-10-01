@@ -255,6 +255,9 @@ pub enum UiError {
     Refused,
     /// There is no consent to withdraw from that member.
     NotConsented,
+    /// A per-room revoke named a member in the trust keyring, which would re-consent on the
+    /// next tick: trust is withdrawn with `vox trust remove`, everywhere at once.
+    StillTrusted,
     /// A consent named a member this node has not admitted to the room yet.
     NotAdmitted,
     /// This client is not networked, or is locked, so it cannot reach anyone.
@@ -315,6 +318,9 @@ impl UiError {
             UiError::KeyringFull => "your trust keyring is full (1,024) — remove one first",
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
+            UiError::StillTrusted => {
+                "not revoked — this member is in your trust keyring; `vox trust remove` withdraws them"
+            }
             UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Refused => "refused — check the channel passphrase",

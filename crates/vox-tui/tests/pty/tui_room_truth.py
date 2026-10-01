@@ -22,6 +22,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   revoke    `:consent revoke`, with Carol still selected and not first in the pane, takes her
             back to "← in-only" and leaves Alice "↔ consented"; a line Bob then posts reaches
             Alice's `vox room read` and not Carol's;
+  trusted   `:consent revoke` on Alice, whom Bob trusts, is refused and the status line says
+            why (she is in his trust keyring; `vox trust remove` withdraws her), not "internal
+            error"; 10 s later she still reads "consented" and reads a line Bob then posts: a
+            per-room revoke of a trusted member must not quietly half-happen and heal itself;
   reach     back on the channel list, the room reads "● online" while Bob's node is connected to
             its other members;
   unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline";
@@ -317,6 +321,30 @@ try:
     claim("revoke", panes_ok and leaked is False,
           f"first in the pane: {first[:30]!r}; carol: {carol_label.strip()!r}; alice: "
           f"{alice_label.strip()!r}; carol read bob's post after the revoke: {leaked}")
+
+    stage("trusted")
+    # Alice is in Bob's trust keyring. Back to the members pane, and the marker onto her.
+    if panes_ok:
+        tui.key("\t", 0.5)  # composer -> members
+    for k in ["\x1b[A"] * 8 + ["\x1b[B"] * 16:  # Up, then Down: wherever she sorts
+        if label_of("alice")[1]:
+            break
+        tui.key(k, 0.5)
+    if not label_of("alice")[1]: apparatus("could not put the marker on alice:\n" + "\n".join(pane()))
+    if "consented" not in (label_of("alice")[0] or ""):
+        apparatus("alice was not shown consented before the revoke, so it keeping that shows nothing")
+    tui.key(":consent revoke\r", 3)
+    said = tui.until(lambda: "trust keyring" in screen(), 10, 0.5)
+    bar = " / ".join(r.strip() for r in tui.display()[-2:])  # the status line and the bar
+    time.sleep(10)  # several of the node's ticks: a revoke that went through and healed shows here
+    kept = label_of("alice")[0] or ""
+    tui.key("\t", 0.5)  # members -> timeline
+    tui.key("\t", 0.5)  # timeline -> composer
+    tui.key("b-after-trusted-revoke\r", 1)
+    reads = until(lambda: "b-after-trusted-revoke" in run("alice", "room", "read", room, "--limit", "500").stdout, 60, 1)
+    claim("trusted", said and "consented" in kept and "in-only" not in kept and reads,
+          f"status line said why: {said} ({bar[:200]!r}); alice 10 s later: {kept.strip()!r}; "
+          f"alice read bob's next post: {reads}")
 
     stage("reach")
     tui.key("\x1b", 2)  # Esc back to the channel list

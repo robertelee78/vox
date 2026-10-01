@@ -342,6 +342,9 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::Refused => UiError::Refused,
         Fault::NotAdmitted => UiError::NotAdmitted,
         Fault::NotConsented => UiError::NotConsented,
+        // Not an internal error: the person asked for something the model refuses, and must be
+        // told which act does mean it.
+        Fault::StillTrusted => UiError::StillTrusted,
         Fault::NotNetworked => UiError::NotNetworked,
         Fault::AddressInUse => UiError::AddressInUse,
         Fault::AlreadyMember => UiError::AlreadyMember,
